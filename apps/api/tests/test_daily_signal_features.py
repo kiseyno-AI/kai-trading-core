@@ -6,6 +6,7 @@ from app.signals.daily_signal_features import (
     OVERTIME_FLUCTUATION,
     OVERTIME_VOLUME,
     VOLUME_POWER,
+    DailySignalFeatureCollection,
     DailySignalFeatureService,
     build_daily_signal_feature_rows,
 )
@@ -179,6 +180,46 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             market='KRX',
             source='kis_ranking',
         )
+
+    async def test_refresh_can_return_full_internal_retry_scope_without_expanding_public_preview(self):
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        symbols = [f'{index:06d}' for index in range(60)]
+        collection = DailySignalFeatureCollection(
+            market_date='2026-04-14',
+            sources=[VOLUME_POWER],
+            source_counts={VOLUME_POWER: len(symbols)},
+            source_errors={},
+            universe={
+                'active_symbols': symbols,
+                'candidate_symbols': symbols,
+                'candidate_universe_availability': 'available',
+            },
+            items=[{'symbol': symbol} for symbol in symbols],
+        )
+
+        with (
+            patch.object(service, 'collect_features', AsyncMock(return_value=collection)),
+            patch(
+                'app.signals.daily_signal_features.upsert_daily_signal_features',
+                side_effect=RuntimeError('bulk persistence failed'),
+            ),
+            patch(
+                'app.signals.daily_signal_features.upsert_daily_signal_feature',
+                side_effect=RuntimeError('row persistence failed'),
+            ),
+            patch(
+                'app.signals.daily_signal_features.daily_market_participation_context_service.rebuild_for_market_date',
+                return_value={'captured_symbol_count': 0},
+            ),
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                include_retry_metadata=True,
+            )
+
+        self.assertEqual(result['features_failed'], 60)
+        self.assertEqual(result['failed_symbols'], symbols[:50])
+        self.assertEqual(result['_retry_metadata']['failed_symbols'], symbols)
 
     async def test_collect_features_can_scope_to_one_source(self):
         service = DailySignalFeatureService(client=FakeKISRankingClient())

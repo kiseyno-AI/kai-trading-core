@@ -475,6 +475,7 @@ def replay_decider_candidate_rules(
     rule_config_json: str | None = None,
     rule_config_path: str | None = None,
     symbols: str | None = None,
+    policy_versions: str | None = None,
     fee_bps: str | float | int = 0,
     slippage_bps: str | float | int = 0,
     notional_krw: str | float | int = 1_000_000,
@@ -487,11 +488,17 @@ def replay_decider_candidate_rules(
     else:
         rule_config = rule_config_json or '{}'
     parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_policy_versions = (
+        [item.strip() for item in policy_versions.split(',') if item.strip()]
+        if policy_versions
+        else None
+    )
     return decider_replay_service.replay(
         market_date_from=market_date_from,
         market_date_to=market_date_to,
         agent_name=agent_name,
         symbols=parsed_symbols,
+        policy_versions=parsed_policy_versions,
         rule_config=rule_config,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
@@ -1210,7 +1217,7 @@ def _build_parser() -> argparse.ArgumentParser:
             '    --agent-name short-term-decider \\\n'
             '    --rule-config-json \'{"rules":[{"name":"stale_watch_veto",'
             '"predicates":[{"type":"trigger_price_drift","max_below_trigger_pct":0.03}]}]}\' \\\n'
-            '    --fee-bps 0 --slippage-bps 0 --output-format markdown\n\n'
+            '    --fee-bps 10 --slippage-bps 5 --output-format markdown\n\n'
             'Predicates are evaluated only against persisted snapshot-time request, response, traceability, '
             'and input-feature payloads. Realized outcomes are used only for replay P/L comparison.'
         ),
@@ -1224,6 +1231,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Decider snapshot stream to replay',
     )
     decider_replay_parser.add_argument('--symbols', help='Optional comma-separated symbol list')
+    decider_replay_parser.add_argument(
+        '--policy-versions',
+        help='Optional comma-separated decision policy versions to include',
+    )
     decider_replay_parser.add_argument(
         '--rule-config-json',
         help=(
@@ -1581,6 +1592,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             rule_config_json=args.rule_config_json,
             rule_config_path=args.rule_config_path,
             symbols=args.symbols,
+            policy_versions=args.policy_versions,
             fee_bps=args.fee_bps,
             slippage_bps=args.slippage_bps,
             notional_krw=args.notional_krw,

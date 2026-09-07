@@ -141,3 +141,22 @@ class DailyTechnicalSnapshotServiceTests(unittest.TestCase):
         self.assertEqual(result['failed_symbols'], [])
         self.assertEqual([item['status'] for item in progress_updates], ['running', 'completed'])
         upsert_mock.assert_called_once()
+
+    def test_rebuild_can_return_full_internal_retry_scope_without_expanding_public_preview(self):
+        service = DailyTechnicalSnapshotService()
+        symbols = [f'{index:06d}' for index in range(60)]
+
+        with (
+            patch('app.eod.technical_snapshots.load_daily_bars_for_symbol', return_value=[]),
+            patch('app.eod.technical_snapshots.upsert_daily_technical_snapshot') as upsert_mock,
+        ):
+            result = service.rebuild_for_market_date(
+                market_date='2026-04-29',
+                symbols=symbols,
+                include_retry_metadata=True,
+            )
+
+        self.assertEqual(result['snapshots_failed'], 60)
+        self.assertEqual(result['failed_symbols'], symbols[:50])
+        self.assertEqual(result['_retry_metadata']['failed_symbols'], symbols)
+        upsert_mock.assert_not_called()

@@ -240,6 +240,7 @@ class SignalDeciderPolicyActivationRequest(BaseModel):
 
     activated_by: str = Field(..., min_length=1, max_length=128)
     activation_note: str | None = Field(default=None, max_length=500)
+    replay_evidence: dict[str, Any] | None = None
 
 
 class AgentSubagentExperimentRequest(BaseModel):
@@ -701,6 +702,10 @@ async def get_symbol_day_context(
     symbols: list[str] = Query(...),
     fs_div: str | None = Query(default=None),
     disclosures_limit: int = Query(default=5, ge=0, le=20),
+    knowledge_cutoff_at: datetime | None = Query(
+        default=None,
+        description='Timezone-aware exclusive upper bound for news known at decision time.',
+    ),
 ) -> dict:
     try:
         return agent_context_read_service.get_symbol_day_context(
@@ -708,6 +713,7 @@ async def get_symbol_day_context(
             symbols=symbols,
             fs_div=fs_div,
             disclosures_limit=disclosures_limit,
+            knowledge_cutoff_at=knowledge_cutoff_at,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1912,6 +1918,7 @@ async def activate_signal_decider_decision_policy(
             policy_version=policy_version,
             activated_by=payload.activated_by,
             activation_note=payload.activation_note,
+            replay_evidence=payload.replay_evidence,
         )
     except ValueError as exc:
         if 'was not found' in str(exc):

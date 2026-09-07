@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
+from zoneinfo import ZoneInfo
 
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
@@ -23,7 +24,13 @@ from app.dart.fundamentals_capture_service import dart_fundamentals_capture_serv
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.action_summaries import daily_action_summary_service
-from app.eod.pykrx_pipeline_runner import PykrxPipelineDependencies, run_market_data_pipeline
+from app.eod.pykrx_pipeline_runner import (
+    AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
+    AUTO_DAILY_TRACKED_STAGE_ORDER,
+    HISTORICAL_BACKFILL_STAGE_ORDER,
+    PykrxPipelineDependencies,
+    run_market_data_pipeline,
+)
 from app.market.session import latest_krx_trading_date
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.signals.daily_signal_features import daily_signal_feature_service
@@ -71,10 +78,12 @@ stock = _LazyPykrxStock()
 webio = _LazyPykrxWebIO()
 _PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
-DEFAULT_START_DATE = '19560101'
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
 MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
-MAX_NON_BLOCKING_DAILY_SYMBOL_MISSING_RATIO = 0.10
+MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE = 5
+AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
+AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
+AUTO_EOD_PIPELINE_ENTRYPOINT = 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
 RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
 PYKRX_STAGE_SEQUENCE = (
     'price_collection',
@@ -118,6 +127,10 @@ def _to_iso_date(value: object) -> str:
 
 def _normalize_iso_date(value: str) -> str:
     return datetime.strptime(value, '%Y%m%d').date().isoformat()
+
+
+def _current_krx_calendar_date() -> date:
+    return datetime.now(ZoneInfo('Asia/Seoul')).date()
 
 
 @contextmanager
@@ -314,6 +327,21 @@ class PykrxBackfillService:
             deactivate_missing=deactivate_missing,
         )
         snapshot = self.fetch_recent_universe_snapshot(markets=markets, limit=limit)
+        if not snapshot.get('complete', True):
+            _log_pykrx_fetch(
+                'refresh_recent_universe',
+                'failed',
+                markets=list(markets),
+                limit=limit,
+                complete=False,
+                market_status=dict(snapshot.get('market_status') or {}),
+                unavailable_markets=list(snapshot.get('unavailable_markets') or []),
+                market_errors=list(snapshot.get('market_errors') or []),
+            )
+            raise RuntimeError(
+                'PyKRX universe snapshot is incomplete for requested markets: '
+                f"{','.join(snapshot['unavailable_markets'])}."
+            )
         symbols = snapshot['symbols']
         persisted = self._persist_universe(symbols, deactivate_missing=deactivate_missing)
         result = {
@@ -323,6 +351,12 @@ class PykrxBackfillService:
             'persisted_count': persisted,
             'latest_trade_date': snapshot['latest_trade_date'],
             'universe_source': snapshot['universe_source'],
+            'membership_basis': snapshot.get('membership_basis', 'end_date_snapshot'),
+            'membership_scope_warning': snapshot.get('membership_scope_warning'),
+            'complete': snapshot.get('complete', True),
+            'market_status': dict(snapshot.get('market_status') or {}),
+            'unavailable_markets': list(snapshot.get('unavailable_markets') or []),
+            'market_errors': list(snapshot.get('market_errors') or []),
             'deactivate_missing': deactivate_missing,
         }
         _log_pykrx_fetch('refresh_recent_universe', 'completed', **result)
@@ -342,26 +376,60 @@ class PykrxBackfillService:
         markets: Sequence[str] = DEFAULT_MARKETS,
         limit: int | None = None,
     ) -> list[PykrxSymbol]:
-        return self.fetch_recent_universe_snapshot(markets=markets, limit=limit)['symbols']
+        snapshot = self.fetch_recent_universe_snapshot(markets=markets, limit=limit)
+        if not snapshot.get('complete', True):
+            raise RuntimeError(
+                'PyKRX universe snapshot is incomplete for requested markets: '
+                f"{','.join(snapshot['unavailable_markets'])}."
+            )
+        return snapshot['symbols']
 
     def fetch_recent_universe_snapshot(
         self,
         *,
         markets: Sequence[str] = DEFAULT_MARKETS,
         limit: int | None = None,
+        end_date: str | None = None,
+        allow_master_fallback: bool = True,
     ) -> dict:
-        latest_trade_date = self.resolve_latest_trade_date()
+        latest_trade_date = self.resolve_latest_trade_date(end_date=end_date)
         as_of_date = latest_trade_date.replace('-', '')
-        pykrx_snapshot = self._fetch_pykrx_market_universe(as_of_date=as_of_date, markets=markets, limit=limit)
+        pykrx_snapshot = self._fetch_pykrx_market_universe(
+            as_of_date=as_of_date,
+            markets=markets,
+            limit=limit,
+            allow_master_fallback=allow_master_fallback,
+        )
         items = pykrx_snapshot['symbols']
         universe_source = pykrx_snapshot['universe_source']
-        if not items:
+        if not items and allow_master_fallback:
             items = self._fetch_master_fallback_universe(markets=markets, limit=limit)
             universe_source = 'kis_master_fallback'
+            requested_markets = [str(market).upper() for market in markets]
+            covered_markets = {item.market.upper() for item in items}
+            market_status = dict(pykrx_snapshot['market_status'])
+            for market in requested_markets:
+                if market in covered_markets:
+                    market_status[market] = 'kis_master_fallback'
+            unavailable_markets = [
+                market for market in requested_markets if market not in covered_markets
+            ]
+        else:
+            market_status = dict(pykrx_snapshot['market_status'])
+            unavailable_markets = list(pykrx_snapshot['unavailable_markets'])
         return {
             'symbols': items,
             'latest_trade_date': latest_trade_date,
             'universe_source': universe_source,
+            'membership_basis': 'end_date_snapshot',
+            'membership_scope_warning': (
+                'This snapshot represents membership at the resolved end date; '
+                'it does not reconstruct membership for every date in a multi-day backfill.'
+            ),
+            'complete': not unavailable_markets,
+            'market_status': market_status,
+            'unavailable_markets': unavailable_markets,
+            'market_errors': list(pykrx_snapshot['market_errors']),
         }
 
     def _fetch_pykrx_market_universe(
@@ -370,10 +438,43 @@ class PykrxBackfillService:
         as_of_date: str,
         markets: Sequence[str],
         limit: int | None = None,
+        allow_master_fallback: bool = True,
     ) -> dict:
         items: list[PykrxSymbol] = []
         used_master_fallback = False
+        market_status: dict[str, str] = {}
+        market_errors: list[dict[str, str]] = []
+
+        def build_result() -> dict:
+            for requested_market in markets:
+                normalized_requested_market = str(requested_market).upper()
+                if normalized_requested_market in market_status:
+                    continue
+                market_status[normalized_requested_market] = (
+                    'not_queried_due_to_limit'
+                    if limit and len(items) >= limit
+                    else 'unavailable'
+                )
+            unavailable_markets = [
+                str(market).upper()
+                for market in markets
+                if market_status.get(str(market).upper()) == 'unavailable'
+            ]
+            return {
+                'symbols': items,
+                'universe_source': (
+                    'pykrx_market_ohlcv_with_master_fallback'
+                    if used_master_fallback
+                    else 'pykrx_market_ohlcv'
+                ),
+                'complete': not unavailable_markets,
+                'market_status': market_status,
+                'unavailable_markets': unavailable_markets,
+                'market_errors': market_errors,
+            }
+
         for market in markets:
+            normalized_market = str(market).upper()
             _log_pykrx_fetch('fetch_market_universe', 'started', market=market, as_of_date=as_of_date, limit=limit)
             try:
                 frame = _call_pykrx(stock.get_market_ohlcv_by_ticker, as_of_date, market=market)
@@ -386,15 +487,30 @@ class PykrxBackfillService:
                     as_of_date=as_of_date,
                     error_type=type(exc).__name__,
                     error_message=str(exc),
-                    fallback_source='kis_master',
+                    fallback_source='kis_master' if allow_master_fallback else None,
                 )
-                fallback_items = self._fetch_master_fallback_for_market(
-                    market=market,
-                    as_of_date=as_of_date,
-                    current_count=len(items),
-                    limit=limit,
+                fallback_items = (
+                    self._fetch_master_fallback_for_market(
+                        market=market,
+                        as_of_date=as_of_date,
+                        current_count=len(items),
+                        limit=limit,
+                    )
+                    if allow_master_fallback
+                    else []
                 )
                 used_master_fallback = used_master_fallback or bool(fallback_items)
+                market_status[normalized_market] = (
+                    'kis_master_fallback' if fallback_items else 'unavailable'
+                )
+                market_errors.append(
+                    {
+                        'market': normalized_market,
+                        'status': 'fetch_failed',
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc),
+                    }
+                )
                 items.extend(fallback_items)
                 if limit and len(items) >= limit:
                     break
@@ -407,19 +523,35 @@ class PykrxBackfillService:
                     'empty',
                     market=market,
                     as_of_date=as_of_date,
-                    fallback_source='kis_master',
+                    fallback_source='kis_master' if allow_master_fallback else None,
                 )
-                fallback_items = self._fetch_master_fallback_for_market(
-                    market=market,
-                    as_of_date=as_of_date,
-                    current_count=len(items),
-                    limit=limit,
+                fallback_items = (
+                    self._fetch_master_fallback_for_market(
+                        market=market,
+                        as_of_date=as_of_date,
+                        current_count=len(items),
+                        limit=limit,
+                    )
+                    if allow_master_fallback
+                    else []
                 )
                 used_master_fallback = used_master_fallback or bool(fallback_items)
+                market_status[normalized_market] = (
+                    'kis_master_fallback' if fallback_items else 'unavailable'
+                )
+                market_errors.append(
+                    {
+                        'market': normalized_market,
+                        'status': 'empty',
+                        'error_type': 'EmptyUniverse',
+                        'error_message': f'No usable tickers returned for {normalized_market} on {as_of_date}.',
+                    }
+                )
                 items.extend(fallback_items)
                 if limit and len(items) >= limit:
                     break
                 continue
+            market_status[normalized_market] = 'pykrx_market_ohlcv'
             for ticker in tickers:
                 try:
                     raw_name_ko = _call_pykrx(stock.get_market_ticker_name, ticker)
@@ -448,14 +580,7 @@ class PykrxBackfillService:
                         limit=limit,
                         fallback_used=used_master_fallback,
                     )
-                    return {
-                        'symbols': items,
-                        'universe_source': (
-                            'pykrx_market_ohlcv_with_master_fallback'
-                            if used_master_fallback
-                            else 'pykrx_market_ohlcv'
-                        ),
-                    }
+                    return build_result()
             _log_pykrx_fetch(
                 'fetch_market_universe',
                 'completed',
@@ -466,12 +591,7 @@ class PykrxBackfillService:
                 limit=limit,
                 fallback_used=used_master_fallback,
             )
-        return {
-            'symbols': items,
-            'universe_source': (
-                'pykrx_market_ohlcv_with_master_fallback' if used_master_fallback else 'pykrx_market_ohlcv'
-            ),
-        }
+        return build_result()
 
     def _extract_market_universe_tickers(self, frame) -> list[str]:
         if getattr(frame, 'empty', True):
@@ -548,7 +668,7 @@ class PykrxBackfillService:
         symbol: str | None = None,
         limit: int | None = None,
     ) -> list[PykrxSymbol]:
-        rows = load_symbols(markets=list(markets), limit=limit)
+        rows = load_symbols(is_active=True, markets=list(markets), limit=limit)
         items: list[PykrxSymbol] = []
         seen: set[str] = set()
         allowed_markets = {market.upper() for market in markets}
@@ -604,7 +724,10 @@ class PykrxBackfillService:
         probe_symbol: str = '005930',
         lookback_days: int = 730,
     ) -> str:
-        normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
+        normalized_end = _normalize_yyyymmdd(
+            end_date,
+            default=_current_krx_calendar_date().strftime('%Y%m%d'),
+        )
         end_dt = datetime.strptime(normalized_end, '%Y%m%d')
         start_dt = end_dt - timedelta(days=lookback_days)
         try:
@@ -626,16 +749,21 @@ class PykrxBackfillService:
     def run_backfill(
         self,
         *,
-        start_date: str = DEFAULT_START_DATE,
+        start_date: str | None = None,
         end_date: str | None = None,
         markets: Sequence[str] = DEFAULT_MARKETS,
         trigger: str = 'manual',
         refresh_universe: bool = True,
         limit: int | None = None,
         symbol: str | None = None,
+        selected_stages: Sequence[str] | None = None,
     ) -> dict:
-        normalized_start = _normalize_yyyymmdd(start_date)
-        normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
+        normalized_end = (
+            _normalize_yyyymmdd(end_date)
+            if end_date is not None
+            else self.resolve_latest_trade_date().replace('-', '')
+        )
+        normalized_start = _normalize_yyyymmdd(start_date, default=normalized_end)
         return self._run_market_data_pipeline(
             start_date=normalized_start,
             end_date=normalized_end,
@@ -645,20 +773,237 @@ class PykrxBackfillService:
             limit=limit,
             symbol=symbol,
             mode='historical_backfill',
+            selected_stages=(
+                tuple(selected_stages)
+                if selected_stages is not None
+                else HISTORICAL_BACKFILL_STAGE_ORDER
+            ),
+            chain_fundamentals_followup=False,
         )
+
+    def _resume_auto_daily_followups_if_due(
+        self,
+        *,
+        market_date: str,
+        latest_available_trade_date: str,
+        latest_eod_run: dict,
+        markets: Sequence[str],
+    ) -> dict | None:
+        """Resume failed post-collection stages without downloading prices again."""
+
+        try:
+            pipeline_run = daily_pipeline_run_state_service.get_latest_run_for_context(
+                market_date=market_date,
+                triggers=(AUTO_FOLLOWUP_RECOVERY_TRIGGER,),
+                entrypoints=(AUTO_EOD_PIPELINE_ENTRYPOINT,),
+            )
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            logger.exception('Unable to inspect daily follow-up recovery state for %s', market_date)
+            result = build_daily_skip_result(
+                reason='followup_recovery_state_unavailable',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'state_unavailable',
+                'error_type': type(exc).__name__,
+            }
+            return result
+
+        if pipeline_run is None:
+            return None
+
+        run_metadata = (
+            pipeline_run.get('run_metadata')
+            if isinstance(pipeline_run.get('run_metadata'), dict)
+            else {}
+        )
+        stage_rows = pipeline_run.get('stages') if isinstance(pipeline_run.get('stages'), dict) else {}
+        resolved_stage_ids = {
+            str(stage_id).strip()
+            for stage_id in (run_metadata.get('resolved_stages') or stage_rows.keys())
+            if str(stage_id).strip()
+        }
+        # Price failures are retried by the collection-specific branch. All
+        # later tracked stages can safely resume from persisted prices without
+        # another provider download.
+        resumable_stage_order = tuple(
+            stage_id
+            for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+            if stage_id != 'price_collection'
+        )
+        recovery_scope = [
+            stage_id
+            for stage_id in resumable_stage_order
+            if stage_id in resolved_stage_ids or stage_id in stage_rows
+        ]
+        if not recovery_scope:
+            return None
+
+        incomplete_stages = [
+            stage_id
+            for stage_id in recovery_scope
+            if str((stage_rows.get(stage_id) or {}).get('status') or '').strip().lower()
+            not in {'completed', 'skipped'}
+        ]
+        if not incomplete_stages:
+            return None
+
+        now = datetime.now(timezone.utc)
+        latest_activity_at = _parse_activity_datetime(
+            pipeline_run.get('updated_at') or pipeline_run.get('started_at')
+        )
+        pipeline_status = str(pipeline_run.get('status') or '').strip().lower()
+        if pipeline_status == 'running':
+            stale_after_seconds = max(
+                60,
+                int(settings.eod_auto_pykrx_stale_run_minutes or 30) * 60,
+            )
+            if latest_activity_at is None or (now - latest_activity_at).total_seconds() < stale_after_seconds:
+                result = build_daily_skip_result(
+                    reason='followup_recovery_already_running',
+                    market_date=market_date,
+                    latest_available_trade_date=latest_available_trade_date,
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'pipeline_run_id': pipeline_run.get('id'),
+                    'resume_from_stage': incomplete_stages[0],
+                }
+                return result
+
+        try:
+            recovery_attempts = daily_pipeline_run_state_service.count_runs(
+                market_date=market_date,
+                trigger=AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            )
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            logger.exception('Unable to count daily follow-up recovery attempts for %s', market_date)
+            result = build_daily_skip_result(
+                reason='followup_recovery_state_unavailable',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'state_unavailable',
+                'error_type': type(exc).__name__,
+            }
+            return result
+
+        if recovery_attempts >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE:
+            result = build_daily_skip_result(
+                reason='followup_recovery_limit_reached',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'attempts': recovery_attempts,
+                'max_attempts': MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE,
+                'resume_from_stage': incomplete_stages[0],
+            }
+            return result
+
+        if pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER:
+            completed_at = _parse_activity_datetime(
+                pipeline_run.get('completed_at') or pipeline_run.get('updated_at')
+            )
+            if (
+                completed_at is not None
+                and (now - completed_at).total_seconds() < AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS
+            ):
+                retry_after_seconds = max(
+                    1,
+                    int(
+                        AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS
+                        - (now - completed_at).total_seconds()
+                    ),
+                )
+                result = build_daily_skip_result(
+                    reason='followup_recovery_backoff',
+                    market_date=market_date,
+                    latest_available_trade_date=latest_available_trade_date,
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'attempts': recovery_attempts,
+                    'max_attempts': MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE,
+                    'retry_after_seconds': retry_after_seconds,
+                    'resume_from_stage': incomplete_stages[0],
+                }
+                return result
+
+        resume_from_stage = incomplete_stages[0]
+        resume_index = recovery_scope.index(resume_from_stage)
+        recovery_stages = recovery_scope[resume_index:]
+
+        # Imported lazily because the stage orchestrator depends on this service.
+        from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
+
+        recovery_kwargs: dict[str, Any] = {
+            'market_date': market_date,
+            'stages': recovery_stages,
+            'markets': markets,
+            'force': False,
+            'reuse_existing_feedback': True,
+            'resume_from_stage': resume_from_stage,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+        }
+        downstream_retry_symbols = _dedupe_symbol_codes(
+            (latest_eod_run.get('run_metadata') or {}).get(
+                'downstream_retry_symbols'
+            )
+            if isinstance(latest_eod_run.get('run_metadata'), dict)
+            else []
+        )
+        # The collection run only knows symbol failures from its immediate
+        # PyKRX stages. A later follow-up can fail independently or never run,
+        # so that subset cannot safely define the follow-up recovery universe.
+        has_incomplete_followup_stage = any(
+            stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
+            for stage_id in incomplete_stages
+        )
+        recovery_symbols = (
+            [] if has_incomplete_followup_stage else downstream_retry_symbols
+        )
+        if recovery_symbols:
+            recovery_kwargs['symbols'] = recovery_symbols
+        recovery_result = dict(daily_pipeline_stage_service.run(**recovery_kwargs))
+        recovery_result.setdefault('triggered', True)
+        recovery_result.setdefault('reason', 'incomplete_followups_resumed')
+        recovery_result.setdefault('market_date', market_date)
+        recovery_result['latest_available_trade_date'] = latest_available_trade_date
+        recovery_result['source'] = 'pykrx'
+        recovery_result['followup_recovery'] = {
+            'attempt': recovery_attempts + 1,
+            'max_attempts': MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE,
+            'resumed_from_pipeline_run_id': pipeline_run.get('id'),
+            'reused_eod_collection_run_id': latest_eod_run.get('id'),
+            'resume_from_stage': resume_from_stage,
+            'stages': recovery_stages,
+            'symbols': recovery_symbols,
+        }
+        return recovery_result
 
     def run_daily_pipeline_if_due(
         self,
         *,
-        market_date: str,
+        market_date: str | None = None,
         markets: Sequence[str] = DEFAULT_MARKETS,
         trigger: str = 'auto_close',
         refresh_universe: bool = True,
         force: bool = False,
     ) -> dict:
-        normalized_market_date = _normalize_yyyymmdd(market_date)
-        market_date_iso = _normalize_iso_date(normalized_market_date)
-        latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
+        if market_date is None:
+            latest_trade_date = self.resolve_latest_trade_date()
+            normalized_market_date = latest_trade_date.replace('-', '')
+            market_date_iso = latest_trade_date
+        else:
+            normalized_market_date = _normalize_yyyymmdd(market_date)
+            market_date_iso = _normalize_iso_date(normalized_market_date)
+            latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
 
         if latest_trade_date != market_date_iso:
             result = build_daily_skip_result(
@@ -703,6 +1048,33 @@ class PykrxBackfillService:
             if not force and latest_run:
                 latest_status = latest_run.get('status')
                 latest_failed = int(latest_run.get('symbols_failed') or 0)
+                metadata_retry_symbols = self._metadata_retry_symbol_codes(latest_run)
+                collection_is_terminal = (
+                    latest_status == 'completed'
+                    and latest_failed == 0
+                ) or (
+                    latest_status == 'completed_with_errors'
+                    and latest_failed == 0
+                    and not metadata_retry_symbols
+                )
+                if collection_is_terminal and _is_auto_daily_trigger(trigger):
+                    recovery_result = self._resume_auto_daily_followups_if_due(
+                        market_date=market_date_iso,
+                        latest_available_trade_date=latest_trade_date,
+                        latest_eod_run=latest_run,
+                        markets=markets,
+                    )
+                    if recovery_result is not None:
+                        _log_pykrx_fetch(
+                            'run_daily_pipeline_if_due',
+                            str(recovery_result.get('status') or 'skipped'),
+                            **{
+                                key: value
+                                for key, value in recovery_result.items()
+                                if key != 'status'
+                            },
+                        )
+                        return recovery_result
                 if latest_status == 'completed' and latest_failed == 0:
                     result = build_daily_skip_result(
                         reason='already_completed',
@@ -712,40 +1084,17 @@ class PykrxBackfillService:
                     )
                     _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
-                if latest_status == 'completed_with_errors' and latest_failed == 0:
+                if (
+                    latest_status == 'completed_with_errors'
+                    and latest_failed == 0
+                    and not metadata_retry_symbols
+                ):
                     result = build_daily_skip_result(
                         reason='already_completed_with_errors',
                         market_date=market_date_iso,
                         latest_available_trade_date=latest_trade_date,
                         existing_run=latest_run,
                     )
-                    _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
-                    return result
-                latest_total = int(latest_run.get('symbols_total') or 0)
-                latest_missing_ratio = (
-                    latest_failed / latest_total
-                    if latest_total > 0
-                    else None
-                )
-                if (
-                    _is_auto_daily_trigger(trigger)
-                    and latest_status == 'completed_with_errors'
-                    and latest_failed > 0
-                    and latest_missing_ratio is not None
-                    and latest_missing_ratio < MAX_NON_BLOCKING_DAILY_SYMBOL_MISSING_RATIO
-                ):
-                    result = build_daily_skip_result(
-                        reason='already_completed_with_minor_symbol_gaps',
-                        market_date=market_date_iso,
-                        latest_available_trade_date=latest_trade_date,
-                        existing_run=latest_run,
-                    )
-                    result['minor_symbol_gap'] = {
-                        'symbols_total': latest_total,
-                        'symbols_failed': latest_failed,
-                        'missing_ratio': round(latest_missing_ratio, 6),
-                        'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_DAILY_SYMBOL_MISSING_RATIO,
-                    }
                     _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
                 if _is_auto_daily_trigger(trigger) and self._is_retryable_daily_run(latest_run):
@@ -912,7 +1261,19 @@ class PykrxBackfillService:
             return False
         if status == 'failed':
             return True
-        return int(run.get('symbols_failed') or 0) > 0
+        return int(run.get('symbols_failed') or 0) > 0 or bool(
+            self._metadata_retry_symbol_codes(run)
+        )
+
+    @staticmethod
+    def _metadata_retry_symbol_codes(run: dict) -> list[str]:
+        metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
+        return _dedupe_symbol_codes(
+            [
+                *(metadata.get('failed_symbols') or []),
+                *(metadata.get('unattempted_symbols') or []),
+            ]
+        )
 
     def _load_retry_symbols_for_run(self, run: dict, *, markets: Sequence[str]) -> list[PykrxSymbol]:
         symbol_codes = self._failed_symbol_codes_for_run(run, markets=markets)
@@ -946,9 +1307,9 @@ class PykrxBackfillService:
 
     def _failed_symbol_codes_for_run(self, run: dict, *, markets: Sequence[str]) -> list[str]:
         metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
-        metadata_failed_symbols = metadata.get('failed_symbols') if metadata else None
-        if metadata_failed_symbols:
-            return _dedupe_symbol_codes(metadata_failed_symbols)
+        metadata_retry_symbols = self._metadata_retry_symbol_codes(run)
+        if metadata_retry_symbols:
+            return metadata_retry_symbols
 
         persisted_symbols = set(load_eod_run_persisted_symbols(run['id']))
         requested_symbols = metadata.get('requested_symbols') if metadata else None
@@ -967,6 +1328,17 @@ class PykrxBackfillService:
         failed_symbol_codes = _dedupe_symbol_codes(failed_symbols)
         updated['failed_symbols'] = failed_symbol_codes
         updated['failed_symbols_count'] = len(failed_symbol_codes)
+        return updated
+
+    def _run_metadata_with_downstream_retry_symbols(
+        self,
+        metadata: dict | None,
+        failed_symbols: Sequence[str],
+    ) -> dict:
+        updated = dict(metadata or {})
+        failed_symbol_codes = _dedupe_symbol_codes(failed_symbols)
+        updated['downstream_retry_symbols'] = failed_symbol_codes
+        updated['downstream_retry_symbols_count'] = len(failed_symbol_codes)
         return updated
 
     def _run_activity_at(self, run: dict) -> datetime | None:
@@ -1236,7 +1608,11 @@ class PykrxBackfillService:
         symbol: str | None = None,
     ) -> dict:
         normalized_start = _normalize_yyyymmdd(start_date)
-        normalized_end = _normalize_yyyymmdd(end_date, default=date.today().strftime('%Y%m%d'))
+        normalized_end = (
+            _normalize_yyyymmdd(end_date)
+            if end_date is not None
+            else self.resolve_latest_trade_date().replace('-', '')
+        )
         if symbol:
             target_symbols = [symbol]
         else:
@@ -1321,13 +1697,18 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_parser.add_argument('--limit', type=int)
 
     backfill_parser = subparsers.add_parser('backfill', help='Backfill pykrx historical daily bars')
-    backfill_parser.add_argument('--start-date', default=DEFAULT_START_DATE)
+    backfill_parser.add_argument('--start-date')
     backfill_parser.add_argument('--end-date')
     backfill_parser.add_argument('--markets', default=','.join(DEFAULT_MARKETS))
     backfill_parser.add_argument('--limit', type=int)
     backfill_parser.add_argument('--symbol')
     backfill_parser.add_argument('--trigger', default='manual_cli')
     backfill_parser.add_argument('--skip-universe-refresh', action='store_true')
+    backfill_parser.add_argument(
+        '--stages',
+        default=','.join(HISTORICAL_BACKFILL_STAGE_ORDER),
+        help='Comma-separated point-in-time-safe stages.',
+    )
     return parser
 
 
@@ -1354,6 +1735,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             refresh_universe=not args.skip_universe_refresh,
             limit=args.limit,
             symbol=args.symbol,
+            selected_stages=tuple(
+                stage.strip()
+                for stage in args.stages.split(',')
+                if stage.strip()
+            ),
         )
         print(result)
         return 0

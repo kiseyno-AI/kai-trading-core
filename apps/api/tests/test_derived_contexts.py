@@ -147,6 +147,26 @@ class DailyPriceContextServiceTests(unittest.TestCase):
         self.assertEqual(result['failed_symbols'], [])
         upsert_daily_price_context_mock.assert_called_once()
 
+    @patch('app.agent_context.derived_contexts.upsert_daily_price_context')
+    @patch('app.agent_context.derived_contexts.load_recent_price_bars_by_symbol', return_value={})
+    def test_rebuild_can_return_full_internal_retry_scope_without_expanding_public_preview(
+        self,
+        _load_recent_price_bars_by_symbol_mock,
+        upsert_daily_price_context_mock,
+    ):
+        symbols = [f'{index:06d}' for index in range(60)]
+
+        result = DailyPriceContextService().rebuild_for_market_date(
+            market_date='2026-04-08',
+            symbols=symbols,
+            include_retry_metadata=True,
+        )
+
+        self.assertEqual(result['contexts_failed'], 60)
+        self.assertEqual(result['failed_symbols'], symbols[:50])
+        self.assertEqual(result['_retry_metadata']['failed_symbols'], symbols)
+        upsert_daily_price_context_mock.assert_not_called()
+
 
 class DerivedContextBackfillServiceTests(unittest.TestCase):
     @patch('app.agent_context.derived_contexts.daily_market_participation_context_service.rebuild_from_rows')

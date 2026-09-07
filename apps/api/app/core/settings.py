@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -278,6 +278,14 @@ class Settings(BaseSettings):
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_session_cleanup_timeout_seconds: float = 30.0
     openclaw_session_cleanup_batch_limit: int = 100
+
+    @field_validator('upstream_bearer_token', 'signal_decider_exec_bearer_token', mode='before')
+    @classmethod
+    def normalize_optional_bearer_token(cls, value):
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
 
 

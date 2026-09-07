@@ -1,5 +1,6 @@
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import patch
 
 from sqlalchemy import delete, func, select
 
@@ -93,8 +94,10 @@ class MacroContextServiceTests(unittest.TestCase):
     def test_refresh_persists_world_bank_series(self) -> None:
         world_bank = FakeWorldBankClient()
         service = self._service(world_bank)
+        now = datetime(2026, 6, 20, 9, tzinfo=timezone.utc)
 
-        result = service.refresh_context(force=True, trigger='unit_test')
+        with patch('app.macro_context.service._utcnow', return_value=now):
+            result = service.refresh_context(force=True, trigger='unit_test')
 
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['observations_upserted'], 3)
@@ -126,7 +129,7 @@ class MacroContextServiceTests(unittest.TestCase):
         self.assertTrue(all(row['value'] is not None for row in row_payloads))
         self.assertTrue(all(row['fetched_at'] is not None for row in row_payloads))
 
-        context = service.get_context(as_of_date='2026-06-20')
+        context = service.get_context(as_of_date='2026-06-20', now=now)
 
         self.assertEqual(context['status'], 'available')
         self.assertEqual(context['macro_regime_summary']['growth_label'], 'growth_expansion')
@@ -157,7 +160,8 @@ class MacroContextServiceTests(unittest.TestCase):
     def test_get_context_marks_stale_data(self) -> None:
         settings.macro_context_stale_after_hours = 24
         service = self._service()
-        old_fetched_at = datetime.now(timezone.utc) - timedelta(days=4)
+        now = datetime(2026, 6, 20, 9, tzinfo=timezone.utc)
+        old_fetched_at = now - timedelta(days=4)
         for series_id, config in DEFAULT_WORLD_BANK_SERIES.items():
             service.store.upsert_observation(
                 source=WORLD_BANK_SOURCE,
@@ -173,7 +177,7 @@ class MacroContextServiceTests(unittest.TestCase):
                 source_status='available',
             )
 
-        context = service.get_context(as_of_date='2026-06-20')
+        context = service.get_context(as_of_date='2026-06-20', now=now)
 
         self.assertEqual(context['status'], 'stale')
         self.assertEqual(context['freshness']['status'], 'stale')

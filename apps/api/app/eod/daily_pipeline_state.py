@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from app.core.settings import settings
 from app.db import session_scope
@@ -534,6 +534,90 @@ class DailyPipelineRunStateService:
                 ).scalars()
             )
             return self._serialize_run(row, stage_rows)
+
+    def get_latest_run_for_context(
+        self,
+        *,
+        market_date: str | date,
+        triggers: Sequence[str] = (),
+        entrypoints: Sequence[str] = (),
+        search_limit: int = 100,
+    ) -> dict[str, Any] | None:
+        """Return the newest run produced by one of the requested entry points.
+
+        A market date can also have manual or operations runs.  Those must not
+        hide a failed automatic EOD continuation, so context matching happens
+        before the associated stage rows are loaded.
+        """
+
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_triggers = {str(item).strip() for item in triggers if str(item).strip()}
+        normalized_entrypoints = {
+            str(item).strip() for item in entrypoints if str(item).strip()
+        }
+        if not normalized_triggers and not normalized_entrypoints:
+            raise ValueError('At least one trigger or entrypoint is required.')
+
+        with session_scope() as session:
+            context_filters = []
+            if normalized_triggers:
+                context_filters.append(
+                    DailyPipelineRun.trigger.in_(sorted(normalized_triggers))
+                )
+            if normalized_entrypoints:
+                context_filters.append(
+                    DailyPipelineRun.run_metadata['entrypoint'].as_string().in_(
+                        sorted(normalized_entrypoints)
+                    )
+                )
+            rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(DailyPipelineRun.market_date == normalized_market_date)
+                    .where(or_(*context_filters))
+                    .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())
+                    .limit(max(1, int(search_limit)))
+                ).scalars()
+            )
+            row = next(
+                (
+                    item
+                    for item in rows
+                    if item.trigger in normalized_triggers
+                    or str((item.run_metadata or {}).get('entrypoint') or '').strip()
+                    in normalized_entrypoints
+                ),
+                None,
+            )
+            if row is None:
+                return None
+            stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(DailyPipelineStageRun.pipeline_run_id == row.id)
+                    .order_by(DailyPipelineStageRun.id.asc())
+                ).scalars()
+            )
+            return self._serialize_run(row, stage_rows)
+
+    def count_runs(
+        self,
+        *,
+        market_date: str | date,
+        trigger: str,
+    ) -> int:
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_trigger = str(trigger or '').strip()
+        if not normalized_trigger:
+            raise ValueError('trigger is required when counting daily pipeline runs')
+        with session_scope() as session:
+            run_ids = session.execute(
+                select(DailyPipelineRun.id).where(
+                    DailyPipelineRun.market_date == normalized_market_date,
+                    DailyPipelineRun.trigger == normalized_trigger,
+                )
+            ).scalars()
+            return sum(1 for _ in run_ids)
 
     def mark_active_runs_interrupted(
         self,

@@ -254,6 +254,7 @@ class InternalOpsTests(unittest.TestCase):
                 agent_name='short-term-decider',
                 rule_config_json='{"rules":[]}',
                 symbols='005930,000660',
+                policy_versions='signal_decider_policy_v1,signal_decider_policy_v2',
                 fee_bps='1',
                 slippage_bps='2',
                 notional_krw='1000000',
@@ -267,6 +268,10 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(replay.call_args.kwargs['market_date_to'], '2026-06-19')
         self.assertEqual(replay.call_args.kwargs['agent_name'], 'short-term-decider')
         self.assertEqual(replay.call_args.kwargs['symbols'], ['005930', '000660'])
+        self.assertEqual(
+            replay.call_args.kwargs['policy_versions'],
+            ['signal_decider_policy_v1', 'signal_decider_policy_v2'],
+        )
         self.assertEqual(replay.call_args.kwargs['fee_bps'], '1')
         self.assertEqual(replay.call_args.kwargs['slippage_bps'], '2')
         self.assertEqual(replay.call_args.kwargs['top_examples_limit'], 3)

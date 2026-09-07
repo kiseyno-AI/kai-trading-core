@@ -750,7 +750,9 @@ class DailyMomentumFactorService:
         symbols: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
-        target_symbols = _normalize_symbols(symbols) or list_symbols_with_daily_bar_on_date(normalized_market_date)
+        requested_symbols = _normalize_symbols(symbols)
+        available_symbols = list_symbols_with_daily_bar_on_date(normalized_market_date)
+        target_symbols = requested_symbols or available_symbols
         if not target_symbols:
             return {
                 'market_date': normalized_market_date,
@@ -769,24 +771,30 @@ class DailyMomentumFactorService:
                 'items': [],
             }
 
+        ranking_symbols = available_symbols if requested_symbols else target_symbols
         price_histories = load_recent_price_bars_by_symbol(
             market_date=normalized_market_date,
-            symbols=target_symbols,
+            symbols=ranking_symbols,
             history_days=self.history_window,
         )
         valid_histories = self._extract_valid_histories(
             market_date=normalized_market_date,
-            target_symbols=target_symbols,
+            target_symbols=ranking_symbols,
             price_histories=price_histories,
         )
         failed_symbols = [symbol for symbol in target_symbols if symbol not in valid_histories]
 
-        rows = build_daily_momentum_factor_rows(
+        ranking_rows = build_daily_momentum_factor_rows(
             market_date=normalized_market_date,
             price_histories=valid_histories,
             overheat_rule=self.overheat_rule,
             eligibility_rule=self.eligibility_rule,
         )
+        if requested_symbols:
+            target_symbol_set = set(target_symbols)
+            rows = [row for row in ranking_rows if row['symbol'] in target_symbol_set]
+        else:
+            rows = ranking_rows
 
         persisted_items: list[dict[str, Any]] = []
         write_failed_symbols: list[str] = []

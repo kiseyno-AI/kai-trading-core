@@ -125,7 +125,7 @@ def upgrade() -> None:
         ['advanced_value_rank'],
     )
     op.create_index(
-        'ix_daily_advanced_value_factor_results_is_advanced_value_eligible',
+        op.f('ix_daily_advanced_value_factor_results_is_advanced_value_eligible'),
         'daily_advanced_value_factor_results',
         ['is_advanced_value_eligible'],
     )
@@ -133,7 +133,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index(
-        'ix_daily_advanced_value_factor_results_is_advanced_value_eligible',
+        op.f('ix_daily_advanced_value_factor_results_is_advanced_value_eligible'),
         table_name='daily_advanced_value_factor_results',
     )
     op.drop_index(

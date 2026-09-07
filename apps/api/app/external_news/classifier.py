@@ -161,17 +161,25 @@ def _resolve_materiality(*, event_type: str, score: float, tags: list[str], sent
     return 'unknown', f'Detected {event_type} context but rule-based evidence is insufficient for material/noise classification.'
 
 
-def external_news_classification_has_contract(classification: dict[str, Any] | None) -> bool:
+def external_news_classification_has_schema_contract(
+    classification: dict[str, Any] | None,
+) -> bool:
     if not isinstance(classification, dict):
         return False
     return (
-        classification.get('classifier') == CLASSIFIER_VERSION
+        bool(classification.get('classifier'))
         and classification.get('materiality') in MATERIALITY_VALUES
         and bool(classification.get('materiality_reason'))
         and classification.get('access_status') in ACCESS_STATUS_VALUES
         and bool(classification.get('event_type'))
         and isinstance(classification.get('source_evidence'), dict)
     )
+
+
+def external_news_classification_has_contract(classification: dict[str, Any] | None) -> bool:
+    if not external_news_classification_has_schema_contract(classification):
+        return False
+    return bool(classification and classification.get('classifier') == CLASSIFIER_VERSION)
 
 
 def external_news_materiality_sort_key(item: dict[str, Any]) -> tuple[int, float]:

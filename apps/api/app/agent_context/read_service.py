@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from calendar import monthrange
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
+import exchange_calendars
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -578,6 +580,206 @@ DECIDER_PRIORITY_TIER_DEFAULTS: dict[str, dict[str, Any]] = {
         ),
     },
 }
+
+
+def _historical_external_news_knowledge_cutoff_at(
+    as_of_date: date,
+    *,
+    market: str = 'KRX',
+    now: datetime | None = None,
+) -> datetime | None:
+    resolved_now = now or datetime.now(timezone.utc)
+    comparable_now_utc = (
+        resolved_now.replace(tzinfo=timezone.utc)
+        if resolved_now.tzinfo is None
+        else resolved_now.astimezone(timezone.utc)
+    )
+    normalized_market = str(market or 'KRX').strip().upper()
+    is_us_market = normalized_market in US_EQUITY_MARKETS
+    market_timezone = ZoneInfo('America/New_York' if is_us_market else 'Asia/Seoul')
+    if as_of_date >= comparable_now_utc.astimezone(market_timezone).date():
+        return None
+
+    if is_us_market:
+        # Use the exchange calendar instead of a fixed 16:00 wall-clock value
+        # so early-close sessions cannot observe news published after the
+        # actual decision boundary.
+        calendar = exchange_calendars.get_calendar('XNYS')
+        session = calendar.date_to_session(as_of_date, direction='previous')
+        return calendar.session_close(session).to_pydatetime().astimezone(timezone.utc)
+
+    # ``market_date`` is a KRX trading date. The default historical decision
+    # boundary is the regular-session close, not calendar midnight; otherwise
+    # same-day evening news would leak into a close-time replay.
+    return datetime.combine(
+        as_of_date,
+        time(hour=15, minute=30),
+        tzinfo=market_timezone,
+    ).astimezone(timezone.utc)
+
+
+def _resolve_external_news_knowledge_cutoff_at(
+    as_of_date: date,
+    knowledge_cutoff_at: datetime | str | None,
+    *,
+    market: str = 'KRX',
+    now: datetime | None = None,
+) -> tuple[datetime, str]:
+    """Resolve a strict point-in-time news boundary and its provenance."""
+
+    resolved_now = now or datetime.now(timezone.utc)
+    now_utc = (
+        resolved_now.replace(tzinfo=timezone.utc)
+        if resolved_now.tzinfo is None
+        else resolved_now.astimezone(timezone.utc)
+    )
+    if knowledge_cutoff_at is None:
+        normalized_market = str(market or 'KRX').strip().upper()
+        if normalized_market == 'MIXED':
+            raise ValueError(
+                'knowledge_cutoff_at is required when a request mixes KRX and US symbols'
+            )
+        historical_cutoff = _historical_external_news_knowledge_cutoff_at(
+            as_of_date,
+            market=normalized_market,
+            now=now_utc,
+        )
+        if historical_cutoff is not None:
+            return historical_cutoff, (
+                'default_xnys_regular_session_close'
+                if normalized_market in US_EQUITY_MARKETS
+                else 'default_krx_regular_session_close'
+            )
+        # Current and future market dates can never observe knowledge beyond
+        # the instant the request is assembled.
+        return now_utc, 'request_time'
+
+    cutoff = knowledge_cutoff_at
+    if isinstance(cutoff, str):
+        cutoff = datetime.fromisoformat(cutoff.replace('Z', '+00:00'))
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+        raise ValueError('knowledge_cutoff_at must include a timezone offset')
+    cutoff_utc = cutoff.astimezone(timezone.utc)
+    if cutoff_utc > now_utc:
+        raise ValueError('knowledge_cutoff_at must not be later than the current time')
+    return cutoff_utc, 'explicit'
+
+
+US_EQUITY_MARKETS = {
+    'US',
+    'NASDAQ',
+    'NASD',
+    'NYSE',
+    'AMEX',
+    'NYSE_AMERICAN',
+    'NYSE ARCA',
+}
+
+
+def _build_us_market_session_metadata(
+    requested_date: date,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build a conservative XNYS session gate for current-cache inputs.
+
+    Calendar lookup failures deliberately return ``*_data_expected=False``.
+    A missing or unknown US session must never make a current quote look valid
+    for a historical decision date.
+    """
+
+    resolved_now = now or datetime.now(timezone.utc)
+    now_utc = (
+        resolved_now.replace(tzinfo=timezone.utc)
+        if resolved_now.tzinfo is None
+        else resolved_now.astimezone(timezone.utc)
+    )
+    current_calendar_date = now_utc.astimezone(ZoneInfo('America/New_York')).date()
+    base = {
+        'requested_date': requested_date.isoformat(),
+        'current_calendar_date': current_calendar_date.isoformat(),
+        'requested_date_is_current_calendar_date': requested_date == current_calendar_date,
+        'current_market_state': None,
+        'current_market_session': None,
+        'intraday_data_expected': False,
+        'quote_data_expected': False,
+        'recommendation_basis': 'latest_completed_eod',
+        'calendar_source': 'exchange_calendars:XNYS',
+        'current_calendar_source': 'exchange_calendars:XNYS',
+    }
+    try:
+        calendar = exchange_calendars.get_calendar('XNYS')
+        requested_is_trading_day = bool(calendar.is_session(requested_date))
+        latest_session = calendar.date_to_session(requested_date, direction='previous')
+        latest_valid_trading_date = latest_session.date().isoformat()
+        if not requested_is_trading_day:
+            status = 'weekend' if requested_date.weekday() >= 5 else 'holiday'
+            reason = status
+        elif requested_date != current_calendar_date:
+            status = 'CLOSED'
+            reason = 'historical_requested_date'
+        else:
+            session_open = calendar.session_open(requested_date).to_pydatetime()
+            session_close = calendar.session_close(requested_date).to_pydatetime()
+            if now_utc < session_open:
+                status = 'PREOPEN'
+                reason = 'before_us_regular_session'
+            elif now_utc <= session_close:
+                status = 'OPEN'
+                reason = None
+            else:
+                status = 'CLOSED'
+                reason = 'after_us_regular_session'
+            base['intraday_data_expected'] = status == 'OPEN'
+            base['quote_data_expected'] = status == 'OPEN'
+            base['recommendation_basis'] = (
+                'live_intraday' if status == 'OPEN' else 'latest_completed_eod'
+            )
+        return {
+            **base,
+            'latest_valid_trading_date': latest_valid_trading_date,
+            'is_trading_day': requested_is_trading_day,
+            'requested_date_is_trading_day': requested_is_trading_day,
+            'current_calendar_date_is_trading_day': bool(
+                calendar.is_session(current_calendar_date)
+            ),
+            'status': status,
+            'market_state': status if requested_date == current_calendar_date else None,
+            'current_market_state': status if requested_date == current_calendar_date else None,
+            'current_market_session': status if requested_date == current_calendar_date else None,
+            'reason': reason,
+            'calendar_source_status': 'available',
+            'calendar_source_error': None,
+            'current_calendar_source_status': 'available',
+            'current_calendar_source_error': None,
+        }
+    except Exception as exc:
+        return {
+            **base,
+            'latest_valid_trading_date': None,
+            'is_trading_day': False,
+            'requested_date_is_trading_day': False,
+            'current_calendar_date_is_trading_day': False,
+            'status': 'unavailable',
+            'market_state': None,
+            'reason': 'us_market_session_unavailable',
+            'calendar_source_status': 'unavailable',
+            'calendar_source_error': str(exc),
+            'current_calendar_source_status': 'unavailable',
+            'current_calendar_source_error': str(exc),
+        }
+
+
+def _resolve_symbol_market_session(
+    *,
+    company_market: str,
+    requested_date: date,
+    krx_market_session: dict[str, Any],
+    us_market_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if company_market in US_EQUITY_MARKETS:
+        return us_market_session or _build_us_market_session_metadata(requested_date)
+    return krx_market_session
 
 
 def _compact_provenance_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -1187,6 +1389,9 @@ def _market_session_data_expected(
 
 
 def _closed_market_not_applicable_reason(market_session: dict[str, Any] | None) -> str:
+    session_reason = str(_maybe_dict(market_session).get('reason') or '').strip()
+    if session_reason == 'us_market_session_unavailable':
+        return session_reason
     return 'closed_market'
 
 
@@ -5271,6 +5476,11 @@ def _latest_external_news_published_at(items: Sequence[dict[str, Any]]) -> str |
 
 def _compact_external_news_context_item(item: dict[str, Any]) -> dict[str, Any]:
     classification = item.get('classification') if isinstance(item.get('classification'), dict) else {}
+    classification_provenance = (
+        dict(item.get('classification_provenance'))
+        if isinstance(item.get('classification_provenance'), dict)
+        else {}
+    )
     source_evidence = (
         item.get('source_evidence')
         if isinstance(item.get('source_evidence'), dict)
@@ -5301,6 +5511,7 @@ def _compact_external_news_context_item(item: dict[str, Any]) -> dict[str, Any]:
         'url': item.get('url'),
         'published_at': item.get('published_at'),
         'collected_at': item.get('collected_at'),
+        'classification_provenance': classification_provenance,
         'event_tags': list(item.get('event_tags') or classification.get('event_tags') or []),
         'event_type': event_type or 'generic_commentary',
         'sentiment': item.get('sentiment') or classification.get('sentiment'),
@@ -5327,11 +5538,25 @@ def _compact_external_news_context_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider_status: dict[str, Any]) -> dict[str, Any]:
-    provider_enabled = bool(provider_status.get('enabled'))
-    if not provider_enabled:
+def _build_recent_external_news_context(
+    items: list[dict[str, Any]],
+    *,
+    provider_status: dict[str, Any],
+    knowledge_cutoff_at: datetime | None = None,
+    knowledge_cutoff_source: str | None = None,
+) -> dict[str, Any]:
+    context_enabled = bool(
+        provider_status.get('context_enabled', provider_status.get('enabled'))
+    )
+    storage_read_enabled = bool(
+        provider_status.get('storage_read_enabled', context_enabled)
+    )
+    if not context_enabled:
         status = 'unavailable'
         reason = provider_status.get('reason') or 'external_news_provider_disabled'
+    elif not storage_read_enabled:
+        status = 'unavailable'
+        reason = provider_status.get('reason') or 'external_news_storage_unavailable'
     elif items:
         status = 'available'
         reason = None
@@ -5364,11 +5589,23 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
         (float(item.get('materiality_score') or 0.0) for item in limited_items),
         default=None,
     )
+    classifier_versions = sorted(
+        {
+            str(version)
+            for item in limited_items
+            for version in (
+                (item.get('classification_provenance') or {}).get('classifier_version'),
+            )
+            if version
+        }
+    )
     return {
         'status': status,
         'reason': reason,
         'provider': provider_status,
         'lookback_days': settings.external_news_context_lookback_days,
+        'knowledge_cutoff_at': knowledge_cutoff_at.isoformat() if knowledge_cutoff_at else None,
+        'knowledge_cutoff_source': knowledge_cutoff_source,
         'item_count': len(items),
         'latest_published_at': latest_published_at,
         'contract': {
@@ -5390,7 +5627,8 @@ def _build_recent_external_news_context(items: list[dict[str, Any]], *, provider
             'access_status_counts': dict(access_status_counts),
             'sentiment_counts': dict(sentiment_counts),
             'max_materiality_score': max_materiality,
-            'classifier': 'rule_based_external_news_contract_v1' if limited_items else None,
+            'classifier': classifier_versions[0] if len(classifier_versions) == 1 else None,
+            'classifier_versions': classifier_versions,
         },
         'material_items': material_items[:context_limit],
         'unknown_items': unknown_items[:context_limit],
@@ -5428,7 +5666,11 @@ def _build_external_news_freshness_provenance(
         requested_market_date=requested_market_date,
         freshness_status=freshness_status,
         provenance_status=provenance_status,
-        source_tables=('external_news_items',),
+        source_tables=(
+            'external_news_items',
+            'external_news_item_symbols',
+            'external_news_item_classifications',
+        ),
         source_provider=str((context.get('provider') or {}).get('provider') or NAVER_NEWS_PROVIDER),
         reason=context.get('reason'),
         latest_available_timestamp=latest_published_at,
@@ -5436,6 +5678,9 @@ def _build_external_news_freshness_provenance(
         extra={
             'provider_status': context.get('provider'),
             'lookback_days': context.get('lookback_days'),
+            'knowledge_cutoff_at': context.get('knowledge_cutoff_at'),
+            'knowledge_cutoff_source': context.get('knowledge_cutoff_source'),
+            'knowledge_cutoff_operator': '<',
         },
     )
 
@@ -5482,9 +5727,33 @@ class AgentContextReadService:
         symbols: Sequence[str],
         fs_div: str | None = None,
         disclosures_limit: int = 5,
+        knowledge_cutoff_at: datetime | str | None = None,
     ) -> dict[str, Any]:
         normalized_symbols = _normalize_symbols(symbols)
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
+        symbol_rows = load_symbols(symbols=normalized_symbols, limit=max(len(normalized_symbols), 1000))
+        symbol_market_by_code = {
+            str(row.get('symbol') or '').strip(): str(row.get('market') or '').strip().upper()
+            for row in symbol_rows
+        }
+        requested_market_kinds = {
+            'US'
+            if symbol_market_by_code.get(symbol) in US_EQUITY_MARKETS
+            else 'KRX'
+            for symbol in normalized_symbols
+        }
+        external_news_market = (
+            'MIXED'
+            if len(requested_market_kinds) > 1
+            else next(iter(requested_market_kinds), 'KRX')
+        )
+        external_news_knowledge_cutoff_at, external_news_knowledge_cutoff_source = (
+            _resolve_external_news_knowledge_cutoff_at(
+                normalized_market_date,
+                knowledge_cutoff_at,
+                market=external_news_market,
+            )
+        )
         normalized_fs_div = _normalize_fs_div(fs_div)
         current_market_state = get_market_state()
         request_market_session = build_market_session_metadata(
@@ -5492,7 +5761,6 @@ class AgentContextReadService:
             current_state=current_market_state,
         )
 
-        symbol_rows = load_symbols(symbols=normalized_symbols, limit=max(len(normalized_symbols), 1000))
         technical_rows = load_daily_technical_snapshots(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -5649,21 +5917,34 @@ class AgentContextReadService:
         if not bool(getattr(settings, 'external_news_context_enabled', True)):
             external_news_provider_status = {
                 **external_news_provider_status,
+                'context_enabled': False,
+                'storage_read_enabled': False,
                 'enabled': False,
                 'status': 'disabled',
                 'reason': 'external_news_context_disabled',
             }
-        if external_news_provider_status.get('enabled'):
+        else:
+            # Provider credentials control collection, not access to already
+            # persisted observations. Replays remain reproducible after keys
+            # rotate or a collection provider is temporarily disabled.
+            external_news_provider_status = {
+                **external_news_provider_status,
+                'context_enabled': True,
+                'storage_read_enabled': True,
+                'collection_enabled': bool(external_news_provider_status.get('enabled')),
+            }
             try:
                 external_news_by_symbol = list_recent_external_news_for_symbols(
                     symbols=normalized_symbols,
                     limit_per_symbol=settings.external_news_context_limit,
                     lookback_days=settings.external_news_context_lookback_days,
+                    published_before=external_news_knowledge_cutoff_at,
+                    collected_before=external_news_knowledge_cutoff_at,
                 )
             except SQLAlchemyError:
                 external_news_provider_status = {
                     **external_news_provider_status,
-                    'enabled': False,
+                    'storage_read_enabled': False,
                     'status': 'storage_unavailable',
                     'reason': 'external_news_storage_unavailable',
                 }
@@ -5735,14 +6016,24 @@ class AgentContextReadService:
         matched_symbols: list[str] = []
         missing_symbols: list[str] = []
         factor_row_counts = {family: 0 for family in PERSISTED_FACTOR_FAMILIES}
+        us_request_market_session: dict[str, Any] | None = None
 
         for symbol in normalized_symbols:
             company_row = symbol_map.get(symbol)
             company_market = str(company_row.get('market') or '').strip().upper() if company_row else ''
-            symbol_market_session = (
-                request_market_session
-                if company_market in {'US', 'NASDAQ', 'NASD', 'NYSE', 'AMEX', 'NYSE ARCA'}
-                else None
+            if company_market in US_EQUITY_MARKETS:
+                if us_request_market_session is None:
+                    us_request_market_session = _build_us_market_session_metadata(
+                        normalized_market_date
+                    )
+            # Empty/unknown markets use the KRX gate as the conservative default
+            # because this context service is KRX-first and six-digit symbols can
+            # outlive their current symbol-master row.
+            symbol_market_session = _resolve_symbol_market_session(
+                company_market=company_market,
+                requested_date=normalized_market_date,
+                krx_market_session=request_market_session,
+                us_market_session=us_request_market_session,
             )
             raw_quote_row = quote_map.get(symbol)
             quote_context = _build_quote_context(
@@ -5868,6 +6159,8 @@ class AgentContextReadService:
             recent_external_news = _build_recent_external_news_context(
                 external_news_by_symbol.get(symbol, []),
                 provider_status=external_news_provider_status,
+                knowledge_cutoff_at=external_news_knowledge_cutoff_at,
+                knowledge_cutoff_source=external_news_knowledge_cutoff_source,
             )
             context_completeness = {
                 'factor_rows': {
@@ -6579,6 +6872,8 @@ class AgentContextReadService:
                 'fs_div': normalized_fs_div,
                 'fs_label': FS_DIV_TO_STATEMENT_TYPE.get(normalized_fs_div) if normalized_fs_div else None,
                 'disclosures_limit': disclosures_limit,
+                'knowledge_cutoff_at': external_news_knowledge_cutoff_at.isoformat(),
+                'knowledge_cutoff_source': external_news_knowledge_cutoff_source,
             },
             'market_session': request_market_session,
             'summary': {
@@ -6635,6 +6930,8 @@ class AgentContextReadService:
                     1 for item in items if item['recent_external_news']['status'] == 'available'
                 ),
                 'external_news_provider': external_news_provider_status,
+                'external_news_knowledge_cutoff_at': external_news_knowledge_cutoff_at.isoformat(),
+                'external_news_knowledge_cutoff_source': external_news_knowledge_cutoff_source,
                 'macro_context_status': macro_context_status,
                 'macro_context_source_statuses': macro_context.get('source_statuses') or {},
                 'factor_row_counts': factor_row_counts,

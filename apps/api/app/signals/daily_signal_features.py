@@ -1203,6 +1203,7 @@ class DailySignalFeatureService:
         max_pages: int = 10,
         overtime_volume_rank_sort_cls_code: str = '2',
         overtime_fluctuation_div_cls_code: str = '2',
+        include_retry_metadata: bool = False,
     ) -> dict[str, Any]:
         collection = await self.collect_features(
             market_date=market_date,
@@ -1249,7 +1250,7 @@ class DailySignalFeatureService:
             ),
         )
 
-        return {
+        result = {
             'market_date': collection.market_date,
             'source': SIGNAL_FEATURE_SOURCE,
             'sources': collection.sources,
@@ -1264,6 +1265,9 @@ class DailySignalFeatureService:
             'items_returned': min(len(persisted_items), SIGNAL_FEATURE_ITEM_PREVIEW_LIMIT),
             'items': _feature_item_preview(persisted_items),
         }
+        if include_retry_metadata:
+            result['_retry_metadata'] = {'failed_symbols': failed_symbols}
+        return result
 
     def inspect(
         self,

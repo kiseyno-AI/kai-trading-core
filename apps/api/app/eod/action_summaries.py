@@ -361,6 +361,7 @@ class DailyActionSummaryService:
         source: str = 'pykrx',
         run_id: int | None = None,
         progress_callback: Callable[[dict], None] | None = None,
+        include_retry_metadata: bool = False,
     ) -> dict:
         requested_symbols = list(symbols or [])
         snapshots = load_daily_technical_snapshot_inputs(
@@ -440,7 +441,7 @@ class DailyActionSummaryService:
                 )
 
         deduped_failed = list(dict.fromkeys(failed_symbols))
-        return {
+        result = {
             'market_date': market_date,
             'source': source,
             'requested_symbols': len(requested_symbols),
@@ -449,6 +450,9 @@ class DailyActionSummaryService:
             'failed_symbols': deduped_failed[:50],
             'items': items,
         }
+        if include_retry_metadata:
+            result['_retry_metadata'] = {'failed_symbols': deduped_failed}
+        return result
 
     def inspect(
         self,

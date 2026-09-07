@@ -1,10 +1,12 @@
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from app.agent_context.signal_decider_calibration_service import SignalDeciderCalibrationService
@@ -12,13 +14,22 @@ from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
     DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+    SIGNAL_DECIDER_POLICY_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
     SignalDeciderLoopService,
     SignalDeciderLoopRepository,
     _dedupe_decision_snapshot_rows,
     _merge_policy_metadata_preserving_audit,
     build_signal_decider_feature_snapshot,
 )
-from app.db_models import AgentContextFeedback, Base, SignalDeciderDecisionSnapshot, SignalDeciderEvaluation
+from app.db_models import (
+    AgentContextFeedback,
+    Base,
+    SignalDeciderDecisionSnapshot,
+    SignalDeciderEvaluation,
+    SignalDeciderPolicyCandidate,
+    SignalDeciderPolicyVersion,
+    SignalDeciderRealizedOutcome,
+)
 
 
 def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
@@ -278,6 +289,144 @@ def _policy_version_record(
     }
 
 
+def _promotion_replay_evidence(
+    *,
+    policy_version: str = 'signal_decider_policy_v2',
+    fee_bps: float = 10,
+    slippage_bps: float = 5,
+    estimated_net_delta_krw: int = 200,
+    symbols: list[str] | None = None,
+    policy_versions: list[str] | None = None,
+) -> dict:
+    baseline_net_pnl = -100
+    candidate_net_pnl = baseline_net_pnl + estimated_net_delta_krw
+    return {
+        'schema_version': SIGNAL_DECIDER_POLICY_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
+        'candidate_policy_version': policy_version,
+        'replay_artifact': {
+            'schema_version': 'decider_replay_v1',
+            'metadata': {
+                'profitability_basis': 'estimated_net',
+                'promotion_metrics_basis': 'estimated_net',
+                'promotion_cohort_basis': 'fixed_horizon_counterfactual',
+                'promotion_cost_gate': {
+                    'eligible': True,
+                    'status': 'passed',
+                    'reason': None,
+                    'minimum_assumptions': {
+                        'fee_bps': 10,
+                        'slippage_bps': 5,
+                    },
+                    'effective_assumptions': {
+                        'fee_bps': fee_bps,
+                        'slippage_bps': slippage_bps,
+                    },
+                },
+            },
+            'request': {
+                'market_date_from': '2026-04-20',
+                'market_date_to': '2026-04-30',
+                'agent_name': 'signal-decider',
+                'symbols': list(symbols or ['005930']),
+                'policy_versions': list(policy_versions or ['signal_decider_policy_v1']),
+                'horizon_days': 5,
+                'rule_config': {
+                    'schema_version': 'decider_replay_rule_config_v1',
+                    'candidate_policy_version': policy_version,
+                    'rules': [
+                        {
+                            'name': 'candidate_policy_rule',
+                            'predicates': [
+                                {
+                                    'type': 'field',
+                                    'field': 'technical.breakout_20d',
+                                    'op': '==',
+                                    'value': True,
+                                }
+                            ],
+                        }
+                    ],
+                },
+                'cost_assumptions': {
+                    'fee_bps': fee_bps,
+                    'slippage_bps': slippage_bps,
+                    'notional_krw': 1_000_000,
+                },
+                'top_examples_limit': 10,
+            },
+            'summary': {
+                'baseline_trade_count': 2,
+                'candidate_trade_count': 1,
+                'skipped_buys': 1,
+                'estimated_net_pnl_delta_krw': estimated_net_delta_krw,
+                'baseline': {'estimated_net_pnl_krw': baseline_net_pnl},
+                'candidate': {'estimated_net_pnl_krw': candidate_net_pnl},
+                'coverage': {
+                    'source_decision_count': 3,
+                    'economic_cohort_count': 2,
+                    'censored_or_excluded_count': 1,
+                    'cohort_basis': 'fixed_horizon_counterfactual',
+                },
+                'promotion_metrics': {
+                    'basis': 'estimated_net',
+                    'estimated_net_pnl_delta_krw': estimated_net_delta_krw,
+                    'estimated_net_win_rate_delta': 0.25,
+                    'estimated_net_average_return_delta': 0.01,
+                },
+            },
+            'examples': [],
+            'markdown_summary': '# replay',
+        },
+    }
+
+
+def _bind_candidate_replay_contract(
+    policy: dict,
+    replay_evidence: dict,
+    *,
+    candidate_kind: str = 'tighten_buy_gate',
+) -> dict:
+    replay_request = replay_evidence['replay_artifact']['request']
+    policy['rule_bundle'].update(
+        {
+            'base_policy_version': policy['parent_policy_version'],
+            'candidate_kind': candidate_kind,
+            'market_date_window': {
+                'from': replay_request['market_date_from'],
+                'to': replay_request['market_date_to'],
+            },
+            'primary_horizon_days': replay_request['horizon_days'],
+            'proposed_changes': [
+                {
+                    'change_type': candidate_kind,
+                    'feature_gate': {
+                        'key': 'technical.breakout_20d',
+                        'value': 'true',
+                    },
+                }
+            ],
+            'replay_contract': deepcopy(replay_request),
+        }
+    )
+    policy['metadata']['evaluation_summary'] = {
+        'market_date_from': replay_request['market_date_from'],
+        'market_date_to': replay_request['market_date_to'],
+        'horizon_days': replay_request['horizon_days'],
+        'symbols': deepcopy(replay_request['symbols']),
+    }
+    return policy
+
+
+class FakeDeciderReplayService:
+    def __init__(self, replay_artifact: dict) -> None:
+        self.replay_artifact = deepcopy(replay_artifact)
+        self.calls: list[dict] = []
+
+    def replay(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        return deepcopy(self.replay_artifact)
+
+
 class FakeSignalDeciderLoopRepository:
     def __init__(self, snapshot_rows):
         self.snapshot_rows = list(snapshot_rows)
@@ -453,6 +602,10 @@ class FakeSignalDeciderLoopRepository:
         active_rows = [row for row in self.policy_versions.values() if row['status'] == 'active']
         if not active_rows:
             return None
+        if len(active_rows) > 1:
+            raise RuntimeError(
+                'Signal-decider policy registry invariant violated: multiple active policies exist.'
+            )
         active_rows.sort(key=lambda row: (row['activated_at'] or '', row['created_at'] or '', row['policy_version']), reverse=True)
         return active_rows[0]
 
@@ -553,7 +706,15 @@ class FakeSignalDeciderLoopRepository:
             persisted.append(stored)
         return persisted
 
-    def activate_policy_version(self, *, policy_version, activated_by, activation_note, activated_at):
+    def activate_policy_version(
+        self,
+        *,
+        policy_version,
+        activated_by,
+        activation_note,
+        promotion_evidence,
+        activated_at,
+    ):
         target = self.policy_versions.get(policy_version)
         if target is None:
             return None
@@ -568,9 +729,13 @@ class FakeSignalDeciderLoopRepository:
         target['retired_at'] = None
         metadata = dict(target.get('metadata') or {})
         metadata['last_activation_note'] = activation_note
+        metadata['promotion_evidence'] = dict(promotion_evidence)
         target['metadata'] = metadata
         candidate_version = target.get('source_candidate_version') or policy_version
         if candidate_version in self.candidates:
+            evidence = dict(self.candidates[candidate_version].get('evidence') or {})
+            evidence['promotion_evidence'] = dict(promotion_evidence)
+            self.candidates[candidate_version]['evidence'] = evidence
             self.candidates[candidate_version]['status'] = 'activated'
             self.candidates[candidate_version]['activated_at'] = activated_at_text
         return target
@@ -958,6 +1123,89 @@ def _build_rule_candidate_report(
 
 
 class SignalDeciderLoopServiceTests(unittest.TestCase):
+    def test_get_active_policy_context_fails_closed_when_registry_is_unavailable(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        service = SignalDeciderLoopService(repository=repository)
+
+        with patch.object(
+            repository,
+            'get_active_policy_version',
+            side_effect=SQLAlchemyError('policy registry unavailable'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'active policy registry is unavailable'):
+                service.get_active_policy_context()
+
+    def test_get_active_policy_context_bootstraps_empty_registry_and_requeries_it(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions.clear()
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.get_active_policy_context()
+
+        persisted = repository.policy_versions[DEFAULT_SIGNAL_DECIDER_POLICY_VERSION]
+        self.assertEqual(result['current_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(result['status'], 'active')
+        self.assertIsNotNone(persisted['id'])
+        self.assertEqual(persisted['status'], 'active')
+
+    def test_get_active_policy_context_fails_closed_when_existing_registry_has_no_active_policy(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions[DEFAULT_SIGNAL_DECIDER_POLICY_VERSION]['status'] = 'retired'
+        service = SignalDeciderLoopService(repository=repository)
+
+        with self.assertRaisesRegex(RuntimeError, 'no active policy exists'):
+            service.get_active_policy_context()
+
+    def test_get_active_policy_context_fails_closed_when_multiple_policies_are_active(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        repository.policy_versions['signal_decider_policy_v2'] = {
+            **_policy_version_record(
+                policy_version='signal_decider_policy_v2',
+                status='active',
+                parent_policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                activated_by='human.reviewer',
+                activated_at='2026-05-01T06:00:00+00:00',
+            ),
+            'id': 2,
+        }
+        service = SignalDeciderLoopService(repository=repository)
+
+        with self.assertRaisesRegex(RuntimeError, 'multiple active policies exist'):
+            service.get_active_policy_context()
+
+    def test_policy_model_rejects_a_second_active_policy(self):
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        Base.metadata.create_all(engine, tables=[SignalDeciderPolicyVersion.__table__])
+        TestSessionLocal = sessionmaker(bind=engine, future=True)
+
+        try:
+            with TestSessionLocal() as session:
+                session.add(
+                    SignalDeciderPolicyVersion(
+                        policy_version='signal_decider_policy_v1',
+                        status='active',
+                        change_summary='Baseline policy.',
+                        rule_bundle_payload={},
+                        metadata_payload={},
+                    )
+                )
+                session.commit()
+
+            with TestSessionLocal() as session:
+                session.add(
+                    SignalDeciderPolicyVersion(
+                        policy_version='signal_decider_policy_v2',
+                        status='active',
+                        change_summary='Conflicting active policy.',
+                        rule_bundle_payload={},
+                        metadata_payload={},
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+        finally:
+            Base.metadata.drop_all(engine, tables=[SignalDeciderPolicyVersion.__table__])
+
     def test_build_signal_decider_feature_snapshot_marks_owned_fallback_signal_rows(self):
         snapshot = build_signal_decider_feature_snapshot(
             symbol_day_context={
@@ -1630,7 +1878,84 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             )
             engine.dispose()
 
-    def test_insert_decision_snapshots_upserts_non_null_feedback_id(self):
+    def test_activate_policy_flushes_higher_pk_active_before_lower_pk_candidate(self):
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        tables = [
+            SignalDeciderPolicyVersion.__table__,
+            SignalDeciderPolicyCandidate.__table__,
+        ]
+        Base.metadata.create_all(engine, tables=tables)
+        TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+        @contextmanager
+        def test_session_scope():
+            session = TestSessionLocal()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        try:
+            with TestSessionLocal() as session:
+                session.add_all(
+                    [
+                        SignalDeciderPolicyVersion(
+                            id=1,
+                            policy_version='signal_decider_policy_v2',
+                            status='candidate',
+                            parent_policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                            source_candidate_version='signal_decider_policy_v2',
+                            change_summary='Lower-PK candidate.',
+                            rule_bundle_payload={},
+                            metadata_payload={},
+                            created_by='system:test',
+                        ),
+                        SignalDeciderPolicyVersion(
+                            id=2,
+                            policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                            status='active',
+                            change_summary='Higher-PK active policy.',
+                            rule_bundle_payload={},
+                            metadata_payload={},
+                            created_by='system:test',
+                            activated_by='system:test',
+                            activated_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+                        ),
+                    ]
+                )
+                session.commit()
+
+            with patch('app.agent_context.signal_decider_loop_service.session_scope', test_session_scope):
+                activated = SignalDeciderLoopRepository().activate_policy_version(
+                    policy_version='signal_decider_policy_v2',
+                    activated_by='human.reviewer',
+                    activation_note=None,
+                    promotion_evidence={'replay_artifact_sha256': 'a' * 64},
+                    activated_at=datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc),
+                )
+
+            self.assertEqual(activated['status'], 'active')
+            with TestSessionLocal() as session:
+                statuses = {
+                    row.policy_version: row.status
+                    for row in session.query(SignalDeciderPolicyVersion).all()
+                }
+            self.assertEqual(
+                statuses,
+                {
+                    'signal_decider_policy_v2': 'active',
+                    DEFAULT_SIGNAL_DECIDER_POLICY_VERSION: 'retired',
+                },
+            )
+        finally:
+            Base.metadata.drop_all(engine, tables=reversed(tables))
+            engine.dispose()
+
+    def test_insert_decision_snapshots_preserves_history_and_idempotent_feedback_retries(self):
         engine = create_engine('sqlite+pysqlite:///:memory:')
         event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
         Base.metadata.create_all(
@@ -1638,10 +1963,23 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             tables=[
                 AgentContextFeedback.__table__,
                 SignalDeciderDecisionSnapshot.__table__,
+                SignalDeciderRealizedOutcome.__table__,
             ],
         )
         TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
         repository = SignalDeciderLoopRepository()
+
+        @contextmanager
+        def test_session_scope():
+            session = TestSessionLocal()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
 
         try:
             with TestSessionLocal() as session:
@@ -1668,16 +2006,63 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 symbol='005930',
                 action='wait',
             )
-            first_item = {
-                key: value
-                for key, value in vars(base_row).items()
-                if key != 'id'
-            }
+            snapshot_preparer = SignalDeciderLoopService(
+                repository=FakeSignalDeciderLoopRepository([])
+            )
+            first_item = snapshot_preparer.prepare_snapshot_persistence_item(
+                feedback_id=feedback_id,
+                market_date=base_row.market_date,
+                symbol=base_row.symbol,
+                agent_name=base_row.agent_name,
+                agent_version=base_row.agent_version,
+                run_id=base_row.decision_run_id,
+                summary_payload=base_row.response_summary_payload,
+                feedback_payload=base_row.response_payload,
+                normalized_feedback_payload=base_row.response_payload,
+                context_payload=base_row.request_payload,
+                received_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+            )
+            self.assertIsNotNone(first_item)
+            first_item['created_at'] = datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc)
             first_item['updated_at'] = first_item['created_at']
 
             with TestSessionLocal() as session:
                 first_rows = repository.insert_decision_snapshots(session=session, items=[first_item])
                 first_snapshot_id = first_rows[0].id
+                session.add(
+                    SignalDeciderRealizedOutcome(
+                        decision_snapshot_id=first_snapshot_id,
+                        feedback_id=feedback_id,
+                        market_date=date(2026, 4, 23),
+                        symbol='005930',
+                        policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                        decision_action='wait',
+                        horizon_days=5,
+                        outcome_status='complete',
+                        bars_observed=5,
+                    )
+                )
+                session.commit()
+
+            retry_item = snapshot_preparer.prepare_snapshot_persistence_item(
+                feedback_id=feedback_id,
+                market_date=base_row.market_date,
+                symbol=base_row.symbol,
+                agent_name=base_row.agent_name,
+                agent_version=base_row.agent_version,
+                run_id=base_row.decision_run_id,
+                summary_payload=base_row.response_summary_payload,
+                feedback_payload=base_row.response_payload,
+                normalized_feedback_payload=base_row.response_payload,
+                context_payload=base_row.request_payload,
+                received_at=datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc),
+            )
+            self.assertIsNotNone(retry_item)
+            retry_item['created_at'] = datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc)
+            retry_item['updated_at'] = retry_item['created_at']
+            with TestSessionLocal() as session:
+                retry_rows = repository.insert_decision_snapshots(session=session, items=[retry_item])
+                retry_snapshot_id = retry_rows[0].id
                 session.commit()
 
             second_item = dict(first_item)
@@ -1699,24 +2084,39 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 session.commit()
 
             with TestSessionLocal() as session:
-                stored_rows = session.query(SignalDeciderDecisionSnapshot).all()
+                stored_rows = session.query(SignalDeciderDecisionSnapshot).order_by(
+                    SignalDeciderDecisionSnapshot.id.asc()
+                ).all()
+                stored_outcome = session.query(SignalDeciderRealizedOutcome).one()
 
-            self.assertEqual(first_snapshot_id, second_snapshot_id)
-            self.assertEqual(len(stored_rows), 1)
-            self.assertEqual(stored_rows[0].decision_run_id, 'signal-run-101-replayed')
-            self.assertEqual(stored_rows[0].decision_action, 'buy')
-            self.assertEqual(stored_rows[0].thesis_summary, 'buy decision for 005930 after replay')
+            with patch('app.agent_context.signal_decider_loop_service.session_scope', test_session_scope):
+                latest_rows = repository.list_decision_snapshots(
+                    market_date=date(2026, 4, 23),
+                    dedupe_feedback_results=True,
+                )
+
+            self.assertEqual(first_snapshot_id, retry_snapshot_id)
+            self.assertNotEqual(first_snapshot_id, second_snapshot_id)
+            self.assertEqual(len(stored_rows), 2)
+            self.assertEqual(stored_rows[0].decision_action, 'wait')
+            self.assertEqual(stored_rows[0].decision_run_id, 'signal-run-101')
+            self.assertEqual(stored_rows[1].decision_run_id, 'signal-run-101-replayed')
+            self.assertEqual(stored_rows[1].decision_action, 'buy')
+            self.assertEqual(stored_rows[1].thesis_summary, 'buy decision for 005930 after replay')
+            self.assertEqual(stored_outcome.decision_snapshot_id, first_snapshot_id)
+            self.assertEqual([row.id for row in latest_rows], [second_snapshot_id])
         finally:
             Base.metadata.drop_all(
                 engine,
                 tables=[
+                    SignalDeciderRealizedOutcome.__table__,
                     SignalDeciderDecisionSnapshot.__table__,
                     AgentContextFeedback.__table__,
                 ],
             )
             engine.dispose()
 
-    def test_insert_decision_snapshots_keeps_null_feedback_rows_distinct(self):
+    def test_insert_decision_snapshots_dedupes_exact_null_feedback_retry_only(self):
         engine = create_engine('sqlite+pysqlite:///:memory:')
         event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
         Base.metadata.create_all(
@@ -1754,6 +2154,18 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                     session=session,
                     items=[first_item, second_item],
                 )
+                inserted_ids = [row.id for row in inserted_rows]
+                session.commit()
+
+            retry_item = dict(first_item)
+            retry_item['created_at'] = datetime(2026, 4, 23, 7, 0, tzinfo=timezone.utc)
+            retry_item['updated_at'] = retry_item['created_at']
+            with TestSessionLocal() as session:
+                retry_rows = repository.insert_decision_snapshots(
+                    session=session,
+                    items=[retry_item],
+                )
+                retry_id = retry_rows[0].id
                 session.commit()
 
             with TestSessionLocal() as session:
@@ -1762,6 +2174,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 ).all()
 
             self.assertEqual(len(inserted_rows), 2)
+            self.assertEqual(retry_id, inserted_ids[0])
             self.assertEqual(len(stored_rows), 2)
             self.assertNotEqual(stored_rows[0].id, stored_rows[1].id)
             self.assertEqual([row.decision_action for row in stored_rows], ['wait', 'buy'])
@@ -3245,6 +3658,67 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertTrue(all(item['activation_mode'] == 'manual_only' for item in result['items']))
         self.assertTrue(all(item['policy_status'] == 'candidate' for item in result['items']))
         self.assertTrue(all(item['policy_version_record']['status'] == 'candidate' for item in result['items']))
+        self.assertTrue(
+            all(
+                item['policy_version_record']['rule_bundle']['activation_eligibility']['eligible']
+                is False
+                for item in result['items']
+                if item['candidate_kind'] == 'relax_wait_gate'
+            )
+        )
+
+    def test_candidate_rule_bundle_builds_executable_boolean_replay_gate(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        bundle = service._candidate_rule_bundle(
+            {
+                'candidate_version': 'signal_decider_policy_v2',
+                'base_policy_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                'evaluation_version': DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
+                'market_date_from': date(2026, 4, 20),
+                'market_date_to': date(2026, 4, 30),
+                'horizon_days': 5,
+                'focus_action': 'buy',
+                'candidate_kind': 'tighten_buy_gate',
+                'feature_key': 'technical.breakout_20d',
+                'feature_value': 'true',
+                'support_ratio': 1.0,
+                'support_count': 3,
+                'contradiction_count': 0,
+                'evidence_payload': {'symbols': ['005930']},
+            }
+        )
+
+        predicate = bundle['replay_contract']['rule_config']['rules'][0]['predicates'][0]
+        self.assertIs(predicate['value'], True)
+
+    def test_candidate_versions_are_bounded_and_do_not_recursively_embed_the_base(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        version_kwargs = {
+            'evaluation_version': DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
+            'horizon_days': 5,
+            'candidate_kind': 'tighten_buy_gate',
+            'feature_key': 'technical.breakout_20d',
+            'feature_value': 'true',
+            'market_date_from': date(2026, 4, 20),
+            'market_date_to': date(2026, 4, 30),
+            'symbols': ['005930'],
+        }
+
+        first_generation = service._candidate_version(
+            base_policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+            **version_kwargs,
+        )
+        second_generation = service._candidate_version(
+            base_policy_version=first_generation,
+            **version_kwargs,
+        )
+
+        self.assertLessEqual(len(first_generation), 64)
+        self.assertLessEqual(len(second_generation), 64)
+        self.assertTrue(first_generation.startswith('signal_decider_candidate_v1_'))
+        self.assertTrue(second_generation.startswith('signal_decider_candidate_v1_'))
+        self.assertNotIn(first_generation, second_generation)
+        self.assertNotEqual(first_generation, second_generation)
 
     def test_generate_policy_candidates_keeps_base_policy_versions_separate(self):
         repository = FakeSignalDeciderLoopRepository(
@@ -3497,18 +3971,20 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
 
     def test_activate_policy_version_retires_previous_active_and_marks_candidate_activated(self):
         repository = FakeSignalDeciderLoopRepository([])
-        repository.policy_versions['signal_decider_policy_v2'] = {
+        replay_evidence = _promotion_replay_evidence()
+        candidate_policy = _bind_candidate_replay_contract({
             **_policy_version_record(
                 policy_version='signal_decider_policy_v2',
                 status='candidate',
                 parent_policy_version='signal_decider_policy_v1',
                 source_candidate_version='signal_decider_policy_v2',
-                change_summary='Relax wait decisions under repeated breakout evidence.',
+                change_summary='Tighten buy decisions under repeated breakout evidence.',
                 activated_by=None,
                 activated_at=None,
             ),
             'id': 2,
-        }
+        }, replay_evidence)
+        repository.policy_versions['signal_decider_policy_v2'] = candidate_policy
         repository.candidates['signal_decider_policy_v2'] = {
             'id': 1,
             'candidate_version': 'signal_decider_policy_v2',
@@ -3517,8 +3993,8 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             'market_date_from': '2026-04-20',
             'market_date_to': '2026-04-30',
             'horizon_days': 5,
-            'focus_action': 'wait',
-            'candidate_kind': 'relax_wait_gate',
+            'focus_action': 'buy',
+            'candidate_kind': 'tighten_buy_gate',
             'feature_key': 'technical.breakout_20d',
             'feature_value': 'true',
             'affected_decisions_count': 3,
@@ -3527,19 +4003,24 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
             'support_ratio': 1.0,
             'status': 'generated',
             'activation_mode': 'manual_only',
-            'summary': 'Relax wait decisions when breakout evidence repeats.',
-            'hypothesis': 'Repeated breakout evidence suggests wait is too conservative.',
+            'summary': 'Tighten buy decisions when breakout evidence repeats.',
+            'hypothesis': 'Repeated breakout evidence suggests buy is too aggressive.',
             'evidence': {'support_ratio': 1.0},
             'recommendation': {'proposed_policy_version': 'signal_decider_policy_v2'},
             'generated_at': '2026-04-30T06:00:00+00:00',
             'activated_at': None,
         }
-        service = SignalDeciderLoopService(repository=repository)
+        replay_service = FakeDeciderReplayService(replay_evidence['replay_artifact'])
+        service = SignalDeciderLoopService(
+            repository=repository,
+            replay_service=replay_service,
+        )
 
         result = service.activate_policy_version(
             policy_version='signal_decider_policy_v2',
             activated_by='human.reviewer',
             activation_note='Reviewed diagnostics and approved the candidate.',
+            replay_evidence=replay_evidence,
         )
 
         self.assertTrue(result['summary']['activated'])
@@ -3547,6 +4028,198 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['item']['status'], 'active')
         self.assertEqual(repository.policy_versions[DEFAULT_SIGNAL_DECIDER_POLICY_VERSION]['status'], 'retired')
         self.assertEqual(repository.candidates['signal_decider_policy_v2']['status'], 'activated')
+        promotion_evidence = repository.policy_versions['signal_decider_policy_v2']['metadata'][
+            'promotion_evidence'
+        ]
+        self.assertEqual(promotion_evidence['validation_status'], 'passed')
+        self.assertEqual(len(promotion_evidence['replay_artifact_sha256']), 64)
+        self.assertEqual(
+            repository.candidates['signal_decider_policy_v2']['evidence']['promotion_evidence'],
+            promotion_evidence,
+        )
+        self.assertEqual(len(replay_service.calls), 1)
+        self.assertEqual(replay_service.calls[0]['symbols'], ['005930'])
+        self.assertEqual(replay_service.calls[0]['policy_versions'], ['signal_decider_policy_v1'])
+        self.assertEqual(
+            replay_service.calls[0]['rule_config'],
+            candidate_policy['rule_bundle']['replay_contract']['rule_config'],
+        )
+
+    def test_candidate_activation_fails_closed_without_positive_net_replay_evidence(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        valid_replay_evidence = _promotion_replay_evidence()
+        candidate_policy = _bind_candidate_replay_contract({
+            **_policy_version_record(
+                policy_version='signal_decider_policy_v2',
+                status='candidate',
+                parent_policy_version='signal_decider_policy_v1',
+                source_candidate_version='signal_decider_policy_v2',
+                activated_by=None,
+                activated_at=None,
+            ),
+            'id': 2,
+        }, valid_replay_evidence)
+        repository.policy_versions['signal_decider_policy_v2'] = candidate_policy
+        service = SignalDeciderLoopService(
+            repository=repository,
+            replay_service=FakeDeciderReplayService(valid_replay_evidence['replay_artifact']),
+        )
+
+        invalid_evidence_cases = [
+            None,
+            _promotion_replay_evidence(fee_bps=0),
+            _promotion_replay_evidence(fee_bps=9.999999),
+            _promotion_replay_evidence(slippage_bps=4.999999),
+            _promotion_replay_evidence(estimated_net_delta_krw=-100),
+        ]
+        wrong_cohort_evidence = _promotion_replay_evidence()
+        wrong_cohort_evidence['replay_artifact']['metadata'][
+            'promotion_cohort_basis'
+        ] = 'actual_execution_lifecycle'
+        invalid_evidence_cases.append(wrong_cohort_evidence)
+
+        for replay_evidence in invalid_evidence_cases:
+            with self.subTest(replay_evidence=replay_evidence):
+                with self.assertRaises(ValueError):
+                    service.activate_policy_version(
+                        policy_version='signal_decider_policy_v2',
+                        activated_by='human.reviewer',
+                        replay_evidence=replay_evidence,
+                    )
+
+        self.assertEqual(
+            repository.policy_versions[DEFAULT_SIGNAL_DECIDER_POLICY_VERSION]['status'],
+            'active',
+        )
+        self.assertEqual(repository.policy_versions['signal_decider_policy_v2']['status'], 'candidate')
+
+    def test_candidate_activation_rejects_tampered_artifact_or_different_contract_inputs(self):
+        valid_replay_evidence = _promotion_replay_evidence()
+        invalid_cases = []
+
+        tampered_artifact = deepcopy(valid_replay_evidence)
+        tampered_artifact['replay_artifact']['summary']['candidate']['estimated_net_pnl_krw'] += 1
+        invalid_cases.append(('tampered_artifact', tampered_artifact))
+
+        different_rule = deepcopy(valid_replay_evidence)
+        different_rule['replay_artifact']['request']['rule_config']['rules'][0]['predicates'][0][
+            'field'
+        ] = 'technical.breakdown_20d'
+        invalid_cases.append(('different_rule', different_rule))
+
+        different_symbols = deepcopy(valid_replay_evidence)
+        different_symbols['replay_artifact']['request']['symbols'] = ['000660']
+        invalid_cases.append(('different_symbols', different_symbols))
+
+        different_policy = deepcopy(valid_replay_evidence)
+        different_policy['replay_artifact']['request']['policy_versions'] = [
+            'unrelated_policy_v9'
+        ]
+        invalid_cases.append(('different_policy', different_policy))
+
+        different_window = deepcopy(valid_replay_evidence)
+        different_window['replay_artifact']['request']['market_date_from'] = '2026-04-21'
+        invalid_cases.append(('different_window', different_window))
+
+        different_costs = _promotion_replay_evidence(fee_bps=11)
+        invalid_cases.append(('different_costs', different_costs))
+
+        for case_name, replay_evidence in invalid_cases:
+            with self.subTest(case_name=case_name):
+                repository = FakeSignalDeciderLoopRepository([])
+                candidate_policy = _bind_candidate_replay_contract(
+                    {
+                        **_policy_version_record(
+                            policy_version='signal_decider_policy_v2',
+                            status='candidate',
+                            parent_policy_version='signal_decider_policy_v1',
+                            source_candidate_version='signal_decider_policy_v2',
+                            activated_by=None,
+                            activated_at=None,
+                        ),
+                        'id': 2,
+                    },
+                    valid_replay_evidence,
+                )
+                repository.policy_versions['signal_decider_policy_v2'] = candidate_policy
+                replay_service = FakeDeciderReplayService(
+                    valid_replay_evidence['replay_artifact']
+                )
+                service = SignalDeciderLoopService(
+                    repository=repository,
+                    replay_service=replay_service,
+                )
+
+                with self.assertRaises(ValueError):
+                    service.activate_policy_version(
+                        policy_version='signal_decider_policy_v2',
+                        activated_by='human.reviewer',
+                        replay_evidence=replay_evidence,
+                    )
+
+                self.assertEqual(
+                    repository.policy_versions['signal_decider_policy_v2']['status'],
+                    'candidate',
+                )
+
+    def test_relax_wait_and_reject_candidates_fail_closed_before_replay(self):
+        for candidate_kind in ('relax_wait_gate', 'relax_reject_gate'):
+            with self.subTest(candidate_kind=candidate_kind):
+                repository = FakeSignalDeciderLoopRepository([])
+                replay_evidence = _promotion_replay_evidence()
+                repository.policy_versions['signal_decider_policy_v2'] = (
+                    _bind_candidate_replay_contract(
+                        {
+                            **_policy_version_record(
+                                policy_version='signal_decider_policy_v2',
+                                status='candidate',
+                                parent_policy_version='signal_decider_policy_v1',
+                                source_candidate_version='signal_decider_policy_v2',
+                                activated_by=None,
+                                activated_at=None,
+                            ),
+                            'id': 2,
+                        },
+                        replay_evidence,
+                        candidate_kind=candidate_kind,
+                    )
+                )
+                replay_service = FakeDeciderReplayService(replay_evidence['replay_artifact'])
+                service = SignalDeciderLoopService(
+                    repository=repository,
+                    replay_service=replay_service,
+                )
+
+                with self.assertRaisesRegex(ValueError, 'counterfactual replay'):
+                    service.activate_policy_version(
+                        policy_version='signal_decider_policy_v2',
+                        activated_by='human.reviewer',
+                        replay_evidence=replay_evidence,
+                    )
+
+                self.assertEqual(replay_service.calls, [])
+
+    def test_already_active_bootstrap_policy_is_idempotent_without_replay_evidence(self):
+        repository = FakeSignalDeciderLoopRepository([])
+        service = SignalDeciderLoopService(repository=repository)
+
+        result = service.activate_policy_version(
+            policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+            activated_by='system:bootstrap',
+        )
+
+        self.assertFalse(result['summary']['activated'])
+        self.assertTrue(result['summary']['already_active'])
+        self.assertFalse(result['summary']['state_changed'])
+        self.assertEqual(
+            result['summary']['promotion_evidence_validation'],
+            'not_run_already_active',
+        )
+        self.assertEqual(result['item']['status'], 'active')
+        self.assertNotIn(
+            'promotion_evidence',
+            repository.policy_versions[DEFAULT_SIGNAL_DECIDER_POLICY_VERSION]['metadata'],
+        )
 
     def test_signal_decider_calibration_report_groups_computed_rows_and_reports_exclusions(self):
         loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()

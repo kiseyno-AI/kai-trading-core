@@ -1,12 +1,136 @@
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.db_models import DailyPipelineRun, DailyPipelineStageRun
 from app.eod.daily_pipeline_state import DailyPipelineRunStateService
 
 
 class DailyPipelineRunStateServiceTests(unittest.TestCase):
+    def test_context_lookup_filters_before_limit_with_more_than_100_unrelated_runs(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        DailyPipelineRun.__table__.create(engine)
+        DailyPipelineStageRun.__table__.create(engine)
+        session_factory = sessionmaker(bind=engine, future=True)
+        market_date = date(2026, 9, 5)
+        started_at = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        with session_factory.begin() as session:
+            session.add(
+                DailyPipelineRun(
+                    market_date=market_date,
+                    trigger='auto_close_scheduler',
+                    status='partial',
+                    started_at=started_at,
+                    run_metadata={
+                        'entrypoint': 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+                    },
+                )
+            )
+            session.add_all(
+                [
+                    DailyPipelineRun(
+                        market_date=market_date,
+                        trigger='manual_api',
+                        status='completed',
+                        started_at=started_at + timedelta(minutes=index + 1),
+                        run_metadata={'entrypoint': 'daily_pipeline_stage_service.run'},
+                    )
+                    for index in range(101)
+                ]
+            )
+
+        @contextmanager
+        def _session_scope():
+            with session_factory.begin() as session:
+                yield session
+
+        try:
+            with patch('app.eod.daily_pipeline_state.session_scope', _session_scope):
+                result = DailyPipelineRunStateService().get_latest_run_for_context(
+                    market_date=market_date,
+                    triggers=('auto_eod_followup_resume',),
+                    entrypoints=(
+                        'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+                    ),
+                    search_limit=100,
+                )
+        finally:
+            engine.dispose()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['trigger'], 'auto_close_scheduler')
+        self.assertEqual(result['status'], 'partial')
+
+    def test_context_lookup_ignores_newer_unrelated_manual_run(self) -> None:
+        now = datetime(2026, 9, 6, tzinfo=timezone.utc)
+        manual_run = SimpleNamespace(
+            id=402,
+            market_date=date(2026, 9, 5),
+            trigger='manual_api',
+            status='completed',
+            current_stage=None,
+            started_at=now,
+            updated_at=now,
+            completed_at=now,
+            error_message=None,
+            run_metadata={'entrypoint': 'daily_pipeline_stage_service.run'},
+        )
+        automatic_run = SimpleNamespace(
+            id=401,
+            market_date=date(2026, 9, 5),
+            trigger='auto_close_scheduler',
+            status='partial',
+            current_stage='signal_decider',
+            started_at=now - timedelta(minutes=5),
+            updated_at=now - timedelta(minutes=4),
+            completed_at=now - timedelta(minutes=4),
+            error_message=None,
+            run_metadata={
+                'entrypoint': 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+                'resolved_stages': ['signal_decider'],
+            },
+        )
+        runs_result = MagicMock()
+        runs_result.scalars.return_value = [manual_run, automatic_run]
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.side_effect = [runs_result, stages_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch('app.eod.daily_pipeline_state.session_scope', return_value=session_context):
+            result = DailyPipelineRunStateService().get_latest_run_for_context(
+                market_date='2026-09-05',
+                triggers=('auto_eod_followup_resume',),
+                entrypoints=('PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',),
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['id'], 401)
+        self.assertEqual(result['status'], 'partial')
+
+    def test_count_runs_uses_exact_trigger(self) -> None:
+        run_ids_result = MagicMock()
+        run_ids_result.scalars.return_value = [501, 502, 503]
+        session = MagicMock()
+        session.execute.return_value = run_ids_result
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch('app.eod.daily_pipeline_state.session_scope', return_value=session_context):
+            result = DailyPipelineRunStateService().count_runs(
+                market_date='2026-09-05',
+                trigger='auto_eod_followup_resume',
+            )
+
+        self.assertEqual(result, 3)
+
     def test_monitor_recovery_acquires_advisory_lock_before_deduplicating(self) -> None:
         now = datetime(2026, 8, 24, tzinfo=timezone.utc)
         existing_run = SimpleNamespace(

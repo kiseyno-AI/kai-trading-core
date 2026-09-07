@@ -1225,8 +1225,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['enrichment_preflight_status'], 'blocked')
         self.assertEqual(result['enrichment_preflight']['zero_coverage_categories'], ['investor_flow_symbol', 'short_selling'])
         self.assertEqual(self.client.post_calls, [])
-        self.assertEqual(result['items'][0]['eligibility_status'], 'blocked')
-        blocking_codes = [entry['code'] for entry in result['items'][0]['validation']['blocking_reasons']]
+        blocked_item = next(
+            item for item in result['items'] if item['plan_item_id'] == self.plan_item_id
+        )
+        self.assertEqual(blocked_item['eligibility_status'], 'blocked')
+        blocking_codes = [entry['code'] for entry in blocked_item['validation']['blocking_reasons']]
         self.assertIn('pykrx_enrichment_preflight_blocked', blocking_codes)
 
     async def test_dispatch_next_open_plan_continues_for_candidate_enriched_short_term_rows(self) -> None:
@@ -2487,13 +2490,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 trigger='test',
             )
 
-        to_thread.assert_awaited_once()
+        self.assertEqual(to_thread.await_count, 2)
         offloaded_func, offloaded_kwargs = to_thread_calls[0]
         self.assertIs(offloaded_func.__self__, signal_decider_next_open_execution_service)
         self.assertEqual(offloaded_func.__name__, 'list_plan_items')
         self.assertEqual(offloaded_kwargs['target_trade_date'], self.target_trade_date)
         self.assertIsNone(offloaded_kwargs['account_reference'])
         self.assertFalse(offloaded_kwargs['refresh'])
+        row_loader, row_loader_kwargs = to_thread_calls[1]
+        self.assertIs(row_loader.__self__, self.service)
+        self.assertEqual(row_loader.__name__, '_load_next_open_rows')
+        self.assertEqual(row_loader_kwargs['target_trade_date'], self.target_trade_date)
         self.assertEqual(len(overview['items']), 1)
 
     async def test_exec_overview_refresh_persists_remote_readback(self) -> None:

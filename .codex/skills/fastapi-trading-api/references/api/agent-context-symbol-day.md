@@ -3,6 +3,8 @@
 ## Summary
 Returns compact symbol/day analysis context for downstream agents. The payload combines quote, price, factor, and PyKRX enrichment blocks with stored DART fundamentals and recent disclosure events. The DART section now includes `fundamentals.latest_snapshot.fundamental_context` for canonical BS/IS/CF facts plus profitability, leverage/liquidity, and cash-flow quality metrics, and `fundamentals.disclosure_context` for recent corrections and ownership or large-holder disclosure signals.
 
+`knowledge_cutoff_at` is an optional timezone-aware, exclusive upper bound for stored news publication and collection timestamps. When omitted for a completed historical KRX session, the service uses 15:30 KST for that market date. Historical US-only requests use the XNYS calendar's actual session close, including early closes. Current/future requests use request time. A request that mixes KRX and US symbols must provide an explicit cutoff because one shared implicit timestamp cannot represent both markets safely. This prevents news learned after the decision from entering a reconstructed context.
+
 The response also includes a compact `factor_summary` block per symbol/day. This is the prompt-trim-safe status-first summary for persisted factor families and stored signal features. It complements the richer `scores` and `persisted_factor_rows` blocks rather than replacing them.
 
 The response now also includes a compact `liquidity_context` block per symbol/day. It keeps the daily turnover state explicit with `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` statuses, plus low-risk liquidity ranking fields and intraday quote/orderbook freshness where those rows exist.
@@ -25,7 +27,7 @@ The response now includes `decision_input_quality_context` per symbol/day. This 
 
 ## Example request
 ```http
-GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&disclosures_limit=5
+GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&disclosures_limit=5&knowledge_cutoff_at=2026-04-15T15:30:00%2B09:00
 ```
 
 ## Closed-market example
@@ -99,7 +101,8 @@ GET /agent-context/symbol-day?market_date=2026-04-15&symbols=005930&fs_div=CFS&d
     "market_date": "2026-04-15",
     "symbols": ["005930"],
     "fs_div": "CFS",
-    "disclosures_limit": 5
+    "disclosures_limit": 5,
+    "knowledge_cutoff_at": "2026-04-15T06:30:00+00:00"
   },
   "summary": {
     "requested_symbol_count": 1,

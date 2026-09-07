@@ -219,6 +219,7 @@ class DailyTechnicalSnapshotService:
         source: str = 'pykrx',
         run_id: int | None = None,
         progress_callback: Callable[[dict], None] | None = None,
+        include_retry_metadata: bool = False,
     ) -> dict:
         target_symbols = list(symbols) if symbols else list_symbols_with_daily_bar_on_date(market_date)
         snapshots: list[dict] = []
@@ -287,7 +288,7 @@ class DailyTechnicalSnapshotService:
                     }
                 )
 
-        return {
+        result = {
             'market_date': market_date,
             'source': source,
             'requested_symbols': len(target_symbols),
@@ -296,6 +297,9 @@ class DailyTechnicalSnapshotService:
             'failed_symbols': failed_symbols[:50],
             'items': snapshots,
         }
+        if include_retry_metadata:
+            result['_retry_metadata'] = {'failed_symbols': failed_symbols}
+        return result
 
     def inspect(
         self,

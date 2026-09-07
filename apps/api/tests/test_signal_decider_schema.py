@@ -230,17 +230,27 @@ class SignalDeciderSchemaTests(unittest.TestCase):
             self.assertEqual(reloaded.activated_by, 'human.reviewer')
             self.assertEqual(reloaded.metadata_payload['activation_mode'], 'manual_only')
 
-    def test_snapshot_feedback_id_is_unique_only_when_non_null(self) -> None:
+    def test_snapshot_history_allows_versions_but_dedupes_content_fingerprint(self) -> None:
         with Session(self.engine) as session:
             feedback = _feedback_row()
             session.add(feedback)
             session.flush()
 
-            session.add(_snapshot_row(feedback.id))
+            first_snapshot = _snapshot_row(feedback.id)
+            first_snapshot.content_fingerprint = 'a' * 64
+            session.add(first_snapshot)
+            session.flush()
+
+            revised_snapshot = _snapshot_row(feedback.id)
+            revised_snapshot.content_fingerprint = 'b' * 64
+            revised_snapshot.response_payload = {'preferred_action': 'wait'}
+            session.add(revised_snapshot)
             session.flush()
 
             with self.assertRaises(IntegrityError):
-                session.add(_snapshot_row(feedback.id))
+                duplicate_snapshot = _snapshot_row(feedback.id)
+                duplicate_snapshot.content_fingerprint = 'a' * 64
+                session.add(duplicate_snapshot)
                 session.flush()
 
             session.rollback()

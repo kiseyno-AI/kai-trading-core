@@ -29,6 +29,16 @@ PYKRX_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'market_risk_filter',
 )
 
+# Historical execution is intentionally narrower than the current-day pipeline.
+# The remaining daily stages either depend on today's active universe or call
+# current-only KIS endpoints, so allowing them to stamp a past market date would
+# introduce survivorship or look-ahead bias into replay inputs.
+HISTORICAL_BACKFILL_STAGE_ORDER: tuple[str, ...] = (
+    'price_collection',
+    'technical_snapshots',
+    'action_summaries',
+)
+
 FACTOR_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'momentum_factors',
     'value_factors',
@@ -126,7 +136,7 @@ def _is_non_blocking_gap(*, failed: int, total: int) -> bool:
 def _completion_status_for_gap(*, failed: int, total: int) -> str:
     if failed <= 0:
         return 'completed'
-    return 'completed' if _is_non_blocking_gap(failed=failed, total=total) else 'partial'
+    return 'partial'
 
 
 def _gap_policy_details(*, failed: int, total: int) -> dict[str, Any]:
@@ -134,8 +144,58 @@ def _gap_policy_details(*, failed: int, total: int) -> dict[str, Any]:
     return {
         'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
         'missing_ratio': round(ratio, 6) if ratio is not None else None,
-        'minor_missing_gap_treated_as_success': _is_non_blocking_gap(failed=failed, total=total),
+        'is_minor_missing_gap': _is_non_blocking_gap(failed=failed, total=total),
+        'minor_missing_gap_treated_as_success': False,
     }
+
+
+def _resolve_requested_stages(
+    *,
+    mode: str,
+    selected_stages: Sequence[str] | None,
+) -> tuple[str, ...]:
+    historical_backfill = mode == 'historical_backfill'
+    defaults = HISTORICAL_BACKFILL_STAGE_ORDER if historical_backfill else PYKRX_DAILY_STAGE_ORDER
+    raw_stages = defaults if selected_stages is None else selected_stages
+    requested = tuple(
+        dict.fromkeys(
+            str(stage_id or '').strip()
+            for stage_id in raw_stages
+            if str(stage_id or '').strip()
+        )
+    )
+    if not requested:
+        raise ValueError('At least one pykrx stage must be requested.')
+    if historical_backfill:
+        unsupported = sorted(set(requested) - set(HISTORICAL_BACKFILL_STAGE_ORDER))
+        if unsupported:
+            raise ValueError(
+                'historical_backfill stages are restricted to point-in-time-safe stages: '
+                f'{",".join(HISTORICAL_BACKFILL_STAGE_ORDER)}; unsupported={",".join(unsupported)}'
+            )
+    if 'price_collection' not in requested:
+        raise ValueError('price_collection stage is required for pykrx pipeline execution')
+    if 'action_summaries' in requested and 'technical_snapshots' not in requested:
+        raise ValueError('technical_snapshots is required when action_summaries is requested')
+    return requested
+
+
+def _consume_retry_failed_symbols(result: dict[str, Any]) -> list[str]:
+    """Read full internal retry scope while keeping public failure previews bounded."""
+
+    retry_metadata = result.pop('_retry_metadata', None)
+    raw_symbols = (
+        retry_metadata.get('failed_symbols')
+        if isinstance(retry_metadata, dict)
+        else result.get('failed_symbols')
+    )
+    return list(
+        dict.fromkeys(
+            str(symbol).strip()
+            for symbol in (raw_symbols or [])
+            if str(symbol).strip()
+        )
+    )
 
 
 def _resolve_result_status(result: dict[str, Any]) -> str:
@@ -800,9 +860,26 @@ def run_market_data_pipeline(
 ) -> dict:
     normalized_start = dependencies.normalize_yyyymmdd(start_date)
     normalized_end = dependencies.normalize_yyyymmdd(end_date)
-    requested_stage_set = set(selected_stages or PYKRX_DAILY_STAGE_ORDER)
-    if 'price_collection' not in requested_stage_set:
-        raise ValueError('price_collection stage is required for pykrx pipeline execution')
+    historical_backfill = mode == 'historical_backfill'
+    resolved_selected_stages = _resolve_requested_stages(
+        mode=mode,
+        selected_stages=selected_stages,
+    )
+    requested_stage_set = set(resolved_selected_stages)
+    if historical_backfill and symbols_override is not None:
+        raise ValueError(
+            'symbols_override is not allowed for historical_backfill; '
+            'membership must be derived from the requested end date.'
+        )
+    if historical_backfill and normalized_start != normalized_end:
+        raise ValueError(
+            'historical_backfill currently supports one market date per request; '
+            'per-date universe membership is required before multi-day ranges are safe.'
+        )
+    if historical_backfill:
+        # Historical requests never enter current-only DART/KIS/decider follow-ups,
+        # even if an internal caller accidentally opts in.
+        chain_fundamentals_followup = False
     dependencies.log_fetch(
         'run_collection',
         'started',
@@ -816,18 +893,43 @@ def run_market_data_pipeline(
         symbols_override_count=len(symbols_override) if symbols_override is not None else None,
         refresh_universe=refresh_universe,
         retry=retry_context,
-        selected_stages=list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+        selected_stages=list(resolved_selected_stages),
     )
 
-    effective_refresh_universe = refresh_universe and symbols_override is None
+    # Historical runs must always derive membership from the requested end date.
+    # ``refresh_universe=False`` is safe for current daily jobs, but loading the
+    # active table here would introduce survivorship bias into a backfill.
+    effective_refresh_universe = (
+        (refresh_universe or historical_backfill) and symbols_override is None
+    )
     if symbols_override is not None:
         universe_snapshot = None
         symbols = list(symbols_override)
     elif effective_refresh_universe:
-        snapshot = service.fetch_recent_universe_snapshot(markets=markets, limit=limit)
+        snapshot = service.fetch_recent_universe_snapshot(
+            markets=markets,
+            # A requested symbol may sort beyond a caller-provided global cap;
+            # inspect the complete point-in-time membership before filtering it.
+            limit=None if historical_backfill and symbol else limit,
+            end_date=normalized_end,
+            # KIS master files represent the current listing set. Using them for
+            # a historical cross-section silently introduces survivorship bias.
+            allow_master_fallback=mode != 'historical_backfill',
+        )
+        if not snapshot.get('complete', True):
+            unavailable_markets = ','.join(snapshot.get('unavailable_markets') or [])
+            raise RuntimeError(
+                'PyKRX universe snapshot is incomplete for requested markets: '
+                f'{unavailable_markets or "unknown"}.'
+            )
         symbols = snapshot['symbols']
-        deactivate_missing = limit is None and symbol is None
-        persisted = service._persist_universe(symbols, deactivate_missing=deactivate_missing)
+        historical_snapshot = historical_backfill
+        deactivate_missing = not historical_snapshot and limit is None and symbol is None
+        persisted = (
+            0
+            if historical_snapshot
+            else service._persist_universe(symbols, deactivate_missing=deactivate_missing)
+        )
         universe_snapshot = {
             'source': 'pykrx',
             'markets': list(markets),
@@ -835,7 +937,16 @@ def run_market_data_pipeline(
             'persisted_count': persisted,
             'latest_trade_date': snapshot['latest_trade_date'],
             'universe_source': snapshot['universe_source'],
+            'membership_basis': snapshot.get('membership_basis', 'end_date_snapshot'),
+            'membership_scope_warning': snapshot.get('membership_scope_warning'),
+            'complete': snapshot.get('complete', True),
+            'market_status': dict(snapshot.get('market_status') or {}),
+            'unavailable_markets': list(snapshot.get('unavailable_markets') or []),
+            'market_errors': list(snapshot.get('market_errors') or []),
             'deactivate_missing': deactivate_missing,
+            'point_in_time': historical_snapshot,
+            'current_universe_mutated': not historical_snapshot,
+            'forced_for_point_in_time': historical_snapshot and not refresh_universe,
         }
     else:
         universe_snapshot = None
@@ -843,7 +954,7 @@ def run_market_data_pipeline(
 
     if symbol:
         symbols = [item for item in symbols if item.symbol == symbol]
-        if not symbols:
+        if not symbols and not historical_backfill:
             matched = service.find_symbol(symbol, markets=markets)
             if matched is not None:
                 symbols = [matched]
@@ -851,6 +962,8 @@ def run_market_data_pipeline(
         raise RuntimeError('No active pykrx symbols are available for backfill.')
 
     latest_trade_date = service.resolve_latest_trade_date(end_date=normalized_end)
+    requested_symbol_codes = [item.symbol for item in symbols]
+    unattempted_symbols = list(requested_symbol_codes)
     run_metadata = {
         'mode': mode,
         'requested_start_date': normalized_start,
@@ -861,10 +974,16 @@ def run_market_data_pipeline(
         'limited_run': limit is not None,
         'universe_refreshed': effective_refresh_universe,
         'universe_snapshot': universe_snapshot,
+        # Persist the complete admission scope before the first provider call.
+        # If a provider outage triggers the bounded early abort, the scheduler
+        # can distinguish never-attempted symbols from attempted failures.
+        'requested_symbols': requested_symbol_codes,
+        'failed_symbols': [],
+        'failed_symbols_count': 0,
+        'unattempted_symbols': unattempted_symbols,
     }
     if retry_context is not None:
         run_metadata['retry'] = retry_context
-        run_metadata['requested_symbols'] = [item.symbol for item in symbols]
     first_symbol = symbols[0].symbol if symbols else None
     run_metadata = dependencies.update_run_stage_metadata(
         run_metadata,
@@ -884,7 +1003,7 @@ def run_market_data_pipeline(
         extra={'bars_upserted': 0},
     )
     tracked_stages = _resolve_auto_daily_tracked_stages(
-        selected_stages=selected_stages,
+        selected_stages=resolved_selected_stages,
         chain_fundamentals_followup=chain_fundamentals_followup,
     )
     daily_pipeline_tracker = _OfficialDailyPipelineTracker(
@@ -901,7 +1020,7 @@ def run_market_data_pipeline(
             'mode': mode,
             'trigger': trigger,
             'markets': list(markets),
-            'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+            'selected_stages': list(resolved_selected_stages),
             'chain_fundamentals_followup': chain_fundamentals_followup,
             'retry': retry_context,
         },
@@ -912,7 +1031,7 @@ def run_market_data_pipeline(
             'reason': pipeline_admission.get('deduplication_reason') or 'overlapping_run_already_active',
             'source': 'pykrx',
             'status': 'skipped',
-            'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+            'selected_stages': list(resolved_selected_stages),
             'markets': list(markets),
             'start_date': normalized_start,
             'requested_end_date': normalized_end,
@@ -1059,6 +1178,7 @@ def run_market_data_pipeline(
                     run_id=run_id,
                     name_ko=item.name_ko,
                     standard_code=item.standard_code,
+                    update_current_symbol_state=not historical_backfill,
                 )
                 bars_upserted += persisted_count
                 symbols_succeeded += 1
@@ -1114,7 +1234,19 @@ def run_market_data_pipeline(
                             'provider appears unavailable.'
                         ),
                     )
+                    run_metadata = service._run_metadata_with_failed_symbols(
+                        run_metadata,
+                        failed_symbols,
+                    )
+                    unattempted_symbols = requested_symbol_codes[index + 1 :]
+                    run_metadata['unattempted_symbols'] = unattempted_symbols
                     break
+            unattempted_symbols = requested_symbol_codes[index + 1 :]
+            run_metadata['unattempted_symbols'] = unattempted_symbols
+            run_metadata = service._run_metadata_with_failed_symbols(
+                run_metadata,
+                failed_symbols,
+            )
             try:
                 next_symbol = symbols[index + 1].symbol if index + 1 < len(symbols) else None
                 persist_stage_progress(
@@ -1246,7 +1378,7 @@ def run_market_data_pipeline(
             'run_id': run_id,
             'source': 'pykrx',
             'status': 'failed',
-            'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+            'selected_stages': list(resolved_selected_stages),
             'markets': list(markets),
             'start_date': normalized_start,
             'requested_end_date': normalized_end,
@@ -1255,6 +1387,8 @@ def run_market_data_pipeline(
             'symbols_succeeded': symbols_succeeded,
             'symbols_failed': symbols_failed,
             'failed_symbols': failed_symbols[:50],
+            'unattempted_symbols': unattempted_symbols[:50],
+            'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
             'error_type': 'PykrxProviderUnavailable',
             'error_message': error_message,
@@ -1273,6 +1407,7 @@ def run_market_data_pipeline(
                 symbols=price_context_symbols,
                 source='pykrx',
                 run_id=run_id,
+                include_retry_metadata=True,
             )
         except Exception as exc:
             price_context_result = build_stage_failure_result(
@@ -1287,6 +1422,9 @@ def run_market_data_pipeline(
                 failed_symbols=price_context_symbols,
                 items_key='items',
             )
+            price_context_result['_retry_metadata'] = {
+                'failed_symbols': list(price_context_symbols),
+            }
             price_context_error_message = f'Price context persistence failed: {exc}'
     else:
         price_context_result = {
@@ -1376,13 +1514,22 @@ def run_market_data_pipeline(
                 'completed'
                 if pykrx_enrichment_result.get('status') == 'completed'
                 and preflight.get('allowed')
-                and not blocking_failed_categories
+                and not failed_categories
                 else 'partial'
             )
-            if blocking_failed_categories:
+            enrichment_failed_count = len(failed_categories)
+            if stage_status != 'completed':
                 pykrx_enrichment_error_message = (
-                    'PyKRX enrichment incomplete for categories: ' + ','.join(blocking_failed_categories)
+                    'PyKRX enrichment incomplete for categories: ' + ','.join(failed_categories)
+                    if failed_categories
+                    else 'PyKRX enrichment did not complete successfully'
                 )
+                # Category/market failures do not always identify exact symbols.
+                # Preserve a conservative bounded retry scope rather than
+                # silently completing a run that has missing decision inputs.
+                pykrx_enrichment_result['_retry_metadata'] = {
+                    'failed_symbols': list(requested_symbol_codes),
+                }
             persist_stage_progress(
                 stage='pykrx_enrichment',
                 status=stage_status,
@@ -1394,8 +1541,8 @@ def run_market_data_pipeline(
                 ),
                 processed=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
                 total=len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
-                succeeded=max(len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES) - len(blocking_failed_categories), 0),
-                failed=len(blocking_failed_categories),
+                succeeded=max(len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES) - enrichment_failed_count, 0),
+                failed=enrichment_failed_count,
                 extra={
                     'categories_requested': pykrx_enrichment_result.get('categories_requested'),
                     'category_row_counts': category_row_counts,
@@ -1433,6 +1580,9 @@ def run_market_data_pipeline(
                     'categories_failed': len(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES),
                 },
             )
+            pykrx_enrichment_result['_retry_metadata'] = {
+                'failed_symbols': list(requested_symbol_codes),
+            }
             pykrx_enrichment_error_message = f'PyKRX enrichment collection failed: {exc}'
             persist_stage_progress(
                 stage='pykrx_enrichment',
@@ -1472,6 +1622,7 @@ def run_market_data_pipeline(
                     default_activity='Computing daily technical snapshots',
                     include_current_symbol=True,
                 ),
+                include_retry_metadata=True,
             )
             technical_failed = int(technical_snapshot_result.get('snapshots_failed') or 0)
             technical_succeeded = int(technical_snapshot_result.get('snapshots_persisted') or 0)
@@ -1503,6 +1654,9 @@ def run_market_data_pipeline(
                 failed_symbols=[item.symbol for item in symbols],
                 items_key='items',
             )
+            technical_snapshot_result['_retry_metadata'] = {
+                'failed_symbols': [item.symbol for item in symbols],
+            }
             snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
             persist_stage_progress(
                 stage='technical_snapshots',
@@ -1538,6 +1692,7 @@ def run_market_data_pipeline(
                     default_activity='Computing daily action summaries',
                     include_current_symbol=True,
                 ),
+                include_retry_metadata=True,
             )
             action_failed = int(action_summary_result.get('action_summaries_failed') or 0)
             action_succeeded = int(action_summary_result.get('action_summaries_persisted') or 0)
@@ -1569,6 +1724,9 @@ def run_market_data_pipeline(
                 failed_symbols=[item.symbol for item in symbols],
                 items_key='items',
             )
+            action_summary_result['_retry_metadata'] = {
+                'failed_symbols': [item.symbol for item in symbols],
+            }
             action_summary_error_message = f'Action summary persistence failed: {exc}'
             persist_stage_progress(
                 stage='action_summaries',
@@ -1612,6 +1770,14 @@ def run_market_data_pipeline(
             )
             trending_total = int(trending_rank_result.get('total') or trending_succeeded + trending_failed or 0)
             trending_status = _completion_status_for_gap(failed=trending_failed, total=trending_total)
+            if trending_failed:
+                trending_rank_error_message = (
+                    f'Trending rank persistence incomplete: {trending_failed} period(s) failed'
+                )
+                # Rank-period failures are global rather than symbol-addressable.
+                trending_rank_result['_retry_metadata'] = {
+                    'failed_symbols': list(requested_symbol_codes),
+                }
             persist_stage_progress(
                 stage='trending_ranks',
                 status=trending_status,
@@ -1635,6 +1801,9 @@ def run_market_data_pipeline(
                     'trending_ranks_persisted': 0,
                 },
             )
+            trending_rank_result['_retry_metadata'] = {
+                'failed_symbols': list(requested_symbol_codes),
+            }
             trending_rank_error_message = f'Trending rank persistence failed: {exc}'
             persist_stage_progress(
                 stage='trending_ranks',
@@ -1675,6 +1844,7 @@ def run_market_data_pipeline(
             signal_feature_result = asyncio.run(
                 dependencies.signal_feature_service.refresh_for_market_date(
                     market_date=latest_trade_date,
+                    include_retry_metadata=True,
                 )
             )
             signal_total = int(signal_feature_result.get('features_persisted', 0)) + int(
@@ -1685,6 +1855,15 @@ def run_market_data_pipeline(
             signal_status = _completion_status_for_gap(failed=signal_failed, total=signal_total)
             if signal_source_errors:
                 signal_status = 'partial'
+                signal_feature_error_message = (
+                    'Daily signal feature sources incomplete: '
+                    + ','.join(sorted(str(source) for source in signal_source_errors))
+                )
+                # A failed ranking source can omit candidates without producing
+                # per-symbol failures, so retry the admitted scope conservatively.
+                signal_feature_result['_retry_metadata'] = {
+                    'failed_symbols': list(requested_symbol_codes),
+                }
             persist_stage_progress(
                 stage='signal_features',
                 status=signal_status,
@@ -1711,12 +1890,15 @@ def run_market_data_pipeline(
                     'sources': [],
                     'source_counts': {},
                     'features_persisted': 0,
-                    'features_failed': 0,
+                    'features_failed': len(symbols),
                 },
-                failed_symbols=[],
+                failed_symbols=[item.symbol for item in symbols],
                 items_key='items',
                 extra={'participation_context': {'error': str(exc)}},
             )
+            signal_feature_result['_retry_metadata'] = {
+                'failed_symbols': [item.symbol for item in symbols],
+            }
             signal_feature_error_message = f'Daily signal feature collection failed: {exc}'
             persist_stage_progress(
                 stage='signal_features',
@@ -1727,7 +1909,6 @@ def run_market_data_pipeline(
                 total=3,
                 succeeded=0,
                 failed=1,
-                error_message=signal_feature_error_message,
                 extra={
                     'error_type': type(exc).__name__,
                     'error_message': str(exc),
@@ -1796,6 +1977,9 @@ def run_market_data_pipeline(
                 failed_symbols=price_context_symbols,
                 items_key='items',
             )
+            market_risk_filter_result['_retry_metadata'] = {
+                'failed_symbols': list(price_context_symbols),
+            }
             market_risk_filter_error_message = f'Market risk filter persistence failed: {exc}'
             persist_stage_progress(
                 stage='market_risk_filter',
@@ -1815,8 +1999,34 @@ def run_market_data_pipeline(
             'source': MARKET_RISK_FILTER_SOURCE,
         }
 
+    downstream_failed_symbols = {
+        failed_symbol
+        for stage_result in (
+            price_context_result,
+            pykrx_enrichment_result,
+            technical_snapshot_result,
+            action_summary_result,
+            trending_rank_result,
+            signal_feature_result,
+            market_risk_filter_result,
+        )
+        for failed_symbol in _consume_retry_failed_symbols(stage_result)
+    }
+    price_retry_symbol_codes = list(dict.fromkeys(failed_symbols))
+    price_retry_symbol_set = set(price_retry_symbol_codes)
+    downstream_retry_symbol_codes = [
+        code
+        for code in requested_symbol_codes
+        if code in downstream_failed_symbols and code not in price_retry_symbol_set
+    ]
+    retry_symbol_codes = list(
+        dict.fromkeys(
+            [*price_retry_symbol_codes, *downstream_retry_symbol_codes]
+        )
+    )
+
     run_errors: list[str] = []
-    if failed_symbols and not _is_non_blocking_gap(failed=len(failed_symbols), total=len(symbols)):
+    if failed_symbols:
         run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
     append_stage_error(
         run_errors,
@@ -1826,7 +2036,6 @@ def run_market_data_pipeline(
         incomplete_prefix='Price context persistence incomplete for symbols: ',
         exclude_symbols=failed_symbol_set,
         total_keys=('requested_symbols', 'contexts_persisted'),
-        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(run_errors, direct_error=pykrx_enrichment_error_message)
     append_stage_error(
@@ -1836,7 +2045,6 @@ def run_market_data_pipeline(
         failed_key='snapshots_failed',
         incomplete_prefix='Technical snapshot persistence incomplete for symbols: ',
         total_keys=('requested_symbols', 'snapshots_persisted'),
-        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(
         run_errors,
@@ -1845,7 +2053,6 @@ def run_market_data_pipeline(
         failed_key='action_summaries_failed',
         incomplete_prefix='Action summary persistence incomplete for symbols: ',
         total_keys=('requested_symbols', 'action_summaries_persisted'),
-        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(run_errors, direct_error=trending_rank_error_message)
     append_stage_error(
@@ -1855,7 +2062,6 @@ def run_market_data_pipeline(
         failed_key='features_failed',
         incomplete_prefix='Daily signal feature persistence incomplete for symbols: ',
         total_keys=('features_total', 'features_persisted'),
-        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     append_stage_error(
         run_errors,
@@ -1864,12 +2070,20 @@ def run_market_data_pipeline(
         failed_key='results_failed',
         incomplete_prefix='Market risk filter persistence incomplete for symbols: ',
         total_keys=('matched_symbols', 'matched_symbol_count', 'requested_symbol_count', 'results_persisted'),
-        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
 
     status = 'completed' if not run_errors else 'completed_with_errors'
-    if failed_symbols:
-        run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
+    # Only collection failures belong in the full-pipeline retry scope.  A
+    # downstream failure must resume from persisted prices instead of
+    # downloading OHLCV again.
+    run_metadata = service._run_metadata_with_failed_symbols(
+        run_metadata,
+        price_retry_symbol_codes,
+    )
+    run_metadata = service._run_metadata_with_downstream_retry_symbols(
+        run_metadata,
+        downstream_retry_symbol_codes,
+    )
     dependencies.complete_eod_collection_run(
         run_id,
         status=status,
@@ -1882,7 +2096,7 @@ def run_market_data_pipeline(
         'run_id': run_id,
         'source': 'pykrx',
         'status': status,
-        'selected_stages': list(selected_stages or PYKRX_DAILY_STAGE_ORDER),
+        'selected_stages': list(resolved_selected_stages),
         'markets': list(markets),
         'start_date': normalized_start,
         'requested_end_date': normalized_end,
@@ -1891,6 +2105,12 @@ def run_market_data_pipeline(
         'symbols_succeeded': symbols_succeeded,
         'symbols_failed': symbols_failed,
         'failed_symbols': failed_symbols[:50],
+        'retry_symbols': retry_symbol_codes[:50],
+        'retry_symbols_count': len(retry_symbol_codes),
+        'price_retry_symbols': price_retry_symbol_codes[:50],
+        'price_retry_symbols_count': len(price_retry_symbol_codes),
+        'downstream_retry_symbols': downstream_retry_symbol_codes[:50],
+        'downstream_retry_symbols_count': len(downstream_retry_symbol_codes),
         'bars_upserted': bars_upserted,
         'price_contexts': price_context_result,
         'pykrx_enrichment': pykrx_enrichment_result,

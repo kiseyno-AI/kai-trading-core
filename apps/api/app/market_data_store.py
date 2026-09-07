@@ -484,6 +484,7 @@ def persist_daily_price_bars(
     run_id: int | None = None,
     name_ko: str | None = None,
     standard_code: str | None = None,
+    update_current_symbol_state: bool = True,
 ) -> int:
     if not bars:
         return 0
@@ -499,12 +500,12 @@ def persist_daily_price_bars(
                 standard_code=standard_code,
                 instrument_type='equity',
                 source=source,
-                is_active=True,
+                is_active=update_current_symbol_state,
                 last_refreshed_at=refreshed_at,
             )
             session.add(record)
             session.flush()
-        else:
+        elif update_current_symbol_state:
             if name_ko:
                 record.name_ko = name_ko
             if standard_code:

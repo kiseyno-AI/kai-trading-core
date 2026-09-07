@@ -4,6 +4,8 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
+import math
+from collections import Counter
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
@@ -26,6 +28,8 @@ from app.orders.signal_decider_alignment_gate import (
     SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE,
     apply_alignment_quantity_enforcement,
     build_alignment_override_evidence,
+    build_signal_decider_alignment_context,
+    build_signal_decider_alignment_gate,
     normalize_alignment_gate_mode,
 )
 
@@ -39,6 +43,8 @@ SUPPORTED_REPLAY_AGENT_NAMES: tuple[str, ...] = (
 )
 DEFAULT_REPLAY_HORIZON_DAYS = 5
 DEFAULT_REPLAY_NOTIONAL_KRW = Decimal('1000000')
+MIN_PROMOTION_FEE_BPS = Decimal('10')
+MIN_PROMOTION_SLIPPAGE_BPS = Decimal('5')
 DEFAULT_TOP_EXAMPLES_LIMIT = 10
 DEFAULT_WAIT_CONFLICT_COMPLETED_WEEKS = 4
 MIN_WAIT_CONFLICT_PROBE_QUANTITY = 1
@@ -75,6 +81,24 @@ class DeciderReplayTrade:
 
 
 @dataclass(frozen=True)
+class DeciderReplayDataset:
+    trades: tuple[DeciderReplayTrade, ...]
+    source_decision_count: int
+    excluded_reason_counts: dict[str, int]
+    cohort_basis: str
+    diagnostics: dict[str, Any]
+
+    def __iter__(self):
+        return iter(self.trades)
+
+    def __len__(self) -> int:
+        return len(self.trades)
+
+    def __getitem__(self, index: int) -> DeciderReplayTrade:
+        return self.trades[index]
+
+
+@dataclass(frozen=True)
 class PredicateResult:
     matched: bool
     reason: str | None = None
@@ -84,6 +108,57 @@ class PredicateResult:
 class RuleEvaluationResult:
     skipped: bool
     reasons: tuple[str, ...]
+
+
+def _replay_profitability_metadata(
+    cost_assumptions: DeciderReplayCostAssumptions,
+    *,
+    cohort_basis: str,
+) -> dict[str, Any]:
+    below_minimum_cost_inputs = [
+        name
+        for name, value, minimum in (
+            ('fee_bps', cost_assumptions.fee_bps, MIN_PROMOTION_FEE_BPS),
+            ('slippage_bps', cost_assumptions.slippage_bps, MIN_PROMOTION_SLIPPAGE_BPS),
+        )
+        if value < minimum
+    ]
+    promotion_eligible = not below_minimum_cost_inputs
+    missing_cost_reason = None
+    if cost_assumptions.fee_bps == 0 and cost_assumptions.slippage_bps == 0:
+        missing_cost_reason = 'zero_fee_and_slippage_assumptions'
+    elif len(below_minimum_cost_inputs) == 2:
+        missing_cost_reason = 'below_minimum_fee_and_slippage_assumptions'
+    elif below_minimum_cost_inputs:
+        missing_cost_reason = f'below_minimum_{below_minimum_cost_inputs[0]}_assumption'
+    return {
+        'profitability_basis': (
+            'gross_only'
+            if cost_assumptions.fee_bps == 0 and cost_assumptions.slippage_bps == 0
+            else 'estimated_net'
+        ),
+        'promotion_metrics_basis': 'estimated_net',
+        'promotion_cohort_basis': cohort_basis,
+        'promotion_cost_gate': {
+            'eligible': promotion_eligible,
+            'status': 'passed' if promotion_eligible else 'ineligible',
+            'reason': missing_cost_reason,
+            'minimum_assumptions': {
+                'fee_bps': _to_json_number(MIN_PROMOTION_FEE_BPS, places='0.000001'),
+                'slippage_bps': _to_json_number(
+                    MIN_PROMOTION_SLIPPAGE_BPS,
+                    places='0.000001',
+                ),
+            },
+            'effective_assumptions': {
+                'fee_bps': _to_json_number(cost_assumptions.fee_bps, places='0.000001'),
+                'slippage_bps': _to_json_number(
+                    cost_assumptions.slippage_bps,
+                    places='0.000001',
+                ),
+            },
+        },
+    }
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -202,15 +277,34 @@ def _normalize_symbols(symbols: Sequence[str] | str | None) -> list[str]:
     return normalized
 
 
+def _normalize_policy_versions(
+    policy_versions: Sequence[str] | str | None,
+) -> list[str]:
+    if policy_versions is None:
+        return []
+    raw_values = [policy_versions] if isinstance(policy_versions, str) else list(policy_versions)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        for piece in str(raw_value or '').split(','):
+            policy_version = piece.strip()
+            if not policy_version or policy_version in seen:
+                continue
+            seen.add(policy_version)
+            normalized.append(policy_version)
+    return normalized
+
+
 def _safe_decimal(value: Any) -> Decimal | None:
     if value is None or value == '' or isinstance(value, bool):
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     try:
-        return Decimal(str(value))
+        resolved = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+    return resolved if resolved.is_finite() else None
 
 
 def _safe_decimal_or_zero(value: Any) -> Decimal:
@@ -243,13 +337,15 @@ def _to_float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, Decimal):
-        return float(value)
+        return float(value) if value.is_finite() else None
     if isinstance(value, (int, float)):
-        return float(value)
+        resolved = float(value)
+        return resolved if math.isfinite(resolved) else None
     try:
-        return float(str(value).strip())
+        resolved = float(str(value).strip())
     except (TypeError, ValueError):
         return None
+    return resolved if math.isfinite(resolved) else None
 
 
 def _to_json_number(value: Decimal | float | int | None, *, places: str = '0.01') -> int | float | None:
@@ -263,9 +359,10 @@ def _to_json_number(value: Decimal | float | int | None, *, places: str = '0.01'
 
 
 def _to_ratio_number(value: float | Decimal | None) -> float | None:
-    if value is None:
+    resolved = _to_float(value)
+    if resolved is None:
         return None
-    return round(float(value), 6)
+    return round(resolved, 6)
 
 
 def _maybe_dict(value: Any) -> dict[str, Any]:
@@ -492,22 +589,82 @@ def _build_point_in_time_context(row: SignalDeciderDecisionSnapshot) -> dict[str
     }
 
 
+def _decimal_values_match(
+    left: Decimal,
+    right: Decimal,
+    *,
+    relative_tolerance: Decimal = Decimal('0.001'),
+    absolute_tolerance: Decimal = Decimal('0.00000001'),
+) -> bool:
+    tolerance = max(absolute_tolerance, max(abs(left), abs(right)) * relative_tolerance)
+    return abs(left - right) <= tolerance
+
+
+def _actual_outcome_exclusion_reason(
+    outcome: SignalDeciderActualExecutionOutcome,
+) -> str | None:
+    if str(outcome.lifecycle_status or '').strip().lower() != 'closed':
+        return 'actual_lifecycle_not_closed'
+
+    open_quantity = _safe_decimal(outcome.open_quantity)
+    if open_quantity is None:
+        return 'actual_open_quantity_missing_or_non_finite'
+    if open_quantity != 0:
+        return 'actual_position_still_open'
+
+    entry_quantity = _safe_decimal(outcome.entry_filled_quantity)
+    closed_quantity = _safe_decimal(outcome.closed_quantity)
+    exit_quantity = _safe_decimal(outcome.exit_filled_quantity)
+    if entry_quantity is None or entry_quantity <= 0:
+        return 'actual_entry_quantity_missing_or_non_finite'
+    if closed_quantity is None or closed_quantity <= 0:
+        return 'actual_closed_quantity_missing_or_non_finite'
+    if not _decimal_values_match(entry_quantity, closed_quantity):
+        return 'actual_closed_quantity_mismatch'
+    if exit_quantity is None or not _decimal_values_match(exit_quantity, closed_quantity):
+        return 'actual_exit_quantity_mismatch'
+
+    entry_notional = _safe_decimal(outcome.entry_notional_krw)
+    exit_notional = _safe_decimal(outcome.exit_notional_krw)
+    entry_price = _safe_decimal(outcome.entry_average_fill_price)
+    exit_price = _safe_decimal(outcome.exit_average_fill_price)
+    if entry_notional is None or entry_notional <= 0:
+        return 'actual_entry_notional_missing_or_non_finite'
+    if exit_notional is None or exit_notional <= 0:
+        return 'actual_exit_notional_missing_or_non_finite'
+    if entry_price is None or entry_price <= 0:
+        return 'actual_entry_price_missing_or_non_finite'
+    if exit_price is None or exit_price <= 0:
+        return 'actual_exit_price_missing_or_non_finite'
+    if not _decimal_values_match(entry_notional, entry_quantity * entry_price):
+        return 'actual_entry_notional_mismatch'
+    if not _decimal_values_match(exit_notional, closed_quantity * exit_price):
+        return 'actual_exit_notional_mismatch'
+
+    gross_pnl = _safe_decimal(outcome.realized_pnl_krw)
+    realized_return = _safe_decimal(outcome.realized_return_pct)
+    if gross_pnl is None and realized_return is None:
+        return 'actual_economic_result_missing_or_non_finite'
+    return None
+
+
 def _actual_outcome_to_trade(
     *,
     snapshot: SignalDeciderDecisionSnapshot,
     outcome: SignalDeciderActualExecutionOutcome,
     cost_assumptions: DeciderReplayCostAssumptions,
 ) -> DeciderReplayTrade:
+    exclusion_reason = _actual_outcome_exclusion_reason(outcome)
+    if exclusion_reason is not None:
+        raise ValueError(f'actual outcome is not eligible for economic replay: {exclusion_reason}')
     entry_notional = _safe_decimal(outcome.entry_notional_krw)
-    if entry_notional is None:
-        quantity = _safe_decimal(outcome.entry_filled_quantity)
-        price = _safe_decimal(outcome.entry_average_fill_price)
-        entry_notional = quantity * price if quantity is not None and price is not None else None
-    notional = entry_notional if entry_notional is not None and entry_notional > 0 else cost_assumptions.notional_krw
+    assert entry_notional is not None
+    notional = entry_notional
     gross_pnl = _safe_decimal(outcome.realized_pnl_krw)
     realized_return = _to_float(outcome.realized_return_pct)
     if gross_pnl is None and realized_return is not None:
         gross_pnl = Decimal(str(realized_return)) * notional
+    assert gross_pnl is not None
     return DeciderReplayTrade(
         replay_trade_id=f'actual:{outcome.id}',
         snapshot_id=int(snapshot.id),
@@ -515,7 +672,7 @@ def _actual_outcome_to_trade(
         symbol=snapshot.symbol,
         market_date=snapshot.market_date,
         policy_version=snapshot.policy_version,
-        baseline_gross_pnl_krw=gross_pnl or Decimal('0'),
+        baseline_gross_pnl_krw=gross_pnl,
         baseline_return_pct=realized_return,
         baseline_notional_krw=notional,
         outcome_source='actual_execution_outcome',
@@ -529,29 +686,61 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     snapshot: SignalDeciderDecisionSnapshot,
     plan_row: SignalDeciderExecutionPlanItem,
     outcome: SignalDeciderActualExecutionOutcome,
+    signal_decider_context: dict[str, Any] | None,
     cost_assumptions: DeciderReplayCostAssumptions,
     gate_mode: str,
     probe_quantity: int,
+    alignment_context_source: str,
 ) -> DeciderReplayTrade:
+    exclusion_reason = _actual_outcome_exclusion_reason(outcome)
     validation = plan_row.validation_payload if isinstance(plan_row.validation_payload, dict) else {}
     traceability = plan_row.traceability_payload if isinstance(plan_row.traceability_payload, dict) else {}
-    persisted_gate = (
-        validation.get('alignment_gate')
-        if isinstance(validation.get('alignment_gate'), dict)
-        else traceability.get('alignment_gate')
-        if isinstance(traceability.get('alignment_gate'), dict)
-        else None
-    )
-    alignment_gate = _replay_alignment_gate(
-        persisted_gate,
-        gate_mode=gate_mode,
-    )
+    persisted_gate = _plan_alignment_gate(plan_row)
+    if persisted_gate:
+        alignment_gate = _replay_alignment_gate(persisted_gate, gate_mode=gate_mode)
+    elif signal_decider_context is not None:
+        short_term = validation.get('short_term') if isinstance(validation.get('short_term'), dict) else {}
+        response_payload = snapshot.response_payload if isinstance(snapshot.response_payload, dict) else {}
+        tactical_action = (
+            traceability.get('tactical_action')
+            or short_term.get('tactical_action')
+            or response_payload.get('tactical_action')
+        )
+        rebuilt_gate = build_signal_decider_alignment_gate(
+            signal_decider_context=signal_decider_context,
+            short_term_entry_quality=(
+                validation.get('short_term_entry_quality')
+                if isinstance(validation.get('short_term_entry_quality'), dict)
+                else None
+            ),
+            tactical_action=(
+                str(tactical_action).strip().lower()
+                if tactical_action is not None
+                else None
+            ),
+            mode=gate_mode,
+        )
+        alignment_gate = _replay_alignment_gate(rebuilt_gate, gate_mode=gate_mode)
+        alignment_gate['evidence_status'] = 'as_of_plan'
+    else:
+        alignment_gate = _replay_alignment_gate(None, gate_mode=gate_mode)
     entry_notional = _safe_decimal(outcome.entry_notional_krw)
-    if entry_notional is None:
-        quantity = _safe_decimal(outcome.entry_filled_quantity)
-        price = _safe_decimal(outcome.entry_average_fill_price)
-        entry_notional = quantity * price if quantity is not None and price is not None else None
-    notional = entry_notional if entry_notional is not None and entry_notional > 0 else cost_assumptions.notional_krw
+    if entry_notional is None or entry_notional <= 0:
+        entry_quantity = _safe_decimal(outcome.entry_filled_quantity)
+        entry_price = _safe_decimal(outcome.entry_average_fill_price)
+        entry_notional = (
+            entry_quantity * entry_price
+            if entry_quantity is not None
+            and entry_quantity > 0
+            and entry_price is not None
+            and entry_price > 0
+            else None
+        )
+    notional = (
+        entry_notional
+        if entry_notional is not None and entry_notional > 0
+        else cost_assumptions.notional_krw
+    )
     gross_pnl = _safe_decimal(outcome.realized_pnl_krw)
     realized_return = _to_float(outcome.realized_return_pct)
     if gross_pnl is None and realized_return is not None:
@@ -564,12 +753,7 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     )
     closed_quantity = _safe_decimal(outcome.closed_quantity)
     open_quantity = _safe_decimal(outcome.open_quantity)
-    outcome_resolved = bool(
-        outcome.lifecycle_status == 'closed'
-        and (closed_quantity or Decimal('0')) > Decimal('0')
-        and open_quantity == Decimal('0')
-        and (gross_pnl is not None or realized_return is not None)
-    )
+    outcome_resolved = exclusion_reason is None
     point_in_time = _build_point_in_time_context(snapshot)
     point_in_time.update(
         {
@@ -583,6 +767,7 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
             'closed_quantity': _to_json_number(closed_quantity),
             'open_quantity': _to_json_number(open_quantity),
             'realized_outcome_available': outcome_resolved,
+            'economic_replay_exclusion_reason': exclusion_reason,
             'signal_decider_alignment': alignment_gate.get('signal_decider_alignment'),
             'alignment_gate_action': alignment_gate.get('alignment_gate_action'),
             'alignment_gate_reason': alignment_gate.get('alignment_gate_reason'),
@@ -590,6 +775,7 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
                 'signal_decider_decision_snapshot_id'
             ),
             'alignment_gate': alignment_gate,
+            'alignment_context_source': alignment_context_source,
         }
     )
     return DeciderReplayTrade(
@@ -614,14 +800,62 @@ def _actual_short_term_outcome_to_wait_conflict_trade(
     )
 
 
+def _plan_alignment_gate(plan_row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
+    validation = plan_row.validation_payload if isinstance(plan_row.validation_payload, dict) else {}
+    traceability = plan_row.traceability_payload if isinstance(plan_row.traceability_payload, dict) else {}
+    short_term = validation.get('short_term') if isinstance(validation.get('short_term'), dict) else {}
+    for candidate in (
+        traceability.get('alignment_gate'),
+        validation.get('alignment_gate'),
+        short_term.get('alignment_gate'),
+    ):
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
+
+
+def _plan_alignment_snapshot_id(plan_row: SignalDeciderExecutionPlanItem) -> int | None:
+    validation = plan_row.validation_payload if isinstance(plan_row.validation_payload, dict) else {}
+    traceability = plan_row.traceability_payload if isinstance(plan_row.traceability_payload, dict) else {}
+    persisted_gate = _plan_alignment_gate(plan_row)
+    for value in (
+        persisted_gate.get('signal_decider_decision_snapshot_id'),
+        persisted_gate.get('decision_snapshot_id'),
+        traceability.get('alignment_signal_decider_decision_snapshot_id'),
+        validation.get('alignment_signal_decider_decision_snapshot_id'),
+    ):
+        resolved = _safe_decimal(value)
+        if resolved is not None and resolved == resolved.to_integral() and resolved > 0:
+            return int(resolved)
+    return None
+
+
+def _snapshot_timestamp(snapshot: SignalDeciderDecisionSnapshot) -> datetime | None:
+    return snapshot.feedback_received_at or snapshot.created_at
+
+
+def _timestamp_not_after(value: datetime | None, cutoff: datetime | None) -> bool:
+    if value is None or cutoff is None:
+        return False
+    if value.tzinfo is None and cutoff.tzinfo is not None:
+        cutoff = cutoff.replace(tzinfo=None)
+    elif value.tzinfo is not None and cutoff.tzinfo is None:
+        value = value.replace(tzinfo=None)
+    return value <= cutoff
+
+
 def _realized_outcome_to_trade(
     *,
     snapshot: SignalDeciderDecisionSnapshot,
     outcome: SignalDeciderRealizedOutcome,
     cost_assumptions: DeciderReplayCostAssumptions,
-) -> DeciderReplayTrade:
+) -> DeciderReplayTrade | None:
+    if str(outcome.outcome_status or '').strip().lower() != 'complete':
+        return None
     return_pct = _to_float(outcome.close_return_pct)
-    gross_pnl = Decimal(str(return_pct or 0)) * cost_assumptions.notional_krw
+    if return_pct is None:
+        return None
+    gross_pnl = Decimal(str(return_pct)) * cost_assumptions.notional_krw
     return DeciderReplayTrade(
         replay_trade_id=f'realized:{outcome.id}',
         snapshot_id=int(snapshot.id),
@@ -643,7 +877,7 @@ def _post_decision_eval_to_trade(
     snapshot: SignalDeciderDecisionSnapshot,
     evaluation: DeciderPostDecisionEvaluation,
     cost_assumptions: DeciderReplayCostAssumptions,
-) -> DeciderReplayTrade:
+) -> DeciderReplayTrade | None:
     entry_price = _to_float(evaluation.entry_price)
     return_pct = None
     if entry_price is not None and entry_price > 0:
@@ -654,8 +888,21 @@ def _post_decision_eval_to_trade(
         elif evaluation.outcome_label == 'stop_hit_before_target' and stop_loss_price is not None:
             return_pct = (stop_loss_price - entry_price) / entry_price
         elif evaluation.outcome_label == 'neither_hit_within_5d':
-            return_pct = 0.0
-    gross_pnl = Decimal(str(return_pct or 0)) * cost_assumptions.notional_krw
+            metadata = _maybe_dict(evaluation.metadata_payload)
+            observed_price_path = _maybe_list(metadata.get('observed_price_path'))
+            final_close = next(
+                (
+                    _to_float(_maybe_dict(item).get('close_price'))
+                    for item in reversed(observed_price_path)
+                    if _to_float(_maybe_dict(item).get('close_price')) is not None
+                ),
+                None,
+            )
+            if final_close is not None and final_close > 0:
+                return_pct = (final_close - entry_price) / entry_price
+    if return_pct is None or not math.isfinite(return_pct):
+        return None
+    gross_pnl = Decimal(str(return_pct)) * cost_assumptions.notional_krw
     return DeciderReplayTrade(
         replay_trade_id=f'post_decision_eval:{evaluation.id}',
         snapshot_id=int(snapshot.id),
@@ -680,15 +927,16 @@ class DeciderReplayRepository:
         market_date_to: date,
         agent_name: str,
         symbols: Sequence[str] | None,
+        policy_versions: Sequence[str] | None = None,
         horizon_days: int,
         cost_assumptions: DeciderReplayCostAssumptions,
-    ) -> list[DeciderReplayTrade]:
+    ) -> DeciderReplayDataset:
         with session_scope() as session:
+            allowed_policy_versions = set(policy_versions or ())
             stmt = select(SignalDeciderDecisionSnapshot).where(
                 SignalDeciderDecisionSnapshot.market_date >= market_date_from,
                 SignalDeciderDecisionSnapshot.market_date <= market_date_to,
                 SignalDeciderDecisionSnapshot.agent_name == agent_name,
-                SignalDeciderDecisionSnapshot.decision_action == 'buy',
             )
             if symbols:
                 stmt = stmt.where(SignalDeciderDecisionSnapshot.symbol.in_(list(symbols)))
@@ -701,9 +949,49 @@ class DeciderReplayRepository:
                     )
                 ).scalars().all()
             )
+            latest_snapshot_by_feedback: dict[int, SignalDeciderDecisionSnapshot] = {}
+            for row in snapshot_rows:
+                if row.feedback_id is None:
+                    continue
+                feedback_id = int(row.feedback_id)
+                current = latest_snapshot_by_feedback.get(feedback_id)
+                if current is None or (row.created_at, int(row.id)) > (
+                    current.created_at,
+                    int(current.id),
+                ):
+                    latest_snapshot_by_feedback[feedback_id] = row
+            latest_snapshot_ids = {
+                int(row.id) for row in latest_snapshot_by_feedback.values()
+            }
+            snapshot_rows = [
+                row
+                for row in snapshot_rows
+                if (
+                    row.feedback_id is None
+                    or int(row.id) in latest_snapshot_ids
+                )
+                and (
+                    not allowed_policy_versions
+                    or row.policy_version in allowed_policy_versions
+                )
+                and row.decision_action == 'buy'
+            ]
             snapshot_ids = [int(row.id) for row in snapshot_rows]
             if not snapshot_ids:
-                return []
+                return DeciderReplayDataset(
+                    trades=(),
+                    source_decision_count=0,
+                    excluded_reason_counts={},
+                    cohort_basis='fixed_horizon_counterfactual',
+                    diagnostics={
+                        'requested_horizon_days': int(horizon_days),
+                        'actual_lifecycle_outcomes_used_for_promotion': False,
+                        'actual_lifecycle_outcome_count': 0,
+                        'actual_lifecycle_eligible_count': 0,
+                        'actual_lifecycle_excluded_count': 0,
+                        'actual_lifecycle_excluded_reason_counts': {},
+                    },
+                )
 
             actual_rows = list(
                 session.execute(
@@ -737,11 +1025,14 @@ class DeciderReplayRepository:
                 ).scalars().all()
             )
 
-            actual_by_snapshot: dict[int, list[SignalDeciderActualExecutionOutcome]] = {}
+            actual_excluded_reason_counts: Counter[str] = Counter()
+            actual_eligible_count = 0
             for row in actual_rows:
-                if row.realized_pnl_krw is None and row.realized_return_pct is None:
-                    continue
-                actual_by_snapshot.setdefault(int(row.decision_snapshot_id), []).append(row)
+                exclusion_reason = _actual_outcome_exclusion_reason(row)
+                if exclusion_reason is None:
+                    actual_eligible_count += 1
+                else:
+                    actual_excluded_reason_counts[exclusion_reason] += 1
             realized_by_snapshot = {
                 int(row.decision_snapshot_id): row
                 for row in realized_rows
@@ -753,55 +1044,54 @@ class DeciderReplayRepository:
             }
 
             trades: list[DeciderReplayTrade] = []
+            excluded_reason_counts: Counter[str] = Counter()
             for snapshot in snapshot_rows:
                 snapshot_id = int(snapshot.id)
-                for actual in actual_by_snapshot.get(snapshot_id, []):
-                    trades.append(
-                        _actual_outcome_to_trade(
-                            snapshot=snapshot,
-                            outcome=actual,
-                            cost_assumptions=cost_assumptions,
-                        )
-                    )
-                if snapshot_id in actual_by_snapshot:
-                    continue
                 realized = realized_by_snapshot.get(snapshot_id)
                 if realized is not None:
-                    trades.append(
-                        _realized_outcome_to_trade(
-                            snapshot=snapshot,
-                            outcome=realized,
-                            cost_assumptions=cost_assumptions,
-                        )
+                    realized_trade = _realized_outcome_to_trade(
+                        snapshot=snapshot,
+                        outcome=realized,
+                        cost_assumptions=cost_assumptions,
                     )
-                    continue
+                    if realized_trade is not None:
+                        trades.append(realized_trade)
+                        continue
                 post_decision = post_decision_by_snapshot.get(snapshot_id)
                 if post_decision is not None:
-                    trades.append(
-                        _post_decision_eval_to_trade(
-                            snapshot=snapshot,
-                            evaluation=post_decision,
-                            cost_assumptions=cost_assumptions,
-                        )
+                    post_decision_trade = _post_decision_eval_to_trade(
+                        snapshot=snapshot,
+                        evaluation=post_decision,
+                        cost_assumptions=cost_assumptions,
                     )
+                    if post_decision_trade is not None:
+                        trades.append(post_decision_trade)
+                        continue
+                    excluded_reason_counts['fixed_horizon_evaluation_not_economic'] += 1
                     continue
-                trades.append(
-                    DeciderReplayTrade(
-                        replay_trade_id=f'snapshot:{snapshot_id}',
-                        snapshot_id=snapshot_id,
-                        agent_name=snapshot.agent_name,
-                        symbol=snapshot.symbol,
-                        market_date=snapshot.market_date,
-                        policy_version=snapshot.policy_version,
-                        baseline_gross_pnl_krw=Decimal('0'),
-                        baseline_return_pct=None,
-                        baseline_notional_krw=cost_assumptions.notional_krw,
-                        outcome_source='decision_snapshot_no_outcome',
-                        point_in_time=_build_point_in_time_context(snapshot),
-                        decision_timestamp=snapshot.feedback_received_at or snapshot.created_at,
-                    )
-                )
-            return sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
+                if realized is not None:
+                    excluded_reason_counts['fixed_horizon_outcome_incomplete_or_non_finite'] += 1
+                else:
+                    excluded_reason_counts['missing_fixed_horizon_outcome'] += 1
+            sorted_trades = tuple(
+                sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
+            )
+            return DeciderReplayDataset(
+                trades=sorted_trades,
+                source_decision_count=len(snapshot_rows),
+                excluded_reason_counts=dict(sorted(excluded_reason_counts.items())),
+                cohort_basis='fixed_horizon_counterfactual',
+                diagnostics={
+                    'requested_horizon_days': int(horizon_days),
+                    'actual_lifecycle_outcomes_used_for_promotion': False,
+                    'actual_lifecycle_outcome_count': len(actual_rows),
+                    'actual_lifecycle_eligible_count': actual_eligible_count,
+                    'actual_lifecycle_excluded_count': len(actual_rows) - actual_eligible_count,
+                    'actual_lifecycle_excluded_reason_counts': dict(
+                        sorted(actual_excluded_reason_counts.items())
+                    ),
+                },
+            )
 
     def list_wait_conflict_gate_trades(
         self,
@@ -812,7 +1102,7 @@ class DeciderReplayRepository:
         cost_assumptions: DeciderReplayCostAssumptions,
         gate_mode: str,
         probe_quantity: int,
-    ) -> list[DeciderReplayTrade]:
+    ) -> DeciderReplayDataset:
         with session_scope() as session:
             stmt = (
                 select(
@@ -846,21 +1136,119 @@ class DeciderReplayRepository:
                 stmt = stmt.where(SignalDeciderActualExecutionOutcome.symbol.in_(list(symbols)))
             rows = list(session.execute(stmt).all())
             if not rows:
-                return []
+                return DeciderReplayDataset(
+                    trades=(),
+                    source_decision_count=0,
+                    excluded_reason_counts={},
+                    cohort_basis='complete_closed_actual_execution',
+                    diagnostics={'actual_lifecycle_outcome_count': 0},
+                )
+
+            excluded_reason_counts: Counter[str] = Counter()
+            for row in rows:
+                exclusion_reason = _actual_outcome_exclusion_reason(row[0])
+                if exclusion_reason is not None:
+                    excluded_reason_counts[exclusion_reason] += 1
+
+            rows_requiring_alignment_fallback = [
+                row for row in rows if not _plan_alignment_gate(row[1])
+            ]
+            source_dates = sorted(
+                {row[1].source_market_date for row in rows_requiring_alignment_fallback}
+            )
+            signal_symbols = sorted(
+                {row[0].symbol for row in rows_requiring_alignment_fallback}
+            )
+            signal_stmt = (
+                select(SignalDeciderDecisionSnapshot)
+                .where(
+                    SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                    SignalDeciderDecisionSnapshot.market_date.in_(source_dates),
+                    SignalDeciderDecisionSnapshot.symbol.in_(signal_symbols),
+                )
+                .order_by(
+                    SignalDeciderDecisionSnapshot.market_date.asc(),
+                    SignalDeciderDecisionSnapshot.symbol.asc(),
+                    SignalDeciderDecisionSnapshot.feedback_received_at.desc(),
+                    SignalDeciderDecisionSnapshot.created_at.desc(),
+                    SignalDeciderDecisionSnapshot.id.desc(),
+                )
+            )
+            signal_rows = (
+                list(session.execute(signal_stmt).scalars().all())
+                if rows_requiring_alignment_fallback
+                else []
+            )
+            signal_by_id = {int(signal_row.id): signal_row for signal_row in signal_rows}
+            signal_by_context: dict[tuple[date, str], list[SignalDeciderDecisionSnapshot]] = {}
+            for signal_row in signal_rows:
+                key = (signal_row.market_date, signal_row.symbol)
+                signal_by_context.setdefault(key, []).append(signal_row)
 
             trades: list[DeciderReplayTrade] = []
+            alignment_context_source_counts: Counter[str] = Counter()
             for outcome, plan_row, snapshot in rows:
+                persisted_gate = _plan_alignment_gate(plan_row)
+                signal_context = None
+                if persisted_gate:
+                    alignment_context_source = 'persisted_plan_alignment_gate'
+                else:
+                    alignment_snapshot_id = _plan_alignment_snapshot_id(plan_row)
+                    signal_row = (
+                        signal_by_id.get(alignment_snapshot_id)
+                        if alignment_snapshot_id is not None
+                        else None
+                    )
+                    if signal_row is not None:
+                        signal_context = build_signal_decider_alignment_context(signal_row)
+                        alignment_context_source = 'persisted_plan_alignment_snapshot_id'
+                    else:
+                        plan_cutoff = plan_row.created_at
+                        eligible_signal_rows = [
+                            row
+                            for row in signal_by_context.get(
+                                (plan_row.source_market_date, outcome.symbol),
+                                [],
+                            )
+                            if _timestamp_not_after(_snapshot_timestamp(row), plan_cutoff)
+                        ]
+                        fallback_row = eligible_signal_rows[0] if eligible_signal_rows else None
+                        signal_context = build_signal_decider_alignment_context(fallback_row)
+                        alignment_context_source = (
+                            'legacy_as_of_plan_created_at'
+                            if fallback_row is not None
+                            else 'no_point_in_time_alignment_context'
+                        )
+                alignment_context_source_counts[alignment_context_source] += 1
                 trades.append(
                     _actual_short_term_outcome_to_wait_conflict_trade(
                         snapshot=snapshot,
                         plan_row=plan_row,
                         outcome=outcome,
+                        signal_decider_context=signal_context,
                         cost_assumptions=cost_assumptions,
                         gate_mode=gate_mode,
                         probe_quantity=probe_quantity,
+                        alignment_context_source=alignment_context_source,
                     )
                 )
-            return sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
+            return DeciderReplayDataset(
+                trades=tuple(
+                    sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
+                ),
+                source_decision_count=len(rows),
+                excluded_reason_counts=dict(sorted(excluded_reason_counts.items())),
+                cohort_basis='complete_closed_actual_execution',
+                diagnostics={
+                    'actual_lifecycle_outcome_count': len(rows),
+                    'actual_lifecycle_eligible_count': (
+                        len(rows) - sum(excluded_reason_counts.values())
+                    ),
+                    'alignment_context_source_counts': dict(
+                        sorted(alignment_context_source_counts.items())
+                    ),
+                },
+            )
 
 
 def _normalize_rule_config(rule_config: dict[str, Any] | str | None) -> dict[str, Any]:
@@ -873,19 +1261,190 @@ def _normalize_rule_config(rule_config: dict[str, Any] | str | None) -> dict[str
             raise ValueError(f'rule_config must be valid JSON: {exc.msg}') from exc
         if not isinstance(parsed, dict):
             raise ValueError('rule_config JSON must be an object')
-        return parsed
+        rule_config = parsed
     if not isinstance(rule_config, dict):
         raise ValueError('rule_config must be a dict or JSON object string')
+    unexpected_config_keys = set(rule_config) - {
+        'schema_version',
+        'candidate_policy_version',
+        'match',
+        'name',
+        'rules',
+        'predicates',
+    }
+    if unexpected_config_keys:
+        raise ValueError(
+            'rule_config contains unsupported fields: '
+            + ', '.join(sorted(str(key) for key in unexpected_config_keys))
+        )
+    schema_version = rule_config.get('schema_version')
+    if schema_version not in {None, DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION}:
+        raise ValueError(
+            f'rule_config.schema_version must be {DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION}'
+        )
+    if 'rules' in rule_config and 'predicates' in rule_config:
+        raise ValueError('rule_config must define either rules or predicates, not both')
+    if 'rules' in rule_config and not isinstance(rule_config.get('rules'), list):
+        raise ValueError('rule_config.rules must be a list')
+    if 'predicates' in rule_config and not isinstance(rule_config.get('predicates'), list):
+        raise ValueError('rule_config.predicates must be a list')
+
+    for rule_index, rule in enumerate(_as_rule_list(rule_config), start=1):
+        if not isinstance(rule, dict):
+            raise ValueError(f'rule_config rule {rule_index} must be an object')
+        unexpected_rule_keys = set(rule) - {'name', 'match', 'predicates', 'all', 'any'}
+        if unexpected_rule_keys:
+            raise ValueError(
+                f'rule_config rule {rule_index} contains unsupported fields: '
+                + ', '.join(sorted(str(key) for key in unexpected_rule_keys))
+            )
+        predicate_keys = [key for key in ('predicates', 'all', 'any') if key in rule]
+        if len(predicate_keys) != 1:
+            raise ValueError(
+                f'rule_config rule {rule_index} must define exactly one of predicates, all, or any'
+            )
+        match_mode = str(rule.get('match') or ('any' if 'any' in rule else 'all')).strip().lower()
+        if match_mode not in {'all', 'any'}:
+            raise ValueError(f'rule_config rule {rule_index} match must be all or any')
+        predicates = rule.get(predicate_keys[0])
+        if not isinstance(predicates, list) or not predicates:
+            raise ValueError(f'rule_config rule {rule_index} predicates must be a non-empty list')
+        for predicate_index, predicate in enumerate(predicates, start=1):
+            _validate_predicate_config(
+                predicate,
+                location=f'rule_config rule {rule_index} predicate {predicate_index}',
+            )
     return rule_config
+
+
+SUPPORTED_PREDICATE_TYPES = {
+    'trigger_price_drift',
+    'confidence',
+    'risk_flag',
+    'liquidity_bucket',
+    'factor_score_bucket',
+    'source_availability',
+    'field',
+}
+SUPPORTED_PREDICATE_OPERATORS = {
+    '==',
+    '!=',
+    'equals',
+    'not_equals',
+    '<',
+    '<=',
+    '>',
+    '>=',
+    'exists',
+    'present',
+    'missing',
+    'not_exists',
+    'contains',
+    'contains_any',
+    'contains_all',
+    'in',
+    'not_in',
+}
+
+
+def _validate_predicate_config(predicate: Any, *, location: str) -> None:
+    if not isinstance(predicate, dict):
+        raise ValueError(f'{location} must be an object')
+    unexpected_predicate_keys = set(predicate) - {
+        'type',
+        'field',
+        'path',
+        'factor',
+        'op',
+        'value',
+        'values',
+        'match',
+        'max_below_trigger_pct',
+        'min_score_10',
+    }
+    if unexpected_predicate_keys:
+        raise ValueError(
+            f'{location} contains unsupported fields: '
+            + ', '.join(sorted(str(key) for key in unexpected_predicate_keys))
+        )
+    predicate_type = str(predicate.get('type') or '').strip().lower()
+    if not predicate_type and predicate.get('field'):
+        predicate_type = 'field'
+    if predicate_type not in SUPPORTED_PREDICATE_TYPES:
+        raise ValueError(f'{location} has unsupported predicate type {predicate_type or "missing"}')
+
+    operator = str(predicate.get('op') or '').strip().lower()
+    if 'op' in predicate and operator not in SUPPORTED_PREDICATE_OPERATORS:
+        raise ValueError(f'{location} has unsupported operator {operator or "missing"}')
+
+    numeric_operators = {'==', '!=', 'equals', 'not_equals', '<', '<=', '>', '>='}
+    if predicate_type in {'trigger_price_drift', 'confidence'} and operator and operator not in numeric_operators:
+        raise ValueError(f'{location} operator {operator} is invalid for a numeric predicate')
+    if predicate_type in {'liquidity_bucket', 'factor_score_bucket'} and operator and operator not in {'in', 'not_in'}:
+        raise ValueError(f'{location} operator {operator} is invalid for a bucket predicate')
+    if predicate_type == 'risk_flag' and operator and operator not in {
+        'contains',
+        'contains_any',
+        'contains_all',
+    }:
+        raise ValueError(f'{location} operator {operator} is invalid for a risk-flag predicate')
+    if 'match' in predicate and str(predicate.get('match') or '').strip().lower() not in {'all', 'any'}:
+        raise ValueError(f'{location} match must be all or any')
+
+    if predicate_type in {'field', 'source_availability'} and not _normalize_text(
+        predicate.get('field') or predicate.get('path')
+    ):
+        raise ValueError(f'{location} requires field or path')
+    if predicate_type == 'factor_score_bucket' and not _normalize_text(predicate.get('factor')):
+        raise ValueError(f'{location} requires factor')
+    if predicate_type in {'risk_flag', 'liquidity_bucket', 'factor_score_bucket'} and not _values_from_predicate(
+        predicate
+    ):
+        raise ValueError(f'{location} requires value or values')
+
+    if predicate_type == 'trigger_price_drift':
+        if 'value' in predicate and 'max_below_trigger_pct' in predicate:
+            raise ValueError(f'{location} must define only one trigger threshold')
+        threshold = predicate.get('value', predicate.get('max_below_trigger_pct'))
+        if _to_float(threshold) is None:
+            raise ValueError(f'{location} requires a finite numeric threshold')
+    if predicate_type == 'confidence':
+        if 'value' in predicate and 'min_score_10' in predicate:
+            raise ValueError(f'{location} must define only one confidence threshold')
+        threshold = predicate.get('value', predicate.get('min_score_10'))
+        if _to_float(threshold) is None:
+            raise ValueError(f'{location} requires a finite numeric threshold')
+    if predicate_type in {'field', 'source_availability'}:
+        effective_operator = operator or (
+            'in'
+            if isinstance(predicate.get('values'), list)
+            else '=='
+            if 'value' in predicate
+            else 'exists'
+        )
+        if effective_operator in {'<', '<=', '>', '>='}:
+            if _to_float(predicate.get('value')) is None:
+                raise ValueError(f'{location} numeric comparison requires a finite value')
+        elif effective_operator in {'in', 'not_in', 'contains', 'contains_any', 'contains_all'}:
+            if not _values_from_predicate(predicate):
+                raise ValueError(f'{location} operator {effective_operator} requires value or values')
+        elif effective_operator not in {'exists', 'present', 'missing', 'not_exists'} and 'value' not in predicate:
+            raise ValueError(f'{location} operator {effective_operator} requires value')
 
 
 def _as_rule_list(rule_config: dict[str, Any]) -> list[dict[str, Any]]:
     rules = rule_config.get('rules')
     if isinstance(rules, list):
-        return [rule for rule in rules if isinstance(rule, dict)]
+        return list(rules)
     predicates = rule_config.get('predicates')
     if isinstance(predicates, list):
-        return [{'name': rule_config.get('name') or 'candidate_rule', 'predicates': predicates}]
+        return [
+            {
+                'name': rule_config.get('name') or 'candidate_rule',
+                'match': rule_config.get('match') or 'all',
+                'predicates': predicates,
+            }
+        ]
     return []
 
 
@@ -972,24 +1531,30 @@ def _evaluate_predicate(predicate: dict[str, Any], point_in_time: dict[str, Any]
     if predicate_type == 'risk_flag':
         expected = [str(item) for item in _values_from_predicate(predicate)]
         match_mode = str(predicate.get('match') or 'any').lower()
+        op = str(
+            predicate.get('op')
+            or ('contains_all' if match_mode == 'all' else 'contains_any')
+        )
         matched = _compare_values(
             point_in_time.get('risk_flags') or [],
-            op='contains_all' if match_mode == 'all' else 'contains_any',
+            op=op,
             values=expected,
         )
         return PredicateResult(matched=matched, reason=f'risk_flags contains {",".join(expected)}')
 
     if predicate_type == 'liquidity_bucket':
         values = [str(item) for item in _values_from_predicate(predicate)]
-        matched = _compare_values(point_in_time.get('liquidity_bucket'), op='in', values=values)
-        return PredicateResult(matched=matched, reason=f'liquidity_bucket in {",".join(values)}')
+        op = str(predicate.get('op') or 'in')
+        matched = _compare_values(point_in_time.get('liquidity_bucket'), op=op, values=values)
+        return PredicateResult(matched=matched, reason=f'liquidity_bucket {op} {",".join(values)}')
 
     if predicate_type == 'factor_score_bucket':
         factor = str(predicate.get('factor') or '').strip()
         bucket = _maybe_dict(point_in_time.get('factor_score_buckets')).get(factor)
         values = [str(item) for item in _values_from_predicate(predicate)]
-        matched = _compare_values(bucket, op='in', values=values)
-        return PredicateResult(matched=matched, reason=f'factor_score_bucket[{factor}] in {",".join(values)}')
+        op = str(predicate.get('op') or 'in')
+        matched = _compare_values(bucket, op=op, values=values)
+        return PredicateResult(matched=matched, reason=f'factor_score_bucket[{factor}] {op} {",".join(values)}')
 
     if predicate_type == 'source_availability':
         path = _normalize_text(predicate.get('path') or predicate.get('field'))
@@ -1046,10 +1611,23 @@ def _trade_net_pnl(trade: DeciderReplayTrade, cost_assumptions: DeciderReplayCos
     return trade.baseline_gross_pnl_krw - _estimated_round_trip_cost(trade, cost_assumptions)
 
 
-def _win_rate(trades: Sequence[DeciderReplayTrade]) -> float | None:
+def _win_rate(
+    trades: Sequence[DeciderReplayTrade],
+    *,
+    cost_assumptions: DeciderReplayCostAssumptions | None = None,
+) -> float | None:
     if not trades:
         return None
-    winners = sum(1 for trade in trades if trade.baseline_gross_pnl_krw > 0)
+    winners = sum(
+        1
+        for trade in trades
+        if (
+            _trade_net_pnl(trade, cost_assumptions)
+            if cost_assumptions is not None
+            else trade.baseline_gross_pnl_krw
+        )
+        > 0
+    )
     return round(winners / len(trades), 6)
 
 
@@ -1058,6 +1636,21 @@ def _average_return(trades: Sequence[DeciderReplayTrade]) -> float | None:
         float(trade.baseline_return_pct)
         for trade in trades
         if trade.baseline_return_pct is not None
+    ]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 6)
+
+
+def _estimated_net_average_return(
+    trades: Sequence[DeciderReplayTrade],
+    *,
+    cost_assumptions: DeciderReplayCostAssumptions,
+) -> float | None:
+    values = [
+        float(_trade_net_pnl(trade, cost_assumptions) / trade.baseline_notional_krw)
+        for trade in trades
+        if trade.baseline_notional_krw > 0
     ]
     if not values:
         return None
@@ -1097,7 +1690,17 @@ def _metric_block(
         'gross_pnl_krw': _to_json_number(_round_money(gross_pnl)),
         'estimated_net_pnl_krw': _to_json_number(_round_money(net_pnl)),
         'win_rate': _win_rate(trades),
+        'gross_win_rate': _win_rate(trades),
+        'estimated_net_win_rate': _win_rate(
+            trades,
+            cost_assumptions=cost_assumptions,
+        ),
         'average_return_pct': _average_return(trades),
+        'gross_average_return_pct': _average_return(trades),
+        'estimated_net_average_return_pct': _estimated_net_average_return(
+            trades,
+            cost_assumptions=cost_assumptions,
+        ),
         'max_drawdown_proxy_krw': _to_json_number(_round_money(max_drawdown)) if max_drawdown is not None else None,
     }
 
@@ -1149,9 +1752,34 @@ def _sort_examples(examples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def _profitability_markdown_lines(
+    *,
+    request: dict[str, Any],
+    metadata: dict[str, Any],
+) -> list[str]:
+    costs = _maybe_dict(request.get('cost_assumptions'))
+    gate = _maybe_dict(metadata.get('promotion_cost_gate'))
+    gate_status = _normalize_text(gate.get('status')) or 'unknown'
+    gate_reason = _normalize_text(gate.get('reason'))
+    gate_text = f'- Promotion cost gate: {gate_status}'
+    if gate_reason:
+        gate_text = f'{gate_text} ({gate_reason})'
+    return [
+        f'- Profitability basis: {metadata.get("profitability_basis") or "unknown"}',
+        (
+            '- Per-side cost assumptions: '
+            f'fee_bps={costs.get("fee_bps")}, '
+            f'slippage_bps={costs.get("slippage_bps")}'
+        ),
+        f'- Fallback notional assumption KRW: {costs.get("notional_krw")}',
+        gate_text,
+    ]
+
+
 def _build_markdown_summary(
     *,
     request: dict[str, Any],
+    metadata: dict[str, Any],
     summary: dict[str, Any],
     examples: Sequence[dict[str, Any]],
 ) -> str:
@@ -1160,6 +1788,7 @@ def _build_markdown_summary(
         '',
         f'- Window: {request["market_date_from"]}..{request["market_date_to"]}',
         f'- Agent: {request["agent_name"]}',
+        *_profitability_markdown_lines(request=request, metadata=metadata),
         f'- Baseline trades: {summary["baseline_trade_count"]}',
         f'- Candidate trades: {summary["candidate_trade_count"]}',
         f'- Skipped buys: {summary["skipped_buys"]}',
@@ -1239,6 +1868,7 @@ def _unresolved_wait_conflict_example(trade: DeciderReplayTrade) -> dict[str, An
 def _build_wait_conflict_markdown_summary(
     *,
     request: dict[str, Any],
+    metadata: dict[str, Any],
     summary: dict[str, Any],
     examples: Sequence[dict[str, Any]],
     weeks: Sequence[dict[str, Any]],
@@ -1253,6 +1883,7 @@ def _build_wait_conflict_markdown_summary(
         '- Baseline source: actual short-term execution outcomes only',
         f'- Candidate gate mode: {request["candidate_gate_mode"]}',
         f'- Replay probe quantity: {request["probe_quantity"]}',
+        *_profitability_markdown_lines(request=request, metadata=metadata),
         f'- Baseline trades: {summary["baseline_trade_count"]}',
         f'- Candidate trades: {summary["candidate_trade_count"]}',
         f'- Blocked candidates: {summary["blocked_candidate_count"]}',
@@ -1325,6 +1956,42 @@ def _build_wait_conflict_markdown_summary(
     return '\n'.join(lines)
 
 
+def _coerce_replay_dataset(
+    value: DeciderReplayDataset | Sequence[DeciderReplayTrade],
+    *,
+    cohort_basis: str,
+) -> DeciderReplayDataset:
+    if isinstance(value, DeciderReplayDataset):
+        return value
+    trades = tuple(value)
+    return DeciderReplayDataset(
+        trades=trades,
+        source_decision_count=len(trades),
+        excluded_reason_counts={},
+        cohort_basis=cohort_basis,
+        diagnostics={},
+    )
+
+
+def _dataset_coverage(dataset: DeciderReplayDataset) -> dict[str, Any]:
+    excluded_count = sum(dataset.excluded_reason_counts.values())
+    denominator = dataset.source_decision_count
+    economic_count = sum(1 for trade in dataset.trades if trade.outcome_resolved)
+    return {
+        'source_decision_count': denominator,
+        'economic_cohort_count': economic_count,
+        'censored_or_excluded_count': excluded_count,
+        'economic_coverage_ratio': (
+            round(economic_count / denominator, 6)
+            if denominator > 0
+            else None
+        ),
+        'excluded_reason_counts': dict(dataset.excluded_reason_counts),
+        'cohort_basis': dataset.cohort_basis,
+        **dataset.diagnostics,
+    }
+
+
 class DeciderReplayService:
     def __init__(self, *, repository: DeciderReplayRepository | None = None) -> None:
         self.repository = repository or DeciderReplayRepository()
@@ -1337,6 +2004,7 @@ class DeciderReplayService:
         agent_name: str,
         rule_config: dict[str, Any] | str | None,
         symbols: Sequence[str] | str | None = None,
+        policy_versions: Sequence[str] | str | None = None,
         fee_bps: Decimal | float | int | str = Decimal('0'),
         slippage_bps: Decimal | float | int | str = Decimal('0'),
         notional_krw: Decimal | float | int | str = DEFAULT_REPLAY_NOTIONAL_KRW,
@@ -1349,6 +2017,7 @@ class DeciderReplayService:
             raise ValueError('market_date_from must be on or before market_date_to')
         normalized_agent = _normalize_agent_name(agent_name)
         normalized_symbols = _normalize_symbols(symbols)
+        normalized_policy_versions = _normalize_policy_versions(policy_versions)
         resolved_costs = DeciderReplayCostAssumptions(
             fee_bps=_normalize_non_negative_decimal(fee_bps, name='fee_bps'),
             slippage_bps=_normalize_non_negative_decimal(slippage_bps, name='slippage_bps'),
@@ -1359,14 +2028,19 @@ class DeciderReplayService:
         resolved_horizon_days = max(1, int(horizon_days))
         resolved_top_examples_limit = max(0, int(top_examples_limit))
         resolved_rule_config = _normalize_rule_config(rule_config)
-        trades = self.repository.list_replay_trades(
-            market_date_from=normalized_from,
-            market_date_to=normalized_to,
-            agent_name=normalized_agent,
-            symbols=normalized_symbols or None,
-            horizon_days=resolved_horizon_days,
-            cost_assumptions=resolved_costs,
+        dataset = _coerce_replay_dataset(
+            self.repository.list_replay_trades(
+                market_date_from=normalized_from,
+                market_date_to=normalized_to,
+                agent_name=normalized_agent,
+                symbols=normalized_symbols or None,
+                policy_versions=normalized_policy_versions or None,
+                horizon_days=resolved_horizon_days,
+                cost_assumptions=resolved_costs,
+            ),
+            cohort_basis='fixed_horizon_counterfactual',
         )
+        trades = list(dataset.trades)
 
         skipped: list[tuple[DeciderReplayTrade, RuleEvaluationResult]] = []
         kept: list[DeciderReplayTrade] = []
@@ -1391,12 +2065,26 @@ class DeciderReplayService:
         )[:resolved_top_examples_limit]
         gross_delta = _safe_decimal_or_zero(candidate['gross_pnl_krw']) - _safe_decimal_or_zero(baseline['gross_pnl_krw'])
         net_delta = _safe_decimal_or_zero(candidate['estimated_net_pnl_krw']) - _safe_decimal_or_zero(baseline['estimated_net_pnl_krw'])
+        gross_win_rate_delta = _delta(candidate.get('gross_win_rate'), baseline.get('gross_win_rate'))
+        net_win_rate_delta = _delta(
+            candidate.get('estimated_net_win_rate'),
+            baseline.get('estimated_net_win_rate'),
+        )
+        gross_average_return_delta = _delta(
+            candidate.get('gross_average_return_pct'),
+            baseline.get('gross_average_return_pct'),
+        )
+        net_average_return_delta = _delta(
+            candidate.get('estimated_net_average_return_pct'),
+            baseline.get('estimated_net_average_return_pct'),
+        )
         drawdown_delta = _delta(candidate.get('max_drawdown_proxy_krw'), baseline.get('max_drawdown_proxy_krw'))
         request = {
             'market_date_from': normalized_from.isoformat(),
             'market_date_to': normalized_to.isoformat(),
             'agent_name': normalized_agent,
             'symbols': normalized_symbols,
+            'policy_versions': normalized_policy_versions,
             'horizon_days': resolved_horizon_days,
             'rule_config': resolved_rule_config,
             'cost_assumptions': {
@@ -1412,22 +2100,49 @@ class DeciderReplayService:
             'skipped_buys': len(skipped),
             'skipped_winners': sum(1 for trade, _ in skipped if trade.baseline_gross_pnl_krw > 0),
             'avoided_losers': sum(1 for trade, _ in skipped if trade.baseline_gross_pnl_krw < 0),
+            'skipped_net_winners': sum(
+                1
+                for trade, _ in skipped
+                if _trade_net_pnl(trade, resolved_costs) > 0
+            ),
+            'avoided_net_losers': sum(
+                1
+                for trade, _ in skipped
+                if _trade_net_pnl(trade, resolved_costs) < 0
+            ),
             'gross_pnl_delta_krw': _to_json_number(_round_money(gross_delta)),
             'estimated_net_pnl_delta_krw': _to_json_number(_round_money(net_delta)),
-            'win_rate_delta': _delta(candidate.get('win_rate'), baseline.get('win_rate')),
-            'average_return_delta': _delta(candidate.get('average_return_pct'), baseline.get('average_return_pct')),
+            'win_rate_delta': gross_win_rate_delta,
+            'average_return_delta': gross_average_return_delta,
+            'gross_win_rate_delta': gross_win_rate_delta,
+            'estimated_net_win_rate_delta': net_win_rate_delta,
+            'gross_average_return_delta': gross_average_return_delta,
+            'estimated_net_average_return_delta': net_average_return_delta,
             'max_drawdown_proxy_delta_krw': drawdown_delta,
             'baseline': baseline,
             'candidate': candidate,
             'outcome_sources': _count_by_key(trades, key='outcome_source'),
+            'coverage': _dataset_coverage(dataset),
+            'promotion_metrics': {
+                'basis': 'estimated_net',
+                'estimated_net_pnl_delta_krw': _to_json_number(_round_money(net_delta)),
+                'estimated_net_win_rate_delta': net_win_rate_delta,
+                'estimated_net_average_return_delta': net_average_return_delta,
+            },
         }
+        profitability_metadata = _replay_profitability_metadata(
+            resolved_costs,
+            cohort_basis=dataset.cohort_basis,
+        )
         markdown_summary = _build_markdown_summary(
             request=request,
+            metadata=profitability_metadata,
             summary=summary,
             examples=examples,
         )
         return {
             'schema_version': DECIDER_REPLAY_SCHEMA_VERSION,
+            'metadata': profitability_metadata,
             'request': request,
             'summary': summary,
             'examples': examples,
@@ -1476,14 +2191,18 @@ class DeciderReplayService:
         if resolved_costs.notional_krw <= 0:
             raise ValueError('notional_krw must be > 0')
         resolved_top_examples_limit = max(0, int(top_examples_limit))
-        trades = self.repository.list_wait_conflict_gate_trades(
-            market_date_from=normalized_from,
-            market_date_to=normalized_to,
-            symbols=normalized_symbols or None,
-            cost_assumptions=resolved_costs,
-            gate_mode=resolved_gate_mode,
-            probe_quantity=resolved_probe_quantity,
+        dataset = _coerce_replay_dataset(
+            self.repository.list_wait_conflict_gate_trades(
+                market_date_from=normalized_from,
+                market_date_to=normalized_to,
+                symbols=normalized_symbols or None,
+                cost_assumptions=resolved_costs,
+                gate_mode=resolved_gate_mode,
+                probe_quantity=resolved_probe_quantity,
+            ),
+            cohort_basis='complete_closed_actual_execution',
         )
+        trades = list(dataset.trades)
 
         def summarize(scope: Sequence[DeciderReplayTrade]) -> dict[str, Any]:
             resolved = [trade for trade in scope if trade.outcome_resolved]
@@ -1648,11 +2367,27 @@ class DeciderReplayService:
             if wait_conflict_total > 0
             else None
         )
+        profitability_metadata = _replay_profitability_metadata(
+            resolved_costs,
+            cohort_basis=dataset.cohort_basis,
+        )
+        promotion_cost_gate = _maybe_dict(
+            profitability_metadata.get('promotion_cost_gate')
+        )
         promotion_thresholds = {
             'minimum_completed_weeks': DEFAULT_WAIT_CONFLICT_COMPLETED_WEEKS,
             'minimum_resolved_wait_conflicts': 20,
+            'minimum_fee_bps': _to_json_number(
+                MIN_PROMOTION_FEE_BPS,
+                places='0.000001',
+            ),
+            'minimum_slippage_bps': _to_json_number(
+                MIN_PROMOTION_SLIPPAGE_BPS,
+                places='0.000001',
+            ),
             'require_positive_net_pnl_delta': True,
             'require_avoided_losses_exceed_skipped_winners': True,
+            'require_minimum_cost_assumptions': True,
             'maximum_unresolved_ratio': 0.25,
             'manual_approval_required': True,
         }
@@ -1669,6 +2404,7 @@ class DeciderReplayService:
                 unresolved_ratio is not None
                 and unresolved_ratio <= Decimal(str(promotion_thresholds['maximum_unresolved_ratio']))
             ),
+            'minimum_cost_assumptions_met': promotion_cost_gate.get('eligible') is True,
         }
         evidence_threshold_met = all(promotion_checks.values())
         promotion_readiness = {
@@ -1683,10 +2419,23 @@ class DeciderReplayService:
         summary['completed_week_count'] = completed_week_count
         summary['resolved_wait_conflict_count'] = resolved_wait_conflict_count
         summary['unresolved_wait_conflict_count'] = unresolved_wait_conflict_count
+        summary['coverage'] = _dataset_coverage(dataset)
+        summary['promotion_metrics'] = {
+            'basis': 'estimated_net',
+            'estimated_net_pnl_delta_krw': summary['estimated_net_pnl_delta_krw'],
+            'estimated_net_win_rate_delta': _delta(
+                summary['candidate'].get('estimated_net_win_rate'),
+                summary['baseline'].get('estimated_net_win_rate'),
+            ),
+            'estimated_net_average_return_delta': _delta(
+                summary['candidate'].get('estimated_net_average_return_pct'),
+                summary['baseline'].get('estimated_net_average_return_pct'),
+            ),
+        }
         summary['empty_data_reason'] = (
             'no_actual_short_term_entry_fills_in_range'
-            if not trades
-            else 'no_resolved_actual_short_term_execution_outcomes_in_range'
+            if dataset.source_decision_count == 0
+            else 'no_complete_closed_actual_execution_outcomes_in_range'
             if summary['baseline_trade_count'] == 0
             else None
         )
@@ -1720,9 +2469,12 @@ class DeciderReplayService:
             'realized_candidate_count': summary['baseline_trade_count'],
             'unresolved_open_candidate_count': summary['unresolved_open_candidate_count'],
             'missing_alignment_evidence_count': summary['missing_alignment_evidence_count'],
+            'economic_cohort_basis': dataset.cohort_basis,
+            'excluded_reason_counts': dict(dataset.excluded_reason_counts),
         }
         markdown_summary = _build_wait_conflict_markdown_summary(
             request=request,
+            metadata=profitability_metadata,
             summary=summary,
             examples=examples,
             weeks=weeks,
@@ -1731,6 +2483,7 @@ class DeciderReplayService:
         )
         return {
             'schema_version': WAIT_CONFLICT_GATE_REPLAY_SCHEMA_VERSION,
+            'metadata': profitability_metadata,
             'request': request,
             'summary': summary,
             'evidence': evidence,

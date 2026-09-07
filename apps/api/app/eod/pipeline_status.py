@@ -29,6 +29,8 @@ from app.db_models import (
     DailyUnifiedValueFactorResult,
     DailyValueFactorResult,
     ExternalNewsItem,
+    ExternalNewsItemClassification,
+    ExternalNewsItemSymbol,
     SignalDeciderDecisionSnapshot,
     Symbol,
 )
@@ -53,6 +55,10 @@ from app.eod.run_stage_support import (
     get_run_metadata,
     resolve_run_updated_at,
     select_preferred_eod_run,
+)
+from app.external_news.classifier import (
+    CLASSIFIER_VERSION,
+    external_news_classification_has_schema_contract,
 )
 from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
@@ -319,28 +325,99 @@ def _market_date_utc_bounds(market_date: str) -> tuple[datetime, datetime]:
 def _load_external_news_counts(*, market_date: str) -> dict[str, Any]:
     start, end = _market_date_utc_bounds(market_date)
     with session_scope() as session:
-        item_count, symbol_count, latest_collected_at = session.execute(
+        rows = session.execute(
             select(
-                func.count(ExternalNewsItem.id),
-                func.count(func.distinct(ExternalNewsItem.symbol_id)),
-                func.max(ExternalNewsItem.collected_at),
+                ExternalNewsItem.id,
+                ExternalNewsItemSymbol.symbol_id,
+                ExternalNewsItemSymbol.associated_at,
+                ExternalNewsItem.payload,
             )
-            .where(ExternalNewsItem.collected_at >= start)
-            .where(ExternalNewsItem.collected_at < end)
-        ).one()
-    # Status reads are used by cron and health endpoints; avoid large JSON
-    # classification scans here. The pipeline run result is the source of truth for enrichment.
-    item_count = int(item_count or 0)
-    contract_classified_count = item_count
+            .join(
+                ExternalNewsItemSymbol,
+                ExternalNewsItemSymbol.external_news_item_id == ExternalNewsItem.id,
+            )
+            .where(ExternalNewsItemSymbol.associated_at >= start)
+            .where(ExternalNewsItemSymbol.associated_at < end)
+        ).all()
+        item_ids = {int(row.id) for row in rows}
+        classification_rows = (
+            session.execute(
+                select(
+                    ExternalNewsItemClassification.id,
+                    ExternalNewsItemClassification.external_news_item_id,
+                    ExternalNewsItemClassification.classifier_version,
+                    ExternalNewsItemClassification.classified_at,
+                    ExternalNewsItemClassification.classification_payload,
+                ).where(
+                    ExternalNewsItemClassification.external_news_item_id.in_(item_ids)
+                ).order_by(
+                    ExternalNewsItemClassification.external_news_item_id,
+                    ExternalNewsItemClassification.classified_at.desc(),
+                    ExternalNewsItemClassification.id.desc(),
+                )
+            ).all()
+            if item_ids
+            else []
+        )
+    symbol_ids = {int(row.symbol_id) for row in rows}
+    contract_classified_ids: set[int] = set()
+    legacy_classified_ids: set[int] = set()
+    outdated_classified_ids: set[int] = set()
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        classification = payload.get('classification')
+        # Embedded classifier output has no trustworthy observation timestamp;
+        # report it as legacy until enrichment creates a timestamped sidecar.
+        if isinstance(classification, dict) and classification:
+            legacy_classified_ids.add(int(row.id))
+    latest_classification_rows: dict[int, Any] = {}
+    latest_current_classification_rows: dict[int, Any] = {}
+    for row in classification_rows:
+        item_id = int(row.external_news_item_id)
+        latest_classification_rows.setdefault(item_id, row)
+        if row.classifier_version == CLASSIFIER_VERSION:
+            latest_current_classification_rows.setdefault(item_id, row)
+        else:
+            outdated_classified_ids.add(item_id)
+    for item_id, row in latest_current_classification_rows.items():
+        classification = row.classification_payload
+        if (
+            isinstance(classification, dict)
+            and row.classifier_version == CLASSIFIER_VERSION
+            and classification.get('classifier') == CLASSIFIER_VERSION
+            and external_news_classification_has_schema_contract(classification)
+        ):
+            contract_classified_ids.add(item_id)
+            legacy_classified_ids.discard(item_id)
+            outdated_classified_ids.discard(item_id)
+    for item_id, row in latest_classification_rows.items():
+        if item_id in contract_classified_ids:
+            continue
+        classification = row.classification_payload
+        if isinstance(classification, dict) and classification:
+            legacy_classified_ids.add(item_id)
+    latest_updated_at = max(
+        (
+            timestamp
+            for timestamp in (
+                *(row.associated_at for row in rows),
+                *(row.classified_at for row in classification_rows),
+            )
+            if timestamp is not None
+        ),
+        default=None,
+    )
     return {
-        'items': item_count,
-        'symbols': int(symbol_count or 0),
-        'classified_items': contract_classified_count,
-        'contract_classified_items': contract_classified_count,
-        'legacy_classified_items': 0,
+        'items': len(item_ids),
+        'symbols': len(symbol_ids),
+        'classified_items': len(contract_classified_ids),
+        'contract_classified_items': len(contract_classified_ids),
+        'legacy_classified_items': len(legacy_classified_ids),
+        'outdated_classified_items': len(outdated_classified_ids),
+        'classifier_version': CLASSIFIER_VERSION,
         'sample_limited': False,
         'sample_limit': None,
-        'updated_at': latest_collected_at.isoformat() if latest_collected_at else None,
+        'updated_at': latest_updated_at.isoformat() if latest_updated_at else None,
     }
 
 

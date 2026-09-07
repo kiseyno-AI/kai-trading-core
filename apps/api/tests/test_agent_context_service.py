@@ -1,5 +1,5 @@
 from contextlib import ExitStack
-from datetime import date
+from datetime import date, datetime, timezone
 import unittest
 from unittest.mock import patch
 
@@ -21,8 +21,13 @@ from app.agent_context.read_service import (
     _build_quote_freshness_provenance,
     _build_recent_dart_events_context,
     _build_recent_disclosures_freshness_provenance,
+    _build_us_market_session_metadata,
+    _historical_external_news_knowledge_cutoff_at,
     _load_latest_symbol_day_block_history,
+    _resolve_external_news_knowledge_cutoff_at,
+    _resolve_symbol_market_session,
 )
+from app.core.settings import settings
 
 EMPTY_LATEST_PRIOR_ROWS = {
     'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
@@ -143,6 +148,19 @@ def _closed_market_session() -> dict[str, object]:
         'recommendation_basis': 'latest_completed_eod',
         'quote_data_expected': False,
         'intraday_data_expected': False,
+    }
+
+
+def _open_market_session(*, market_date: str = '2026-04-08') -> dict[str, object]:
+    return {
+        'requested_date': market_date,
+        'status': 'OPEN',
+        'current_market_state': 'OPEN',
+        'current_calendar_date': market_date,
+        'latest_valid_trading_date': market_date,
+        'recommendation_basis': 'live_intraday',
+        'quote_data_expected': True,
+        'intraday_data_expected': True,
     }
 
 
@@ -716,7 +734,165 @@ class DartEventContextTests(unittest.TestCase):
         self.assertEqual(provenance['reason'], 'dart_disclosure_storage_unavailable')
 
 
+class ExternalNewsKnowledgeCutoffTests(unittest.TestCase):
+    def test_cutoff_applies_only_to_historical_market_dates(self):
+        now = datetime(2026, 4, 9, 12, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _historical_external_news_knowledge_cutoff_at(date(2026, 4, 8), now=now),
+            datetime(2026, 4, 8, 6, 30, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(
+            _historical_external_news_knowledge_cutoff_at(date(2026, 4, 9), now=now)
+        )
+
+    def test_cutoff_uses_seoul_calendar_day_near_utc_midnight(self):
+        now = datetime(2026, 4, 8, 16, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _historical_external_news_knowledge_cutoff_at(date(2026, 4, 8), now=now),
+            datetime(2026, 4, 8, 6, 30, tzinfo=timezone.utc),
+        )
+
+    def test_aapl_cutoff_uses_xnys_session_close(self):
+        cutoff, source = _resolve_external_news_knowledge_cutoff_at(
+            date(2026, 4, 8),
+            None,
+            market='NASDAQ',
+            now=datetime(2026, 4, 9, 12, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(cutoff, datetime(2026, 4, 8, 20, 0, tzinfo=timezone.utc))
+        self.assertEqual(source, 'default_xnys_regular_session_close')
+
+    def test_mixed_krx_and_us_request_requires_explicit_cutoff(self):
+        service = AgentContextReadService()
+        with patch(
+            'app.agent_context.read_service.load_symbols',
+            return_value=[
+                {'symbol': '005930', 'market': 'KOSPI'},
+                {'symbol': 'AAPL', 'market': 'NASDAQ'},
+            ],
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                'required when a request mixes KRX and US symbols',
+            ):
+                service.get_symbol_day_context(
+                    market_date='2026-04-08',
+                    symbols=['005930', 'AAPL'],
+                )
+
+    def test_mixed_request_accepts_explicit_cutoff(self):
+        cutoff, source = _resolve_external_news_knowledge_cutoff_at(
+            date(2026, 4, 8),
+            '2026-04-08T19:30:00Z',
+            market='MIXED',
+            now=datetime(2026, 4, 9, 12, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(cutoff, datetime(2026, 4, 8, 19, 30, tzinfo=timezone.utc))
+        self.assertEqual(source, 'explicit')
+
+    def test_resolver_uses_request_time_for_current_and_future_dates(self):
+        now = datetime(2026, 4, 9, 12, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _resolve_external_news_knowledge_cutoff_at(date(2026, 4, 9), None, now=now),
+            (now, 'request_time'),
+        )
+        self.assertEqual(
+            _resolve_external_news_knowledge_cutoff_at(date(2026, 4, 10), None, now=now),
+            (now, 'request_time'),
+        )
+
+    def test_resolver_accepts_aware_explicit_cutoff_and_normalizes_to_utc(self):
+        cutoff, source = _resolve_external_news_knowledge_cutoff_at(
+            date(2026, 4, 8),
+            '2026-04-08T15:15:00+09:00',
+            now=datetime(2026, 4, 9, 12, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(cutoff, datetime(2026, 4, 8, 6, 15, tzinfo=timezone.utc))
+        self.assertEqual(source, 'explicit')
+
+    def test_resolver_rejects_naive_or_future_explicit_cutoff(self):
+        now = datetime(2026, 4, 9, 12, tzinfo=timezone.utc)
+
+        with self.assertRaisesRegex(ValueError, 'timezone offset'):
+            _resolve_external_news_knowledge_cutoff_at(
+                date(2026, 4, 8),
+                datetime(2026, 4, 8, 15, 30),
+                now=now,
+            )
+        with self.assertRaisesRegex(ValueError, 'current time'):
+            _resolve_external_news_knowledge_cutoff_at(
+                date(2026, 4, 10),
+                datetime(2026, 4, 9, 12, 0, 1, tzinfo=timezone.utc),
+                now=now,
+            )
+
+
 class AgentContextReadServiceTests(unittest.TestCase):
+    def test_krx_symbol_uses_request_session_gate_instead_of_unguarded_current_cache(self):
+        krx_session = _closed_market_session()
+
+        resolved = _resolve_symbol_market_session(
+            company_market='KOSPI',
+            requested_date=date(2026, 4, 10),
+            krx_market_session=krx_session,
+        )
+        quote_context = _build_quote_context(
+            {'symbol': '005930', 'price': 70000},
+            market_date=date(2026, 4, 10),
+            market_session=resolved,
+        )
+
+        self.assertIs(resolved, krx_session)
+        self.assertEqual(quote_context['status'], 'not_applicable')
+        self.assertFalse(quote_context['available'])
+        self.assertIsNone(quote_context['price'])
+
+    def test_us_market_session_lookup_failure_fails_current_cache_closed(self):
+        with patch(
+            'app.agent_context.read_service.exchange_calendars.get_calendar',
+            side_effect=RuntimeError('calendar unavailable'),
+        ):
+            session = _build_us_market_session_metadata(
+                date(2026, 4, 8),
+                now=datetime(2026, 4, 8, 15, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(session['status'], 'unavailable')
+        self.assertEqual(session['reason'], 'us_market_session_unavailable')
+        self.assertFalse(session['quote_data_expected'])
+        self.assertFalse(session['intraday_data_expected'])
+        quote_context = _build_quote_context(
+            {'symbol': 'AAPL', 'price': 200},
+            market_date=date(2026, 4, 8),
+            market_session=session,
+        )
+        self.assertEqual(quote_context['status'], 'not_applicable')
+        self.assertIsNone(quote_context['price'])
+        self.assertEqual(quote_context['freshness']['reason'], 'us_market_session_unavailable')
+
+    def test_nyse_american_symbol_uses_us_session_gate(self):
+        us_session = {
+            **_closed_market_session(),
+            'reason': 'historical_requested_date',
+            'calendar_source': 'exchange_calendars:XNYS',
+        }
+
+        resolved = _resolve_symbol_market_session(
+            company_market='NYSE_AMERICAN',
+            requested_date=date(2026, 4, 10),
+            krx_market_session=_open_market_session(),
+            us_market_session=us_session,
+        )
+
+        self.assertIs(resolved, us_session)
+        self.assertFalse(resolved['quote_data_expected'])
+
     @patch('app.agent_context.read_service.load_daily_market_relative_contexts')
     @patch('app.agent_context.read_service.load_daily_composite_factor_results')
     @patch('app.agent_context.read_service.load_daily_beta_factor_results')
@@ -1266,9 +1442,36 @@ class AgentContextReadServiceTests(unittest.TestCase):
             fundamentals_repository=FakeFundamentalsRepository(),
             disclosure_repository=FakeDisclosureRepository(),
         )
-        with patch(
-            'app.agent_context.read_service._load_latest_symbol_day_block_history',
-            return_value=EMPTY_LATEST_PRIOR_ROWS,
+        with (
+            patch(
+                'app.agent_context.read_service.build_market_session_metadata',
+                return_value=_open_market_session(),
+            ),
+            patch(
+                'app.agent_context.read_service._load_latest_symbol_day_block_history',
+                return_value=EMPTY_LATEST_PRIOR_ROWS,
+            ),
+            patch(
+                'app.agent_context.read_service._external_news_provider_status',
+                return_value={
+                    'enabled': False,
+                    'status': 'disabled',
+                    'reason': 'naver_search_credentials_missing',
+                },
+            ),
+            patch(
+                'app.agent_context.read_service.list_recent_external_news_for_symbols',
+                return_value={'005930': [], '000660': []},
+            ) as external_news_mock,
+            patch(
+                'app.agent_context.read_service.pykrx_enrichment_service.load_symbol_day_context_inputs',
+                return_value={'by_symbol': {}, 'by_market': {}, 'sector_rows_by_market': {}},
+            ),
+            patch(
+                'app.agent_context.read_service.macro_context_service.get_context',
+                return_value={'status': 'unavailable', 'freshness': {'reason': 'test_fixture'}},
+            ),
+            patch.object(settings, 'external_news_context_enabled', True),
         ):
             result = service.get_symbol_day_context(
                 market_date='2026-04-08',
@@ -1278,6 +1481,9 @@ class AgentContextReadServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(load_technical_mock.call_args.kwargs['fallback_window_days'], 0)
+        knowledge_cutoff = datetime(2026, 4, 8, 6, 30, tzinfo=timezone.utc)
+        self.assertEqual(external_news_mock.call_args.kwargs['published_before'], knowledge_cutoff)
+        self.assertEqual(external_news_mock.call_args.kwargs['collected_before'], knowledge_cutoff)
 
         self.assertEqual(result['market_session']['requested_date'], '2026-04-08')
         self.assertEqual(result['market_session']['latest_valid_trading_date'], '2026-04-08')
@@ -1298,6 +1504,18 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['context_completeness']['signal_features']['missing_rows'], 1)
 
         first_item = result['items'][0]
+        self.assertEqual(
+            first_item['recent_external_news']['freshness_provenance']['knowledge_cutoff_at'],
+            '2026-04-08T06:30:00+00:00',
+        )
+        self.assertEqual(
+            first_item['recent_external_news']['freshness_provenance']['knowledge_cutoff_source'],
+            'default_krx_regular_session_close',
+        )
+        self.assertEqual(
+            first_item['recent_external_news']['freshness_provenance']['knowledge_cutoff_operator'],
+            '<',
+        )
         self.assertEqual(first_item['symbol'], '005930')
         self.assertEqual(first_item['company']['name_ko'], '삼성전자')
         self.assertEqual(first_item['company']['dart']['corp_code'], '00126380')
@@ -2061,8 +2279,9 @@ class AgentContextReadServiceTests(unittest.TestCase):
             )
 
         item = result['items'][0]
-        self.assertEqual(item['quote_context']['freshness_provenance']['freshness_status'], 'stale')
-        self.assertEqual(item['quote_context']['freshness_provenance']['issue_types'], ['stale'])
+        self.assertEqual(item['quote_context']['freshness_provenance']['freshness_status'], 'not_applicable')
+        self.assertEqual(item['quote_context']['freshness_provenance']['issue_types'], [])
+        self.assertEqual(item['quote_context']['freshness_provenance']['reason'], 'closed_market')
         self.assertIsNone(item['price_context'])
         self.assertEqual(item['context_provenance']['price_context']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['price_context']['latest_available_market_date'], '2026-04-07')
@@ -2083,7 +2302,10 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(item['liquidity_context']['ranking']['liquidity_percentile'], 0.82)
         self.assertTrue(item['liquidity_context']['ranking']['passes_liquidity_floor'])
         self.assertEqual(item['decider_data_quality_context']['blocks']['liquidity_turnover']['status'], 'stale')
-        self.assertEqual(item['decider_data_quality_context']['blocks']['intraday_realtime']['status'], 'stale')
+        self.assertEqual(
+            item['decider_data_quality_context']['blocks']['intraday_realtime']['status'],
+            'not_applicable',
+        )
         self.assertEqual(item['decision_input_quality_context']['final_judgment']['decision_band'], 'block')
         self.assertIn(
             'liquidity_turnover',
@@ -2092,9 +2314,15 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertIsNone(item['signal_features'])
         self.assertEqual(item['context_provenance']['signal_features']['freshness_status'], 'stale')
         self.assertEqual(item['context_provenance']['signal_features']['latest_available_market_date'], '2026-04-07')
-        self.assertEqual(item['intraday_execution_context']['status'], 'available')
-        self.assertEqual(item['context_provenance']['intraday_execution_context']['freshness_status'], 'stale')
-        self.assertEqual(item['context_provenance']['intraday_execution_context']['latest_available_market_date'], '2026-04-07')
+        self.assertEqual(item['intraday_execution_context']['status'], 'not_applicable')
+        self.assertEqual(
+            item['context_provenance']['intraday_execution_context']['freshness_status'],
+            'not_applicable',
+        )
+        self.assertEqual(
+            item['context_provenance']['intraday_execution_context']['reason'],
+            'closed_market',
+        )
         self.assertIsNone(item['persisted_factor_rows']['unified_value'])
         self.assertEqual(item['context_provenance']['factor_rows']['unified_value']['freshness_status'], 'available_but_old')
         self.assertEqual(item['scores']['unified_value']['freshness_provenance']['freshness_status'], 'available_but_old')
@@ -2992,7 +3220,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             result['items'][0]['context_completeness']['requested_symbol_coverage']['intraday_execution_context']['coverage_status'],
-            'missing',
+            'not_applicable',
         )
 
     def test_get_symbol_day_context_includes_pykrx_enrichment_blocks(self):

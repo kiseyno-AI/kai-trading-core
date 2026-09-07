@@ -71,7 +71,7 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
             passed_filter=None,
             limit=None,
         )
-        self.assertEqual(result, ['066570', '005930'])
+        self.assertEqual(result, ['005930', '066570'])
         lg_record = next(item for item in records if item['symbol'] == '066570')
         self.assertFalse(lg_record['hard_blocked'])
         self.assertEqual(lg_record['status'], 'soft_penalized_dispatched')
