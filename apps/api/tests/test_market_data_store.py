@@ -1,5 +1,8 @@
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sqlalchemy import delete, select
 from sqlalchemy.dialects import postgresql
@@ -19,9 +22,112 @@ from app.market_data_store import (
     load_daily_pykrx_enrichment_rows,
     load_current_kis_intraday_snapshot,
     persist_daily_price_bar,
-    upsert_daily_pykrx_enrichment_rows,
+    persist_daily_price_bars,
     persist_kis_intraday_snapshot,
+    upsert_daily_pykrx_enrichment_rows,
 )
+
+
+class HistoricalPriceBarPersistenceTests(unittest.TestCase):
+    @staticmethod
+    def _bar() -> dict:
+        return {
+            'trade_date': '2020-01-02',
+            'open_price': 100,
+            'high_price': 110,
+            'low_price': 90,
+            'close_price': 105,
+            'volume': 1_000,
+            'turnover': 105_000,
+        }
+
+    def test_historical_bar_write_preserves_existing_current_symbol_state(self) -> None:
+        existing = SimpleNamespace(
+            id=91,
+            name_ko='Current name',
+            standard_code='CURRENT-CODE',
+            market='CURRENT-MARKET',
+            instrument_type='current-type',
+            source='current-source',
+            is_active=False,
+            last_refreshed_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        )
+
+        class FakeSession:
+            def execute(self, _statement):
+                return None
+
+        fake_session = FakeSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with (
+            patch('app.market_data_store.session_scope', fake_session_scope),
+            patch('app.market_data_store._get_symbol', return_value=existing),
+        ):
+            persisted = persist_daily_price_bars(
+                '005930',
+                [self._bar()],
+                market='HISTORICAL-MARKET',
+                source='historical-source',
+                name_ko='Historical name',
+                standard_code='HISTORICAL-CODE',
+                update_current_symbol_state=False,
+            )
+
+        self.assertEqual(persisted, 1)
+        self.assertEqual(existing.name_ko, 'Current name')
+        self.assertEqual(existing.standard_code, 'CURRENT-CODE')
+        self.assertEqual(existing.market, 'CURRENT-MARKET')
+        self.assertEqual(existing.instrument_type, 'current-type')
+        self.assertEqual(existing.source, 'current-source')
+        self.assertFalse(existing.is_active)
+        self.assertEqual(
+            existing.last_refreshed_at,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+        )
+
+    def test_historical_bar_write_creates_unknown_symbol_as_inactive(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.added = []
+
+            def add(self, row) -> None:
+                self.added.append(row)
+
+            def flush(self) -> None:
+                self.added[0].id = 92
+
+            def execute(self, _statement):
+                return None
+
+        fake_session = FakeSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with (
+            patch('app.market_data_store.session_scope', fake_session_scope),
+            patch('app.market_data_store._get_symbol', return_value=None),
+        ):
+            persisted = persist_daily_price_bars(
+                '099999',
+                [self._bar()],
+                market='KOSPI',
+                source='pykrx',
+                name_ko='Historical listing',
+                update_current_symbol_state=False,
+            )
+
+        self.assertEqual(persisted, 1)
+        self.assertEqual(len(fake_session.added), 1)
+        created_symbol = fake_session.added[0]
+        self.assertEqual(created_symbol.symbol, '099999')
+        self.assertEqual(created_symbol.name_ko, 'Historical listing')
+        self.assertFalse(created_symbol.is_active)
 
 
 class MarketRelativeQueryShapeTests(unittest.TestCase):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,7 @@ class StartAPIScriptTests(unittest.TestCase):
             """#!/usr/bin/env bash
 set -euo pipefail
 
+printf 'PYTHON_EXECUTABLE=%s\\n' "$0" >> "${FAKE_PYTHON_LOG:?}"
 printf '%s\\n' "$*" >> "${FAKE_PYTHON_LOG:?}"
 
 if [ "${1:-}" = "-m" ] && [ "${2:-}" = "app.internal.deploy_hygiene" ]; then
@@ -45,6 +47,7 @@ fi
 
 if [ "${1:-}" = "-m" ] && [ "${2:-}" = "uvicorn" ]; then
   printf 'UVICORN_DB_AUTO_UPGRADE=%s\\n' "${DB_AUTO_UPGRADE:-<unset>}" >> "${FAKE_PYTHON_LOG:?}"
+  printf 'UVICORN_APP_DEBUG=%s\\n' "${APP_DEBUG:-<unset>}" >> "${FAKE_PYTHON_LOG:?}"
   exit 0
 fi
 
@@ -71,18 +74,52 @@ exit 1
         preflight_json_exit_code: int = 0,
         preflight_text_exit_code: int = 1,
         preflight_require_head_exit_code: int = 0,
+        host: str | None = None,
+        upstream_bearer_token: str | None = None,
+        use_explicit_python: bool = True,
+        virtual_env: Path | None = None,
+        env_python_bin: Path | None = None,
+        env_install_requirements: str | None = None,
+        inherited_install_requirements: str | None = 'false',
         expected_returncode: int = 0,
     ) -> list[str]:
         env_path = self.workdir / '.env'
         env_lines = ['APP_ENV=test']
         if db_auto_upgrade is not None:
             env_lines.append(f'DB_AUTO_UPGRADE={db_auto_upgrade}')
+        if upstream_bearer_token is not None:
+            env_lines.append(f'UPSTREAM_BEARER_TOKEN={shlex.quote(upstream_bearer_token)}')
+        if env_python_bin is not None:
+            env_lines.append(f'PYTHON_BIN={shlex.quote(str(env_python_bin))}')
+        if env_install_requirements is not None:
+            env_lines.append(f'INSTALL_REQUIREMENTS_ON_START={shlex.quote(env_install_requirements)}')
         env_path.write_text('\n'.join(env_lines) + '\n', encoding='utf-8')
 
         env = os.environ.copy()
-        env['PYTHON_BIN'] = str(self.wrapper_path)
+        # The launcher intentionally honors inherited operator settings. Tests
+        # must start from a clean process environment so a developer's shell
+        # cannot silently supply auth, host, or migration controls.
+        for key in (
+            'APP_DEBUG',
+            'DB_AUTO_UPGRADE',
+            'HOST',
+            'UPSTREAM_BEARER_TOKEN',
+            'VIRTUAL_ENV',
+        ):
+            env.pop(key, None)
+        if use_explicit_python:
+            env['PYTHON_BIN'] = str(self.wrapper_path)
+        else:
+            env.pop('PYTHON_BIN', None)
+        if virtual_env is not None:
+            env['VIRTUAL_ENV'] = str(virtual_env)
         env['FAKE_PYTHON_LOG'] = str(self.log_path)
-        env['INSTALL_REQUIREMENTS_ON_START'] = 'false'
+        if inherited_install_requirements is None:
+            env.pop('INSTALL_REQUIREMENTS_ON_START', None)
+        else:
+            env['INSTALL_REQUIREMENTS_ON_START'] = inherited_install_requirements
+        if host is not None:
+            env['HOST'] = host
         if preflight_json is not None:
             env['FAKE_PREFLIGHT_JSON'] = preflight_json
         env['FAKE_PREFLIGHT_JSON_EXIT_CODE'] = str(preflight_json_exit_code)
@@ -99,7 +136,83 @@ exit 1
         )
 
         self.assertEqual(result.returncode, expected_returncode, msg=f'stdout={result.stdout}\nstderr={result.stderr}')
+        if not self.log_path.exists():
+            return []
         return self.log_path.read_text(encoding='utf-8').splitlines()
+
+    def test_active_virtualenv_python_is_used_without_an_explicit_override(self) -> None:
+        virtual_env = self.workdir / 'active-venv'
+        virtualenv_python = virtual_env / 'bin' / 'python'
+        virtualenv_python.parent.mkdir(parents=True)
+        virtualenv_python.symlink_to(self.wrapper_path)
+
+        log_lines = self._run_script(
+            db_auto_upgrade='false',
+            use_explicit_python=False,
+            virtual_env=virtual_env,
+        )
+
+        self.assertIn(f'PYTHON_EXECUTABLE={virtualenv_python}', log_lines)
+        self.assertTrue(any('-m uvicorn app.main:app' in line for line in log_lines))
+
+    def test_env_python_is_loaded_before_dependency_probe(self) -> None:
+        log_lines = self._run_script(
+            db_auto_upgrade='false',
+            use_explicit_python=False,
+            env_python_bin=self.wrapper_path,
+        )
+
+        self.assertIn(f'PYTHON_EXECUTABLE={self.wrapper_path}', log_lines)
+        self.assertTrue(any('-m uvicorn app.main:app' in line for line in log_lines))
+
+    def test_inherited_python_override_wins_over_env_file(self) -> None:
+        log_lines = self._run_script(
+            db_auto_upgrade='false',
+            env_python_bin=self.workdir / 'missing-python-from-env',
+        )
+
+        self.assertIn(f'PYTHON_EXECUTABLE={self.wrapper_path}', log_lines)
+        self.assertTrue(any('-m uvicorn app.main:app' in line for line in log_lines))
+
+    def test_env_install_control_is_loaded_before_bootstrap_decision(self) -> None:
+        log_lines = self._run_script(
+            db_auto_upgrade='false',
+            use_explicit_python=False,
+            env_python_bin=self.wrapper_path,
+            env_install_requirements='true',
+            inherited_install_requirements=None,
+        )
+
+        self.assertTrue(any('-m pip install -r requirements.txt' in line for line in log_lines))
+
+    def test_non_loopback_bind_requires_bearer_token(self) -> None:
+        log_lines = self._run_script(
+            db_auto_upgrade='false',
+            host='0.0.0.0',
+            expected_returncode=1,
+        )
+
+        self.assertFalse(any('-m uvicorn app.main:app' in line for line in log_lines))
+
+    def test_non_loopback_bind_rejects_whitespace_only_bearer_token(self) -> None:
+        log_lines = self._run_script(
+            db_auto_upgrade='false',
+            host='0.0.0.0',
+            upstream_bearer_token='   ',
+            expected_returncode=1,
+        )
+
+        self.assertFalse(any('-m uvicorn app.main:app' in line for line in log_lines))
+
+    def test_non_loopback_bind_with_bearer_token_disables_debug(self) -> None:
+        log_lines = self._run_script(
+            db_auto_upgrade='false',
+            host='0.0.0.0',
+            upstream_bearer_token='internal-secret',
+        )
+
+        self.assertTrue(any('-m uvicorn app.main:app --host 0.0.0.0' in line for line in log_lines))
+        self.assertIn('UVICORN_APP_DEBUG=false', log_lines)
 
     def test_truthy_db_auto_upgrade_values_run_preflight_and_disable_runtime_upgrade_when_at_head(self) -> None:
         for value in ('true', 'True', 'TRUE', '1', 'yes', 'on'):

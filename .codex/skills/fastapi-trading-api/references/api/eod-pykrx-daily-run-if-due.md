@@ -1,7 +1,7 @@
 # POST /eod/pykrx/daily/run-if-due
 
 ## Summary
-Runs the daily pykrx EOD pipeline only when due, including persisted price-context refresh after bar writes. The scheduled daily sequence includes `pykrx_enrichment` immediately after price collection, so source-market-date sector classification, investor-flow-symbol, and short-selling coverage is populated before downstream exec/decider use. When `DART_API_KEY` is configured, the same daily-auto path also chains the DART daily fundamentals refresh after successful completion.
+Runs the daily pykrx EOD pipeline only when due, including persisted price-context refresh after bar writes. If `market_date` is omitted, the API selects the latest KRX trading session; an explicitly supplied weekend or holiday is rejected with HTTP 400. The scheduled daily sequence includes `pykrx_enrichment` immediately after price collection, so source-market-date sector classification, investor-flow-symbol, and short-selling coverage is populated before downstream exec/decider use. When `DART_API_KEY` is configured, the same daily-auto path also chains the DART daily fundamentals refresh after successful completion.
 
 ## Example request
 ```http

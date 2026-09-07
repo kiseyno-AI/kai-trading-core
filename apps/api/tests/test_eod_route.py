@@ -1,5 +1,7 @@
 
 import unittest
+from datetime import date
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import FastAPI
@@ -1109,6 +1111,91 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(payload['market_session']['status'], 'holiday')
         self.assertEqual(payload['market_session']['latest_valid_trading_date'], '2026-05-04')
         self.assertFalse(payload['market_session']['intraday_data_expected'])
+
+    def test_pykrx_backfill_omitted_dates_use_latest_krx_session(self):
+        client = TestClient(self.app)
+        with (
+            patch(
+                'app.api.routes_eod.async_latest_krx_trading_date',
+                return_value=date(2026, 5, 4),
+            ),
+            patch.object(
+                routes_eod.PYKRX_BACKFILL_SERVICE,
+                'run_backfill',
+                return_value={'status': 'completed'},
+            ) as run_backfill,
+        ):
+            response = client.post('/eod/pykrx/backfill')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_backfill.call_args.kwargs['start_date'], '2026-05-04')
+        self.assertEqual(run_backfill.call_args.kwargs['end_date'], '2026-05-04')
+
+    def test_pykrx_backfill_rejects_explicit_krx_holiday(self):
+        client = TestClient(self.app)
+        with (
+            patch(
+                'app.api.routes_eod.async_get_krx_calendar_day',
+                return_value=SimpleNamespace(is_open=False),
+            ),
+            patch.object(
+                routes_eod.PYKRX_BACKFILL_SERVICE,
+                'run_backfill',
+            ) as run_backfill,
+        ):
+            response = client.post(
+                '/eod/pykrx/backfill',
+                params={'end_date': '2026-05-05'},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()['detail'],
+            'end_date must be a KRX trading day; 2026-05-05 is a holiday',
+        )
+        run_backfill.assert_not_called()
+
+    def test_pykrx_daily_rejects_explicit_weekend(self):
+        client = TestClient(self.app)
+        with (
+            patch(
+                'app.api.routes_eod.async_get_krx_calendar_day',
+                return_value=SimpleNamespace(is_open=False),
+            ),
+            patch.object(
+                routes_eod.PYKRX_BACKFILL_SERVICE,
+                'run_daily_pipeline_if_due',
+            ) as run_daily,
+        ):
+            response = client.post(
+                '/eod/pykrx/daily/run-if-due',
+                params={'market_date': '2026-05-09'},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()['detail'],
+            'market_date must be a KRX trading day; 2026-05-09 is a weekend',
+        )
+        run_daily.assert_not_called()
+
+    def test_pykrx_daily_omitted_date_uses_latest_krx_session(self):
+        client = TestClient(self.app)
+        with (
+            patch(
+                'app.api.routes_eod.async_latest_krx_trading_date',
+                return_value=date(2026, 5, 4),
+            ),
+            patch.object(
+                routes_eod.PYKRX_BACKFILL_SERVICE,
+                'run_daily_pipeline_if_due',
+                return_value={'status': 'completed'},
+            ) as run_daily,
+        ):
+            response = client.post('/eod/pykrx/daily/run-if-due')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_daily.call_args.kwargs['market_date'], '2026-05-04')
 
     def test_get_eod_freshness_route_returns_service_payload(self):
         fake_service = FakeFreshnessService()

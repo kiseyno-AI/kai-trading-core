@@ -4585,12 +4585,12 @@ class SignalDeciderExecIntegrationService:
             derived_status = 'working'
         elif any(status in REMOTE_ACTIVE_STATUSES for status in order_status_counts):
             derived_status = 'working'
-        elif any(status in EXEC_WATCH_READBACK_ACTIVE_STATUSES for status in item_statuses):
-            derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
         elif any(status in REMOTE_CANCELLED_STATUSES for status in status_set):
             derived_status = UI_BOARD_STATUS_CANCELLED
         elif any(status in REMOTE_TERMINAL_FAILURE_STATUSES for status in status_set):
             derived_status = 'failed'
+        elif any(status in EXEC_WATCH_READBACK_ACTIVE_STATUSES for status in item_statuses):
+            derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
 
         return {
             'derived_status': derived_status,

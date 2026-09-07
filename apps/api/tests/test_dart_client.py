@@ -17,6 +17,8 @@ class FakeResponse:
 
 
 class TestableDartClient(DartClient):
+    __test__ = False
+
     def __init__(self, payload, *, content=b'', headers=None):
         super().__init__()
         self.payload = payload

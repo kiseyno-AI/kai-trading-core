@@ -384,9 +384,32 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     SignalDeciderPolicyVersion.policy_version == self.policy_version
                 )
             )
+            session.flush()
+            for policy_version, retired_at in self._previous_active_policy_states:
+                previous_policy = (
+                    session.query(SignalDeciderPolicyVersion)
+                    .filter(SignalDeciderPolicyVersion.policy_version == policy_version)
+                    .one_or_none()
+                )
+                if previous_policy is not None:
+                    previous_policy.status = 'active'
+                    previous_policy.retired_at = retired_at
 
     def _seed_policy_version(self) -> None:
+        self._previous_active_policy_states: list[tuple[str, datetime | None]] = []
         with session_scope() as session:
+            active_policies = (
+                session.query(SignalDeciderPolicyVersion)
+                .filter(SignalDeciderPolicyVersion.status == 'active')
+                .all()
+            )
+            for active_policy in active_policies:
+                self._previous_active_policy_states.append(
+                    (active_policy.policy_version, active_policy.retired_at)
+                )
+                active_policy.status = 'retired'
+                active_policy.retired_at = datetime.now(timezone.utc)
+            session.flush()
             session.add(
                 SignalDeciderPolicyVersion(
                     policy_version=self.policy_version,
@@ -993,15 +1016,20 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 return_value=candidate_rows,
             ) as load_candidate_rows,
             patch(
+                'app.eod.pykrx_enrichment.pykrx_enrichment_service.collect_for_market_date',
+                return_value={'status': 'partial'},
+            ) as repair_candidate_rows,
+            patch(
                 'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
                 return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
             ),
         ):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
-        load_candidate_rows.assert_called_once()
+        self.assertEqual(load_candidate_rows.call_count, 2)
         self.assertEqual(load_candidate_rows.call_args.kwargs['symbols'], ['005930'])
         self.assertEqual(load_candidate_rows.call_args.kwargs['categories'], required_categories)
+        repair_candidate_rows.assert_called_once()
         self.assertTrue(result['summary']['enrichment_preflight_allowed'])
         self.assertEqual(result['summary']['enrichment_preflight_status'], 'ready')
         self.assertEqual(result['summary']['blocked_count'], 1)
@@ -1628,6 +1656,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self._seed_short_term_snapshot(
             symbol='000660',
             tactical_action='watch_for_trigger',
+            trigger_price=250000,
+            chase_limit_price=255000,
+            target_price=260000,
+            stop_loss_price=245000,
             input_feature_snapshot_payload={
                 'buy_quality_score': 45,
                 'raw_trading_value_krw': 250000000,

@@ -906,9 +906,13 @@ Authorization: Bearer <token>
 ## 4.1 `GET /agent-context/symbol-day`
 Returns a symbol/day aggregate payload combining multiple stored datasets.
 
+`knowledge_cutoff_at` is an optional timezone-aware, exclusive upper bound for stored news publication and
+collection timestamps. When omitted for a past KRX date, the service uses 15:30 KST on that date; current or
+future dates are capped at request time, and an explicit future or timezone-naive cutoff is rejected.
+
 ### Example request
 ```http
-GET /agent-context/symbol-day?market_date=2026-04-09&symbols=005930&fs_div=CFS&disclosures_limit=5
+GET /agent-context/symbol-day?market_date=2026-04-09&symbols=005930&fs_div=CFS&disclosures_limit=5&knowledge_cutoff_at=2026-04-09T15:30:00%2B09:00
 Authorization: Bearer <token>
 ```
 
@@ -920,7 +924,9 @@ Authorization: Bearer <token>
     "symbols": ["005930"],
     "fs_div": "CFS",
     "fs_label": "consolidated",
-    "disclosures_limit": 5
+    "disclosures_limit": 5,
+    "knowledge_cutoff_at": "2026-04-09T06:30:00+00:00",
+    "knowledge_cutoff_source": "explicit"
   },
   "summary": {
     "requested_symbol_count": 1,
@@ -1400,7 +1406,8 @@ Content-Type: application/json
 
 ### Notes
 - `summary` and `feedback` are JSON objects; at least one must be non-empty.
-- Stored feedback is append-only and separate from deterministic action summaries.
+- `agent_context_feedback` is the mutable latest row for one `market_date + symbol + agent_name`; an exact key resubmission updates that row and its transport receipt timestamp.
+- Signal-decider decision evidence is stored separately in append-only `signal_decider_decision_snapshots`. Semantic retries are fingerprint-deduplicated even when the transport receipt time changes, while changed decisions append a new snapshot.
 - When `context` includes symbol-day `context_provenance`, missing-data normalization can enrich stored categories with provenance-aware issue typing such as `missing`, `stale`, `available_but_old`, and `derived_or_fallback`.
 - This route does not trigger orders, positions, or live trading.
 

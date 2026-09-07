@@ -1,4 +1,6 @@
 import asyncio
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -20,7 +22,11 @@ from app.eod.service import EOD_SERVICE
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.market.clock import async_get_market_state
-from app.market.session import async_build_market_session_metadata
+from app.market.session import (
+    async_build_market_session_metadata,
+    async_get_krx_calendar_day,
+    async_latest_krx_trading_date,
+)
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FACTOR_SOURCE,
     daily_advanced_value_factor_service,
@@ -47,6 +53,41 @@ from app.signals.unified_value_factor import (
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
 
 router = APIRouter(prefix='/eod', tags=['eod'])
+
+
+def _parse_pykrx_market_date(value: str, *, field_name: str) -> date:
+    normalized = str(value or '').strip()
+    try:
+        if len(normalized) == 8 and normalized.isdigit():
+            return datetime.strptime(normalized, '%Y%m%d').date()
+        return date.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f'{field_name} must be YYYY-MM-DD or YYYYMMDD') from exc
+
+
+async def _resolve_pykrx_market_date(
+    value: str | None,
+    *,
+    field_name: str,
+) -> str:
+    if value is None:
+        current_krx_date = datetime.now(ZoneInfo('Asia/Seoul')).date()
+        latest_session = await async_latest_krx_trading_date(current_krx_date)
+        if latest_session is None:
+            raise ValueError(
+                f'Unable to resolve the latest KRX trading day for {field_name}'
+            )
+        return latest_session.isoformat()
+
+    requested_date = _parse_pykrx_market_date(value, field_name=field_name)
+    calendar_day = await async_get_krx_calendar_day(requested_date)
+    if not calendar_day.is_open:
+        session_status = 'weekend' if requested_date.weekday() >= 5 else 'holiday'
+        raise ValueError(
+            f'{field_name} must be a KRX trading day; '
+            f'{requested_date.isoformat()} is a {session_status}'
+        )
+    return requested_date.isoformat()
 
 
 class EODPipelineRunRequest(BaseModel):
@@ -226,25 +267,43 @@ async def refresh_pykrx_universe(markets: str = ','.join(DEFAULT_MARKETS), limit
 
 @router.post('/pykrx/backfill')
 async def backfill_pykrx_eod(
-    start_date: str = '19560101',
+    start_date: str | None = None,
     end_date: str | None = None,
     markets: str = ','.join(DEFAULT_MARKETS),
     limit: int | None = None,
     symbol: str | None = None,
     refresh_universe: bool = True,
+    stages: str | None = None,
 ) -> dict:
     try:
         parsed_markets = tuple(item.strip().upper() for item in markets.split(',') if item.strip())
+        parsed_stages = (
+            tuple(item.strip() for item in stages.split(',') if item.strip())
+            if stages is not None
+            else None
+        )
+        resolved_end_date = await _resolve_pykrx_market_date(
+            end_date,
+            field_name='end_date',
+        )
+        resolved_start_date = (
+            await _resolve_pykrx_market_date(start_date, field_name='start_date')
+            if start_date is not None
+            else resolved_end_date
+        )
         return await asyncio.to_thread(
             PYKRX_BACKFILL_SERVICE.run_backfill,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=resolved_start_date,
+            end_date=resolved_end_date,
             markets=parsed_markets or DEFAULT_MARKETS,
             trigger='manual_api',
             refresh_universe=refresh_universe,
             limit=limit,
             symbol=symbol,
+            selected_stages=parsed_stages,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'pykrx backfill failed: {exc}') from exc
 
@@ -258,9 +317,10 @@ async def run_pykrx_daily_if_due(
 ) -> dict:
     try:
         parsed_markets = tuple(item.strip().upper() for item in (markets or settings.eod_auto_pykrx_markets).split(',') if item.strip())
-        resolved_market_date = market_date
-        if resolved_market_date is None:
-            resolved_market_date = (await async_get_market_state()).server_time[:10]
+        resolved_market_date = await _resolve_pykrx_market_date(
+            market_date,
+            field_name='market_date',
+        )
         return await asyncio.to_thread(
             PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due,
             market_date=resolved_market_date,
@@ -269,6 +329,8 @@ async def run_pykrx_daily_if_due(
             refresh_universe=settings.eod_auto_pykrx_refresh_universe if refresh_universe is None else refresh_universe,
             force=force,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'pykrx daily EOD run failed: {exc}') from exc
 

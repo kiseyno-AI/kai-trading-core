@@ -11,8 +11,9 @@ Start command:
 - `./start-api.sh`
 
 What it does:
-- installs Python requirements
-- loads `apps/api/.env`
+- loads `apps/api/.env` before interpreting launcher controls, while preserving explicit process-environment overrides
+- chooses `PYTHON_BIN` when explicitly set, otherwise the active virtual environment, `apps/api/.venv/bin/python`, or `python3.11` on `PATH`, in that order
+- installs Python requirements when `INSTALL_REQUIREMENTS_ON_START=true`, or in the default `auto` mode only when required imports are missing
 - when `DB_AUTO_UPGRADE=true`, runs deploy preflight before uvicorn, applies `alembic upgrade head` itself when the database is safely behind head, then verifies `--require-head` before starting the server
 - starts FastAPI via uvicorn on `127.0.0.1:8000` by default
 - if `UPSTREAM_BEARER_TOKEN` is set, all incoming API requests require `Authorization: Bearer <token>`
@@ -194,6 +195,14 @@ If the preflight flags likely drift, or `alembic upgrade head` fails with `Dupli
 
 If schema parity is not clean, write a corrective migration instead of dropping tables in place.
 
+## External-news point-in-time integrity
+
+- Apply migrations through `20260906_0079` with `python3.11 -m alembic upgrade head` before collecting or reading external news. Revision `0078` adds article-to-symbol associations; `0079` adds append-only classifier versions.
+- Article rows are immutable; repeated provider IDs or URLs may add an idempotent row in `external_news_item_symbols` but must not rewrite title, payload, `published_at`, or `collected_at`.
+- Historical symbol reads require the article observation, its `associated_at`, and the selected classifier version's `classified_at` to be earlier than the exclusive knowledge cutoff.
+- `external_news_enrich` inserts the current classifier version for legacy rows into `external_news_item_classifications`; it never rewrites an article. Replays are idempotent per article/version. Change the classifier version before changing classification semantics—existing versions must remain immutable.
+- Embedded `payload.classification` values have no trustworthy availability timestamp and are not exposed as decision evidence. After deployment, run the normal `external_news_enrich` stage once to create timestamped sidecars for recent legacy rows.
+
 ## pykrx EOD backfill
 
 From `apps/api` on this machine:
@@ -201,13 +210,13 @@ From `apps/api` on this machine:
 1. `python3.11 -m pip install -r requirements.txt`
 2. `alembic upgrade head`
 3. `python3.11 -m app.eod.pykrx_backfill refresh-universe`
-4. `python3.11 -m app.eod.pykrx_backfill backfill --start-date 19560101`
+4. `python3.11 -m app.eod.pykrx_backfill backfill --start-date 20260408 --end-date 20260408`
 
 Useful limited-scope runs:
 
-- One-symbol verification: `python3.11 -m app.eod.pykrx_backfill backfill --symbol 005930 --limit 1`
+- One-symbol verification: `python3.11 -m app.eod.pykrx_backfill backfill --start-date 20260408 --end-date 20260408 --symbol 005930 --limit 1`
 - API-triggered universe refresh: `curl -X POST http://127.0.0.1:8000/eod/pykrx/universe/refresh`
-- API-triggered backfill: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/backfill?start_date=19560101"`
+- API-triggered backfill: `curl -X POST "http://127.0.0.1:8000/eod/pykrx/backfill?start_date=20260408&end_date=20260408&stages=price_collection,technical_snapshots,action_summaries"`
 - DART company snapshot smoke test: `curl "http://127.0.0.1:8000/disclosures/dart/company-snapshot?stock_code=005930"`
 - DART fundamentals smoke test: `curl "http://127.0.0.1:8000/disclosures/dart/fundamentals?stock_code=005930&business_year=2025&report_code=11011&fs_div=CFS"`
 - DART stored fundamentals history smoke test: `curl "http://127.0.0.1:8000/disclosures/dart/fundamentals/history?symbols=005930&symbols=000660&start_date=2024-01-01&end_date=2024-12-31"`
@@ -302,11 +311,14 @@ Internal ops commands from `apps/api`:
 - `python3.11 -m app.internal.ops agent-signal-decider-execution-outcomes-backfill --market-date-from 2026-06-29 --market-date-to 2026-07-03`
 - `python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay --completed-weeks 4 --gate-mode downsize_probe --probe-quantity 3 --output-format markdown`
 - `python3.11 -m app.internal.ops agent-signal-decider-calendar-refresh --market-date 2026-04-30 --lookback-days 30 --horizons 1,3,5,10 --primary-horizons 1,3,5,10`
-- Offline decider rule replay before activation: `python3.11 -m app.internal.ops agent-decider-replay --market-date-from 2026-06-15 --market-date-to 2026-06-19 --agent-name short-term-decider --rule-config-json '{"rules":[{"name":"stale_watch_trigger_drift","predicates":[{"type":"trigger_price_drift","max_below_trigger_pct":0.03}]}]}' --fee-bps 0 --slippage-bps 0 --output-format markdown`
-  - The replay command accepts `--rule-config-json` or `--rule-config-path`, optional `--symbols`, `--horizon-days`, `--fee-bps`, and `--slippage-bps`.
+- Offline decider rule replay before activation: `python3.11 -m app.internal.ops agent-decider-replay --market-date-from 2026-06-15 --market-date-to 2026-06-19 --agent-name short-term-decider --rule-config-json '{"rules":[{"name":"stale_watch_trigger_drift","predicates":[{"type":"trigger_price_drift","max_below_trigger_pct":0.03}]}]}' --fee-bps 10 --slippage-bps 5 --output-format markdown`
+  - The replay command accepts `--rule-config-json` or `--rule-config-path`, optional `--symbols`, `--policy-versions`, `--horizon-days`, `--fee-bps`, and `--slippage-bps`.
   - Supported first-pass predicates include `trigger_price_drift`, `confidence`, `risk_flag`, `liquidity_bucket`, `factor_score_bucket`, `source_availability`, and generic `field` path checks.
   - Candidate predicates are evaluated only against persisted snapshot-time request/response/traceability/input-feature payloads. Realized outcomes are used only for baseline vs candidate P/L comparison.
-- If historical duplicate `signal_decider_decision_snapshots.feedback_id` rows were repaired during a deploy or manual schema recovery, rerun `agent-signal-decider-evaluations-repair` for the affected date range and then `agent-signal-decider-calendar-refresh` so persisted review coverage and calendar items realign to the canonical deduplicated snapshots.
+  - Policy activation uses the exact inputs in the candidate policy's stored `rule_bundle.replay_contract` and requires the complete JSON replay artifact in `replay_evidence`. Core recomputes only the candidate's base-policy snapshot cohort server-side; a manually edited result or different base policy/rule/symbol/window/horizon/cost is rejected.
+  - Only `tighten_buy_gate` currently has an activation-safe replay. `relax_wait_gate` and `relax_reject_gate` remain fail-closed because the buy-only replay cannot yet price trades that the relaxed policy would add.
+  - Regenerate legacy candidates whose rule bundle lacks `replay_contract`, `base_policy_version`, or the base-policy-only `policy_versions` cohort; activation intentionally rejects them.
+- If reprocessing appends replacement `signal_decider_decision_snapshots` for an existing non-null `feedback_id`, rerun `agent-signal-decider-evaluations-repair` for the affected date range and then `agent-signal-decider-calendar-refresh`. Replay selects the latest such snapshot; null-feedback legacy snapshots remain independent.
 - `python3.11 -m app.internal.ops kis-daily-signal-features-collect --market-date 2026-04-14`
 - `python3.11 -m app.internal.ops kis-intraday-snapshots-collect --symbols 005930 --include-news true`
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
@@ -322,21 +334,22 @@ Notes:
 
 - These commands call repo services directly instead of looping back through `127.0.0.1:8000`, so they are safe when `UPSTREAM_BEARER_TOKEN` is enabled.
 - If HTTP must remain for an internal localhost caller, use `app.internal.http_client.InternalAPIClient`, which automatically sends the configured bearer token.
-
-Notes:
-
-- The pykrx path refreshes the active listed universe first, then backfills only those active symbols.
+- Historical PyKRX backfills support exactly one requested market date per call: `start_date` and `end_date` must match. Run an explicit date-by-date loop outside the service for a longer interval, and retain each response so failed dates can be retried independently.
+- Historical runs always resolve membership for that requested date, even when `refresh_universe` is false. They do not use the current active table or KIS master as a fallback, and they abort before bar collection when any queried market is unavailable. This avoids current-universe leakage while date-by-date membership reconstruction remains unavailable.
+- Historical runs accept only `price_collection`, `technical_snapshots`, and `action_summaries`. Current-only ranking, KIS signal/market-risk, and downstream decider/follow-up stages are rejected before provider I/O. Metadata uses `membership_basis=end_date_snapshot`; a global `limit` may intentionally leave later markets as `not_queried_due_to_limit`, which is not a source failure.
+- Daily/current PyKRX runs may refresh the active listed universe and use the current KIS master fallback. Historical bar persistence can register previously unknown symbols as inactive for foreign-key integrity, but it does not reactivate or overwrite the current symbol state.
 - Automatic daily ingestion uses the same pykrx universe/backfill persistence path, but only for the resolved market date and only once per day unless forced or retrying a partial/failed run. Automatic retries are capped at 5 runs per trade date and retry only the symbols that failed in the prior run.
+- Price collection completion does not hide a failed downstream stage. On the next automatic check, Core reads the official daily-pipeline record and resumes from the first incomplete fundamentals/factor/news/feedback/decider/plan/evaluation stage without re-running price collection. These follow-up-only attempts use a five-minute minimum interval and a five-attempt cap per trade date; inspect the returned `reason` and `followup_recovery` fields when the run is waiting or exhausted.
 - The automatic pykrx daily ingestion path now also persists `daily_price_contexts`, `daily_pykrx_enrichment_rows`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks` after the day bar write completes.
 - The same automatic daily path now also collects `daily_market_risk_snapshots` from KIS `inquire-price-2`, then computes `daily_market_risk_filter_results` from those stored snapshots for the successfully stored symbol universe. Per-symbol KIS failures are reported as partial errors and do not abort the rest of the daily run.
 - KIS ranking signal-feature collection is a separate ops path because it calls KIS ranking endpoints (`volume-power`, `overtime-volume`, and `overtime-fluctuation`) rather than pykrx bars.
 - The KIS ranking signal-feature collection path also rebuilds `daily_market_participation_contexts` from the stored `daily_signal_features` rows for that market date.
 - `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent` is the repo-owned bootstrap path for the new derived-context tables. It backfills the recent seven trading days ending yesterday from existing stored `daily_price_bars` and `daily_signal_features`, and it skips participation dates that do not yet have stored signal-feature rows.
 - Duplicate bar writes are harmless because `daily_price_bars` upserts on `(symbol_id, trade_date)`, and the scheduler checks `eod_collection_runs` plus a Postgres advisory lock before starting.
-- When pykrx market-wide universe endpoints are empty, the command falls back to the existing KIS master universe so delisted names are still excluded.
+- When PyKRX market-wide universe endpoints are empty, only current/daily runs may fall back to the existing KIS master universe. Historical backfills fail closed instead.
 - Historical bars use pykrx's default adjusted OHLCV series because long-range `adjusted=False` calls returned empty data during local verification.
 - `--limit` runs do not deactivate missing symbols in the DB, so they are safe for small smoke tests.
-- The historical pykrx backfill writes into `symbols`, `daily_price_bars`, `eod_collection_runs`, `daily_price_contexts`, `daily_technical_snapshots`, `daily_action_summaries`, and day-based `daily_trending_ranks`.
+- The historical PyKRX backfill writes inactive symbol identity rows when needed for foreign-key integrity, plus `daily_price_bars`, `eod_collection_runs`, `daily_price_contexts`, `daily_technical_snapshots`, and `daily_action_summaries`; it does not replace current active-universe membership or write current-only trending ranks.
 
 Local overrides:
 

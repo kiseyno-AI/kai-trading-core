@@ -14,6 +14,8 @@ class FakeResponse:
 
 
 class TestableUpbitClient(UpbitQuotationClient):
+    __test__ = False
+
     def __init__(self, response):
         super().__init__()
         self.response = response

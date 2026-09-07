@@ -11,22 +11,26 @@ from sqlalchemy.orm import sessionmaker
 
 from app.agent_context.decider_replay_service import (
     DeciderReplayCostAssumptions,
+    DeciderReplayDataset,
     DeciderReplayRepository,
     DeciderReplayService,
     DeciderReplayTrade,
     _actual_short_term_outcome_to_wait_conflict_trade,
     _build_wait_conflict_markdown_summary,
+    _post_decision_eval_to_trade,
     _replay_alignment_gate,
 )
-from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME
+from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.db_models import (
     AgentContextFeedback,
     Base,
     BrokerOrder,
+    DeciderPostDecisionEvaluation,
     OrderRequest,
     SignalDeciderActualExecutionOutcome,
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
+    SignalDeciderRealizedOutcome,
 )
 
 
@@ -44,14 +48,21 @@ class FakeDeciderReplayRepository:
         self,
         trades: list[DeciderReplayTrade],
         wait_conflict_trades: list[DeciderReplayTrade] | None = None,
+        replay_dataset: DeciderReplayDataset | None = None,
     ) -> None:
         self.trades = list(trades)
         self.wait_conflict_trades = list(wait_conflict_trades or [])
+        self.replay_dataset = replay_dataset
         self.calls: list[dict] = []
         self.wait_conflict_calls: list[dict] = []
 
-    def list_replay_trades(self, **kwargs) -> list[DeciderReplayTrade]:
+    def list_replay_trades(
+        self,
+        **kwargs,
+    ) -> DeciderReplayDataset | list[DeciderReplayTrade]:
         self.calls.append(kwargs)
+        if self.replay_dataset is not None:
+            return self.replay_dataset
         return list(self.trades)
 
     def list_wait_conflict_gate_trades(self, **kwargs) -> list[DeciderReplayTrade]:
@@ -187,6 +198,10 @@ def _actual_wait_conflict_trade(
         lifecycle_status=lifecycle_status or ('closed' if open_quantity == 0 else 'partially_closed'),
         entry_filled_quantity=Decimal('10'),
         entry_average_fill_price=Decimal('10000'),
+        entry_notional_krw=Decimal('100000'),
+        exit_filled_quantity=Decimal(closed_quantity),
+        exit_average_fill_price=Decimal('10000'),
+        exit_notional_krw=Decimal(closed_quantity) * Decimal('10000'),
         closed_quantity=Decimal(closed_quantity),
         open_quantity=Decimal(open_quantity),
         realized_pnl_krw=Decimal(realized_pnl_krw),
@@ -196,9 +211,46 @@ def _actual_wait_conflict_trade(
         snapshot=snapshot,
         plan_row=plan_row,
         outcome=outcome,
+        signal_decider_context=None,
         cost_assumptions=DeciderReplayCostAssumptions(),
         gate_mode=gate_mode,
         probe_quantity=probe_quantity,
+        alignment_context_source='persisted_plan_alignment_gate',
+    )
+
+
+def _snapshot_object(*, snapshot_id: int = 1, symbol: str = '005930') -> SignalDeciderDecisionSnapshot:
+    return SignalDeciderDecisionSnapshot(
+        id=snapshot_id,
+        feedback_id=None,
+        market_date=date(2026, 6, 16),
+        symbol=symbol,
+        agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+        agent_version='test-agent',
+        decision_run_id='test-run',
+        feedback_received_at=datetime(2026, 6, 16, 6, 0, tzinfo=timezone.utc),
+        policy_version='short_term_decider_policy_test',
+        decision_action='buy',
+        preferred_action='buy',
+        next_day_open_action='buy',
+        entry_price_basis='next_open',
+        target_price=110,
+        expected_return_pct=0.10,
+        stop_loss_price=90,
+        suggested_holding_period='5 trading days',
+        confidence_score_10=7,
+        conviction_score_10=6,
+        thesis_summary='Replay test snapshot.',
+        supporting_evidence_payload=[],
+        decision_risks_payload=[],
+        invalidation_conditions_payload=[],
+        data_quality_warnings_payload=[],
+        specialist_disagreement_payload=[],
+        traceability_payload={},
+        input_feature_snapshot_payload={},
+        request_payload={},
+        response_payload={},
+        response_summary_payload={},
     )
 
 
@@ -244,6 +296,15 @@ class DeciderReplayServiceTests(unittest.TestCase):
                 'date_window_basis': 'source_market_date',
                 'candidate_gate_mode': 'hard_block',
                 'probe_quantity': 1,
+                'cost_assumptions': {
+                    'fee_bps': 10,
+                    'slippage_bps': 5,
+                    'notional_krw': 1_000_000,
+                },
+            },
+            metadata={
+                'profitability_basis': 'estimated_net',
+                'promotion_cost_gate': {'status': 'passed', 'reason': None},
             },
             summary={
                 'baseline_trade_count': 20,
@@ -401,6 +462,14 @@ class DeciderReplayServiceTests(unittest.TestCase):
             fee_bps=10,
             slippage_bps=5,
         )
+        unrealistically_low_cost = service.replay(
+            market_date_from='2026-06-15',
+            market_date_to='2026-06-19',
+            agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+            rule_config=None,
+            fee_bps='0.000001',
+            slippage_bps='0.000001',
+        )
 
         self.assertEqual(
             zero_cost['summary']['baseline']['gross_pnl_krw'],
@@ -409,6 +478,232 @@ class DeciderReplayServiceTests(unittest.TestCase):
         self.assertEqual(zero_cost['summary']['baseline']['gross_pnl_krw'], 10_000)
         self.assertEqual(zero_cost['summary']['baseline']['estimated_net_pnl_krw'], 10_000)
         self.assertEqual(with_cost['summary']['baseline']['estimated_net_pnl_krw'], 7_000)
+        self.assertEqual(zero_cost['metadata']['profitability_basis'], 'gross_only')
+        self.assertEqual(
+            zero_cost['metadata']['promotion_cost_gate'],
+            {
+                'eligible': False,
+                'status': 'ineligible',
+                'reason': 'zero_fee_and_slippage_assumptions',
+                'minimum_assumptions': {
+                    'fee_bps': 10,
+                    'slippage_bps': 5,
+                },
+                'effective_assumptions': {
+                    'fee_bps': 0,
+                    'slippage_bps': 0,
+                },
+            },
+        )
+        self.assertEqual(with_cost['metadata']['profitability_basis'], 'estimated_net')
+        self.assertEqual(with_cost['metadata']['promotion_cost_gate']['status'], 'passed')
+        self.assertEqual(
+            with_cost['metadata']['promotion_cost_gate']['minimum_assumptions'],
+            {'fee_bps': 10, 'slippage_bps': 5},
+        )
+        self.assertEqual(
+            with_cost['metadata']['promotion_cost_gate']['effective_assumptions'],
+            {'fee_bps': 10, 'slippage_bps': 5},
+        )
+        self.assertEqual(
+            unrealistically_low_cost['metadata']['promotion_cost_gate']['status'],
+            'ineligible',
+        )
+        self.assertEqual(
+            unrealistically_low_cost['metadata']['promotion_cost_gate']['reason'],
+            'below_minimum_fee_and_slippage_assumptions',
+        )
+        self.assertIn('- Profitability basis: gross_only', zero_cost['markdown_summary'])
+        self.assertIn(
+            '- Per-side cost assumptions: fee_bps=0, slippage_bps=0',
+            zero_cost['markdown_summary'],
+        )
+        self.assertIn(
+            '- Fallback notional assumption KRW: 1000000',
+            zero_cost['markdown_summary'],
+        )
+        self.assertIn(
+            '- Promotion cost gate: ineligible (zero_fee_and_slippage_assumptions)',
+            zero_cost['markdown_summary'],
+        )
+        self.assertIn('- Profitability basis: estimated_net', with_cost['markdown_summary'])
+        self.assertIn('- Promotion cost gate: passed', with_cost['markdown_summary'])
+
+    def test_non_finite_cost_inputs_are_rejected(self) -> None:
+        service = DeciderReplayService(repository=FakeDeciderReplayRepository([]))
+
+        for field_name, value in (
+            ('fee_bps', Decimal('NaN')),
+            ('fee_bps', float('inf')),
+            ('slippage_bps', Decimal('-Infinity')),
+            ('notional_krw', 'NaN'),
+        ):
+            kwargs = {
+                'fee_bps': 1,
+                'slippage_bps': 1,
+                'notional_krw': DEFAULT_NOTIONAL,
+            }
+            kwargs[field_name] = value
+            with self.subTest(field_name=field_name, value=str(value)):
+                with self.assertRaisesRegex(ValueError, f'{field_name} must be numeric'):
+                    service.replay(
+                        market_date_from='2026-06-15',
+                        market_date_to='2026-06-19',
+                        agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                        rule_config=None,
+                        **kwargs,
+                    )
+
+    def test_invalid_rule_config_fails_closed_before_repository_access(self) -> None:
+        invalid_configs = (
+            {'rules': 'not-a-list'},
+            {'rules': [{'name': 'typo', 'predicates': [{'type': 'confidnce', 'value': 5}]}]},
+            {'rules': [{'name': 'bad-op', 'predicates': [{'field': 'symbol', 'op': 'approx', 'value': '005930'}]}]},
+            {'rules': [{'name': 'ignored-operator', 'predicates': [{'field': 'symbol', 'operator': '!=', 'value': '005930'}]}]},
+            {'rules': [{'name': 'wrong-op-type', 'predicates': [{'type': 'confidence', 'op': 'contains', 'value': 5}]}]},
+            {'rules': [{'name': 'numeric-nan', 'predicates': [{'field': 'confidence_score_10', 'op': '>', 'value': 'Infinity'}]}]},
+            {'rules': [{'name': 'ignored-rule-field', 'enabled': False, 'predicates': [{'field': 'symbol', 'value': '005930'}]}]},
+            {'rules': [{'name': 'nan', 'predicates': [{'type': 'confidence', 'value': 'NaN'}]}]},
+        )
+        for rule_config in invalid_configs:
+            repository = FakeDeciderReplayRepository([])
+            service = DeciderReplayService(repository=repository)
+
+            with self.subTest(rule_config=rule_config):
+                with self.assertRaises(ValueError):
+                    service.replay(
+                        market_date_from='2026-06-15',
+                        market_date_to='2026-06-19',
+                        agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                        rule_config=rule_config,
+                    )
+                self.assertEqual(repository.calls, [])
+
+    def test_replay_reports_censored_coverage_without_charging_synthetic_trades(self) -> None:
+        economic_trade = _trade(
+            snapshot_id=31,
+            symbol='005930',
+            gross_pnl_krw=10_000,
+            trigger_price_drift_pct=None,
+        )
+        dataset = DeciderReplayDataset(
+            trades=(economic_trade,),
+            source_decision_count=3,
+            excluded_reason_counts={'missing_fixed_horizon_outcome': 2},
+            cohort_basis='fixed_horizon_counterfactual',
+            diagnostics={'actual_lifecycle_outcomes_used_for_promotion': False},
+        )
+        service = DeciderReplayService(
+            repository=FakeDeciderReplayRepository([], replay_dataset=dataset)
+        )
+
+        result = service.replay(
+            market_date_from='2026-06-15',
+            market_date_to='2026-06-19',
+            agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+            rule_config=None,
+            fee_bps=10,
+            slippage_bps=5,
+        )
+
+        self.assertEqual(result['summary']['baseline_trade_count'], 1)
+        self.assertEqual(result['summary']['baseline']['estimated_net_pnl_krw'], 7_000)
+        self.assertEqual(result['summary']['coverage']['source_decision_count'], 3)
+        self.assertEqual(result['summary']['coverage']['censored_or_excluded_count'], 2)
+        self.assertEqual(result['summary']['coverage']['economic_coverage_ratio'], 0.333333)
+        self.assertFalse(
+            result['summary']['coverage']['actual_lifecycle_outcomes_used_for_promotion']
+        )
+
+    def test_profitability_metrics_separate_gross_and_estimated_net_winners(self) -> None:
+        service = DeciderReplayService(
+            repository=FakeDeciderReplayRepository(
+                [
+                    _trade(
+                        snapshot_id=32,
+                        symbol='005930',
+                        gross_pnl_krw=1_000,
+                        trigger_price_drift_pct=-0.04,
+                    )
+                ]
+            )
+        )
+
+        result = service.replay(
+            market_date_from='2026-06-15',
+            market_date_to='2026-06-19',
+            agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+            rule_config=_stale_watch_rule(),
+            fee_bps=10,
+            slippage_bps=5,
+        )
+
+        self.assertEqual(result['summary']['baseline']['gross_win_rate'], 1.0)
+        self.assertEqual(result['summary']['baseline']['estimated_net_win_rate'], 0.0)
+        self.assertEqual(result['summary']['skipped_winners'], 1)
+        self.assertEqual(result['summary']['avoided_net_losers'], 1)
+        self.assertEqual(result['summary']['promotion_metrics']['basis'], 'estimated_net')
+
+    def test_neither_hit_uses_last_observed_close_instead_of_zero_return(self) -> None:
+        evaluation = DeciderPostDecisionEvaluation(
+            id=70,
+            feedback_id=1,
+            decision_snapshot_id=1,
+            agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+            market_date=date(2026, 6, 16),
+            symbol='005930',
+            window_days=5,
+            decision_action='buy',
+            entry_price=100,
+            target_price=110,
+            stop_loss_price=90,
+            outcome_label='neither_hit_within_5d',
+            outcome_reason='Neither threshold was touched.',
+            data_quality_warnings_payload=[],
+            metadata_payload={
+                'observed_price_path': [
+                    {'trade_date': '2026-06-17', 'close_price': 101},
+                    {'trade_date': '2026-06-23', 'close_price': 104},
+                ]
+            },
+        )
+
+        trade = _post_decision_eval_to_trade(
+            snapshot=_snapshot_object(),
+            evaluation=evaluation,
+            cost_assumptions=DeciderReplayCostAssumptions(),
+        )
+
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.baseline_return_pct, 0.04)
+        self.assertEqual(trade.baseline_gross_pnl_krw, Decimal('40000.00'))
+
+    def test_neither_hit_without_observed_close_is_excluded(self) -> None:
+        evaluation = DeciderPostDecisionEvaluation(
+            id=71,
+            feedback_id=1,
+            decision_snapshot_id=1,
+            agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+            market_date=date(2026, 6, 16),
+            symbol='005930',
+            window_days=5,
+            decision_action='buy',
+            entry_price=100,
+            target_price=110,
+            stop_loss_price=90,
+            outcome_label='neither_hit_within_5d',
+            outcome_reason='Neither threshold was touched.',
+            data_quality_warnings_payload=[],
+            metadata_payload={'observed_price_path': []},
+        )
+
+        trade = _post_decision_eval_to_trade(
+            snapshot=_snapshot_object(),
+            evaluation=evaluation,
+            cost_assumptions=DeciderReplayCostAssumptions(),
+        )
+
+        self.assertIsNone(trade)
 
     def test_wait_conflict_gate_replay_reports_tradeoff_counts(self) -> None:
         repository = FakeDeciderReplayRepository(
@@ -451,6 +746,10 @@ class DeciderReplayServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result['schema_version'], 'short_term_wait_conflict_gate_replay_v1')
+        self.assertEqual(result['metadata']['promotion_cost_gate']['status'], 'ineligible')
+        self.assertIn('- Profitability basis: gross_only', result['markdown_summary'])
+        self.assertIn('- Fallback notional assumption KRW: 1000000', result['markdown_summary'])
+        self.assertIn('- Promotion cost gate: ineligible', result['markdown_summary'])
         self.assertEqual(result['summary']['baseline_trade_count'], 3)
         self.assertEqual(result['summary']['candidate_trade_count'], 2)
         self.assertEqual(result['summary']['blocked_candidate_count'], 1)
@@ -793,6 +1092,144 @@ class DeciderReplayServiceTests(unittest.TestCase):
 
 
 class DeciderReplayRepositoryTests(unittest.TestCase):
+    def test_replay_uses_latest_snapshot_per_feedback_and_keeps_null_feedback_independent(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
+        tables = [
+            AgentContextFeedback.__table__,
+            SignalDeciderDecisionSnapshot.__table__,
+            SignalDeciderRealizedOutcome.__table__,
+            DeciderPostDecisionEvaluation.__table__,
+            SignalDeciderActualExecutionOutcome.__table__,
+        ]
+        Base.metadata.create_all(engine, tables=tables)
+        TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+        @contextmanager
+        def test_session_scope():
+            session = TestSessionLocal()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        try:
+            with TestSessionLocal() as session:
+                feedback = AgentContextFeedback(
+                    market_date=date(2026, 6, 16),
+                    symbol='005930',
+                    agent_name=SIGNAL_DECIDER_AGENT_NAME,
+                    summary_payload={'summary': 'same semantic feedback'},
+                    feedback_payload={'preferred_action': 'buy'},
+                    received_at=datetime(2026, 6, 16, 6, 0, tzinfo=timezone.utc),
+                )
+                session.add(feedback)
+                session.flush()
+
+                snapshot_specs = [
+                    (
+                        11,
+                        feedback.id,
+                        date(2026, 6, 16),
+                        '005930',
+                        'buy',
+                        'short_term_decider_policy_test',
+                        datetime(2026, 6, 16, 6, 0, tzinfo=timezone.utc),
+                    ),
+                    (
+                        12,
+                        feedback.id,
+                        date(2026, 6, 15),
+                        '005930',
+                        'wait',
+                        'unrelated_policy_v9',
+                        datetime(2026, 6, 17, 7, 0, tzinfo=timezone.utc),
+                    ),
+                    (
+                        13,
+                        None,
+                        date(2026, 6, 16),
+                        '000660',
+                        'buy',
+                        'short_term_decider_policy_test',
+                        datetime(2026, 6, 16, 8, 0, tzinfo=timezone.utc),
+                    ),
+                    (
+                        14,
+                        None,
+                        date(2026, 6, 16),
+                        '000660',
+                        'buy',
+                        'short_term_decider_policy_test',
+                        datetime(2026, 6, 16, 9, 0, tzinfo=timezone.utc),
+                    ),
+                    (
+                        15,
+                        None,
+                        date(2026, 6, 16),
+                        '035420',
+                        'buy',
+                        'unrelated_policy_v9',
+                        datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc),
+                    ),
+                ]
+                for (
+                    snapshot_id,
+                    feedback_id,
+                    market_date,
+                    symbol,
+                    action,
+                    policy_version,
+                    created_at,
+                ) in snapshot_specs:
+                    snapshot = _snapshot_object(snapshot_id=snapshot_id, symbol=symbol)
+                    snapshot.feedback_id = feedback_id
+                    snapshot.market_date = market_date
+                    snapshot.agent_name = SIGNAL_DECIDER_AGENT_NAME
+                    snapshot.decision_run_id = f'run-{snapshot_id}'
+                    snapshot.decision_action = action
+                    snapshot.policy_version = policy_version
+                    snapshot.created_at = created_at
+                    snapshot.updated_at = created_at
+                    session.add(snapshot)
+                    session.flush()
+                    session.add(
+                        SignalDeciderRealizedOutcome(
+                            decision_snapshot_id=snapshot.id,
+                            feedback_id=feedback_id,
+                            market_date=market_date,
+                            symbol=symbol,
+                            policy_version=snapshot.policy_version,
+                            decision_action='buy',
+                            horizon_days=5,
+                            outcome_status='complete',
+                            bars_observed=5,
+                            close_return_pct=Decimal('0.01'),
+                        )
+                    )
+                session.commit()
+
+            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+                dataset = DeciderReplayRepository().list_replay_trades(
+                    market_date_from=date(2026, 6, 15),
+                    market_date_to=date(2026, 6, 16),
+                    agent_name=SIGNAL_DECIDER_AGENT_NAME,
+                    symbols=None,
+                    policy_versions=['short_term_decider_policy_test'],
+                    horizon_days=5,
+                    cost_assumptions=DeciderReplayCostAssumptions(),
+                )
+
+            self.assertEqual(dataset.source_decision_count, 2)
+            self.assertEqual({trade.snapshot_id for trade in dataset}, {13, 14})
+        finally:
+            Base.metadata.drop_all(engine, tables=reversed(tables))
+            engine.dispose()
+
     def test_wait_conflict_gate_filters_source_date_and_applies_one_replay_probe(self) -> None:
         engine = create_engine('sqlite+pysqlite:///:memory:')
         event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
@@ -801,6 +1238,8 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
             OrderRequest.__table__,
             BrokerOrder.__table__,
             SignalDeciderDecisionSnapshot.__table__,
+            SignalDeciderRealizedOutcome.__table__,
+            DeciderPostDecisionEvaluation.__table__,
             SignalDeciderExecutionPlanItem.__table__,
             SignalDeciderActualExecutionOutcome.__table__,
         ]
@@ -827,6 +1266,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
             target_trade_date: date,
             realized_pnl_krw: Decimal,
             alignment_gate: dict | None = None,
+            open_quantity: Decimal = Decimal('0'),
         ) -> None:
             snapshot = SignalDeciderDecisionSnapshot(
                 feedback_id=None,
@@ -866,8 +1306,10 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
             session.add(snapshot)
             session.flush()
             validation_payload = {'short_term': {'tactical_action': 'watch_for_trigger'}}
+            traceability_payload = {'tactical_action': 'watch_for_trigger'}
             if alignment_gate is not None:
                 validation_payload['alignment_gate'] = alignment_gate
+                traceability_payload['alignment_gate'] = alignment_gate
             plan_row = SignalDeciderExecutionPlanItem(
                 execution_window='next_open',
                 decision_agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
@@ -889,7 +1331,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                 eligibility_status='eligible',
                 execution_status='filled',
                 validation_payload=validation_payload,
-                traceability_payload={'tactical_action': 'watch_for_trigger'},
+                traceability_payload=traceability_payload,
             )
             session.add(plan_row)
             session.flush()
@@ -909,7 +1351,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     entry_filled_quantity=Decimal('10'),
                     exit_filled_quantity=Decimal('10'),
                     closed_quantity=Decimal('10'),
-                    open_quantity=Decimal('0'),
+                    open_quantity=open_quantity,
                     entry_average_fill_price=Decimal('10000'),
                     exit_average_fill_price=Decimal('10100'),
                     entry_notional_krw=Decimal('100000'),
@@ -937,7 +1379,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                 )
                 seed_outcome(
                     session=session,
-                    symbol='444444',
+                    symbol='666666',
                     source_market_date=date(2026, 7, 2),
                     target_trade_date=date(2026, 7, 3),
                     realized_pnl_krw=Decimal('-3000'),
@@ -969,10 +1411,19 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     target_trade_date=date(2026, 7, 7),
                     realized_pnl_krw=Decimal('3000'),
                 )
+                seed_outcome(
+                    session=session,
+                    symbol='444444',
+                    source_market_date=date(2026, 7, 2),
+                    target_trade_date=date(2026, 7, 3),
+                    realized_pnl_krw=Decimal('500'),
+                    open_quantity=Decimal('1'),
+                )
                 session.commit()
 
             with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
-                trades = DeciderReplayRepository().list_wait_conflict_gate_trades(
+                repository = DeciderReplayRepository()
+                trades = repository.list_wait_conflict_gate_trades(
                     market_date_from=date(2026, 6, 29),
                     market_date_to=date(2026, 7, 3),
                     symbols=None,
@@ -980,10 +1431,18 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     gate_mode='downsize_probe',
                     probe_quantity=3,
                 )
+                fixed_horizon_dataset = repository.list_replay_trades(
+                    market_date_from=date(2026, 6, 29),
+                    market_date_to=date(2026, 7, 3),
+                    agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                    symbols=None,
+                    horizon_days=5,
+                    cost_assumptions=DeciderReplayCostAssumptions(),
+                )
 
             self.assertEqual(
                 [trade.symbol for trade in trades],
-                ['555555', '444444', '111111'],
+                ['555555', '444444', '666666', '111111'],
             )
             for trade in trades:
                 with self.subTest(symbol=trade.symbol):
@@ -992,12 +1451,39 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     self.assertEqual(trade.alignment_gate['final_quantity'], 3)
                     self.assertEqual(trade.point_in_time['alignment_gate']['probe_quantity'], 3)
             self.assertEqual(trades[0].alignment_gate['evidence_status'], 'missing')
-            self.assertEqual(trades[1].alignment_gate['evidence_status'], 'persisted')
+            self.assertEqual(trades[1].alignment_gate['evidence_status'], 'missing')
             self.assertEqual(trades[2].alignment_gate['evidence_status'], 'persisted')
-            self.assertEqual(trades[2].market_date, date(2026, 7, 3))
-            self.assertEqual(trades[2].point_in_time['market_date'], '2026-07-03')
-            self.assertEqual(trades[2].point_in_time['source_market_date'], '2026-07-03')
-            self.assertEqual(trades[2].point_in_time['target_trade_date'], '2026-07-06')
+            self.assertEqual(trades[3].alignment_gate['evidence_status'], 'persisted')
+            self.assertEqual(trades[3].market_date, date(2026, 7, 3))
+            self.assertEqual(trades[3].point_in_time['market_date'], '2026-07-03')
+            self.assertEqual(trades[3].point_in_time['source_market_date'], '2026-07-03')
+            self.assertEqual(trades[3].point_in_time['target_trade_date'], '2026-07-06')
+            self.assertEqual(
+                trades[3].point_in_time['alignment_context_source'],
+                'persisted_plan_alignment_gate',
+            )
+            self.assertEqual(trades[3].alignment_gate['alignment_gate_action'], 'downsize_probe')
+            self.assertEqual(trades.source_decision_count, 4)
+            self.assertEqual(
+                trades.excluded_reason_counts,
+                {'actual_position_still_open': 1},
+            )
+            self.assertEqual(trades.diagnostics['actual_lifecycle_eligible_count'], 3)
+            self.assertEqual(sum(trade.outcome_resolved for trade in trades), 3)
+            self.assertEqual(len(fixed_horizon_dataset), 0)
+            self.assertEqual(fixed_horizon_dataset.source_decision_count, 4)
+            self.assertEqual(
+                fixed_horizon_dataset.excluded_reason_counts,
+                {'missing_fixed_horizon_outcome': 4},
+            )
+            self.assertEqual(
+                fixed_horizon_dataset.diagnostics['actual_lifecycle_outcomes_used_for_promotion'],
+                False,
+            )
+            self.assertEqual(
+                fixed_horizon_dataset.diagnostics['actual_lifecycle_eligible_count'],
+                3,
+            )
         finally:
             Base.metadata.drop_all(engine, tables=list(reversed(tables)))
 

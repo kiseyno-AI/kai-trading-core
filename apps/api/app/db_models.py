@@ -11,6 +11,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -40,9 +41,13 @@ class TimestampMixin:
 
 class Symbol(Base, TimestampMixin):
     __tablename__ = 'symbols'
+    __table_args__ = (
+        UniqueConstraint('symbol', name='symbols_symbol_key'),
+        Index('ix_symbols_symbol', 'symbol'),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     standard_code: Mapped[str | None] = mapped_column(String(32))
     name_ko: Mapped[str] = mapped_column(String(255), nullable=False)
     name_en: Mapped[str | None] = mapped_column(String(255))
@@ -189,8 +194,77 @@ class ExternalNewsItem(Base, TimestampMixin):
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     source_url: Mapped[str | None] = mapped_column(String(2048))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
-    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    collected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
     payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ExternalNewsItemSymbol(Base):
+    """Point-in-time attribution of one immutable article to one symbol."""
+
+    __tablename__ = 'external_news_item_symbols'
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            'external_news_item_id',
+            'symbol_id',
+            name='pk_external_news_item_symbols',
+        ),
+        Index(
+            'ix_external_news_item_symbols_symbol_associated',
+            'symbol_id',
+            'associated_at',
+            'external_news_item_id',
+        ),
+    )
+
+    external_news_item_id: Mapped[int] = mapped_column(
+        ForeignKey('external_news_items.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    symbol_id: Mapped[int] = mapped_column(
+        ForeignKey('symbols.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    associated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class ExternalNewsItemClassification(Base):
+    """Append-only classifier output for an immutable news observation."""
+
+    __tablename__ = 'external_news_item_classifications'
+    __table_args__ = (
+        UniqueConstraint(
+            'external_news_item_id',
+            'classifier_version',
+            name='uq_external_news_item_classifications_item_version',
+        ),
+        Index(
+            'ix_external_news_item_classifications_item_classified',
+            'external_news_item_id',
+            'classified_at',
+            'id',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    external_news_item_id: Mapped[int] = mapped_column(
+        ForeignKey('external_news_items.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    classifier_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    classified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    classification_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
 class MarketStatusSnapshot(Base):
@@ -278,6 +352,28 @@ class MacroContextObservation(Base, TimestampMixin):
     payload: Mapped[dict | None] = mapped_column(JSON)
 
 
+class PortfolioAssetSnapshot(Base):
+    __tablename__ = 'portfolio_asset_snapshots'
+    __table_args__ = (
+        Index(
+            'ix_portfolio_asset_snapshots_account_captured',
+            'account_reference',
+            'captured_at',
+        ),
+        Index('ix_portfolio_asset_snapshots_captured_at', 'captured_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_reference: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_label: Mapped[str | None] = mapped_column(String(128))
+    total_assets: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_payload: Mapped[dict | None] = mapped_column(JSON)
+
+
 class EODCollectionRun(Base):
     __tablename__ = 'eod_collection_runs'
     __table_args__ = (
@@ -286,8 +382,8 @@ class EODCollectionRun(Base):
             'market',
             'trade_date',
             'source',
-            'started_at',
-            'id',
+            desc('started_at'),
+            desc('id'),
         ),
     )
 
@@ -737,7 +833,19 @@ class DailyPriceContext(Base, TimestampMixin):
 
 class DailyTechnicalSnapshot(Base, TimestampMixin):
     __tablename__ = 'daily_technical_snapshots'
-    __table_args__ = (UniqueConstraint('symbol_id', 'market_date', name='uq_daily_technical_snapshots_symbol_market_date'),)
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol_id',
+            'market_date',
+            name='uq_daily_technical_snapshots_symbol_market_date',
+        ),
+        Index(
+            'ix_daily_technical_snapshots_eod_run_captured_id',
+            'eod_run_id',
+            desc('captured_at'),
+            'id',
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
@@ -869,7 +977,7 @@ class DailyMarketRiskSnapshot(Base, TimestampMixin):
     source_endpoint: Mapped[str] = mapped_column(String(64), nullable=False, default='inquire-price-2')
     market_warning_code: Mapped[str | None] = mapped_column(String(8))
     market_warning_name: Mapped[str | None] = mapped_column(String(64))
-    is_management_item: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    is_management_item: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_investment_caution: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_short_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     short_overheat_class_code: Mapped[str | None] = mapped_column(String(8))
@@ -877,7 +985,7 @@ class DailyMarketRiskSnapshot(Base, TimestampMixin):
     vi_class_code: Mapped[str | None] = mapped_column(String(8))
     is_vi_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_dishonest_disclosure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    is_trade_halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    is_trade_halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     snapshot_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -944,11 +1052,11 @@ class DailyPiotroskiFilterResult(Base, TimestampMixin):
     has_profitability_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     has_capital_impairment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     has_audit_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    piotroski_score: Mapped[int | None] = mapped_column(Integer, index=True)
+    piotroski_score: Mapped[int | None] = mapped_column(Integer)
     passes_piotroski_score: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     momentum_percentile_rank: Mapped[float | None] = mapped_column(Numeric(12, 6))
     is_bottom_momentum: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    passed_filter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    passed_filter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     filter_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -1060,7 +1168,7 @@ class DailyValueFactorResult(Base, TimestampMixin):
     value_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
     value_rank: Mapped[int | None] = mapped_column(Integer, index=True)
     value_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
-    value_status: Mapped[str] = mapped_column(String(32), nullable=False, default='missing_metric', index=True)
+    value_status: Mapped[str] = mapped_column(String(32), nullable=False, default='missing_metric')
     factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -1092,6 +1200,14 @@ class DailyAdvancedValueFactorResult(Base, TimestampMixin):
             'captured_at',
             'id',
         ),
+        Index(
+            'ix_daily_advanced_value_factor_results_fcf_yield_valid',
+            'fcf_yield_valid_for_scoring',
+        ),
+        Index(
+            'ix_daily_advanced_value_factor_results_ev_to_ebitda_valid',
+            'ev_to_ebitda_valid_for_scoring',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1111,8 +1227,8 @@ class DailyAdvancedValueFactorResult(Base, TimestampMixin):
         default='missing_metric',
         index=True,
     )
-    fcf_yield_valid_for_scoring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
-    ev_to_ebitda_valid_for_scoring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    fcf_yield_valid_for_scoring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    ev_to_ebitda_valid_for_scoring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     fcf_yield_rank: Mapped[int | None] = mapped_column(Integer, index=True)
     ev_to_ebitda_rank: Mapped[int | None] = mapped_column(Integer, index=True)
     fcf_yield_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
@@ -1125,7 +1241,6 @@ class DailyAdvancedValueFactorResult(Base, TimestampMixin):
         String(48),
         nullable=False,
         default='insufficient_components',
-        index=True,
     )
     is_advanced_value_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -1166,25 +1281,24 @@ class DailyUnifiedValueFactorResult(Base, TimestampMixin):
     dividend_yield_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing', index=True)
     fcf_yield_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric', index=True)
     ev_to_ebitda_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric', index=True)
-    per_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    pbr_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    dividend_yield_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    fcf_yield_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    ev_to_ebitda_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    per_rank: Mapped[int | None] = mapped_column(Integer)
+    pbr_rank: Mapped[int | None] = mapped_column(Integer)
+    dividend_yield_rank: Mapped[int | None] = mapped_column(Integer)
+    fcf_yield_rank: Mapped[int | None] = mapped_column(Integer)
+    ev_to_ebitda_rank: Mapped[int | None] = mapped_column(Integer)
     per_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     pbr_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     dividend_yield_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     fcf_yield_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     ev_to_ebitda_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     unified_value_score: Mapped[float | None] = mapped_column(Numeric(12, 6))
-    unified_value_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    unified_value_rank: Mapped[int | None] = mapped_column(Integer)
     unified_value_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     components_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     unified_value_status: Mapped[str] = mapped_column(
         String(48),
         nullable=False,
         default='insufficient_components',
-        index=True,
     )
     factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -1224,12 +1338,12 @@ class DailyQualityFactorResult(Base, TimestampMixin):
     )
     debt_ratio_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric')
     accruals_ratio_status: Mapped[str] = mapped_column(String(48), nullable=False, default='missing_metric')
-    roe_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    roa_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    gross_profit_to_assets_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    operating_cash_flow_to_net_income_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    debt_ratio_rank: Mapped[int | None] = mapped_column(Integer, index=True)
-    accruals_ratio_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    roe_rank: Mapped[int | None] = mapped_column(Integer)
+    roa_rank: Mapped[int | None] = mapped_column(Integer)
+    gross_profit_to_assets_rank: Mapped[int | None] = mapped_column(Integer)
+    operating_cash_flow_to_net_income_rank: Mapped[int | None] = mapped_column(Integer)
+    debt_ratio_rank: Mapped[int | None] = mapped_column(Integer)
+    accruals_ratio_rank: Mapped[int | None] = mapped_column(Integer)
     roe_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     roa_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     gross_profit_to_assets_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
@@ -1296,7 +1410,6 @@ class DailyCompositeFactorResult(Base, TimestampMixin):
         String(48),
         nullable=False,
         default='insufficient_inputs',
-        index=True,
     )
     is_composite_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     factor_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -1335,7 +1448,7 @@ class DailyMomentumFactorResult(Base, TimestampMixin):
     is_price_above_ma120: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_ma60_above_ma120: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_recent_overheated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    momentum_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    momentum_rank: Mapped[int | None] = mapped_column(Integer)
     momentum_percentile: Mapped[float | None] = mapped_column(Numeric(12, 6))
     momentum_percentile_threshold: Mapped[float] = mapped_column(Numeric(12, 6), nullable=False, default=0.80)
     passes_momentum_top_percentile: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -1378,13 +1491,13 @@ class DailyPykrxEnrichmentRow(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    symbol_id: Mapped[int | None] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), index=True)
-    market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
-    market: Mapped[str] = mapped_column(String(32), nullable=False, default='KRX', index=True)
-    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    scope_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    scope_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    source: Mapped[str] = mapped_column(String(32), nullable=False, default='pykrx', index=True)
+    symbol_id: Mapped[int | None] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'))
+    market_date: Mapped[date] = mapped_column(Date, nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False, default='KRX')
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default='pykrx')
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -1466,11 +1579,11 @@ class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
             desc('id'),
         ),
         Index(
-            'uq_signal_decider_decision_snapshots_feedback_id_not_null',
-            'feedback_id',
+            'uq_signal_decider_snapshots_content_fingerprint',
+            'content_fingerprint',
             unique=True,
-            postgresql_where=text('feedback_id IS NOT NULL'),
-            sqlite_where=text('feedback_id IS NOT NULL'),
+            postgresql_where=text('content_fingerprint IS NOT NULL'),
+            sqlite_where=text('content_fingerprint IS NOT NULL'),
         ),
     )
 
@@ -1479,13 +1592,14 @@ class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
         ForeignKey('agent_context_feedback.id', ondelete='SET NULL'),
         index=True,
     )
+    content_fingerprint: Mapped[str | None] = mapped_column(String(64))
     market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     agent_name: Mapped[str] = mapped_column(String(64), nullable=False, default='signal-decider', index=True)
     agent_version: Mapped[str | None] = mapped_column(String(64))
     decision_run_id: Mapped[str | None] = mapped_column(String(128), index=True)
     feedback_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
-    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_policy_v1', index=True)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False, default='signal_decider_policy_v1', index=True)
     decision_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait', index=True)
     preferred_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait')
     next_day_open_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait')
@@ -1538,7 +1652,7 @@ class SignalDeciderRealizedOutcome(Base, TimestampMixin):
     )
     market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_policy_v1', index=True)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False, default='signal_decider_policy_v1', index=True)
     decision_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait', index=True)
     horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     outcome_status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending', index=True)
@@ -1598,7 +1712,7 @@ class SignalDeciderEvaluation(Base, TimestampMixin):
     )
     market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_policy_v1', index=True)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False, default='signal_decider_policy_v1', index=True)
     decision_action: Mapped[str] = mapped_column(String(16), nullable=False, default='wait', index=True)
     horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_eval_v1', index=True)
@@ -1749,7 +1863,7 @@ class SignalDeciderCalendarReviewItem(Base, TimestampMixin):
     )
     market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     decision_action: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False, default='signal_decider_eval_v1', index=True)
     primary_horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
@@ -1782,6 +1896,13 @@ class SignalDeciderPolicyVersion(Base, TimestampMixin):
             'parent_policy_version',
             'status',
         ),
+        Index(
+            'uq_signal_decider_policy_versions_one_active',
+            'status',
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1812,7 +1933,7 @@ class SignalDeciderPolicyCandidate(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     candidate_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    base_policy_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    base_policy_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     market_date_from: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     market_date_to: Mapped[date] = mapped_column(Date, nullable=False, index=True)
@@ -1970,7 +2091,7 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
     account_reference: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     account_label: Mapped[str | None] = mapped_column(String(64))
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    policy_version: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     planned_side: Mapped[str] = mapped_column(String(16), nullable=False, default='buy')
     planned_order_type: Mapped[str] = mapped_column(String(32), nullable=False, default='market')
     planned_time_in_force: Mapped[str] = mapped_column(String(32), nullable=False, default='day')
@@ -2085,7 +2206,7 @@ class SignalDeciderActualExecutionOutcome(Base, TimestampMixin):
     target_trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     account_reference: Mapped[str] = mapped_column(String(128), nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
-    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False)
     entry_side: Mapped[str] = mapped_column(String(16), nullable=False, default='buy')
     exit_side: Mapped[str] = mapped_column(String(16), nullable=False, default='sell')
     lifecycle_status: Mapped[str] = mapped_column(String(32), nullable=False, default='planned')
@@ -2144,6 +2265,7 @@ class AgentContextFeedbackFailure(Base, TimestampMixin):
 class AgentContextFeedbackRun(Base, TimestampMixin):
     __tablename__ = 'agent_context_feedback_runs'
     __table_args__ = (
+        UniqueConstraint('run_id', name='uq_agent_context_feedback_runs_run_id'),
         Index('ix_agent_context_feedback_runs_market_date_status_started', 'market_date', 'status', 'started_at'),
     )
 
@@ -2156,7 +2278,7 @@ class AgentContextFeedbackRun(Base, TimestampMixin):
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     request_payload: Mapped[dict | None] = mapped_column(JSON)
     summary_payload: Mapped[dict | None] = mapped_column(JSON)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -2206,6 +2328,8 @@ class DartDisclosureSyncRun(Base):
 class DartDisclosureEvent(Base, TimestampMixin):
     __tablename__ = 'dart_disclosure_events'
     __table_args__ = (
+        UniqueConstraint('rcept_no', name='dart_disclosure_events_rcept_no_key'),
+        Index('ix_dart_disclosure_events_rcept_no', 'rcept_no'),
         Index(
             'ix_dart_disclosure_events_financial_status_symbol_receipt',
             'is_financial_report',
@@ -2238,7 +2362,7 @@ class DartDisclosureEvent(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    rcept_no: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False)
     corp_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     corp_name: Mapped[str] = mapped_column(String(255), nullable=False)
     stock_code: Mapped[str | None] = mapped_column(String(16), index=True)
@@ -2328,6 +2452,12 @@ class DartFundamentalsSnapshot(Base, TimestampMixin):
             'business_year',
             'report_code',
             'id',
+        ),
+        Index(
+            'ix_dart_fundamentals_snapshots_fs_updated_stock',
+            'fs_div',
+            'updated_at',
+            'stock_code',
         ),
     )
 
@@ -2422,6 +2552,12 @@ class DartFundamentalsHighlight(Base, TimestampMixin):
     pre_prior_amount: Mapped[int | None] = mapped_column(BigInteger)
     currency: Mapped[str | None] = mapped_column(String(16))
     ratio_value: Mapped[float | None] = mapped_column(Numeric(18, 4))
+    source_api: Mapped[str | None] = mapped_column(String(64))
+    index_code: Mapped[str | None] = mapped_column(String(64))
+    index_class_code: Mapped[str | None] = mapped_column(String(64))
+    index_class_name: Mapped[str | None] = mapped_column(String(255))
+    period_end_date: Mapped[date | None] = mapped_column(Date)
+    detail_payload: Mapped[dict | None] = mapped_column(JSON)
 
 
 class DartAuditSignal(Base, TimestampMixin):
@@ -2432,16 +2568,16 @@ class DartAuditSignal(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    disclosure_event_id: Mapped[int | None] = mapped_column(ForeignKey('dart_disclosure_events.id', ondelete='SET NULL'), index=True)
-    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    corp_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-    stock_code: Mapped[str | None] = mapped_column(String(16), index=True)
+    disclosure_event_id: Mapped[int | None] = mapped_column(ForeignKey('dart_disclosure_events.id', ondelete='SET NULL'))
+    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False)
+    corp_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    stock_code: Mapped[str | None] = mapped_column(String(16))
     corp_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    receipt_date: Mapped[date | None] = mapped_column(Date, index=True)
+    receipt_date: Mapped[date | None] = mapped_column(Date)
     report_nm: Mapped[str | None] = mapped_column(String(255))
-    opinion_code: Mapped[str | None] = mapped_column(String(32), index=True)
-    opinion_label: Mapped[str | None] = mapped_column(String(64), index=True)
-    has_audit_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    opinion_code: Mapped[str | None] = mapped_column(String(32))
+    opinion_label: Mapped[str | None] = mapped_column(String(64))
+    has_audit_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     source_section: Mapped[str | None] = mapped_column(String(255))
     evidence_text: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict | None] = mapped_column(JSON)
@@ -2455,15 +2591,15 @@ class DartDilutionSignal(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    disclosure_event_id: Mapped[int | None] = mapped_column(ForeignKey('dart_disclosure_events.id', ondelete='SET NULL'), index=True)
-    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    corp_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-    stock_code: Mapped[str | None] = mapped_column(String(16), index=True)
+    disclosure_event_id: Mapped[int | None] = mapped_column(ForeignKey('dart_disclosure_events.id', ondelete='SET NULL'))
+    rcept_no: Mapped[str] = mapped_column(String(32), nullable=False)
+    corp_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    stock_code: Mapped[str | None] = mapped_column(String(16))
     corp_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    receipt_date: Mapped[date | None] = mapped_column(Date, index=True)
+    receipt_date: Mapped[date | None] = mapped_column(Date)
     report_nm: Mapped[str | None] = mapped_column(String(255))
-    signal_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    has_dilution_signal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    signal_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    has_dilution_signal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     security_type: Mapped[str | None] = mapped_column(String(64))
     reason: Mapped[str | None] = mapped_column(String(255))
     payload: Mapped[dict | None] = mapped_column(JSON)

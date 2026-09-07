@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
+import json
 from types import SimpleNamespace
 from typing import Any, Sequence
 
@@ -12,6 +13,15 @@ from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.agent_context.decider_replay_service import (
+    DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION,
+    DECIDER_REPLAY_SCHEMA_VERSION,
+    DEFAULT_REPLAY_NOTIONAL_KRW,
+    DEFAULT_TOP_EXAMPLES_LIMIT,
+    MIN_PROMOTION_FEE_BPS,
+    MIN_PROMOTION_SLIPPAGE_BPS,
+    DeciderReplayService,
+)
 from app.agent_context.decision_delta import build_decision_delta
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.wait_reason_taxonomy import derive_wait_reason
@@ -66,6 +76,11 @@ DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON = 5
 DEFAULT_SIGNAL_DECIDER_REVIEW_HORIZONS: tuple[int, ...] = (1, 3, 5)
 SIGNAL_DECIDER_REPLAY_REVIEW_VERSION = 'signal_decider_replay_review_v1'
 SIGNAL_DECIDER_POLICY_STATUSES: tuple[str, ...] = ('draft', 'candidate', 'active', 'retired')
+SIGNAL_DECIDER_POLICY_ACTIVATION_EVIDENCE_SCHEMA_VERSION = (
+    'signal_decider_policy_activation_evidence_v1'
+)
+SIGNAL_DECIDER_REPLAY_SCHEMA_VERSION = DECIDER_REPLAY_SCHEMA_VERSION
+SIGNAL_DECIDER_PROMOTION_COHORT_BASIS = 'fixed_horizon_counterfactual'
 SIGNAL_DECIDER_EVALUATION_HORIZONS: tuple[int, ...] = (1, 3, 5, 10)
 SIGNAL_DECIDER_ACTIONS: tuple[str, ...] = ('buy', 'wait', 'reject')
 SHORT_TERM_DECIDER_ACTIONS: tuple[str, ...] = (
@@ -102,6 +117,7 @@ SIGNAL_DECIDER_EVALUATION_COVERAGE_REASONS: tuple[str, ...] = (
 POLICY_VERSION_AUDIT_METADATA_KEYS: tuple[str, ...] = (
     'activation_history',
     'last_activation_note',
+    'promotion_evidence',
     'retired_by_activation_of',
 )
 SIGNAL_DECIDER_REPLAY_PATH_MARKERS: tuple[str, ...] = (
@@ -346,6 +362,50 @@ def _decision_snapshot_feedback_dedupe_key(row: SignalDeciderDecisionSnapshotRow
         str(getattr(row, 'symbol')),
         str(getattr(row, 'agent_name')),
     )
+
+
+_DECISION_SNAPSHOT_FINGERPRINT_EXCLUDED_FIELDS = frozenset(
+    {'id', 'content_fingerprint', 'feedback_received_at', 'created_at', 'updated_at'}
+)
+
+
+def _canonical_fingerprint_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, (int, float, Decimal)):
+        decimal_value = Decimal(str(value))
+        if not decimal_value.is_finite():
+            raise ValueError('decision snapshot fingerprint values must be finite')
+        return {'__number__': format(decimal_value.normalize(), 'f')}
+    if isinstance(value, datetime):
+        return {'__datetime__': value.isoformat()}
+    if isinstance(value, date):
+        return {'__date__': value.isoformat()}
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_fingerprint_value(nested_value)
+            for key, nested_value in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_fingerprint_value(item) for item in value]
+    raise ValueError(
+        f'unsupported decision snapshot fingerprint value type: {type(value).__name__}'
+    )
+
+
+def _decision_snapshot_content_fingerprint(item: dict[str, Any]) -> str:
+    fingerprint_payload = {
+        str(key): _canonical_fingerprint_value(value)
+        for key, value in item.items()
+        if key not in _DECISION_SNAPSHOT_FINGERPRINT_EXCLUDED_FIELDS
+    }
+    encoded = json.dumps(
+        fingerprint_payload,
+        ensure_ascii=False,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _dedupe_decision_snapshot_rows(
@@ -720,6 +780,445 @@ def _merge_policy_metadata_preserving_audit(
         if key in existing_metadata:
             merged_metadata[key] = existing_metadata[key]
     return merged_metadata
+
+
+def _promotion_decimal(value: Any, *, field: str) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f'replay_evidence {field} must be a finite number')
+    try:
+        resolved = Decimal(str(value))
+    except (ArithmeticError, ValueError) as exc:
+        raise ValueError(f'replay_evidence {field} must be a finite number') from exc
+    if not resolved.is_finite():
+        raise ValueError(f'replay_evidence {field} must be a finite number')
+    return resolved
+
+
+def _candidate_replay_rule_config(
+    *,
+    policy_version: str,
+    candidate_kind: str,
+    feature_key: Any,
+    feature_value: Any,
+) -> dict[str, Any] | None:
+    if candidate_kind != 'tighten_buy_gate':
+        return None
+    normalized_feature_key = str(feature_key or '').strip()
+    if not normalized_feature_key:
+        raise ValueError('candidate policy feature gate key is required')
+    replay_feature_value = (
+        True
+        if feature_value == 'true'
+        else False
+        if feature_value == 'false'
+        else feature_value
+    )
+    return {
+        'schema_version': DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION,
+        'candidate_policy_version': policy_version,
+        'rules': [
+            {
+                'name': 'candidate_policy_rule',
+                'predicates': [
+                    {
+                        'type': 'field',
+                        'field': normalized_feature_key,
+                        'op': '==',
+                        'value': replay_feature_value,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _policy_promotion_replay_contract(
+    *,
+    policy_version: str,
+    target: dict[str, Any],
+) -> dict[str, Any]:
+    rule_bundle = _maybe_dict(target.get('rule_bundle'))
+    candidate_kind = str(rule_bundle.get('candidate_kind') or '').strip()
+    if candidate_kind in {'relax_wait_gate', 'relax_reject_gate'}:
+        raise ValueError(
+            f'{candidate_kind} activation requires a dedicated counterfactual replay implementation'
+        )
+    if candidate_kind != 'tighten_buy_gate':
+        raise ValueError('candidate policy kind is not supported for activation')
+
+    proposed_changes = rule_bundle.get('proposed_changes')
+    if not isinstance(proposed_changes, list) or len(proposed_changes) != 1:
+        raise ValueError('candidate policy must contain exactly one proposed feature gate')
+    proposed_change = _maybe_dict(proposed_changes[0])
+    if proposed_change.get('change_type') != candidate_kind:
+        raise ValueError('candidate policy proposed change does not match its candidate kind')
+    feature_gate = _maybe_dict(proposed_change.get('feature_gate'))
+    expected_rule_config = _candidate_replay_rule_config(
+        policy_version=policy_version,
+        candidate_kind=candidate_kind,
+        feature_key=feature_gate.get('key'),
+        feature_value=feature_gate.get('value'),
+    )
+
+    replay_contract = _maybe_dict(rule_bundle.get('replay_contract'))
+    if not replay_contract:
+        raise ValueError('candidate policy rule bundle is missing its replay contract')
+    if _canonical_fingerprint_value(replay_contract.get('rule_config')) != (
+        _canonical_fingerprint_value(expected_rule_config)
+    ):
+        raise ValueError('candidate policy replay rule does not match its proposed feature gate')
+    if replay_contract.get('agent_name') != SIGNAL_DECIDER_AGENT_NAME:
+        raise ValueError('candidate policy replay contract must target signal-decider')
+
+    base_policy_version = str(rule_bundle.get('base_policy_version') or '').strip()
+    if not base_policy_version:
+        raise ValueError('candidate policy rule bundle is missing its base policy version')
+    if str(target.get('parent_policy_version') or '').strip() != base_policy_version:
+        raise ValueError('candidate policy base version conflicts with its parent policy version')
+    contract_policy_versions = replay_contract.get('policy_versions')
+    if (
+        not isinstance(contract_policy_versions, list)
+        or [str(value).strip() for value in contract_policy_versions] != [base_policy_version]
+    ):
+        raise ValueError('candidate policy replay contract must target only its base policy version')
+
+    evaluation_summary = _maybe_dict(_maybe_dict(target.get('metadata')).get('evaluation_summary'))
+    required_fields = ('market_date_from', 'market_date_to', 'horizon_days', 'symbols')
+    missing_fields = [field for field in required_fields if field not in evaluation_summary]
+    if missing_fields:
+        raise ValueError(
+            'candidate policy metadata is missing replay binding fields: '
+            + ', '.join(missing_fields)
+        )
+    market_date_from = _normalize_market_date(evaluation_summary['market_date_from'])
+    market_date_to = _normalize_market_date(evaluation_summary['market_date_to'])
+    if market_date_from > market_date_to:
+        raise ValueError('candidate policy replay window is invalid')
+    if isinstance(evaluation_summary.get('horizon_days'), bool):
+        raise ValueError('candidate policy replay horizon_days must be a positive integer')
+    horizon_days = int(evaluation_summary['horizon_days'])
+    if horizon_days < 1:
+        raise ValueError('candidate policy replay horizon_days must be a positive integer')
+    if not isinstance(evaluation_summary.get('symbols'), list):
+        raise ValueError('candidate policy replay symbols must be a list')
+    symbols = _normalize_symbols(evaluation_summary['symbols'])
+
+    market_date_window = _maybe_dict(rule_bundle.get('market_date_window'))
+    if (
+        str(market_date_window.get('from') or '') != market_date_from.isoformat()
+        or str(market_date_window.get('to') or '') != market_date_to.isoformat()
+        or int(rule_bundle.get('primary_horizon_days') or 0) != horizon_days
+    ):
+        raise ValueError('candidate policy rule bundle conflicts with its evaluation window')
+    if (
+        str(replay_contract.get('market_date_from') or '') != market_date_from.isoformat()
+        or str(replay_contract.get('market_date_to') or '') != market_date_to.isoformat()
+        or replay_contract.get('horizon_days') != horizon_days
+    ):
+        raise ValueError('candidate policy replay contract conflicts with its evaluation window')
+    if not isinstance(replay_contract.get('symbols'), list):
+        raise ValueError('candidate policy replay contract symbols must be a list')
+    if _normalize_symbols(replay_contract['symbols']) != symbols:
+        raise ValueError('candidate policy replay contract conflicts with its symbol cohort')
+
+    cost_assumptions = _maybe_dict(replay_contract.get('cost_assumptions'))
+    fee_bps = _promotion_decimal(
+        cost_assumptions.get('fee_bps'),
+        field='candidate.rule_bundle.replay_contract.cost_assumptions.fee_bps',
+    )
+    slippage_bps = _promotion_decimal(
+        cost_assumptions.get('slippage_bps'),
+        field='candidate.rule_bundle.replay_contract.cost_assumptions.slippage_bps',
+    )
+    notional_krw = _promotion_decimal(
+        cost_assumptions.get('notional_krw'),
+        field='candidate.rule_bundle.replay_contract.cost_assumptions.notional_krw',
+    )
+    if fee_bps < MIN_PROMOTION_FEE_BPS or slippage_bps < MIN_PROMOTION_SLIPPAGE_BPS:
+        raise ValueError('candidate policy replay contract cost assumptions are below safety minimums')
+    if notional_krw <= 0:
+        raise ValueError('candidate policy replay contract notional_krw must be positive')
+    top_examples_limit = replay_contract.get('top_examples_limit')
+    if isinstance(top_examples_limit, bool) or not isinstance(top_examples_limit, int):
+        raise ValueError('candidate policy replay contract top_examples_limit must be an integer')
+    if top_examples_limit < 0:
+        raise ValueError('candidate policy replay contract top_examples_limit must be non-negative')
+
+    return {
+        'market_date_from': market_date_from.isoformat(),
+        'market_date_to': market_date_to.isoformat(),
+        'agent_name': SIGNAL_DECIDER_AGENT_NAME,
+        'symbols': symbols,
+        'policy_versions': [base_policy_version],
+        'horizon_days': horizon_days,
+        'rule_config': expected_rule_config,
+        'fee_bps': fee_bps,
+        'slippage_bps': slippage_bps,
+        'notional_krw': notional_krw,
+        'top_examples_limit': top_examples_limit,
+    }
+
+
+def _validate_policy_promotion_evidence(
+    *,
+    policy_version: str,
+    target: dict[str, Any],
+    replay_evidence: dict[str, Any] | None,
+    replay_contract: dict[str, Any],
+    server_replay_artifact: dict[str, Any],
+    validated_at: datetime,
+) -> dict[str, Any]:
+    if not isinstance(replay_evidence, dict):
+        raise ValueError('candidate policy activation requires replay_evidence')
+    if replay_evidence.get('schema_version') != SIGNAL_DECIDER_POLICY_ACTIVATION_EVIDENCE_SCHEMA_VERSION:
+        raise ValueError(
+            'replay_evidence.schema_version must be '
+            f'{SIGNAL_DECIDER_POLICY_ACTIVATION_EVIDENCE_SCHEMA_VERSION}'
+        )
+    if replay_evidence.get('candidate_policy_version') != policy_version:
+        raise ValueError('replay_evidence candidate_policy_version must match the target policy')
+    source_candidate_version = target.get('source_candidate_version')
+    if source_candidate_version and source_candidate_version != policy_version:
+        raise ValueError('candidate policy source version does not match the target policy')
+
+    replay_artifact = replay_evidence.get('replay_artifact')
+    if not isinstance(replay_artifact, dict):
+        raise ValueError('replay_evidence.replay_artifact must be an object')
+    if replay_artifact.get('schema_version') != SIGNAL_DECIDER_REPLAY_SCHEMA_VERSION:
+        raise ValueError(
+            f'replay artifact schema_version must be {SIGNAL_DECIDER_REPLAY_SCHEMA_VERSION}'
+        )
+
+    replay_request = replay_artifact.get('request')
+    replay_metadata = replay_artifact.get('metadata')
+    replay_summary = replay_artifact.get('summary')
+    if not isinstance(replay_request, dict):
+        raise ValueError('replay artifact request must be an object')
+    if not isinstance(replay_metadata, dict):
+        raise ValueError('replay artifact metadata must be an object')
+    if not isinstance(replay_summary, dict):
+        raise ValueError('replay artifact summary must be an object')
+
+    for field in ('market_date_from', 'market_date_to'):
+        if str(replay_request.get(field) or '') != replay_contract[field]:
+            raise ValueError(f'replay artifact {field} does not match candidate replay contract')
+    if _promotion_decimal(
+        replay_request.get('horizon_days'),
+        field='replay_artifact.request.horizon_days',
+    ) != Decimal(replay_contract['horizon_days']):
+        raise ValueError('replay artifact horizon_days does not match candidate replay contract')
+    if replay_request.get('agent_name') != replay_contract['agent_name']:
+        raise ValueError('replay artifact agent_name does not match candidate replay contract')
+    if not isinstance(replay_request.get('symbols'), list):
+        raise ValueError('replay artifact request.symbols must be a list')
+    if _normalize_symbols(replay_request['symbols']) != replay_contract['symbols']:
+        raise ValueError('replay artifact symbols do not match candidate replay contract')
+    if not isinstance(replay_request.get('policy_versions'), list):
+        raise ValueError('replay artifact request.policy_versions must be a list')
+    if replay_request['policy_versions'] != replay_contract['policy_versions']:
+        raise ValueError('replay artifact policy versions do not match candidate replay contract')
+    if replay_request.get('top_examples_limit') != replay_contract['top_examples_limit']:
+        raise ValueError('replay artifact top_examples_limit does not match candidate replay contract')
+
+    rule_config = replay_request.get('rule_config')
+    if _canonical_fingerprint_value(rule_config) != _canonical_fingerprint_value(
+        replay_contract['rule_config']
+    ):
+        raise ValueError('replay artifact rule_config does not match candidate replay contract')
+
+    cost_assumptions = replay_request.get('cost_assumptions')
+    if not isinstance(cost_assumptions, dict):
+        raise ValueError('replay artifact cost_assumptions must be an object')
+    fee_bps = _promotion_decimal(
+        cost_assumptions.get('fee_bps'),
+        field='replay_artifact.request.cost_assumptions.fee_bps',
+    )
+    slippage_bps = _promotion_decimal(
+        cost_assumptions.get('slippage_bps'),
+        field='replay_artifact.request.cost_assumptions.slippage_bps',
+    )
+    notional_krw = _promotion_decimal(
+        cost_assumptions.get('notional_krw'),
+        field='replay_artifact.request.cost_assumptions.notional_krw',
+    )
+    if (
+        fee_bps != replay_contract['fee_bps']
+        or slippage_bps != replay_contract['slippage_bps']
+        or notional_krw != replay_contract['notional_krw']
+    ):
+        raise ValueError('replay artifact costs do not match candidate replay contract')
+
+    if not isinstance(server_replay_artifact, dict):
+        raise ValueError('server replay did not produce an artifact')
+    if _canonical_fingerprint_value(replay_artifact) != _canonical_fingerprint_value(
+        server_replay_artifact
+    ):
+        raise ValueError('replay artifact does not match the server-recomputed artifact')
+
+    promotion_cost_gate = replay_metadata.get('promotion_cost_gate')
+    if not isinstance(promotion_cost_gate, dict):
+        raise ValueError('replay artifact promotion_cost_gate must be an object')
+    if promotion_cost_gate.get('eligible') is not True or promotion_cost_gate.get('status') != 'passed':
+        raise ValueError('replay artifact promotion cost gate did not pass')
+    minimum_assumptions = promotion_cost_gate.get('minimum_assumptions')
+    effective_assumptions = promotion_cost_gate.get('effective_assumptions')
+    if not isinstance(minimum_assumptions, dict) or not isinstance(effective_assumptions, dict):
+        raise ValueError('replay artifact promotion cost gate must disclose minimum and effective assumptions')
+    if (
+        _promotion_decimal(
+            minimum_assumptions.get('fee_bps'),
+            field='replay_artifact.metadata.promotion_cost_gate.minimum_assumptions.fee_bps',
+        )
+        != MIN_PROMOTION_FEE_BPS
+        or _promotion_decimal(
+            minimum_assumptions.get('slippage_bps'),
+            field=(
+                'replay_artifact.metadata.promotion_cost_gate.minimum_assumptions.'
+                'slippage_bps'
+            ),
+        )
+        != MIN_PROMOTION_SLIPPAGE_BPS
+    ):
+        raise ValueError('replay artifact promotion cost minimums do not match the active safety gate')
+    if (
+        _promotion_decimal(
+            effective_assumptions.get('fee_bps'),
+            field='replay_artifact.metadata.promotion_cost_gate.effective_assumptions.fee_bps',
+        )
+        != fee_bps
+        or _promotion_decimal(
+            effective_assumptions.get('slippage_bps'),
+            field=(
+                'replay_artifact.metadata.promotion_cost_gate.effective_assumptions.'
+                'slippage_bps'
+            ),
+        )
+        != slippage_bps
+    ):
+        raise ValueError('replay artifact promotion cost gate conflicts with its request assumptions')
+    if replay_metadata.get('profitability_basis') != 'estimated_net':
+        raise ValueError('replay artifact profitability_basis must be estimated_net')
+    if replay_metadata.get('promotion_metrics_basis') != 'estimated_net':
+        raise ValueError('replay artifact promotion_metrics_basis must be estimated_net')
+    if replay_metadata.get('promotion_cohort_basis') != SIGNAL_DECIDER_PROMOTION_COHORT_BASIS:
+        raise ValueError('replay artifact promotion cohort must be fixed-horizon counterfactual')
+
+    coverage = replay_summary.get('coverage')
+    if not isinstance(coverage, dict):
+        raise ValueError('replay artifact summary.coverage must be an object')
+    if coverage.get('cohort_basis') != SIGNAL_DECIDER_PROMOTION_COHORT_BASIS:
+        raise ValueError('replay artifact coverage cohort must be fixed-horizon counterfactual')
+    economic_cohort_count = _promotion_decimal(
+        coverage.get('economic_cohort_count'),
+        field='replay_artifact.summary.coverage.economic_cohort_count',
+    )
+    source_decision_count = _promotion_decimal(
+        coverage.get('source_decision_count'),
+        field='replay_artifact.summary.coverage.source_decision_count',
+    )
+    baseline_trade_count = _promotion_decimal(
+        replay_summary.get('baseline_trade_count'),
+        field='replay_artifact.summary.baseline_trade_count',
+    )
+    candidate_trade_count = _promotion_decimal(
+        replay_summary.get('candidate_trade_count'),
+        field='replay_artifact.summary.candidate_trade_count',
+    )
+    censored_or_excluded_count = _promotion_decimal(
+        coverage.get('censored_or_excluded_count'),
+        field='replay_artifact.summary.coverage.censored_or_excluded_count',
+    )
+    count_values = (
+        economic_cohort_count,
+        source_decision_count,
+        baseline_trade_count,
+        candidate_trade_count,
+        censored_or_excluded_count,
+    )
+    if any(value != value.to_integral_value() for value in count_values):
+        raise ValueError('replay artifact cohort and trade counts must be integers')
+    if economic_cohort_count <= 0 or source_decision_count < economic_cohort_count:
+        raise ValueError('replay artifact must contain a non-empty, internally valid economic cohort')
+    if censored_or_excluded_count != source_decision_count - economic_cohort_count:
+        raise ValueError('replay artifact censored count conflicts with its cohort counts')
+    if baseline_trade_count != economic_cohort_count:
+        raise ValueError('replay artifact baseline count must equal its economic cohort count')
+    if candidate_trade_count < 0 or candidate_trade_count > baseline_trade_count:
+        raise ValueError('replay artifact candidate trade count is invalid')
+    skipped_buys = _promotion_decimal(
+        replay_summary.get('skipped_buys'),
+        field='replay_artifact.summary.skipped_buys',
+    )
+    if skipped_buys != skipped_buys.to_integral_value() or skipped_buys < 0:
+        raise ValueError('replay artifact skipped_buys must be a non-negative integer')
+    if skipped_buys != baseline_trade_count - candidate_trade_count:
+        raise ValueError('replay artifact skipped count conflicts with its trade counts')
+
+    promotion_metrics = replay_summary.get('promotion_metrics')
+    baseline_metrics = replay_summary.get('baseline')
+    candidate_metrics = replay_summary.get('candidate')
+    if not isinstance(promotion_metrics, dict) or promotion_metrics.get('basis') != 'estimated_net':
+        raise ValueError('replay artifact promotion_metrics must use estimated_net')
+    if not isinstance(baseline_metrics, dict) or not isinstance(candidate_metrics, dict):
+        raise ValueError('replay artifact baseline and candidate metrics must be objects')
+    promotion_net_delta = _promotion_decimal(
+        promotion_metrics.get('estimated_net_pnl_delta_krw'),
+        field='replay_artifact.summary.promotion_metrics.estimated_net_pnl_delta_krw',
+    )
+    headline_net_delta = _promotion_decimal(
+        replay_summary.get('estimated_net_pnl_delta_krw'),
+        field='replay_artifact.summary.estimated_net_pnl_delta_krw',
+    )
+    baseline_net_pnl = _promotion_decimal(
+        baseline_metrics.get('estimated_net_pnl_krw'),
+        field='replay_artifact.summary.baseline.estimated_net_pnl_krw',
+    )
+    candidate_net_pnl = _promotion_decimal(
+        candidate_metrics.get('estimated_net_pnl_krw'),
+        field='replay_artifact.summary.candidate.estimated_net_pnl_krw',
+    )
+    if promotion_net_delta != headline_net_delta:
+        raise ValueError('replay artifact net promotion delta conflicts with its headline delta')
+    if candidate_net_pnl - baseline_net_pnl != promotion_net_delta:
+        raise ValueError('replay artifact net promotion delta conflicts with its metric totals')
+    if promotion_net_delta <= 0:
+        raise ValueError('candidate policy activation requires a positive estimated-net replay delta')
+
+    artifact_sha256 = hashlib.sha256(
+        json.dumps(
+            _canonical_fingerprint_value(replay_artifact),
+            ensure_ascii=False,
+            separators=(',', ':'),
+            sort_keys=True,
+        ).encode('utf-8')
+    ).hexdigest()
+    declared_sha256 = replay_evidence.get('replay_artifact_sha256')
+    if declared_sha256 is not None and declared_sha256 != artifact_sha256:
+        raise ValueError('replay_evidence replay_artifact_sha256 does not match the artifact')
+
+    return {
+        'schema_version': SIGNAL_DECIDER_POLICY_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
+        'validation_status': 'passed',
+        'validation_source': 'server_recomputed_replay',
+        'validated_at': validated_at.isoformat(),
+        'candidate_policy_version': policy_version,
+        'replay_artifact_sha256': artifact_sha256,
+        'replay_schema_version': SIGNAL_DECIDER_REPLAY_SCHEMA_VERSION,
+        'replay_request': {
+            'market_date_from': replay_request['market_date_from'],
+            'market_date_to': replay_request['market_date_to'],
+            'agent_name': replay_request['agent_name'],
+            'symbols': list(replay_request['symbols']),
+            'policy_versions': list(replay_request['policy_versions']),
+            'horizon_days': replay_request['horizon_days'],
+            'rule_config': dict(rule_config),
+            'cost_assumptions': dict(cost_assumptions),
+            'top_examples_limit': replay_request['top_examples_limit'],
+        },
+        'cohort_basis': SIGNAL_DECIDER_PROMOTION_COHORT_BASIS,
+        'coverage': dict(coverage),
+        'promotion_metrics': dict(promotion_metrics),
+    }
 
 
 def _signal_score_bucket(score: float | None) -> str | None:
@@ -1343,115 +1842,62 @@ class SignalDeciderLoopRepository:
     ) -> list[SignalDeciderDecisionSnapshot]:
         if not items:
             return []
-        return_order: list[tuple[str, int]] = []
-        null_feedback_items: list[dict[str, Any]] = []
-        deduped_feedback_items: list[tuple[int, dict[str, Any]]] = []
-        seen_feedback_ids: set[int] = set()
-        for item in reversed(list(items)):
-            feedback_id = item.get('feedback_id')
-            if feedback_id is None:
-                continue
-            normalized_feedback_id = int(feedback_id)
-            if normalized_feedback_id in seen_feedback_ids:
-                continue
-            seen_feedback_ids.add(normalized_feedback_id)
-            deduped_feedback_items.append((normalized_feedback_id, item))
-        deduped_feedback_items.reverse()
+        return_order: list[str] = []
+        fingerprint_items: list[tuple[str, dict[str, Any]]] = []
+        seen_fingerprints: set[str] = set()
 
-        null_item_index = 0
         for item in items:
             feedback_id = item.get('feedback_id')
-            if feedback_id is None:
-                null_feedback_items.append(item)
-                return_order.append(('null', null_item_index))
-                null_item_index += 1
+            normalized_item = dict(item)
+            if feedback_id is not None:
+                normalized_item['feedback_id'] = int(feedback_id)
+            content_fingerprint = _decision_snapshot_content_fingerprint(normalized_item)
+            normalized_item['content_fingerprint'] = content_fingerprint
+            return_order.append(content_fingerprint)
+            if content_fingerprint in seen_fingerprints:
                 continue
-            return_order.append(('feedback', int(feedback_id)))
+            seen_fingerprints.add(content_fingerprint)
+            fingerprint_items.append((content_fingerprint, normalized_item))
 
-        rows_by_feedback_id: dict[int, SignalDeciderDecisionSnapshot] = {}
-        rows_by_null_index: dict[int, SignalDeciderDecisionSnapshot] = {}
-        if deduped_feedback_items:
+        rows_by_fingerprint: dict[str, SignalDeciderDecisionSnapshot] = {}
+        if fingerprint_items:
             if session.bind is not None and session.bind.dialect.name == 'postgresql':
                 stmt = insert(SignalDeciderDecisionSnapshot).values(
-                    [dict(item) for _, item in deduped_feedback_items]
+                    [item for _, item in fingerprint_items]
                 )
-                excluded = stmt.excluded
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=[SignalDeciderDecisionSnapshot.feedback_id],
-                    index_where=SignalDeciderDecisionSnapshot.feedback_id.is_not(None),
-                    set_={
-                        'market_date': excluded.market_date,
-                        'symbol': excluded.symbol,
-                        'agent_name': excluded.agent_name,
-                        'agent_version': excluded.agent_version,
-                        'decision_run_id': excluded.decision_run_id,
-                        'feedback_received_at': excluded.feedback_received_at,
-                        'policy_version': excluded.policy_version,
-                        'decision_action': excluded.decision_action,
-                        'preferred_action': excluded.preferred_action,
-                        'next_day_open_action': excluded.next_day_open_action,
-                        'entry_price_basis': excluded.entry_price_basis,
-                        'target_price': excluded.target_price,
-                        'expected_return_pct': excluded.expected_return_pct,
-                        'stop_loss_price': excluded.stop_loss_price,
-                        'suggested_holding_period': excluded.suggested_holding_period,
-                        'confidence_score_10': excluded.confidence_score_10,
-                        'conviction_score_10': excluded.conviction_score_10,
-                        'thesis_summary': excluded.thesis_summary,
-                        'supporting_evidence_payload': excluded.supporting_evidence_payload,
-                        'decision_risks_payload': excluded.decision_risks_payload,
-                        'invalidation_conditions_payload': excluded.invalidation_conditions_payload,
-                        'data_quality_warnings_payload': excluded.data_quality_warnings_payload,
-                        'specialist_disagreement_payload': excluded.specialist_disagreement_payload,
-                        'traceability_payload': excluded.traceability_payload,
-                        'input_feature_snapshot_payload': excluded.input_feature_snapshot_payload,
-                        'request_payload': excluded.request_payload,
-                        'response_payload': excluded.response_payload,
-                        'response_summary_payload': excluded.response_summary_payload,
-                        'created_at': excluded.created_at,
-                        'updated_at': excluded.updated_at,
-                    },
-                ).returning(SignalDeciderDecisionSnapshot.id)
-                ids = session.execute(stmt).scalars().all()
+                stmt = stmt.on_conflict_do_nothing(
+                    index_elements=[SignalDeciderDecisionSnapshot.content_fingerprint],
+                    index_where=SignalDeciderDecisionSnapshot.content_fingerprint.is_not(None),
+                )
+                session.execute(stmt)
                 rows = session.execute(
                     select(SignalDeciderDecisionSnapshot)
-                    .where(SignalDeciderDecisionSnapshot.id.in_(ids))
+                    .where(
+                        SignalDeciderDecisionSnapshot.content_fingerprint.in_(
+                            [fingerprint for fingerprint, _ in fingerprint_items]
+                        )
+                    )
                     .order_by(SignalDeciderDecisionSnapshot.id.asc())
                 ).scalars().all()
-                rows_by_feedback_id = {
-                    int(row.feedback_id): row
+                rows_by_fingerprint = {
+                    str(row.content_fingerprint): row
                     for row in rows
-                    if row.feedback_id is not None
+                    if row.content_fingerprint is not None
                 }
             else:
-                for feedback_id, item in deduped_feedback_items:
+                for content_fingerprint, item in fingerprint_items:
                     row = session.execute(
                         select(SignalDeciderDecisionSnapshot).where(
-                            SignalDeciderDecisionSnapshot.feedback_id == feedback_id
+                            SignalDeciderDecisionSnapshot.content_fingerprint == content_fingerprint
                         )
                     ).scalar_one_or_none()
                     if row is None:
                         row = SignalDeciderDecisionSnapshot(**item)
                         session.add(row)
-                    else:
-                        for key, value in item.items():
-                            setattr(row, key, value)
                     session.flush()
-                    rows_by_feedback_id[feedback_id] = row
+                    rows_by_fingerprint[content_fingerprint] = row
 
-        if null_feedback_items:
-            null_rows = [SignalDeciderDecisionSnapshot(**item) for item in null_feedback_items]
-            session.add_all(null_rows)
-            session.flush()
-            rows_by_null_index = {
-                index: row
-                for index, row in enumerate(null_rows)
-            }
-
-        return [
-            rows_by_null_index[key] if kind == 'null' else rows_by_feedback_id[key]
-            for kind, key in return_order
-        ]
+        return [rows_by_fingerprint[content_fingerprint] for content_fingerprint in return_order]
 
     def list_decision_snapshots(
         self,
@@ -1808,10 +2254,14 @@ class SignalDeciderLoopRepository:
                     SignalDeciderPolicyVersion.created_at.desc(),
                     SignalDeciderPolicyVersion.id.desc(),
                 )
-                .limit(1)
+                .limit(2)
             )
-            row = session.execute(stmt).scalar_one_or_none()
-            return _serialize_policy_version_row(row) if row is not None else None
+            rows = list(session.execute(stmt).scalars().all())
+            if len(rows) > 1:
+                raise RuntimeError(
+                    'Signal-decider policy registry invariant violated: multiple active policies exist.'
+                )
+            return _serialize_policy_version_row(rows[0]) if rows else None
 
     def bulk_upsert_realized_outcomes(self, *, items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if not items:
@@ -2051,23 +2501,33 @@ class SignalDeciderLoopRepository:
         policy_version: str,
         activated_by: str,
         activation_note: str | None,
+        promotion_evidence: dict[str, Any],
         activated_at: datetime,
     ) -> dict[str, Any] | None:
         with session_scope() as session:
-            target = session.execute(
-                select(SignalDeciderPolicyVersion).where(
-                    SignalDeciderPolicyVersion.policy_version == policy_version
-                )
-            ).scalar_one_or_none()
+            locked_policy_rows = list(
+                session.execute(
+                    select(SignalDeciderPolicyVersion)
+                    .order_by(SignalDeciderPolicyVersion.id.asc())
+                    .with_for_update()
+                ).scalars().all()
+            )
+            target = next(
+                (
+                    row
+                    for row in locked_policy_rows
+                    if row.policy_version == policy_version
+                ),
+                None,
+            )
             if target is None:
                 return None
 
-            previously_active_rows = session.execute(
-                select(SignalDeciderPolicyVersion).where(
-                    SignalDeciderPolicyVersion.status == 'active',
-                    SignalDeciderPolicyVersion.policy_version != policy_version,
-                )
-            ).scalars().all()
+            previously_active_rows = [
+                row
+                for row in locked_policy_rows
+                if row.status == 'active' and row.policy_version != policy_version
+            ]
             for row in previously_active_rows:
                 metadata = dict(row.metadata_payload or {})
                 activation_history = list(metadata.get('activation_history') or [])
@@ -2085,6 +2545,9 @@ class SignalDeciderLoopRepository:
                 row.retired_at = activated_at
                 row.updated_at = activated_at
 
+            if previously_active_rows:
+                session.flush()
+
             target_metadata = dict(target.metadata_payload or {})
             activation_history = list(target_metadata.get('activation_history') or [])
             activation_history.append(
@@ -2094,9 +2557,11 @@ class SignalDeciderLoopRepository:
                     'activated_by': activated_by,
                     'activation_note': activation_note,
                     'previous_status': target.status,
+                    'replay_artifact_sha256': promotion_evidence.get('replay_artifact_sha256'),
                 }
             )
             target_metadata['activation_history'] = activation_history[-10:]
+            target_metadata['promotion_evidence'] = dict(promotion_evidence)
             if activation_note:
                 target_metadata['last_activation_note'] = activation_note
             target.metadata_payload = target_metadata
@@ -2113,6 +2578,9 @@ class SignalDeciderLoopRepository:
                 )
             ).scalar_one_or_none()
             if candidate_row is not None:
+                candidate_evidence = dict(candidate_row.evidence_payload or {})
+                candidate_evidence['promotion_evidence'] = dict(promotion_evidence)
+                candidate_row.evidence_payload = candidate_evidence
                 candidate_row.status = 'activated'
                 candidate_row.activated_at = activated_at
                 candidate_row.updated_at = activated_at
@@ -2123,24 +2591,35 @@ class SignalDeciderLoopRepository:
 
 
 class SignalDeciderLoopService:
-    def __init__(self, *, repository: SignalDeciderLoopRepository | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        repository: SignalDeciderLoopRepository | None = None,
+        replay_service: DeciderReplayService | None = None,
+    ) -> None:
         self.repository = repository or SignalDeciderLoopRepository()
+        self.replay_service = replay_service or DeciderReplayService()
 
     def get_active_policy_context(self) -> dict[str, Any]:
         try:
             policy_record = self.repository.get_active_policy_version()
             if policy_record is None:
+                existing_policy_records = self.repository.list_policy_versions(limit=1)
+                if existing_policy_records:
+                    raise RuntimeError(
+                        'Signal-decider policy registry invariant violated: no active policy exists.'
+                    )
                 self._ensure_default_policy_version_registered()
                 policy_record = self.repository.get_active_policy_version()
             if policy_record is None:
-                policy_record = self._default_policy_version_record(status='active')
+                raise RuntimeError(
+                    'Signal-decider policy bootstrap did not persist exactly one active policy.'
+                )
             return self._policy_prompt_context(policy_record=policy_record)
-        except SQLAlchemyError:
-            return self._fallback_policy_prompt_context(
-                policy_version=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
-                status='active',
-                change_summary='Baseline manual-only signal-decider policy.',
-            )
+        except SQLAlchemyError as exc:
+            raise RuntimeError(
+                'Signal-decider active policy registry is unavailable; refusing an implicit baseline fallback.'
+            ) from exc
 
     def get_policy_prompt_context(self, *, policy_version: str | None = None) -> dict[str, Any]:
         normalized_policy_version = _normalize_optional_text(policy_version)
@@ -2228,6 +2707,7 @@ class SignalDeciderLoopService:
         policy_version: str,
         activated_by: str,
         activation_note: str | None = None,
+        replay_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_policy_version = _normalize_optional_text(policy_version)
         if not normalized_policy_version:
@@ -2257,18 +2737,40 @@ class SignalDeciderLoopService:
                 'summary': {
                     'activated': False,
                     'already_active': True,
+                    'state_changed': False,
+                    'promotion_evidence_validation': 'not_run_already_active',
                     'previous_active_policy_version': normalized_policy_version,
                     'manual_activation_required': True,
                 },
                 'item': self._enrich_policy_version_item(target, candidate=candidate),
             }
 
+        replay_contract = _policy_promotion_replay_contract(
+            policy_version=normalized_policy_version,
+            target=target,
+        )
+        if not isinstance(replay_evidence, dict) or not isinstance(
+            replay_evidence.get('replay_artifact'),
+            dict,
+        ):
+            raise ValueError('candidate policy activation requires replay_evidence')
+        server_replay_artifact = self.replay_service.replay(**replay_contract)
+        activated_at = self._utcnow()
+        promotion_evidence = _validate_policy_promotion_evidence(
+            policy_version=normalized_policy_version,
+            target=target,
+            replay_evidence=replay_evidence,
+            replay_contract=replay_contract,
+            server_replay_artifact=server_replay_artifact,
+            validated_at=activated_at,
+        )
         previous_active = self.repository.get_active_policy_version()
         activated_record = self.repository.activate_policy_version(
             policy_version=normalized_policy_version,
             activated_by=normalized_activated_by,
             activation_note=normalized_activation_note,
-            activated_at=self._utcnow(),
+            promotion_evidence=promotion_evidence,
+            activated_at=activated_at,
         )
         if activated_record is None:
             raise ValueError(f'signal-decider policy version {normalized_policy_version} was not found')
@@ -2280,10 +2782,13 @@ class SignalDeciderLoopService:
                 'policy_version': normalized_policy_version,
                 'activated_by': normalized_activated_by,
                 'activation_note': normalized_activation_note,
+                'replay_artifact_sha256': promotion_evidence['replay_artifact_sha256'],
             },
             'summary': {
                 'activated': True,
                 'already_active': False,
+                'state_changed': True,
+                'promotion_evidence_validation': 'passed',
                 'previous_active_policy_version': (
                     previous_active.get('policy_version')
                     if previous_active is not None and previous_active.get('policy_version') != normalized_policy_version
@@ -3616,7 +4121,7 @@ class SignalDeciderLoopService:
     ) -> dict[str, Any]:
         normalized_from = _normalize_market_date(market_date_from)
         normalized_to = _normalize_market_date(market_date_to)
-        normalized_symbols = _normalize_symbols(symbols)
+        normalized_symbols = sorted(_normalize_symbols(symbols))
         normalized_horizons = _normalize_horizons(horizons)
         if primary_horizon_days not in normalized_horizons:
             raise ValueError('primary_horizon_days must be included in horizons')
@@ -3725,6 +4230,7 @@ class SignalDeciderLoopService:
                 feature_value=group['feature_value'],
                 market_date_from=normalized_from,
                 market_date_to=normalized_to,
+                symbols=normalized_symbols,
             )
             summary = self._candidate_summary(
                 decision_action=group['decision_action'],
@@ -3770,6 +4276,7 @@ class SignalDeciderLoopService:
                         'sample_decisions': group['samples'],
                         'market_date_from': normalized_from.isoformat(),
                         'market_date_to': normalized_to.isoformat(),
+                        'symbols': normalized_symbols,
                     },
                     'recommendation_payload': {
                         'proposed_policy_version': candidate_version,
@@ -6280,8 +6787,9 @@ class SignalDeciderLoopService:
         feature_value: str,
         market_date_from: date,
         market_date_to: date,
+        symbols: Sequence[str],
     ) -> str:
-        digest = hashlib.sha1(
+        digest = hashlib.sha256(
             '|'.join(
                 [
                     base_policy_version,
@@ -6292,10 +6800,11 @@ class SignalDeciderLoopService:
                     feature_value,
                     market_date_from.isoformat(),
                     market_date_to.isoformat(),
+                    ','.join(symbols) if symbols else '*',
                 ]
             ).encode('utf-8')
-        ).hexdigest()[:12]
-        return f'{base_policy_version}-h{horizon_days}-{candidate_kind}-{digest}'
+        ).hexdigest()[:32]
+        return f'signal_decider_candidate_v1_{digest}'
 
     def _candidate_summary(
         self,
@@ -6353,6 +6862,7 @@ class SignalDeciderLoopService:
                 'market_date_from': candidate_item['market_date_from'].isoformat(),
                 'market_date_to': candidate_item['market_date_to'].isoformat(),
                 'horizon_days': candidate_item['horizon_days'],
+                'symbols': list(_maybe_dict(candidate_item['evidence_payload']).get('symbols') or []),
                 'focus_action': candidate_item['focus_action'],
                 'support_ratio': candidate_item['support_ratio'],
                 'support_count': candidate_item['support_count'],
@@ -6379,7 +6889,15 @@ class SignalDeciderLoopService:
         }
 
     def _candidate_rule_bundle(self, candidate_item: dict[str, Any]) -> dict[str, Any]:
-        return {
+        candidate_kind = str(candidate_item['candidate_kind'])
+        cohort_symbols = list(_maybe_dict(candidate_item['evidence_payload']).get('symbols') or [])
+        replay_rule_config = _candidate_replay_rule_config(
+            policy_version=str(candidate_item['candidate_version']),
+            candidate_kind=candidate_kind,
+            feature_key=candidate_item['feature_key'],
+            feature_value=candidate_item['feature_value'],
+        )
+        bundle = {
             'schema_version': 'signal_decider_policy_bundle_v1',
             'policy_version': candidate_item['candidate_version'],
             'base_policy_version': candidate_item['base_policy_version'],
@@ -6392,7 +6910,7 @@ class SignalDeciderLoopService:
             },
             'primary_horizon_days': candidate_item['horizon_days'],
             'focus_action': candidate_item['focus_action'],
-            'candidate_kind': candidate_item['candidate_kind'],
+            'candidate_kind': candidate_kind,
             'proposed_changes': [
                 {
                     'change_type': candidate_item['candidate_kind'],
@@ -6407,6 +6925,32 @@ class SignalDeciderLoopService:
                 }
             ],
         }
+        if replay_rule_config is None:
+            bundle['activation_eligibility'] = {
+                'eligible': False,
+                'reason': 'dedicated_counterfactual_replay_not_implemented',
+            }
+        else:
+            bundle['activation_eligibility'] = {
+                'eligible': True,
+                'reason': None,
+            }
+            bundle['replay_contract'] = {
+                'market_date_from': candidate_item['market_date_from'].isoformat(),
+                'market_date_to': candidate_item['market_date_to'].isoformat(),
+                'agent_name': SIGNAL_DECIDER_AGENT_NAME,
+                'symbols': cohort_symbols,
+                'policy_versions': [candidate_item['base_policy_version']],
+                'horizon_days': candidate_item['horizon_days'],
+                'rule_config': replay_rule_config,
+                'cost_assumptions': {
+                    'fee_bps': int(MIN_PROMOTION_FEE_BPS),
+                    'slippage_bps': int(MIN_PROMOTION_SLIPPAGE_BPS),
+                    'notional_krw': int(DEFAULT_REPLAY_NOTIONAL_KRW),
+                },
+                'top_examples_limit': DEFAULT_TOP_EXAMPLES_LIMIT,
+            }
+        return bundle
 
     def _group_by_snapshot_id(self, rows: Sequence[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
         grouped: dict[int, list[dict[str, Any]]] = {}

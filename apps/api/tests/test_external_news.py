@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -13,7 +14,13 @@ from app.external_news.classifier import classify_external_news_item
 from app.external_news.provider import NaverNewsSearchProvider
 from app.external_news.service import ExternalNewsService
 from app.external_news.provider import ExternalNewsItem
-from app.external_news.store import _build_external_news_insert_statement, _dedupe_provider_news_items
+from app.external_news.store import (
+    _build_external_news_insert_statement,
+    _dedupe_provider_news_items,
+    list_external_news_items,
+    list_recent_external_news_for_symbols,
+    persist_external_news_items,
+)
 from app.agent_context.read_service import (
     _build_decider_disclosures_news_quality_context,
     _build_external_news_freshness_provenance,
@@ -130,6 +137,130 @@ def test_external_news_insert_is_idempotent_for_all_unique_conflicts() -> None:
 
     assert 'ON CONFLICT DO NOTHING' in compiled
     assert 'ON CONSTRAINT' not in compiled
+
+
+def test_duplicate_provider_url_does_not_rewrite_original_observation() -> None:
+    original_collected_at = datetime(2026, 5, 7, tzinfo=timezone.utc)
+    existing = SimpleNamespace(
+        id=41,
+        symbol_id=1,
+        provider_item_id='original-id',
+        source='original-source',
+        title='original title',
+        description='original description',
+        source_url='https://publisher.example.test/original',
+        published_at=datetime(2026, 5, 6, tzinfo=timezone.utc),
+        collected_at=original_collected_at,
+        payload={'original': True},
+    )
+
+    class _InsertResult:
+        @staticmethod
+        def scalar_one_or_none():
+            return None
+
+    class _Session:
+        @staticmethod
+        def execute(_statement):
+            return _InsertResult()
+
+    @contextmanager
+    def _session_scope():
+        yield _Session()
+
+    replay = ExternalNewsItem(
+        provider='naver_news_search',
+        provider_item_id='later-id',
+        title='rewritten title',
+        description='rewritten description',
+        url='https://example.test/news/1',
+        source_url='https://publisher.example.test/later',
+        published_at=datetime(2026, 5, 8, tzinfo=timezone.utc),
+        payload={'later': True},
+    )
+    with (
+        patch('app.external_news.store.session_scope', _session_scope),
+        patch('app.external_news.store._get_symbol', return_value=SimpleNamespace(id=2)),
+        patch('app.external_news.store._find_existing_news_item', return_value=existing),
+        patch(
+            'app.external_news.store._utcnow',
+            return_value=datetime(2026, 5, 9, tzinfo=timezone.utc),
+        ),
+    ):
+        result = persist_external_news_items(symbol='000660', items=[replay])
+
+    assert result == {'inserted': 0, 'updated': 0, 'skipped': 1}
+    assert existing.symbol_id == 1
+    assert existing.provider_item_id == 'original-id'
+    assert existing.source == 'original-source'
+    assert existing.title == 'original title'
+    assert existing.description == 'original description'
+    assert existing.source_url == 'https://publisher.example.test/original'
+    assert existing.published_at == datetime(2026, 5, 6, tzinfo=timezone.utc)
+    assert existing.collected_at == original_collected_at
+    assert existing.payload == {'original': True}
+
+
+def test_list_external_news_items_applies_publication_and_collection_upper_bounds() -> None:
+    captured: dict[str, object] = {}
+
+    class _Result:
+        @staticmethod
+        def all() -> list[object]:
+            return []
+
+    class _Session:
+        @staticmethod
+        def execute(statement):
+            captured['statement'] = statement
+            return _Result()
+
+    @contextmanager
+    def _session_scope():
+        yield _Session()
+
+    published_since = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    knowledge_cutoff = datetime(2026, 4, 9, tzinfo=timezone.utc)
+    with patch('app.external_news.store.session_scope', _session_scope):
+        rows = list_external_news_items(
+            symbols=['005930'],
+            published_since=published_since,
+            published_before=knowledge_cutoff,
+            collected_before=knowledge_cutoff,
+        )
+
+    assert rows == []
+    statement = captured['statement']
+    compiled = statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert 'external_news_items.published_at >=' in sql
+    assert 'external_news_items.published_at IS NULL' in sql
+    assert 'external_news_items.collected_at >=' in sql
+    assert 'external_news_items.published_at <' in sql
+    assert 'external_news_items.collected_at <' in sql
+    assert 'external_news_item_symbols.associated_at <' in sql
+    assert knowledge_cutoff in compiled.params.values()
+
+
+def test_recent_external_news_anchors_lookback_and_forwards_knowledge_cutoff() -> None:
+    knowledge_cutoff = datetime(2026, 4, 9, tzinfo=timezone.utc)
+    with patch('app.external_news.store.list_external_news_items', return_value=[]) as list_items_mock:
+        result = list_recent_external_news_for_symbols(
+            symbols=['005930'],
+            limit_per_symbol=3,
+            lookback_days=14,
+            published_before=knowledge_cutoff,
+            collected_before=knowledge_cutoff,
+        )
+
+    assert result == {'005930': []}
+    assert list_items_mock.call_args.kwargs == {
+        'symbols': ['005930'],
+        'limit': 12,
+        'published_since': knowledge_cutoff - timedelta(days=14),
+        'published_before': knowledge_cutoff,
+        'collected_before': knowledge_cutoff,
+    }
 
 
 class ExternalNewsServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -339,6 +470,34 @@ class ExternalNewsContextTests(unittest.TestCase):
         self.assertEqual(provenance['freshness_status'], 'missing')
         self.assertEqual(provenance['provenance_status'], 'external_provider_unavailable')
 
+    def test_stored_news_remains_available_when_collection_credentials_are_missing(self) -> None:
+        context = _build_recent_external_news_context(
+            [
+                {
+                    'provider': 'naver_news_search',
+                    'title': 'Stored observation',
+                    'description': 'Previously collected news remains readable.',
+                    'url': 'https://example.test/stored',
+                    'published_at': '2026-05-08T00:00:00+00:00',
+                    'classification': {'materiality': 'unknown'},
+                }
+            ],
+            provider_status={
+                'provider': 'naver_news_search',
+                'enabled': False,
+                'collection_enabled': False,
+                'context_enabled': True,
+                'storage_read_enabled': True,
+                'status': 'disabled',
+                'reason': 'naver_search_credentials_missing',
+            },
+        )
+
+        self.assertEqual(context['status'], 'available')
+        self.assertIsNone(context['reason'])
+        self.assertEqual(context['item_count'], 1)
+        self.assertFalse(context['provider']['collection_enabled'])
+
     def test_context_exposes_news_classification_fields(self) -> None:
         context = _build_recent_external_news_context(
             [
@@ -378,6 +537,11 @@ class ExternalNewsContextTests(unittest.TestCase):
                     'materiality_score': 0.62,
                     'materiality_bucket': 'medium',
                     'access_status': 'full_text',
+                    'classification_provenance': {
+                        'source': 'append_only_sidecar',
+                        'classifier_version': 'rule_based_external_news_contract_v1',
+                        'classified_at': '2026-05-08T00:01:00+00:00',
+                    },
                     'source_evidence': {
                         'url': 'https://example.test/news/1',
                         'publication': 'example.test',
@@ -414,6 +578,10 @@ class ExternalNewsContextTests(unittest.TestCase):
         self.assertEqual(context['items'][0]['materiality'], 'material')
         self.assertEqual(context['items'][0]['event_tags'], ['contract', 'earnings'])
         self.assertEqual(context['items'][0]['sentiment'], 'positive')
+        self.assertEqual(
+            context['items'][0]['classification_provenance']['classified_at'],
+            '2026-05-08T00:01:00+00:00',
+        )
         self.assertEqual(context['items'][0]['source_evidence']['url'], 'https://example.test/news/1')
         self.assertEqual(context['material_items'][0]['title'], '삼성전자 공급 계약')
         self.assertEqual(context['unknown_items'][0]['access_status'], 'paywalled')
@@ -425,6 +593,14 @@ class ExternalNewsContextTests(unittest.TestCase):
         self.assertEqual(context['classification_summary']['materiality_counts']['noise'], 1)
         self.assertEqual(context['classification_summary']['access_status_counts']['paywalled'], 1)
         self.assertEqual(context['classification_summary']['max_materiality_score'], 0.62)
+        self.assertEqual(
+            context['classification_summary']['classifier_versions'],
+            ['rule_based_external_news_contract_v1'],
+        )
+        self.assertEqual(
+            context['classification_summary']['classifier'],
+            'rule_based_external_news_contract_v1',
+        )
 
     def test_freshness_provenance_uses_latest_news_timestamp_after_material_sorting(self) -> None:
         provider_status = {'provider': 'fake_news', 'enabled': True, 'status': 'available', 'reason': None}
@@ -479,6 +655,14 @@ class ExternalNewsContextTests(unittest.TestCase):
         self.assertEqual(context['items'][0]['published_at'], older_material_timestamp)
         self.assertEqual(context['latest_published_at'], newer_noise_timestamp)
         self.assertEqual(provenance['latest_available_timestamp'], newer_noise_timestamp)
+        self.assertEqual(
+            provenance['source_tables'],
+            [
+                'external_news_items',
+                'external_news_item_symbols',
+                'external_news_item_classifications',
+            ],
+        )
 
     def test_decider_quality_context_distinguishes_empty_disclosures_from_news_provider_error(self) -> None:
         block = _build_decider_disclosures_news_quality_context(

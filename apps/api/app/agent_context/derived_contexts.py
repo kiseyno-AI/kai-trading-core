@@ -388,6 +388,7 @@ class DailyPriceContextService:
         symbols: Sequence[str] | None = None,
         source: str = 'pykrx',
         run_id: int | None = None,
+        include_retry_metadata: bool = False,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         target_symbols = list(dict.fromkeys(symbols or list_symbols_with_daily_bar_on_date(normalized_market_date.isoformat())))
@@ -426,7 +427,7 @@ class DailyPriceContextService:
                 }
             )
 
-        return {
+        result = {
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'requested_symbols': len(target_symbols),
@@ -435,6 +436,9 @@ class DailyPriceContextService:
             'failed_symbols': failed_symbols[:50],
             'items': items,
         }
+        if include_retry_metadata:
+            result['_retry_metadata'] = {'failed_symbols': failed_symbols}
+        return result
 
 
 class DailyMarketParticipationContextService:

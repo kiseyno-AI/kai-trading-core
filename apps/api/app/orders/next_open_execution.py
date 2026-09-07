@@ -1099,7 +1099,7 @@ class SignalDeciderNextOpenExecutionService:
         rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
             account_reference=account_reference,
-            include_payloads=False,
+            include_payloads=True,
         )
         agent_context_completeness = self._build_agent_context_completeness_context(
             source_market_date=source_market_date,

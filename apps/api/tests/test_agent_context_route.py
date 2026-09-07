@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 import unittest
 from unittest.mock import patch
 
@@ -1256,6 +1256,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     ('symbols', '000660'),
                     ('fs_div', 'CFS'),
                     ('disclosures_limit', '3'),
+                    ('knowledge_cutoff_at', '2026-04-08T15:15:00+09:00'),
                 ],
             )
         finally:
@@ -1265,6 +1266,10 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_args['symbols'], ['005930', '000660'])
         self.assertEqual(fake_service.last_args['fs_div'], 'CFS')
         self.assertEqual(fake_service.last_args['disclosures_limit'], 3)
+        self.assertEqual(
+            fake_service.last_args['knowledge_cutoff_at'],
+            datetime.fromisoformat('2026-04-08T15:15:00+09:00'),
+        )
         self.assertEqual(response.json()['items'][0]['symbol'], '005930')
 
     def test_feedback_retry_cycles_route_calls_service_and_returns_progress(self):
@@ -2346,6 +2351,11 @@ class AgentContextRouteTests(unittest.TestCase):
 
     def test_signal_decider_decision_policy_activation_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()
+        replay_evidence = {
+            'schema_version': 'signal_decider_policy_activation_evidence_v1',
+            'candidate_policy_version': 'signal_decider_policy_v2',
+            'replay_artifact': {'schema_version': 'decider_replay_v1'},
+        }
         original_service = routes_agent_context.signal_decider_loop_service
         routes_agent_context.signal_decider_loop_service = fake_service
         try:
@@ -2355,6 +2365,7 @@ class AgentContextRouteTests(unittest.TestCase):
                 json={
                     'activated_by': 'human.reviewer',
                     'activation_note': 'Approved after diagnostics review.',
+                    'replay_evidence': replay_evidence,
                 },
             )
         finally:
@@ -2367,6 +2378,7 @@ class AgentContextRouteTests(unittest.TestCase):
                 'policy_version': 'signal_decider_policy_v2',
                 'activated_by': 'human.reviewer',
                 'activation_note': 'Approved after diagnostics review.',
+                'replay_evidence': replay_evidence,
             },
         )
         self.assertEqual(response.json()['item']['status'], 'active')
