@@ -23,7 +23,12 @@ from app.agent_context.decider_replay_service import (
     DeciderReplayService,
 )
 from app.agent_context.decision_delta import build_decision_delta
-from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import (
+    SHORT_TERM_DECIDER_AGENT_NAME,
+    SIGNAL_DECIDER_AGENT_NAME,
+    canonical_evaluation_action,
+    short_term_tactical_action_to_decision_action,
+)
 from app.agent_context.wait_reason_taxonomy import derive_wait_reason
 from app.market.session import next_krx_trading_date
 from app.core.settings import settings
@@ -89,10 +94,6 @@ SHORT_TERM_DECIDER_ACTIONS: tuple[str, ...] = (
     'avoid_chase',
     'wait',
     'reject',
-)
-SHORT_TERM_DECIDER_ACTIONABLE_ACTIONS: tuple[str, ...] = (
-    'scalp_buy_candidate',
-    'watch_for_trigger',
 )
 SIGNAL_DECIDER_GRADE_LABELS: tuple[str, ...] = (
     'good_buy',
@@ -517,11 +518,7 @@ def _normalize_short_term_action(value: Any) -> str:
 
 
 def _short_term_generic_action(tactical_action: str) -> str:
-    if tactical_action in SHORT_TERM_DECIDER_ACTIONABLE_ACTIONS:
-        return 'buy'
-    if tactical_action == 'reject':
-        return 'reject'
-    return 'wait'
+    return short_term_tactical_action_to_decision_action(tactical_action) or 'wait'
 
 
 def _to_float(value: Any) -> float | None:
@@ -3038,16 +3035,26 @@ class SignalDeciderLoopService:
         enriched_summary = dict(summary_payload)
         enriched_feedback = dict(feedback_payload)
         if agent_name == SIGNAL_DECIDER_AGENT_NAME:
-            default_policy_context = self.get_active_policy_context()
-            policy_version = _policy_version_from_payloads(
-                summary_payload=summary_payload,
-                feedback_payload=feedback_payload,
-                context_payload=context,
-                default_policy_version=default_policy_context.get('current_version'),
+            dispatched_policy_context = _maybe_dict(context.get('signal_decider_policy'))
+            dispatched_policy_version = _normalize_optional_text(
+                dispatched_policy_context.get('current_version')
             )
-            policy_context = self.get_policy_prompt_context(policy_version=policy_version)
-            enriched_summary.setdefault('policy_version', policy_version)
-            enriched_feedback.setdefault('policy_version', policy_version)
+            if dispatched_policy_version:
+                policy_version = dispatched_policy_version
+                policy_context = dispatched_policy_context
+                enriched_summary['policy_version'] = policy_version
+                enriched_feedback['policy_version'] = policy_version
+            else:
+                default_policy_context = self.get_active_policy_context()
+                policy_version = _policy_version_from_payloads(
+                    summary_payload=summary_payload,
+                    feedback_payload=feedback_payload,
+                    context_payload=context,
+                    default_policy_version=default_policy_context.get('current_version'),
+                )
+                policy_context = self.get_policy_prompt_context(policy_version=policy_version)
+                enriched_summary.setdefault('policy_version', policy_version)
+                enriched_feedback.setdefault('policy_version', policy_version)
             context['signal_decider_policy'] = policy_context
             context['signal_decider_trace'] = {
                 'policy_version': policy_version,
@@ -4995,6 +5002,13 @@ class SignalDeciderLoopService:
             )
         policy_version = _normalize_optional_text(row.policy_version, default=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
         decision_action = _normalize_action(row.decision_action or feedback_payload.get('next_day_open_action'))
+        canonical_action = canonical_evaluation_action(
+            agent_name=row.agent_name,
+            persisted_action=row.decision_action,
+            response_payload=feedback_payload,
+        )
+        if canonical_action is not None:
+            decision_action = canonical_action
         thesis_summary = str(
             row.thesis_summary
             or feedback_payload.get('thesis_summary')

@@ -53,6 +53,8 @@ AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'fundamentals_daily_refresh',
     *FACTOR_FOLLOWUP_STAGE_ORDER,
     'external_news_collect',
+    'external_news_enrich',
+    'macro_context_refresh',
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
@@ -605,6 +607,54 @@ def _run_daily_external_news_followup(*, market_date: str, enabled: bool) -> dic
     return {
         'triggered': True,
         **result,
+    }
+
+
+def _run_daily_external_news_enrichment_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {
+            'triggered': False,
+            'reason': 'followup_disabled',
+            'market_date': market_date,
+        }
+
+    from app.core.settings import settings
+    from app.external_news.service import external_news_service
+
+    result = external_news_service.enrich_recent_classification(
+        lookback_days=settings.external_news_context_lookback_days,
+        limit=1000,
+    )
+    return {
+        'triggered': True,
+        'market_date': market_date,
+        **result,
+    }
+
+
+def _run_daily_macro_context_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {
+            'triggered': False,
+            'reason': 'followup_disabled',
+            'market_date': market_date,
+            'freshness_gate': 'not_checked',
+        }
+
+    from app.macro_context.service import macro_context_service
+
+    result = macro_context_service.refresh_context(
+        force=False,
+        trigger='eod_pykrx_followup',
+    )
+    context = result.get('context') if isinstance(result.get('context'), dict) else {}
+    freshness = context.get('freshness') if isinstance(context.get('freshness'), dict) else {}
+    freshness_status = str(freshness.get('status') or context.get('status') or 'unavailable').strip().lower()
+    return {
+        'triggered': True,
+        'market_date': market_date,
+        **result,
+        'freshness_gate': freshness_status,
     }
 
 
@@ -2339,6 +2389,22 @@ def run_market_data_pipeline(
                         enabled=True,
                     ),
                 )
+                result['external_news_enrichment_followup'] = run_followup_stage(
+                    'external_news_enrich',
+                    activity='Running external news classification enrichment follow-up',
+                    call=lambda: _run_daily_external_news_enrichment_followup(
+                        market_date=latest_trade_date,
+                        enabled=True,
+                    ),
+                )
+                result['macro_context_followup'] = run_followup_stage(
+                    'macro_context_refresh',
+                    activity='Refreshing freshness-gated macro context follow-up',
+                    call=lambda: _run_daily_macro_context_followup(
+                        market_date=latest_trade_date,
+                        enabled=True,
+                    ),
+                )
             else:
                 result['factor_scoring_followup'] = {
                     'triggered': False,
@@ -2355,6 +2421,21 @@ def run_market_data_pipeline(
                     'fundamentals_status': fundamentals_status or None,
                 }
                 record_followup_result('external_news_collect', result['external_news_followup'])
+                result['external_news_enrichment_followup'] = build_blocked_followup_result(
+                    'external_news_enrich',
+                    'external_news_collection_incomplete',
+                    upstream_status=_resolve_result_status(result['external_news_followup']),
+                )
+                record_followup_result(
+                    'external_news_enrich',
+                    result['external_news_enrichment_followup'],
+                )
+                result['macro_context_followup'] = build_blocked_followup_result(
+                    'macro_context_refresh',
+                    'external_news_enrichment_incomplete',
+                    upstream_status='blocked',
+                )
+                record_followup_result('macro_context_refresh', result['macro_context_followup'])
             factor_status = _resolve_result_status(result.get('factor_scoring_followup') or {})
             result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
                 market_date=latest_trade_date,
@@ -2475,6 +2556,22 @@ def run_market_data_pipeline(
                 'external_news_collect',
                 activity='Running external news collection follow-up',
                 call=lambda: _run_daily_external_news_followup(
+                    market_date=latest_trade_date,
+                    enabled=True,
+                ),
+            )
+            result['external_news_enrichment_followup'] = run_followup_stage(
+                'external_news_enrich',
+                activity='Running external news classification enrichment follow-up',
+                call=lambda: _run_daily_external_news_enrichment_followup(
+                    market_date=latest_trade_date,
+                    enabled=True,
+                ),
+            )
+            result['macro_context_followup'] = run_followup_stage(
+                'macro_context_refresh',
+                activity='Refreshing freshness-gated macro context follow-up',
+                call=lambda: _run_daily_macro_context_followup(
                     market_date=latest_trade_date,
                     enabled=True,
                 ),

@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME
 from app.agent_context.signal_decider_calibration_service import SignalDeciderCalibrationService
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
@@ -1270,6 +1271,113 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertIn('decision_delta', feedback)
         self.assertFalse(feedback['decision_delta']['has_previous_decision'])
 
+    def test_prepare_feedback_persistence_preserves_dispatched_policy_for_replay(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        dispatched_policy = {
+            'current_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+            'status': 'active',
+            'activation_mode': 'manual_only',
+            'candidate_activation_required': True,
+            'rule_bundle': {'schema_version': 'signal_decider_policy_bundle_v1'},
+            'performance_criteria': {
+                'schema_version': 'signal_decider_performance_criteria_v1',
+                'status': 'ready',
+                'sample_count': 12,
+                'performance_buckets': [
+                    {
+                        'bucket_key': 'decision.reward_risk_bucket',
+                        'bucket_value': 'reward_risk_lt_1_3',
+                        'sample_count': 5,
+                        'bad_buy_rate': 0.8,
+                    }
+                ],
+                'rule_candidates': [],
+                'usage_policy': {
+                    'model_guidance_eligible': True,
+                    'deterministic_gate_eligible': True,
+                    'manual_review_only': True,
+                    'allow_buy_authorization': False,
+                },
+            },
+        }
+        decision_provenance = {
+            'model': 'openclaw/signal-decider',
+            'prompt_sha256': 'sha256:prompt-hash',
+            'prompt_chars': 4321,
+            'contract_version': 'agent_role_contract_v1',
+            'contract_sha256': 'sha256:contract-hash',
+            'role': 'signal-decider',
+        }
+
+        summary, feedback, context = service.prepare_feedback_persistence(
+            agent_name='signal-decider',
+            summary_payload={
+                'model': 'openclaw/signal-decider',
+                'decision_provenance': deepcopy(decision_provenance),
+            },
+            feedback_payload={
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'next_day_open_action': 'wait',
+                'traceability': {'symbol': '005930', 'market_date': '2026-04-23'},
+            },
+            context_payload={
+                'market_date': '2026-04-23',
+                'signal_decider_policy': deepcopy(dispatched_policy),
+                'symbol_day_context': {'symbol': '005930'},
+            },
+        )
+
+        self.assertEqual(context['signal_decider_policy'], dispatched_policy)
+        self.assertEqual(summary['decision_provenance'], decision_provenance)
+
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=13,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='openclaw-v1',
+            run_id='signal-run-13',
+            summary_payload=summary,
+            feedback_payload=feedback,
+            context_payload=context,
+            received_at='2026-04-23T06:00:00+00:00',
+        )
+
+        self.assertEqual(snapshot_item['request_payload']['signal_decider_policy'], dispatched_policy)
+        self.assertEqual(
+            snapshot_item['response_summary_payload']['decision_provenance'],
+            decision_provenance,
+        )
+
+    def test_prepare_feedback_persistence_uses_dispatched_policy_version_when_response_conflicts(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+
+        summary, feedback, context = service.prepare_feedback_persistence(
+            agent_name='signal-decider',
+            summary_payload={'policy_version': 'hallucinated_summary_policy'},
+            feedback_payload={
+                'policy_version': 'hallucinated_response_policy',
+                'next_day_open_action': 'wait',
+            },
+            context_payload={
+                'signal_decider_policy': {
+                    'current_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                    'performance_criteria': {
+                        'schema_version': 'signal_decider_performance_criteria_v1',
+                        'status': 'ready',
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(summary['policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(feedback['policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(
+            context['signal_decider_policy']['current_version'],
+            DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+        )
+
     def test_prepare_snapshot_persistence_item_builds_structured_traceability(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
         snapshot_item = service.prepare_snapshot_persistence_item(
@@ -1408,11 +1516,34 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
 
         self.assertEqual(snapshot_item['agent_name'], 'short-term-decider')
         self.assertEqual(snapshot_item['policy_version'], 'short_term_decider_contract_v1')
-        self.assertEqual(snapshot_item['decision_action'], 'buy')
+        self.assertEqual(snapshot_item['decision_action'], 'wait')
+        self.assertEqual(snapshot_item['preferred_action'], 'wait')
+        self.assertEqual(snapshot_item['next_day_open_action'], 'wait')
+        self.assertEqual(snapshot_item['response_payload']['tactical_action'], 'watch_for_trigger')
         self.assertEqual(snapshot_item['entry_price_basis'], 'trigger_limit')
         self.assertEqual(snapshot_item['traceability_payload']['schema_version'], 'short_term_decider_trace_v1')
         self.assertEqual(snapshot_item['traceability_payload']['tactical_context']['trigger_price'], 81200)
         self.assertEqual(snapshot_item['traceability_payload']['upstream_references']['technical-summarizer']['feedback_id'], 8)
+
+    def test_historical_watch_snapshot_is_not_replayed_as_a_buy_sample(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        historical_row = _feedback_row(
+            feedback_id=13,
+            snapshot_id=13,
+            market_date='2026-04-23',
+            symbol='005930',
+            action='buy',
+        )
+        historical_row.agent_name = 'short-term-decider'
+        historical_row.response_payload = {
+            **historical_row.response_payload,
+            'tactical_action': 'watch_for_trigger',
+            'preferred_action': 'watch_for_trigger',
+        }
+
+        decision = service._build_decision_snapshot(historical_row)
+
+        self.assertEqual(decision['decision']['action'], 'wait')
 
     def test_prepare_snapshot_persistence_item_filters_resolved_pre_decider_warnings(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
@@ -4275,6 +4406,85 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertTrue(result['summary']['ready_for_operator_review'])
         self.assertEqual(result['review_boundary']['manual_review_only'], True)
         self.assertEqual(result['review_boundary']['auto_apply_prompt_changes'], False)
+
+    def test_signal_decider_calibration_excludes_stale_evaluation_for_a_different_action(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            loop_service.repository.evaluations[
+                (101, 5, 'signal_decider_eval_test')
+            ]['decision_action'] = 'wait'
+
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        self.assertEqual(result['summary']['mature_computed_count'], 3)
+        self.assertEqual(
+            result['exclusions']['status_reason_counts']['evaluation_decision_action_mismatch'],
+            1,
+        )
+        exclusion = next(
+            item for item in result['exclusions']['items'] if item['snapshot_id'] == 101
+        )
+        self.assertEqual(exclusion['canonical_decision_action'], 'buy')
+        self.assertEqual(exclusion['evaluation_decision_action'], 'wait')
+        self.assertTrue(exclusion['recompute_required'])
+        self.assertEqual(result['summary']['decision_action_counts'], {'buy': 1, 'wait': 2})
+
+    def test_signal_decider_calibration_excludes_invalid_short_term_source_payload(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            source_row = next(row for row in loop_service.repository.snapshot_rows if row.id == 101)
+            source_row.agent_name = SHORT_TERM_DECIDER_AGENT_NAME
+            source_row.response_payload = {}
+
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        self.assertEqual(result['summary']['mature_computed_count'], 3)
+        self.assertEqual(
+            result['exclusions']['status_reason_counts']['invalid_short_term_tactical_action'],
+            1,
+        )
+        exclusion = next(
+            item for item in result['exclusions']['items'] if item['snapshot_id'] == 101
+        )
+        self.assertIsNone(exclusion['canonical_decision_action'])
+        self.assertEqual(exclusion['evaluation_decision_action'], 'buy')
+        self.assertTrue(exclusion['source_correction_required'])
+        self.assertTrue(exclusion['recompute_required'])
+        self.assertEqual(result['summary']['decision_action_counts'], {'buy': 1, 'wait': 2})
 
     def test_signal_decider_calibration_report_identifies_condition_clusters_and_hints(self):
         loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()

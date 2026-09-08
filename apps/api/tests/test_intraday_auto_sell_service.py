@@ -424,6 +424,11 @@ class IntradayAutoSellServiceTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
             'rule_candidates': [],
+            'usage_policy': {
+                'deterministic_gate_eligible': True,
+                'manual_review_only': True,
+                'allow_buy_authorization': False,
+            },
         }
         with session_scope() as session:
             snapshot = session.execute(

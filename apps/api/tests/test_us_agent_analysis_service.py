@@ -1,8 +1,10 @@
 import json
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from app.agent_context.orchestrator import OpenClawAgentClient
+from app.agent_context.orchestrator_helpers import correlate_decoded_batch_response
 from app.us_equities.agent_analysis_service import US_AGENT_ROLE_CAPS, USAgentAnalysisService
 
 
@@ -45,21 +47,83 @@ def _candidate(index: int) -> dict:
 
 
 class FakeDispatcher:
+    @staticmethod
+    def _feedback(*, spec, market_date, item):
+        common = {
+            'role': spec.role,
+            'agent_name': spec.agent_name,
+            'symbol': item['symbol'],
+            'market_date': market_date.isoformat(),
+            'traceability': {'symbol': item['symbol']},
+            'summary': f"{item['symbol']} summary",
+            'confidence': 0.8,
+            'risk_flags': [],
+            'details': {},
+            'improvement_notes': [],
+        }
+        if spec.role == 'signal-decider':
+            return {
+                **common,
+                'preferred_action': 'buy',
+                'next_day_open_action': 'buy',
+                'wait_reason': None,
+                'entry_price_basis': 'next_open',
+                'target_price': 10.90,
+                'expected_return_pct': 6.34,
+                'stop_loss_price': 9.80,
+                'suggested_holding_period': '3-10 trading days',
+                'confidence_score_10': 8,
+                'conviction_score_10': 7,
+                'thesis_summary': f"{item['symbol']} summary",
+                'supporting_evidence': ['추세와 유동성이 매수 후보를 지지합니다.'],
+                'decision_risks': ['장 초반 변동성이 확대될 수 있습니다.'],
+                'decision_delta': {},
+                'invalidation_conditions': ['9.80달러 이탈 시 전제가 훼손됩니다.'],
+                'data_quality_warnings': [],
+                'specialist_disagreement': [],
+            }
+        if spec.role == 'short-term-decider':
+            return {
+                **common,
+                'tactical_action': 'watch_for_trigger',
+                'preferred_action': 'watch_for_trigger',
+                'wait_reason': {
+                    'code': 'unsuitable_execution_timing',
+                    'summary': '10.30달러 돌파와 거래량 확인 전입니다.',
+                },
+                'trigger_price': 10.30,
+                'chase_limit_price': 10.50,
+                'target_price': 10.90,
+                'stop_loss_price': 9.80,
+                'expected_holding_period': '1-3 trading days',
+                'confidence_score_10': 8,
+                'conviction_score_10': 7,
+                'thesis_summary': f"{item['symbol']} summary",
+                'trigger_conditions': ['10.30달러 돌파와 거래량 증가를 확인합니다.'],
+                'supporting_evidence': ['단기 상대강도가 개선됐습니다.'],
+                'tactical_risks': ['갭 상승 시 손익비가 악화될 수 있습니다.'],
+                'decision_delta': {},
+                'invalidation_conditions': ['9.80달러 이탈 시 전제가 훼손됩니다.'],
+                'data_quality_warnings': [],
+            }
+        return common
+
     def dispatch_batch(self, *, spec, market_date, batch_items):
-        return {'decoded': {'items': [
+        decoded = {'items': [
             {
                 'symbol': item['symbol'],
-                'feedback': {
-                    'role': spec.role,
-                    'summary': f"{item['symbol']} summary",
-                    'confidence': 0.8,
-                    'risk_flags': [],
-                    'details': {},
-                    'improvement_notes': [],
-                },
+                'feedback': self._feedback(spec=spec, market_date=market_date, item=item),
             }
             for item in batch_items
-        ]}}
+        ]}
+        decoded, response_correlation = correlate_decoded_batch_response(
+            decoded=decoded,
+            expected_symbols=[item['symbol'] for item in batch_items],
+        )
+        return {
+            'decoded': decoded,
+            'response_correlation': response_correlation,
+        }
 
 
 class MissingFundamentalDispatcher(FakeDispatcher):
@@ -88,7 +152,73 @@ class PromptCapturingDispatcher(FakeDispatcher):
         return super().dispatch_batch(spec=spec, market_date=market_date, batch_items=batch_items)
 
 
+class SessionCapturingDispatcher(FakeDispatcher):
+    def __init__(self):
+        self.calls = []
+
+    def dispatch_batch(self, *, spec, market_date, batch_items):
+        self.calls.append({
+            'role': spec.role,
+            'batch_items': [dict(item) for item in batch_items],
+        })
+        return super().dispatch_batch(spec=spec, market_date=market_date, batch_items=batch_items)
+
+
+class InnerIdentityMismatchDispatcher(FakeDispatcher):
+    def dispatch_batch(self, *, spec, market_date, batch_items):
+        result = super().dispatch_batch(spec=spec, market_date=market_date, batch_items=batch_items)
+        result['decoded']['items'][0]['feedback'].update(
+            {
+                'symbol': 'MSFT',
+                'market_date': '2026-08-18',
+            }
+        )
+        return result
+
+
+class AttributionMismatchDispatcher(FakeDispatcher):
+    def dispatch_batch(self, *, spec, market_date, batch_items):
+        result = super().dispatch_batch(spec=spec, market_date=market_date, batch_items=batch_items)
+        result['response_correlation'] = {
+            'attribution_status': 'mismatch',
+            'failure_class': 'batch_response_attribution_mismatch',
+            'duplicate_symbols': [batch_items[0]['symbol']],
+        }
+        return result
+
+
+class MissingFeedbackDispatcher(FakeDispatcher):
+    def dispatch_batch(self, *, spec, market_date, batch_items):
+        result = super().dispatch_batch(
+            spec=spec,
+            market_date=market_date,
+            batch_items=batch_items,
+        )
+        result['decoded']['items'][0]['feedback'] = None
+        return result
+
+
+class RecordingSessionCleanup:
+    def __init__(self, *, error: str | None = None):
+        self.calls = []
+        self.error = error
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        return {'status': 'deleted', 'session_key': kwargs['session_key']}
+
+
 class USAgentAnalysisServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.default_cleanup_patcher = patch(
+            'app.us_equities.agent_analysis_service.agent_feedback_orchestrator._cleanup_session_key',
+            return_value={'status': 'deleted'},
+        )
+        self.default_cleanup_patcher.start()
+        self.addCleanup(self.default_cleanup_patcher.stop)
+
     def test_ten_thousand_candidates_are_deterministically_bounded_by_role_caps(self):
         rows = [_candidate(index) for index in range(10_000)]
         service = USAgentAnalysisService(candidate_loader=lambda **kwargs: rows)
@@ -122,6 +252,165 @@ class USAgentAnalysisServiceTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['completed'], 2)
         self.assertEqual(result['failed'], 0)
+
+    def test_inner_identity_mismatch_is_rejected_before_us_feedback_persistence(self):
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: InnerIdentityMismatchDispatcher(),
+        )
+
+        with patch('app.us_equities.agent_analysis_service.upsert_us_agent_feedback') as persist_feedback:
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['technical-summarizer'],
+                persist=True,
+            )
+
+        persist_feedback.assert_not_called()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['completed'], 0)
+        self.assertEqual(result['failed'], 1)
+        self.assertEqual(result['failures'][0]['error'], 'response_identity_mismatch:symbol_mismatch,market_date_mismatch')
+
+    def test_batch_attribution_mismatch_is_rejected_before_us_feedback_persistence(self):
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: AttributionMismatchDispatcher(),
+        )
+
+        with patch('app.us_equities.agent_analysis_service.upsert_us_agent_feedback') as persist_feedback:
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['technical-summarizer'],
+                persist=True,
+            )
+
+        persist_feedback.assert_not_called()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['completed'], 0)
+        self.assertEqual(result['failed'], 1)
+        self.assertEqual(result['failures'][0]['error'], 'batch_response_attribution_mismatch')
+
+    def test_missing_feedback_object_rejects_entire_us_batch_before_persistence(self):
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0), _candidate(1)],
+            dispatcher_getter=lambda: MissingFeedbackDispatcher(),
+        )
+
+        with patch('app.us_equities.agent_analysis_service.upsert_us_agent_feedback') as persist_feedback:
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['technical-summarizer'],
+                persist=True,
+                batch_size=2,
+            )
+
+        persist_feedback.assert_not_called()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['completed'], 0)
+        self.assertEqual(result['failed'], 2)
+        self.assertEqual(
+            {failure['error'] for failure in result['failures']},
+            {'response_contract_invalid:feedback_missing'},
+        )
+
+    def test_us_batches_clean_fresh_session_once_on_success_and_contract_failure(self):
+        cases = (
+            ('success', FakeDispatcher(), 'completed'),
+            ('contract_failure', MissingFeedbackDispatcher(), 'failed'),
+        )
+
+        for label, dispatcher, expected_status in cases:
+            with self.subTest(label=label):
+                cleanup = RecordingSessionCleanup()
+                service = USAgentAnalysisService(
+                    candidate_loader=lambda **kwargs: [_candidate(0), _candidate(1)],
+                    dispatcher_getter=lambda dispatcher=dispatcher: dispatcher,
+                    session_cleanup=cleanup,
+                )
+
+                result = service.dispatch(
+                    market_date=date(2026, 8, 19),
+                    collection_run_id=77,
+                    roles=['technical-summarizer'],
+                    persist=False,
+                    batch_size=2,
+                )
+
+                self.assertEqual(result['status'], expected_status)
+                self.assertEqual(len(cleanup.calls), 1)
+                self.assertEqual(
+                    cleanup.calls[0]['session_key'],
+                    result['session_cleanup'][0]['session_key'],
+                )
+
+    def test_us_cleanup_failure_is_audited_without_overwriting_dispatch_result(self):
+        cleanup = RecordingSessionCleanup(error='cleanup audit store unavailable')
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: FakeDispatcher(),
+            session_cleanup=cleanup,
+        )
+
+        result = service.dispatch(
+            market_date=date(2026, 8, 19),
+            collection_run_id=77,
+            roles=['technical-summarizer'],
+            persist=False,
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['completed'], 1)
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(len(cleanup.calls), 1)
+        self.assertEqual(result['session_cleanup'][0]['status'], 'deferred')
+        self.assertEqual(
+            result['session_cleanup'][0]['reason'],
+            'fresh_batch_session_cleanup_failed',
+        )
+        self.assertEqual(
+            result['session_cleanup'][0]['error'],
+            'cleanup audit store unavailable',
+        )
+
+    def test_same_date_dispatches_use_distinct_fresh_per_batch_session_keys(self):
+        dispatcher = SessionCapturingDispatcher()
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0), _candidate(1)],
+            dispatcher_getter=lambda: dispatcher,
+        )
+
+        first = service.dispatch(
+            market_date=date(2026, 8, 19),
+            collection_run_id=77,
+            roles=['technical-summarizer'],
+            persist=False,
+            batch_size=1,
+        )
+        second = service.dispatch(
+            market_date=date(2026, 8, 19),
+            collection_run_id=77,
+            roles=['technical-summarizer'],
+            persist=False,
+            batch_size=1,
+        )
+
+        first_calls, second_calls = dispatcher.calls[:2], dispatcher.calls[2:]
+        first_keys = {call['batch_items'][0]['session_key'] for call in first_calls}
+        second_keys = {call['batch_items'][0]['session_key'] for call in second_calls}
+        self.assertTrue(first_keys.isdisjoint(second_keys))
+        self.assertEqual(len(first_keys), 2)
+        self.assertEqual(len(second_keys), 2)
+        for result, calls in ((first, first_calls), (second, second_calls)):
+            for batch_index, call in enumerate(calls, start=1):
+                item = call['batch_items'][0]
+                self.assertEqual(item['session_reuse_mode'], 'fresh_per_batch')
+                self.assertIn(result['run_id'], item['session_key'])
+                self.assertIn(f'/batch-{batch_index:03d}/', item['session_key'])
+                self.assertRegex(item['session_key'], r'/[0-9a-f]{10}$')
 
     def test_decider_request_expands_required_upstream_roles(self):
         service = USAgentAnalysisService(candidate_loader=lambda **kwargs: [_candidate(0)])

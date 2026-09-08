@@ -54,6 +54,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 - KIS uses mock trading by default (`KIS_USE_MOCK=true`). Do not set it to `false` until the production account, credentials, account references, and operational runbook have been verified.
 - US-equity execution and signal-decider execution are separately gated and disabled by default (`US_EQUITY_EXECUTION_ENABLED=false`, `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled`).
+- Core-to-Exec dispatch currently supports one explicit account target per Exec base URL. Dispatch mode fails closed with `multi_account_exec_endpoint_unsupported` when multiple targets are configured; disabled/planning-only mode may still materialize multi-account plans.
 - Prefer delegated execution through `kai-trading-exec`. Core still exposes legacy/direct KIS order, account, reconciliation, and execution-handoff routes, so treat write endpoints as broker-affecting operations.
 - The launcher binds to loopback by default and refuses a non-loopback `HOST` unless `UPSTREAM_BEARER_TOKEN` is configured. With a token, every request except `OPTIONS` must send `Authorization: Bearer <token>`. Local internal jobs should prefer `python -m app.internal.ops ...`, which does not loop through bearer middleware.
 - `DB_AUTO_UPGRADE=true` changes the database at process start. Run the preflight explicitly before production restarts.
@@ -244,12 +245,14 @@ Install runtime and test dependencies, then run from `apps/api`:
 
 ```bash
 python3.11 -m pip install -r requirements-dev.txt
+export DATABASE_URL=postgresql+psycopg://kai:kai@127.0.0.1:5432/kai_trading_test
+DB_AUTO_UPGRADE=false python3.11 -m alembic upgrade head
 python3.11 -m pytest -q
 python3.11 -c 'from app.main import app'
 bash -n start-api.sh
 ```
 
-CI applies the complete PostgreSQL migration chain, rejects ORM/schema drift with `alembic check`, and runs the import smoke test plus complete pytest suite on Python 3.11 and 3.12. The repository does not currently declare a lint or static typecheck tool; do not report either gate as passing until one is added and configured.
+The test suite accepts only Core-scoped PostgreSQL databases: `kai_trading_test`, an isolated `kai_trading_test_<suffix>` worker database, or a named isolation database matching `kai_trading_core_<scope>_test`. Pytest enforces this at collection. The `tests` package and the database module enforce the same check for `python -m unittest`, unittest discovery, and direct `tests/test_*.py` execution, so alternate runners cannot bypass the database-name guard. Generic databases whose names merely contain `test`, another repository's test database, the development/production database, and in-memory SQLite are rejected; Core's PostgreSQL engine configuration is not SQLite-compatible. CI applies the complete PostgreSQL migration chain, rejects ORM/schema drift with `alembic check`, and runs the import smoke test plus complete pytest suite on Python 3.11 and 3.12. The repository does not currently declare a lint or static typecheck tool; do not report either gate as passing until one is added and configured.
 
 ## Repository relationships
 

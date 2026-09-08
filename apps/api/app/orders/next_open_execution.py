@@ -65,7 +65,9 @@ from app.orders.store import load_broker_order, load_order_request
 EXECUTION_WINDOW_NEXT_OPEN = 'next_open'
 ELIGIBILITY_ELIGIBLE = 'eligible'
 ELIGIBILITY_BLOCKED = 'blocked'
+ELIGIBILITY_MONITOR_CANDIDATE = 'monitor_candidate'
 EXECUTION_STATUS_PLANNED = 'planned'
+EXECUTION_STATUS_AWAITING_TRIGGER = 'awaiting_trigger'
 EXECUTION_STATUS_DRY_RUN = 'dry_run'
 EXECUTION_STATUS_SUBMITTED = 'submitted'
 EXECUTION_STATUS_SUBMIT_FAILED = 'submit_failed'
@@ -74,7 +76,7 @@ ORDER_SOURCE = 'signal_decider_next_open'
 SHORT_TERM_ACTIONABLE_ACTIONS = {'scalp_buy_candidate', 'watch_for_trigger'}
 SHORT_TERM_GENERIC_ACTION_BY_TACTICAL_ACTION = {
     'scalp_buy_candidate': 'buy',
-    'watch_for_trigger': 'buy',
+    'watch_for_trigger': 'monitor_candidate',
     'avoid_chase': 'wait',
     'wait': 'wait',
     'reject': 'reject',
@@ -2871,11 +2873,26 @@ class SignalDeciderNextOpenExecutionService:
                 }
             )
         row.last_evaluated_at = now
-        row.eligibility_status = ELIGIBILITY_BLOCKED if blocking_reasons else ELIGIBILITY_ELIGIBLE
+        is_monitor_candidate = (
+            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            and short_term_tactical_action == 'watch_for_trigger'
+            and not blocking_reasons
+        )
+        row.eligibility_status = (
+            ELIGIBILITY_BLOCKED
+            if blocking_reasons
+            else ELIGIBILITY_MONITOR_CANDIDATE
+            if is_monitor_candidate
+            else ELIGIBILITY_ELIGIBLE
+        )
         if row.eligibility_status == ELIGIBILITY_ELIGIBLE and row.first_ready_at is None:
             row.first_ready_at = now
         if row.eligibility_status == ELIGIBILITY_BLOCKED and not _is_dispatch_terminal_status(row.execution_status):
             row.execution_status = EXECUTION_STATUS_PLANNED
+        elif row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE and not _is_dispatch_terminal_status(
+            row.execution_status
+        ):
+            row.execution_status = EXECUTION_STATUS_AWAITING_TRIGGER
         elif row.eligibility_status == ELIGIBILITY_ELIGIBLE and row.execution_status not in {
             EXECUTION_STATUS_SUBMITTED,
             EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
@@ -2949,7 +2966,13 @@ class SignalDeciderNextOpenExecutionService:
             'items_total': len(rows),
             'eligible_count': sum(1 for row in rows if row.eligibility_status == ELIGIBILITY_ELIGIBLE),
             'blocked_count': sum(1 for row in rows if row.eligibility_status == ELIGIBILITY_BLOCKED),
+            'monitor_candidate_count': sum(
+                1 for row in rows if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE
+            ),
             'planned_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_PLANNED),
+            'awaiting_trigger_count': sum(
+                1 for row in rows if row.execution_status == EXECUTION_STATUS_AWAITING_TRIGGER
+            ),
             'dry_run_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_DRY_RUN),
             'submitted_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_SUBMITTED),
             'delegated_for_exec_agent_sizing_count': sum(
@@ -2968,7 +2991,7 @@ class SignalDeciderNextOpenExecutionService:
                 1
                 for row in rows
                 if _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME
-                and row.eligibility_status == ELIGIBILITY_ELIGIBLE
+                and row.eligibility_status in {ELIGIBILITY_ELIGIBLE, ELIGIBILITY_MONITOR_CANDIDATE}
             ),
             'short_term_blocked_or_degraded_count': sum(
                 1
@@ -3003,7 +3026,8 @@ class SignalDeciderNextOpenExecutionService:
                 == SIGNAL_DECIDER_ALIGNMENT_WAIT_CONFLICT_OVERRIDE
             ),
         }
-        counts['ready_count'] = counts['eligible_count']
+        counts['buy_eligible_count'] = counts['eligible_count']
+        counts['ready_count'] = counts['eligible_count'] + counts['monitor_candidate_count']
         return {
             'target_trade_date': target_trade_date.isoformat(),
             'source_market_date': source_market_date.isoformat(),
@@ -3041,8 +3065,10 @@ class SignalDeciderNextOpenExecutionService:
         raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
         generic_action = traceability.get('generic_action')
         if generic_action is None:
-            if raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}:
+            if raw_action == 'scalp_buy_candidate':
                 generic_action = 'buy'
+            elif raw_action == 'watch_for_trigger':
+                generic_action = 'monitor_candidate'
             elif decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and row.planned_side == 'buy':
                 generic_action = 'buy'
         handoff_intent = traceability.get('handoff_intent')
@@ -3055,7 +3081,7 @@ class SignalDeciderNextOpenExecutionService:
                 handoff_intent = 'next_open_buy'
         handoff_active = bool(traceability.get('handoff_active')) or bool(
             decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-            and row.eligibility_status == ELIGIBILITY_ELIGIBLE
+            and row.eligibility_status in {ELIGIBILITY_ELIGIBLE, ELIGIBILITY_MONITOR_CANDIDATE}
             and handoff_intent in {'tactical_buy', 'intraday_watch_buy'}
         )
         exec_monitoring_active = bool(traceability.get('exec_monitoring_active')) or handoff_active

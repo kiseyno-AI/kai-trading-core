@@ -9,6 +9,13 @@ from uuid import uuid4
 from sqlalchemy import delete
 
 from app.core.settings import settings
+from app.core.test_database_safety import (
+    assert_safe_test_database_settings,
+    assert_single_active_policy_fixture_state,
+)
+
+assert_safe_test_database_settings(settings)
+
 from app.db import engine, session_scope
 from app.db_models import (
     AgentContextFeedback,
@@ -34,6 +41,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_SUBMITTED,
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
+    ELIGIBILITY_MONITOR_CANDIDATE,
     SignalDeciderNextOpenExecutionService,
     NextOpenAccountTarget,
     _preopen_plan_covers_latest_snapshots,
@@ -308,6 +316,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_wait_conflict_probe_quantity': settings.signal_decider_wait_conflict_probe_quantity,
             'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
         }
+        self._previous_active_policy_states: list[tuple[str, datetime | None]] = []
+        self.addCleanup(self._restore_fixture_state)
         settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
         settings.signal_decider_next_open_enabled = True
         settings.signal_decider_next_open_dry_run = False
@@ -348,7 +358,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(reset_krx_calendar_provider)
         self._seed_policy_version()
 
-    def tearDown(self) -> None:
+    def _restore_fixture_state(self) -> None:
         reset_krx_calendar_provider()
         for key, value in self.original_settings.items():
             setattr(settings, key, value)
@@ -396,12 +406,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     previous_policy.retired_at = retired_at
 
     def _seed_policy_version(self) -> None:
-        self._previous_active_policy_states: list[tuple[str, datetime | None]] = []
         with session_scope() as session:
             active_policies = (
                 session.query(SignalDeciderPolicyVersion)
                 .filter(SignalDeciderPolicyVersion.status == 'active')
                 .all()
+            )
+            assert_single_active_policy_fixture_state(
+                [active_policy.policy_version for active_policy in active_policies]
             )
             for active_policy in active_policies:
                 self._previous_active_policy_states.append(
@@ -924,7 +936,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('pykrx_enrichment_preflight_blocked', signal_block_codes)
 
         short_item = items_by_agent['short-term-decider'][0]
-        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(short_item['validation']['blocking_reasons'], [])
         self.assertEqual(short_item['validation']['candidate_pykrx_enrichment']['missing_categories'], [])
         short_warning_codes = {warning['code'] for warning in short_item['validation']['warnings']}
@@ -1124,6 +1136,11 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
             'rule_candidates': [],
+            'usage_policy': {
+                'deterministic_gate_eligible': True,
+                'manual_review_only': True,
+                'allow_buy_authorization': False,
+            },
         }
         with session_scope() as session:
             snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
@@ -1150,6 +1167,54 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
         self.assertIn('performance_reward_risk_gate_blocked', block_codes)
         self.assertIn('performance_adjusted_confidence_below_threshold', block_codes)
+
+    def test_refresh_plan_items_ignores_manual_review_performance_without_explicit_eligibility(self) -> None:
+        snapshot_id = self._seed_snapshot(symbol='005930')
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            snapshot.request_payload = {
+                **(snapshot.request_payload or {}),
+                'signal_decider_policy': {
+                    'current_version': self.policy_version,
+                    'performance_criteria': {
+                        'schema_version': 'signal_decider_performance_criteria_v1',
+                        'status': 'ready',
+                        'sample_count': 12,
+                        'overall': {
+                            'positive_outcome_rate': 0.2,
+                            'negative_outcome_rate': 0.8,
+                        },
+                        'performance_buckets': [
+                            {
+                                'bucket_key': 'decision.reward_risk_bucket',
+                                'bucket_value': 'reward_risk_1_3_to_2_0',
+                                'sample_count': 8,
+                                'bad_buy_rate': 0.8,
+                                'negative_rate': 0.8,
+                                'avg_close_return_pct': -1.7,
+                            }
+                        ],
+                        'rule_candidates': [],
+                        'usage_policy': {
+                            'manual_review_only': True,
+                            'allow_buy_authorization': False,
+                        },
+                    },
+                },
+            }
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['validation']['performance_gate']['status'], 'not_eligible')
+        block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
+        self.assertFalse(any(code.startswith('performance_') for code in block_codes))
 
     def test_refresh_plan_items_reuses_cached_policy_context_by_policy_version(self) -> None:
         self._seed_snapshot(symbol='005930')
@@ -1193,10 +1258,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['signal-decider']['client_order_id'], 'SDNO-20260430-005930')
         self.assertEqual(by_agent['short-term-decider']['decision_snapshot_id'], short_term_snapshot_id)
         self.assertEqual(by_agent['short-term-decider']['client_order_id'], 'STDE-20260430-005930')
-        self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(by_agent['short-term-decider']['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(by_agent['short-term-decider']['raw_action'], 'watch_for_trigger')
         self.assertEqual(by_agent['short-term-decider']['tactical_action'], 'watch_for_trigger')
-        self.assertEqual(by_agent['short-term-decider']['generic_action'], 'buy')
+        self.assertEqual(by_agent['short-term-decider']['generic_action'], 'monitor_candidate')
         self.assertEqual(by_agent['short-term-decider']['handoff_intent'], 'intraday_watch_buy')
         self.assertTrue(by_agent['short-term-decider']['handoff_active'])
         self.assertTrue(by_agent['short-term-decider']['exec_monitoring_active'])
@@ -1205,6 +1270,33 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_agent['short-term-decider']['chase_limit_price'], 51500)
         self.assertEqual(by_agent['short-term-decider']['target_price'], 54000)
         self.assertEqual(by_agent['short-term-decider']['stop_loss_price'], 49000)
+
+    def test_watch_for_trigger_is_a_monitor_candidate_not_a_buy_eligible_planned_order(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_short_term_snapshot(symbol='005930', tactical_action='watch_for_trigger')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        item = result['items'][0]
+        self.assertEqual(item['tactical_action'], 'watch_for_trigger')
+        self.assertEqual(item['generic_action'], 'monitor_candidate')
+        self.assertEqual(item['eligibility_status'], 'monitor_candidate')
+        self.assertEqual(item['execution_status'], 'awaiting_trigger')
+        self.assertEqual(item['approval_state'], 'pending_exec_agent')
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['summary']['planned_count'], 0)
+        self.assertEqual(result['summary']['monitor_candidate_count'], 1)
+        self.assertEqual(result['summary']['awaiting_trigger_count'], 1)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, item['plan_item_id'])
+            session.expunge(row)
+        self.assertTrue(SignalDeciderExecIntegrationService._row_is_dispatchable(row))
 
     def test_refresh_plan_items_audits_wait_conflict_block_report_only(self) -> None:
         signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='wait')
@@ -1218,7 +1310,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
-        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(short_item['signal_decider_alignment'], 'wait_conflict_block')
         self.assertEqual(short_item['alignment_gate_action'], 'report_only_block_candidate')
         self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
@@ -1257,7 +1349,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
-        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(short_item['signal_decider_alignment'], 'wait_conflict_override')
         self.assertEqual(short_item['alignment_gate_action'], 'allow_by_override')
         self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
@@ -1306,7 +1398,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(item['alignment_gate_action'], 'downsize_probe')
         self.assertEqual(item['final_enforcement_decision'], 'downsized')
         self.assertGreater(item['requested_quantity'], 2)
@@ -1325,7 +1417,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         short_item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
-        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(short_item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(short_item['signal_decider_alignment'], 'aligned')
         self.assertEqual(short_item['alignment_gate_action'], 'allow')
         self.assertEqual(short_item['alignment_signal_decider_decision_snapshot_id'], signal_snapshot_id)
@@ -1356,9 +1448,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         items_by_symbol = {item['symbol']: item for item in result['items']}
-        self.assertEqual(result['summary']['eligible_count'], 2)
-        self.assertEqual(items_by_symbol['005930']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
-        self.assertEqual(items_by_symbol['000660']['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['summary']['monitor_candidate_count'], 2)
+        self.assertEqual(items_by_symbol['005930']['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertEqual(items_by_symbol['000660']['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(items_by_symbol['000660']['validation']['blocking_reasons'], [])
         self.assertIn(
             'confidence_below_threshold',
@@ -1439,8 +1532,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = result['items'][0]
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
-        self.assertEqual(item['execution_status'], 'planned')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertEqual(item['execution_status'], 'awaiting_trigger')
         self.assertEqual(item['traceability']['core_execution_classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(item['validation']['blocking_reasons'], [])
         warning_codes = {warning['code'] for warning in item['validation']['warnings']}
@@ -1462,7 +1555,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = result['items'][0]
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(item['validation']['blocking_reasons'], [])
         warning_codes = {warning['code'] for warning in item['validation']['warnings']}
         self.assertIn('short_term_liquidity_unverified_warning', warning_codes)
@@ -1512,7 +1605,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         self.assertEqual(result['summary']['items_total'], 1)
-        self.assertEqual(result['summary']['eligible_count'], 1)
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['summary']['monitor_candidate_count'], 1)
         self.assertEqual(result['summary']['blocked_count'], 0)
         item = result['items'][0]
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
@@ -1521,7 +1615,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['traceability']['allocation_mode'], 'unspecified_route')
         self.assertEqual(item['traceability']['allocation_budget_krw'], '0')
         self.assertIsNone(item['planned_quantity'])
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
 
     async def test_unspecified_route_wait_conflict_dispatches_configured_probe_quantity(self) -> None:
         settings.signal_decider_wait_conflict_gate_mode = 'downsize_probe'
@@ -1539,7 +1633,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         self.assertEqual(result['summary']['items_total'], 1)
-        self.assertEqual(result['summary']['eligible_count'], 1)
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['summary']['monitor_candidate_count'], 1)
         self.assertEqual(result['summary']['blocked_count'], 0)
         item = result['items'][0]
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
@@ -1547,7 +1642,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['account_label'], 'UNSPECIFIED_ROUTE')
         self.assertEqual(item['traceability']['allocation_mode'], 'unspecified_route')
         self.assertEqual(item['traceability']['allocation_budget_krw'], '0')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(item['alignment_gate_action'], 'downsize_probe')
         self.assertEqual(item['final_enforcement_decision'], 'downsized')
         self.assertEqual(item['requested_quantity'], 2)
@@ -1679,7 +1774,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = next(item for item in result['items'] if item['symbol'] == '000660')
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(item['validation']['blocking_reasons'], [])
         self.assertTrue(item['handoff_active'])
         self.assertTrue(item['exec_monitoring_active'])
@@ -1797,7 +1892,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second['summary']['items_total'], 1)
         self.assertEqual(second['summary']['ready_count'], 1)
         self.assertEqual(first['items'][0]['plan_item_id'], second['items'][0]['plan_item_id'])
-        self.assertEqual(second['items'][0]['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(second['items'][0]['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(second['items'][0]['validation']['short_term']['tactical_action'], 'watch_for_trigger')
 
     async def test_run_market_open_execution_submits_and_prevents_duplicate_replays(self) -> None:
@@ -1952,3 +2047,26 @@ class CandidateEnrichmentRepairTests(unittest.TestCase):
             allow_kis_candidate_fallback=True,
         )
         self.assertEqual(result['004370']['missing_categories'], [])
+
+
+class NextOpenSetupCleanupSafetyTests(unittest.TestCase):
+    def test_failed_setup_cleanup_restores_mutated_runtime_settings(self) -> None:
+        original_targets = settings.signal_decider_next_open_account_targets
+        case = NextOpenExecutionServiceTests(
+            methodName='test_previous_trading_day_uses_kis_calendar_helper'
+        )
+
+        with patch.object(
+            case,
+            '_seed_policy_version',
+            side_effect=RuntimeError('fixture seed failed'),
+        ):
+            result = unittest.TestResult()
+            case.run(result)
+
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn('fixture seed failed', result.errors[0][1])
+        self.assertEqual(
+            settings.signal_decider_next_open_account_targets,
+            original_targets,
+        )

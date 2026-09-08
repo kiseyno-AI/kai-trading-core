@@ -13,6 +13,7 @@ from app.agent_context.signal_envelope import (
     build_decider_signal_envelopes,
 )
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
+from app.agent_context.response_contract import build_agent_contract_provenance
 
 ABORTLIKE_ERROR_MARKERS = (
     'this operation was aborted',
@@ -36,8 +37,17 @@ def feedback_session_key(*, agent_name: str, slot: int) -> str:
     return f"{FEEDBACK_SESSION_KEY_PREFIX}/{agent_name}/slot-{slot:02d}"
 
 
-def fresh_feedback_session_key(*, agent_name: str, request_run_id: str, slot: int) -> str:
-    return f"{FRESH_FEEDBACK_SESSION_KEY_PREFIX}/{agent_name}/{request_run_id}/slot-{slot:02d}/{uuid.uuid4().hex[:10]}"
+def fresh_feedback_session_key(
+    *,
+    agent_name: str,
+    request_run_id: str,
+    batch_index: int,
+    slot: int,
+) -> str:
+    return (
+        f'{FRESH_FEEDBACK_SESSION_KEY_PREFIX}/{agent_name}/{request_run_id}/'
+        f'batch-{batch_index:03d}/slot-{slot:02d}/{uuid.uuid4().hex[:10]}'
+    )
 
 
 def subagent_test_session_key(*, agent_name: str, request_run_id: str, symbol: str) -> str:
@@ -97,56 +107,6 @@ def _canonical_symbol(value: Any) -> str | None:
     return symbol or None
 
 
-def _feedback_reported_symbol(feedback: Any) -> str | None:
-    if not isinstance(feedback, dict):
-        return None
-    symbol = _canonical_symbol(feedback.get('symbol'))
-    if symbol:
-        return symbol
-    traceability = feedback.get('traceability')
-    if isinstance(traceability, dict):
-        return _canonical_symbol(traceability.get('symbol'))
-    return None
-
-
-def _append_feedback_risk_flags(feedback: dict[str, Any], flags: Sequence[str]) -> None:
-    existing = feedback.get('risk_flags')
-    risk_flags = [str(flag) for flag in existing if isinstance(flag, str)] if isinstance(existing, list) else []
-    feedback['risk_flags'] = list(dict.fromkeys([*risk_flags, *flags]))
-
-
-def _annotate_feedback_attribution(
-    *,
-    feedback: Any,
-    expected_symbol: str,
-    item_symbol: str | None,
-    feedback_symbol: str | None,
-    fallback_reason: str,
-    session_reuse_mode: str | None,
-) -> None:
-    if not isinstance(feedback, dict):
-        return
-    flags = ['fallback_symbol_attribution']
-    if item_symbol is None and feedback_symbol is None:
-        flags.append('response_symbol_missing')
-    if item_symbol is not None and item_symbol != expected_symbol:
-        flags.append('response_symbol_mismatch')
-    if feedback_symbol is not None and feedback_symbol != expected_symbol:
-        flags.append('reported_symbol_mismatch')
-    _append_feedback_risk_flags(feedback, flags)
-    traceability = feedback.get('traceability') if isinstance(feedback.get('traceability'), dict) else {}
-    feedback['traceability'] = {
-        **traceability,
-        'response_attribution': {
-            'expected_symbol': expected_symbol,
-            'item_symbol': item_symbol,
-            'feedback_symbol': feedback_symbol,
-            'fallback_reason': fallback_reason,
-            'session_reuse_mode': session_reuse_mode,
-        },
-    }
-
-
 def coerce_decoded_batch_response(decoded: dict[str, Any] | None) -> dict[str, Any] | None:
     """Normalize common agent output-shape mistakes before symbol correlation.
 
@@ -192,15 +152,25 @@ def correlate_decoded_batch_response(
     expected_symbols: Sequence[str],
     session_reuse_mode: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    expected = [_canonical_symbol(symbol) for symbol in expected_symbols]
-    expected = [symbol for symbol in expected if symbol is not None]
+    expected_symbol_pairs = [
+        (str(symbol).strip(), _canonical_symbol(symbol))
+        for symbol in expected_symbols
+        if str(symbol or '').strip()
+    ]
+    expected = [canonical for _, canonical in expected_symbol_pairs if canonical is not None]
     metadata: dict[str, Any] = {
         'expected_symbols': expected,
+        'expected_item_count': len(expected),
+        'response_item_count': 0,
+        'item_count_matches': False,
         'parsed_symbols': [],
         'response_symbols': [],
+        'duplicate_symbols': [],
+        'item_symbol_mismatches': [],
         'missing_symbols': expected,
         'unexpected_symbols': [],
         'fallback_attributions': [],
+        'structure_mismatch_flags': [],
         'attribution_status': 'not_decoded',
         'failure_class': 'invalid_json',
         'session_reuse_mode': session_reuse_mode,
@@ -208,25 +178,52 @@ def correlate_decoded_batch_response(
     if decoded is None:
         return None, metadata
 
+    structure_mismatch_flags: list[str] = []
+    if isinstance(decoded, dict) and decoded.get('_coerced_from_batch_key') is True:
+        structure_mismatch_flags.append('batch_wrapper')
+    if isinstance(decoded, dict) and decoded.get('_coerced_from_top_level_object') is True:
+        structure_mismatch_flags.append('top_level_feedback_object')
+
     decoded_items = decoded.get('items') if isinstance(decoded, dict) else None
     if not isinstance(decoded_items, list):
         metadata['attribution_status'] = 'missing_items'
         metadata['failure_class'] = 'batch_response_missing_items'
         return decoded, metadata
 
-    canonical_by_symbol = {symbol: symbol for symbol in expected}
+    metadata['response_item_count'] = len(decoded_items)
+    metadata['item_count_matches'] = len(decoded_items) == len(expected)
+
+    canonical_by_symbol = {
+        canonical: exact
+        for exact, canonical in expected_symbol_pairs
+        if canonical is not None
+    }
     response_symbols: list[str] = []
+    item_symbol_mismatches: list[dict[str, Any]] = []
     normalized_items: list[Any] = []
-    for item in decoded_items:
+    for item_index, item in enumerate(decoded_items):
         if not isinstance(item, dict):
             normalized_items.append(item)
             continue
         copied = dict(item)
-        item_symbol = _canonical_symbol(copied.get('symbol'))
+        if copied.get('_coerced_feedback_from_item') is True:
+            structure_mismatch_flags.append(f'item_feedback_missing:{item_index}')
+        raw_item_symbol = copied.get('symbol')
+        response_symbol = str(raw_item_symbol) if raw_item_symbol is not None else None
+        item_symbol = _canonical_symbol(raw_item_symbol)
         if item_symbol:
             response_symbols.append(item_symbol)
             if item_symbol in canonical_by_symbol:
-                copied['symbol'] = canonical_by_symbol[item_symbol]
+                expected_exact_symbol = canonical_by_symbol[item_symbol]
+                copied['symbol'] = expected_exact_symbol
+                if response_symbol != expected_exact_symbol:
+                    item_symbol_mismatches.append(
+                        {
+                            'item_index': item_index,
+                            'expected_symbol': expected_exact_symbol,
+                            'response_symbol': response_symbol,
+                        }
+                    )
         normalized_items.append(copied)
 
     normalized_decoded = {**decoded, 'items': normalized_items}
@@ -234,45 +231,21 @@ def correlate_decoded_batch_response(
     expected_set = set(expected)
     missing_symbols = [symbol for symbol in expected if symbol not in response_symbol_set]
     unexpected_symbols = [symbol for symbol in response_symbols if symbol not in expected_set]
-
-    if len(expected) == 1 and len(normalized_items) == 1 and isinstance(normalized_items[0], dict):
-        expected_symbol = expected[0]
-        item = dict(normalized_items[0])
-        feedback = item.get('feedback')
-        item_symbol = _canonical_symbol(item.get('symbol'))
-        feedback_symbol = _feedback_reported_symbol(feedback)
-        feedback_symbol_matches = feedback_symbol in (None, expected_symbol)
-        if item_symbol is None and feedback_symbol_matches:
-            fallback_reason = 'single_symbol_batch'
-            item['symbol'] = expected_symbol
-            _annotate_feedback_attribution(
-                feedback=feedback,
-                expected_symbol=expected_symbol,
-                item_symbol=item_symbol,
-                feedback_symbol=feedback_symbol,
-                fallback_reason=fallback_reason,
-                session_reuse_mode=session_reuse_mode,
-            )
-            normalized_decoded = {**decoded, 'items': [item]}
-            metadata.update(
-                {
-                    'parsed_symbols': response_symbols,
-                    'response_symbols': [expected_symbol],
-                    'missing_symbols': [],
-                    'unexpected_symbols': [],
-                    'fallback_attributions': [
-                        {
-                            'symbol': expected_symbol,
-                            'item_symbol': item_symbol,
-                            'feedback_symbol': feedback_symbol,
-                            'reason': fallback_reason,
-                        }
-                    ],
-                    'attribution_status': 'fallback_attributed',
-                    'failure_class': None,
-                }
-            )
-            return normalized_decoded, metadata
+    seen_response_symbols: set[str] = set()
+    duplicate_symbols: list[str] = []
+    for response_symbol in response_symbols:
+        if response_symbol in seen_response_symbols and response_symbol not in duplicate_symbols:
+            duplicate_symbols.append(response_symbol)
+        seen_response_symbols.add(response_symbol)
+    item_count_matches = len(decoded_items) == len(expected)
+    attribution_matches = (
+        not missing_symbols
+        and not unexpected_symbols
+        and not duplicate_symbols
+        and not item_symbol_mismatches
+        and item_count_matches
+        and not structure_mismatch_flags
+    )
 
     metadata.update(
         {
@@ -280,8 +253,19 @@ def correlate_decoded_batch_response(
             'response_symbols': response_symbols,
             'missing_symbols': missing_symbols,
             'unexpected_symbols': unexpected_symbols,
-            'attribution_status': 'matched' if not missing_symbols and not unexpected_symbols else 'mismatch',
-            'failure_class': None if not missing_symbols and not unexpected_symbols else 'batch_response_attribution_mismatch',
+            'duplicate_symbols': duplicate_symbols,
+            'item_symbol_mismatches': item_symbol_mismatches,
+            'structure_mismatch_flags': structure_mismatch_flags,
+            'attribution_status': 'matched' if attribution_matches else 'mismatch',
+            'failure_class': (
+                None
+                if attribution_matches
+                else (
+                    'batch_response_structure_mismatch'
+                    if structure_mismatch_flags
+                    else 'batch_response_attribution_mismatch'
+                )
+            ),
         }
     )
     return normalized_decoded, metadata
@@ -297,13 +281,35 @@ def slot_from_items(batch_items: Sequence[dict[str, Any]]) -> int | None:
 def extract_response_mismatch_flags(normalized_feedback: dict[str, Any] | None) -> list[str]:
     if not isinstance(normalized_feedback, dict):
         return []
+    explicit_flags = [
+        str(flag).strip()
+        for key in ('structural_mismatch_flags', 'response_schema_violation_flags')
+        for flag in (normalized_feedback.get(key) or [])
+        if str(flag).strip()
+    ]
+    if explicit_flags:
+        return list(dict.fromkeys(explicit_flags))
     risk_flags = normalized_feedback.get('risk_flags')
     if not isinstance(risk_flags, list):
         return []
     return [
         str(flag)
         for flag in risk_flags
-        if isinstance(flag, str) and flag in {'role_mismatch', 'symbol_mismatch', 'market_date_mismatch'}
+        if isinstance(flag, str)
+        and flag
+        in {
+            'role_missing',
+            'role_mismatch',
+            'agent_name_missing',
+            'agent_name_mismatch',
+            'symbol_missing',
+            'symbol_mismatch',
+            'market_date_missing',
+            'market_date_mismatch',
+            'traceability_missing',
+            'traceability_symbol_missing',
+            'traceability_symbol_mismatch',
+        }
     ]
 
 
@@ -438,6 +444,27 @@ def build_response_storage_payload(
     model_name = None
     if raw_response is not None:
         model_name = raw_response.get('model') or raw_response.get('model_name')
+    resolved_model_name = model_name or f'openclaw/{spec.agent_name}'
+    request_provenance = (
+        batch_result.get('request_provenance')
+        if isinstance(batch_result.get('request_provenance'), dict)
+        else {}
+    )
+    canonical_contract_provenance = build_agent_contract_provenance(role=spec.role)
+    decision_provenance = {
+        'model': resolved_model_name,
+        'prompt_sha256': request_provenance.get('prompt_sha256'),
+        'prompt_chars': request_provenance.get('prompt_chars'),
+        'contract_version': (
+            request_provenance.get('contract_version')
+            or canonical_contract_provenance['contract_version']
+        ),
+        'contract_sha256': (
+            request_provenance.get('contract_sha256')
+            or canonical_contract_provenance['contract_sha256']
+        ),
+        'role': request_provenance.get('role') or spec.role,
+    }
     return {
         'attempt': batch_result.get('attempt', 1),
         'attempt_id': batch_result.get('attempt_id'),
@@ -454,7 +481,8 @@ def build_response_storage_payload(
         'response_id': batch_result.get('session_ref', {}).get('response_id') if isinstance(batch_result.get('session_ref'), dict) else None,
         'started_at': batch_result.get('started_at'),
         'completed_at': batch_result.get('completed_at'),
-        'model': model_name or f'openclaw/{spec.agent_name}',
+        'model': resolved_model_name,
+        'decision_provenance': decision_provenance,
         'output_text': batch_result.get('output_text'),
         'raw_response': raw_response,
         'normalized_feedback': normalized_feedback,
@@ -980,150 +1008,17 @@ def compressed_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     """Return a bounded one-symbol prompt payload without silently dropping raw evidence."""
     trimmed = trim_batch_item_for_prompt(item)
     compressed = _compress_prompt_value(trimmed)
-    return compressed if isinstance(compressed, dict) else {'payload': compressed}
+    if not isinstance(compressed, dict):
+        return {'payload': compressed}
+    dispatched_policy = trimmed.get('signal_decider_policy')
+    if isinstance(dispatched_policy, dict):
+        compressed['signal_decider_policy'] = dispatched_policy
+    return compressed
 
 
 def slim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     """Backward-compatible alias for older tests/imports."""
     return compressed_batch_item_for_prompt(item)
-
-
-def extract_json_object(text: str | None) -> str | None:
-    if not text:
-        return None
-    normalized = text.strip()
-    if not normalized:
-        return None
-    if normalized.startswith('```'):
-        parts = normalized.split('```')
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            if part.startswith('json'):
-                part = part[4:].strip()
-            candidate = extract_json_object(part)
-            if candidate:
-                return candidate
-    if normalized.startswith('[intent:'):
-        newline_index = normalized.find("\n")
-        if newline_index != -1:
-            candidate = extract_json_object(normalized[newline_index + 1:])
-            if candidate:
-                return candidate
-    if '[tool_code]' in normalized and '[/tool_code]' in normalized:
-        start_marker = normalized.find('[tool_code]') + len('[tool_code]')
-        end_marker = normalized.find('[/tool_code]', start_marker)
-        if end_marker != -1:
-            tool_block = normalized[start_marker:end_marker].strip()
-            json_call_match = re.search(r'json\.dumps\((\{.*\})\)\s*$', tool_block, re.DOTALL)
-            if json_call_match:
-                candidate = extract_json_object(json_call_match.group(1))
-                if candidate:
-                    return candidate
-            candidate = extract_json_object(tool_block)
-            if candidate:
-                return candidate
-    start = normalized.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escaped = False
-    for idx in range(start, len(normalized)):
-        char = normalized[idx]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == '\\':
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-            continue
-        if char == '{':
-            depth += 1
-        elif char == '}':
-            depth -= 1
-            if depth == 0:
-                candidate = normalized[start:idx + 1]
-                try:
-                    json.loads(candidate)
-                    return candidate
-                except json.JSONDecodeError:
-                    continue
-    return None
-
-
-def repair_json_tail(text: str | None) -> str | None:
-    if not text:
-        return None
-    normalized = text.strip()
-    if not normalized:
-        return None
-    try:
-        json.loads(normalized)
-        return normalized
-    except json.JSONDecodeError as exc:
-        tail_threshold = max(len(normalized) - 64, int(len(normalized) * 0.9))
-        if exc.pos < tail_threshold:
-            return None
-
-    repaired_chars: list[str] = []
-    stack: list[str] = []
-    in_string = False
-    escaped = False
-    altered = False
-
-    for char in normalized:
-        if in_string:
-            repaired_chars.append(char)
-            if escaped:
-                escaped = False
-            elif char == '\\':
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-            repaired_chars.append(char)
-            continue
-
-        if char == '{':
-            stack.append('}')
-            repaired_chars.append(char)
-            continue
-        if char == '[':
-            stack.append(']')
-            repaired_chars.append(char)
-            continue
-        if char in {'}', ']'}:
-            if stack and char == stack[-1]:
-                stack.pop()
-                repaired_chars.append(char)
-                continue
-            altered = True
-            continue
-
-        repaired_chars.append(char)
-
-    if stack:
-        altered = True
-        repaired_chars.extend(reversed(stack))
-
-    if not altered:
-        return None
-
-    candidate = ''.join(repaired_chars)
-    try:
-        json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-    return candidate
 
 
 def build_upstream_feedback_bundle(
@@ -1422,16 +1317,18 @@ def build_signal_decider_payload(
                     'final_judgment',
                 ],
                 'respect_decision_input_quality_hard_blocks': True,
-                'performance_criteria_authoritative': True,
+                'performance_criteria_requires_model_guidance_eligibility': True,
                 'performance_criteria_sections': [
                     'overall',
                     'performance_buckets',
                     'rule_candidates',
                     'guidance',
                 ],
-                'use_win_loss_return_drawdown_and_reward_risk_to_adjust_action_thresholds': True,
+                'use_eligible_replay_evidence_to_tighten_buy_thresholds': True,
                 'tighten_buy_threshold_for_bad_buy_or_negative_return_clusters': True,
-                'relax_wait_reject_threshold_for_missed_opportunity_clusters': True,
+                'relax_wait_reject_threshold_for_missed_opportunity_clusters': False,
+                'manual_review_criteria_never_authorize_buy': True,
+                'deterministic_gate_requires_explicit_eligibility': True,
                 'do_not_limit_decider_improvement_to_reason_names_or_text_detail': True,
                 'pre_decider_enrichment_blocks': [
                     'quote_orderbook_snapshot',

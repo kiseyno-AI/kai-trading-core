@@ -8,7 +8,11 @@ from itertools import combinations
 import json
 from typing import Any, Sequence
 
-from app.agent_context.roles import SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import (
+    SHORT_TERM_DECIDER_AGENT_NAME,
+    SIGNAL_DECIDER_AGENT_NAME,
+    canonical_evaluation_action,
+)
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
     DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
@@ -515,10 +519,47 @@ class SignalDeciderCalibrationService:
                 evaluation=evaluation,
             )
             coverage_items.append(coverage)
-            if (
+            canonical_decision_action = canonical_evaluation_action(
+                agent_name=row.agent_name,
+                persisted_action=row.decision_action,
+                response_payload=row.response_payload,
+            )
+            invalid_action_reason = None
+            if canonical_decision_action is None:
+                invalid_action_reason = (
+                    'invalid_short_term_tactical_action'
+                    if row.agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    else 'invalid_decision_action'
+                )
+            evaluation_decision_action = _normalize_optional_text(
+                _maybe_dict(evaluation).get('decision_action')
+            )
+            is_graded_computed = (
                 coverage.get('status_reason') == 'computed'
-                and _normalize_optional_text(_maybe_dict(evaluation).get('evaluation_status')) == 'graded'
-            ):
+                and _normalize_optional_text(
+                    _maybe_dict(evaluation).get('evaluation_status')
+                )
+                == 'graded'
+            )
+            evaluation_action_mismatch = (
+                is_graded_computed
+                and canonical_decision_action is not None
+                and evaluation_decision_action != canonical_decision_action
+            )
+            action_integrity_reason = invalid_action_reason
+            action_integrity_message = None
+            if invalid_action_reason:
+                action_integrity_message = (
+                    'Source decision action is invalid; repair the source payload and '
+                    'recompute its evaluation.'
+                )
+            elif evaluation_action_mismatch:
+                action_integrity_reason = 'evaluation_decision_action_mismatch'
+                action_integrity_message = (
+                    'Stored evaluation action differs from the canonical snapshot action; '
+                    'recompute required.'
+                )
+            if is_graded_computed and action_integrity_reason is None:
                 mature_items.append(
                     self._build_calibration_item(
                         row=row,
@@ -536,10 +577,16 @@ class SignalDeciderCalibrationService:
                     'market_date': row.market_date.isoformat(),
                     'symbol': row.symbol,
                     'policy_version': decision['policy_version'],
-                    'decision_action': decision['decision']['action'],
+                    'decision_action': (
+                        canonical_decision_action or decision['decision']['action']
+                    ),
                     'wait_reason': decision.get('wait_reason'),
-                    'status_reason': coverage.get('status_reason'),
-                    'status_message': coverage.get('status_message'),
+                    'status_reason': action_integrity_reason or coverage.get('status_reason'),
+                    'status_message': action_integrity_message or coverage.get('status_message'),
+                    'canonical_decision_action': canonical_decision_action,
+                    'evaluation_decision_action': evaluation_decision_action,
+                    'source_correction_required': invalid_action_reason is not None,
+                    'recompute_required': action_integrity_reason is not None,
                     'matured': bool(coverage.get('matured')),
                     'stored_outcome': bool(coverage.get('stored_outcome')),
                     'stored_evaluation': bool(coverage.get('stored_evaluation')),
@@ -568,7 +615,7 @@ class SignalDeciderCalibrationService:
         hints = self._build_calibration_hints(
             horizon_days=normalized_horizon_days,
             condition_clusters=clusters,
-            exclusion_status_reason_counts=dict(coverage_summary.get('status_reason_counts') or {}),
+            exclusion_status_reason_counts=dict(sorted(excluded_status_reason_counts.items())),
         )
         rule_candidates = self._build_rule_candidates(
             market_date_from=normalized_from,

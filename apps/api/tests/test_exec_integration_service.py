@@ -585,6 +585,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_exec_request_timeout_seconds': settings.signal_decider_exec_request_timeout_seconds,
             'signal_decider_next_open_enabled': settings.signal_decider_next_open_enabled,
             'signal_decider_next_open_dry_run': settings.signal_decider_next_open_dry_run,
+            'signal_decider_next_open_account_targets': settings.signal_decider_next_open_account_targets,
         }
         settings.signal_decider_exec_integration_mode = 'dispatch'
         settings.signal_decider_exec_base_url = 'http://exec.test'
@@ -593,6 +594,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_exec_request_timeout_seconds = 5.0
         settings.signal_decider_next_open_enabled = True
         settings.signal_decider_next_open_dry_run = False
+        settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
         self.client = FakeExecClient()
         self.service = SignalDeciderExecIntegrationService(client=self.client)
         self.enrichment_preflight_patcher = patch(
@@ -1597,6 +1599,52 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(exec_dispatch['dispatch_status'], 'accepted')
             self.assertEqual(len(exec_dispatch['item_links']), 3)
 
+    async def test_dispatch_mode_blocks_multiple_explicit_accounts_before_exec_http(self) -> None:
+        second_account_reference = f'KIS:97{uuid4().hex[:6].upper()}-01'
+        settings.signal_decider_next_open_account_targets = (
+            f'Main={self.account_reference}@1500000,'
+            f'Secondary={second_account_reference}@1500000'
+        )
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        issue = next(
+            item
+            for item in result['integration']['issues']
+            if item['code'] == 'multi_account_exec_endpoint_unsupported'
+        )
+        self.assertEqual(issue['configured_account_target_count'], 2)
+        self.assertFalse(result['summary']['triggered'])
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        self.assertEqual(
+            result['dispatch']['groups'][0]['error']['code'],
+            'multi_account_exec_endpoint_unsupported',
+        )
+
+    def test_disabled_mode_keeps_multi_account_planning_configuration_available(self) -> None:
+        second_account_reference = f'KIS:97{uuid4().hex[:6].upper()}-01'
+        settings.signal_decider_exec_integration_mode = 'disabled'
+        settings.signal_decider_next_open_account_targets = (
+            f'Main={self.account_reference}@1500000,'
+            f'Secondary={second_account_reference}@1500000'
+        )
+
+        result = self.service.integration_status()
+
+        self.assertEqual(result['config_status'], 'disabled')
+        self.assertNotIn(
+            'multi_account_exec_endpoint_unsupported',
+            {issue['code'] for issue in result['issues']},
+        )
+
     async def test_dispatch_next_open_plan_persists_compact_per_row_payload_for_multi_item_plan(self) -> None:
         bulky_decider_context = {
             'decider_input_context': {
@@ -1977,13 +2025,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(short_entry['raw_action'], 'watch_for_trigger')
         self.assertEqual(short_entry['tactical_action'], 'watch_for_trigger')
-        self.assertEqual(short_entry['generic_action'], 'buy')
+        self.assertEqual(short_entry['generic_action'], 'monitor_candidate')
         self.assertEqual(short_entry['trigger_price'], 50500)
         self.assertEqual(short_entry['limit_price'], 51500)
         self.assertEqual(short_entry['risk_context']['agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['handoff_intent'], 'intraday_watch_buy')
-        self.assertEqual(short_entry['risk_context']['generic_action'], 'buy')
+        self.assertEqual(short_entry['risk_context']['generic_action'], 'monitor_candidate')
         self.assertEqual(short_entry['risk_context']['signal_decider_alignment'], 'wait_conflict_block')
         self.assertEqual(short_entry['risk_context']['alignment_gate_action'], 'report_only_block_candidate')
         self.assertEqual(short_entry['risk_context']['final_enforcement_decision'], 'allowed_report_only')
@@ -2049,7 +2097,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff['traceability']['final_enforcement_decision'], 'allowed_report_only')
         self.assertEqual(handoff['traceability']['requested_quantity'], 29)
         self.assertEqual(handoff['traceability']['final_quantity'], 29)
-        self.assertEqual(handoff['decider_output']['generic_action'], 'buy')
+        self.assertEqual(handoff['decider_output']['generic_action'], 'monitor_candidate')
         self.assertEqual(handoff['decider_output']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(handoff['decider_output']['signal_decider_alignment'], 'wait_conflict_block')
         self.assertEqual(handoff['decider_output']['final_enforcement_decision'], 'allowed_report_only')
@@ -2469,7 +2517,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_item = next(item for item in overview['items'] if item['decision_agent_name'] == 'short-term-decider')
         self.assertEqual(short_item['raw_action'], 'watch_for_trigger')
         self.assertEqual(short_item['tactical_action'], 'watch_for_trigger')
-        self.assertEqual(short_item['generic_action'], 'buy')
+        self.assertEqual(short_item['generic_action'], 'monitor_candidate')
         self.assertEqual(short_item['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(short_item['approval_state'], 'not_dispatched')
         self.assertFalse(short_item['exec_agent_approved'])

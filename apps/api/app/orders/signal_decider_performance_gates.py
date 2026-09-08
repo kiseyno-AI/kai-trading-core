@@ -233,6 +233,20 @@ def evaluate_next_open_performance_gate(
             'matched_negative_buckets': [],
             'matched_rule_candidates': [],
         }
+    usage_policy = _maybe_dict(criteria.get('usage_policy'))
+    if usage_policy.get('deterministic_gate_eligible') is not True:
+        return {
+            'status': 'not_eligible',
+            'sample_count': criteria.get('sample_count'),
+            'feature_values': feature_values,
+            'adjusted_min_confidence_score_10': str(adjusted_min_confidence),
+            'adjusted_min_expected_return_pct': str(adjusted_min_expected_return),
+            'min_reward_risk_ratio': format(min_reward_risk, 'f'),
+            'blocking_reasons': blocking_reasons,
+            'warnings': [],
+            'matched_negative_buckets': [],
+            'matched_rule_candidates': [],
+        }
 
     overall = _maybe_dict(criteria.get('overall'))
     if (
@@ -267,7 +281,12 @@ def evaluate_next_open_performance_gate(
     for candidate in _maybe_list(criteria.get('rule_candidates')):
         if not isinstance(candidate, dict):
             continue
-        if str(candidate.get('activation_status') or '') not in {'needs_replay', 'generated', 'candidate', 'active'}:
+        if (
+            str(candidate.get('activation_status') or '') != 'active'
+            or candidate.get('active_policy') is not True
+            or candidate.get('deterministic_gate_eligible') is not True
+            or candidate.get('manual_review_only') is True
+        ):
             continue
         if _predicate_matches(_maybe_dict(candidate.get('predicate')), feature_values=feature_values):
             matched_rule_candidates.append(candidate)

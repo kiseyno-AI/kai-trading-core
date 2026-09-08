@@ -8,6 +8,10 @@ from typing import Any, Callable, Sequence
 from fastapi.encoders import jsonable_encoder
 
 from app.agent_context.orchestrator import DISPATCH_SPECS, AgentDispatchSpec, agent_feedback_orchestrator
+from app.agent_context.orchestrator_runtime_helpers import (
+    batch_response_contract_failure,
+    normalized_feedback_contract_failure,
+)
 from app.agent_context.response_contract import normalize_agent_response
 from app.repositories.us_equity_repository import load_us_agent_candidates, upsert_us_agent_feedback
 
@@ -270,9 +274,49 @@ class USAgentAnalysisService:
         *,
         candidate_loader: Callable[..., list[dict]] = load_us_agent_candidates,
         dispatcher_getter: Callable[[], Any] | None = None,
+        session_cleanup: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._candidate_loader = candidate_loader
         self._dispatcher_getter = dispatcher_getter or agent_feedback_orchestrator._get_client
+        self._session_cleanup = session_cleanup or agent_feedback_orchestrator._cleanup_session_key
+
+    def _cleanup_fresh_batch_session(
+        self,
+        *,
+        market_date: date,
+        symbol: str,
+        agent_name: str,
+        run_id: str,
+        session_key: str,
+    ) -> dict[str, Any]:
+        audit_context = {
+            'session_key': session_key,
+            'agent_name': agent_name,
+            'symbol': symbol,
+        }
+        try:
+            result = self._session_cleanup(
+                market_date=market_date,
+                symbol=symbol,
+                agent_name=agent_name,
+                run_id=run_id,
+                session_key=session_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                **audit_context,
+                'status': 'deferred',
+                'reason': 'fresh_batch_session_cleanup_failed',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+            }
+        if isinstance(result, dict):
+            return {**result, **audit_context}
+        return {
+            **audit_context,
+            'status': 'unknown',
+            'reason': 'fresh_batch_session_cleanup_returned_non_object',
+        }
 
     def prepare(
         self,
@@ -329,6 +373,7 @@ class USAgentAnalysisService:
         feedback_by_symbol: dict[str, dict[str, dict]] = {}
         completed: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
+        session_cleanup: list[dict[str, Any]] = []
         bounded_batch_size = max(1, batch_size)
         total_batches = sum(
             (len(symbols) + bounded_batch_size - 1) // bounded_batch_size
@@ -338,6 +383,11 @@ class USAgentAnalysisService:
         for role, symbols in prepared['role_scopes'].items():
             spec: AgentDispatchSpec = specs_by_role[role]
             for start in range(0, len(symbols), bounded_batch_size):
+                batch_index = (start // bounded_batch_size) + 1
+                batch_session_key = (
+                    f'agent:{role}:feedback-us/{role}/{run_id}/'
+                    f'batch-{batch_index:03d}/{uuid.uuid4().hex[:10]}'
+                )
                 batch_symbols = symbols[start:start + bounded_batch_size]
                 batch_items = []
                 for symbol in batch_symbols:
@@ -356,10 +406,8 @@ class USAgentAnalysisService:
                     context = dict(prepared['contexts'][symbol])
                     context['upstream_agent_feedback'] = feedback_by_symbol.get(symbol, {})
                     context['request_run_id'] = run_id
-                    context['session_key'] = (
-                        f'feedback-us/{role}/{market_date.isoformat()}/'
-                        f'{start // bounded_batch_size:03d}'
-                    )
+                    context['session_key'] = batch_session_key
+                    context['session_reuse_mode'] = 'fresh_per_batch'
                     batch_items.append(context)
                 if not batch_items:
                     completed_batches += 1
@@ -383,18 +431,20 @@ class USAgentAnalysisService:
                         market_date=market_date,
                         batch_items=batch_items,
                     )
+                    batch_contract_failure = batch_response_contract_failure(batch_result)
                     decoded_items = (batch_result.get('decoded') or {}).get('items') or []
                     decoded_by_symbol = {
                         str(row.get('symbol')): row.get('feedback')
                         for row in decoded_items
                         if isinstance(row, dict) and isinstance(row.get('feedback'), dict)
                     }
+                    staged_feedback: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
                     for context in batch_items:
                         symbol = str(context['symbol'])
                         feedback = decoded_by_symbol.get(symbol)
                         if feedback is None:
-                            failures.append({'role': role, 'symbol': symbol, 'error': 'missing_symbol_feedback'})
-                            continue
+                            batch_contract_failure = 'response_contract_invalid:feedback_missing'
+                            break
                         normalized = normalize_agent_response(
                             role=role,
                             output_text=json.dumps(feedback, ensure_ascii=False),
@@ -403,23 +453,50 @@ class USAgentAnalysisService:
                             symbol=symbol,
                             agent_name=spec.agent_name,
                         )
-                        feedback_by_symbol.setdefault(symbol, {})[role] = normalized
-                        feedback_id = None
-                        if persist:
-                            feedback_id = upsert_us_agent_feedback(
-                                market_date=market_date,
-                                symbol_id=int(candidate_by_symbol[symbol]['id']),
-                                agent_name=spec.agent_name,
-                                run_id=run_id,
-                                context_payload=context,
-                                response_payload=jsonable_encoder(batch_result),
-                                normalized_feedback_payload=normalized,
-                            )
-                        completed.append({'role': role, 'symbol': symbol, 'feedback_id': feedback_id})
+                        normalized_contract_failure = normalized_feedback_contract_failure(normalized)
+                        if normalized_contract_failure is not None:
+                            batch_contract_failure = normalized_contract_failure
+                            break
+                        staged_feedback.append((context, symbol, normalized))
+
+                    if batch_contract_failure is not None:
+                        failures.extend(
+                            {
+                                'role': role,
+                                'symbol': str(context['symbol']),
+                                'error': batch_contract_failure,
+                            }
+                            for context in batch_items
+                        )
+                    else:
+                        for context, symbol, normalized in staged_feedback:
+                            feedback_by_symbol.setdefault(symbol, {})[role] = normalized
+                            feedback_id = None
+                            if persist:
+                                feedback_id = upsert_us_agent_feedback(
+                                    market_date=market_date,
+                                    symbol_id=int(candidate_by_symbol[symbol]['id']),
+                                    agent_name=spec.agent_name,
+                                    run_id=run_id,
+                                    context_payload=context,
+                                    response_payload=jsonable_encoder(batch_result),
+                                    normalized_feedback_payload=normalized,
+                                )
+                            completed.append({'role': role, 'symbol': symbol, 'feedback_id': feedback_id})
                 except Exception as exc:
                     failures.extend(
                         {'role': role, 'symbol': symbol, 'error': f'{type(exc).__name__}: {exc}'}
                         for symbol in batch_symbols
+                    )
+                finally:
+                    session_cleanup.append(
+                        self._cleanup_fresh_batch_session(
+                            market_date=market_date,
+                            symbol=str(batch_items[0]['symbol']),
+                            agent_name=spec.agent_name,
+                            run_id=run_id,
+                            session_key=batch_session_key,
+                        )
                     )
                 completed_batches += 1
                 if progress_callback is not None:
@@ -450,6 +527,7 @@ class USAgentAnalysisService:
             'total_batches': total_batches,
             'items': completed,
             'failures': failures,
+            'session_cleanup': session_cleanup,
         }
 
 
