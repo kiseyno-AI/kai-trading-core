@@ -1,7 +1,9 @@
 # GET /trading/orders/next-open-execution and POST /trading/orders/next-open-execution/run-if-due
 
 ## Summary
-Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day decision snapshots. The planner now includes both classic `signal-decider` next-open buys and actionable `short-term-decider` tactical candidates, stores blocked-vs-eligible validation results durably with explicit decider identity, and the submit hook either reuses the existing trading-order persistence flow or, when `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, translates eligible rows into normalized exec plan items and delegates sizing/execution authority to `kai-trading-exec`.
+Inspect or execute the persisted next-open buy plan derived from the latest previous-trading-day decision snapshots. The planner includes classic `signal-decider` next-open buys plus `short-term-decider` tactical rows, stores their validation results durably with explicit decider identity, and the submit hook either reuses the existing trading-order persistence flow or, when `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, translates buy-eligible rows and monitor-only watcher rows into normalized exec plan items and delegates sizing/execution authority to `kai-trading-exec`.
+
+`watch_for_trigger` rows are monitor-only, not immediate buy candidates. They return `generic_action="monitor_candidate"`, `eligibility_status="monitor_candidate"`, and `execution_status="awaiting_trigger"` while Exec watches their trigger/chase conditions. The summary separates these rows from buy eligibility: `buy_eligible_count` aliases `eligible_count`, `monitor_candidate_count` counts monitor-only rows, `awaiting_trigger_count` counts rows still waiting for their trigger, and `ready_count` is `eligible_count + monitor_candidate_count`. Consumers must not interpret `monitor_candidate_count` or `ready_count` as an immediately executable buy count.
 
 The daily EOD pipeline refreshes this persisted plan immediately after the decision-support decider stage completes. PREOPEN refresh remains as an idempotent safety net, but operators no longer need to wait until the next morning for buy snapshots to become inspectable execution-plan rows.
 
@@ -58,8 +60,13 @@ Content-Type: application/json
     "target_trade_date": "2026-04-30",
     "source_market_date": "2026-04-29",
     "items_total": 2,
-    "eligible_count": 2,
+    "eligible_count": 1,
+    "buy_eligible_count": 1,
     "blocked_count": 0,
+    "monitor_candidate_count": 1,
+    "planned_count": 1,
+    "awaiting_trigger_count": 1,
+    "ready_count": 2,
     "submitted_count": 0,
     "delegated_for_exec_agent_sizing_count": 0,
     "enrichment_preflight_allowed": true,
@@ -139,7 +146,7 @@ Content-Type: application/json
       "source_feedback_id": 702,
       "raw_action": "watch_for_trigger",
       "tactical_action": "watch_for_trigger",
-      "generic_action": "buy",
+      "generic_action": "monitor_candidate",
       "handoff_intent": "intraday_watch_buy",
       "handoff_active": true,
       "exec_monitoring_active": true,
@@ -163,8 +170,8 @@ Content-Type: application/json
       "planned_order_type": "limit",
       "planned_quantity": "30.00000000",
       "estimated_reference_price": 51500,
-      "eligibility_status": "eligible",
-      "execution_status": "planned",
+      "eligibility_status": "monitor_candidate",
+      "execution_status": "awaiting_trigger",
       "client_order_id": "STDE-20260430-005930",
       "validation": {
         "decision_agent_name": "short-term-decider",
@@ -195,7 +202,7 @@ Content-Type: application/json
         "short_term": {
           "raw_action": "watch_for_trigger",
           "tactical_action": "watch_for_trigger",
-          "generic_action": "buy",
+          "generic_action": "monitor_candidate",
           "handoff_intent": "intraday_watch_buy",
           "entry_execution_mode": "pending_trigger_limit",
           "trigger_price": 50500,
@@ -306,7 +313,7 @@ When `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE=downsize_probe` reduces a short-ter
 }
 ```
 
-Signal-decider rows keep the existing market-open submit behavior only in core-local mode. `short-term-decider` rows are only mapped when the tactical action is actionable (`scalp_buy_candidate` or `watch_for_trigger`) and all required guarded-entry levels pass. `scalp_buy_candidate` exposes `handoff_intent="tactical_buy"` with `entry_execution_mode="guarded_tactical_buy"`, while `watch_for_trigger` exposes `handoff_intent="intraday_watch_buy"` with `entry_execution_mode="pending_trigger_limit"`. In core-local mode they remain planned-only because trigger/chase semantics are not translated into live market orders locally. In exec dispatch mode, signal and short-term entry legs are normally sent at/after 08:00 KST as exec-agent-sized candidates; enforced `downsize_probe` entries instead carry the fixed core probe quantity shown above. Accepted exec-agent-sized rows without an agent-approved positive quantity move to `execution_status="delegated_for_exec_agent_sizing"`, and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including decider-aware `plan_id`, remote item ids, last dispatch attempt, and the latest matched readback snapshot.
+Signal-decider rows keep the existing market-open submit behavior only in core-local mode. `short-term-decider` rows are only mapped when the tactical action is supported (`scalp_buy_candidate` or `watch_for_trigger`) and all required guarded-entry levels pass. `scalp_buy_candidate` exposes `handoff_intent="tactical_buy"` with `entry_execution_mode="guarded_tactical_buy"`; `watch_for_trigger` remains monitor-only with `handoff_intent="intraday_watch_buy"` and `entry_execution_mode="pending_trigger_limit"`. In core-local mode short-term rows remain inspection-only because trigger/chase semantics are not translated into live market orders locally; watcher rows stay `awaiting_trigger` and Core does not submit them. In exec dispatch mode, signal and short-term entry legs are normally sent at/after 08:00 KST as exec-agent-sized candidates; enforced `downsize_probe` entries instead carry the fixed core probe quantity shown above. Accepted exec-agent-sized rows without an agent-approved positive quantity move to `execution_status="delegated_for_exec_agent_sizing"`, and the delegated linkage or audit state is stored under `submission.exec_dispatch` for each item, including decider-aware `plan_id`, remote item ids, last dispatch attempt, and the latest matched readback snapshot.
 
 When later Exec readback restores or confirms active/pending watch monitoring for a stale short-term `blocked/planned` row, core updates the row's `execution_status` to `delegated_for_exec_agent_sizing` and stores `exec_watch_state_sync` audit metadata while leaving the original validation `blocking_reasons` and warnings available for replay review.
 

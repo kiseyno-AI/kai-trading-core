@@ -156,6 +156,26 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
             'response_identity_missing:market_date',
         )
 
+    def test_market_level_feedback_requires_market_date_but_not_symbol(self):
+        base = {
+            'response_contract_valid': True,
+            'structural_mismatch_flags': [],
+            'response_schema_violation_flags': [],
+            'symbol': None,
+            'market_date': '2026-04-23',
+        }
+
+        self.assertIsNone(
+            normalized_feedback_contract_failure(base, require_symbol_identity=False)
+        )
+        self.assertEqual(
+            normalized_feedback_contract_failure(
+                {**base, 'market_date': None},
+                require_symbol_identity=False,
+            ),
+            'response_identity_missing:market_date',
+        )
+
     def test_missing_normalized_contract_verdict_fails_closed(self):
         self.assertEqual(
             normalized_feedback_contract_failure(
@@ -293,7 +313,7 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
             'single_dispatch_session_cleanup_failed',
         )
 
-    def test_single_dispatch_success_persists_and_cleans_exactly_once(self):
+    def test_market_level_single_dispatch_without_symbol_persists_and_cleans_exactly_once(self):
         cleanup_calls: list[dict] = []
         store_calls: list[dict] = []
 
@@ -308,7 +328,6 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
                         'risk_flags': [],
                         'details': {},
                         'improvement_notes': [],
-                        'symbol': '__MARKET__',
                         'market_date': '2026-04-23',
                         'response_contract_valid': True,
                         'structural_mismatch_flags': [],
@@ -347,6 +366,56 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
         self.assertFalse(store_calls[0]['cleanup_session'])
         self.assertEqual(len(cleanup_calls), 1)
         self.assertEqual(items[0]['storage']['session_cleanup']['status'], 'deleted')
+
+    def test_symbol_single_dispatch_without_symbol_is_rejected_before_persistence(self):
+        cleanup_calls: list[dict] = []
+
+        class Client:
+            @staticmethod
+            def dispatch(**_kwargs):
+                return {
+                    'normalized_feedback': {
+                        'role': 'technical-analyst',
+                        'summary': '종목 기술 요약',
+                        'confidence': 0.7,
+                        'risk_flags': [],
+                        'details': {},
+                        'improvement_notes': [],
+                        'market_date': '2026-04-23',
+                        'response_contract_valid': True,
+                        'structural_mismatch_flags': [],
+                        'response_schema_violation_flags': [],
+                    },
+                    'session_ref': {'session_key': 'feedback-fresh/technical/missing-symbol'},
+                }
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**_kwargs):
+                raise AssertionError('symbol feedback without symbol identity must not be persisted')
+
+            @staticmethod
+            def _cleanup_session_key(**kwargs):
+                cleanup_calls.append(kwargs)
+                return {'status': 'deleted', 'session_key': kwargs['session_key']}
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='single-missing-symbol',
+            specs=[SimpleNamespace(role='technical-analyst', agent_name='technical-analyst')],
+            payloads={'technical-analyst': {'market_date': '2026-04-23', 'symbol': '005930'}},
+            symbol='005930',
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]['failure_kind'], 'response_identity_missing:symbol')
+        self.assertEqual(len(cleanup_calls), 1)
 
     def test_single_dispatch_exception_uses_known_fresh_session_and_cleans_once(self):
         cleanup_calls: list[dict] = []

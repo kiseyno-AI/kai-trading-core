@@ -39,10 +39,15 @@ def batch_response_contract_failure(batch_result: dict[str, Any]) -> str | None:
     return None
 
 
-def normalized_feedback_contract_failure(normalized_feedback: dict[str, Any]) -> str | None:
+def normalized_feedback_contract_failure(
+    normalized_feedback: dict[str, Any],
+    *,
+    require_symbol_identity: bool = True,
+) -> str | None:
+    required_identity_fields = ('symbol', 'market_date') if require_symbol_identity else ('market_date',)
     missing_identity_fields = [
         field
-        for field in ('symbol', 'market_date')
+        for field in required_identity_fields
         if not str(normalized_feedback.get(field) or '').strip()
     ]
     if missing_identity_fields:
@@ -300,7 +305,10 @@ def dispatch_and_store(
                 if isinstance(response.get('normalized_feedback'), dict)
                 else {}
             )
-            contract_failure = normalized_feedback_contract_failure(normalized_feedback)
+            contract_failure = normalized_feedback_contract_failure(
+                normalized_feedback,
+                require_symbol_identity=symbol != '__MARKET__',
+            )
             if contract_failure is not None:
                 failure = build_failed_dispatch_item(
                     role=spec.role,
