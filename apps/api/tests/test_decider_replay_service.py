@@ -1092,6 +1092,97 @@ class DeciderReplayServiceTests(unittest.TestCase):
 
 
 class DeciderReplayRepositoryTests(unittest.TestCase):
+    def test_short_term_replay_uses_tactical_action_instead_of_legacy_generic_buy(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
+        tables = [
+            AgentContextFeedback.__table__,
+            SignalDeciderDecisionSnapshot.__table__,
+            SignalDeciderRealizedOutcome.__table__,
+            DeciderPostDecisionEvaluation.__table__,
+            SignalDeciderActualExecutionOutcome.__table__,
+        ]
+        Base.metadata.create_all(engine, tables=tables)
+        TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+        @contextmanager
+        def test_session_scope():
+            session = TestSessionLocal()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        try:
+            with TestSessionLocal() as session:
+                snapshot_specs = [
+                    (1, SHORT_TERM_DECIDER_AGENT_NAME, '111111', {'tactical_action': 'watch_for_trigger'}),
+                    (2, SHORT_TERM_DECIDER_AGENT_NAME, '222222', {'tactical_action': 'reject'}),
+                    (3, SHORT_TERM_DECIDER_AGENT_NAME, '333333', {'tactical_action': 'scalp_buy_candidate'}),
+                    (4, SHORT_TERM_DECIDER_AGENT_NAME, '444444', {}),
+                    (5, SIGNAL_DECIDER_AGENT_NAME, '555555', {}),
+                ]
+                for snapshot_id, agent_name, symbol, response_payload in snapshot_specs:
+                    snapshot = _snapshot_object(snapshot_id=snapshot_id, symbol=symbol)
+                    snapshot.agent_name = agent_name
+                    snapshot.response_payload = response_payload
+                    session.add(snapshot)
+                    session.flush()
+                    session.add(
+                        SignalDeciderRealizedOutcome(
+                            decision_snapshot_id=snapshot.id,
+                            feedback_id=None,
+                            market_date=snapshot.market_date,
+                            symbol=symbol,
+                            policy_version=snapshot.policy_version,
+                            decision_action='buy',
+                            horizon_days=5,
+                            outcome_status='complete',
+                            bars_observed=5,
+                            close_return_pct=Decimal('0.01'),
+                        )
+                    )
+                session.commit()
+
+            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+                repository = DeciderReplayRepository()
+                short_term_dataset = repository.list_replay_trades(
+                    market_date_from=date(2026, 6, 16),
+                    market_date_to=date(2026, 6, 16),
+                    agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                    symbols=None,
+                    horizon_days=5,
+                    cost_assumptions=DeciderReplayCostAssumptions(),
+                )
+                signal_dataset = repository.list_replay_trades(
+                    market_date_from=date(2026, 6, 16),
+                    market_date_to=date(2026, 6, 16),
+                    agent_name=SIGNAL_DECIDER_AGENT_NAME,
+                    symbols=None,
+                    horizon_days=5,
+                    cost_assumptions=DeciderReplayCostAssumptions(),
+                )
+
+            self.assertEqual(short_term_dataset.source_decision_count, 4)
+            self.assertEqual([trade.snapshot_id for trade in short_term_dataset], [3])
+            self.assertEqual(
+                short_term_dataset.excluded_reason_counts,
+                {
+                    'invalid_short_term_tactical_action': 1,
+                    'short_term_tactical_action_not_buy': 2,
+                },
+            )
+            self.assertEqual(signal_dataset.source_decision_count, 1)
+            self.assertEqual([trade.snapshot_id for trade in signal_dataset], [5])
+            self.assertEqual(signal_dataset.excluded_reason_counts, {})
+        finally:
+            Base.metadata.drop_all(engine, tables=reversed(tables))
+            engine.dispose()
+
     def test_replay_uses_latest_snapshot_per_feedback_and_keeps_null_feedback_independent(self) -> None:
         engine = create_engine('sqlite+pysqlite:///:memory:')
         event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
@@ -1474,7 +1565,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
             self.assertEqual(fixed_horizon_dataset.source_decision_count, 4)
             self.assertEqual(
                 fixed_horizon_dataset.excluded_reason_counts,
-                {'missing_fixed_horizon_outcome': 4},
+                {'short_term_tactical_action_not_buy': 4},
             )
             self.assertEqual(
                 fixed_horizon_dataset.diagnostics['actual_lifecycle_outcomes_used_for_promotion'],

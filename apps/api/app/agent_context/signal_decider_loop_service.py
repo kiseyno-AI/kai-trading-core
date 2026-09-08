@@ -23,7 +23,12 @@ from app.agent_context.decider_replay_service import (
     DeciderReplayService,
 )
 from app.agent_context.decision_delta import build_decision_delta
-from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import (
+    SHORT_TERM_DECIDER_AGENT_NAME,
+    SIGNAL_DECIDER_AGENT_NAME,
+    canonical_evaluation_action,
+    short_term_tactical_action_to_decision_action,
+)
 from app.agent_context.wait_reason_taxonomy import derive_wait_reason
 from app.market.session import next_krx_trading_date
 from app.core.settings import settings
@@ -513,11 +518,7 @@ def _normalize_short_term_action(value: Any) -> str:
 
 
 def _short_term_generic_action(tactical_action: str) -> str:
-    if tactical_action == 'scalp_buy_candidate':
-        return 'buy'
-    if tactical_action == 'reject':
-        return 'reject'
-    return 'wait'
+    return short_term_tactical_action_to_decision_action(tactical_action) or 'wait'
 
 
 def _to_float(value: Any) -> float | None:
@@ -5001,17 +5002,13 @@ class SignalDeciderLoopService:
             )
         policy_version = _normalize_optional_text(row.policy_version, default=DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
         decision_action = _normalize_action(row.decision_action or feedback_payload.get('next_day_open_action'))
-        if row.agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
-            raw_tactical_action = feedback_payload.get('tactical_action')
-            if raw_tactical_action is None:
-                raw_tactical_action = feedback_payload.get('preferred_action')
-            if (
-                isinstance(raw_tactical_action, str)
-                and raw_tactical_action.strip().lower() in SHORT_TERM_DECIDER_ACTIONS
-            ):
-                decision_action = _short_term_generic_action(
-                    _normalize_short_term_action(raw_tactical_action)
-                )
+        canonical_action = canonical_evaluation_action(
+            agent_name=row.agent_name,
+            persisted_action=row.decision_action,
+            response_payload=feedback_payload,
+        )
+        if canonical_action is not None:
+            decision_action = canonical_action
         thesis_summary = str(
             row.thesis_summary
             or feedback_payload.get('thesis_summary')

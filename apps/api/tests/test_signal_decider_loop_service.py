@@ -4406,6 +4406,45 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['review_boundary']['manual_review_only'], True)
         self.assertEqual(result['review_boundary']['auto_apply_prompt_changes'], False)
 
+    def test_signal_decider_calibration_excludes_stale_evaluation_for_a_different_action(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            loop_service.repository.evaluations[
+                (101, 5, 'signal_decider_eval_test')
+            ]['decision_action'] = 'wait'
+
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        self.assertEqual(result['summary']['mature_computed_count'], 3)
+        self.assertEqual(
+            result['exclusions']['status_reason_counts']['evaluation_decision_action_mismatch'],
+            1,
+        )
+        exclusion = next(
+            item for item in result['exclusions']['items'] if item['snapshot_id'] == 101
+        )
+        self.assertEqual(exclusion['canonical_decision_action'], 'buy')
+        self.assertEqual(exclusion['evaluation_decision_action'], 'wait')
+        self.assertTrue(exclusion['recompute_required'])
+        self.assertEqual(result['summary']['decision_action_counts'], {'buy': 1, 'wait': 2})
+
     def test_signal_decider_calibration_report_identifies_condition_clusters_and_hints(self):
         loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
 

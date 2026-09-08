@@ -11,7 +11,11 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
-from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import (
+    SHORT_TERM_DECIDER_AGENT_NAME,
+    SIGNAL_DECIDER_AGENT_NAME,
+    canonical_evaluation_action,
+)
 from app.db import session_scope
 from app.db_models import (
     DeciderPostDecisionEvaluation,
@@ -963,7 +967,7 @@ class DeciderReplayRepository:
             latest_snapshot_ids = {
                 int(row.id) for row in latest_snapshot_by_feedback.values()
             }
-            snapshot_rows = [
+            candidate_snapshot_rows = [
                 row
                 for row in snapshot_rows
                 if (
@@ -976,27 +980,31 @@ class DeciderReplayRepository:
                 )
                 and row.decision_action == 'buy'
             ]
-            snapshot_ids = [int(row.id) for row in snapshot_rows]
-            if not snapshot_ids:
-                return DeciderReplayDataset(
-                    trades=(),
-                    source_decision_count=0,
-                    excluded_reason_counts={},
-                    cohort_basis='fixed_horizon_counterfactual',
-                    diagnostics={
-                        'requested_horizon_days': int(horizon_days),
-                        'actual_lifecycle_outcomes_used_for_promotion': False,
-                        'actual_lifecycle_outcome_count': 0,
-                        'actual_lifecycle_eligible_count': 0,
-                        'actual_lifecycle_excluded_count': 0,
-                        'actual_lifecycle_excluded_reason_counts': {},
-                    },
+            source_decision_count = len(candidate_snapshot_rows)
+            canonical_action_exclusions: Counter[str] = Counter()
+            snapshot_rows = []
+            for row in candidate_snapshot_rows:
+                canonical_action = canonical_evaluation_action(
+                    agent_name=row.agent_name,
+                    persisted_action=row.decision_action,
+                    response_payload=row.response_payload,
                 )
-
+                if canonical_action == 'buy':
+                    snapshot_rows.append(row)
+                elif canonical_action is None and row.agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+                    canonical_action_exclusions['invalid_short_term_tactical_action'] += 1
+                else:
+                    canonical_action_exclusions['short_term_tactical_action_not_buy'] += 1
+            snapshot_ids = [int(row.id) for row in snapshot_rows]
+            source_snapshot_ids = [int(row.id) for row in candidate_snapshot_rows]
             actual_rows = list(
                 session.execute(
                     select(SignalDeciderActualExecutionOutcome)
-                    .where(SignalDeciderActualExecutionOutcome.decision_snapshot_id.in_(snapshot_ids))
+                    .where(
+                        SignalDeciderActualExecutionOutcome.decision_snapshot_id.in_(
+                            source_snapshot_ids
+                        )
+                    )
                     .order_by(
                         SignalDeciderActualExecutionOutcome.market_date.asc(),
                         SignalDeciderActualExecutionOutcome.target_trade_date.asc(),
@@ -1044,7 +1052,7 @@ class DeciderReplayRepository:
             }
 
             trades: list[DeciderReplayTrade] = []
-            excluded_reason_counts: Counter[str] = Counter()
+            excluded_reason_counts: Counter[str] = Counter(canonical_action_exclusions)
             for snapshot in snapshot_rows:
                 snapshot_id = int(snapshot.id)
                 realized = realized_by_snapshot.get(snapshot_id)
@@ -1078,7 +1086,7 @@ class DeciderReplayRepository:
             )
             return DeciderReplayDataset(
                 trades=sorted_trades,
-                source_decision_count=len(snapshot_rows),
+                source_decision_count=source_decision_count,
                 excluded_reason_counts=dict(sorted(excluded_reason_counts.items())),
                 cohort_basis='fixed_horizon_counterfactual',
                 diagnostics={
