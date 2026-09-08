@@ -24,7 +24,9 @@ from app.eod.pykrx_pipeline_runner import (
     _OfficialDailyPipelineTracker,
     _extract_result_counts,
     _normalize_stage_status,
+    _run_daily_external_news_enrichment_followup,
     _run_daily_feedback_followup,
+    _run_daily_macro_context_followup,
     _run_daily_next_open_execution_plan_followup,
     _run_daily_signal_decider_evaluation_followup,
     _run_daily_signal_decider_followup,
@@ -323,6 +325,55 @@ class PykrxBackfillServiceTests(TestCase):
                 FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
             ],
         )
+
+    def test_auto_followup_order_matches_canonical_news_macro_feedback_dependencies(self) -> None:
+        collect_index = AUTO_DAILY_FOLLOWUP_STAGE_ORDER.index('external_news_collect')
+
+        self.assertEqual(
+            AUTO_DAILY_FOLLOWUP_STAGE_ORDER[collect_index : collect_index + 4],
+            (
+                'external_news_collect',
+                'external_news_enrich',
+                'macro_context_refresh',
+                'agent_feedback_summaries',
+            ),
+        )
+
+    def test_external_news_enrichment_followup_uses_idempotent_classification_stage(self) -> None:
+        with patch(
+            'app.external_news.service.external_news_service.enrich_recent_classification',
+            return_value={'status': 'completed', 'classifications_persisted': 2},
+        ) as enrich_recent_classification:
+            result = _run_daily_external_news_enrichment_followup(
+                market_date='2026-04-03',
+                enabled=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['market_date'], '2026-04-03')
+        enrich_recent_classification.assert_called_once_with(
+            lookback_days=ANY,
+            limit=1000,
+        )
+
+    def test_macro_context_followup_uses_service_freshness_gate_instead_of_forcing_duplicate_refresh(self) -> None:
+        macro_result = {
+            'status': 'skipped',
+            'reason': 'macro_context_refresh_not_due',
+            'context': {'freshness': {'status': 'fresh'}},
+        }
+        with patch(
+            'app.macro_context.service.macro_context_service.refresh_context',
+            return_value=macro_result,
+        ) as refresh_context:
+            result = _run_daily_macro_context_followup(
+                market_date='2026-04-03',
+                enabled=True,
+            )
+
+        self.assertEqual(result['market_date'], '2026-04-03')
+        self.assertEqual(result['freshness_gate'], 'fresh')
+        refresh_context.assert_called_once_with(force=False, trigger='eod_pykrx_followup')
 
     def test_fetch_recent_universe_uses_index_when_market_frame_columns_change(self) -> None:
         service = PykrxBackfillService()
@@ -1637,6 +1688,7 @@ class PykrxBackfillServiceTests(TestCase):
     )
     def test_run_collection_always_chains_fundamentals_for_daily_auto(self, evaluation_followup) -> None:
         service = PykrxBackfillService()
+        followup_order: list[str] = []
 
         with ExitStack() as stack:
             stack.enter_context(patch('app.eod.pykrx_backfill.settings.dart_api_key', 'test-dart-key'))
@@ -1727,13 +1779,29 @@ class PykrxBackfillServiceTests(TestCase):
             external_news_followup = stack.enter_context(
                 patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_external_news_followup',
-                    return_value={'triggered': True, 'status': 'disabled', 'reason': 'naver_search_credentials_missing'},
+                    side_effect=lambda **_: followup_order.append('external_news_collect')
+                    or {'triggered': True, 'status': 'disabled', 'reason': 'naver_search_credentials_missing'},
+                )
+            )
+            external_news_enrichment_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_external_news_enrichment_followup',
+                    side_effect=lambda **_: followup_order.append('external_news_enrich')
+                    or {'triggered': True, 'status': 'completed', 'classifications_persisted': 0},
+                )
+            )
+            macro_context_followup = stack.enter_context(
+                patch(
+                    'app.eod.pykrx_pipeline_runner._run_daily_macro_context_followup',
+                    side_effect=lambda **_: followup_order.append('macro_context_refresh')
+                    or {'triggered': True, 'status': 'completed', 'freshness_gate': 'fresh'},
                 )
             )
             feedback_followup = stack.enter_context(
                 patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_feedback_followup',
-                    return_value={'triggered': True, 'status': 'completed'},
+                    side_effect=lambda **_: followup_order.append('agent_feedback_summaries')
+                    or {'triggered': True, 'status': 'completed'},
                 )
             )
             signal_decider_followup = stack.enter_context(
@@ -1772,6 +1840,17 @@ class PykrxBackfillServiceTests(TestCase):
         )
         factor_followup.assert_called_once_with(market_date='2026-04-03')
         external_news_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
+        external_news_enrichment_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
+        macro_context_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
+        self.assertEqual(
+            followup_order[:4],
+            [
+                'external_news_collect',
+                'external_news_enrich',
+                'macro_context_refresh',
+                'agent_feedback_summaries',
+            ],
+        )
         feedback_followup.assert_called_once_with(
             market_date='2026-04-03',
             enabled=False,
@@ -1790,6 +1869,14 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             result['external_news_followup'],
             {'triggered': True, 'status': 'disabled', 'reason': 'naver_search_credentials_missing'},
+        )
+        self.assertEqual(
+            result['external_news_enrichment_followup'],
+            {'triggered': True, 'status': 'completed', 'classifications_persisted': 0},
+        )
+        self.assertEqual(
+            result['macro_context_followup'],
+            {'triggered': True, 'status': 'completed', 'freshness_gate': 'fresh'},
         )
         self.assertEqual(
             result['feedback_followup'],

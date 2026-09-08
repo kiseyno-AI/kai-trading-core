@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import logging
 from pathlib import Path
+import sys
 import threading
 import time
 
@@ -15,6 +16,30 @@ from app.db_models import Base
 
 logger = logging.getLogger(__name__)
 _database_healthcheck_lock = threading.Lock()
+
+
+def _running_under_database_test_runner() -> bool:
+    main_module = sys.modules.get('__main__')
+    main_spec_name = str(
+        getattr(getattr(main_module, '__spec__', None), 'name', '') or ''
+    )
+    if main_spec_name in {'unittest.__main__', 'pytest.__main__'}:
+        return True
+    if 'pytest' in sys.modules:
+        return True
+    main_file = str(getattr(main_module, '__file__', '') or '').strip()
+    if not main_file:
+        return False
+    main_path = Path(main_file).resolve()
+    return main_path.name.startswith('test_') and any(
+        parent.name == 'tests' for parent in main_path.parents
+    )
+
+
+if _running_under_database_test_runner():
+    from app.core.test_database_safety import assert_safe_test_database_settings
+
+    assert_safe_test_database_settings(settings)
 
 
 def _build_engine_connect_args() -> dict[str, object]:

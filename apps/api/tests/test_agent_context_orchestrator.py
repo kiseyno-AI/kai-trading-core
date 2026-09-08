@@ -1,6 +1,8 @@
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import date
 import httpx
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -13,19 +15,36 @@ from unittest.mock import patch
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import (
+    build_response_storage_payload,
     build_signal_decider_payload,
     coerce_decoded_batch_response,
     compressed_batch_item_for_prompt,
     correlate_decoded_batch_response,
-    repair_json_tail,
+    extract_response_mismatch_flags,
     trim_batch_item_for_prompt,
 )
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, RuntimeFeedbackStateStore
+from app.agent_context.orchestrator_runtime_helpers import (
+    batch_response_contract_failure,
+    dispatch_and_store,
+    normalized_feedback_contract_failure,
+)
+
+
+def _attach_response_correlation(result: dict, *, expected_symbols: list[str]) -> dict:
+    decoded, response_correlation = correlate_decoded_batch_response(
+        decoded=result.get('decoded'),
+        expected_symbols=expected_symbols,
+        session_reuse_mode='fresh_per_batch',
+    )
+    result['decoded'] = decoded
+    result['response_correlation'] = response_correlation
+    return result
 
 
 def _batch_result(symbol: str) -> dict:
-    return {
+    return _attach_response_correlation({
         'decoded': {
             'items': [
                 {
@@ -51,6 +70,38 @@ def _batch_result(symbol: str) -> dict:
         'started_at': '2026-04-14T01:00:00+00:00',
         'completed_at': '2026-04-14T01:01:00+00:00',
         'session_ref': {'session_key': 'feedback/eod-summarizer/slot-01'},
+    }, expected_symbols=[symbol])
+
+
+def _complete_actionable_signal_feedback(*, symbol: str = '005930') -> dict:
+    return {
+        'role': 'signal-decider',
+        'agent_name': 'signal-decider',
+        'symbol': symbol,
+        'market_date': '2026-04-23',
+        'preferred_action': 'buy',
+        'next_day_open_action': 'buy',
+        'wait_reason': None,
+        'entry_price_basis': 'next_open',
+        'target_price': 91200,
+        'expected_return_pct': 6.4,
+        'stop_loss_price': 82900,
+        'suggested_holding_period': '3-10 trading days',
+        'confidence_score_10': 7,
+        'conviction_score_10': 6,
+        'thesis_summary': 'Momentum and execution conditions support a buy.',
+        'supporting_evidence': ['Relative strength and volume improved together.'],
+        'decision_risks': ['Opening volatility may expand.'],
+        'decision_delta': {},
+        'invalidation_conditions': ['The thesis fails below the stop price.'],
+        'data_quality_warnings': [],
+        'specialist_disagreement': [],
+        'traceability': {'symbol': symbol},
+        'summary': 'Momentum and execution conditions support a buy.',
+        'confidence': 0.7,
+        'risk_flags': [],
+        'details': {'decision_support': {'decision_support_only': True}},
+        'improvement_notes': [],
     }
 
 
@@ -81,7 +132,295 @@ def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[st
     }
 
 
+class ResponseIntegrityGuardTests(unittest.TestCase):
+    def test_missing_batch_response_correlation_fails_closed(self):
+        self.assertEqual(
+            batch_response_contract_failure({'decoded': {'items': []}}),
+            'batch_response_correlation_missing',
+        )
+
+    def test_missing_normalized_symbol_or_market_date_fails_closed(self):
+        base = {
+            'response_contract_valid': True,
+            'structural_mismatch_flags': [],
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+        }
+
+        self.assertEqual(
+            normalized_feedback_contract_failure({**base, 'symbol': None}),
+            'response_identity_missing:symbol',
+        )
+        self.assertEqual(
+            normalized_feedback_contract_failure({**base, 'market_date': None}),
+            'response_identity_missing:market_date',
+        )
+
+    def test_missing_normalized_contract_verdict_fails_closed(self):
+        self.assertEqual(
+            normalized_feedback_contract_failure(
+                {
+                    'symbol': '005930',
+                    'market_date': '2026-04-23',
+                    'structural_mismatch_flags': [],
+                    'response_schema_violation_flags': [],
+                }
+            ),
+            'response_contract_verdict_missing',
+        )
+
+    def test_schema_contract_violations_are_rejected_by_every_dispatch_guard(self):
+        normalized = {
+            'response_contract_valid': False,
+            'structural_mismatch_flags': [],
+            'response_schema_violation_flags': ['required_field_missing:summary'],
+            'risk_flags': ['required_field_missing:summary'],
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+        }
+
+        self.assertEqual(
+            normalized_feedback_contract_failure(normalized),
+            'response_contract_invalid:required_field_missing:summary',
+        )
+        self.assertEqual(
+            extract_response_mismatch_flags(normalized),
+            ['required_field_missing:summary'],
+        )
+
+    def test_single_dispatch_rejects_invalid_contract_before_persistence_and_cleans_once(self):
+        cleanup_calls: list[dict] = []
+        store_calls: list[dict] = []
+
+        class Client:
+            @staticmethod
+            def dispatch(**kwargs):
+                return {
+                    'normalized_feedback': {
+                        'symbol': '__MARKET__',
+                        'market_date': '2026-04-23',
+                        'response_contract_valid': False,
+                        'structural_mismatch_flags': [],
+                        'response_schema_violation_flags': ['required_field_missing:summary'],
+                    },
+                    'session_ref': {'session_key': kwargs['payload']['session_key']},
+                }
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**kwargs):
+                store_calls.append(kwargs)
+                return {'id': 1}
+
+            @staticmethod
+            def _cleanup_session_key(**kwargs):
+                cleanup_calls.append(kwargs)
+                return {'status': 'deleted', 'session_key': kwargs['session_key']}
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='single-invalid-contract',
+            specs=[SimpleNamespace(role='eod-summarizer', agent_name='eod-summarizer')],
+            payloads={'eod-summarizer': {'trade_date': '2026-04-23'}},
+            symbol='__MARKET__',
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(store_calls, [])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(
+            failures[0]['failure_kind'],
+            'response_contract_invalid:required_field_missing:summary',
+        )
+        self.assertTrue(failures[0]['retryable'])
+        self.assertEqual(len(cleanup_calls), 1)
+        self.assertEqual(
+            cleanup_calls[0]['session_key'],
+            'agent:eod-summarizer:feedback/eod-summarizer/single-invalid-contract',
+        )
+        self.assertEqual(failures[0]['diagnostics']['session_cleanup']['status'], 'deleted')
+
+    def test_single_dispatch_cleanup_failure_does_not_mask_contract_failure(self):
+        class Client:
+            @staticmethod
+            def dispatch(**_kwargs):
+                return {
+                    'normalized_feedback': {
+                        'symbol': '__MARKET__',
+                        'market_date': '2026-04-23',
+                        'response_contract_valid': False,
+                        'structural_mismatch_flags': [],
+                        'response_schema_violation_flags': ['required_field_type_invalid:details'],
+                    },
+                    'session_ref': {'session_key': 'feedback-fresh/eod/cleanup-error'},
+                }
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**_kwargs):
+                raise AssertionError('invalid feedback must not be persisted')
+
+            @staticmethod
+            def _cleanup_session_key(**_kwargs):
+                raise RuntimeError('cleanup unavailable')
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='single-invalid-cleanup-error',
+            specs=[SimpleNamespace(role='eod-summarizer', agent_name='eod-summarizer')],
+            payloads={'eod-summarizer': {'trade_date': '2026-04-23'}},
+            symbol='__MARKET__',
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(
+            failures[0]['failure_kind'],
+            'response_contract_invalid:required_field_type_invalid:details',
+        )
+        self.assertEqual(failures[0]['diagnostics']['session_cleanup']['status'], 'deferred')
+        self.assertEqual(
+            failures[0]['diagnostics']['session_cleanup']['reason'],
+            'single_dispatch_session_cleanup_failed',
+        )
+
+    def test_single_dispatch_success_persists_and_cleans_exactly_once(self):
+        cleanup_calls: list[dict] = []
+        store_calls: list[dict] = []
+
+        class Client:
+            @staticmethod
+            def dispatch(**_kwargs):
+                return {
+                    'normalized_feedback': {
+                        'role': 'eod-summarizer',
+                        'summary': '시장 요약',
+                        'confidence': 0.7,
+                        'risk_flags': [],
+                        'details': {},
+                        'improvement_notes': [],
+                        'symbol': '__MARKET__',
+                        'market_date': '2026-04-23',
+                        'response_contract_valid': True,
+                        'structural_mismatch_flags': [],
+                        'response_schema_violation_flags': [],
+                    },
+                    'session_ref': {'session_key': 'feedback-fresh/eod/success'},
+                }
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**kwargs):
+                store_calls.append(kwargs)
+                return {'id': 1}
+
+            @staticmethod
+            def _cleanup_session_key(**kwargs):
+                cleanup_calls.append(kwargs)
+                return {'status': 'deleted', 'session_key': kwargs['session_key']}
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='single-valid-contract',
+            specs=[SimpleNamespace(role='eod-summarizer', agent_name='eod-summarizer')],
+            payloads={'eod-summarizer': {'trade_date': '2026-04-23'}},
+            symbol='__MARKET__',
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(store_calls), 1)
+        self.assertFalse(store_calls[0]['cleanup_session'])
+        self.assertEqual(len(cleanup_calls), 1)
+        self.assertEqual(items[0]['storage']['session_cleanup']['status'], 'deleted')
+
+    def test_single_dispatch_exception_uses_known_fresh_session_and_cleans_once(self):
+        cleanup_calls: list[dict] = []
+        dispatched_payloads: list[dict] = []
+
+        class Client:
+            @staticmethod
+            def dispatch(**kwargs):
+                dispatched_payloads.append(kwargs['payload'])
+                raise RuntimeError('gateway unavailable')
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**_kwargs):
+                raise AssertionError('failed dispatch must not be persisted')
+
+            @staticmethod
+            def _cleanup_session_key(**kwargs):
+                cleanup_calls.append(kwargs)
+                return {'status': 'deleted', 'session_key': kwargs['session_key']}
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='single-dispatch-exception',
+            specs=[SimpleNamespace(role='eod-summarizer', agent_name='eod-summarizer')],
+            payloads={'eod-summarizer': {'trade_date': '2026-04-23'}},
+            symbol='__MARKET__',
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]['error'], 'gateway unavailable')
+        self.assertTrue(failures[0]['retryable'])
+        self.assertEqual(len(cleanup_calls), 1)
+        self.assertEqual(cleanup_calls[0]['session_key'], dispatched_payloads[0]['session_key'])
+        self.assertEqual(failures[0]['diagnostics']['session_cleanup']['status'], 'deleted')
+
+
 class RepairJsonTailTests(unittest.TestCase):
+    def test_response_storage_payload_preserves_prompt_model_and_contract_provenance(self):
+        spec = SimpleNamespace(role='signal-decider', agent_name='signal-decider')
+        payload = build_response_storage_payload(
+            spec=spec,
+            batch_result={
+                'response': {'model': 'openclaw/signal-decider'},
+                'request_provenance': {
+                    'prompt_sha256': 'sha256:prompt-hash',
+                    'prompt_chars': 12345,
+                    'contract_version': 'agent_role_contract_v1',
+                    'contract_sha256': 'sha256:contract-hash',
+                    'role': 'signal-decider',
+                },
+            },
+            normalized_feedback={'role': 'signal-decider', 'risk_flags': []},
+            collector_mode='test',
+        )
+
+        self.assertEqual(
+            payload['decision_provenance'],
+            {
+                'model': 'openclaw/signal-decider',
+                'prompt_sha256': 'sha256:prompt-hash',
+                'prompt_chars': 12345,
+                'contract_version': 'agent_role_contract_v1',
+                'contract_sha256': 'sha256:contract-hash',
+                'role': 'signal-decider',
+            },
+        )
+
     def test_build_signal_decider_payload_promotes_pre_decider_enrichment_context(self):
         pre_decider_context = {
             'schema_version': 'pre_decider_enrichment_v1',
@@ -190,12 +529,27 @@ class RepairJsonTailTests(unittest.TestCase):
         )
         self.assertTrue(
             payload['decision_support_constraints']['missing_context_policy'][
-                'performance_criteria_authoritative'
+                'performance_criteria_requires_model_guidance_eligibility'
             ]
         )
         self.assertTrue(
             payload['decision_support_constraints']['missing_context_policy'][
-                'use_win_loss_return_drawdown_and_reward_risk_to_adjust_action_thresholds'
+                'use_eligible_replay_evidence_to_tighten_buy_thresholds'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'manual_review_criteria_never_authorize_buy'
+            ]
+        )
+        self.assertTrue(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'deterministic_gate_requires_explicit_eligibility'
+            ]
+        )
+        self.assertFalse(
+            payload['decision_support_constraints']['missing_context_policy'][
+                'relax_wait_reject_threshold_for_missed_opportunity_clusters'
             ]
         )
         self.assertTrue(
@@ -216,6 +570,7 @@ class RepairJsonTailTests(unittest.TestCase):
             'summary': {
                 'status': 'ready',
                 'mature_computed_count': 12,
+                'ready_for_operator_review': True,
                 'decision_action_counts': {'buy': 5, 'wait': 7},
                 'grade_label_counts': {'bad_buy': 4, 'missed_opportunity_after_wait': 3},
                 'positive_outcome_rate': 0.416667,
@@ -249,6 +604,9 @@ class RepairJsonTailTests(unittest.TestCase):
                         'evaluated_sample_count': 4,
                         'negative_rate': 0.75,
                         'activation_status': 'needs_replay',
+                        'manual_review_only': True,
+                        'active_policy': False,
+                        'deterministic_gate_eligible': False,
                     }
                 ]
             },
@@ -269,9 +627,66 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertEqual(criteria['performance_buckets'][0]['bucket_value'], 'reward_risk_lt_1_0')
         self.assertEqual(criteria['performance_buckets'][0]['bad_buy_rate'], 0.75)
         self.assertEqual(criteria['rule_candidates'][0]['candidate_id'], 'rule-1')
-        self.assertTrue(criteria['usage_policy']['use_for_buy_wait_reject_thresholds'])
+        self.assertTrue(criteria['rule_candidates'][0]['manual_review_only'])
+        self.assertFalse(criteria['rule_candidates'][0]['active_policy'])
+        self.assertFalse(criteria['rule_candidates'][0]['deterministic_gate_eligible'])
+        self.assertTrue(criteria['usage_policy']['model_guidance_eligible'])
+        self.assertTrue(criteria['usage_policy']['deterministic_gate_eligible'])
+        self.assertFalse(criteria['usage_policy']['use_for_buy_wait_reject_thresholds'])
+        self.assertTrue(criteria['usage_policy']['tighten_buy_when_matching_bucket_has_bad_buy_or_negative_return'])
+        self.assertFalse(criteria['usage_policy']['relax_wait_or_reject_when_matching_bucket_has_missed_opportunity'])
+        self.assertFalse(criteria['usage_policy']['allow_buy_authorization'])
         self.assertTrue(criteria['usage_policy']['reward_risk_and_outcome_path_override_name_only_reasoning'])
         self.assertFalse(criteria['usage_policy']['auto_apply_policy_changes'])
+
+    def test_signal_decider_performance_criteria_are_ineligible_when_replay_sample_is_insufficient(self):
+        service = AgentFeedbackOrchestrator()
+        report = {
+            'request': {'policy_version': 'signal_decider_policy_v1', 'horizon_days': 5},
+            'summary': {
+                'status': 'insufficient_sample',
+                'mature_computed_count': 2,
+                'positive_outcome_rate': 0.5,
+                'negative_outcome_rate': 0.5,
+            },
+            'group_summaries': {},
+            'rule_candidates': {'items': []},
+            'calibration_hints': {},
+        }
+
+        with patch.object(orchestrator_module.signal_decider_calibration_service, 'build_report', return_value=report):
+            criteria = service._build_signal_decider_performance_criteria(
+                policy_context={'current_version': 'signal_decider_policy_v1'},
+                market_date=date(2026, 7, 14),
+            )
+
+        self.assertFalse(criteria['usage_policy']['model_guidance_eligible'])
+        self.assertFalse(criteria['usage_policy']['deterministic_gate_eligible'])
+        self.assertFalse(criteria['usage_policy']['allow_buy_authorization'])
+
+    def test_signal_decider_performance_criteria_are_ineligible_without_operator_review_readiness(self):
+        service = AgentFeedbackOrchestrator()
+        report = {
+            'request': {'policy_version': 'signal_decider_policy_v1', 'horizon_days': 5},
+            'summary': {
+                'status': 'ready',
+                'mature_computed_count': 12,
+                'positive_outcome_rate': 0.5,
+                'negative_outcome_rate': 0.5,
+            },
+            'group_summaries': {},
+            'rule_candidates': {'items': []},
+            'calibration_hints': {},
+        }
+
+        with patch.object(orchestrator_module.signal_decider_calibration_service, 'build_report', return_value=report):
+            criteria = service._build_signal_decider_performance_criteria(
+                policy_context={'current_version': 'signal_decider_policy_v1'},
+                market_date=date(2026, 7, 14),
+            )
+
+        self.assertFalse(criteria['usage_policy']['model_guidance_eligible'])
+        self.assertFalse(criteria['usage_policy']['deterministic_gate_eligible'])
 
     def test_build_signal_decider_payload_includes_signal_envelopes_without_replacing_raw_blocks(self):
         upstream_summaries = {
@@ -423,25 +838,165 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertEqual(result['items'][0]['feedback']['tactical_action'], 'watch_for_trigger')
         self.assertTrue(result['items'][0]['_coerced_feedback_from_item'])
 
-    def test_repair_json_tail_drops_extra_closing_brace_before_items_close(self):
-        malformed = '{"items":[{"symbol":"014190","feedback":{"summary":"ok","details":{},"improvement_notes":[]}}}]}'
-        repaired = repair_json_tail(malformed)
-        self.assertIsNotNone(repaired)
-        parsed = json.loads(repaired)
-        self.assertEqual(parsed['items'][0]['symbol'], '014190')
+    def test_batch_correlation_rejects_coerced_noncanonical_response_shapes(self):
+        malformed_responses = (
+            {
+                'batch': {
+                    'items': [
+                        {
+                            'symbol': '005930',
+                            'feedback': {'role': 'eod-summarizer'},
+                        }
+                    ]
+                }
+            },
+            {
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'role': 'eod-summarizer',
+                        'summary': '중첩 feedback 객체가 누락됐습니다.',
+                    }
+                ]
+            },
+        )
 
-    def test_decode_candidate_json_recovers_tail_mismatch(self):
-        malformed = '{"items":[{"symbol":"014190","feedback":{"role":"signal-decider","summary":"ok","confidence":0.6,"risk_flags":[],"details":{},"improvement_notes":[]}}}]}'
+        for malformed in malformed_responses:
+            with self.subTest(shape=next(iter(malformed))):
+                coerced = coerce_decoded_batch_response(malformed)
+                _, metadata = correlate_decoded_batch_response(
+                    decoded=coerced,
+                    expected_symbols=['005930'],
+                    session_reuse_mode='fresh_per_batch',
+                )
+
+                self.assertEqual(metadata['attribution_status'], 'mismatch')
+                self.assertEqual(metadata['failure_class'], 'batch_response_structure_mismatch')
+                self.assertTrue(metadata['structure_mismatch_flags'])
+
+    def test_batch_correlation_rejects_top_level_feedback_fallback_shape(self):
+        _, metadata = correlate_decoded_batch_response(
+            decoded={
+                '_coerced_from_top_level_object': True,
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'feedback': {'role': 'eod-summarizer'},
+                    }
+                ],
+            },
+            expected_symbols=['005930'],
+            session_reuse_mode='fresh_per_batch',
+        )
+
+        self.assertEqual(metadata['attribution_status'], 'mismatch')
+        self.assertEqual(metadata['failure_class'], 'batch_response_structure_mismatch')
+        self.assertEqual(metadata['structure_mismatch_flags'], ['top_level_feedback_object'])
+
+    def test_batch_correlation_requires_exact_raw_krx_and_us_item_symbols(self):
+        cases = (
+            ('005930', '005930 '),
+            ('AAPL', 'aapl'),
+        )
+
+        for expected_symbol, returned_symbol in cases:
+            with self.subTest(expected_symbol=expected_symbol, returned_symbol=returned_symbol):
+                _, metadata = correlate_decoded_batch_response(
+                    decoded={
+                        'items': [
+                            {
+                                'symbol': returned_symbol,
+                                'feedback': {'symbol': expected_symbol},
+                            }
+                        ]
+                    },
+                    expected_symbols=[expected_symbol],
+                    session_reuse_mode='fresh_per_batch',
+                )
+
+                self.assertEqual(metadata['attribution_status'], 'mismatch')
+                self.assertEqual(metadata['failure_class'], 'batch_response_attribution_mismatch')
+                self.assertEqual(
+                    metadata['item_symbol_mismatches'],
+                    [
+                        {
+                            'item_index': 0,
+                            'expected_symbol': expected_symbol,
+                            'response_symbol': returned_symbol,
+                        }
+                    ],
+                )
+
+    def test_decode_candidate_json_rejects_actionable_payload_with_tail_corruption(self):
+        valid = json.dumps(
+            {
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'feedback': _complete_actionable_signal_feedback(),
+                    }
+                ]
+            }
+        )
+        malformed_candidates = {
+            'extra_closing_brace': f'{valid}}}',
+            'missing_closing_brace': valid[:-1],
+        }
+
         client = OpenClawAgentClient()
-        decoded, failure = client._decode_candidate_json(malformed)
-        self.assertIsNone(failure)
-        self.assertIsNotNone(decoded)
-        self.assertEqual(decoded['items'][0]['symbol'], '014190')
+        for corruption, malformed in malformed_candidates.items():
+            with self.subTest(corruption=corruption):
+                decoded, failure = client._decode_candidate_json(malformed)
+                self.assertIsNone(decoded)
+                self.assertEqual(failure, 'json_decode_error')
 
-    def test_repair_json_tail_does_not_hide_mid_object_syntax_errors(self):
-        malformed = '{"items":[{"symbol":"014190" "feedback":{}}]}'
-        repaired = repair_json_tail(malformed)
-        self.assertIsNone(repaired)
+    def test_decode_candidate_json_rejects_top_level_array(self):
+        malformed = json.dumps(
+            [
+                {
+                    'symbol': '005930',
+                    'feedback': _complete_actionable_signal_feedback(),
+                }
+            ]
+        )
+
+        decoded, failure = OpenClawAgentClient._decode_candidate_json(malformed)
+
+        self.assertIsNone(decoded)
+        self.assertEqual(failure, 'json_shape_not_object')
+
+    def test_decode_candidate_json_rejects_duplicate_keys_at_any_depth(self):
+        feedback_json = json.dumps(_complete_actionable_signal_feedback())
+        duplicate_action_feedback = '{"preferred_action":"wait",' + feedback_json[1:]
+        canonical_batch = json.dumps(
+            {
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'feedback': _complete_actionable_signal_feedback(),
+                    }
+                ]
+            }
+        )
+        duplicate_traceability_symbol = canonical_batch.replace(
+            '"traceability": {"symbol": "005930"}',
+            '"traceability": {"symbol": "000660", "symbol": "005930"}',
+        )
+        self.assertNotEqual(duplicate_traceability_symbol, canonical_batch)
+        candidates = {
+            'duplicate_action': (
+                '{"items":[{"symbol":"005930","feedback":'
+                f'{duplicate_action_feedback}'
+                '}]}'
+            ),
+            'duplicate_nested_traceability_symbol': duplicate_traceability_symbol,
+        }
+
+        for duplicate_kind, candidate in candidates.items():
+            with self.subTest(duplicate_kind=duplicate_kind):
+                decoded, failure = OpenClawAgentClient._decode_candidate_json(candidate)
+                self.assertIsNone(decoded)
+                self.assertEqual(failure, 'json_duplicate_key')
 
     def test_trim_batch_item_for_prompt_preserves_compact_factor_summary(self):
         trimmed = trim_batch_item_for_prompt(
@@ -841,7 +1396,7 @@ class RecordingBatchClient:
         spec = kwargs['spec']
         batch_items = kwargs['batch_items']
         dispatch_id = kwargs['batch_items'][0].get('dispatch_id')
-        return {
+        return _attach_response_correlation({
             'decoded': {
                 'items': [
                     {
@@ -868,7 +1423,57 @@ class RecordingBatchClient:
             'started_at': '2026-04-14T01:00:00+00:00',
             'completed_at': '2026-04-14T01:01:00+00:00',
             'session_ref': {'session_key': kwargs['batch_items'][0]['session_key']},
-        }
+        }, expected_symbols=[item['symbol'] for item in batch_items])
+
+
+class InnerIdentityMismatchBatchClient(RecordingBatchClient):
+    def dispatch_batch(self, **kwargs):
+        result = super().dispatch_batch(**kwargs)
+        feedback = result['decoded']['items'][0]['feedback']
+        feedback['role'] = kwargs['spec'].role
+        feedback['symbol'] = '000660'
+        feedback['market_date'] = '2026-04-13'
+        return result
+
+
+class DuplicateAttributionBatchClient(RecordingBatchClient):
+    def dispatch_batch(self, **kwargs):
+        result = super().dispatch_batch(**kwargs)
+        first_item = result['decoded']['items'][0]
+        result['decoded']['items'].append(
+            {
+                'symbol': first_item['symbol'],
+                'feedback': dict(first_item['feedback']),
+            }
+        )
+        _, response_correlation = correlate_decoded_batch_response(
+            decoded=result['decoded'],
+            expected_symbols=[item['symbol'] for item in kwargs['batch_items']],
+            session_reuse_mode='fresh_per_batch',
+        )
+        result['response_correlation'] = response_correlation
+        return result
+
+
+class MissingFeedbackBatchClient(RecordingBatchClient):
+    def dispatch_batch(self, **kwargs):
+        result = super().dispatch_batch(**kwargs)
+        result['decoded']['items'][0]['feedback'] = None
+        return result
+
+
+class MissingCorrelationBatchClient(RecordingBatchClient):
+    def dispatch_batch(self, **kwargs):
+        result = super().dispatch_batch(**kwargs)
+        result.pop('response_correlation', None)
+        return result
+
+
+class RaisingBatchClient(RecordingBatchClient):
+    def dispatch_batch(self, **kwargs):
+        with self._lock:
+            self.calls.append(kwargs)
+        raise RuntimeError('dispatch failed after session allocation')
 
 
 class PreflightFailingClient:
@@ -964,8 +1569,13 @@ class SignalDeciderBatchClient:
                     'agent_name': spec.agent_name,
                     'symbol': item['symbol'],
                     'market_date': item['market_date'],
+                    'traceability': {'symbol': item['symbol']},
                     'tactical_action': 'watch_for_trigger',
                     'preferred_action': 'watch_for_trigger',
+                    'wait_reason': {
+                        'code': 'unsuitable_execution_timing',
+                        'summary': '돌파와 거래량 확인 전입니다.',
+                    },
                     'trigger_price': 87200,
                     'chase_limit_price': 88500,
                     'target_price': 91200,
@@ -979,6 +1589,11 @@ class SignalDeciderBatchClient:
                     'tactical_risks': ['Leadership remains narrow.'],
                     'invalidation_conditions': ['82900원 이탈'],
                     'data_quality_warnings': ['Signal-feature coverage was partial.'],
+                    'decision_delta': {},
+                    'summary': '단기 탄력은 있으나 돌파 확인이 필요합니다.',
+                    'confidence': 0.6,
+                    'risk_flags': [],
+                    'details': {},
                     'improvement_notes': ['Add premarket gap context.'],
                 }
                 for item in batch_items
@@ -991,8 +1606,10 @@ class SignalDeciderBatchClient:
                     'agent_name': spec.agent_name,
                     'symbol': item['symbol'],
                     'market_date': item['market_date'],
+                    'traceability': {'symbol': item['symbol']},
                     'preferred_action': 'buy',
                     'next_day_open_action': 'buy',
+                    'wait_reason': None,
                     'entry_price_basis': 'next_open',
                     'target_price': 91200,
                     'expected_return_pct': 6.4,
@@ -1006,11 +1623,16 @@ class SignalDeciderBatchClient:
                     'invalidation_conditions': ['Gap below 82900 at the next open.'],
                     'data_quality_warnings': ['Signal-feature coverage was partial.'],
                     'specialist_disagreement': ['Fundamental view was constructive but not emphatic.'],
+                    'decision_delta': {},
+                    'summary': 'Specialists align on a tactical next-day long setup.',
+                    'confidence': 0.7,
+                    'risk_flags': [],
+                    'details': {},
                     'improvement_notes': ['Add premarket gap context.'],
                 }
                 for item in batch_items
             }
-        return {
+        return _attach_response_correlation({
             'decoded': {
                 'items': [
                     {
@@ -1032,7 +1654,7 @@ class SignalDeciderBatchClient:
             'session_ref': {'session_key': batch_items[0]['session_key']},
             'response': {'model': f"openclaw/{spec.agent_name}", 'id': f"resp-{spec.role}"},
             'output_text': '{}',
-        }
+        }, expected_symbols=[item['symbol'] for item in batch_items])
 
 
 class FailingSignalDeciderBatchClient(SignalDeciderBatchClient):
@@ -1140,6 +1762,12 @@ class FakeSessionCleanupService:
     def delete_now(self, *, target):
         self.targets.append(target)
         return {'status': 'deleted', 'session_key': target.session_key}
+
+
+class RaisingSessionCleanupService(FakeSessionCleanupService):
+    def delete_now(self, *, target):
+        self.targets.append(target)
+        raise RuntimeError('cleanup audit store unavailable')
 
 
 class RecordingFailureService:
@@ -1429,8 +2057,71 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('output exactly 1 item(s)', one_symbol_message)
         self.assertIn('One-symbol requests still require the same batch envelope with exactly one item', one_symbol_message)
         self.assertIn('Immediately before sending, re-check the final JSON formatting one last time', one_symbol_message)
+        self.assertIn('usage_policy.model_guidance_eligible=true', message)
+        self.assertIn('manual_review_only', message)
+        self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
+        self.assertNotIn('tighten or relax the actual action threshold', message)
 
-    def test_signal_decider_prompt_trim_final_fallback_uses_one_item_rules(self):
+    def test_short_term_and_fundamental_prompts_use_canonical_horizon_and_market_specific_sources(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+        short_term_spec = next(
+            spec for spec in orchestrator_module.DISPATCH_SPECS if spec.role == 'short-term-decider'
+        )
+        fundamental_spec = next(
+            spec for spec in orchestrator_module.DISPATCH_SPECS if spec.role == 'fundamental-summarizer'
+        )
+        us_item = {
+            'symbol': 'AAPL',
+            'market_date': '2026-08-19',
+            'symbol_day_context': {
+                'market': 'US',
+                'fundamentals': {'source': 'sec_edgar_companyfacts'},
+            },
+        }
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            short_term_message = client._build_batch_message(
+                spec=short_term_spec,
+                market_date=orchestrator_module.date.fromisoformat('2026-08-19'),
+                batch_items=[us_item],
+                request_marker='batch-request::short-horizon',
+            )
+            fundamental_message = client._build_batch_message(
+                spec=fundamental_spec,
+                market_date=orchestrator_module.date.fromisoformat('2026-08-19'),
+                batch_items=[us_item],
+                request_marker='batch-request::fundamental-source',
+            )
+
+        self.assertIn('1-3 trading day horizon', short_term_message)
+        self.assertIn('"expected_holding_period": "1-3 trading days"', short_term_message)
+        self.assertIn('"preferred_action": "watch_for_trigger"', short_term_message)
+        self.assertNotIn('1-2 trading day', short_term_message)
+        self.assertIn('DART', fundamental_message)
+        self.assertIn('SEC', fundamental_message)
+        self.assertIn('market and source metadata', fundamental_message)
+
+    def test_eod_prompt_limits_a_bounded_batch_to_per_symbol_readiness_and_anomalies(self):
+        eod_spec = next(
+            spec for spec in orchestrator_module.DISPATCH_SPECS if spec.role == 'eod-summarizer'
+        )
+
+        self.assertIn('per-symbol', eod_spec.instruction)
+        self.assertIn('completeness', eod_spec.instruction)
+        self.assertIn('freshness', eod_spec.instruction)
+        self.assertIn('anomalies', eod_spec.instruction)
+        self.assertIn('Do not infer market-wide breadth, leaders, or laggards', eod_spec.instruction)
+        self.assertIn('bounded dispatch batch', eod_spec.instruction)
+
+    def test_signal_decider_prompt_budget_never_silently_drops_assigned_symbols(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
             openclaw_gateway_token='gateway-token',
@@ -1442,21 +2133,57 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         with patch.object(orchestrator_module, 'settings', fake_settings):
             client = OpenClawAgentClient()
+            with self.assertRaisesRegex(
+                orchestrator_module.AgentDispatchTerminalError,
+                'without dropping assigned symbols',
+            ):
+                client._build_batch_message(
+                    spec=orchestrator_module.DISPATCH_SPECS[-1],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=[
+                        {'symbol': '005930', 'market_date': '2026-04-14', 'large_context': 'x' * 1000},
+                        {'symbol': '000660', 'market_date': '2026-04-14', 'large_context': 'y' * 1000},
+                    ],
+                    request_marker='batch-request::trim-fallback',
+                )
+
+    def test_signal_decider_prompt_compression_preserves_every_assigned_symbol_and_count(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=60000,
+        )
+        huge_items = [
+            {
+                'symbol': symbol,
+                'market_date': '2026-04-14',
+                'context_provenance': {'raw': marker * 80000},
+                'upstream_summaries': {'technical-summarizer': {'raw_payload': marker * 80000}},
+            }
+            for symbol, marker in [('005930', 'x'), ('000660', 'y')]
+        ]
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
             message = client._build_batch_message(
                 spec=orchestrator_module.DISPATCH_SPECS[-1],
                 market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
-                batch_items=[
-                    {'symbol': '005930', 'market_date': '2026-04-14', 'large_context': 'x' * 1000},
-                    {'symbol': '000660', 'market_date': '2026-04-14', 'large_context': 'y' * 1000},
-                ],
-                request_marker='batch-request::trim-fallback',
+                batch_items=huge_items,
+                request_marker='batch-request::compress-all',
             )
 
-        self.assertIn('Assigned symbols (exact authoritative strings): ["005930"]', message)
-        self.assertIn('output exactly 1 item(s)', message)
-        self.assertNotIn('Assigned symbols (exact authoritative strings): ["005930", "000660"]', message)
-        self.assertNotIn('output exactly 2 item(s)', message)
-        self.assertNotIn('"symbol": "000660"', message)
+        self.assertLess(len(message), fake_settings.openclaw_agent_max_prompt_chars)
+        self.assertIn('Request marker: batch-request::compress-all', message)
+        self.assertIn('Assigned symbols (exact authoritative strings): ["005930", "000660"]', message)
+        self.assertIn('output exactly 2 item(s)', message)
+        self.assertIn('"symbol": "005930"', message)
+        self.assertIn('"symbol": "000660"', message)
+        self.assertGreaterEqual(message.count('compressed_payload'), 2)
+        self.assertIn('usage_policy.model_guidance_eligible=true', message)
+        self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
 
     def test_signal_decider_prompt_trim_final_fallback_compresses_large_one_symbol_payload(self):
         fake_settings = SimpleNamespace(
@@ -1523,6 +2250,44 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('text_evidence_summary_v1', encoded)
         self.assertIn('raw_payload', encoded)
         self.assertIn('response_payload', encoded)
+
+    def test_compressed_batch_item_preserves_exact_dispatched_performance_policy(self):
+        dispatched_policy = {
+            'current_version': 'signal_decider_policy_v1',
+            'activation_mode': 'manual_only',
+            'performance_criteria': {
+                'schema_version': 'signal_decider_performance_criteria_v1',
+                'status': 'ready',
+                'sample_count': 12,
+                'performance_buckets': [
+                    {
+                        'bucket_key': 'decision.confidence_bucket',
+                        'bucket_value': f'confidence_{index}',
+                        'sample_count': 3,
+                        'negative_rate': 0.7,
+                    }
+                    for index in range(6)
+                ],
+                'rule_candidates': [],
+                'usage_policy': {
+                    'model_guidance_eligible': True,
+                    'deterministic_gate_eligible': True,
+                    'manual_review_only': True,
+                    'allow_buy_authorization': False,
+                },
+            },
+        }
+
+        compressed = compressed_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'signal_decider_policy': deepcopy(dispatched_policy),
+                'context_provenance': {'raw': 'x' * 80_000},
+            }
+        )
+
+        self.assertEqual(compressed['signal_decider_policy'], dispatched_policy)
 
     def test_reuse_existing_skips_reusable_symbol_role_pairs(self):
         service = AgentFeedbackOrchestrator()
@@ -1974,9 +2739,199 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             for call in client.calls
         )
         self.assertEqual(slots, [1, 2, 3])
+        session_keys = [call['batch_items'][0]['session_key'] for call in client.calls]
+        self.assertEqual(len(session_keys), len(set(session_keys)))
+        for call in client.calls:
+            batch_item = call['batch_items'][0]
+            self.assertEqual(batch_item['session_reuse_mode'], 'fresh_per_batch')
+            self.assertIn(result['request']['request_run_id'], batch_item['session_key'])
+            self.assertRegex(batch_item['session_key'], r'/[0-9a-f]{10}$')
+        self.assertEqual(
+            {
+                batch_index
+                for batch_index in range(1, 4)
+                if any(f'/batch-{batch_index:03d}/' in key for key in session_keys)
+            },
+            {1, 2, 3},
+        )
         self.assertEqual(result['request']['per_role_parallelism'], 3)
         self.assertEqual(result['request']['total_parallel_subtasks'], 3)
         self.assertEqual(result['summary']['completed'], 6)
+        self.assertEqual(len(cleanup_service.targets), 3)
+        self.assertEqual(
+            {target.session_key for target in cleanup_service.targets},
+            set(session_keys),
+        )
+
+    def test_subagent_dispatch_rejects_inner_identity_mismatch_before_persistence(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = InnerIdentityMismatchBatchClient()
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+
+        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                    with _patch_feedback_eligibility('005930'):
+                        result = service.dispatch_for_symbols_via_subagents(
+                            market_date='2026-04-14',
+                            symbols=['005930'],
+                            roles=['eod-summarizer'],
+                            per_role_parallelism=1,
+                        )
+
+        self.assertEqual(feedback_service.submitted, [])
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(
+            result['failures'][0]['error'],
+            'response_identity_mismatch:symbol_mismatch,market_date_mismatch',
+        )
+
+    def test_subagent_dispatch_rejects_batch_attribution_mismatch_before_persistence(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = DuplicateAttributionBatchClient()
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+
+        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                    with _patch_feedback_eligibility('005930'):
+                        result = service.dispatch_for_symbols_via_subagents(
+                            market_date='2026-04-14',
+                            symbols=['005930'],
+                            roles=['eod-summarizer'],
+                            per_role_parallelism=1,
+                        )
+
+        self.assertEqual(feedback_service.submitted, [])
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(result['failures'][0]['error'], 'batch_response_attribution_mismatch')
+
+    def test_subagent_dispatch_rejects_whole_batch_when_one_feedback_object_is_missing(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = MissingFeedbackBatchClient()
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+
+        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                    with _patch_feedback_eligibility('005930', '000660'):
+                        result = service.dispatch_for_symbols_via_subagents(
+                            market_date='2026-04-14',
+                            symbols=['005930', '000660'],
+                            roles=['eod-summarizer'],
+                            per_role_parallelism=1,
+                        )
+
+        self.assertEqual(feedback_service.submitted, [])
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 2)
+        self.assertEqual(
+            {failure['error'] for failure in result['failures']},
+            {'response_contract_invalid:feedback_missing'},
+        )
+        self.assertEqual(
+            {failure['failure_kind'] for failure in result['failures']},
+            {'response_contract_invalid:feedback_missing'},
+        )
+        self.assertEqual(len(cleanup_service.targets), 1)
+
+    def test_subagent_dispatch_failure_cleans_allocated_batch_session_once(self):
+        service = AgentFeedbackOrchestrator()
+        client = RaisingBatchClient()
+        service.client = client
+        cleanup_service = FakeSessionCleanupService()
+
+        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                with _patch_feedback_eligibility('005930'):
+                    result = service.dispatch_for_symbols_via_subagents(
+                        market_date='2026-04-14',
+                        symbols=['005930'],
+                        roles=['eod-summarizer'],
+                        per_role_parallelism=1,
+                    )
+
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(len(cleanup_service.targets), 1)
+        self.assertEqual(
+            cleanup_service.targets[0].session_key,
+            client.calls[0]['batch_items'][0]['session_key'],
+        )
+
+    def test_subagent_cleanup_failure_is_audited_without_overwriting_dispatch_result(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = RecordingBatchClient()
+        feedback_service = FakeFeedbackService()
+        cleanup_service = RaisingSessionCleanupService()
+
+        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                    with _patch_feedback_eligibility('005930'):
+                        result = service.dispatch_for_symbols_via_subagents(
+                            market_date='2026-04-14',
+                            symbols=['005930'],
+                            roles=['eod-summarizer'],
+                            per_role_parallelism=1,
+                        )
+
+        self.assertEqual(result['summary']['status'], 'completed')
+        self.assertEqual(result['summary']['completed'], 1)
+        self.assertEqual(result['summary']['failed'], 0)
+        self.assertEqual(len(cleanup_service.targets), 1)
+        self.assertEqual(result['session_cleanup'][0]['status'], 'deferred')
+        self.assertEqual(
+            result['session_cleanup'][0]['reason'],
+            'fresh_batch_session_cleanup_failed',
+        )
+        self.assertEqual(
+            result['session_cleanup'][0]['error'],
+            'cleanup audit store unavailable',
+        )
+
+    def test_same_date_subagent_dispatches_never_reuse_batch_session_keys(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+
+        with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+            with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                    with _patch_feedback_eligibility('005930'):
+                        first = service.dispatch_for_symbols_via_subagents(
+                            market_date='2026-04-14',
+                            symbols=['005930'],
+                            roles=['eod-summarizer'],
+                            per_role_parallelism=1,
+                        )
+                        second = service.dispatch_for_symbols_via_subagents(
+                            market_date='2026-04-14',
+                            symbols=['005930'],
+                            roles=['eod-summarizer'],
+                            per_role_parallelism=1,
+                        )
+
+        first_key = client.calls[0]['batch_items'][0]['session_key']
+        second_key = client.calls[1]['batch_items'][0]['session_key']
+        self.assertNotEqual(first_key, second_key)
+        self.assertIn(first['request']['request_run_id'], first_key)
+        self.assertIn(second['request']['request_run_id'], second_key)
+        self.assertIn('/batch-001/', first_key)
+        self.assertIn('/batch-001/', second_key)
+        self.assertEqual(client.calls[0]['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
+        self.assertEqual(client.calls[1]['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
 
     def test_timed_out_running_future_keeps_slot_until_it_completes(self):
         first_future = FakeFuture(result=_batch_result('005930'), cancel_result=False)
@@ -2584,10 +3539,12 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(eod_call['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
         self.assertTrue(eod_call['batch_items'][0]['session_key'].startswith('agent:eod-summarizer:feedback-fresh/eod-summarizer/'))
         self.assertIn(result['request']['request_run_id'], eod_call['batch_items'][0]['session_key'])
+        self.assertIn('/batch-001/', eod_call['batch_items'][0]['session_key'])
         decider_call = next(call for call in client.calls if call['spec'].role == 'signal-decider')
         self.assertEqual(decider_call['batch_items'][0]['session_reuse_mode'], 'fresh_per_batch')
         self.assertTrue(decider_call['batch_items'][0]['session_key'].startswith('agent:signal-decider:feedback-fresh/signal-decider/'))
         self.assertIn(result['request']['request_run_id'], decider_call['batch_items'][0]['session_key'])
+        self.assertIn('/batch-001/', decider_call['batch_items'][0]['session_key'])
         self.assertEqual(market_context_builder.calls, ['2026-04-14', '2026-04-14'])
         self.assertEqual(result['summary']['completed'], 5)
 
@@ -3244,6 +4201,13 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['attempt_id'], f'{dispatch_id}:attempt-1')
         self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/v1/responses')
         self.assertEqual(http_calls[0]['json']['model'], 'openclaw/eod-summarizer')
+        self.assertEqual(result['request_provenance']['model'], 'openclaw/eod-summarizer')
+        self.assertEqual(result['request_provenance']['contract_version'], 'agent_role_contract_v1')
+        self.assertEqual(
+            result['request_provenance']['prompt_sha256'],
+            f"sha256:{hashlib.sha256(http_calls[0]['json']['input'].encode('utf-8')).hexdigest()}",
+        )
+        self.assertEqual(result['request_provenance']['prompt_chars'], len(http_calls[0]['json']['input']))
         self.assertIn('dispatch_batch_request', [entry['stage'] for entry in captured_logs])
         self.assertIn('dispatch_batch_response', [entry['stage'] for entry in captured_logs])
         mismatch_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_symbol_mismatch')
@@ -3253,7 +4217,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(mismatch_log['failure_class'], 'batch_response_attribution_mismatch')
         self.assertEqual(mismatch_log['session_reuse_mode'], 'slot_reused')
 
-    def test_signal_decider_one_symbol_batch_attributes_missing_symbol_under_reused_session(self):
+    def test_signal_decider_one_symbol_batch_rejects_missing_symbol_without_fallback_attribution(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'
         http_calls = []
         captured_logs = []
@@ -3346,15 +4310,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     )
 
         decoded_item = result['decoded']['items'][0]
-        self.assertEqual(decoded_item['symbol'], '005930')
-        self.assertEqual(result['response_correlation']['attribution_status'], 'fallback_attributed')
-        self.assertEqual(result['response_correlation']['fallback_attributions'][0]['reason'], 'single_symbol_batch')
-        self.assertIn('fallback_symbol_attribution', decoded_item['feedback']['risk_flags'])
-        self.assertIn('response_symbol_missing', decoded_item['feedback']['risk_flags'])
-        self.assertNotIn('batch_response_symbol_mismatch', [entry['stage'] for entry in captured_logs])
-        fallback_log = next(entry for entry in captured_logs if entry['stage'] == 'batch_response_symbol_attribution_fallback')
-        self.assertEqual(fallback_log['session_reuse_mode'], 'slot_reused')
-        self.assertEqual(fallback_log['fallback_attributions'][0]['symbol'], '005930')
+        self.assertNotIn('symbol', decoded_item)
+        self.assertEqual(result['response_correlation']['attribution_status'], 'mismatch')
+        self.assertEqual(result['response_correlation']['failure_class'], 'batch_response_attribution_mismatch')
+        self.assertEqual(result['response_correlation']['missing_symbols'], ['005930'])
+        self.assertEqual(result['response_correlation']['fallback_attributions'], [])
+        self.assertNotIn('fallback_symbol_attribution', decoded_item['feedback']['risk_flags'])
+        self.assertIn('batch_response_symbol_mismatch', [entry['stage'] for entry in captured_logs])
+        self.assertNotIn('batch_response_symbol_attribution_fallback', [entry['stage'] for entry in captured_logs])
 
     def test_single_symbol_batch_keeps_contradictory_envelope_symbol_as_mismatch(self):
         decoded, metadata = correlate_decoded_batch_response(
@@ -3385,6 +4348,26 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(metadata['missing_symbols'], ['005930'])
         self.assertEqual(metadata['unexpected_symbols'], ['999999'])
         self.assertEqual(metadata['fallback_attributions'], [])
+
+    def test_batch_correlation_rejects_duplicate_symbols_and_item_count_mismatch(self):
+        decoded, metadata = correlate_decoded_batch_response(
+            decoded={
+                'items': [
+                    {'symbol': '005930', 'feedback': {'symbol': '005930'}},
+                    {'symbol': '005930', 'feedback': {'symbol': '005930'}},
+                ]
+            },
+            expected_symbols=['005930'],
+            session_reuse_mode='fresh_per_batch',
+        )
+
+        self.assertEqual(len(decoded['items']), 2)
+        self.assertEqual(metadata['attribution_status'], 'mismatch')
+        self.assertEqual(metadata['failure_class'], 'batch_response_attribution_mismatch')
+        self.assertEqual(metadata['duplicate_symbols'], ['005930'])
+        self.assertEqual(metadata['expected_item_count'], 1)
+        self.assertEqual(metadata['response_item_count'], 2)
+        self.assertFalse(metadata['item_count_matches'])
 
     def test_openclaw_batch_dispatch_converts_invalid_json_to_structured_fallback(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'
@@ -3474,6 +4457,20 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(feedback['next_day_open_action'], 'wait')
         self.assertEqual(feedback['wait_reason']['code'], 'core_execution_evidence_gap')
         self.assertIn('agent_json_contract_violation', feedback['risk_flags'])
+        normalized_fallback = orchestrator_module.normalize_agent_response(
+            role='signal-decider',
+            agent_name='signal-decider',
+            symbol='005930',
+            market_date='2026-04-14',
+            output_text=json.dumps(feedback, ensure_ascii=False),
+            raw_response=feedback,
+        )
+        self.assertFalse(normalized_fallback['response_contract_valid'])
+        self.assertEqual(normalized_fallback['next_day_open_action'], 'reject')
+        self.assertIn(
+            'core_generated_fallback',
+            normalized_fallback['response_schema_violation_flags'],
+        )
         self.assertEqual(result['response_correlation']['decoded_source'], 'core_structured_fallback')
         self.assertEqual(result['response_correlation']['missing_symbols'], [])
         self.assertNotIn('batch_response_symbol_mismatch', [entry['stage'] for entry in captured_logs])
@@ -4023,6 +5020,149 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         final_log = next(entry for entry in captured_logs if entry['stage'] == 'run_finished')
         self.assertEqual(final_log['request_run_id'], request_run_id)
         self.assertEqual(final_log['terminal_status'], 'completed')
+
+    def test_dispatch_for_symbols_rejects_inner_identity_mismatch_without_persisting_feedback(self):
+        service = AgentFeedbackOrchestrator()
+        client = InnerIdentityMismatchBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        captured_logs = []
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility('005930'):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'log_agent_feedback_event',
+                                        side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                                    ):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            roles=['eod-summarizer'],
+                                            reuse_existing=False,
+                                        )
+
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertEqual(failure_service.recorded[0]['failure_kind'], 'response_identity_mismatch')
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertNotIn('normalized_response_accepted', [entry['stage'] for entry in captured_logs])
+        rejected_log = next(entry for entry in captured_logs if entry['stage'] == 'normalized_response_rejected')
+        self.assertEqual(rejected_log['failure_class'], 'response_identity_mismatch')
+        self.assertEqual(
+            rejected_log['mismatch_flags'],
+            ['symbol_mismatch', 'market_date_mismatch'],
+        )
+
+    def test_dispatch_for_symbols_rejects_duplicate_batch_attribution_without_persisting_feedback(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = DuplicateAttributionBatchClient()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        captured_logs = []
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility('005930'):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'log_agent_feedback_event',
+                                        side_effect=lambda stage, **payload: captured_logs.append({'stage': stage, **payload}),
+                                    ):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            roles=['eod-summarizer'],
+                                            reuse_existing=False,
+                                        )
+
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertEqual(failure_service.recorded[0]['failure_kind'], 'batch_response_attribution_mismatch')
+        self.assertEqual(result['summary']['status'], 'failed')
+        rejected_log = next(entry for entry in captured_logs if entry['stage'] == 'normalized_response_rejected')
+        self.assertEqual(rejected_log['failure_class'], 'batch_response_attribution_mismatch')
+        self.assertEqual(rejected_log['response_correlation']['duplicate_symbols'], ['005930'])
+        self.assertFalse(rejected_log['response_correlation']['item_count_matches'])
+
+    def test_dispatch_for_symbols_rejects_missing_response_correlation_before_persistence(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = MissingCorrelationBatchClient()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with _patch_feedback_eligibility('005930'):
+                                result = service.dispatch_for_symbols(
+                                    market_date='2026-04-14',
+                                    symbols=['005930'],
+                                    roles=['eod-summarizer'],
+                                    reuse_existing=False,
+                                )
+
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(
+            failure_service.recorded[0]['failure_kind'],
+            'batch_response_correlation_missing',
+        )
+        self.assertEqual(len(cleanup_service.targets), 1)
+
+    def test_dispatch_for_symbols_rejects_whole_batch_when_one_feedback_is_missing(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = MissingFeedbackBatchClient()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=2, openclaw_agent_parallel_subtasks=1)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                        with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                            with _patch_feedback_eligibility('005930', '000660'):
+                                result = service.dispatch_for_symbols(
+                                    market_date='2026-04-14',
+                                    symbols=['005930', '000660'],
+                                    roles=['eod-summarizer'],
+                                    reuse_existing=False,
+                                )
+
+        self.assertEqual(feedback_service.bulk_calls, [])
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 2)
+        self.assertEqual(len(failure_service.recorded), 2)
+        self.assertEqual(
+            {failure['failure_kind'] for failure in failure_service.recorded},
+            {'response_contract_invalid:feedback_missing'},
+        )
+        self.assertEqual(len(cleanup_service.targets), 1)
 
     def test_dispatch_for_symbols_times_out_hung_batch_and_finishes(self):
         service = AgentFeedbackOrchestrator()

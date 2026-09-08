@@ -1270,6 +1270,113 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertIn('decision_delta', feedback)
         self.assertFalse(feedback['decision_delta']['has_previous_decision'])
 
+    def test_prepare_feedback_persistence_preserves_dispatched_policy_for_replay(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        dispatched_policy = {
+            'current_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+            'status': 'active',
+            'activation_mode': 'manual_only',
+            'candidate_activation_required': True,
+            'rule_bundle': {'schema_version': 'signal_decider_policy_bundle_v1'},
+            'performance_criteria': {
+                'schema_version': 'signal_decider_performance_criteria_v1',
+                'status': 'ready',
+                'sample_count': 12,
+                'performance_buckets': [
+                    {
+                        'bucket_key': 'decision.reward_risk_bucket',
+                        'bucket_value': 'reward_risk_lt_1_3',
+                        'sample_count': 5,
+                        'bad_buy_rate': 0.8,
+                    }
+                ],
+                'rule_candidates': [],
+                'usage_policy': {
+                    'model_guidance_eligible': True,
+                    'deterministic_gate_eligible': True,
+                    'manual_review_only': True,
+                    'allow_buy_authorization': False,
+                },
+            },
+        }
+        decision_provenance = {
+            'model': 'openclaw/signal-decider',
+            'prompt_sha256': 'sha256:prompt-hash',
+            'prompt_chars': 4321,
+            'contract_version': 'agent_role_contract_v1',
+            'contract_sha256': 'sha256:contract-hash',
+            'role': 'signal-decider',
+        }
+
+        summary, feedback, context = service.prepare_feedback_persistence(
+            agent_name='signal-decider',
+            summary_payload={
+                'model': 'openclaw/signal-decider',
+                'decision_provenance': deepcopy(decision_provenance),
+            },
+            feedback_payload={
+                'symbol': '005930',
+                'market_date': '2026-04-23',
+                'next_day_open_action': 'wait',
+                'traceability': {'symbol': '005930', 'market_date': '2026-04-23'},
+            },
+            context_payload={
+                'market_date': '2026-04-23',
+                'signal_decider_policy': deepcopy(dispatched_policy),
+                'symbol_day_context': {'symbol': '005930'},
+            },
+        )
+
+        self.assertEqual(context['signal_decider_policy'], dispatched_policy)
+        self.assertEqual(summary['decision_provenance'], decision_provenance)
+
+        snapshot_item = service.prepare_snapshot_persistence_item(
+            feedback_id=13,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='openclaw-v1',
+            run_id='signal-run-13',
+            summary_payload=summary,
+            feedback_payload=feedback,
+            context_payload=context,
+            received_at='2026-04-23T06:00:00+00:00',
+        )
+
+        self.assertEqual(snapshot_item['request_payload']['signal_decider_policy'], dispatched_policy)
+        self.assertEqual(
+            snapshot_item['response_summary_payload']['decision_provenance'],
+            decision_provenance,
+        )
+
+    def test_prepare_feedback_persistence_uses_dispatched_policy_version_when_response_conflicts(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+
+        summary, feedback, context = service.prepare_feedback_persistence(
+            agent_name='signal-decider',
+            summary_payload={'policy_version': 'hallucinated_summary_policy'},
+            feedback_payload={
+                'policy_version': 'hallucinated_response_policy',
+                'next_day_open_action': 'wait',
+            },
+            context_payload={
+                'signal_decider_policy': {
+                    'current_version': DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+                    'performance_criteria': {
+                        'schema_version': 'signal_decider_performance_criteria_v1',
+                        'status': 'ready',
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(summary['policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(feedback['policy_version'], DEFAULT_SIGNAL_DECIDER_POLICY_VERSION)
+        self.assertEqual(
+            context['signal_decider_policy']['current_version'],
+            DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+        )
+
     def test_prepare_snapshot_persistence_item_builds_structured_traceability(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
         snapshot_item = service.prepare_snapshot_persistence_item(
@@ -1408,11 +1515,34 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
 
         self.assertEqual(snapshot_item['agent_name'], 'short-term-decider')
         self.assertEqual(snapshot_item['policy_version'], 'short_term_decider_contract_v1')
-        self.assertEqual(snapshot_item['decision_action'], 'buy')
+        self.assertEqual(snapshot_item['decision_action'], 'wait')
+        self.assertEqual(snapshot_item['preferred_action'], 'wait')
+        self.assertEqual(snapshot_item['next_day_open_action'], 'wait')
+        self.assertEqual(snapshot_item['response_payload']['tactical_action'], 'watch_for_trigger')
         self.assertEqual(snapshot_item['entry_price_basis'], 'trigger_limit')
         self.assertEqual(snapshot_item['traceability_payload']['schema_version'], 'short_term_decider_trace_v1')
         self.assertEqual(snapshot_item['traceability_payload']['tactical_context']['trigger_price'], 81200)
         self.assertEqual(snapshot_item['traceability_payload']['upstream_references']['technical-summarizer']['feedback_id'], 8)
+
+    def test_historical_watch_snapshot_is_not_replayed_as_a_buy_sample(self):
+        service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))
+        historical_row = _feedback_row(
+            feedback_id=13,
+            snapshot_id=13,
+            market_date='2026-04-23',
+            symbol='005930',
+            action='buy',
+        )
+        historical_row.agent_name = 'short-term-decider'
+        historical_row.response_payload = {
+            **historical_row.response_payload,
+            'tactical_action': 'watch_for_trigger',
+            'preferred_action': 'watch_for_trigger',
+        }
+
+        decision = service._build_decision_snapshot(historical_row)
+
+        self.assertEqual(decision['decision']['action'], 'wait')
 
     def test_prepare_snapshot_persistence_item_filters_resolved_pre_decider_warnings(self):
         service = SignalDeciderLoopService(repository=FakeSignalDeciderLoopRepository([]))

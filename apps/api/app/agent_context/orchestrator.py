@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -37,9 +38,7 @@ from app.agent_context.orchestrator_helpers import (
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
     coerce_decoded_batch_response as _coerce_decoded_batch_response,
     correlate_decoded_batch_response as _correlate_decoded_batch_response,
-    extract_json_object as _extract_json_object,
     extract_response_mismatch_flags as _extract_response_mismatch_flags,
-    repair_json_tail as _repair_json_tail,
     failure_log_fields as _failure_log_fields,
     feedback_row_lookup as _feedback_row_lookup,
     feedback_session_key as _feedback_session_key,
@@ -55,12 +54,14 @@ from app.agent_context.orchestrator_helpers import (
     trim_batch_item_for_prompt as _trim_batch_item_for_prompt,
 )
 from app.agent_context.orchestrator_runtime_helpers import (
+    batch_response_contract_failure as _batch_response_contract_failure,
     build_buffer_counts as _build_buffer_counts,
     build_pending_failure_row as _build_pending_failure_row,
     build_pending_feedback_row as _build_pending_feedback_row,
     dispatch_and_store as _dispatch_and_store_helper,
     dispatch_for_symbols_via_subagents as _dispatch_for_symbols_via_subagents_helper,
     normalize_symbol_feedback as _normalize_symbol_feedback,
+    normalized_feedback_contract_failure as _normalized_feedback_contract_failure,
     resolve_batch_dispatch_context as _resolve_batch_dispatch_context,
 )
 from app.agent_context.logging import (
@@ -75,7 +76,12 @@ from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.roles import DEFAULT_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES, SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
-from app.agent_context.response_contract import build_contract_prompt_suffix, normalize_agent_response
+from app.agent_context.response_contract import (
+    build_agent_contract_provenance,
+    build_contract_prompt_suffix,
+    decode_strict_agent_json_object,
+    normalize_agent_response,
+)
 from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
     FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
@@ -125,7 +131,10 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
     AgentDispatchSpec(
         role='eod-summarizer',
         agent_name='eod-summarizer',
-        instruction='Summarize the latest end-of-day trading session conservatively, emphasizing breadth, leaders, laggards, anomalies, and data gaps.',
+        instruction=(
+            'Assess each supplied symbol independently for end-of-day data readiness, emphasizing per-symbol completeness, freshness, anomalies, and data gaps. '
+            'Do not infer market-wide breadth, leaders, or laggards from the bounded dispatch batch.'
+        ),
     ),
     AgentDispatchSpec(
         role='technical-summarizer',
@@ -135,14 +144,17 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
     AgentDispatchSpec(
         role='fundamental-summarizer',
         agent_name='fundamental-summarizer',
-        instruction='Summarize the latest fundamentals conservatively, emphasizing business quality, balance-sheet risks, cash-flow traits, anomalies, and data gaps.',
+        instruction=(
+            'Summarize the latest fundamentals conservatively using the supplied market and source metadata: KRX inputs may come from DART filings/XBRL, while US inputs may come from SEC EDGAR filings/company facts. '
+            'Emphasize business quality, balance-sheet risks, cash-flow traits, anomalies, and data gaps without assuming every payload is DART-specific.'
+        ),
     ),
     AgentDispatchSpec(
         role=SHORT_TERM_DECIDER_AGENT_NAME,
         agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
         instruction=(
             'Synthesize the specialist summaries, market context, flow context, momentum, volume, price-action, and data-quality inputs into short-term tactical decision support only, '
-            'classifying each symbol as scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, or reject for a 1-2 trading day horizon. '
+            'classifying each symbol as scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, or reject for a 1-3 trading day horizon. '
             'Prioritize liquidity, fresh participation, clean trigger/invalidation levels, and chase-risk control. '
             'Every watch_for_trigger, avoid_chase, or wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup. '
@@ -478,27 +490,7 @@ class OpenClawAgentClient:
 
     @staticmethod
     def _decode_candidate_json(candidate_text: str | None) -> tuple[dict[str, Any] | None, str | None]:
-        normalized_text = _extract_json_object(candidate_text)
-        if not normalized_text:
-            repaired_raw_text = _repair_json_tail(candidate_text)
-            if not repaired_raw_text:
-                return None, 'json_object_not_found'
-            normalized_text = repaired_raw_text
-        try:
-            candidate_decoded = json.loads(normalized_text)
-        except json.JSONDecodeError:
-            repaired_text = _repair_json_tail(normalized_text)
-            if not repaired_text:
-                return None, 'json_decode_error'
-            try:
-                candidate_decoded = json.loads(repaired_text)
-            except json.JSONDecodeError:
-                return None, 'json_decode_error'
-        if isinstance(candidate_decoded, list):
-            return {'items': candidate_decoded}, None
-        if isinstance(candidate_decoded, dict):
-            return candidate_decoded, None
-        return None, 'json_shape_not_object'
+        return decode_strict_agent_json_object(candidate_text)
 
     @staticmethod
     def _failure_class_for_mode(failure_mode: str | None) -> str:
@@ -506,6 +498,7 @@ class OpenClawAgentClient:
             None,
             'json_object_not_found',
             'json_decode_error',
+            'json_duplicate_key',
             'json_shape_not_object',
             'session_history_assistant_non_json_after_marker',
             'trajectory_assistant_non_json',
@@ -1052,6 +1045,7 @@ class OpenClawAgentClient:
                 'symbol': example_symbol,
                 'market_date': market_date.isoformat(),
                 'tactical_action': 'watch_for_trigger',
+                'preferred_action': 'watch_for_trigger',
                 'wait_reason': {
                     'code': 'unsuitable_execution_timing',
                     'summary': '돌파 트리거 확인 전이라 진입 시점이 아직 이릅니다.',
@@ -1060,7 +1054,7 @@ class OpenClawAgentClient:
                 'chase_limit_price': short_term_example_levels[1],
                 'target_price': short_term_example_levels[2],
                 'stop_loss_price': short_term_example_levels[3],
-                'expected_holding_period': '1-2 trading days',
+                'expected_holding_period': '1-3 trading days',
                 'confidence_score_10': 6,
                 'conviction_score_10': 5,
                 'thesis_summary': 'brief short-term tactical thesis',
@@ -1178,7 +1172,7 @@ class OpenClawAgentClient:
             "If previous_decision_context is present, use it to populate decision_delta, avoid copy-pasting the prior wait narrative, and explain both the stable blockers and the concrete upgrade trigger.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
-            "Interpret signal_decider_policy.performance_criteria as recent replay-backed buy/wait/reject calibration: use win/loss rates, realized/replay returns, drawdown, reward/risk, bad-buy clusters, and missed-opportunity clusters to tighten or relax the actual action threshold instead of only changing wording, labels, or rationale detail.\n"
+            "Interpret signal_decider_policy.performance_criteria as auditable replay context only when usage_policy.model_guidance_eligible=true. It may support conservative review or tighter buy thresholds; when manual_review_only=true it must never relax wait/reject into buy or authorize a buy. Deterministic execution may consume it only when usage_policy.deterministic_gate_eligible=true, and that eligibility never activates rule candidates or grants buy authority.\n"
             "Interpret market_regime_context as the authoritative market/sector regime guardrail: defensive/risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; normal preserves existing sizing/entry rules; aggressive_open and trend_day may support faster or continuation-oriented entries only inside the supplied bounded window, while quantity_multiplier remains an exec-side capped hint and never bypasses stop-loss or account/symbol/notional safety gates.\n"
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
@@ -1198,58 +1192,41 @@ class OpenClawAgentClient:
         max_chars = int(settings.openclaw_agent_max_prompt_chars or 0)
         if max_chars <= 0 or len(base_message) <= max_chars:
             return base_message
-        while len(prepared_items) > 1:
-            prepared_items = prepared_items[:-1]
-            candidate = (
-                f"Request marker: {request_marker}\n"
-                f"Role: {spec.role}\n"
-                f"Instruction: {spec.instruction}\n"
-                f"Assigned symbols (exact authoritative strings): {assigned_symbols_json}\n"
-                "Analyze each assigned symbol directly and return aggregated JSON only.\n"
-                "Each assigned symbol must appear exactly once in {\"items\": [...]} with structured feedback; do not omit or invent symbols.\n"
-                "item.symbol must exactly match an assigned symbol string.\n"
-                f"{signal_decider_batch_rules}"
-                "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
-                "Immediately before sending, re-check the final JSON formatting one last time and fix any extra or missing closing braces/brackets.\n"
-                "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-                "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
-                "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
-                "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
-                "Interpret signal_decider_policy.performance_criteria as recent replay-backed buy/wait/reject calibration: use win/loss rates, realized/replay returns, drawdown, reward/risk, bad-buy clusters, and missed-opportunity clusters to tighten or relax the actual action threshold instead of only changing wording, labels, or rationale detail.\n"
-                "Interpret market_regime_context as the authoritative market/sector regime guardrail: defensive/risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; normal preserves existing sizing/entry rules; aggressive_open and trend_day may support faster or continuation-oriented entries only inside the supplied bounded window, while quantity_multiplier remains an exec-side capped hint and never bypasses stop-loss or account/symbol/notional safety gates.\n"
-                "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
-                "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
-                "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
-                f"{build_contract_prompt_suffix(role=spec.role)}\n"
-                f"Market date: {market_date.isoformat()}\n"
-                f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
-            )
-            if max_chars <= 0 or len(candidate) <= max_chars:
-                return candidate
-        fallback_item = _compressed_batch_item_for_prompt(batch_items[0])
-        fallback_symbol = str(fallback_item.get('symbol') or example_symbol).strip() or '000000'
-        fallback_assigned_symbols = [fallback_symbol]
-        fallback_assigned_symbols_json = json.dumps(fallback_assigned_symbols, ensure_ascii=False)
-        return (
+        compressed_items = [_compressed_batch_item_for_prompt(item) for item in batch_items]
+        compact_message = (
+            f"Request marker: {request_marker}\n"
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
-            f"Assigned symbols (exact authoritative strings): {fallback_assigned_symbols_json}\n"
-            "Analyze the assigned symbol directly and return aggregated JSON only.\n"
-            "Return {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]} with exactly one item.\n"
-            "The one item.symbol must exactly match the assigned symbol string; do not omit feedback.symbol when the role contract requires it.\n"
-            f"{_signal_decider_batch_rules(fallback_assigned_symbols)}"
+            f"Assigned symbols (exact authoritative strings): {assigned_symbols_json}\n"
+            "Analyze every assigned symbol directly and return one aggregated JSON object.\n"
+            "Return {\"items\": [{\"symbol\": \"...\", \"feedback\": {...}}]} with exactly one item per assigned symbol.\n"
+            "Every item.symbol must exactly match one assigned symbol string; do not omit feedback.symbol when the role contract requires it.\n"
+            f"{signal_decider_batch_rules}"
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for the assigned symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for every assigned symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
+            "Interpret signal_decider_policy.performance_criteria as auditable replay context only when usage_policy.model_guidance_eligible=true. It may support conservative review or tighter buy thresholds; when manual_review_only=true it must never relax wait/reject into buy or authorize a buy. Deterministic execution may consume it only when usage_policy.deterministic_gate_eligible=true, and that eligibility never activates rule candidates or grants buy authority.\n"
             "Interpret market_regime_context as the authoritative market/sector regime guardrail: defensive/risk_off should default to wait/reject unless exceptional relative/sector leadership is evident; normal preserves existing sizing/entry rules; aggressive_open and trend_day may support faster or continuation-oriented entries only inside the supplied bounded window, while quantity_multiplier remains an exec-side capped hint and never bypasses stop-loss or account/symbol/notional safety gates.\n"
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
             f"{build_contract_prompt_suffix(role=spec.role)}\n"
             f"Market date: {market_date.isoformat()}\n"
-            f"Assigned batch payload:\n{json.dumps([fallback_item], ensure_ascii=False)}"
+            f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False)}"
+        )
+        if len(compact_message) <= max_chars:
+            return compact_message
+        raise AgentDispatchTerminalError(
+            'OpenClaw prompt budget is too small to encode the requested batch without dropping assigned symbols',
+            details={
+                'failure_kind': 'prompt_budget_exceeded_without_symbol_loss',
+                'assigned_symbols': assigned_symbols,
+                'assigned_symbol_count': len(assigned_symbols),
+                'prompt_chars': len(compact_message),
+                'max_prompt_chars': max_chars,
+            },
         )
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1561,14 +1538,22 @@ class OpenClawAgentClient:
             response: httpx.Response | None = None
             attempt_id = make_attempt_id(dispatch_id=dispatch_id, attempt=attempt)
             request_marker = f"batch-request::{attempt_id or dispatch_id}"
+            model_name = f'openclaw/{spec.agent_name}'
+            prompt_text = self._build_batch_message(
+                spec=spec,
+                market_date=market_date,
+                batch_items=batch_items,
+                request_marker=request_marker,
+            )
+            request_provenance = {
+                **build_agent_contract_provenance(role=spec.role),
+                'model': model_name,
+                'prompt_sha256': f"sha256:{hashlib.sha256(prompt_text.encode('utf-8')).hexdigest()}",
+                'prompt_chars': len(prompt_text),
+            }
             body = {
-                'model': f'openclaw/{spec.agent_name}',
-                'input': self._build_batch_message(
-                    spec=spec,
-                    market_date=market_date,
-                    batch_items=batch_items,
-                    request_marker=request_marker,
-                ),
+                'model': model_name,
+                'input': prompt_text,
             }
             try:
                 request_session_key = fixed_session_key
@@ -1794,6 +1779,7 @@ class OpenClawAgentClient:
                             }
                         )
                     decoded = {
+                        '_coerced_from_top_level_object': True,
                         'items': symbol_items,
                     }
                 decoded, response_correlation = _correlate_decoded_batch_response(
@@ -1882,6 +1868,7 @@ class OpenClawAgentClient:
                     'history_checked': bool(session_history_diagnostics.get('checked')),
                     'response_correlation': response_correlation,
                     'session_reuse_mode': session_reuse_mode,
+                    'request_provenance': request_provenance,
                 }
             except AgentDispatchTerminalError:
                 raise
@@ -2184,11 +2171,18 @@ class AgentFeedbackOrchestrator:
                 'manual_review_only': True,
             }
 
+        sample_count = int(summary.get('mature_computed_count') or 0)
+        operator_review_ready = summary.get('ready_for_operator_review')
+        replay_eligible = (
+            summary.get('status') == 'ready'
+            and sample_count >= 3
+            and operator_review_ready is True
+        )
         return {
             'schema_version': 'signal_decider_performance_criteria_v1',
             'status': summary.get('status'),
             'request': report.get('request') or {},
-            'sample_count': int(summary.get('mature_computed_count') or 0),
+            'sample_count': sample_count,
             'overall': {
                 'decision_action_counts': summary.get('decision_action_counts') or {},
                 'grade_label_counts': summary.get('grade_label_counts') or {},
@@ -2206,9 +2200,12 @@ class AgentFeedbackOrchestrator:
                 report.get('calibration_hints') if isinstance(report.get('calibration_hints'), dict) else {}
             ),
             'usage_policy': {
-                'use_for_buy_wait_reject_thresholds': True,
+                'model_guidance_eligible': replay_eligible,
+                'deterministic_gate_eligible': replay_eligible,
+                'use_for_buy_wait_reject_thresholds': False,
                 'tighten_buy_when_matching_bucket_has_bad_buy_or_negative_return': True,
-                'relax_wait_or_reject_when_matching_bucket_has_missed_opportunity': True,
+                'relax_wait_or_reject_when_matching_bucket_has_missed_opportunity': False,
+                'allow_buy_authorization': False,
                 'reward_risk_and_outcome_path_override_name_only_reasoning': True,
                 'auto_apply_policy_changes': False,
                 'manual_review_only': True,
@@ -2271,6 +2268,9 @@ class AgentFeedbackOrchestrator:
                     'evaluated_sample_count': item.get('evaluated_sample_count'),
                     'negative_rate': item.get('negative_rate'),
                     'activation_status': item.get('activation_status'),
+                    'manual_review_only': item.get('manual_review_only'),
+                    'active_policy': item.get('active_policy'),
+                    'deterministic_gate_eligible': item.get('deterministic_gate_eligible'),
                 }
             )
         return compacted
@@ -2572,6 +2572,7 @@ class AgentFeedbackOrchestrator:
         payload: dict[str, Any],
         response: dict[str, Any],
         context: dict[str, Any],
+        cleanup_session: bool = True,
     ) -> dict[str, Any]:
         serializable_response = jsonable_encoder(response)
         serializable_context = jsonable_encoder(context)
@@ -2584,31 +2585,32 @@ class AgentFeedbackOrchestrator:
             feedback=serializable_response.get('normalized_feedback') if isinstance(serializable_response, dict) else None,
             context=serializable_context,
         )
-        cleanup_result = None
-        try:
-            cleanup_result = self._cleanup_feedback_session(
-                market_date=market_date,
-                symbol=str(payload.get('symbol') or ''),
-                agent_name=agent_name,
-                run_id=run_id,
-                response=response,
-            )
-        except Exception as exc:  # noqa: BLE001
-            cleanup_result = {
-                'status': 'deferred',
-                'reason': 'cleanup_failed_after_feedback_persisted',
-                'error_type': type(exc).__name__,
-                'error': str(exc),
-            }
-            logger.warning(
-                'agent feedback session cleanup failed after feedback persisted for %s/%s/%s: %s',
-                market_date,
-                agent_name,
-                payload.get('symbol'),
-                exc,
-            )
-        if cleanup_result is not None:
-            result['item']['session_cleanup'] = cleanup_result
+        if cleanup_session:
+            cleanup_result = None
+            try:
+                cleanup_result = self._cleanup_feedback_session(
+                    market_date=market_date,
+                    symbol=str(payload.get('symbol') or ''),
+                    agent_name=agent_name,
+                    run_id=run_id,
+                    response=response,
+                )
+            except Exception as exc:  # noqa: BLE001
+                cleanup_result = {
+                    'status': 'deferred',
+                    'reason': 'cleanup_failed_after_feedback_persisted',
+                    'error_type': type(exc).__name__,
+                    'error': str(exc),
+                }
+                logger.warning(
+                    'agent feedback session cleanup failed after feedback persisted for %s/%s/%s: %s',
+                    market_date,
+                    agent_name,
+                    payload.get('symbol'),
+                    exc,
+                )
+            if cleanup_result is not None:
+                result['item']['session_cleanup'] = cleanup_result
         return result['item']
 
     def _build_run_summary_payload(
@@ -3859,7 +3861,7 @@ class AgentFeedbackOrchestrator:
                     for batch_index, batch in enumerate(indexed_batches):
                         slot = (batch_index % role_parallelism) + 1
                         session_reuse_mode = 'fresh_per_batch'
-                        stable_session_key = f"agent:{spec.agent_name}:{_fresh_feedback_session_key(agent_name=spec.agent_name, request_run_id=request_run_id, slot=slot)}"
+                        stable_session_key = f"agent:{spec.agent_name}:{_fresh_feedback_session_key(agent_name=spec.agent_name, request_run_id=request_run_id, batch_index=batch_index + 1, slot=slot)}"
                         dispatch_id = f'{request_run_id}:{role}:slot-{slot}:batch-{batch_index + 1}'
                         batch_with_session = [
                             {
@@ -3974,41 +3976,89 @@ class AgentFeedbackOrchestrator:
                                         if isinstance(batch_result.get('response_correlation'), dict)
                                         else {}
                                     )
-                                    for source_item in batch:
-                                        symbol = source_item['symbol']
-                                        symbol_key = str(symbol).strip().upper()
-                                        dispatch_context = _resolve_batch_dispatch_context(
-                                            batch_result=batch_result,
-                                            source_item=source_item,
-                                            batch=batch,
-                                            slot=slot,
-                                        )
-                                        dispatch_id = dispatch_context['dispatch_id']
-                                        attempt_id = dispatch_context['attempt_id']
-                                        batch_symbols = dispatch_context['batch_symbols']
-                                        session_key = dispatch_context['session_key']
-                                        session_id = dispatch_context.get('session_id')
-                                        response_id = dispatch_context.get('response_id')
-                                        request_marker = dispatch_context.get('request_marker')
-                                        feedback_candidate = by_symbol.get(symbol_key, {}).get('feedback')
-                                        if not feedback_candidate:
-                                            failure_class = (
-                                                response_correlation.get('failure_class')
-                                                if response_correlation.get('failure_class')
-                                                else 'missing_batch_feedback'
+                                    contract_failure = _batch_response_contract_failure(batch_result)
+                                    contract_mismatch_flags: list[str] = []
+                                    contract_snapshot: dict[str, Any] | None = None
+                                    staged_feedback: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+                                    if contract_failure is None:
+                                        for source_item in batch:
+                                            symbol = source_item['symbol']
+                                            symbol_key = str(symbol).strip().upper()
+                                            feedback_candidate = by_symbol.get(symbol_key, {}).get('feedback')
+                                            if not isinstance(feedback_candidate, dict):
+                                                contract_failure = 'response_contract_invalid:feedback_missing'
+                                                break
+                                            normalized_feedback = _normalize_symbol_feedback(
+                                                normalize_agent_response=normalize_agent_response,
+                                                role=spec.role,
+                                                agent_name=spec.agent_name,
+                                                feedback_candidate=feedback_candidate,
+                                                market_date=(
+                                                    source_item.get('market_date')
+                                                    or normalized_market_date.isoformat()
+                                                ),
+                                                symbol=symbol,
                                             )
-                                            failure_mode = response_correlation.get('failure_mode')
+                                            normalized_contract_failure = _normalized_feedback_contract_failure(
+                                                normalized_feedback
+                                            )
+                                            if normalized_contract_failure is not None:
+                                                contract_failure = normalized_contract_failure
+                                                contract_mismatch_flags = _extract_response_mismatch_flags(
+                                                    normalized_feedback
+                                                )
+                                                contract_snapshot = build_normalized_feedback_snapshot(
+                                                    normalized_feedback
+                                                )
+                                                break
+                                            staged_feedback.append(
+                                                (source_item, feedback_candidate, normalized_feedback)
+                                            )
+
+                                    if contract_failure is not None:
+                                        failure_class = (
+                                            'response_identity_mismatch'
+                                            if contract_failure.startswith('response_identity_mismatch:')
+                                            else contract_failure
+                                        )
+                                        failure_kind = failure_class
+                                        failure_mode = response_correlation.get('failure_mode') or failure_class
+                                        diagnostics = (
+                                            response_correlation.get('response_recovery')
+                                            if isinstance(response_correlation.get('response_recovery'), dict)
+                                            else None
+                                        )
+                                        for source_item in batch:
+                                            symbol = source_item['symbol']
+                                            dispatch_context = _resolve_batch_dispatch_context(
+                                                batch_result=batch_result,
+                                                source_item=source_item,
+                                                batch=batch,
+                                                slot=slot,
+                                            )
+                                            dispatch_id = dispatch_context['dispatch_id']
+                                            attempt_id = dispatch_context['attempt_id']
+                                            batch_symbols = dispatch_context['batch_symbols']
+                                            session_key = dispatch_context['session_key']
+                                            session_id = dispatch_context.get('session_id')
+                                            response_id = dispatch_context.get('response_id')
+                                            request_marker = dispatch_context.get('request_marker')
                                             failure_context = {
                                                 **source_item,
+                                                'contract_failure': contract_failure,
                                                 'response_correlation': response_correlation or None,
                                             }
+                                            if contract_mismatch_flags:
+                                                failure_context['mismatch_flags'] = contract_mismatch_flags
+                                            if contract_snapshot is not None:
+                                                failure_context['normalized_feedback_snapshot'] = contract_snapshot
                                             failure = _build_failed_dispatch_item(
                                                 role=role,
                                                 agent_name=spec.agent_name,
                                                 symbol=symbol,
                                                 error=str(failure_class),
                                                 retryable=True,
-                                                failure_kind=str(failure_mode or failure_class),
+                                                failure_kind=str(failure_kind),
                                                 context=failure_context,
                                                 dispatch_id=dispatch_id,
                                                 attempt_id=attempt_id,
@@ -4017,11 +4067,7 @@ class AgentFeedbackOrchestrator:
                                                 session_id=session_id,
                                                 response_id=response_id,
                                                 request_marker=request_marker,
-                                                diagnostics=(
-                                                    response_correlation.get('response_recovery')
-                                                    if isinstance(response_correlation.get('response_recovery'), dict)
-                                                    else None
-                                                ),
+                                                diagnostics=diagnostics,
                                                 batch_symbols=batch_symbols,
                                             )
                                             all_failures.append(failure)
@@ -4041,19 +4087,27 @@ class AgentFeedbackOrchestrator:
                                                 session_id=session_id,
                                                 response_id=response_id,
                                                 request_marker=request_marker,
-                                                error_type='MissingBatchFeedback',
+                                                error_type=(
+                                                    'ResponseIdentityMismatch'
+                                                    if failure_class == 'response_identity_mismatch'
+                                                    else 'ResponseContractInvalid'
+                                                ),
                                                 error_message=str(failure_class),
                                                 failure_class=failure_class,
                                                 failure_mode=failure_mode,
+                                                contract_failure=contract_failure,
+                                                mismatch_flags=contract_mismatch_flags,
                                                 response_symbols=response_symbols,
-                                                response_correlation=response_correlation,
+                                                attribution_status=response_correlation.get('attribution_status'),
+                                                response_correlation=response_correlation or None,
+                                                normalized_feedback_snapshot=contract_snapshot,
                                             )
                                             buffer_failure(
                                                 role,
                                                 symbol,
                                                 str(failure_class),
                                                 True,
-                                                failure_kind=str(failure_mode or failure_class),
+                                                failure_kind=str(failure_kind),
                                                 context=failure_context,
                                                 agent_name=spec.agent_name,
                                                 dispatch_id=dispatch_id,
@@ -4063,53 +4117,26 @@ class AgentFeedbackOrchestrator:
                                                 session_id=session_id,
                                                 response_id=response_id,
                                                 request_marker=request_marker,
-                                                diagnostics=(
-                                                    response_correlation.get('response_recovery')
-                                                    if isinstance(response_correlation.get('response_recovery'), dict)
-                                                    else None
-                                                ),
+                                                diagnostics=diagnostics,
                                                 batch_symbols=batch_symbols,
                                             )
-                                            staged_batch_outcomes = True
-                                            continue
-                                        normalized_feedback = _normalize_symbol_feedback(
-                                            normalize_agent_response=normalize_agent_response,
-                                            role=spec.role,
-                                            agent_name=spec.agent_name,
-                                            feedback_candidate=feedback_candidate,
-                                            market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
-                                            symbol=symbol,
-                                        )
-                                        mismatch_flags = _extract_response_mismatch_flags(normalized_feedback)
-                                        normalization_status = 'accepted_with_warnings' if mismatch_flags else 'accepted'
-                                        log_agent_feedback_event(
-                                            'normalized_response_accepted',
-                                            status=normalization_status,
-                                            market_date=normalized_market_date.isoformat(),
-                                            request_run_id=request_run_id,
-                                            dispatch_id=dispatch_id,
-                                            attempt_id=attempt_id,
-                                            role=role,
-                                            agent_name=spec.agent_name,
-                                            symbol=symbol,
-                                            batch_symbols=batch_symbols,
-                                            slot=slot,
-                                            session_key=session_key,
-                                            session_reuse_mode=batch_result.get('session_reuse_mode'),
-                                            normalized_feedback_snapshot=build_normalized_feedback_snapshot(normalized_feedback),
-                                            mismatch_flags=mismatch_flags,
-                                            attribution_status=response_correlation.get('attribution_status'),
-                                            response_correlation=response_correlation or None,
-                                            response_symbol=(
-                                                feedback_candidate.get('symbol')
-                                                if isinstance(feedback_candidate, dict)
-                                                else None
-                                            ),
-                                        )
-                                        if mismatch_flags:
+                                    else:
+                                        for source_item, feedback_candidate, normalized_feedback in staged_feedback:
+                                            symbol = source_item['symbol']
+                                            dispatch_context = _resolve_batch_dispatch_context(
+                                                batch_result=batch_result,
+                                                source_item=source_item,
+                                                batch=batch,
+                                                slot=slot,
+                                            )
+                                            dispatch_id = dispatch_context['dispatch_id']
+                                            attempt_id = dispatch_context['attempt_id']
+                                            batch_symbols = dispatch_context['batch_symbols']
+                                            session_key = dispatch_context['session_key']
+                                            mismatch_flags = _extract_response_mismatch_flags(normalized_feedback)
                                             log_agent_feedback_event(
-                                                'normalized_response_mismatch',
-                                                status='warning',
+                                                'normalized_response_accepted',
+                                                status='accepted',
                                                 market_date=normalized_market_date.isoformat(),
                                                 request_run_id=request_run_id,
                                                 dispatch_id=dispatch_id,
@@ -4121,26 +4148,34 @@ class AgentFeedbackOrchestrator:
                                                 slot=slot,
                                                 session_key=session_key,
                                                 session_reuse_mode=batch_result.get('session_reuse_mode'),
+                                                normalized_feedback_snapshot=build_normalized_feedback_snapshot(
+                                                    normalized_feedback
+                                                ),
                                                 mismatch_flags=mismatch_flags,
                                                 attribution_status=response_correlation.get('attribution_status'),
                                                 response_correlation=response_correlation or None,
-                                                normalized_feedback_snapshot=build_normalized_feedback_snapshot(normalized_feedback),
+                                                response_symbol=feedback_candidate.get('symbol'),
                                             )
-                                        response_payload_item = _build_response_storage_payload(
-                                            spec=spec,
-                                            batch_result=batch_result,
-                                            normalized_feedback=normalized_feedback,
-                                            collector_mode='role_sequential_runtime_buffered',
-                                        )
-                                        buffer_success(spec.agent_name, symbol, source_item, response_payload_item)
-                                        all_items.append(
-                                            _build_completed_dispatch_item(
-                                                role=role,
-                                                agent_name=spec.agent_name,
-                                                symbol=symbol,
+                                            response_payload_item = _build_response_storage_payload(
+                                                spec=spec,
+                                                batch_result=batch_result,
                                                 normalized_feedback=normalized_feedback,
+                                                collector_mode='role_sequential_runtime_buffered',
                                             )
-                                        )
+                                            buffer_success(
+                                                spec.agent_name,
+                                                symbol,
+                                                source_item,
+                                                response_payload_item,
+                                            )
+                                            all_items.append(
+                                                _build_completed_dispatch_item(
+                                                    role=role,
+                                                    agent_name=spec.agent_name,
+                                                    symbol=symbol,
+                                                    normalized_feedback=normalized_feedback,
+                                                )
+                                            )
                                     staged_batch_outcomes = True
                                 except Exception as exc:
                                     error_details = exc.details if isinstance(exc, AgentDispatchError) else {}

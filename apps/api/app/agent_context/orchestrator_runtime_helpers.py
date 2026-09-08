@@ -20,6 +20,138 @@ from app.agent_context.orchestrator_helpers import (
 )
 
 
+def batch_response_contract_failure(batch_result: dict[str, Any]) -> str | None:
+    response_correlation = (
+        batch_result.get('response_correlation')
+        if isinstance(batch_result.get('response_correlation'), dict)
+        else None
+    )
+    if response_correlation is None:
+        return 'batch_response_correlation_missing'
+    failure_class = str(response_correlation.get('failure_class') or '').strip()
+    attribution_status = str(response_correlation.get('attribution_status') or '').strip().lower()
+    if failure_class:
+        return failure_class
+    if attribution_status != 'matched':
+        return 'batch_response_attribution_mismatch'
+    if response_correlation.get('item_count_matches') is not True:
+        return 'batch_response_attribution_mismatch'
+    return None
+
+
+def normalized_feedback_contract_failure(normalized_feedback: dict[str, Any]) -> str | None:
+    missing_identity_fields = [
+        field
+        for field in ('symbol', 'market_date')
+        if not str(normalized_feedback.get(field) or '').strip()
+    ]
+    if missing_identity_fields:
+        return f"response_identity_missing:{','.join(missing_identity_fields)}"
+    mismatch_flags = [
+        str(flag).strip()
+        for flag in (normalized_feedback.get('structural_mismatch_flags') or [])
+        if str(flag).strip()
+    ]
+    schema_violation_flags = [
+        str(flag).strip()
+        for flag in (normalized_feedback.get('response_schema_violation_flags') or [])
+        if str(flag).strip()
+    ]
+    if mismatch_flags:
+        return f"response_identity_mismatch:{','.join(mismatch_flags)}"
+    if schema_violation_flags:
+        return f"response_contract_invalid:{','.join(schema_violation_flags)}"
+    if normalized_feedback.get('response_contract_valid') is not True:
+        if 'response_contract_valid' not in normalized_feedback:
+            return 'response_contract_verdict_missing'
+        return 'response_contract_invalid'
+    return None
+
+
+def cleanup_fresh_batch_session(
+    orchestrator,
+    *,
+    market_date: date,
+    batch: Sequence[dict[str, Any]],
+    agent_name: str,
+    request_run_id: str,
+) -> dict[str, Any]:
+    session_key = str(batch[0].get('session_key') or '').strip() if batch else ''
+    symbol = str(batch[0].get('symbol') or '').strip() if batch else ''
+    if not session_key:
+        return {
+            'status': 'skipped',
+            'reason': 'fresh_batch_session_key_missing',
+            'agent_name': agent_name,
+            'symbol': symbol,
+        }
+    try:
+        result = orchestrator._cleanup_session_key(
+            market_date=market_date,
+            symbol=symbol,
+            agent_name=agent_name,
+            run_id=request_run_id,
+            session_key=session_key,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            'status': 'deferred',
+            'reason': 'fresh_batch_session_cleanup_failed',
+            'session_key': session_key,
+            'agent_name': agent_name,
+            'symbol': symbol,
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+        }
+    if isinstance(result, dict):
+        return result
+    return {
+        'status': 'unknown',
+        'reason': 'fresh_batch_session_cleanup_returned_non_object',
+        'session_key': session_key,
+        'agent_name': agent_name,
+        'symbol': symbol,
+    }
+
+
+def cleanup_single_dispatch_session(
+    orchestrator,
+    *,
+    market_date: date,
+    symbol: str,
+    agent_name: str,
+    request_run_id: str,
+    session_key: str,
+) -> dict[str, Any]:
+    try:
+        result = orchestrator._cleanup_session_key(
+            market_date=market_date,
+            symbol=symbol,
+            agent_name=agent_name,
+            run_id=request_run_id,
+            session_key=session_key,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            'status': 'deferred',
+            'reason': 'single_dispatch_session_cleanup_failed',
+            'session_key': session_key,
+            'agent_name': agent_name,
+            'symbol': symbol,
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+        }
+    if isinstance(result, dict):
+        return result
+    return {
+        'status': 'unknown',
+        'reason': 'single_dispatch_session_cleanup_returned_non_object',
+        'session_key': session_key,
+        'agent_name': agent_name,
+        'symbol': symbol,
+    }
+
+
 def build_buffer_counts(snapshot: Any | None) -> dict[str, int | None]:
     if snapshot is None:
         return {
@@ -153,38 +285,77 @@ def dispatch_and_store(
     items: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     for spec in specs:
-        payload = payloads[spec.role]
+        payload = dict(payloads[spec.role])
+        session_key = str(payload.get('session_key') or '').strip()
+        if not session_key:
+            session_key = f'agent:{spec.agent_name}:feedback/{spec.agent_name}/{request_run_id}'
+            payload['session_key'] = session_key
         response: dict[str, Any] | None = None
+        stored: dict[str, Any] | None = None
+        failure: dict[str, Any] | None = None
         try:
             response = orchestrator._get_client().dispatch(spec=spec, payload=payload)
-            stored = orchestrator._store_feedback(
-                market_date=market_date,
-                agent_name=spec.agent_name,
-                run_id=request_run_id,
-                payload={'role': spec.role, 'symbol': symbol},
-                response=response,
-                context=payload,
+            normalized_feedback = (
+                response.get('normalized_feedback')
+                if isinstance(response.get('normalized_feedback'), dict)
+                else {}
             )
-            items.append(
-                build_completed_dispatch_item(
+            contract_failure = normalized_feedback_contract_failure(normalized_feedback)
+            if contract_failure is not None:
+                failure = build_failed_dispatch_item(
                     role=spec.role,
                     agent_name=spec.agent_name,
                     symbol=symbol,
-                    normalized_feedback=response.get('normalized_feedback') or {},
-                    storage=stored,
+                    retryable=True,
+                    error=contract_failure,
+                    failure_kind=contract_failure,
+                    context=payload,
+                    session_key=session_key,
                 )
-            )
+            else:
+                stored = orchestrator._store_feedback(
+                    market_date=market_date,
+                    agent_name=spec.agent_name,
+                    run_id=request_run_id,
+                    payload={'role': spec.role, 'symbol': symbol},
+                    response=response,
+                    context=payload,
+                    cleanup_session=False,
+                )
         except Exception as exc:  # noqa: BLE001
             retryable = exc.__class__.__name__ != 'AgentDispatchTerminalError'
-            failures.append(
-                build_failed_dispatch_item(
-                    role=spec.role,
-                    agent_name=spec.agent_name,
-                    symbol=symbol,
-                    retryable=retryable,
-                    error=str(exc),
-                )
+            failure = build_failed_dispatch_item(
+                role=spec.role,
+                agent_name=spec.agent_name,
+                symbol=symbol,
+                retryable=retryable,
+                error=str(exc),
+                context=payload,
+                session_key=session_key,
             )
+        cleanup_result = cleanup_single_dispatch_session(
+            orchestrator,
+            market_date=market_date,
+            symbol=symbol,
+            agent_name=spec.agent_name,
+            request_run_id=request_run_id,
+            session_key=session_key,
+        )
+        if failure is not None:
+            failure['diagnostics'] = {'session_cleanup': cleanup_result}
+            failures.append(failure)
+            continue
+        stored = dict(stored or {})
+        stored['session_cleanup'] = cleanup_result
+        items.append(
+            build_completed_dispatch_item(
+                role=spec.role,
+                agent_name=spec.agent_name,
+                symbol=symbol,
+                normalized_feedback=response.get('normalized_feedback') or {},
+                storage=stored,
+            )
+        )
     return items, failures
 
 
@@ -250,6 +421,7 @@ def dispatch_for_symbols_via_subagents(
     )
     items: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    session_cleanup: list[dict[str, Any]] = []
     batch_size = 2
     role_worker_count = max(1, int(per_role_parallelism))
     total_max_workers = max(1, len(specs) * role_worker_count)
@@ -260,11 +432,17 @@ def dispatch_for_symbols_via_subagents(
         for batch_index, start in enumerate(range(0, len(dispatch_items), batch_size)):
             slot = (batch_index % role_worker_count) + 1
             batch = dispatch_items[start:start + batch_size]
+            batch_session_key = (
+                f'agent:{spec.agent_name}:feedback-fresh/{spec.agent_name}/'
+                f'{request_run_id}/batch-{batch_index + 1:03d}/{uuid.uuid4().hex[:10]}'
+            )
             batch_with_session = [
                 {
                     **batch_item,
                     'session_slot': slot,
-                    'session_key': f"feedback/{spec.agent_name}/slot-{slot:02d}",
+                    'session_key': batch_session_key,
+                    'session_reuse_mode': 'fresh_per_batch',
+                    'request_run_id': request_run_id,
                 }
                 for batch_item in batch
             ]
@@ -284,26 +462,34 @@ def dispatch_for_symbols_via_subagents(
             spec, batch = future_map[future]
             try:
                 batch_result = future.result()
+                batch_contract_failure = batch_response_contract_failure(batch_result)
+                if batch_contract_failure is not None:
+                    failures.extend(
+                        build_failed_dispatch_item(
+                            role=spec.role,
+                            agent_name=spec.agent_name,
+                            symbol=source_item['symbol'],
+                            retryable=True,
+                            error=batch_contract_failure,
+                            failure_kind=batch_contract_failure,
+                        )
+                        for source_item in batch
+                    )
+                    continue
                 decoded_items = batch_result.get('decoded', {}).get('items', [])
                 by_symbol = {
                     item['symbol']: item
                     for item in decoded_items
                     if isinstance(item, dict) and item.get('symbol')
                 }
+                staged_feedback: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                normalized_contract_failure: str | None = None
                 for source_item in batch:
                     symbol = source_item['symbol']
                     feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
-                    if not feedback_candidate:
-                        failures.append(
-                            build_failed_dispatch_item(
-                                role=spec.role,
-                                agent_name=spec.agent_name,
-                                symbol=symbol,
-                                retryable=True,
-                                error='parent_slot_missing_symbol_feedback',
-                            )
-                        )
-                        continue
+                    if not isinstance(feedback_candidate, dict):
+                        normalized_contract_failure = 'response_contract_invalid:feedback_missing'
+                        break
                     normalized_feedback = normalize_symbol_feedback(
                         normalize_agent_response=normalize_agent_response,
                         role=spec.role,
@@ -312,6 +498,32 @@ def dispatch_for_symbols_via_subagents(
                         market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
                         symbol=symbol,
                     )
+                    normalized_contract_failure = normalized_feedback_contract_failure(normalized_feedback)
+                    if normalized_contract_failure is not None:
+                        break
+                    staged_feedback.append((source_item, normalized_feedback))
+
+                if normalized_contract_failure is not None:
+                    failure_kind = (
+                        'response_identity_mismatch'
+                        if normalized_contract_failure.startswith('response_identity_mismatch:')
+                        else normalized_contract_failure
+                    )
+                    failures.extend(
+                        build_failed_dispatch_item(
+                            role=spec.role,
+                            agent_name=spec.agent_name,
+                            symbol=source_item['symbol'],
+                            retryable=True,
+                            error=normalized_contract_failure,
+                            failure_kind=failure_kind,
+                        )
+                        for source_item in batch
+                    )
+                    continue
+
+                for source_item, normalized_feedback in staged_feedback:
+                    symbol = source_item['symbol']
                     stored = orchestrator._store_feedback(
                         market_date=normalized_market_date,
                         agent_name=spec.agent_name,
@@ -324,6 +536,7 @@ def dispatch_for_symbols_via_subagents(
                             collector_mode='slot_parent_subagent_fanout',
                         ),
                         context=source_item,
+                        cleanup_session=False,
                     )
                     items.append(
                         build_completed_dispatch_item(
@@ -346,6 +559,16 @@ def dispatch_for_symbols_via_subagents(
                             error=f'{type(exc).__name__}: {exc}',
                         )
                     )
+            finally:
+                session_cleanup.append(
+                    cleanup_fresh_batch_session(
+                        orchestrator,
+                        market_date=normalized_market_date,
+                        batch=batch,
+                        agent_name=spec.agent_name,
+                        request_run_id=request_run_id,
+                    )
+                )
 
     status = resolve_dispatch_status(completed=len(items), failed=len(failures))
 
@@ -375,4 +598,5 @@ def dispatch_for_symbols_via_subagents(
         },
         'items': items,
         'failures': failures,
+        'session_cleanup': session_cleanup,
     }

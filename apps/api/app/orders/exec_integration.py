@@ -57,6 +57,8 @@ from app.orders.exec_payload_slimming import (
 from app.orders.next_open_execution import (
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
+    ELIGIBILITY_MONITOR_CANDIDATE,
+    EXECUTION_STATUS_AWAITING_TRIGGER,
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
     EXECUTION_STATUS_PLANNED,
     EXECUTION_STATUS_SUBMIT_FAILED,
@@ -102,6 +104,7 @@ EXEC_DISPATCH_STATUS_ALREADY_DISPATCHED = 'already_dispatched'
 EXEC_DISPATCH_STATUS_NOT_CONFIGURED = 'not_configured'
 EXEC_DISPATCH_STATUS_CONTRACT_ERROR = 'contract_error'
 EXEC_DISPATCH_STATUS_UNAVAILABLE = 'unavailable'
+MULTI_ACCOUNT_EXEC_ENDPOINT_UNSUPPORTED = 'multi_account_exec_endpoint_unsupported'
 
 REMOTE_FETCH_STATUS_OK = 'ok'
 REMOTE_FETCH_STATUS_DISABLED = 'disabled'
@@ -413,6 +416,15 @@ def _sanitize_key(value: str) -> str:
 def _normalize_decision_agent_name(value: Any) -> str:
     normalized = _normalize_optional_text(value, lowercase=True)
     return normalized or SIGNAL_DECIDER_AGENT_NAME
+
+
+def _normalize_short_term_generic_action(*, raw_action: Any, generic_action: Any) -> Any:
+    tactical_action = _normalize_optional_text(raw_action, lowercase=True)
+    if tactical_action == 'watch_for_trigger':
+        return 'monitor_candidate'
+    if tactical_action == 'scalp_buy_candidate':
+        return 'buy'
+    return generic_action
 
 
 def _collect_items(payload: Any) -> list[dict[str, Any]]:
@@ -845,6 +857,21 @@ class SignalDeciderExecIntegrationService:
                     message='SIGNAL_DECIDER_EXEC_BASE_URL must be configured when exec integration is enabled.',
                 )
             )
+        configured_account_targets, _ = signal_decider_next_open_execution_service._parse_account_targets()
+        if mode == INTEGRATION_MODE_DISPATCH and len(configured_account_targets) > 1:
+            issues.append(
+                {
+                    **_serialize_error(
+                        code=MULTI_ACCOUNT_EXEC_ENDPOINT_UNSUPPORTED,
+                        message=(
+                            'One Exec base URL cannot safely prove routing for multiple explicit account targets; '
+                            'configure one account target per Exec endpoint before dispatch.'
+                        ),
+                    ),
+                    'configured_account_target_count': len(configured_account_targets),
+                    'required_contract': 'one_explicit_account_target_per_exec_endpoint',
+                }
+            )
         runtime_mode = _normalize_optional_text(settings.signal_decider_exec_runtime_mode, lowercase=True) or 'mock'
         config_status = 'ready'
         if not enabled:
@@ -1233,6 +1260,10 @@ class SignalDeciderExecIntegrationService:
                         'already_dispatched_count': len(already_dispatched_rows),
                         'dispatch_candidate_count': len(dispatch_rows),
                         'translated_item_count': len(plan_payload['items']),
+                        'error': integration['issues'][0] if integration['issues'] else _serialize_error(
+                            code='not_configured',
+                            message='Exec integration is not configured.',
+                        ),
                     }
                 )
                 continue
@@ -2962,9 +2993,12 @@ class SignalDeciderExecIntegrationService:
 
     @staticmethod
     def _row_is_dispatchable(row: SignalDeciderExecutionPlanItem) -> bool:
-        if row.eligibility_status != ELIGIBILITY_ELIGIBLE:
-            return False
         decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
+        if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
+            if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
+                return False
+        elif row.eligibility_status != ELIGIBILITY_ELIGIBLE:
+            return False
         if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
             return True
         validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
@@ -3063,9 +3097,10 @@ class SignalDeciderExecIntegrationService:
             decision_agent_name=row_decision_agent_name,
         )
         raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
-        generic_action = traceability.get('generic_action')
-        if generic_action is None and raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}:
-            generic_action = 'buy'
+        generic_action = _normalize_short_term_generic_action(
+            raw_action=raw_action,
+            generic_action=traceability.get('generic_action'),
+        )
         handoff_intent = traceability.get('handoff_intent')
         if handoff_intent is None and row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             if raw_action == 'scalp_buy_candidate':
@@ -3311,9 +3346,10 @@ class SignalDeciderExecIntegrationService:
             trigger_price = traceability.get('trigger_price')
             chase_limit_price = traceability.get('chase_limit_price')
             raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
-            generic_action = traceability.get('generic_action')
-            if generic_action is None and raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}:
-                generic_action = 'buy'
+            generic_action = _normalize_short_term_generic_action(
+                raw_action=raw_action,
+                generic_action=traceability.get('generic_action'),
+            )
             handoff_intent = (
                 _normalize_optional_text(traceability.get('handoff_intent'), lowercase=True)
                 or (
@@ -4233,7 +4269,7 @@ class SignalDeciderExecIntegrationService:
         original_execution_status = _normalize_optional_text(row.execution_status, lowercase=True)
         core_needs_exec_watch_sync = bool(
             original_eligibility_status == ELIGIBILITY_BLOCKED
-            or original_execution_status == EXECUTION_STATUS_PLANNED
+            or original_execution_status in {EXECUTION_STATUS_PLANNED, EXECUTION_STATUS_AWAITING_TRIGGER}
             or original_execution_status == EXECUTION_STATUS_SUBMIT_FAILED
         )
         if not core_needs_exec_watch_sync:
@@ -4650,9 +4686,10 @@ class SignalDeciderExecIntegrationService:
         dispatch_status = _normalize_status(exec_dispatch.get('dispatch_status'))
         derived_state = readback.get('derived_state') if isinstance(readback.get('derived_state'), dict) else {}
         raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
-        generic_action = traceability.get('generic_action')
-        if generic_action is None and raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}:
-            generic_action = 'buy'
+        generic_action = _normalize_short_term_generic_action(
+            raw_action=raw_action,
+            generic_action=traceability.get('generic_action'),
+        )
         handoff_intent = traceability.get('handoff_intent')
         if handoff_intent is None and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             if raw_action == 'scalp_buy_candidate':
@@ -4661,7 +4698,7 @@ class SignalDeciderExecIntegrationService:
                 handoff_intent = EXEC_INTENT_INTRADAY_WATCH_BUY
         handoff_active = bool(traceability.get('handoff_active')) or bool(
             decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-            and item.get('eligibility_status') == ELIGIBILITY_ELIGIBLE
+            and item.get('eligibility_status') in {ELIGIBILITY_ELIGIBLE, ELIGIBILITY_MONITOR_CANDIDATE}
             and handoff_intent in {'tactical_buy', EXEC_INTENT_INTRADAY_WATCH_BUY}
         )
         dispatch_payload = {
@@ -4696,7 +4733,8 @@ class SignalDeciderExecIntegrationService:
         active_exec_statuses = self._entry_link_active_statuses(item_links=dispatch_payload.get('item_links') or [])
         core_was_blocked_or_planned = bool(
             item.get('eligibility_status') == ELIGIBILITY_BLOCKED
-            or _normalize_status(item.get('execution_status')) == EXECUTION_STATUS_PLANNED
+            or _normalize_status(item.get('execution_status'))
+            in {EXECUTION_STATUS_PLANNED, EXECUTION_STATUS_AWAITING_TRIGGER}
         )
         sync_audit = (
             exec_dispatch.get('core_state_sync')
