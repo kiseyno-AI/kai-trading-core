@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME
 from app.agent_context.signal_decider_calibration_service import SignalDeciderCalibrationService
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
@@ -4442,6 +4443,46 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         )
         self.assertEqual(exclusion['canonical_decision_action'], 'buy')
         self.assertEqual(exclusion['evaluation_decision_action'], 'wait')
+        self.assertTrue(exclusion['recompute_required'])
+        self.assertEqual(result['summary']['decision_action_counts'], {'buy': 1, 'wait': 2})
+
+    def test_signal_decider_calibration_excludes_invalid_short_term_source_payload(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            source_row = next(row for row in loop_service.repository.snapshot_rows if row.id == 101)
+            source_row.agent_name = SHORT_TERM_DECIDER_AGENT_NAME
+            source_row.response_payload = {}
+
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        self.assertEqual(result['summary']['mature_computed_count'], 3)
+        self.assertEqual(
+            result['exclusions']['status_reason_counts']['invalid_short_term_tactical_action'],
+            1,
+        )
+        exclusion = next(
+            item for item in result['exclusions']['items'] if item['snapshot_id'] == 101
+        )
+        self.assertIsNone(exclusion['canonical_decision_action'])
+        self.assertEqual(exclusion['evaluation_decision_action'], 'buy')
+        self.assertTrue(exclusion['source_correction_required'])
         self.assertTrue(exclusion['recompute_required'])
         self.assertEqual(result['summary']['decision_action_counts'], {'buy': 1, 'wait': 2})
 
