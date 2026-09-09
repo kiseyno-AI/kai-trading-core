@@ -47,7 +47,7 @@
 44. BTC/ETH Upbit crypto strategy context read route for paper/research decision support
 
 ## Current routes
-- `POST /broker/kis/token`
+- `POST /broker/kis/token` (operator Bearer auth required; sanitized token metadata only)
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930,000660&market_code=J&max_ranking_pages=2&max_news_items=5&include_news=true`
