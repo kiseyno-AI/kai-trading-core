@@ -138,6 +138,63 @@ Required or integration-specific secrets include KIS, DART, BOK/ECOS, Korea Exim
 
 Production portfolio summaries additionally require valid KIS credentials and `PORTFOLIO_ACCOUNT_REFERENCES`. See `.env.example` for bounded concurrency, freshness, and safety defaults before tuning collection throughput.
 
+### KIS OAuth token cache (Core/Exec shared contract)
+
+Core follows the [official KIS open-trading-api examples](https://github.com/koreainvestment/open-trading-api) principle of reusing a token before it must be refreshed and keeping production and demo credentials separate. Every Core and Exec process that uses the same KIS credential must point `KIS_TOKEN_CACHE_DIRECTORY` at the same local directory. The default is `~/.cache/kai-trading/kis-oauth-tokens`; `~` is expanded before use, and relative, root, home, symlinked, or otherwise unsafe locations are rejected.
+
+#### On-disk v1 contract
+
+All JSON records use `schema_version: 1` and the same canonical identity.
+
+| Area | Contract |
+| --- | --- |
+| Identity | `environment` is `real` or `demo`. `credential_fingerprint` is `hmac-sha256:` plus `HMAC-SHA256(key=app_secret, message="kis-token-cache-v1\0{environment}\0{app_key}")`; `\0` is a NUL-byte separator. Raw app keys and secrets are never written. |
+| Files | The prefix is `{environment}-{first_32_fingerprint_hex}` and the suffixes are `.token.json`, `.lock`, and `.failure.json`. The owning user must own the `0700` directory and regular, singly linked `0600` files. Existing safe files and unknown optional JSON fields are accepted. Unsafe paths/files, malformed JSON, duplicate keys, non-finite values, and identity/schema mismatches fail closed before OAuth issuance. |
+| Token | A `token` record contains a canonical UUID `generation`, header-safe token68 `access_token`, `token_type: "Bearer"`, and UTC RFC 3339 `issued_at`, `expires_at`, and `refresh_after`. `issued_at` is response-received time. `expires_at` is the earlier of request-start plus `expires_in` and the strictly parsed KIS `access_token_token_expired` KST timestamp. `refresh_after` already includes the margin and must still be future when the response arrives; readers must not subtract a second margin. |
+| Issuance ledger | `.failure.json` contains `failure`, `issuance_attempt`, or `issuance_success`. It shares failures, preserves ambiguous/crashed attempts, and enforces the minimum issuance interval even if the token file disappears. A positive cooldown shorter than the reader's local floor is extended in memory; zero, negative, over-one-hour, or future-start records fail closed. An attempt's `invalidates_generation` permanently prevents revival of that older token: callers wait during the lease, then exactly one may issue a replacement. |
+| Revocation | `invalidate_if_matches(...)` runs under the shared lock. Supplied token bytes are authoritative; generation is only a fallback when token bytes are unavailable. A different current token is preserved. A match becomes a `revocation` tombstone with a SHA-256 token fingerprint and `not_before`, never the raw token. The maximum valid tombstone window is the maximum one-hour issue interval plus five minutes of allowed token clock skew. HTTP `401` and business error `EGW00123` invoke this CAS path; broker GETs and order POSTs are not replayed. Exec must use the same CAS rule and pass its force flag through authentication. |
+
+#### Concurrency and crash ordering
+
+The stable `.lock` serializes state decisions and OAuth requests across processes. Cache reads, writes, and `fsync` calls run outside the async event-loop thread while the process continues to hold that lock. `force_refresh` ignores the caller's old generation, adopts a generation just written by a peer, and never bypasses the minimum issue interval.
+
+The crash-safe order under the lock is:
+
+1. Atomically write and `fsync` `issuance_attempt`.
+2. Call `tokenP`.
+3. Atomically write and file/directory-`fsync` the token.
+4. Atomically write and `fsync` `issuance_success`.
+
+Never write success before the token. While a success ledger is active, a missing or mismatched token is not reused. After the interval, exactly one caller may repair that torn state. A still-fresh token whose generation matches the ledger remains reusable.
+
+#### Timing and clock requirement
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `KIS_TOKEN_REFRESH_MARGIN_SECONDS` | `300` | Proactive refresh margin, applied once by the writer |
+| `KIS_TOKEN_FAILURE_COOLDOWN_SECONDS` | `60` | Shared explicit-failure cooldown |
+| `KIS_TOKEN_REQUEST_TIMEOUT_SECONDS` | `15` | Whole token-request deadline |
+| `KIS_TOKEN_ISSUANCE_LEASE_SECONDS` | `90` | Ambiguous/crashed-request lease |
+| `KIS_TOKEN_MIN_ISSUE_INTERVAL_SECONDS` | `60` | Hard minimum interval between issuances |
+
+The lease must be at least request timeout plus minimum issue interval; startup rejects a shorter value. Failures and timeouts cool down for at least the minimum interval. Core and Exec must use aligned values, including this relationship when Exec has a longer timeout.
+
+Durable cross-process records necessarily use UTC wall-clock time; a monotonic process clock cannot survive restarts or be compared by another process. Hosts sharing the directory must therefore maintain stable NTP-synchronized clocks and avoid manual clock jumps. A forward jump can make a token or guard expire early; a backward jump can extend reuse/cooldown windows. Future failure/attempt/success starts fail closed, while token and revocation timestamps tolerate at most five minutes of skew and fail closed beyond it. Restore clock stability before retrying after a discontinuity.
+
+#### Token endpoint migration
+
+`POST /broker/kis/token` is an authenticated operator action, not a token-reading API. It is disabled with `503` unless `UPSTREAM_BEARER_TOKEN` is configured and requires exact `Authorization: Bearer <UPSTREAM_BEARER_TOKEN>` authentication. KIS routes return bounded errors without broker, token, account, or raw exception text.
+
+The response contract intentionally changed from returning `access_token` to metadata only:
+
+| Client behavior | Before | Now |
+| --- | --- | --- |
+| Read response | Consume `access_token` and possibly build a downstream Authorization header | Consume `access_token_present`, `token_type`, `expires_in`, `cached`, `refresh_deferred`, and optional `defer_reason` |
+| Broker authentication | Client could handle the raw KIS token | Remains server-side; clients must not expect or reconstruct the KIS bearer token |
+| Forced refresh | Treat success as a newly issued token | Inspect `refresh_deferred`/`defer_reason`; success may mean safe reuse because a peer refreshed or the minimum interval is active |
+
+Clients using the old raw-token response must migrate before deploying this API version. See the endpoint reference under `.codex/skills/fastapi-trading-api/references/api/` for the exact response and error shapes.
+
 ## HTTP API
 
 OpenAPI at `/docs` or `/redoc` is the authoritative endpoint-level reference. The implemented route groups are:

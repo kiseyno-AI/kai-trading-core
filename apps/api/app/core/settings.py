@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -61,7 +61,12 @@ class Settings(BaseSettings):
     market_snapshot_kis_use_real: bool = True
     market_snapshot_refresh_interval_seconds: int = 3600
     kis_hts_id: str = ''
-    kis_token_refresh_margin_seconds: int = 300
+    kis_token_refresh_margin_seconds: int = Field(default=300, ge=0, le=172_799)
+    kis_token_failure_cooldown_seconds: int = Field(default=60, ge=60, le=3600)
+    kis_token_request_timeout_seconds: int = Field(default=15, ge=1, le=120)
+    kis_token_issuance_lease_seconds: int = Field(default=90, ge=75, le=3600)
+    kis_token_min_issue_interval_seconds: int = Field(default=60, ge=60, le=3600)
+    kis_token_cache_directory: str = '~/.cache/kai-trading/kis-oauth-tokens'
     kis_realtime_trending_cache_ttl_seconds: int = 20
     kis_realtime_order_notice_enabled: bool = True
     kis_realtime_price_enabled: bool = True
@@ -286,6 +291,20 @@ class Settings(BaseSettings):
             return None
         normalized = str(value).strip()
         return normalized or None
+
+    @model_validator(mode='after')
+    def validate_kis_token_issuance_timing(self):
+        required_lease_seconds = (
+            self.kis_token_request_timeout_seconds
+            + self.kis_token_min_issue_interval_seconds
+        )
+        if self.kis_token_issuance_lease_seconds < required_lease_seconds:
+            raise ValueError(
+                'KIS_TOKEN_ISSUANCE_LEASE_SECONDS must be at least '
+                'KIS_TOKEN_REQUEST_TIMEOUT_SECONDS + '
+                'KIS_TOKEN_MIN_ISSUE_INTERVAL_SECONDS'
+            )
+        return self
 
 
 

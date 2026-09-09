@@ -26,6 +26,7 @@
 2. Fill in:
    - `KIS_APP_KEY`
    - `KIS_APP_SECRET`
+   - `UPSTREAM_BEARER_TOKEN` to enable authenticated token issuance
 3. Keep `KIS_USE_MOCK=true` for initial testing
 4. Optional intraday snapshot knobs:
    - `KIS_INTRADAY_SNAPSHOT_ENABLED=true`
@@ -45,7 +46,7 @@
 ## Test routes
 - `GET /health`
 - `GET /broker/kis/health`
-- `POST /broker/kis/token`
+- `POST /broker/kis/token` with `Authorization: Bearer <UPSTREAM_BEARER_TOKEN>`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
 - `GET /quotes/realtime/monitored`
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930`
@@ -56,6 +57,7 @@
 
 ## Notes
 - Do not commit real secrets
+- The token route returns presence, cache, expiry, type, and safe defer metadata only. It never returns the raw KIS access token and is disabled when `UPSTREAM_BEARER_TOKEN` is unset.
 - Start with mock trading base URL first
 - `GET /market/snapshot` is the exception to the general mock-first guidance: it uses real-domain KIS market data by default because the selected index and investor-flow APIs do not exist on the mock domain. Keep `MARKET_SNAPSHOT_KIS_USE_REAL=true` and set `KOREAEXIM_API_KEY` alongside the KIS credentials when you need that route.
 - KRX open-day checks use KIS `chk-holiday` `opnd_yn` as the primary truth with a small in-process TTL cache. If KIS calendar data is unavailable, read-only market/status views can fall back to `exchange_calendars` with explicit `calendar_source` metadata; live order submission/dispatch paths fail closed unless an operator uses the existing `force=true` override.

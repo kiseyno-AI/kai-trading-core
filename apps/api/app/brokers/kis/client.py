@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 import httpx
 
+from app.brokers.kis.token_cache import (
+    CachedKISToken,
+    CachedKISTokenFailure,
+    CachedKISTokenRevocation,
+    KISTokenCacheError,
+    KISTokenCacheStore,
+    is_valid_bearer_token,
+    run_token_cache_io,
+)
 from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 from app.us_equities.kis_market_codes import to_kis_price_exchange
@@ -74,6 +86,39 @@ def _safe_json(response: httpx.Response) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _parse_token_expiry_seconds(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        seconds = value
+    elif (
+        isinstance(value, str)
+        and len(value) <= 6
+        and value.isascii()
+        and value.isdigit()
+    ):
+        seconds = int(value)
+    else:
+        return None
+    return seconds if 0 < seconds <= 172_800 else None
+
+
+_KIS_TOKEN_EXPIRY_PATTERN = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
+_KIS_TIMEZONE = ZoneInfo('Asia/Seoul')
+
+
+def _parse_kis_token_expiry(value: object) -> datetime | None:
+    if not isinstance(value, str) or _KIS_TOKEN_EXPIRY_PATTERN.fullmatch(value) is None:
+        return None
+    try:
+        parsed = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+    except (ValueError, OverflowError):
+        return None
+    if parsed.strftime('%Y-%m-%d %H:%M:%S') != value:
+        return None
+    return parsed.replace(tzinfo=_KIS_TIMEZONE).astimezone(timezone.utc)
+
+
 class KISClient:
     def __init__(self, *, use_mock: bool | None = None) -> None:
         self.use_mock = settings.kis_use_mock if use_mock is None else bool(use_mock)
@@ -82,7 +127,11 @@ class KISClient:
             'access_token': '',
             'expires_at': datetime.min.replace(tzinfo=timezone.utc),
             'token_type': 'Bearer',
+            'cache_key': '',
+            'generation': '',
         }
+        self._token_lock = asyncio.Lock()
+        self._token_failure: tuple[str, datetime, KISClientError] | None = None
 
     def _environment(self) -> str:
         return 'demo' if self.use_mock else 'real'
@@ -90,12 +139,29 @@ class KISClient:
     def websocket_url(self) -> str:
         return settings.kis_realtime_mock_ws_url if self.use_mock else settings.kis_realtime_ws_url
 
-    def _get_cached_token(self) -> dict | None:
+    def _token_store(self) -> KISTokenCacheStore:
+        return KISTokenCacheStore(
+            directory=settings.kis_token_cache_directory,
+            environment=self._environment(),
+            app_key=settings.kis_app_key,
+            app_secret=settings.kis_app_secret,
+            minimum_issue_interval_seconds=(
+                settings.kis_token_min_issue_interval_seconds
+            ),
+            issuance_lease_seconds=settings.kis_token_issuance_lease_seconds,
+        )
+
+    def _get_cached_token(self, *, cache_key: str) -> dict | None:
         now = datetime.now(timezone.utc)
         cached_token = str(self._token_cache.get('access_token') or '')
         expires_at = self._token_cache.get('expires_at')
         token_type = str(self._token_cache.get('token_type') or 'Bearer')
-        if cached_token and isinstance(expires_at, datetime) and now < expires_at:
+        if (
+            self._token_cache.get('cache_key') == cache_key
+            and cached_token
+            and isinstance(expires_at, datetime)
+            and now < expires_at
+        ):
             return {
                 'access_token': cached_token,
                 'expires_in': int((expires_at - now).total_seconds()),
@@ -103,6 +169,184 @@ class KISClient:
                 'cached': True,
             }
         return None
+
+    def _clear_cached_token(self, *, cache_key: str) -> None:
+        if self._token_cache.get('cache_key') != cache_key:
+            return
+        self._token_cache = {
+            'access_token': '',
+            'expires_at': datetime.min.replace(tzinfo=timezone.utc),
+            'token_type': 'Bearer',
+            'cache_key': '',
+            'generation': '',
+        }
+
+    async def _invalidate_rejected_token(
+        self,
+        *,
+        store: KISTokenCacheStore,
+        access_token: str,
+        generation: str,
+    ) -> None:
+        try:
+            try:
+                await store.invalidate_if_matches(
+                    generation=generation or None,
+                    access_token=access_token,
+                    minimum_issue_interval_seconds=(
+                        settings.kis_token_min_issue_interval_seconds
+                    ),
+                )
+            except KISTokenCacheError as exc:
+                raise KISConfigurationError(
+                    'KIS token cache is not safe to invalidate'
+                ) from exc
+        finally:
+            if (
+                self._token_cache.get('cache_key') == store.cache_key
+                and self._token_cache.get('generation') == generation
+                and self._token_cache.get('access_token') == access_token
+            ):
+                self._clear_cached_token(cache_key=store.cache_key)
+
+    def _reuse_authoritative_token(
+        self,
+        store: KISTokenCacheStore,
+        state: CachedKISToken | CachedKISTokenRevocation | None,
+    ) -> dict | None:
+        if not isinstance(state, CachedKISToken):
+            self._clear_cached_token(cache_key=store.cache_key)
+            return None
+        if datetime.now(timezone.utc) >= state.refresh_after:
+            self._clear_cached_token(cache_key=store.cache_key)
+            return None
+        cached = self._get_cached_token(cache_key=store.cache_key)
+        if (
+            cached is not None
+            and self._token_cache.get('generation') == state.generation
+            and self._token_cache.get('access_token') == state.access_token
+        ):
+            return cached
+        return self._use_persisted_token(store, state)
+
+    def _use_persisted_token(
+        self,
+        store: KISTokenCacheStore,
+        record: CachedKISToken,
+        *,
+        defer_reason: str | None = None,
+    ) -> dict:
+        self._token_cache = {
+            'access_token': record.access_token,
+            'expires_at': record.refresh_after,
+            'token_type': record.token_type,
+            'cache_key': store.cache_key,
+            'generation': record.generation,
+        }
+        result_expiry = (
+            record.expires_at
+            if defer_reason == 'minimum_issue_interval'
+            else record.refresh_after
+        )
+        result = {
+            'access_token': record.access_token,
+            'expires_in': max(
+                0,
+                int((result_expiry - datetime.now(timezone.utc)).total_seconds()),
+            ),
+            'token_type': record.token_type,
+            'cached': True,
+        }
+        if defer_reason is not None:
+            result['refresh_deferred'] = True
+            result['defer_reason'] = defer_reason
+        return result
+
+    @staticmethod
+    def _token_is_invalidated_by_guard(
+        record: CachedKISToken,
+        guard: CachedKISTokenFailure | None,
+    ) -> bool:
+        if guard is None or guard.record_type == 'issuance_success':
+            return False
+        if guard.invalidates_generation is not None:
+            return guard.invalidates_generation == record.generation
+        return guard.failed_at >= record.issued_at
+
+    def _raise_if_token_failure_is_cooling_down(
+        self,
+        store: KISTokenCacheStore,
+        shared_failure: CachedKISTokenFailure | None,
+    ) -> None:
+        failure = self._token_failure
+        if failure is not None:
+            cache_key, cooldown_until, error = failure
+            if cache_key == store.cache_key and datetime.now(timezone.utc) < cooldown_until:
+                raise type(error)(
+                    str(error),
+                    payload=dict(error.payload),
+                    status_code=error.status_code,
+                    retryable=error.retryable,
+                )
+            if cache_key == store.cache_key or datetime.now(timezone.utc) >= cooldown_until:
+                self._token_failure = None
+
+        if (
+            shared_failure is None
+            or datetime.now(timezone.utc) >= shared_failure.cooldown_until
+        ):
+            return
+        error_type: type[KISClientError]
+        if shared_failure.error_kind == 'timeout':
+            error_type = KISTimeoutError
+        elif shared_failure.error_kind in {
+            'transport',
+            'ambiguous_attempt',
+            'minimum_issue_interval',
+        }:
+            error_type = KISTransportError
+        elif shared_failure.error_kind == 'protocol':
+            error_type = KISAPIError
+        else:
+            error_type = KISHTTPError
+        raise error_type(
+            'KIS token issue suppressed during shared failure cooldown',
+            status_code=shared_failure.status_code,
+            retryable=shared_failure.retryable,
+        )
+
+    async def _remember_token_failure(
+        self,
+        error: KISClientError,
+        store: KISTokenCacheStore,
+    ) -> None:
+        cooldown_seconds = max(
+            int(settings.kis_token_failure_cooldown_seconds),
+            int(settings.kis_token_min_issue_interval_seconds),
+        )
+        failed_at = datetime.now(timezone.utc)
+        cooldown_until = failed_at + timedelta(seconds=cooldown_seconds)
+        self._token_failure = (
+            store.cache_key,
+            cooldown_until,
+            error,
+        )
+        if isinstance(error, KISTimeoutError):
+            error_kind = 'timeout'
+        elif isinstance(error, KISTransportError):
+            error_kind = 'transport'
+        elif isinstance(error, KISAPIError):
+            error_kind = 'protocol'
+        else:
+            error_kind = 'http'
+        await run_token_cache_io(
+            store.save_failure,
+            error_kind=error_kind,
+            status_code=error.status_code,
+            retryable=error.retryable,
+            failed_at=failed_at,
+            cooldown_until=cooldown_until,
+        )
 
     def _resolve_tr_id(self, *, real: str, demo: str | None = None) -> str:
         if self._environment() == 'demo' and demo:
@@ -113,51 +357,229 @@ class KISClient:
         if not settings.kis_app_key or not settings.kis_app_secret:
             raise KISConfigurationError('KIS_APP_KEY and KIS_APP_SECRET must be configured')
 
-        if not force_refresh:
-            cached = self._get_cached_token()
-            if cached:
-                return cached
+        try:
+            return await self._issue_access_token(force_refresh=force_refresh)
+        except KISTokenCacheError as exc:
+            raise KISConfigurationError('KIS token cache is not safe to use') from exc
 
-        payload = {
-            'grant_type': 'client_credentials',
-            'appkey': settings.kis_app_key,
-            'appsecret': settings.kis_app_secret,
-        }
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
-            try:
-                response = await request_with_audit(
-                    client,
-                    'kis',
-                    'POST',
-                    '/oauth2/tokenP',
-                    json_body=payload,
+    async def _issue_access_token(self, *, force_refresh: bool) -> dict:
+        store = self._token_store()
+        observed_state = (
+            await run_token_cache_io(store.load_cache_state) if force_refresh else None
+        )
+        force_refresh_generation = (
+            observed_state.generation if isinstance(observed_state, CachedKISToken) else None
+        )
+        async with self._token_lock:
+            async with store.lock():
+                current_time = datetime.now(timezone.utc)
+                current_state = await run_token_cache_io(
+                    store.load_cache_state,
+                    now=current_time,
                 )
-            except httpx.TimeoutException as exc:
-                raise KISTimeoutError('KIS token issue timed out', retryable=True) from exc
-            except httpx.HTTPError as exc:
-                raise KISTransportError('KIS token issue transport failure', retryable=True) from exc
-            if response.status_code >= 400:
-                error_payload = _safe_json(response)
-                message = error_payload.get('msg1') or response.text
-                raise KISHTTPError(
-                    f'KIS token issue failed [{response.status_code}]: {message}',
-                    payload=error_payload,
-                    status_code=response.status_code,
-                    retryable=response.status_code >= 500,
+                shared_guard = await run_token_cache_io(
+                    store.load_failure,
+                    now=current_time,
+                    include_expired=True,
                 )
-            token = response.json()
+                disk_record = (
+                    current_state if isinstance(current_state, CachedKISToken) else None
+                )
+                success_generation_mismatch = bool(
+                    shared_guard is not None
+                    and shared_guard.record_type == 'issuance_success'
+                    and (
+                        (
+                            disk_record is None
+                            and not isinstance(current_state, CachedKISTokenRevocation)
+                        )
+                        or (
+                            disk_record is not None
+                            and shared_guard.generation != disk_record.generation
+                        )
+                    )
+                )
+                raw_record = (
+                    None
+                    if success_generation_mismatch
+                    or (
+                        disk_record is not None
+                        and self._token_is_invalidated_by_guard(disk_record, shared_guard)
+                    )
+                    else disk_record
+                )
+                if success_generation_mismatch:
+                    self._clear_cached_token(cache_key=store.cache_key)
+                if force_refresh:
+                    if (
+                        raw_record is not None
+                        and current_time < raw_record.expires_at
+                        and raw_record.generation != force_refresh_generation
+                    ):
+                        return self._use_persisted_token(
+                            store,
+                            raw_record,
+                            defer_reason='peer_refresh',
+                        )
+                else:
+                    authoritative = self._reuse_authoritative_token(store, raw_record)
+                    if authoritative is not None:
+                        return authoritative
+                if (
+                    raw_record is not None
+                    and current_time < raw_record.issued_at
+                    + timedelta(seconds=settings.kis_token_min_issue_interval_seconds)
+                ):
+                    if current_time < raw_record.expires_at:
+                        return self._use_persisted_token(
+                            store,
+                            raw_record,
+                            defer_reason='minimum_issue_interval',
+                        )
+                    raise KISTransportError(
+                        'KIS token issue suppressed during minimum issue interval',
+                        retryable=True,
+                    )
+                if (
+                    isinstance(current_state, CachedKISTokenRevocation)
+                    and current_time < current_state.not_before
+                ):
+                    raise KISTransportError(
+                        'KIS token issue suppressed after token revocation',
+                        retryable=True,
+                    )
+                self._raise_if_token_failure_is_cooling_down(store, shared_guard)
 
-        now = datetime.now(timezone.utc)
-        expires_in = int(token.get('expires_in', 0) or 0)
-        refresh_margin = max(0, settings.kis_token_refresh_margin_seconds)
-        expires_at = now + timedelta(seconds=max(0, expires_in - refresh_margin))
-        self._token_cache = {
-            'access_token': token.get('access_token', ''),
-            'expires_at': expires_at,
-            'token_type': token.get('token_type', 'Bearer'),
-        }
-        token['cached'] = False
-        return token
+                issuance_started_at = datetime.now(timezone.utc)
+                issuance_lease_seconds = int(settings.kis_token_issuance_lease_seconds)
+                await run_token_cache_io(
+                    store.save_issuance_attempt,
+                    started_at=issuance_started_at,
+                    cooldown_until=issuance_started_at
+                    + timedelta(seconds=issuance_lease_seconds),
+                    invalidates_generation=(
+                        disk_record.generation if disk_record is not None else None
+                    ),
+                )
+
+                payload = {
+                    'grant_type': 'client_credentials',
+                    'appkey': settings.kis_app_key,
+                    'appsecret': settings.kis_app_secret,
+                }
+                async with httpx.AsyncClient(
+                    base_url=self.base_url,
+                    timeout=float(settings.kis_token_request_timeout_seconds),
+                ) as client:
+                    try:
+                        async with asyncio.timeout(
+                            float(settings.kis_token_request_timeout_seconds)
+                        ):
+                            response = await request_with_audit(
+                                client,
+                                'kis',
+                                'POST',
+                                '/oauth2/tokenP',
+                                json_body=payload,
+                            )
+                    except (TimeoutError, httpx.TimeoutException) as exc:
+                        error = KISTimeoutError('KIS token issue timed out', retryable=True)
+                        await self._remember_token_failure(error, store)
+                        raise error from exc
+                    except httpx.HTTPError as exc:
+                        error = KISTransportError(
+                            'KIS token issue transport failure',
+                            retryable=True,
+                        )
+                        await self._remember_token_failure(error, store)
+                        raise error from exc
+                    if response.status_code >= 400:
+                        error_payload = _safe_json(response)
+                        message = error_payload.get('msg1') or response.text
+                        error = KISHTTPError(
+                            f'KIS token issue failed [{response.status_code}]: {message}',
+                            payload=error_payload,
+                            status_code=response.status_code,
+                            retryable=response.status_code >= 500,
+                        )
+                        await self._remember_token_failure(error, store)
+                        raise error
+                    try:
+                        token = response.json()
+                    except ValueError as exc:
+                        error = KISAPIError('KIS token issue returned malformed JSON')
+                        await self._remember_token_failure(error, store)
+                        raise error from exc
+
+                refresh_margin = max(0, settings.kis_token_refresh_margin_seconds)
+                if not isinstance(token, dict):
+                    error = KISAPIError('KIS token issue returned a non-object payload')
+                    await self._remember_token_failure(error, store)
+                    raise error
+                raw_access_token = token.get('access_token')
+                raw_token_type = token.get('token_type', 'Bearer')
+                expires_in = _parse_token_expiry_seconds(token.get('expires_in'))
+                provider_expiry_value = token.get('access_token_token_expired')
+                provider_expiry = (
+                    _parse_kis_token_expiry(provider_expiry_value)
+                    if 'access_token_token_expired' in token
+                    else None
+                )
+                if (
+                    not is_valid_bearer_token(raw_access_token)
+                    or not isinstance(raw_token_type, str)
+                    or raw_token_type.lower() != 'bearer'
+                    or expires_in is None
+                    or (
+                        'access_token_token_expired' in token
+                        and provider_expiry is None
+                    )
+                ):
+                    error = KISAPIError('KIS token issue returned an invalid token payload')
+                    await self._remember_token_failure(error, store)
+                    raise error
+                access_token = raw_access_token
+                token_type = 'Bearer'
+
+                response_received_at = datetime.now(timezone.utc)
+                expires_at = issuance_started_at + timedelta(seconds=expires_in)
+                if provider_expiry is not None:
+                    expires_at = min(expires_at, provider_expiry)
+                refresh_after = expires_at - timedelta(seconds=refresh_margin)
+                if (
+                    expires_at <= response_received_at
+                    or refresh_after <= response_received_at
+                ):
+                    error = KISAPIError('KIS token issue returned an expired token payload')
+                    await self._remember_token_failure(error, store)
+                    raise error
+                record = await run_token_cache_io(
+                    store.save_token_after_issuance,
+                    access_token=access_token,
+                    token_type=token_type,
+                    issued_at=response_received_at,
+                    expires_at=expires_at,
+                    refresh_after=refresh_after,
+                    minimum_issue_interval_seconds=(
+                        settings.kis_token_min_issue_interval_seconds
+                    ),
+                )
+                self._token_cache = {
+                    'access_token': record.access_token,
+                    'expires_at': record.refresh_after,
+                    'token_type': record.token_type,
+                    'cache_key': store.cache_key,
+                    'generation': record.generation,
+                }
+                self._token_failure = None
+                token['access_token'] = access_token
+                token['token_type'] = token_type
+                token['expires_in'] = max(
+                    0,
+                    int((expires_at - response_received_at).total_seconds()),
+                )
+                token['cached'] = False
+                return token
 
     async def healthcheck(self) -> dict:
         return {
@@ -256,8 +678,11 @@ class KISClient:
         use_hashkey: bool = False,
     ) -> tuple[dict[str, Any], str]:
         token = await self.issue_access_token()
+        token_store = self._token_store()
+        used_access_token = str(token['access_token'])
+        used_generation = str(self._token_cache.get('generation') or '')
         headers = {
-            'authorization': f"Bearer {token['access_token']}",
+            'authorization': f'Bearer {used_access_token}',
             'appkey': settings.kis_app_key,
             'appsecret': settings.kis_app_secret,
             'tr_id': tr_id,
@@ -266,7 +691,16 @@ class KISClient:
         if tr_cont:
             headers['tr_cont'] = tr_cont
         if use_hashkey and json_body:
-            hashkey = await self._issue_hashkey(headers=headers, payload=json_body)
+            try:
+                hashkey = await self._issue_hashkey(headers=headers, payload=json_body)
+            except KISHTTPError as exc:
+                if exc.status_code == 401:
+                    await self._invalidate_rejected_token(
+                        store=token_store,
+                        access_token=used_access_token,
+                        generation=used_generation,
+                    )
+                raise
             if hashkey:
                 headers['hashkey'] = hashkey
 
@@ -297,6 +731,12 @@ class KISClient:
         if response.status_code >= 400:
             error_payload = _safe_json(response)
             message = error_payload.get('msg1') or response.text
+            if response.status_code == 401:
+                await self._invalidate_rejected_token(
+                    store=token_store,
+                    access_token=used_access_token,
+                    generation=used_generation,
+                )
             raise KISHTTPError(
                 f'KIS request failed [{response.status_code}] {path}: {message}',
                 payload=error_payload,
@@ -309,11 +749,18 @@ class KISClient:
         result_code = str(payload.get('rt_cd') if payload.get('rt_cd') is not None else '').strip()
         if result_code and result_code != '0':
             message = payload.get('msg1') or 'KIS request rejected'
+            msg_code = str(payload.get('msg_cd') or '').strip() or None
+            if msg_code == 'EGW00123':
+                await self._invalidate_rejected_token(
+                    store=token_store,
+                    access_token=used_access_token,
+                    generation=used_generation,
+                )
             raise KISAPIError(
                 f'KIS request rejected {path}: {message}',
                 payload=payload,
                 status_code=response.status_code,
-                msg_code=str(payload.get('msg_cd') or '').strip() or None,
+                msg_code=msg_code,
                 result_code=result_code,
             )
 
