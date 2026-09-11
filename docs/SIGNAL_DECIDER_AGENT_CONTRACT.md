@@ -8,6 +8,37 @@ Canonical runtime source: `apps/api/app/agent_context/response_contract.py`. The
 
 `signal-decider` combines the bounded EOD, technical, fundamental, market-regime, liquidity, data-quality, and prior-decision context supplied by Core. It provides conservative next-session decision support. It does not place orders, size positions, or bypass Core/Exec risk controls.
 
+## Runtime model identity
+
+Core requests `OPENCLAW_SIGNAL_DECIDER_EXPECTED_MODEL` (default
+`openai/gpt-5.6-sol`) through OpenClaw's exact model override. That request is
+not itself proof of the runtime model. The response `model` value such as
+`openclaw/signal-decider` is only a route alias and is never recorded as the
+actual backend model. After completion, Core independently reads the exact
+session registry entry, binds its terminal status and timestamps to the current
+dispatch attempt, and verifies the observed provider/model against the expected
+model. Decision provenance keeps requested, observed actual, status, reason,
+and verification basis separate from the route alias.
+
+`actual_observed_from_response=false` is intentional: actual identity comes
+from the post-dispatch session observation, never from the response route alias.
+Core also hashes the canonical runtime contract and the live workspace
+`AGENTS.md`; missing, unsafe, unreadable, or mismatched live contracts fail the
+same actionability fence. Core does not install or repair runtime files during
+dispatch. Every HTTP attempt records separate immediately-before and
+immediately-after hashes. Both observations and their version/hash identity
+must be verified and identical; drift during an attempt or between retries is
+non-actionable and a failed-response retry is stopped.
+
+A missing, unverified, or mismatched backend identity makes the response
+non-actionable. Core preserves the raw response and audit provenance, coerces
+the normalized decision to `reject`, and records a retryable failure instead of
+successful feedback. Runtime auto-discovery is diagnostic only and cannot grant
+model authority. Evaluation, replay, and calibration outputs carry or select a
+single actual-model cohort so observations from different models are not mixed.
+Legacy rows without verified identity remain available for diagnostics, but are
+excluded from profitability aggregation and policy-promotion evidence.
+
 ## Allowed actions
 
 `preferred_action` and `next_day_open_action` must both use exactly one of `buy`, `wait`, `reject`.
@@ -50,7 +81,7 @@ Decision evidence remains immutable across revisions. A newer WAIT/reject, chang
 
 Snapshot selection is cohort-aware: the newest feedback run owns its requested symbol/role scope, and a requested symbol missing or failed in that run cannot fall back to an older BUY. Narrower unrelated runs do not erase other scopes. Signal and short-term snapshots are ranked before actionability classification, so a newer WAIT is always observed.
 
-Short-term quality gates consume only explicitly allowlisted, server-built objective fields in the stored request payload. Model response text, thesis, evidence, risks, invalidation prose, and the response-derived feature snapshot are audit-only and cannot prove a breakout or improve a score. Continuation requires a structured objective setup, and percentiles must be finite in `[0, 1]` unless an adjacent explicit percent unit authorizes a bounded `0..100` conversion. Negative, out-of-range, ambiguous, NaN, and infinite values fail closed.
+Short-term quality authority is defined by the separate [Short-Term Decider Agent Contract](./SHORT_TERM_DECIDER_AGENT_CONTRACT.md). Signal-decider cross-checks may constrain a short-term candidate, but they do not replace that contract's server-built objective evidence or restore a failed setup.
 
 ## Data-quality and decision rules
 

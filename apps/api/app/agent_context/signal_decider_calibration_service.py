@@ -13,6 +13,10 @@ from app.agent_context.roles import (
     SIGNAL_DECIDER_AGENT_NAME,
     canonical_evaluation_action,
 )
+from app.agent_context.model_identity import (
+    expected_decider_model,
+    select_model_identity_cohort_rows,
+)
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
     DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
@@ -20,6 +24,7 @@ from app.agent_context.signal_decider_loop_service import (
     SIGNAL_DECIDER_EVALUATION_HORIZONS,
     signal_decider_loop_service,
 )
+from app.core.settings import settings
 
 
 POSITIVE_GRADE_LABELS: tuple[str, ...] = (
@@ -455,12 +460,22 @@ class SignalDeciderCalibrationService:
         resolved_min_sample_size = _normalize_limit(min_sample_size, default=3, maximum=1000)
         resolved_cluster_limit = _normalize_limit(cluster_limit, default=DEFAULT_CLUSTER_LIMIT, maximum=50)
 
-        rows = self.loop_service.repository.list_decision_snapshots(
+        source_rows = self.loop_service.repository.list_decision_snapshots(
             market_date_from=normalized_from,
             market_date_to=normalized_to,
             symbols=normalized_symbols or None,
             policy_versions=[normalized_policy_version] if normalized_policy_version else None,
             dedupe_feedback_results=True,
+        )
+        rows, model_identity_exclusions, model_identity_cohort = (
+            select_model_identity_cohort_rows(
+                source_rows,
+                role=SIGNAL_DECIDER_AGENT_NAME,
+                expected_model=expected_decider_model(
+                    SIGNAL_DECIDER_AGENT_NAME,
+                    settings_obj=settings,
+                ),
+            )
         )
         snapshot_ids = [row.id for row in rows]
         outcomes = self.loop_service.repository.list_realized_outcomes(
@@ -478,7 +493,7 @@ class SignalDeciderCalibrationService:
         latest_trade_date_cache: dict[tuple[str, date], date | None] = {}
 
         mature_items: list[dict[str, Any]] = []
-        excluded_items: list[dict[str, Any]] = []
+        excluded_items: list[dict[str, Any]] = list(model_identity_exclusions)
         coverage_items: list[dict[str, Any]] = []
         for row in rows:
             decision = self.loop_service._build_decision_snapshot(row)
@@ -627,7 +642,7 @@ class SignalDeciderCalibrationService:
             condition_clusters=clusters,
         )
         report_status = 'empty'
-        if rows:
+        if source_rows:
             report_status = 'ready' if len(mature_items) >= resolved_min_sample_size else 'insufficient_sample'
 
         return {
@@ -640,6 +655,7 @@ class SignalDeciderCalibrationService:
                 'evaluation_version': resolved_evaluation_version,
                 'min_sample_size': resolved_min_sample_size,
                 'cluster_limit': resolved_cluster_limit,
+                'model_identity_cohort': model_identity_cohort,
             },
             'review_boundary': {
                 'report_version': CALIBRATION_REPORT_VERSION,
@@ -650,7 +666,7 @@ class SignalDeciderCalibrationService:
             },
             'summary': {
                 'status': report_status,
-                'snapshots_considered': len(rows),
+                'snapshots_considered': len(source_rows),
                 'mature_computed_count': len(mature_items),
                 'excluded_count': len(excluded_items),
                 'coverage': coverage_summary,

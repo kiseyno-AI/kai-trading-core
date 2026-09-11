@@ -249,6 +249,8 @@ class Settings(BaseSettings):
     openclaw_base_url: str = 'http://127.0.0.1:18789'
     openclaw_gateway_token: Optional[str] = None
     openclaw_state_dir: str = '~/.openclaw'
+    openclaw_signal_decider_expected_model: str = 'openai/gpt-5.6-sol'
+    openclaw_short_term_decider_expected_model: str = 'openai/gpt-5.6-sol'
     openclaw_agent_timeout_seconds: float = 0.0
     openclaw_agent_max_retries: int = 2
     openclaw_agent_retry_backoff_seconds: float = 2.0

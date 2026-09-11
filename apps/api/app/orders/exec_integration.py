@@ -56,6 +56,10 @@ from app.orders.execution_handoff_contract import (
     validate_execution_plan_dispatch_ack,
     validate_execution_revocation_ack,
 )
+from app.orders.buy_authority_bridge import (
+    build_core_buy_authority_observation,
+    core_exec_buy_authority_bridge,
+)
 from app.orders.exec_payload_slimming import (
     compact_exec_item_link,
     compact_exec_readback,
@@ -81,7 +85,9 @@ from app.orders.next_open_execution import (
     SHORT_TERM_MIN_REWARD_RISK_RATIO,
     UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE,
     _execution_plan_row_authority_fingerprint,
+    _current_route_live_market_buy_authority,
     _is_canonical_closed_market_cost_absence,
+    _load_live_market_snapshot_context,
     _async_previous_trading_day,
     async_normalize_next_open_target_trade_date,
     signal_decider_next_open_execution_service,
@@ -1455,6 +1461,20 @@ class SignalDeciderExecPayloadContractError(RuntimeError):
     """Raised before dispatch when a Core-owned Exec payload cannot be proven safe."""
 
 
+def _dispatch_group_requires_core_krx_buy_authority(
+    *,
+    route_family: str,
+    rows: Sequence[SignalDeciderExecutionPlanItem],
+) -> bool:
+    return bool(
+        route_family == 'kis_krx_krw'
+        and any(
+            str(row.planned_side or '').strip().lower() == 'buy'
+            for row in rows
+        )
+    )
+
+
 class SignalDeciderExecClient:
     def __init__(
         self,
@@ -1476,6 +1496,16 @@ class SignalDeciderExecClient:
 
     async def post_execution_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request_json('POST', '/v4/execution-plans', json_body=payload)
+
+    async def post_buy_authority_observation(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._request_json(
+            'POST',
+            '/runtime/core-buy-authority/observations',
+            json_body=payload,
+        )
 
     async def list_execution_plans(self, *, external_plan_id: str | None = None) -> dict[str, Any]:
         params = {'external_plan_id': external_plan_id} if external_plan_id else None
@@ -1609,6 +1639,90 @@ class SignalDeciderExecIntegrationService:
         self._dashboard_build_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
         self._dashboard_refresh_tasks: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
         self._dashboard_refresh_state: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
+
+    async def _synchronize_open_buy_authority(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        integration: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Deliver deterministic KRX authority before any OPEN buy dispatch."""
+
+        market_state = await async_get_market_state()
+        snapshot_context, snapshot_load_error = await asyncio.to_thread(
+            _load_live_market_snapshot_context
+        )
+        route_authority = _current_route_live_market_buy_authority(
+            target_trade_date=target_trade_date,
+            market_state=market_state,
+            snapshot_context=snapshot_context,
+            snapshot_load_error=snapshot_load_error,
+        )
+        sync: dict[str, Any] = {
+            'applies': route_authority.get('applies') is True,
+            'route_action': route_authority.get('action'),
+            'route_status': route_authority.get('status'),
+            'source_observed_at': route_authority.get('observed_at'),
+            'accounts': {},
+            'errors': [],
+        }
+        if not sync['applies']:
+            return sync
+
+        configured_targets, target_errors = (
+            signal_decider_next_open_execution_service._parse_account_targets()
+        )
+        if target_errors:
+            sync['errors'].extend(target_errors)
+        targets = [
+            target
+            for target in configured_targets
+            if account_reference is None
+            or target.account_reference == account_reference
+        ]
+        if not targets:
+            sync['errors'].append(
+                'No explicit configured KIS account target matched the OPEN buy-authority scope.'
+            )
+            return sync
+
+        runtime_mode = str(integration.get('runtime_mode') or '').strip().lower()
+        for target in targets:
+            try:
+                observation = build_core_buy_authority_observation(
+                    route_authority=route_authority,
+                    runtime_mode=runtime_mode,
+                    account_reference=target.account_reference,
+                )
+                staged = await asyncio.to_thread(
+                    core_exec_buy_authority_bridge.stage,
+                    observation,
+                )
+                flushed = await core_exec_buy_authority_bridge.flush_scope(
+                    scope_key=staged.scope_key,
+                    client=self.client,
+                )
+                sync['accounts'][target.account_reference] = {
+                    'scope_key': staged.scope_key,
+                    'observation_id': staged.observation_id,
+                    'dispatch_allowed': flushed.dispatch_allowed,
+                    'errors': list(flushed.errors),
+                    'ack': (
+                        flushed.ack.model_dump(mode='json')
+                        if flushed.ack is not None
+                        else None
+                    ),
+                }
+            except Exception as exc:  # noqa: BLE001 - uncertainty is a buy fence
+                sync['accounts'][target.account_reference] = {
+                    'scope_key': None,
+                    'observation_id': None,
+                    'dispatch_allowed': False,
+                    'errors': [f'{type(exc).__name__}: {exc}'],
+                    'ack': None,
+                }
+        return sync
 
     def _destination_binding_for_payload(
         self,
@@ -2065,6 +2179,7 @@ class SignalDeciderExecIntegrationService:
         target_trade_date: date,
         account_reference: str | None,
         integration: dict[str, Any],
+        buy_authority_sync: dict[str, Any],
         trigger: str,
     ) -> list[dict[str, Any]]:
         rows = self._load_next_open_rows(
@@ -2127,6 +2242,30 @@ class SignalDeciderExecIntegrationService:
                     'exec_destination_binding_missing'
                     if expected_destination is None
                     else 'exec_destination_mismatch'
+                )
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code=reason_code,
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': reason_code,
+                    }
+                )
+                continue
+
+            if any(
+                str(row.planned_side or '').strip().lower() != 'buy'
+                for row in group_rows
+            ):
+                reason_code = (
+                    'dispatch_write_ahead_non_buy_invariant_violation'
                 )
                 for row in group_rows:
                     self._mark_exec_destination_manual_review(
@@ -2361,6 +2500,53 @@ class SignalDeciderExecIntegrationService:
                         }
                     )
                     continue
+                required_authority_accounts = {
+                    scoped_account
+                    for (
+                        scoped_account,
+                        _decision_agent_name,
+                        route_family,
+                    ), scoped_rows in self._group_rows_by_dispatch_scope(
+                        group_rows
+                    ).items()
+                    if _dispatch_group_requires_core_krx_buy_authority(
+                        route_family=route_family,
+                        rows=scoped_rows,
+                    )
+                }
+                if (
+                    required_authority_accounts
+                    and buy_authority_sync.get('applies') is True
+                ):
+                    synchronized_accounts = buy_authority_sync.get('accounts')
+                    account_results = (
+                        synchronized_accounts
+                        if isinstance(synchronized_accounts, dict)
+                        else {}
+                    )
+                    blocked_accounts = sorted(
+                        scoped_account
+                        for scoped_account in required_authority_accounts
+                        if not isinstance(
+                            account_results.get(scoped_account),
+                            dict,
+                        )
+                        or not account_results[scoped_account].get(
+                            'dispatch_allowed'
+                        )
+                    )
+                    if blocked_accounts:
+                        results.append(
+                            {
+                                'plan_id': plan_id,
+                                'status': 'not_found_pending_retry',
+                                'reason_code': (
+                                    'core_exec_buy_authority_not_acknowledged'
+                                ),
+                                'blocked_account_references': blocked_accounts,
+                            }
+                        )
+                        continue
                 try:
                     candidate_response = await self.client.post_execution_plan(
                         payload
@@ -2499,17 +2685,30 @@ class SignalDeciderExecIntegrationService:
         calendar_day = await async_get_krx_calendar_day(resolved_target_date, allow_fallback=True)
         source_market_date = await _async_previous_trading_day(resolved_target_date)
 
-        await self._reconcile_pending_dispatch_write_ahead(
-            target_trade_date=resolved_target_date,
-            account_reference=resolved_account_reference,
-            integration=integration,
-            trigger=trigger,
-        )
-
         execution_control_disabled = bool(
             integration['mode'] != INTEGRATION_MODE_DISPATCH
             or not settings.signal_decider_next_open_enabled
         )
+        buy_authority_sync: dict[str, Any] = {
+            'applies': False,
+            'accounts': {},
+            'errors': [],
+        }
+        if not execution_control_disabled:
+            buy_authority_sync = await self._synchronize_open_buy_authority(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                integration=integration,
+            )
+
+        await self._reconcile_pending_dispatch_write_ahead(
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            integration=integration,
+            buy_authority_sync=buy_authority_sync,
+            trigger=trigger,
+        )
+
         managed_delegated_authority = bool(
             execution_control_disabled
             and self.should_manage_delegated_authority(
@@ -2760,6 +2959,7 @@ class SignalDeciderExecIntegrationService:
                         'trigger': trigger,
                     },
                     'integration': integration,
+                    'buy_authority_sync': buy_authority_sync,
                     'dispatch': {
                         'groups': [],
                         'preview_plans': [],
@@ -2805,7 +3005,7 @@ class SignalDeciderExecIntegrationService:
         skipped_group_count = 0
         preview_plans: list[dict[str, Any]] = []
 
-        for (account_key, decision_agent_name, _route_family), account_rows in grouped.items():
+        for (account_key, decision_agent_name, route_family), account_rows in grouped.items():
             eligible_rows = [row for row in account_rows if self._row_is_dispatchable(row)]
             if not eligible_rows:
                 skipped_group_count += 1
@@ -2819,6 +3019,41 @@ class SignalDeciderExecIntegrationService:
                     }
                 )
                 continue
+
+            if (
+                _dispatch_group_requires_core_krx_buy_authority(
+                    route_family=route_family,
+                    rows=eligible_rows,
+                )
+                and buy_authority_sync.get('applies') is True
+            ):
+                account_authority = (
+                    buy_authority_sync.get('accounts', {}).get(account_key)
+                    if isinstance(buy_authority_sync.get('accounts'), dict)
+                    else None
+                )
+                if not isinstance(account_authority, dict) or not account_authority.get(
+                    'dispatch_allowed'
+                ):
+                    skipped_group_count += 1
+                    group_results.append(
+                        {
+                            'account_reference': account_key,
+                            'decision_agent_name': decision_agent_name,
+                            'dispatch_status': EXEC_DISPATCH_STATUS_SKIPPED,
+                            'message': (
+                                'Core OPEN buy authority was not acknowledged as '
+                                'allowing this exact Exec account scope.'
+                            ),
+                            'reason': 'core_exec_buy_authority_not_acknowledged',
+                            'eligible_count': len(eligible_rows),
+                            'buy_authority': account_authority,
+                            'buy_authority_errors': (
+                                buy_authority_sync.get('errors') or []
+                            ),
+                        }
+                    )
+                    continue
 
             already_dispatched_rows, dispatch_rows = _partition_exec_dispatch_rows(
                 eligible_rows,
@@ -3283,6 +3518,7 @@ class SignalDeciderExecIntegrationService:
                 'trigger': trigger,
             },
             'integration': integration,
+            'buy_authority_sync': buy_authority_sync,
             'dispatch': {
                 'groups': group_results,
                 'preview_plans': preview_plans,
@@ -5104,6 +5340,8 @@ class SignalDeciderExecIntegrationService:
 
     @staticmethod
     def _row_is_dispatchable(row: SignalDeciderExecutionPlanItem) -> bool:
+        if str(row.planned_side or '').strip().lower() != 'buy':
+            return False
         decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
         if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
             if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:

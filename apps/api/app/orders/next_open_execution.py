@@ -13,6 +13,7 @@ import json
 import logging
 import math
 from typing import Any, Callable, Sequence
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -146,6 +147,7 @@ CALENDAR_FALLBACK_STATUSES = {
 # is treated as a routing/budget placeholder and does not drive fixed sizing.
 
 logger = logging.getLogger(__name__)
+KST = ZoneInfo('Asia/Seoul')
 
 
 class _PlanRefreshRevisionConflict(RuntimeError):
@@ -154,6 +156,19 @@ class _PlanRefreshRevisionConflict(RuntimeError):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_aware_datetime(value: Any) -> datetime | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
 
 def _normalize_date(value: str | date | None, *, default: date) -> date:
@@ -614,6 +629,122 @@ def _stable_live_market_authority_generation_material(
             'provenance',
         )
         if key in authority
+    }
+
+
+def _current_route_live_market_buy_authority(
+    *,
+    target_trade_date: date,
+    market_state: object,
+    snapshot_context: dict[str, Any] | None,
+    snapshot_load_error: bool = False,
+) -> dict[str, Any]:
+    """Aggregate the complete KRX route without depending on candidate rows."""
+
+    class _MarketSnapshot:
+        def __init__(self, market: str) -> None:
+            self.request_payload = {
+                'symbol_day_context': {
+                    'market': market,
+                    'company': {'market': market},
+                }
+            }
+
+    evaluated_at = _parse_aware_datetime(
+        getattr(market_state, 'server_time', None)
+    ) or _utcnow()
+    market_authorities = [
+        _current_live_market_buy_authority(
+            snapshot=_MarketSnapshot(market),  # type: ignore[arg-type]
+            target_trade_date=target_trade_date,
+            market_state=market_state,
+            snapshot_context=snapshot_context,
+            snapshot_load_error=snapshot_load_error,
+        )
+        for market in ('KOSPI', 'KOSDAQ')
+    ]
+    evidence: list[dict[str, Any]] = []
+    for market, authority in zip(
+        ('KOSPI', 'KOSDAQ'),
+        market_authorities,
+        strict=True,
+    ):
+        observed_at = _parse_aware_datetime(authority.get('observed_at'))
+        observed_at_is_trusted = bool(
+            observed_at is not None
+            and observed_at <= evaluated_at
+            and observed_at.astimezone(KST).date() == target_trade_date
+        )
+        source_ready = bool(
+            authority.get('status') == 'available'
+            and authority.get('authoritative') is True
+            and observed_at_is_trusted
+        )
+        source_allows = bool(source_ready and authority.get('action') == 'allow')
+        evidence.append(
+            {
+                'market': market,
+                'status': 'available' if source_ready else 'unavailable',
+                'authoritative': source_ready,
+                'action': 'allow' if source_allows else 'block_new_buy',
+                'observed_at': (
+                    observed_at.isoformat()
+                    if source_ready and observed_at is not None
+                    else None
+                ),
+                'reason_code': str(
+                    authority.get('reason_code')
+                    or (
+                        'market_authority_timestamp_unavailable'
+                        if observed_at is None
+                        else 'market_authority_unavailable'
+                    )
+                ),
+            }
+        )
+    observed_at_values = [
+        parsed
+        for item in evidence
+        if (parsed := _parse_aware_datetime(item.get('observed_at'))) is not None
+    ]
+    complete = bool(
+        len(observed_at_values) == 2
+        and all(
+            item['status'] == 'available' and item['authoritative'] is True
+            for item in evidence
+        )
+    )
+    allow = complete and all(item['action'] == 'allow' for item in evidence)
+    reason_codes = list(
+        dict.fromkeys(
+            str(item['reason_code'])
+            for item in evidence
+            if item['action'] != 'allow' or not complete
+        )
+    )
+    if not reason_codes:
+        reason_codes = ['current_live_market_authority_allow']
+    return {
+        'schema_version': CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION,
+        'applies': _current_live_market_authority_applies(
+            market_state=market_state,
+            target_trade_date=target_trade_date,
+        ),
+        'market_date': target_trade_date.isoformat(),
+        'source': 'current_market_snapshot_cache',
+        'market': 'KRX',
+        'status': 'available' if complete else 'unavailable',
+        'authoritative': complete,
+        'action': 'allow' if allow else 'block_new_buy',
+        'reason_codes': reason_codes,
+        'observed_at': (
+            min(observed_at_values).isoformat()
+            if len(observed_at_values) == 2
+            else None
+        ),
+        'evaluated_at': max([evaluated_at, *observed_at_values]).isoformat(),
+        'required_markets': ['KOSPI', 'KOSDAQ'],
+        'market_evidence': evidence,
     }
 
 

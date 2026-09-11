@@ -11,6 +11,7 @@ from uuid import uuid4
 from sqlalchemy import delete, event, select
 
 from app.agent_context.decider_replay_service import DeciderReplayCostAssumptions, DeciderReplayRepository
+from app.agent_context.model_identity import build_observed_model_identity
 from app.core.settings import settings
 from app.db import engine, session_scope
 from app.db_models import (
@@ -1872,7 +1873,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'conviction_score_10': 6.5,
                     **(response_payload_extra or {}),
                 },
-                response_summary_payload={'model': 'openclaw/short-term-decider'},
+                response_summary_payload={
+                    'model': 'openclaw/short-term-decider',
+                    'decision_provenance': {
+                        'model_identity': build_observed_model_identity(
+                            role='short-term-decider',
+                            expected_model='openai/gpt-5.6-sol',
+                            actual_provider='openai',
+                            actual_model='gpt-5.6-sol',
+                        ),
+                    },
+                },
             )
             session.add(row)
             session.flush()
@@ -4852,19 +4863,171 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         restarted_service = SignalDeciderExecIntegrationService(
             client=self.client
         )
-        result = await restarted_service.dispatch_next_open_plan(
-            target_trade_date=self.target_trade_date,
-            refresh_plan=False,
-            force=False,
-            trigger='restart_retry_exact_write_ahead',
-        )
+        events: list[str] = []
+        original_list = self.client.list_execution_plans
+        original_post = self.client.post_execution_plan
 
+        async def synchronize_authority(**_kwargs: object) -> dict:
+            events.append('authority')
+            return {
+                'applies': True,
+                'accounts': {
+                    self.account_reference: {
+                        'dispatch_allowed': True,
+                        'errors': [],
+                    }
+                },
+                'errors': [],
+            }
+
+        async def record_readback(*, external_plan_id: str | None = None) -> dict:
+            events.append('readback')
+            return await original_list(external_plan_id=external_plan_id)
+
+        async def record_retry(payload: dict) -> dict:
+            events.append('plan')
+            return await original_post(payload)
+
+        with (
+            patch.object(
+                restarted_service,
+                '_synchronize_open_buy_authority',
+                side_effect=synchronize_authority,
+            ),
+            patch.object(
+                self.client,
+                'list_execution_plans',
+                side_effect=record_readback,
+            ),
+            patch.object(
+                self.client,
+                'post_execution_plan',
+                side_effect=record_retry,
+            ),
+        ):
+            result = await restarted_service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                force=False,
+                trigger='restart_retry_exact_write_ahead',
+            )
+
+        self.assertEqual(events[:3], ['authority', 'readback', 'plan'])
         self.assertEqual(len(self.client.plan_calls), 1)
         self.assertEqual(len(self.client.post_calls), 1)
         self.assertEqual(result['summary']['dispatched_group_count'], 0)
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+    async def test_restart_does_not_retry_write_ahead_when_buy_authority_blocks(
+        self,
+    ) -> None:
+        async def crash_before_remote_send(payload: dict) -> dict:
+            raise SystemExit('simulated crash before remote send')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_before_remote_send,
+        ):
+            with self.assertRaisesRegex(SystemExit, 'before remote send'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_before_blocked_retry',
+                )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        blocked_sync = {
+            'applies': True,
+            'accounts': {
+                self.account_reference: {
+                    'dispatch_allowed': False,
+                    'errors': ['authority ACK unavailable'],
+                }
+            },
+            'errors': [],
+        }
+        with patch.object(
+            restarted_service,
+            '_synchronize_open_buy_authority',
+            new=AsyncMock(return_value=blocked_sync),
+        ) as synchronize:
+            result = await restarted_service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                force=False,
+                trigger='restart_blocked_write_ahead_retry',
+            )
+
+        synchronize.assert_awaited_once()
+        self.assertEqual(len(self.client.plan_calls), 1)
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(
+                row.execution_status,
+                'dispatch_pending_remote_ack',
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['dispatch_status'],
+                'pending_remote_ack',
+            )
+
+    async def test_restart_never_retries_non_buy_write_ahead_as_buy(self) -> None:
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.planned_side = 'sell'
+
+        async def crash_before_remote_send(payload: dict) -> dict:
+            self.assertEqual(payload['items'][0]['side'], 'buy')
+            raise SystemExit('simulated legacy non-buy write-ahead crash')
+
+        with (
+            patch.object(
+                self.service,
+                '_row_is_dispatchable',
+                return_value=True,
+            ),
+            patch.object(
+                self.client,
+                'post_execution_plan',
+                side_effect=crash_before_remote_send,
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, 'legacy non-buy'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='seed_legacy_non_buy_write_ahead',
+                )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=False,
+            trigger='restart_legacy_non_buy_write_ahead',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'dispatch_write_ahead_non_buy_invariant_violation',
+            )
 
     async def test_restart_drops_not_found_write_ahead_when_decision_changed(
         self,

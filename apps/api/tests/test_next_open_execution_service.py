@@ -394,6 +394,7 @@ def test_preopen_plan_never_reuses_nonterminal_row_even_with_matching_fingerprin
 def test_exec_dispatch_rejects_legacy_signal_row_without_raw_cost_provenance() -> None:
     row = SimpleNamespace(
         decision_agent_name='signal-decider',
+        planned_side='buy',
         eligibility_status=ELIGIBILITY_ELIGIBLE,
         source_market_date=date(2026, 4, 29),
         validation_payload={
@@ -455,6 +456,7 @@ def test_exec_dispatch_requires_consistent_pending_cost_contract() -> None:
 
     row = SimpleNamespace(
         decision_agent_name='signal-decider',
+        planned_side='buy',
         eligibility_status=ELIGIBILITY_ELIGIBLE,
         source_market_date=date(2026, 4, 29),
         validation_payload=validation(),

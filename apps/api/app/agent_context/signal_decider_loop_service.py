@@ -30,6 +30,10 @@ from app.agent_context.roles import (
     short_term_tactical_action_to_decision_action,
 )
 from app.agent_context.wait_reason_taxonomy import derive_wait_reason
+from app.agent_context.model_identity import (
+    expected_decider_model,
+    select_model_identity_cohort_rows,
+)
 from app.market.session import next_krx_trading_date
 from app.core.settings import settings
 from app.db import session_scope as _base_session_scope
@@ -4150,6 +4154,18 @@ class SignalDeciderLoopService:
             symbols=normalized_symbols or None,
             dedupe_feedback_results=True,
         )
+        (
+            snapshot_rows,
+            model_identity_exclusions,
+            model_identity_cohort,
+        ) = select_model_identity_cohort_rows(
+            snapshot_rows,
+            role=SIGNAL_DECIDER_AGENT_NAME,
+            expected_model=expected_decider_model(
+                SIGNAL_DECIDER_AGENT_NAME,
+                settings_obj=settings,
+            ),
+        )
         snapshots_by_id = {row.id: row for row in snapshot_rows}
         evaluations = self.repository.list_evaluations_by_range(
             market_date_from=normalized_from,
@@ -4238,6 +4254,7 @@ class SignalDeciderLoopService:
                 market_date_from=normalized_from,
                 market_date_to=normalized_to,
                 symbols=normalized_symbols,
+                model_identity_cohort=model_identity_cohort,
             )
             summary = self._candidate_summary(
                 decision_action=group['decision_action'],
@@ -4284,6 +4301,7 @@ class SignalDeciderLoopService:
                         'market_date_from': normalized_from.isoformat(),
                         'market_date_to': normalized_to.isoformat(),
                         'symbols': normalized_symbols,
+                        'model_identity_cohort': model_identity_cohort,
                     },
                     'recommendation_payload': {
                         'proposed_policy_version': candidate_version,
@@ -4336,9 +4354,15 @@ class SignalDeciderLoopService:
                 'evaluation_version': resolved_version,
                 'min_sample_size': min_sample_size,
                 'force_recompute': force_recompute,
+                'model_identity_cohort': model_identity_cohort,
             },
             'summary': {
-                'evaluations_considered': len(evaluations),
+                'evaluations_considered': sum(
+                    1
+                    for evaluation in evaluations
+                    if int(evaluation['decision_snapshot_id']) in snapshots_by_id
+                ),
+                'model_identity_excluded_count': len(model_identity_exclusions),
                 'candidates_generated': len(enriched_candidates),
                 'policy_versions_registered': len(persisted_policy_versions),
                 'manual_activation_required': True,
@@ -4988,6 +5012,7 @@ class SignalDeciderLoopService:
 
     def _build_decision_snapshot(self, row: SignalDeciderDecisionSnapshotRow) -> dict[str, Any]:
         summary_payload = _maybe_dict(row.response_summary_payload)
+        decision_provenance = _maybe_dict(summary_payload.get('decision_provenance'))
         feedback_payload = _maybe_dict(row.response_payload)
         request_payload = _maybe_dict(row.request_payload)
         feature_snapshot = _maybe_dict(row.input_feature_snapshot_payload)
@@ -5062,6 +5087,7 @@ class SignalDeciderLoopService:
             'market_date': row.market_date.isoformat(),
             'symbol': row.symbol,
             'policy_version': policy_version,
+            'decision_provenance': decision_provenance,
             'decision': {
                 'action': decision_action,
                 'preferred_action': _normalize_action(row.preferred_action or feedback_payload.get('preferred_action')),
@@ -6548,6 +6574,9 @@ class SignalDeciderLoopService:
             'expected_horizon_days': horizon_days,
             'bars_observed': len(usable_bars),
             'coverage': coverage,
+            'model_identity': _maybe_dict(decision.get('decision_provenance')).get(
+                'model_identity'
+            ),
         }
         return {
             'decision_snapshot_id': snapshot_row.id,
@@ -6746,6 +6775,9 @@ class SignalDeciderLoopService:
             'expected_return_pct': decision_fields.get('expected_return_pct'),
             'feature_snapshot': decision.get('feature_snapshot'),
             'coverage': coverage,
+            'model_identity': _maybe_dict(decision.get('decision_provenance')).get(
+                'model_identity'
+            ),
         }
         return {
             'decision_snapshot_id': snapshot_row.id,
@@ -6802,6 +6834,7 @@ class SignalDeciderLoopService:
         market_date_from: date,
         market_date_to: date,
         symbols: Sequence[str],
+        model_identity_cohort: str = 'legacy_unattributed',
     ) -> str:
         digest = hashlib.sha256(
             '|'.join(
@@ -6815,6 +6848,7 @@ class SignalDeciderLoopService:
                     market_date_from.isoformat(),
                     market_date_to.isoformat(),
                     ','.join(symbols) if symbols else '*',
+                    model_identity_cohort,
                 ]
             ).encode('utf-8')
         ).hexdigest()[:32]

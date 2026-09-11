@@ -1516,7 +1516,7 @@ Web is a display-only consumer:
 - do not submit orders or create new execution commands from these read models.
 
 ## Contract surfaces
-- Dispatch payloads use `signal_decider_exec_plan_v2` in `metadata.schema_version` and per-item `risk_context.schema_version`.
+- Dispatch payloads use `signal_decider_exec_plan_v4` in `metadata.schema_version` and per-item `risk_context.schema_version`, with the `delegated_final_full_cost_gate_recheck_v1` capability and a complete material fingerprint.
 - Exec-agent handoff context uses `exec_agent_decider_handoff_v1`.
 - Dashboard read models use `execution_runtime_dashboard_read_model_v1` in `freshness.schema_version`.
 - Today buy/sell facts use `execution_runtime_today_activity_v1`.
@@ -1527,6 +1527,42 @@ Web is a display-only consumer:
 - Daily-board `activity_coverage` values are `available`, `no_activity`, and `unavailable`. `exec_activity_not_materialized` prevents an empty Core row set from being presented as no activity when Exec runtime summaries show current orders, jobs, fills, positions, or monitored symbols.
 - Monitored-symbol states are `watching_target_stop`, `watching_fill`, `reconciling`, and `idle`.
 - Freshness states are `fresh`, `stale`, `partial`, `refreshing`, and `unavailable`.
+
+## Scoped OPEN buy-authority handshake
+
+The OPEN handoff has an additional authority contract that is independent of
+agent output and plan ranking:
+
+| Contract field | Requirement |
+| --- | --- |
+| Source | Core's deterministic `current_live_market_buy_authority_v1`; agent prose, confidence, and risk-flag counts cannot create authority |
+| Coverage | Fresh authoritative evidence for both KOSPI and KOSDAQ, including a route-wide observation when the candidate set is empty |
+| Scope | The exact KIS/KRX/KRW runtime mode and account reference; unrelated US, crypto, runtime, or account lanes are not projected |
+| Delivery | Core commits the scoped authority state and pending outbox row in one transaction, then calls Exec `POST /runtime/core-buy-authority/observations` |
+| Identity | A canonical material fingerprint plus idempotent `observation_id`; duplicates cannot advance a healthy streak, and stale or conflicting reuse fails closed |
+| OPEN admission | The latest exact-scope ACK must match the observation and report both `fence_active=false` and `projection_pending=false` before Core dispatches a new v4 buy |
+
+Unavailable or stale required market evidence produces an explicit
+`block_new_buy` observation rather than a synthetic healthy result. Delivery or
+ACK uncertainty also leaves Core blocked. When a block or recovery changes
+eligible Core-v4 KRX items, Exec applies it as a durable two-phase fence: it
+first persists the scoped state and ledger, then projects that state onto the
+items. An interrupted projection therefore remains fenced and is safely
+retryable by observation ID.
+
+A healthy authority ACK releases only the applicable scoped market-authority
+fence. Account-drawdown latches use the separate account-recovery observer
+contract. Neither recovery resumes a paused or kill-switched runtime, bypasses
+the independent hourly risk-off gate, or reactivates a rejected, cancelled, or
+expired order. Every fresh candidate must re-enter the current runtime, account,
+session, quote, sizing, exposure, and broker-boundary gates.
+
+## Exec evidence constraints visible through Core
+
+- KIS US new-buy admission requires a finite, non-negative valuation proof for every non-zero holding and a known positive-price notional for every open buy. Valuation may be broker-supplied or deterministically derived from average price, quantity, and unrealized P/L; otherwise the US exposure gate remains closed.
+- A legacy cumulative fill without explicit `fill_time_precision` is treated as `observed_upper_bound`, not exact. It keeps FIFO chronology indeterminate and US new buys blocked until a later exact-scope verified-flat boundary.
+- Duplicate fill identities deduplicate only when quantity, base/quote notional, price, settlement currency, transaction cost, coverage, source, and currency-conflict evidence agree. An economic conflict excludes the entire duplicate group from realized P/L and keeps US new buys blocked for review.
+- Exec bounds async and sync waits on the shared KIS OAuth issuance lease, including the sync coroutine bridge. A lock or cache timeout closes its file descriptor and surfaces a retryable `503` classified as `TRANSIENT` / `RETRY_PENDING`; it must not trigger uncoordinated token issuance or broker-request replay.
 
 ## Current portfolio-risk equivalent
 Core does not expose a separate portfolio-risk snapshot endpoint today. The currently owned equivalent is:

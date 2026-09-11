@@ -110,6 +110,7 @@ KIS / pykrx / DART / SEC / macro / news
 | Buy economics | One coherent executable quote context plus explicit non-spread costs, all finite and current | Block locally, or mark `pending_live_cost_confirmation` only when Exec will perform the final live re-price |
 | Agent decision | Versioned, cutoff-safe inputs with deterministic quality, policy, liquidity, and expected-return gates | Agent output may rank or reduce candidates but cannot restore missing evidence or override a failed gate |
 | Exec dispatch | One material-bound v4 contract ACK, one unique ACK per Core item, and durable readback proof | Keep the item pending/failed; duplicate, missing, stale-material, or mismatched acknowledgements never count as accepted |
+| OPEN buy authority | A current `current_live_market_buy_authority_v1` observation covering both KOSPI and KOSDAQ, delivered for the exact KIS/KRX/KRW runtime/account scope | Persist the observation as pending and block every new v4 buy until Exec ACKs with `fence_active=false` and `projection_pending=false` |
 | Market-open revalidation | Fresh OPEN-session identity plus required index/breadth evidence before a pre-open buy remains actionable | Revoke unsafe delegated BUY authority; missing required evidence fails closed, while an optional-only partial snapshot does not create or remove authority |
 
 Delegated v4 dispatch uses Exec's `GET/POST /v4/execution-plans` and
@@ -142,6 +143,31 @@ managed delegated authority even if dispatch or next-open execution is later
 disabled: Core reconciles and revokes it at the original destination before any
 Core-local execution path can be selected.
 
+At OPEN, Core separately derives one route-wide buy-authority observation from
+the deterministic `current_live_market_buy_authority_v1` read model. It does
+not count agent prose, confidence, or risk-flag text as authority. The
+observation requires fresh authoritative KOSPI and KOSDAQ evidence and binds
+its canonical material fingerprint and idempotent observation ID to the exact
+KIS/KRX/KRW runtime and account reference. Core stores the scoped authority
+state and pending outbox row in one transaction, then posts the observation to
+Exec at `POST /runtime/core-buy-authority/observations` even when the candidate
+set is empty. Missing or stale market evidence becomes an explicit
+`block_new_buy` observation; delivery failure or an invalid, stale, conflicting,
+or mismatched ACK never synthesizes allow.
+
+Core may dispatch a new OPEN v4 buy only after the latest exact-scope
+observation is durably acknowledged and the ACK reports both
+`fence_active=false` and `projection_pending=false`. Exec applies block and
+recovery through a durable two-phase projection so an interrupted item update
+leaves the fence closed and is retryable by the same observation ID. A healthy
+observation duplicate cannot advance the recovery streak. Recovery releases
+only its scoped market-authority fence. Account-drawdown latches use the
+separate account-recovery observer contract. Neither recovery resumes a paused
+or kill-switched runtime, bypasses the independent hourly risk-off fence, or
+revives a rejected order. Every fresh candidate is evaluated again through
+current runtime, account, session, quote, sizing, exposure, and broker-boundary
+gates.
+
 Accepted v4 authority also binds every Core item key to the exact Exec plan and
 plan-item IDs returned by the validated ACK. Later plan readback may update
 status only when all three identities match. Remote orders and executions with
@@ -154,6 +180,18 @@ discarded and audited, so a later revocation continues to address the original
 ACK-bound authority. Compact readback keeps authoritative total counts separate
 from retained items. A truncated source is excluded from outcome calculation;
 P/L stays unavailable unless another complete source proves it.
+
+Exec's KIS US-equity gate also requires complete valuation and economic proof
+before a new buy. Every non-zero holding needs either a finite, non-negative
+broker market value or a deterministic value derived from average price,
+quantity, and unrealized P/L. Every open buy needs a known positive-price
+notional. A cumulative legacy fill without explicit `fill_time_precision` is
+treated as `observed_upper_bound`, not exact, so it contaminates FIFO chronology
+until a later exact-scope verified-flat boundary and keeps the US gate closed.
+Duplicate broker fill identities collapse only when quantity, base/quote
+notional, price, settlement currency, transaction cost, coverage, source, and
+currency-conflict evidence agree; any economic conflict excludes the whole
+group from realized P/L and keeps the US new-buy gate closed for review.
 
 Open-drive snapshot refreshes use both process-local single-flight and a durable
 database bucket claim. Transaction advisory locking makes the first cache-row
@@ -239,7 +277,7 @@ Production portfolio summaries additionally require valid KIS credentials and `P
 
 ### KIS OAuth token cache (Core/Exec shared contract)
 
-Core follows the [official KIS open-trading-api examples](https://github.com/koreainvestment/open-trading-api) principle of reusing a token before it must be refreshed and keeping production and demo credentials separate. Every Core and Exec process that uses the same KIS credential must point `KIS_TOKEN_CACHE_DIRECTORY` at the same local directory. The default is `~/.cache/kai-trading/kis-oauth-tokens`; `~` is expanded before use, and relative, root, home, symlinked, or otherwise unsafe locations are rejected.
+Core follows the [official KIS open-trading-api examples](https://github.com/koreainvestment/open-trading-api) principle of reusing a token before it must be refreshed and keeping production and demo credentials separate. Every process that uses the same KIS credential must share one exact cache leaf: Core sets `KIS_TOKEN_CACHE_DIRECTORY`, while Exec sets `KAI_EXEC_KIS_TOKEN_CACHE_DIRECTORY`. Align Core's remaining `KIS_TOKEN_*` timing settings with Exec's corresponding `KAI_EXEC_KIS_TOKEN_*` settings. The default directory is `~/.cache/kai-trading/kis-oauth-tokens`; `~` is expanded before use, and relative, root, home, symlinked, or otherwise unsafe locations are rejected.
 
 #### On-disk v1 contract
 
@@ -256,6 +294,12 @@ All JSON records use `schema_version: 1` and the same canonical identity.
 #### Concurrency and crash ordering
 
 The stable `.lock` serializes state decisions and OAuth requests across processes. Cache reads, writes, and `fsync` calls run outside the async event-loop thread while the process continues to hold that lock. `force_refresh` ignores the caller's old generation, adopts a generation just written by a peer, and never bypasses the minimum issue interval.
+
+Exec treats the issuance lease as a hard monotonic deadline for both async and
+sync lock waiters and bounds the synchronous coroutine bridge as well. A lock
+or cache-operation timeout closes its descriptor and returns a retryable `503`
+classified as `TRANSIENT` / `RETRY_PENDING`; it never falls through to an
+uncoordinated token issue or replays a broker request.
 
 The crash-safe order under the lock is:
 

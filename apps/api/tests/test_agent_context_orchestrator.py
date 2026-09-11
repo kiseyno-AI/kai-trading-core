@@ -30,6 +30,7 @@ from app.agent_context.orchestrator_runtime_helpers import (
     dispatch_and_store,
     normalized_feedback_contract_failure,
 )
+from app.agent_context.model_identity import build_observed_model_identity
 from app.orders.signal_decider_performance_gates import evaluate_next_open_performance_gate
 
 
@@ -103,6 +104,18 @@ def _complete_actionable_signal_feedback(*, symbol: str = '005930') -> dict:
         'risk_flags': [],
         'details': {'decision_support': {'decision_support_only': True}},
         'improvement_notes': [],
+    }
+
+
+def _runtime_contract_proof(digest: str) -> dict:
+    return {
+        'role': 'signal-decider',
+        'version': 'v1',
+        'expected_sha256': 'sha256:canonical',
+        'live_sha256': f'sha256:{digest}',
+        'verified': True,
+        'status': 'verified',
+        'reason': None,
     }
 
 
@@ -368,6 +381,59 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
         self.assertEqual(len(cleanup_calls), 1)
         self.assertEqual(items[0]['storage']['session_cleanup']['status'], 'deleted')
 
+    def test_decider_single_dispatch_without_trusted_model_identity_is_rejected_with_audit(self):
+        store_calls: list[dict] = []
+
+        class Client:
+            @staticmethod
+            def dispatch(**kwargs):
+                return {
+                    'normalized_feedback': {
+                        **_complete_actionable_signal_feedback(),
+                        'response_contract_valid': True,
+                        'structural_mismatch_flags': [],
+                        'response_schema_violation_flags': [],
+                    },
+                    'response': {'id': 'raw-response-kept', 'model': 'openclaw/signal-decider'},
+                    'output_text': '{"next_day_open_action":"buy"}',
+                    'session_ref': {'session_key': kwargs['payload']['session_key']},
+                }
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**kwargs):
+                store_calls.append(kwargs)
+                return {'id': 1}
+
+            @staticmethod
+            def _cleanup_session_key(**kwargs):
+                return {'status': 'deleted', 'session_key': kwargs['session_key']}
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='single-missing-model-identity',
+            specs=[SimpleNamespace(role='signal-decider', agent_name='signal-decider')],
+            payloads={'signal-decider': {'market_date': '2026-04-23', 'symbol': '005930'}},
+            symbol='005930',
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(store_calls, [])
+        self.assertEqual(failures[0]['failure_kind'], 'response_contract_invalid')
+        self.assertEqual(
+            failures[0]['context']['response_audit']['response']['id'],
+            'raw-response-kept',
+        )
+        self.assertEqual(
+            failures[0]['context']['response_audit']['model_identity_verdict']['status'],
+            'actual_model_missing',
+        )
+
     def test_symbol_single_dispatch_without_symbol_is_rejected_before_persistence(self):
         cleanup_calls: list[dict] = []
 
@@ -463,6 +529,17 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
 class RepairJsonTailTests(unittest.TestCase):
     def test_response_storage_payload_preserves_prompt_model_and_contract_provenance(self):
         spec = SimpleNamespace(role='signal-decider', agent_name='signal-decider')
+        observed_model_identity = build_observed_model_identity(
+            role='signal-decider',
+            expected_model='openai/gpt-5.6-sol',
+            actual_provider='openai',
+            actual_model='gpt-5.6-sol',
+        )
+        model_identity = {
+            **observed_model_identity,
+            'status': 'verified',
+            'cohort': 'signal-decider|openai/gpt-5.6-sol',
+        }
         payload = build_response_storage_payload(
             spec=spec,
             batch_result={
@@ -473,9 +550,20 @@ class RepairJsonTailTests(unittest.TestCase):
                     'contract_version': 'agent_role_contract_v1',
                     'contract_sha256': 'sha256:contract-hash',
                     'role': 'signal-decider',
+                    'model_identity': observed_model_identity,
+                    'runtime_contract': {
+                        'role': 'signal-decider',
+                        'version': 'v1',
+                        'sha256': 'sha256:runtime-contract-hash',
+                        'status': 'canonical_contract_available',
+                    },
                 },
             },
-            normalized_feedback={'role': 'signal-decider', 'risk_flags': []},
+            normalized_feedback={
+                'role': 'signal-decider',
+                'risk_flags': [],
+                'model_identity': model_identity,
+            },
             collector_mode='test',
         )
 
@@ -483,11 +571,18 @@ class RepairJsonTailTests(unittest.TestCase):
             payload['decision_provenance'],
             {
                 'model': 'openclaw/signal-decider',
+                'model_identity': model_identity,
                 'prompt_sha256': 'sha256:prompt-hash',
                 'prompt_chars': 12345,
                 'contract_version': 'agent_role_contract_v1',
                 'contract_sha256': 'sha256:contract-hash',
                 'role': 'signal-decider',
+                'runtime_contract': {
+                    'role': 'signal-decider',
+                    'version': 'v1',
+                    'sha256': 'sha256:runtime-contract-hash',
+                    'status': 'canonical_contract_available',
+                },
             },
         )
 
@@ -1692,6 +1787,15 @@ class RecordingBatchClient:
             'started_at': '2026-04-14T01:00:00+00:00',
             'completed_at': '2026-04-14T01:01:00+00:00',
             'session_ref': {'session_key': kwargs['batch_items'][0]['session_key']},
+            'model_identity': build_observed_model_identity(
+                role=spec.role,
+                expected_model='openai/gpt-5.6-sol',
+                actual_provider='openai',
+                actual_model='gpt-5.6-sol',
+            ),
+            'request_provenance': {
+                'runtime_contract': {'version': 'v1', 'verified': True, 'status': 'verified'}
+            },
         }, expected_symbols=[item['symbol'] for item in batch_items])
 
 
@@ -1923,6 +2027,15 @@ class SignalDeciderBatchClient:
             'session_ref': {'session_key': batch_items[0]['session_key']},
             'response': {'model': f"openclaw/{spec.agent_name}", 'id': f"resp-{spec.role}"},
             'output_text': '{}',
+            'model_identity': build_observed_model_identity(
+                role=spec.role,
+                expected_model='openai/gpt-5.6-sol',
+                actual_provider='openai',
+                actual_model='gpt-5.6-sol',
+            ),
+            'request_provenance': {
+                'runtime_contract': {'version': 'v1', 'verified': True, 'status': 'verified'}
+            },
         }, expected_symbols=[item['symbol'] for item in batch_items])
 
 
@@ -2239,6 +2352,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             openclaw_agent_max_retries=0,
             openclaw_agent_retry_backoff_seconds=0,
             openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent/openclaw-test-state',
         )
 
         with patch.object(orchestrator_module, 'settings', fake_settings):
@@ -2249,6 +2363,178 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             orchestrator_module.DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS,
         )
         self.assertEqual(client.http_timeout_seconds, client.timeout_seconds)
+
+    def test_single_dispatch_persists_pre_and_post_runtime_contract_drift_proof(self):
+        http_calls: list[dict] = []
+        response_payload = {
+            'id': 'response-1',
+            'status': 'completed',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [
+                        {
+                            'type': 'output_text',
+                            'text': json.dumps(_complete_actionable_signal_feedback()),
+                        }
+                    ],
+                }
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent/openclaw-test-state',
+        )
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.build_runtime_contract_provenance',
+            side_effect=[_runtime_contract_proof('before'), _runtime_contract_proof('after')],
+        ), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=lambda **kwargs: FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=http_calls,
+                **kwargs,
+            ),
+        ):
+            client = OpenClawAgentClient()
+            with patch.object(
+                client,
+                '_observe_post_dispatch_model_identity',
+                return_value=build_observed_model_identity(
+                    role='signal-decider',
+                    expected_model='openai/gpt-5.6-sol',
+                    actual_provider='openai',
+                    actual_model='gpt-5.6-sol',
+                ),
+            ):
+                result = client.dispatch(
+                    spec=orchestrator_module.DISPATCH_SPECS[-1],
+                    payload={
+                        'market_date': '2026-04-23',
+                        'symbol': '005930',
+                        'session_key': 'feedback/signal-decider/drift-test',
+                    },
+                )
+
+        proof = result['request_provenance']['runtime_contract']
+        self.assertFalse(proof['verified'])
+        self.assertEqual(proof['status'], 'live_contract_changed_during_dispatch')
+        self.assertEqual(proof['pre_dispatch']['live_sha256'], 'sha256:before')
+        self.assertEqual(proof['post_dispatch']['live_sha256'], 'sha256:after')
+        self.assertFalse(result['normalized_feedback']['response_contract_valid'])
+        self.assertEqual(result['normalized_feedback']['next_day_open_action'], 'reject')
+
+    def test_batch_dispatch_persists_pre_and_post_runtime_contract_drift_proof(self):
+        http_calls: list[dict] = []
+        response_payload = {
+            'id': 'response-1',
+            'status': 'completed',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [
+                        {
+                            'type': 'output_text',
+                            'text': json.dumps(
+                                {'items': [{'symbol': '005930', 'feedback': _complete_actionable_signal_feedback()}]}
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent/openclaw-test-state',
+        )
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.build_runtime_contract_provenance',
+            side_effect=[_runtime_contract_proof('before'), _runtime_contract_proof('after')],
+        ), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=lambda **kwargs: FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=http_calls,
+                **kwargs,
+            ),
+        ):
+            client = OpenClawAgentClient()
+            with patch.object(
+                client,
+                '_observe_post_dispatch_model_identity',
+                return_value=build_observed_model_identity(
+                    role='signal-decider',
+                    expected_model='openai/gpt-5.6-sol',
+                    actual_provider='openai',
+                    actual_model='gpt-5.6-sol',
+                ),
+            ):
+                result = client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[-1],
+                    market_date=date(2026, 4, 23),
+                    batch_items=[
+                        {
+                            'market_date': '2026-04-23',
+                            'symbol': '005930',
+                            'session_key': 'feedback/signal-decider/drift-test',
+                        }
+                    ],
+                )
+
+        proof = result['request_provenance']['runtime_contract']
+        self.assertFalse(proof['verified'])
+        self.assertEqual(proof['status'], 'live_contract_changed_during_dispatch')
+        self.assertEqual(proof['pre_dispatch']['live_sha256'], 'sha256:before')
+        self.assertEqual(proof['post_dispatch']['live_sha256'], 'sha256:after')
+
+    def test_retry_stops_when_runtime_contract_drifts_after_failed_response(self):
+        http_calls: list[dict] = []
+        responses = [
+            FakeHTTPResponse(500, {'status': 'failed'}),
+            FakeHTTPResponse(200, {'status': 'completed', 'output': []}),
+        ]
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=1,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent/openclaw-test-state',
+        )
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.build_runtime_contract_provenance',
+            side_effect=[_runtime_contract_proof('before'), _runtime_contract_proof('after')],
+        ), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=lambda **kwargs: FakeHTTPClient(
+                response=responses.pop(0),
+                calls=http_calls,
+                **kwargs,
+            ),
+        ):
+            client = OpenClawAgentClient()
+            with self.assertRaises(orchestrator_module.AgentDispatchTerminalError):
+                client.dispatch(
+                    spec=orchestrator_module.DISPATCH_SPECS[-1],
+                    payload={
+                        'market_date': '2026-04-23',
+                        'symbol': '005930',
+                        'session_key': 'feedback/signal-decider/retry-drift-test',
+                    },
+                )
+
+        self.assertEqual(len(http_calls), 1)
 
     def test_openclaw_auth_preflight_maps_gateway_auth_rejection(self):
         fake_settings = SimpleNamespace(
@@ -4509,6 +4795,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['attempt_id'], f'{dispatch_id}:attempt-1')
         self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/v1/responses')
         self.assertEqual(http_calls[0]['json']['model'], 'openclaw/eod-summarizer')
+        self.assertNotIn('x-openclaw-model', http_calls[0]['kwargs']['headers'])
         self.assertEqual(result['request_provenance']['model'], 'openclaw/eod-summarizer')
         self.assertEqual(result['request_provenance']['contract_version'], 'agent_role_contract_v1')
         self.assertEqual(
@@ -4584,6 +4871,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             openclaw_agent_max_retries=0,
             openclaw_agent_retry_backoff_seconds=0,
             openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent/openclaw-model-identity-test',
         )
 
         def fake_client_factory(*args, **kwargs):
@@ -4618,6 +4906,16 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     )
 
         decoded_item = result['decoded']['items'][0]
+        self.assertEqual(
+            http_calls[0]['kwargs']['headers']['x-openclaw-model'],
+            'openai/gpt-5.6-sol',
+        )
+        self.assertEqual(
+            result['request_provenance']['requested_model_identity']['requested_model'],
+            'openai/gpt-5.6-sol',
+        )
+        self.assertIsNone(result['model_identity']['actual_model_ref'])
+        self.assertFalse(result['model_identity']['verified'])
         self.assertNotIn('symbol', decoded_item)
         self.assertEqual(result['response_correlation']['attribution_status'], 'mismatch')
         self.assertEqual(result['response_correlation']['failure_class'], 'batch_response_attribution_mismatch')

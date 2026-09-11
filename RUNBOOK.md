@@ -94,7 +94,11 @@ What it does:
 - Open/trend evidence uses the KIS intraday index-bar business date and session time as its observation timestamp; cache collection/attempt timestamps never relabel a prior-session row. The same KIS index response's `prdy_tr_pbmn` is the preferred prior-session turnover baseline. PyKRX is queried only when that field is unavailable, and only a `completed`, zero-failure EOD run with complete as-of-universe metadata, exact requested-versus-persisted symbol membership, and matching SHA-256 membership digests qualifies. A missing or timed-out fallback leaves the fresh index leg visible but disables value-expansion confirmation.
 - Every live index refresh performs current-before, one-minute-series, and current-after KIS reads per market. The timestamped bar must fit the monotonic cumulative-turnover bracket, and the newer current response becomes the displayed row. Budget two current-index requests plus one time-series request per market per refresh when checking KIS quotas and rate limits.
 - A delegated v4 create is preceded by a durable, compact `pending_remote_ack` record. Restart recovery and all later readback/revocation calls must match its normalized original Exec URL, runtime mode, dispatch source, and account reference. If those settings change, Core sends nothing to the replacement endpoint and leaves the authority in manual review; restore the original destination or reconcile it explicitly. Bearer-token rotation at the same destination is supported, and tokens or embedded URL credentials must never be stored in dispatch evidence. Pending remote ACK state remains managed after dispatch or next-open execution is disabled: Core performs same-destination readback and revocation before routing can fall back to Core-local buys.
+- Before any OPEN v4 buy dispatch, Core derives a route-wide `current_live_market_buy_authority_v1` observation from fresh authoritative KOSPI and KOSDAQ evidence, binds it to the exact KIS/KRX/KRW runtime/account scope, and commits the authority state plus outbox row in one transaction. It sends that observation to Exec at `POST /runtime/core-buy-authority/observations` even when no candidate survives. Missing or stale required market evidence is an explicit block; transport failure, a stale/conflicting observation ID, or a mismatched ACK leaves the outbox pending and buying blocked.
+- Treat the Exec ACK as complete only when it matches the submitted observation and reports both `fence_active=false` and `projection_pending=false`. Exec persists the scoped fence before projecting it onto eligible Core-v4 KRX plan items, so an interrupted projection remains closed and retryable. Replayed healthy observations do not advance the healthy streak. Recovery releases only the scoped market-authority fence or drawdown latch; it never resumes the whole runtime, clears a kill switch, bypasses hourly risk-off, or revives an old order. The next fresh candidate must pass every current gate again.
 - The accepted contract proof stores the exact ACK mapping from each Core item key to its Exec plan ID and plan-item ID. Readback status is merged only on an exact three-field match. When remote orders or executions provide stable IDs, every supplied item/order ID plus symbol and side must resolve to the same ACK-bound item; symbol fallback is allowed only when no stable ID exists. Plan-scoped position reads require both external and internal plan IDs, KIS/KRX route proof, and one non-empty opaque account scope. Conflicts are discarded with a contract error and any later revoke continues to use the original ACK IDs. Compact readback total counts are not item counts: incomplete order/execution sources are excluded from P/L unless a complete alternate source exists.
+- Exec US-account evidence is intentionally fail-closed. Each non-zero holding needs a finite, non-negative broker market value or a deterministic average-price/quantity/unrealized-P&L derivation, and each open buy needs a known positive-price notional. Legacy cumulative fills without explicit `fill_time_precision` are treated as `observed_upper_bound`, make FIFO chronology indeterminate, and block US new buys until a later exact-scope verified-flat boundary. Duplicate fill IDs deduplicate only when quantity, base/quote notional, price, settlement currency, transaction cost, coverage, source, and currency-conflict evidence agree; an economic conflict excludes the entire group from realized P/L and blocks US new buys for review.
+- The shared KIS OAuth issuance lease is a hard monotonic deadline for Exec async and sync lock waiters, including the sync coroutine bridge. Lock or cache-operation timeout is retryable (`503`, `TRANSIENT`, `RETRY_PENDING`): confirm contention or lease expiry and retry normally. Do not bypass the shared cache, issue an uncoordinated token, or replay the failed broker request.
 - A transient critical-evidence revocation can produce a new dispatch generation only after the exact revocation ACK, unchanged authority/destination/material fingerprint, and a fresh authoritative allow observation. Explicit revocations, route or material changes, and manual-review rows never auto-resume.
 - Live Exec dispatch requires exactly one explicit valid `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS` KIS account and exact handoff-row binding to it. Missing, invalid, multiple, mismatched, or synthetic `KIS:00000000-00` routes fail before HTTP; the synthetic route is limited to mock/paper dispatch and monitor-only planning.
 - All five KIS breadth buckets (upper-limit, advance, unchanged, decline, lower-limit) are retained. Strong breadth requires a completed same-date KIS-master universe proof and a bucket-total match that resolves the provider's limit-bucket semantics; count-only or partial responses fail closed. `aggressive_open` and `trend_day` remain observable shadow regimes, but their uncalibrated 2.0x/1.25x sizing and confidence uplifts are shadow-only: live `quantity_multiplier` is capped at 1.0 and live entry-priority boost is disabled. The value-expansion audit records the actual elapsed fraction and conservative denominator (`max(actual, 0.25)`); no full-day linear extrapolation or last-known fallback is used.
@@ -109,7 +113,7 @@ What it does:
 - If Exec already accepted part of an account/agent group, Core sends only newly pending rows under a deterministic `-delta-<key>` plan id. This avoids the create-only Exec API's duplicate-plan conflict while keeping retries idempotent.
 - Signal-decider, short-term-decider, and exec-agent handoffs now carry `decision_input_quality_context`, a deterministic buy-quality envelope that separates data quality, market/setup edge, execution feasibility, and final judgment. Operators should treat stale/fallback quote evidence and missing raw source turnover as hard blocks or major discounts in that envelope; missing news/disclosure context is secondary and neutral by default. The envelope is explicitly free/current-data-only (`paid_api_dependency=false`): missing provider data should be encoded with provenance and conservative gates, not solved by assuming paid APIs.
 - Executable spread evidence expires after `KIS_REALTIME_PRICE_STALE_AFTER_SECONDS` (default `30`). It requires the exact provider table set for one source context (`current_quote_cache` + `quote_snapshots`, or `current_kis_intraday_snapshot_cache` + `kis_intraday_snapshots`), a timezone-aware same-market-date timestamp, and a positive coherent price/bid/ask/spread bundle. Extra tables, mixed quote/intraday components, zero or crossed books, future timestamps, and stale observations are non-authoritative.
-- Short-term next-open/watch candidates carry a signal-decider alignment gate audit. The live default remains `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE=report_only`. Explicit `hard_block` and `downsize_probe` modes enforce zero or the configured deterministic probe quantity for non-override conflicts; valid overrides are preserved, and missing/stale signal-decider context is never silently approved. Core persists the final enforcement decision plus requested/final quantity through Exec handoff and risk context. Promotion thresholds and rollback are documented in [WAIT_CONFLICT_GATE_ENFORCEMENT.md](./docs/WAIT_CONFLICT_GATE_ENFORCEMENT.md).
+- Short-term next-open/watch candidates carry a signal-decider alignment gate audit. The live default remains `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE=report_only`. Explicit `hard_block` enforces zero; `downsize_probe` passes the configured probe as a hard `max_quantity` ceiling while Exec retains final sizing authority and may reduce or reject it. Valid overrides are preserved, and missing/stale signal-decider context is never silently approved. Core persists the final enforcement decision plus requested/final quantity through Exec handoff and risk context. Promotion thresholds and rollback are documented in [WAIT_CONFLICT_GATE_ENFORCEMENT.md](./docs/WAIT_CONFLICT_GATE_ENFORCEMENT.md).
 - During `OPEN`, the `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled` compatibility path can inspect Core-local next-open plans, but signal-decider buys remain ineligible because Core has no execution-time quote/cost recheck. A source-day quote and the non-spread allowance do not authorize submission; use Exec dispatch for live trigger-time full-cost validation.
 - During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled`, core also evaluates linked next-open positions against persisted signal-decider target/stop thresholds and submits intraday auto-sell market orders when the live KIS quote crosses a configured exit rule.
 - During `OPEN`, if `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=dispatch`, core does not place those live signal-decider orders itself. Instead it refreshes the core-owned exec read model from the exec runtime APIs so operator and web views can read dispatch/runtime/order/execution state without double-submitting live actions from core.
@@ -155,6 +159,25 @@ queries older than the configured threshold and never cancels write queries.
 
 ## Deployment migration hygiene
 
+Revision `20260911_0081` is a coordinated Core/Exec authority migration. Use
+this order:
+
+1. Pause delegated dispatch, then drain every Core database writer and
+   background process.
+2. Create a compressed PostgreSQL backup with `pg_dump -Fc`; verify it is
+   non-empty and readable with `pg_restore --list`.
+3. Upgrade Exec first through `202609110003`, start it paused, and verify its
+   schema/runtime readiness.
+4. Upgrade Core through `20260911_0081` with exactly one migration owner.
+5. Start Core while dispatch remains paused, reconcile every pending authority
+   outbox row, then verify a mock or paper authority observation and matching
+   Exec ACK.
+6. Resume only after the existing runtime, kill-switch, hourly risk-off,
+   account-drawdown, and authority fences have been reviewed independently.
+
+Once either `0081` table contains authority or outbox evidence, do not run the
+migration's destructive downgrade. Restore the verified backup or fix forward.
+
 Use these commands from `apps/api` when you want deploy-time schema checks to fail early and explain drift more clearly:
 
 1. Preflight before upgrade or restart:
@@ -172,6 +195,7 @@ Use these commands from `apps/api` when you want deploy-time schema checks to fa
 
 Notes:
 
+- This release expects one Core Alembic head, `20260911_0081`; that revision adds the transaction-bound Core buy-authority state/outbox. Pair it with Exec head `202609110003` before enabling OPEN dispatch.
 - The preflight is intentionally non-destructive. It does not mutate schema state.
 - The migration preflight includes the runtime schema drift result. It blocks on schema drift when the database is expected to be at Alembic head, including the `--require-head` deploy gate.
 - The preflight now also reports whether `/market/snapshot` is runtime-ready before restart, including the resolved KIS environment and any missing required secrets.
@@ -179,6 +203,20 @@ Notes:
 - The duplicate-table warning is heuristic by design: it flags live tables that overlap with still-pending unguarded `create_table(...)` revisions, which is the common `alembic_version` lag pattern behind repeated `DuplicateTable` deploy failures.
 - The smoke command now exercises `/portfolio/summary` in addition to `/health`, `/eod/freshness`, and `/market/snapshot`, and it fails when portfolio sync is still `not_configured` after restart.
 - The smoke command automatically sends `Authorization: Bearer <token>` when `UPSTREAM_BEARER_TOKEN` is set in the current shell environment.
+
+Before starting Core, verify both versioned OpenClaw instruction contracts from
+the repository root:
+
+```bash
+python3.11 scripts/sync_openclaw_runtime_contract.py --check --agent signal-decider
+python3.11 scripts/sync_openclaw_runtime_contract.py --check --agent short-term-decider
+```
+
+Any status other than `match` blocks deployment. The check is read-only and
+reports hashes without printing contract content. Use `--install` only after
+reviewing the versioned template, then rerun `--check`; installation changes
+only that workspace's `AGENTS.md` and never enables dispatch or alters trading
+state.
 
 ## Runtime write-path schema drift diagnostics
 
@@ -366,7 +404,7 @@ Local overrides:
 - Tune `EOD_AUTO_PYKRX_AFTER_CLOSE_MINUTES`, `EOD_AUTO_PYKRX_POLL_SECONDS`, `EOD_AUTO_PYKRX_MARKETS`, `EOD_AUTO_PYKRX_REFRESH_UNIVERSE`, `EOD_AUTO_PYKRX_STALE_RUN_MINUTES`, and `EOD_PYKRX_REQUEST_TIMEOUT_SECONDS` in `apps/api/.env`, then restart the API.
 - Use `SIGNAL_DECIDER_NEXT_OPEN_ENABLED`, `SIGNAL_DECIDER_NEXT_OPEN_DRY_RUN`, `SIGNAL_DECIDER_NEXT_OPEN_ACCOUNT_TARGETS`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_CONFIDENCE_SCORE_10`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_EXPECTED_RETURN_PCT`, `SIGNAL_DECIDER_NEXT_OPEN_MIN_REWARD_RISK_RATIO`, `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE`, `SIGNAL_DECIDER_WAIT_CONFLICT_PROBE_QUANTITY`, and the `SIGNAL_DECIDER_NEXT_OPEN_REQUIRE_*` / `...BLOCK_ON_*` guardrails in `apps/api/.env`, then restart the API. Keep the WAIT-conflict gate at `report_only` until the documented rolling replay promotion threshold and manual approval are satisfied; follow the documented rollback procedure for any trial.
 - Use `SIGNAL_DECIDER_EXEC_INTEGRATION_MODE=disabled|observe|dispatch`, `SIGNAL_DECIDER_EXEC_BASE_URL`, optional `SIGNAL_DECIDER_EXEC_BEARER_TOKEN`, `SIGNAL_DECIDER_EXEC_RUNTIME_MODE`, and `SIGNAL_DECIDER_EXEC_REQUEST_TIMEOUT_SECONDS` in `apps/api/.env` to control the core-to-exec integration lane, then restart the API.
-- In `dispatch` mode, eligible `signal-decider` next-open buys and actionable `short-term-decider` watcher candidates with `confidence_score_10 >= 6.0` are handed to exec for account-aware sizing at/after 08:00 KST. Core sends budget/reference/target/stop/confidence/risk context, does not force buy quantity from budget/reference fallback sizing, and leaves accepted rows delegated unless exec returns a positive agent-approved quantity.
+- In `dispatch` mode, eligible `signal-decider` next-open buys and actionable `short-term-decider` watcher candidates with `confidence_score_10 >= 6.0` are handed to Exec for account-aware sizing at/after 08:00 KST. Core sends budget/reference/target/stop/confidence/risk context and never grants executable fixed sizing; even a `downsize_probe` is only a `max_quantity` ceiling. Accepted rows remain delegated unless Exec returns a positive agent-approved quantity.
 - The KRX next-open loader requires an explicit domestic market claim (`KRX`, `KOSPI`, `KOSDAQ`, or `KONEX`) in the persisted symbol context. Missing, US, unknown, or contradictory market claims are skipped rather than defaulted to KRX.
 - Use `GET /eod/status` to inspect the scheduler state and last result.
 
