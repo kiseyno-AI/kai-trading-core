@@ -253,8 +253,9 @@ class MarketRelativeQueryShapeTests(unittest.TestCase):
         self.assertEqual(result['last_refresh_status'], 'success')
         self.assertEqual(result['payload']['markets']['kospi']['index_code'], '0001')
 
-    def test_load_prior_market_turnover_baselines_requires_exact_completed_eod_membership(self) -> None:
+    def test_load_prior_market_turnover_baselines_accepts_point_in_time_historical_run(self) -> None:
         run_metadata = {
+            'mode': 'historical_backfill',
             'markets': ['KOSPI'],
             'symbol': None,
             'limited_run': False,
@@ -266,10 +267,12 @@ class MarketRelativeQueryShapeTests(unittest.TestCase):
                 'complete': True,
                 'markets': ['KOSPI'],
                 'symbol_count': 2,
-                'persisted_count': 2,
+                'persisted_count': 0,
                 'latest_trade_date': '2026-04-07',
                 'membership_basis': 'end_date_snapshot',
                 'unavailable_markets': [],
+                'point_in_time': True,
+                'current_universe_mutated': False,
                 'market_membership': _market_membership(
                     {'KOSPI': ['005930', '000660']}
                 ),
@@ -345,6 +348,7 @@ class MarketRelativeQueryShapeTests(unittest.TestCase):
 
     def test_load_prior_market_turnover_baselines_rejects_same_count_wrong_symbol_set(self) -> None:
         run_metadata = {
+            'mode': 'historical_backfill',
             'markets': ['KOSPI'],
             'symbol': None,
             'limited_run': False,
@@ -356,10 +360,12 @@ class MarketRelativeQueryShapeTests(unittest.TestCase):
                 'complete': True,
                 'markets': ['KOSPI'],
                 'symbol_count': 2,
-                'persisted_count': 2,
+                'persisted_count': 0,
                 'latest_trade_date': '2026-04-07',
                 'membership_basis': 'end_date_snapshot',
                 'unavailable_markets': [],
+                'point_in_time': True,
+                'current_universe_mutated': False,
                 'market_membership': _market_membership(
                     {'KOSPI': ['005930', '000660']}
                 ),

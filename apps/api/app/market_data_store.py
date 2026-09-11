@@ -1244,6 +1244,12 @@ def _completed_eod_turnover_run_is_eligible(
     except (TypeError, ValueError):
         return False, [], {}
     total, succeeded, failed, universe_symbol_count, universe_persisted_count = numeric_proof_values
+    historical_point_in_time_universe = bool(
+        metadata.get('mode') == 'historical_backfill'
+        and universe.get('point_in_time') is True
+        and universe.get('current_universe_mutated') is False
+        and universe_persisted_count == 0
+    )
     eligible = bool(
         row.get('status') == 'completed'
         and row.get('completed_at') is not None
@@ -1262,7 +1268,10 @@ def _completed_eod_turnover_run_is_eligible(
         and isinstance(universe.get('unavailable_markets'), list)
         and not universe.get('unavailable_markets')
         and universe_symbol_count == total
-        and universe_persisted_count == total
+        and (
+            universe_persisted_count == total
+            or historical_point_in_time_universe
+        )
         and universe_latest_date == row.get('trade_date')
         and required_markets.issubset(requested_markets)
         and required_markets.issubset(universe_markets)
