@@ -1335,9 +1335,12 @@ class OpenClawAgentClient:
         last_error: Exception | None = None
         last_error_details: dict[str, Any] | None = None
         retry_contract_anchor: dict[str, Any] | None = None
+        dispatch_started_at: datetime | None = None
         while attempt <= self.max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
+            if dispatch_started_at is None:
+                dispatch_started_at = started_at
             try:
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
@@ -1415,7 +1418,7 @@ class OpenClawAgentClient:
                     agent_name=spec.agent_name,
                     session_key=request_session_key,
                     expected_model=expected_model,
-                    dispatch_started_at=started_at,
+                    dispatch_started_at=dispatch_started_at,
                     session_id=(
                         str(parsed.get('session_id')).strip()
                         if parsed.get('session_id') is not None
@@ -1693,9 +1696,12 @@ class OpenClawAgentClient:
         attempt = 0
         last_error: Exception | None = None
         retry_contract_anchor: dict[str, Any] | None = None
+        dispatch_started_at: datetime | None = None
         while attempt <= self.max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
+            if dispatch_started_at is None:
+                dispatch_started_at = started_at
             response: httpx.Response | None = None
             attempt_id = make_attempt_id(dispatch_id=dispatch_id, attempt=attempt)
             request_marker = f"batch-request::{attempt_id or dispatch_id}"
@@ -1830,7 +1836,7 @@ class OpenClawAgentClient:
                     agent_name=spec.agent_name,
                     session_key=request_session_key,
                     expected_model=expected_model,
-                    dispatch_started_at=started_at,
+                    dispatch_started_at=dispatch_started_at,
                     session_id=(
                         str(session_ref.get('session_id')).strip()
                         if session_ref.get('session_id') is not None
