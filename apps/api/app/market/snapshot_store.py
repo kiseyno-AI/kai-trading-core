@@ -147,6 +147,45 @@ def _payload_can_replace(
     return candidate == current
 
 
+def _failed_refresh_overlay(
+    *,
+    current: dict[str, Any] | None,
+    candidate: dict[str, Any] | None,
+    current_attempt: datetime | None,
+    candidate_attempt: datetime | None,
+    current_success: datetime | None,
+    last_refresh_status: str,
+) -> dict[str, Any] | None:
+    current_order = _payload_observation_order(current)
+    candidate_order = _payload_observation_order(candidate)
+    if (
+        current is None
+        or candidate is None
+        or str(last_refresh_status).strip().lower() != 'error'
+        or str(candidate.get('status') or '').strip().lower() != 'stale'
+        or not str(candidate.get('stale_reason') or '').strip()
+        or candidate_attempt is None
+        or (current_attempt is not None and candidate_attempt < current_attempt)
+        or (current_success is not None and candidate_attempt <= current_success)
+        or current_order is None
+        or candidate_order != current_order
+    ):
+        return None
+    current_market_observations = _payload_market_observations(current)
+    candidate_market_observations = _payload_market_observations(candidate)
+    if (
+        current_market_observations is None
+        or candidate_market_observations is None
+        or candidate_market_observations != current_market_observations
+    ):
+        return None
+
+    overlay = deepcopy(current)
+    overlay['status'] = 'stale'
+    overlay['stale_reason'] = candidate['stale_reason']
+    return overlay
+
+
 @dataclass(frozen=True)
 class MarketSnapshotCacheRecord:
     payload: dict[str, Any] | None
@@ -240,7 +279,18 @@ class MarketSnapshotCacheStore:
                 return self._to_record(row)
 
             current_payload = deepcopy(row.payload) if isinstance(row.payload, dict) else None
-            if not _payload_can_replace(
+            current_success = _comparable_datetime(row.last_refresh_succeeded_at)
+            failed_overlay = _failed_refresh_overlay(
+                current=current_payload,
+                candidate=stored_payload,
+                current_attempt=current_attempt,
+                candidate_attempt=candidate_attempt,
+                current_success=current_success,
+                last_refresh_status=last_refresh_status,
+            )
+            if failed_overlay is not None:
+                stored_payload = failed_overlay
+            elif not _payload_can_replace(
                 current=current_payload,
                 candidate=stored_payload,
             ):
@@ -256,7 +306,6 @@ class MarketSnapshotCacheStore:
             row.stale_reason = stored_payload.get('stale_reason') if stored_payload is not None else None
             row.as_of = _normalize_datetime(stored_payload.get('as_of')) if stored_payload is not None else None
             row.last_refresh_attempted_at = last_refresh_attempted_at
-            current_success = _comparable_datetime(row.last_refresh_succeeded_at)
             candidate_success = _comparable_datetime(last_refresh_succeeded_at)
             row.last_refresh_succeeded_at = (
                 last_refresh_succeeded_at

@@ -199,7 +199,8 @@ class MarketSnapshotCacheStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(saved.last_refresh_status, 'error')
         self.assertEqual(saved.last_refresh_error, 'market_snapshot_observation_regressed')
 
-    def test_equal_observation_with_lower_quality_cannot_replace_ready_snapshot(self) -> None:
+    def test_newer_failed_attempt_marks_equal_last_good_observation_stale(self) -> None:
+        last_succeeded_at = datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc)
         observed_payload = {
             'as_of': '2026-04-30T10:10:00+09:00',
             'collected_at': '2026-04-30T10:10:03+09:00',
@@ -209,7 +210,7 @@ class MarketSnapshotCacheStoreIntegrationTests(unittest.TestCase):
         self.store.save(
             payload=observed_payload,
             last_refresh_attempted_at=datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc),
-            last_refresh_succeeded_at=datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc),
+            last_refresh_succeeded_at=last_succeeded_at,
             last_refresh_status='success',
             last_refresh_error=None,
             refresh_trigger='ready_observation',
@@ -220,6 +221,7 @@ class MarketSnapshotCacheStoreIntegrationTests(unittest.TestCase):
                 **observed_payload,
                 'status': 'stale',
                 'stale_reason': 'market_snapshot_kis_upstream_error',
+                'markets': {'kospi': {'value': 2600.0}},
             },
             last_refresh_attempted_at=datetime(2026, 4, 30, 1, 15, tzinfo=timezone.utc),
             last_refresh_succeeded_at=None,
@@ -228,7 +230,65 @@ class MarketSnapshotCacheStoreIntegrationTests(unittest.TestCase):
             refresh_trigger='same_observation_failure',
         )
 
-        self.assertEqual(saved.payload, observed_payload)
+        self.assertEqual(
+            saved.payload,
+            {
+                **observed_payload,
+                'status': 'stale',
+                'stale_reason': 'market_snapshot_kis_upstream_error',
+            },
+        )
+        self.assertEqual(saved.snapshot_status, 'stale')
+        self.assertEqual(saved.stale_reason, 'market_snapshot_kis_upstream_error')
+        self.assertEqual(saved.last_refresh_succeeded_at, last_succeeded_at)
+        self.assertEqual(saved.last_refresh_status, 'error')
+        self.assertEqual(saved.last_refresh_error, 'late failure for the same observation')
+        self.assertEqual(saved.refresh_trigger, 'same_observation_failure')
+
+    def test_failed_attempt_with_regressed_market_observation_is_rejected(self) -> None:
+        last_good_payload = {
+            'as_of': '2026-04-30T10:10:00+09:00',
+            'collected_at': '2026-04-30T10:10:03+09:00',
+            'status': 'ready',
+            'markets': {
+                'kospi': {
+                    'value': 2700.0,
+                    'provider_observed_at': '2026-04-30T10:10:00+09:00',
+                }
+            },
+        }
+        last_succeeded_at = datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc)
+        self.store.save(
+            payload=last_good_payload,
+            last_refresh_attempted_at=last_succeeded_at,
+            last_refresh_succeeded_at=last_succeeded_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='last_good',
+        )
+
+        saved = self.store.save(
+            payload={
+                **last_good_payload,
+                'status': 'stale',
+                'stale_reason': 'market_snapshot_kis_upstream_error',
+                'markets': {
+                    'kospi': {
+                        'value': 2690.0,
+                        'provider_observed_at': '2026-04-30T10:05:00+09:00',
+                    }
+                },
+            },
+            last_refresh_attempted_at=datetime(2026, 4, 30, 1, 15, tzinfo=timezone.utc),
+            last_refresh_succeeded_at=last_succeeded_at,
+            last_refresh_status='error',
+            last_refresh_error='provider returned an older observation',
+            refresh_trigger='regressed_failed_attempt',
+        )
+
+        self.assertEqual(saved.payload, last_good_payload)
+        self.assertEqual(saved.snapshot_status, 'ready')
+        self.assertEqual(saved.last_refresh_succeeded_at, last_succeeded_at)
         self.assertEqual(saved.last_refresh_status, 'error')
         self.assertEqual(saved.last_refresh_error, 'market_snapshot_observation_regressed')
 
