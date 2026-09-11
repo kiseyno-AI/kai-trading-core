@@ -10,8 +10,10 @@ import exchange_calendars as exchange_calendars
 from app.core.settings import settings
 from app.orders.exec_integration import SignalDeciderExecClient
 from app.orders.execution_handoff_contract import (
+    EXECUTION_HANDOFF_CAPABILITY,
+    EXECUTION_HANDOFF_CONTRACT_VERSION,
     EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
-    serialize_execution_plan_dispatch_payload,
+    validate_execution_plan_dispatch_ack,
 )
 from app.repositories.us_equity_repository import load_us_signal_feedback
 from app.us_equities.kis_market_codes import to_kis_order_exchange
@@ -22,6 +24,7 @@ STRUCTURAL_AGENT_RISK_FLAGS = {
     'symbol_mismatch',
     'market_date_mismatch',
 }
+US_EXECUTION_BLOCK_REASON = 'exec_currency_aware_sizing_capability_unavailable'
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -106,6 +109,7 @@ class USExecutionPlanService:
             }
             risk_context = {
                 'schema_version': EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+                'agent_run_id': agent_run_id,
                 'source_market_date': source_market_date.isoformat(),
                 'canonical_symbol': candidate['symbol'],
                 'currency': 'USD',
@@ -122,7 +126,19 @@ class USExecutionPlanService:
                         'source_plan_item_id': entry_key,
                         'side': 'buy',
                         'intent': 'next_open_buy',
-                        'quantity_policy': {'kind': 'shares', 'quantity': candidate['quantity']},
+                        'handoff_intent': 'next_open_buy',
+                        'raw_action': 'buy',
+                        'generic_action': 'buy',
+                        'quantity_policy': {
+                            'type': 'exec_agent_sized',
+                            'max_quantity': candidate['quantity'],
+                            'budget_usd': str(settings.us_equity_exec_per_symbol_budget_usd),
+                            'estimated_reference_price': str(candidate['limit_price']),
+                        'pricing_note': (
+                            'Preview only: dispatch remains blocked until Exec enforces '
+                            'currency-aware USD sizing and account-risk ceilings.'
+                        ),
+                        },
                         'limit_price': str(candidate['limit_price']),
                         'trigger_price': None,
                         'risk_context': risk_context,
@@ -164,32 +180,46 @@ class USExecutionPlanService:
             else 'unreachable'
         )
         plan_id = f"core-us-signal-decider-{resolved_target.strftime('%Y%m%d')}-kis-{run_identity}"
-        payload = serialize_execution_plan_dispatch_payload(
-            {
+        preview_payload = None
+        if items:
+            requested_at = datetime.now(timezone.utc).isoformat()
+            preview_payload = {
                 'plan_id': plan_id,
-                'source': settings.signal_decider_exec_dispatch_source or 'kai-trading-core',
+                'source': 'kai-trading-core',
                 'mode': settings.signal_decider_exec_runtime_mode,
                 'market_date': resolved_target.isoformat(),
                 'strategy_run_id': agent_run_id,
-                'requested_at': datetime.now(timezone.utc).isoformat(),
+                'requested_at': requested_at,
                 'items': items,
                 'metadata': {
                     'schema_version': EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
-                    'market': 'US',
-                    'currency': 'USD',
+                    'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                    'required_capability': EXECUTION_HANDOFF_CAPABILITY,
+                    'agent_name': 'signal-decider',
+                    'decision_agent_name': 'signal-decider',
+                    'trigger': 'us_equity_signal_decider',
+                    'requested_at': requested_at,
+                    'account_reference': None,
+                    'account_label': None,
                     'source_market_date': source_market_date.isoformat(),
-                    'agent_run_id': agent_run_id,
+                    'target_trade_date': resolved_target.isoformat(),
+                    'dispatch_batch_type': 'initial',
+                    'dispatch_batch_key': None,
                 },
             }
-        )
         return {
-            'status': 'ready' if items else 'empty',
+            'status': 'preview_only' if items else 'empty',
+            'execution_supported': False,
+            'execution_block_reason': US_EXECUTION_BLOCK_REASON,
             'source_market_date': source_market_date.isoformat(),
             'target_trade_date': resolved_target.isoformat(),
             'accepted_candidate_count': len(accepted),
             'rejected_candidate_count': len(rejected),
             'rejections': rejected,
-            'payload': payload,
+            # This proposal deliberately is not exposed as a dispatch payload:
+            # the current v4 capability only certifies KIS/KRX/KRW sizing.
+            'payload': None,
+            'preview_payload': preview_payload,
         }
 
     async def dispatch(
@@ -210,11 +240,41 @@ class USExecutionPlanService:
             agent_run_id=agent_run_id,
         )
         result['dry_run'] = dry_run
-        if dry_run or not result['payload']['items']:
+        if dry_run or result['status'] == 'empty':
             return result
+        if not result['execution_supported']:
+            # Exec's delegated sizing contract is currently KRW/KRX-specific.
+            # Keep US plans as inspectable previews until Exec can enforce
+            # currency-aware cash, fee, quantity, and account-route ceilings.
+            raise ValueError(str(result['execution_block_reason']))
+        payload = result['payload']
+        if not isinstance(payload, dict):
+            raise ValueError('execution_dispatch_payload_unavailable')
         if not settings.us_equity_execution_enabled:
             raise ValueError('US equity execution dispatch is disabled by configuration')
-        result['exec_response'] = await self._client_factory().post_execution_plan(result['payload'])
+        metadata = payload.get('metadata')
+        dispatch_material_fingerprint = (
+            metadata.get('dispatch_material_fingerprint')
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(dispatch_material_fingerprint, str):
+            raise ValueError(
+                'execution dispatch payload validation error: '
+                'dispatch_material_fingerprint is required'
+            )
+        exec_response = await self._client_factory().post_execution_plan(payload)
+        validate_execution_plan_dispatch_ack(
+            exec_response,
+            plan_id=str(payload['plan_id']),
+            submitted_core_item_keys=[
+                str(item['core_item_key']) for item in payload['items']
+            ],
+            expected_dispatch_material_fingerprint=(
+                dispatch_material_fingerprint
+            ),
+        )
+        result['exec_response'] = exec_response
         result['status'] = 'dispatched'
         return result
 

@@ -295,16 +295,26 @@ async def list_next_open_execution_plan(
 @router.post('/next-open-execution/run-if-due')
 async def run_next_open_execution_if_due(payload: TradingNextOpenExecutionRunRequest) -> dict[str, Any]:
     try:
-        if signal_decider_exec_integration_service.should_delegate_execution():
+        resolved_target_trade_date = (
+            await signal_decider_next_open_execution_service._resolve_target_trade_date_async(
+                payload.target_trade_date,
+            )
+        )
+        if (
+            signal_decider_exec_integration_service.should_delegate_execution()
+            or signal_decider_exec_integration_service.should_manage_delegated_authority(
+                target_trade_date=resolved_target_trade_date,
+            )
+        ):
             return await signal_decider_exec_integration_service.dispatch_next_open_plan(
-                target_trade_date=payload.target_trade_date,
+                target_trade_date=resolved_target_trade_date,
                 refresh_plan=True,
                 dry_run=payload.dry_run,
                 force=payload.force,
                 trigger='api',
             )
         return await signal_decider_next_open_execution_service.run_market_open_execution_if_due(
-            target_trade_date=payload.target_trade_date,
+            target_trade_date=resolved_target_trade_date,
             dry_run=payload.dry_run,
             force=payload.force,
             trigger='api',

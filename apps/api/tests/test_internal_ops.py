@@ -2,6 +2,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -168,10 +169,76 @@ class InternalOpsTests(unittest.TestCase):
 
         bootstrap_runtime.assert_called_once_with()
         self.assertEqual(result['summary']['selected_count'], 1)
-        self.assertEqual(run_execution.call_args.kwargs['target_trade_date'], '2026-04-30')
+        self.assertEqual(run_execution.call_args.kwargs['target_trade_date'], date(2026, 4, 30))
         self.assertEqual(run_execution.call_args.kwargs['dry_run'], False)
         self.assertEqual(run_execution.call_args.kwargs['trigger'], 'internal_ops_cli')
         self.assertEqual(run_execution.call_args.kwargs['force'], True)
+
+    def test_run_next_open_execution_if_due_scopes_current_run_to_one_resolved_trade_date(self) -> None:
+        resolved_target_date = date(2026, 4, 30)
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_next_open_execution_service._resolve_target_trade_date',
+                return_value=resolved_target_date,
+            ) as resolve_target_date,
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.should_delegate_execution',
+                return_value=False,
+            ),
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.should_manage_delegated_authority',
+                return_value=False,
+            ) as should_manage,
+            patch(
+                'app.internal.ops.signal_decider_next_open_execution_service.run_market_open_execution_if_due',
+                new=AsyncMock(return_value={'summary': {'triggered': True, 'selected_count': 1}}),
+            ) as run_execution,
+        ):
+            result = ops.run_next_open_execution_if_due(
+                target_trade_date=None,
+                dry_run=False,
+                force=False,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result['summary']['selected_count'], 1)
+        resolve_target_date.assert_called_once_with(None)
+        should_manage.assert_called_once_with(target_trade_date=resolved_target_date)
+        self.assertEqual(run_execution.call_args.kwargs['target_trade_date'], resolved_target_date)
+
+    def test_run_next_open_execution_if_due_dispatches_managed_authority_for_resolved_trade_date(self) -> None:
+        resolved_target_date = date(2026, 4, 30)
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_next_open_execution_service._resolve_target_trade_date',
+                return_value=resolved_target_date,
+            ) as resolve_target_date,
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.should_delegate_execution',
+                return_value=False,
+            ),
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.should_manage_delegated_authority',
+                return_value=True,
+            ) as should_manage,
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.dispatch_next_open_plan',
+                new=AsyncMock(return_value={'summary': {'delegated_to_exec': True, 'submitted_count': 1}}),
+            ) as dispatch_exec,
+        ):
+            result = ops.run_next_open_execution_if_due(
+                target_trade_date=None,
+                dry_run=False,
+                force=False,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertTrue(result['summary']['delegated_to_exec'])
+        resolve_target_date.assert_called_once_with(None)
+        should_manage.assert_called_once_with(target_trade_date=resolved_target_date)
+        self.assertEqual(dispatch_exec.call_args.kwargs['target_trade_date'], resolved_target_date)
 
     def test_run_intraday_auto_sell_if_due_uses_direct_service_call(self) -> None:
         with (
@@ -213,7 +280,7 @@ class InternalOpsTests(unittest.TestCase):
 
         bootstrap_runtime.assert_called_once_with()
         self.assertTrue(result['summary']['delegated_to_exec'])
-        self.assertEqual(dispatch_exec.call_args.kwargs['target_trade_date'], '2026-04-30')
+        self.assertEqual(dispatch_exec.call_args.kwargs['target_trade_date'], date(2026, 4, 30))
         self.assertTrue(dispatch_exec.call_args.kwargs['refresh_plan'])
         self.assertEqual(dispatch_exec.call_args.kwargs['dry_run'], False)
         self.assertEqual(dispatch_exec.call_args.kwargs['trigger'], 'internal_ops_cli')

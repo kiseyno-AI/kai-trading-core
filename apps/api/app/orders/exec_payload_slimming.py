@@ -6,6 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 import copy
 import json
+import math
 from typing import Any, Sequence
 
 from sqlalchemy import String, cast, func, select
@@ -52,7 +53,9 @@ class SubmissionPayloadSlimmingResult:
 
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
-        return format(value, 'f')
+        return format(value, 'f') if value.is_finite() else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, date):
@@ -80,6 +83,7 @@ def _normalize_text(value: Any, *, lowercase: bool = False) -> str | None:
 
 
 def _truncate_text(value: Any, *, max_chars: int = _MAX_TEXT_CHARS) -> Any:
+    value = _json_safe(value)
     if not isinstance(value, str) or len(value) <= max_chars:
         return value
     return {
@@ -159,6 +163,7 @@ def _compact_risk_context_summary(risk_context: Any) -> dict[str, Any] | None:
         'tactical_action',
         'original_watch_trigger_price',
         'original_watch_chase_limit_price',
+        'delegated_gate_confirmation_required',
     ):
         if key in risk_context and risk_context.get(key) is not None:
             compact[key] = _truncate_text(risk_context.get(key), max_chars=256)
@@ -168,6 +173,47 @@ def _compact_risk_context_summary(risk_context: Any) -> dict[str, Any] | None:
             compact[list_key] = [_truncate_text(value, max_chars=160) for value in values[:3]]
             if len(values) > 3:
                 compact[f'{list_key}_omitted_count'] = len(values) - 3
+    delegated_gate_codes = risk_context.get('delegated_gate_codes')
+    if isinstance(delegated_gate_codes, list):
+        compact['delegated_gate_codes'] = [
+            _truncate_text(code, max_chars=160)
+            for code in delegated_gate_codes[:10]
+        ]
+    delegated_gates = risk_context.get('delegated_gates')
+    if isinstance(delegated_gates, list):
+        compact['delegated_gates'] = [
+            {
+                key: _json_safe(gate.get(key))
+                for key in (
+                    'code',
+                    'observed_value',
+                    'field_path',
+                    'comparator',
+                    'threshold',
+                    'policy_version',
+                    'observed_at',
+                    'recheck_source',
+                    'expires_at',
+                )
+                if key in gate
+            }
+            for gate in delegated_gates
+            if isinstance(gate, dict)
+        ]
+    execution_feasibility = risk_context.get('execution_feasibility_context')
+    if isinstance(execution_feasibility, dict):
+        compact['execution_feasibility_context'] = {
+            key: _truncate_text(execution_feasibility.get(key), max_chars=160)
+            for key in (
+                'expected_slippage_bps',
+                'expected_slippage_basis',
+                'expected_slippage_status',
+                'expected_slippage_reason',
+                'liquidity_tier',
+                'max_safe_notional_krw',
+            )
+            if key in execution_feasibility
+        }
     decision_quality = risk_context.get('decision_input_quality_context')
     if isinstance(decision_quality, dict):
         compact['decision_input_quality_summary'] = _compact_decision_quality_summary(decision_quality)
@@ -196,8 +242,17 @@ def _compact_decision_quality_summary(payload: dict[str, Any]) -> dict[str, Any]
     if isinstance(execution_feasibility, dict):
         summary['execution_feasibility'] = {
             key: _truncate_text(execution_feasibility.get(key), max_chars=160)
-            for key in ('status', 'score', 'liquidity_tier', 'max_safe_notional_krw')
-            if execution_feasibility.get(key) is not None
+            for key in (
+                'status',
+                'score',
+                'liquidity_tier',
+                'max_safe_notional_krw',
+                'expected_slippage_bps',
+                'expected_slippage_basis',
+                'expected_slippage_status',
+                'expected_slippage_reason',
+            )
+            if key in execution_feasibility
         }
     return summary
 
@@ -311,6 +366,11 @@ def compact_exec_item_link(link: Any) -> dict[str, Any] | None:
     if not isinstance(link, dict):
         return None
     compact: dict[str, Any] = {}
+    identity_keys = {
+        'core_item_key',
+        'exec_plan_id',
+        'exec_plan_item_id',
+    }
     for key in (
         'core_item_key',
         'intent',
@@ -323,7 +383,11 @@ def compact_exec_item_link(link: Any) -> dict[str, Any] | None:
         'remote_status',
     ):
         if key in link and link.get(key) is not None:
-            compact[key] = _truncate_text(link.get(key), max_chars=256)
+            compact[key] = (
+                _json_safe(link.get(key))
+                if key in identity_keys
+                else _truncate_text(link.get(key), max_chars=256)
+            )
     response_item = compact_exec_response_item(link.get('response_item'))
     if response_item:
         compact['response_item'] = response_item
@@ -402,6 +466,7 @@ def compact_exec_request_summary(
                 'account_label',
                 'source_market_date',
                 'target_trade_date',
+                'dispatch_material_fingerprint',
             )
             if metadata.get(key) is not None
         }
@@ -417,7 +482,12 @@ def compact_exec_response_summary(
 ) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
-    response_items = payload.get('items') if isinstance(payload.get('items'), list) else []
+    if isinstance(payload.get('item_acks'), list):
+        response_items = payload['item_acks']
+    elif isinstance(payload.get('items'), list):
+        response_items = payload['items']
+    else:
+        response_items = []
     response_by_key: dict[str, dict[str, Any]] = {}
     for item in response_items:
         if not isinstance(item, dict):
@@ -434,6 +504,7 @@ def compact_exec_response_summary(
     validation_failures = payload.get('validation_failures') if isinstance(payload.get('validation_failures'), list) else []
     summary = {
         'schema_version': 'exec_dispatch_response_summary_v1',
+        'execution_plan_id': _normalize_text(payload.get('execution_plan_id')),
         'accepted_item_count': payload.get('accepted_item_count'),
         'rejected_item_count': payload.get('rejected_item_count'),
         'total_item_count': len(response_items),
@@ -445,6 +516,20 @@ def compact_exec_response_summary(
             'bulky_nested_contexts': True,
         },
     }
+    contract_ack = payload.get('contract_ack')
+    if isinstance(contract_ack, dict):
+        summary['contract_ack'] = {
+            key: _json_safe(contract_ack.get(key))
+            for key in (
+                'schema_version',
+                'contract_version',
+                'capability',
+                'plan_id',
+                'status',
+                'dispatch_material_fingerprint',
+            )
+            if contract_ack.get(key) is not None
+        }
     if len(validation_failures) > 3:
         summary['validation_failures_omitted_count'] = len(validation_failures) - 3
     if len(selected_items) > _MAX_SUMMARY_ITEMS:
@@ -458,6 +543,7 @@ def _compact_remote_item(item: Any, *, kind: str) -> dict[str, Any] | None:
     fields_by_kind = {
         'order': (
             'id',
+            'broker_order_pk',
             'broker_order_id',
             'order_id',
             'client_order_id',
@@ -489,11 +575,15 @@ def _compact_remote_item(item: Any, *, kind: str) -> dict[str, Any] | None:
         ),
         'execution': (
             'id',
+            'execution_fill_id',
             'execution_id',
             'broker_execution_id',
             'broker_order_id',
             'order_id',
             'broker_order_pk',
+            'execution_plan_item_id',
+            'plan_item_id',
+            'exec_plan_item_id',
             'symbol',
             'side',
             'quantity',
@@ -512,6 +602,10 @@ def _compact_remote_item(item: Any, *, kind: str) -> dict[str, Any] | None:
         'position': (
             'id',
             'account_reference',
+            'provider',
+            'account_scope',
+            'exchange',
+            'position_scope_proof',
             'symbol',
             'quantity',
             'available_quantity',
@@ -733,13 +827,33 @@ def slim_signal_decider_exec_submission_payload(
     slimmed_exec: dict[str, Any] = {
         'plan_id': exec_dispatch.get('plan_id'),
         'plan_fingerprint': exec_dispatch.get('plan_fingerprint'),
+        'dispatch_revision_fingerprint': exec_dispatch.get(
+            'dispatch_revision_fingerprint'
+        ),
+        'dispatch_material_fingerprint': exec_dispatch.get(
+            'dispatch_material_fingerprint'
+        ),
+        'dispatch_batch_key': exec_dispatch.get('dispatch_batch_key'),
         'dispatch_status': exec_dispatch.get('dispatch_status'),
+        'prior_execution_status': exec_dispatch.get('prior_execution_status'),
+        'prior_eligibility_status': exec_dispatch.get('prior_eligibility_status'),
         'last_attempt_at': exec_dispatch.get('last_attempt_at'),
         'last_success_at': exec_dispatch.get('last_success_at'),
         'last_error': summarize_error(exec_dispatch.get('last_error')),
         'item_links': item_links,
         'attempts': [_shallow_slim(item) for item in (exec_dispatch.get('attempts') or [])[-5:]],
     }
+    contract_proof = exec_dispatch.get('contract_proof')
+    if isinstance(contract_proof, dict):
+        slimmed_exec['contract_proof'] = _shallow_slim(contract_proof)
+    destination_binding = exec_dispatch.get('destination_binding')
+    if isinstance(destination_binding, dict):
+        slimmed_exec['destination_binding'] = _shallow_slim(destination_binding)
+    authority_generation_before = exec_dispatch.get('authority_generation_before')
+    if isinstance(authority_generation_before, dict):
+        slimmed_exec['authority_generation_before'] = _shallow_slim(
+            authority_generation_before
+        )
     request_summary = exec_dispatch.get('last_request_summary')
     if not isinstance(request_summary, dict):
         request_summary = compact_exec_request_summary(
@@ -768,7 +882,73 @@ def slim_signal_decider_exec_submission_payload(
         'latest': _shallow_slim(payload.get('latest')),
         'exec_dispatch': slimmed_exec,
     }
-    slimmed_payload = enforce_json_size(slimmed_payload, max_bytes=max_bytes, label='signal_decider_submission_payload')
+    raw_lifecycle_payload: dict[str, Any] = {}
+    for lifecycle_key, expected_type in (
+        ('revision_history', list),
+        ('revocation', dict),
+        ('revocation_history', list),
+        ('dispatch_reconciliation', dict),
+    ):
+        raw_lifecycle_evidence = payload.get(lifecycle_key)
+        if isinstance(raw_lifecycle_evidence, expected_type):
+            raw_lifecycle_payload[lifecycle_key] = copy.deepcopy(
+                _json_safe(
+                    raw_lifecycle_evidence[-5:]
+                    if isinstance(raw_lifecycle_evidence, list)
+                    else raw_lifecycle_evidence
+                )
+            )
+    lifecycle_payload = copy.deepcopy(raw_lifecycle_payload)
+    if json_size_bytes(lifecycle_payload) > max_bytes // 2:
+        lifecycle_payload = {
+            key: _shallow_slim(value)
+            for key, value in raw_lifecycle_payload.items()
+        }
+        raw_revocation = raw_lifecycle_payload.get('revocation')
+        compact_revocation = lifecycle_payload.get('revocation')
+        if isinstance(raw_revocation, dict) and isinstance(compact_revocation, dict):
+            compact_revocation['item_links'] = copy.deepcopy(
+                raw_revocation.get('item_links') or []
+            )
+        for raw_revision, compact_revision in zip(
+            raw_lifecycle_payload.get('revision_history') or [],
+            lifecycle_payload.get('revision_history') or [],
+            strict=True,
+        ):
+            if not isinstance(raw_revision, dict) or not isinstance(
+                compact_revision, dict
+            ):
+                continue
+            raw_dispatch = raw_revision.get('dispatch_evidence')
+            compact_dispatch = compact_revision.get('dispatch_evidence')
+            if isinstance(raw_dispatch, dict) and isinstance(compact_dispatch, dict):
+                compact_dispatch['item_links'] = copy.deepcopy(
+                    raw_dispatch.get('item_links') or []
+                )
+        for raw_record, compact_record in zip(
+            raw_lifecycle_payload.get('revocation_history') or [],
+            lifecycle_payload.get('revocation_history') or [],
+            strict=True,
+        ):
+            if not isinstance(raw_record, dict) or not isinstance(compact_record, dict):
+                continue
+            raw_request = raw_record.get('request')
+            compact_request = compact_record.get('request')
+            if isinstance(raw_request, dict) and isinstance(compact_request, dict):
+                compact_request['items'] = copy.deepcopy(raw_request.get('items') or [])
+            raw_response = raw_record.get('response')
+            compact_response = compact_record.get('response')
+            if isinstance(raw_response, dict) and isinstance(compact_response, dict):
+                compact_response['item_acks'] = copy.deepcopy(
+                    raw_response.get('item_acks') or []
+                )
+    lifecycle_reserve = json_size_bytes(lifecycle_payload) + 256
+    slimmed_payload = enforce_json_size(
+        slimmed_payload,
+        max_bytes=max(max_bytes - lifecycle_reserve, 1024),
+        label='signal_decider_submission_payload',
+    )
+    slimmed_payload.update(lifecycle_payload)
     slimmed_size = json_size_bytes(slimmed_payload)
     return SubmissionPayloadSlimmingResult(
         payload=slimmed_payload,
@@ -823,6 +1003,8 @@ def cleanup_signal_decider_exec_submission_payloads(
             )
             if parsed_target_date is not None:
                 stmt = stmt.where(SignalDeciderExecutionPlanItem.target_trade_date == parsed_target_date)
+            if not dry_run:
+                stmt = stmt.with_for_update()
             rows = session.execute(stmt).all()
             if not rows:
                 break

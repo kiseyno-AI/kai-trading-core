@@ -994,6 +994,7 @@ class OpenClawAgentClient:
             if str(item.get('symbol') or '').strip()
         ]
         assigned_symbols_json = json.dumps(assigned_symbols, ensure_ascii=False)
+        contract_prompt_suffix = build_contract_prompt_suffix(role=spec.role)
         is_us_batch = any(
             str((item.get('symbol_day_context') or {}).get('market') or '').upper() == 'US'
             for item in batch_items
@@ -1184,7 +1185,7 @@ class OpenClawAgentClient:
             "Do not restate the request, do not describe what you will do, and do not explain the schema. Output the final JSON only.\n"
             "Immediately before sending, re-check the final JSON formatting one last time. If any closing brace/bracket count is wrong, fix it before answering.\n"
             "Your final answer must be a raw JSON object only, beginning with { and ending with }.\n"
-            f"{build_contract_prompt_suffix(role=spec.role)}\n"
+            f"{contract_prompt_suffix}\n"
             f"JSON example:\n{json.dumps(example, ensure_ascii=False)}\n\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -1212,7 +1213,7 @@ class OpenClawAgentClient:
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
-            f"{build_contract_prompt_suffix(role=spec.role)}\n"
+            f"{contract_prompt_suffix}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False)}"
         )
@@ -2254,23 +2255,56 @@ class AgentFeedbackOrchestrator:
         items = rule_candidates.get('items') if isinstance(rule_candidates, dict) else None
         if not isinstance(items, list):
             return []
+        candidate_type_aliases = {
+            'veto': 'buy_veto',
+            'downsize': 'tighten_buy_gate',
+        }
         compacted: list[dict[str, Any]] = []
         for item in items[:8]:
             if not isinstance(item, dict):
                 continue
+            candidate_type = candidate_type_aliases.get(
+                str(item.get('candidate_type') or '').strip(),
+                str(item.get('candidate_type') or '').strip(),
+            )
+            predicate = item.get('predicate') if isinstance(item.get('predicate'), dict) else {}
+            predicate_branch = (
+                'all' if 'all' in predicate and 'any' not in predicate
+                else 'any' if 'any' in predicate and 'all' not in predicate
+                else None
+            )
+            predicate_items = predicate.get(predicate_branch) if predicate_branch else None
+            canonical_predicate = bool(
+                predicate.get('schema_version') == 'signal_decider_rule_predicate_v1'
+                and predicate_branch
+                and set(predicate) == {'schema_version', predicate_branch}
+                and isinstance(predicate_items, list)
+                and predicate_items
+                and all(isinstance(predicate_item, dict) for predicate_item in predicate_items)
+            )
+            activation_status = str(item.get('activation_status') or 'needs_replay').strip()
+            manual_review_only = item.get('manual_review_only') is not False
+            deterministic_gate_eligible = bool(
+                candidate_type in {'buy_veto', 'tighten_buy_gate'}
+                and canonical_predicate
+                and activation_status == 'active'
+                and item.get('active_policy') is True
+                and item.get('deterministic_gate_eligible') is True
+                and not manual_review_only
+            )
             compacted.append(
                 {
                     'candidate_id': item.get('candidate_id'),
-                    'candidate_type': item.get('candidate_type'),
-                    'predicate': item.get('predicate'),
+                    'candidate_type': candidate_type,
+                    'predicate': predicate,
                     'reason': item.get('reason'),
                     'support_sample_count': item.get('support_sample_count'),
                     'evaluated_sample_count': item.get('evaluated_sample_count'),
                     'negative_rate': item.get('negative_rate'),
-                    'activation_status': item.get('activation_status'),
-                    'manual_review_only': item.get('manual_review_only'),
-                    'active_policy': item.get('active_policy'),
-                    'deterministic_gate_eligible': item.get('deterministic_gate_eligible'),
+                    'activation_status': activation_status,
+                    'manual_review_only': manual_review_only,
+                    'active_policy': deterministic_gate_eligible,
+                    'deterministic_gate_eligible': deterministic_gate_eligible,
                 }
             )
         return compacted

@@ -871,11 +871,14 @@ class SignalDeciderCalibrationService:
         ):
             score_payload = _maybe_dict(scores.get(family))
             factor_payload = _maybe_dict(factor_scores.get(family))
+            raw_score = score_payload.get('score')
+            if raw_score is None:
+                raw_score = factor_payload.get('score')
             bucket_value = _factor_bucket_value(
                 status=_normalize_optional_text(
                     factor_payload.get('status') or score_payload.get('status')
                 ),
-                score=_to_float(score_payload.get('score') or factor_payload.get('score')),
+                score=_to_float(raw_score),
             )
             if bucket_value:
                 tokens.append(
@@ -1339,9 +1342,9 @@ class SignalDeciderCalibrationService:
             return None
 
         candidate_type = (
-            'veto'
+            'buy_veto'
             if bad_buy_rate >= RULE_CANDIDATE_BAD_BUY_VETO_RATE_THRESHOLD
-            else 'downsize'
+            else 'tighten_buy_gate'
         )
         predicate = self._rule_candidate_predicate(
             tokens=tokens,
@@ -1507,6 +1510,7 @@ class SignalDeciderCalibrationService:
             'activation_status': RULE_CANDIDATE_DEFAULT_ACTIVATION_STATUS,
             'manual_review_only': True,
             'active_policy': False,
+            'deterministic_gate_eligible': False,
             'source_cluster': {
                 'cluster_key': cluster.get('cluster_key'),
                 'bucket_label': cluster.get('bucket_label'),
@@ -1570,8 +1574,7 @@ class SignalDeciderCalibrationService:
         )
         return {
             'schema_version': RULE_CANDIDATE_PREDICATE_SCHEMA_VERSION,
-            'operator': 'all',
-            'conditions': conditions,
+            'all': conditions,
         }
 
     def _has_policy_condition(self, tokens: Sequence[dict[str, Any]]) -> bool:
@@ -1594,8 +1597,8 @@ class SignalDeciderCalibrationService:
 
     def _rule_candidate_sort_key(self, candidate: dict[str, Any]) -> tuple[int, float, int, str]:
         type_priority = {
-            'veto': 0,
-            'downsize': 1,
+            'buy_veto': 0,
+            'tighten_buy_gate': 1,
             'require_confirmation': 2,
             'prompt_warning': 3,
         }

@@ -11,6 +11,7 @@ from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
     build_pykrx_enrichment_preflight,
 )
+from app.eod.market_membership import build_market_membership_snapshot
 from app.eod.pykrx_pipeline_support import (
     append_stage_error,
     build_stage_failure_result,
@@ -997,6 +998,10 @@ def run_market_data_pipeline(
             'point_in_time': historical_snapshot,
             'current_universe_mutated': not historical_snapshot,
             'forced_for_point_in_time': historical_snapshot and not refresh_universe,
+            'market_membership': build_market_membership_snapshot(
+                symbols=symbols,
+                markets=markets,
+            ),
         }
     else:
         universe_snapshot = None

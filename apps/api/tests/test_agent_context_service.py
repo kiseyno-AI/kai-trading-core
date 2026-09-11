@@ -1,5 +1,7 @@
 from contextlib import ExitStack
+from copy import deepcopy
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -15,7 +17,9 @@ from app.agent_context.read_service import (
     _build_intraday_execution_context,
     _build_intraday_execution_freshness_provenance,
     _build_market_regime_context,
+    _build_market_open_drive_context,
     _build_pre_decider_enrichment_context,
+    _build_pre_decider_quote_orderbook_snapshot,
     _build_price_context,
     _build_quote_context,
     _build_quote_freshness_provenance,
@@ -126,17 +130,125 @@ def _open_drive_context(
     weak_continuation_detected: bool | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
+        'status': 'available',
+        'authoritative': True,
+        'market': 'KOSPI',
+        'market_date': '2026-07-23',
+        'phase': 'opening',
+        'source': 'kis_market_snapshot_v1',
+        'source_table': 'current_market_snapshot_cache',
         'gap_up_pct': gap_up_pct,
         'index_change_pct': index_change_pct,
         'early_continuation_pct': early_continuation_pct,
         'trading_value_expansion_ratio': trading_value_expansion_ratio,
         'gap_fade_detected': gap_fade_detected,
+        'provenance': {
+            'validation_status': 'validated',
+            'snapshot_source': 'kis_market_snapshot_v1',
+            'baseline_source': 'pykrx',
+            'elapsed_fraction_adjusted': True,
+        },
     }
     if early_continuation_confirmed is not None:
         payload['early_continuation_confirmed'] = early_continuation_confirmed
     if weak_continuation_detected is not None:
         payload['weak_continuation_detected'] = weak_continuation_detected
     return payload
+
+
+def _stored_market_snapshot_context(
+    *,
+    as_of: str,
+    market_key: str = 'kospi',
+    source: str = 'kis_market_snapshot_v1',
+) -> dict[str, object]:
+    observed_at = datetime.fromisoformat(as_of)
+    provider_observed_at = observed_at.isoformat()
+    return {
+        'source': source,
+        'source_table': 'current_market_snapshot_cache',
+        'snapshot_status': 'ready',
+        'last_refresh_status': 'success',
+        'as_of': as_of,
+        'last_refresh_succeeded_at': as_of,
+        'payload': {
+            'status': 'ready',
+            'as_of': as_of,
+            'legs': {
+                'index': {'status': 'ready'},
+                'flow': {'status': 'ready'},
+                'fx': {'status': 'ready'},
+            },
+            'markets': {
+                market_key: {
+                    'label': 'KOSPI' if market_key == 'kospi' else 'KOSDAQ',
+                    'index_code': '0001' if market_key == 'kospi' else '1001',
+                    'value': 2700.0,
+                    'change': 27.0,
+                    'change_percent': 1.01,
+                    'open': 2685.0,
+                    'trading_value': 3_000_000,
+                    'trading_value_unit': 'million_krw',
+                    'upper_limit_count': 0,
+                    'advancers': 700,
+                    'unchanged': 50,
+                    'decliners': 200,
+                    'lower_limit_count': 0,
+                    'breadth_raw_buckets': {
+                        'upper_limit_count': 0,
+                        'advancers': 700,
+                        'unchanged': 50,
+                        'decliners': 200,
+                        'lower_limit_count': 0,
+                    },
+                    'breadth_completeness': {
+                        'status': 'verified',
+                        'expected_symbol_count': 950,
+                        'observed_symbol_count': 950,
+                        'limit_bucket_semantics': 'included_in_direction_counts',
+                    },
+                    'provider_business_date': observed_at.date().isoformat(),
+                    'provider_session_time': observed_at.strftime('%H:%M:%S'),
+                    'provider_observed_at': provider_observed_at,
+                    'index_leg': {
+                        'status': 'ready',
+                        'observation_source': 'kis_index_intraday_bar',
+                        'provider_observed_at': provider_observed_at,
+                    },
+                }
+            },
+        },
+    }
+
+
+def _prior_market_turnover_baseline(*, market: str = 'KOSPI') -> dict[str, object]:
+    return {
+        'market': market,
+        'trade_date': '2026-04-28',
+        'turnover_krw': 8_000_000_000_000,
+        'observed_symbol_count': 950,
+        'expected_symbol_count': 950,
+        'coverage_ratio': 1.0,
+        'source': 'pykrx',
+        'source_table': 'daily_price_bars',
+        'basis': 'prior_complete_market_session_positive_provider_turnover_sum',
+        'eod_run_id': 73,
+        'eod_run_status': 'completed',
+        'eod_run_completed_at': '2026-04-28T16:00:00+09:00',
+        'coverage_proof': {
+            'status': 'verified',
+            'membership_status': 'exact',
+            'requested_symbol_count': 950,
+            'persisted_symbol_count': 950,
+            'market_symbol_count': 950,
+            'universe_complete': True,
+            'universe_source': 'pykrx',
+            'membership_basis': 'end_date_snapshot',
+            'membership_trade_date': '2026-04-28',
+            'requested_membership_sha256': 'a' * 64,
+            'persisted_membership_sha256': 'a' * 64,
+        },
+    }
 
 
 def _closed_market_session() -> dict[str, object]:
@@ -247,6 +359,392 @@ def _make_intraday_execution_row(
 
 
 class MarketRegimeContextTests(unittest.TestCase):
+    def test_open_drive_prefers_same_provider_prior_turnover_and_provider_observation(self) -> None:
+        snapshot = _stored_market_snapshot_context(
+            as_of='2026-04-29T09:10:20+09:00'
+        )
+        market_row = snapshot['payload']['markets']['kospi']
+        market_row.update(
+            {
+                'provider_business_date': '2026-04-29',
+                'provider_session_time': '09:10:00',
+                'provider_observed_at': '2026-04-29T09:10:00+09:00',
+                'prior_trading_value': 8_000_000,
+                'prior_trading_value_unit': 'million_krw',
+                'upper_limit_count': 2,
+                'lower_limit_count': 1,
+                'breadth_raw_buckets': {
+                    'upper_limit_count': 2,
+                    'advancers': 700,
+                    'unchanged': 50,
+                    'decliners': 200,
+                    'lower_limit_count': 1,
+                },
+                'breadth_completeness': {
+                    'status': 'verified',
+                    'expected_symbol_count': 950,
+                    'observed_symbol_count': 950,
+                    'limit_bucket_semantics': 'included_in_direction_counts',
+                },
+                'index_leg': {
+                    'status': 'ready',
+                    'observation_source': 'kis_index_intraday_bar',
+                    'provider_observed_at': '2026-04-29T09:10:00+09:00',
+                },
+            }
+        )
+        snapshot['payload']['legs'] = {
+            'index': {'status': 'ready'},
+            'flow': {'status': 'unavailable'},
+            'fx': {'status': 'missing'},
+        }
+
+        result = _build_market_open_drive_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=snapshot,
+            prior_market_turnover_baseline=None,
+        )
+
+        self.assertEqual(result['status'], 'available')
+        self.assertEqual(result['observed_at'], '2026-04-29T09:10:00+09:00')
+        self.assertAlmostEqual(result['trading_value_expansion_ratio'], 1.5, places=4)
+        self.assertEqual(result['market_breadth_context']['up_count'], 700)
+        self.assertEqual(result['market_breadth_context']['down_count'], 200)
+        self.assertEqual(result['provenance']['baseline_source'], 'kis_market_snapshot_v1')
+        self.assertEqual(result['provenance']['baseline_provider_field'], 'prdy_tr_pbmn')
+        self.assertEqual(result['provenance']['baseline_relative_session'], 'previous')
+        regime = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=result['market_breadth_context'],
+            market_breadth_provenance=result['market_breadth_provenance'],
+            sector_peer_context=_sector_context(sector_avg=1.4),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(return_percentile=0.84, volume_percentile=0.78),
+            market_relative_provenance=_fresh_provenance(),
+            macro_context=_macro_context_fx(value=1320.0),
+            open_drive_context=result,
+        )
+        self.assertEqual(regime['market_regime'], 'aggressive_open')
+
+    def test_unverified_or_partial_five_bucket_breadth_cannot_confirm_strong_breadth(self) -> None:
+        for case_name in ('unverified_semantics', 'partial_response_with_limit_down'):
+            with self.subTest(case=case_name):
+                snapshot = _stored_market_snapshot_context(
+                    as_of='2026-04-29T09:10:00+09:00'
+                )
+                market_row = snapshot['payload']['markets']['kospi']
+                market_row['prior_trading_value'] = 8_000_000
+                market_row['prior_trading_value_unit'] = 'million_krw'
+                market_row['upper_limit_count'] = 4
+                market_row['lower_limit_count'] = 25
+                market_row['breadth_raw_buckets'] = {
+                    'upper_limit_count': 4,
+                    'advancers': 700,
+                    'unchanged': 50,
+                    'decliners': 200,
+                    'lower_limit_count': 25,
+                }
+                if case_name == 'unverified_semantics':
+                    market_row['breadth_completeness'] = {
+                        'status': 'unverified',
+                        'expected_symbol_count': None,
+                        'observed_symbol_count': 950,
+                        'limit_bucket_semantics': 'unknown',
+                    }
+                else:
+                    market_row['breadth_completeness'] = {
+                        'status': 'verified',
+                        'expected_symbol_count': 951,
+                        'observed_symbol_count': 950,
+                        'limit_bucket_semantics': 'included_in_direction_counts',
+                    }
+
+                open_drive = _build_market_open_drive_context(
+                    requested_market_date=date(2026, 4, 29),
+                    market='KOSPI',
+                    decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+                    snapshot_context=snapshot,
+                    prior_market_turnover_baseline=None,
+                )
+                regime = _build_market_regime_context(
+                    requested_market_date=date(2026, 4, 29),
+                    market='KOSPI',
+                    market_breadth_context=open_drive['market_breadth_context'],
+                    market_breadth_provenance=open_drive['market_breadth_provenance'],
+                    sector_peer_context=_sector_context(sector_avg=1.4),
+                    sector_peer_provenance=_fresh_provenance(),
+                    market_relative_context=_relative_context(return_percentile=0.84, volume_percentile=0.78),
+                    market_relative_provenance=_fresh_provenance(),
+                    macro_context=_macro_context_fx(value=1320.0),
+                    open_drive_context=open_drive,
+                )
+
+                self.assertEqual(open_drive['status'], 'available')
+                self.assertEqual(open_drive['market_breadth_context']['status'], 'unavailable')
+                self.assertEqual(regime['market_regime'], 'normal')
+                self.assertLessEqual(regime['quantity_multiplier'], 1.0)
+
+    def test_build_market_open_drive_context_derives_conservative_provider_evidence(self) -> None:
+        result = _build_market_open_drive_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=_stored_market_snapshot_context(
+                as_of='2026-04-29T09:10:00+09:00'
+            ),
+            prior_market_turnover_baseline=_prior_market_turnover_baseline(),
+        )
+
+        self.assertEqual(result['status'], 'available')
+        self.assertTrue(result['authoritative'])
+        self.assertEqual(result['phase'], 'opening')
+        self.assertAlmostEqual(result['gap_up_pct'], 0.4489, places=4)
+        self.assertAlmostEqual(result['index_change_pct'], 1.01, places=4)
+        self.assertAlmostEqual(result['early_continuation_pct'], 0.5587, places=4)
+        self.assertAlmostEqual(result['trading_value_expansion_ratio'], 1.5, places=4)
+        self.assertEqual(result['market_breadth_context']['up_count'], 700)
+        self.assertEqual(result['market_breadth_context']['down_count'], 200)
+        self.assertEqual(result['market_breadth_context']['flat_count'], 50)
+        self.assertEqual(
+            result['market_breadth_provenance']['source_provider'],
+            'kis_market_snapshot_v1',
+        )
+        calculation = result['provenance']['calculation']
+        self.assertTrue(calculation['elapsed_fraction_adjusted'])
+        self.assertEqual(calculation['elapsed_fraction_denominator'], 0.25)
+        self.assertEqual(
+            calculation['trading_value_expansion_method'],
+            'current_cumulative_krw_divided_by_prior_full_session_krw_times_conservative_elapsed_fraction',
+        )
+        self.assertFalse(calculation['full_session_linear_extrapolation_used'])
+
+    def test_disjoint_limit_buckets_are_included_in_directional_market_breadth(self) -> None:
+        snapshot = _stored_market_snapshot_context(
+            as_of='2026-04-29T09:10:00+09:00'
+        )
+        market_row = snapshot['payload']['markets']['kospi']
+        market_row.update(
+            {
+                'upper_limit_count': 100,
+                'advancers': 150,
+                'unchanged': 100,
+                'decliners': 300,
+                'lower_limit_count': 350,
+                'breadth_raw_buckets': {
+                    'upper_limit_count': 100,
+                    'advancers': 150,
+                    'unchanged': 100,
+                    'decliners': 300,
+                    'lower_limit_count': 350,
+                },
+                'breadth_completeness': {
+                    'status': 'verified',
+                    'expected_symbol_count': 1000,
+                    'observed_symbol_count': 1000,
+                    'limit_bucket_semantics': 'disjoint_from_direction_counts',
+                },
+            }
+        )
+
+        open_drive = _build_market_open_drive_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=snapshot,
+            prior_market_turnover_baseline=None,
+        )
+        breadth = open_drive['market_breadth_context']
+
+        self.assertEqual(breadth['up_count'], 250)
+        self.assertEqual(breadth['down_count'], 650)
+        self.assertEqual(breadth['flat_count'], 100)
+        self.assertEqual(breadth['advance_decline_ratio'], 0.3846)
+
+        regime = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=breadth,
+            market_breadth_provenance=open_drive['market_breadth_provenance'],
+            sector_peer_context=_sector_context(),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(),
+            market_relative_provenance=_fresh_provenance(),
+        )
+        self.assertEqual(regime['posture'], 'risk_off')
+        self.assertEqual(regime['recommended_exec_action'], 'reject')
+
+    def test_market_open_drive_accepts_fresh_kis_leg_when_only_fx_leg_is_degraded(self) -> None:
+        snapshot = _stored_market_snapshot_context(
+            as_of='2026-04-29T09:10:00+09:00'
+        )
+        snapshot['snapshot_status'] = 'partial'
+        snapshot['last_refresh_status'] = 'degraded'
+        snapshot['payload']['status'] = 'partial'
+        snapshot['payload']['missing_fields'] = ['usd_krw.rate']
+
+        result = _build_market_open_drive_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=snapshot,
+            prior_market_turnover_baseline=_prior_market_turnover_baseline(),
+        )
+
+        self.assertEqual(result['status'], 'available')
+        self.assertEqual(result['provenance']['snapshot_status'], 'partial')
+        self.assertEqual(result['provenance']['snapshot_refresh_status'], 'degraded')
+
+    def test_missing_turnover_baseline_preserves_fresh_index_leg_but_cannot_upsize(self) -> None:
+        snapshot = _stored_market_snapshot_context(as_of='2026-04-29T09:10:00+09:00')
+
+        open_drive = _build_market_open_drive_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=snapshot,
+            prior_market_turnover_baseline=None,
+        )
+        regime = _build_market_regime_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            market_breadth_context=open_drive['market_breadth_context'],
+            market_breadth_provenance=open_drive['market_breadth_provenance'],
+            sector_peer_context=_sector_context(sector_avg=1.4),
+            sector_peer_provenance=_fresh_provenance(),
+            market_relative_context=_relative_context(return_percentile=0.84, volume_percentile=0.78),
+            market_relative_provenance=_fresh_provenance(),
+            macro_context=_macro_context_fx(value=1320.0),
+            open_drive_context=open_drive,
+        )
+
+        self.assertEqual(open_drive['status'], 'partial')
+        self.assertEqual(open_drive['index_leg']['status'], 'available')
+        self.assertIsNotNone(open_drive['gap_up_pct'])
+        self.assertIsNotNone(open_drive['early_continuation_pct'])
+        self.assertIsNone(open_drive['trading_value_expansion_ratio'])
+        self.assertEqual(open_drive['baseline']['status'], 'unavailable')
+        self.assertEqual(regime['market_regime'], 'normal')
+        self.assertLessEqual(regime['quantity_multiplier'], 1.0)
+
+    def test_market_open_drive_maps_kosdaq_to_its_provider_index(self) -> None:
+        result = _build_market_open_drive_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSDAQ',
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=_stored_market_snapshot_context(
+                as_of='2026-04-29T09:10:00+09:00',
+                market_key='kosdaq',
+            ),
+            prior_market_turnover_baseline=_prior_market_turnover_baseline(
+                market='KOSDAQ'
+            ),
+        )
+
+        self.assertEqual(result['status'], 'available')
+        self.assertEqual(result['market'], 'KOSDAQ')
+
+    def test_invalid_market_open_drive_provenance_fails_closed(self) -> None:
+        valid_snapshot = _stored_market_snapshot_context(
+            as_of='2026-04-29T09:10:00+09:00'
+        )
+        valid_baseline = _prior_market_turnover_baseline()
+        cases: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
+
+        stale_snapshot = deepcopy(valid_snapshot)
+        stale_row = stale_snapshot['payload']['markets']['kospi']
+        stale_row['provider_session_time'] = '09:00:00'
+        stale_row['provider_observed_at'] = '2026-04-29T09:00:00+09:00'
+        stale_row['index_leg']['provider_observed_at'] = stale_row['provider_observed_at']
+        cases['stale_snapshot'] = (stale_snapshot, deepcopy(valid_baseline))
+
+        future_snapshot = deepcopy(valid_snapshot)
+        future_row = future_snapshot['payload']['markets']['kospi']
+        future_row['provider_session_time'] = '09:11:00'
+        future_row['provider_observed_at'] = '2026-04-29T09:11:00+09:00'
+        future_row['index_leg']['provider_observed_at'] = future_row['provider_observed_at']
+        cases['future_snapshot'] = (future_snapshot, deepcopy(valid_baseline))
+
+        wrong_date_snapshot = deepcopy(valid_snapshot)
+        wrong_date_row = wrong_date_snapshot['payload']['markets']['kospi']
+        wrong_date_row['provider_business_date'] = '2026-04-28'
+        wrong_date_row['provider_observed_at'] = '2026-04-28T09:10:00+09:00'
+        wrong_date_row['index_leg']['provider_observed_at'] = wrong_date_row['provider_observed_at']
+        cases['wrong_date_snapshot'] = (wrong_date_snapshot, deepcopy(valid_baseline))
+
+        after_hours_snapshot = deepcopy(valid_snapshot)
+        after_hours_row = after_hours_snapshot['payload']['markets']['kospi']
+        after_hours_row['provider_session_time'] = '15:31:00'
+        after_hours_row['provider_observed_at'] = '2026-04-29T15:31:00+09:00'
+        after_hours_row['index_leg']['provider_observed_at'] = after_hours_row['provider_observed_at']
+        cases['after_hours_provider_row'] = (after_hours_snapshot, deepcopy(valid_baseline))
+
+        missing_source_snapshot = deepcopy(valid_snapshot)
+        missing_source_snapshot['source'] = None
+        cases['missing_snapshot_source'] = (missing_source_snapshot, deepcopy(valid_baseline))
+
+        missing_field_snapshot = deepcopy(valid_snapshot)
+        del missing_field_snapshot['payload']['markets']['kospi']['open']
+        cases['missing_provider_field'] = (missing_field_snapshot, deepcopy(valid_baseline))
+
+        wrong_unit_snapshot = deepcopy(valid_snapshot)
+        wrong_unit_snapshot['payload']['markets']['kospi']['trading_value_unit'] = 'krw'
+        cases['wrong_trading_value_unit'] = (wrong_unit_snapshot, deepcopy(valid_baseline))
+
+        missing_baseline_source = deepcopy(valid_baseline)
+        missing_baseline_source['source'] = None
+        cases['missing_baseline_source'] = (deepcopy(valid_snapshot), missing_baseline_source)
+
+        low_coverage_baseline = deepcopy(valid_baseline)
+        low_coverage_baseline['coverage_ratio'] = 0.4
+        cases['low_baseline_coverage'] = (deepcopy(valid_snapshot), low_coverage_baseline)
+
+        count_only_baseline = deepcopy(valid_baseline)
+        count_only_baseline.pop('coverage_proof')
+        cases['count_only_baseline'] = (deepcopy(valid_snapshot), count_only_baseline)
+
+        digest_missing_baseline = deepcopy(valid_baseline)
+        digest_missing_baseline['coverage_proof'].pop('persisted_membership_sha256')
+        cases['membership_digest_missing'] = (deepcopy(valid_snapshot), digest_missing_baseline)
+
+        for case_name, (snapshot_context, baseline) in cases.items():
+            with self.subTest(case=case_name):
+                open_drive = _build_market_open_drive_context(
+                    requested_market_date=date(2026, 4, 29),
+                    market='KOSPI',
+                    decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+                    snapshot_context=snapshot_context,
+                    prior_market_turnover_baseline=baseline,
+                )
+                regime = _build_market_regime_context(
+                    requested_market_date=date(2026, 4, 29),
+                    market='KOSPI',
+                    market_breadth_context=_market_breadth_context(up=780, down=140, flat=80),
+                    market_breadth_provenance=_fresh_provenance(),
+                    sector_peer_context=_sector_context(sector_avg=1.4),
+                    sector_peer_provenance=_fresh_provenance(),
+                    market_relative_context=_relative_context(return_percentile=0.84, volume_percentile=0.78),
+                    market_relative_provenance=_fresh_provenance(),
+                    macro_context=_macro_context_fx(value=1320.0),
+                    open_drive_context=open_drive,
+                )
+
+                expected_status = (
+                    'partial'
+                    if case_name in {
+                        'missing_baseline_source',
+                        'low_baseline_coverage',
+                        'count_only_baseline',
+                        'membership_digest_missing',
+                    }
+                    else 'unavailable'
+                )
+                self.assertEqual(open_drive['status'], expected_status)
+                self.assertEqual(regime['market_regime'], 'normal')
+                self.assertLessEqual(regime['quantity_multiplier'], 1.0)
+
     def test_build_market_regime_context_returns_normal_posture(self) -> None:
         result = _build_market_regime_context(
             requested_market_date=date(2026, 4, 29),
@@ -286,9 +784,13 @@ class MarketRegimeContextTests(unittest.TestCase):
         )
 
         self.assertEqual(result['market_regime'], 'aggressive_open')
-        self.assertGreater(result['quantity_multiplier'], 1.0)
-        self.assertLessEqual(result['quantity_multiplier'], 2.0)
-        self.assertTrue(result['entry_priority_boost'])
+        self.assertEqual(result['quantity_multiplier'], 1.0)
+        self.assertGreater(result['shadow_quantity_multiplier'], 1.0)
+        self.assertLessEqual(result['shadow_quantity_multiplier'], 2.0)
+        self.assertEqual(result['live_upsize_status'], 'shadow_only_uncalibrated')
+        self.assertFalse(result['entry_priority_boost'])
+        self.assertTrue(result['sizing_window']['shadow_entry_priority_boost'])
+        self.assertEqual(result['sizing_window']['quantity_multiplier_cap'], 1.0)
         self.assertEqual(result['valid_until'], '2026-07-23T09:20:00+09:00')
         self.assertIn('early_continuation_confirmed', result['regime_reasons'])
 
@@ -310,7 +812,8 @@ class MarketRegimeContextTests(unittest.TestCase):
         self.assertEqual(result['fx_context']['sector_sensitivity'], 'exporter_or_dollar_revenue_sensitive')
         self.assertEqual(result['fx_context']['penalty_status'], 'dampened')
         self.assertLess(result['fx_context']['penalty_score'], 0.30)
-        self.assertGreater(result['quantity_multiplier'], 1.0)
+        self.assertEqual(result['quantity_multiplier'], 1.0)
+        self.assertGreater(result['shadow_quantity_multiplier'], 1.0)
         self.assertIn('fx_penalty_dampened_for_exporter_sector', result['regime_reasons'])
 
     def test_build_market_regime_context_keeps_high_fx_penalty_with_weak_breadth(self) -> None:
@@ -834,6 +1337,303 @@ class ExternalNewsKnowledgeCutoffTests(unittest.TestCase):
 
 
 class AgentContextReadServiceTests(unittest.TestCase):
+    def test_symbol_day_context_wires_fresh_stored_open_drive_evidence_into_regime(self):
+        class EmptyFundamentalsRepository:
+            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+                return []
+
+        class EmptyDisclosureRepository:
+            def list_recent_events_by_stock_codes(
+                self,
+                *,
+                stock_codes,
+                receipt_date_to=None,
+                limit_per_symbol=5,
+            ):
+                return {symbol: [] for symbol in stock_codes}
+
+        service = AgentContextReadService(
+            fundamentals_repository=EmptyFundamentalsRepository(),
+            disclosure_repository=EmptyDisclosureRepository(),
+        )
+        valid_open = _stored_market_snapshot_context(as_of='2026-04-29T09:10:00+09:00')
+        stale = _stored_market_snapshot_context(as_of='2026-04-29T09:00:00+09:00')
+        future = _stored_market_snapshot_context(as_of='2026-04-29T09:11:00+09:00')
+        wrong_date = _stored_market_snapshot_context(as_of='2026-04-28T09:10:00+09:00')
+        missing_source = deepcopy(valid_open)
+        missing_source['source'] = None
+        missing_field = deepcopy(valid_open)
+        del missing_field['payload']['markets']['kospi']['open']
+        low_coverage = _prior_market_turnover_baseline()
+        low_coverage['coverage_ratio'] = 0.4
+        same_provider_prior = deepcopy(valid_open)
+        same_provider_prior['payload']['markets']['kospi'].update(
+            {
+                'prior_trading_value': 8_000_000,
+                'prior_trading_value_unit': 'million_krw',
+            }
+        )
+        fresh_downside_without_baseline = deepcopy(valid_open)
+        fresh_downside_market = fresh_downside_without_baseline['payload']['markets']['kospi']
+        fresh_downside_market.update(
+            {
+                'advancers': 250,
+                'unchanged': 20,
+                'decliners': 680,
+                'breadth_raw_buckets': {
+                    'upper_limit_count': 0,
+                    'advancers': 250,
+                    'unchanged': 20,
+                    'decliners': 680,
+                    'lower_limit_count': 0,
+                },
+            }
+        )
+        cases = (
+            (
+                'same_provider_prior_skips_eod_fallback',
+                '2026-04-29T09:10:30+09:00',
+                same_provider_prior,
+                SQLAlchemyError('fallback must not be called'),
+                'aggressive_open',
+            ),
+            (
+                'fresh_opening',
+                '2026-04-29T09:10:30+09:00',
+                valid_open,
+                _prior_market_turnover_baseline(),
+                'aggressive_open',
+            ),
+            (
+                'fresh_trend',
+                '2026-04-29T09:25:30+09:00',
+                _stored_market_snapshot_context(as_of='2026-04-29T09:25:00+09:00'),
+                _prior_market_turnover_baseline(),
+                'trend_day',
+            ),
+            (
+                'fresh_downside_without_turnover_baseline',
+                '2026-04-29T09:10:30+09:00',
+                fresh_downside_without_baseline,
+                None,
+                'defensive',
+            ),
+            ('stale', '2026-04-29T09:10:30+09:00', stale, _prior_market_turnover_baseline(), 'normal'),
+            ('future', '2026-04-29T09:10:30+09:00', future, _prior_market_turnover_baseline(), 'normal'),
+            ('wrong_date', '2026-04-29T09:10:30+09:00', wrong_date, _prior_market_turnover_baseline(), 'normal'),
+            (
+                'missing_source',
+                '2026-04-29T09:10:30+09:00',
+                missing_source,
+                _prior_market_turnover_baseline(),
+                'normal',
+            ),
+            (
+                'missing_field',
+                '2026-04-29T09:10:30+09:00',
+                missing_field,
+                _prior_market_turnover_baseline(),
+                'normal',
+            ),
+            ('low_coverage', '2026-04-29T09:10:30+09:00', valid_open, low_coverage, 'normal'),
+            (
+                'baseline_storage_error',
+                '2026-04-29T09:10:30+09:00',
+                valid_open,
+                SQLAlchemyError('baseline unavailable'),
+                'normal',
+            ),
+            (
+                'baseline_timeout',
+                '2026-04-29T09:10:30+09:00',
+                valid_open,
+                TimeoutError('baseline query timed out'),
+                'normal',
+            ),
+            (
+                'snapshot_storage_timeout',
+                '2026-04-29T09:10:30+09:00',
+                TimeoutError('snapshot query timed out'),
+                _prior_market_turnover_baseline(),
+                'normal',
+            ),
+        )
+
+        for case_name, server_time, snapshot_context, baseline, expected_regime in cases:
+            with self.subTest(case=case_name), ExitStack() as stack:
+                stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service.load_symbols',
+                        return_value=[
+                            {
+                                'id': 1,
+                                'symbol': '005930',
+                                'standard_code': 'KR7005930003',
+                                'name_ko': '삼성전자',
+                                'market': 'KOSPI',
+                                'instrument_type': 'equity',
+                                'source': 'pykrx',
+                                'is_active': True,
+                                'last_refreshed_at': None,
+                            }
+                        ],
+                    )
+                )
+                empty_loaders = (
+                    'load_daily_technical_snapshots',
+                    'load_daily_signal_features',
+                    'load_daily_action_summaries',
+                    'load_daily_price_contexts',
+                    'load_daily_price_context_history',
+                    'load_current_quotes',
+                    'load_current_kis_intraday_snapshots',
+                    'load_daily_value_factor_results',
+                    'load_daily_unified_value_factor_results',
+                    'load_daily_quality_factor_results',
+                    'load_daily_momentum_factor_results',
+                    'load_daily_advanced_value_factor_results',
+                    'load_daily_low_risk_factor_results',
+                    'load_daily_beta_factor_results',
+                    'load_daily_composite_factor_results',
+                    'load_daily_market_relative_contexts',
+                )
+                for loader_name in empty_loaders:
+                    stack.enter_context(
+                        patch(f'app.agent_context.read_service.{loader_name}', return_value=[])
+                    )
+                stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service.load_current_market_snapshot_context',
+                        side_effect=(
+                            snapshot_context
+                            if isinstance(snapshot_context, Exception)
+                            else None
+                        ),
+                        return_value=(
+                            None
+                            if isinstance(snapshot_context, Exception)
+                            else snapshot_context
+                        ),
+                    )
+                )
+                baseline_loader = stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service.load_prior_market_turnover_baselines',
+                        side_effect=baseline if isinstance(baseline, Exception) else None,
+                        return_value=None if isinstance(baseline, Exception) else {'KOSPI': baseline},
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service.pykrx_enrichment_service.load_symbol_day_context_inputs',
+                        return_value={
+                            'by_symbol': {},
+                            'by_market': {},
+                            'sector_rows_by_market': {},
+                        },
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service._load_latest_symbol_day_block_history',
+                        return_value=EMPTY_LATEST_PRIOR_ROWS,
+                    )
+                )
+                stack.enter_context(
+                    patch('app.agent_context.read_service.build_signal_decider_scores', return_value={})
+                )
+                stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service.get_market_state',
+                        return_value=SimpleNamespace(
+                            market='KRX',
+                            state='OPEN',
+                            is_trading_day=True,
+                            is_open=True,
+                            server_time=server_time,
+                        ),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service.build_market_session_metadata',
+                        return_value=_open_market_session(market_date='2026-04-29'),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        'app.agent_context.read_service.macro_context_service.get_context',
+                        return_value={'status': 'unavailable', 'series': []},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(settings, 'external_news_context_enabled', False)
+                )
+
+                result = service.get_symbol_day_context(
+                    market_date='2026-04-29',
+                    symbols=['005930'],
+                )
+
+            item = result['items'][0]
+            self.assertEqual(item['market_regime_context']['market_regime'], expected_regime)
+            if case_name == 'fresh_downside_without_turnover_baseline':
+                self.assertEqual(item['market_regime_context']['posture'], 'risk_off')
+                self.assertEqual(item['market_regime_context']['recommended_exec_action'], 'reject')
+                self.assertEqual(item['market_breadth_context']['source'], 'kis_market_snapshot_v1')
+                self.assertEqual(item['market_breadth_context']['up_count'], 250)
+                self.assertEqual(item['market_breadth_context']['down_count'], 680)
+                self.assertEqual(
+                    item['context_provenance']['market_breadth_context']['source_provider'],
+                    'kis_market_snapshot_v1',
+                )
+            if expected_regime in {'aggressive_open', 'trend_day'}:
+                self.assertEqual(item['market_regime_context']['quantity_multiplier'], 1.0)
+                self.assertGreater(
+                    item['market_regime_context']['shadow_quantity_multiplier'],
+                    1.0,
+                )
+                self.assertEqual(
+                    item['market_regime_context']['live_upsize_status'],
+                    'shadow_only_uncalibrated',
+                )
+                self.assertEqual(item['market_breadth_context']['source'], 'kis_market_snapshot_v1')
+                self.assertEqual(
+                    item['context_provenance']['market_breadth_context']['source_provider'],
+                    'kis_market_snapshot_v1',
+                )
+                self.assertEqual(
+                    item['market_regime_context']['open_drive_context']['provenance'][
+                        'validation_status'
+                    ],
+                    'validated',
+                )
+            else:
+                self.assertLessEqual(item['market_regime_context']['quantity_multiplier'], 1.0)
+                self.assertFalse(
+                    item['market_regime_context']['open_drive_context']['authoritative']
+                )
+            if case_name in {'baseline_storage_error', 'baseline_timeout'}:
+                self.assertEqual(
+                    item['market_regime_context']['open_drive_context']['status'],
+                    'unavailable',
+                    item['market_regime_context']['open_drive_context'],
+                )
+                self.assertEqual(
+                    item['market_regime_context']['open_drive_context']['index_leg']['status'],
+                    'available',
+                )
+            if case_name in {
+                'same_provider_prior_skips_eod_fallback',
+                'snapshot_storage_timeout',
+            }:
+                baseline_loader.assert_not_called()
+            else:
+                baseline_loader.assert_called_once_with(
+                    market_date=date(2026, 4, 29),
+                    markets=['KOSPI'],
+                )
+
     def test_krx_symbol_uses_request_session_gate_instead_of_unguarded_current_cache(self):
         krx_session = _closed_market_session()
 
@@ -1444,6 +2244,10 @@ class AgentContextReadServiceTests(unittest.TestCase):
         )
         with (
             patch(
+                'app.agent_context.decision_input_quality._utcnow',
+                return_value=datetime(2026, 4, 8, 0, 57, 10, tzinfo=timezone.utc),
+            ),
+            patch(
                 'app.agent_context.read_service.build_market_session_metadata',
                 return_value=_open_market_session(),
             ),
@@ -1560,6 +2364,15 @@ class AgentContextReadServiceTests(unittest.TestCase):
             'available',
         )
         self.assertEqual(first_item['decision_input_quality_context']['schema_version'], 'decision_input_quality_v1')
+        executable_quote = first_item['pre_decider_enrichment_context']['quote_orderbook_snapshot']
+        self.assertEqual(executable_quote['snapshot_type'], 'live_intraday')
+        self.assertEqual(executable_quote['spread_source_context'], 'quote_context')
+        self.assertEqual(executable_quote['quote_freshness_timestamp'], '2026-04-08T09:57:00+09:00')
+        self.assertEqual(executable_quote['freshness']['quote_context']['source_provider'], 'kis')
+        self.assertEqual(
+            first_item['decision_input_quality_context']['execution_feasibility']['expected_slippage_basis'],
+            'quote_spread_bps',
+        )
         self.assertEqual(
             first_item['decision_input_quality_context']['data_quality']['blocks']['liquidity_turnover']['decision_effect'],
             'confirmed',
@@ -1895,6 +2708,79 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(context['turnover']['estimated_trading_value_krw'], 8520000000)
         self.assertEqual(context['turnover']['reason'], 'derived_from_close_price_x_volume')
 
+    def test_build_compact_liquidity_context_rejects_negative_provider_turnover(self):
+        context = _build_compact_liquidity_context(
+            requested_market_date=date.fromisoformat('2026-04-08'),
+            quote_context=None,
+            quote_freshness_provenance={},
+            price_context={
+                'trade_date': '2026-04-08',
+                'source': 'pykrx',
+                'captured_at': '2026-04-08T15:30:00+09:00',
+                'close_price': 71000,
+                'volume': 120000,
+                'turnover': -8520000000,
+                'liquidity': {
+                    'turnover_krw': -8520000000,
+                    'provider_turnover_krw': -8520000000,
+                    'estimated_turnover_krw': 8520000000,
+                },
+            },
+            price_context_history=[],
+            price_context_freshness_provenance=_fresh_provenance(),
+            price_context_storage_unavailable=False,
+            low_risk_row=None,
+            latest_prior_low_risk_row=None,
+            low_risk_freshness_provenance={},
+            low_risk_storage_unavailable=False,
+            low_risk_prior_storage_unavailable=False,
+            intraday_execution_context=None,
+            intraday_execution_freshness_provenance={},
+        )
+
+        self.assertEqual(context['status'], 'missing_price_or_volume')
+        self.assertEqual(context['turnover']['reason'], 'nonpositive_turnover_value')
+        self.assertEqual(context['turnover']['trading_value_source'], 'missing')
+        self.assertIsNone(context['turnover']['turnover_krw'])
+        self.assertIsNone(context['turnover']['raw_trading_value_krw'])
+        self.assertIsNone(context['turnover']['estimated_trading_value_krw'])
+
+    def test_build_compact_liquidity_context_does_not_hide_negative_valuation_turnover(self):
+        context = _build_compact_liquidity_context(
+            requested_market_date=date.fromisoformat('2026-04-08'),
+            quote_context=None,
+            quote_freshness_provenance={},
+            price_context={
+                'trade_date': '2026-04-08',
+                'source': 'pykrx',
+                'captured_at': '2026-04-08T15:30:00+09:00',
+                'close_price': 71000,
+                'volume': 120000,
+                'turnover': 8520000000,
+                'liquidity': {'provider_turnover_krw': 8520000000},
+            },
+            price_context_history=[],
+            price_context_freshness_provenance=_fresh_provenance(),
+            price_context_storage_unavailable=False,
+            low_risk_row=None,
+            latest_prior_low_risk_row=None,
+            low_risk_freshness_provenance={},
+            low_risk_storage_unavailable=False,
+            low_risk_prior_storage_unavailable=False,
+            intraday_execution_context=None,
+            intraday_execution_freshness_provenance={},
+            valuation_context={
+                'status': 'available',
+                'valuation_snapshot': {'trading_value': -9870000000},
+            },
+            valuation_context_freshness_provenance=_fresh_provenance(),
+        )
+
+        self.assertEqual(context['status'], 'missing_price_or_volume')
+        self.assertEqual(context['turnover']['reason'], 'nonpositive_turnover_value')
+        self.assertEqual(context['turnover']['trading_value_source'], 'missing')
+        self.assertIsNone(context['turnover']['turnover_krw'])
+
     def test_build_compact_liquidity_context_prefers_raw_pykrx_trading_value(self):
         context = _build_compact_liquidity_context(
             requested_market_date=date.fromisoformat('2026-04-08'),
@@ -2046,6 +2932,173 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertFalse(phase_contract['realtime_quote_orderbook_required'])
         self.assertTrue(phase_contract['eod_reference_price_accepted'])
         self.assertTrue(phase_contract['agent_guidance']['daily_process_agents_use_completed_eod'])
+
+    def test_pre_decider_spread_metadata_uses_one_source_provenance_bundle(self):
+        market_date = date(2026, 4, 8)
+        quote_observed_at = '2026-04-08T09:57:00+09:00'
+        snapshot = _build_pre_decider_quote_orderbook_snapshot(
+            requested_market_date=market_date,
+            market_session={},
+            quote_context={
+                'status': 'available',
+                'source': 'kis',
+                'captured_at': quote_observed_at,
+                'price': 50_000,
+                'spread': {
+                    'bid_price': 49_950,
+                    'ask_price': 50_050,
+                    'spread_points': 100,
+                    'spread_bps_of_price': 20,
+                },
+            },
+            quote_freshness_provenance={
+                'freshness_status': 'fresh',
+                'as_of_market_date': market_date.isoformat(),
+                'as_of_timestamp': quote_observed_at,
+            },
+            intraday_execution_context={
+                'status': 'available',
+                'as_of_market_date': '2026-04-07',
+                'as_of_timestamp': '2026-04-07T15:30:00+09:00',
+            },
+            intraday_execution_freshness_provenance={
+                'freshness_status': 'stale',
+                'as_of_market_date': '2026-04-07',
+                'as_of_timestamp': '2026-04-07T15:30:00+09:00',
+            },
+            price_context=None,
+        )
+
+        self.assertEqual(snapshot['spread_source_context'], 'quote_context')
+        self.assertEqual(snapshot['quote_freshness_status'], 'fresh')
+        self.assertEqual(snapshot['quote_freshness_timestamp'], quote_observed_at)
+        self.assertEqual(snapshot['as_of_market_date'], market_date.isoformat())
+        self.assertEqual(snapshot['as_of_timestamp'], quote_observed_at)
+        self.assertEqual(
+            snapshot['spread_component_source_context'],
+            {
+                'current_price': 'quote_context',
+                'bid_price': 'quote_context',
+                'ask_price': 'quote_context',
+                'spread_points': 'quote_context',
+                'spread_bps': 'quote_context',
+            },
+        )
+
+    def test_pre_decider_spread_prefers_fresh_intraday_over_coherent_stale_quote(self):
+        market_date = date(2026, 4, 8)
+        stale_quote_at = '2026-04-07T15:30:00+09:00'
+        fresh_intraday_at = '2026-04-08T09:57:01+09:00'
+
+        snapshot = _build_pre_decider_quote_orderbook_snapshot(
+            requested_market_date=market_date,
+            market_session={},
+            quote_context={
+                'status': 'available',
+                'source': 'kis',
+                'captured_at': stale_quote_at,
+                'price': 50_000,
+                'spread': {
+                    'bid_price': 49_950,
+                    'ask_price': 50_050,
+                    'spread_points': 100,
+                    'spread_bps_of_price': 20,
+                },
+            },
+            quote_freshness_provenance={
+                'freshness_status': 'stale',
+                'provenance_status': 'provider_sourced',
+                'as_of_market_date': '2026-04-07',
+                'as_of_timestamp': stale_quote_at,
+                'source_provider': 'kis',
+                'source_tables': ['current_quote_cache', 'quote_snapshots'],
+            },
+            intraday_execution_context={
+                'status': 'available',
+                'source': 'kis_intraday_snapshot_v1',
+                'as_of_market_date': market_date.isoformat(),
+                'as_of_timestamp': fresh_intraday_at,
+                'quote': {
+                    'price': 51_000,
+                    'bid_price': 50_949,
+                    'ask_price': 51_051,
+                    'spread_points': 102,
+                    'spread_bps_of_price': 20,
+                },
+            },
+            intraday_execution_freshness_provenance={
+                'freshness_status': 'fresh',
+                'provenance_status': 'provider_sourced',
+                'as_of_market_date': market_date.isoformat(),
+                'as_of_timestamp': fresh_intraday_at,
+                'source_provider': 'kis_intraday_snapshot_v1',
+                'source_tables': [
+                    'current_kis_intraday_snapshot_cache',
+                    'kis_intraday_snapshots',
+                ],
+            },
+            price_context=None,
+        )
+
+        self.assertEqual(
+            snapshot['spread_source_context'],
+            'intraday_execution_context',
+        )
+        self.assertEqual(snapshot['current_price'], 51_000)
+        self.assertEqual(snapshot['spread_bps'], 20)
+        self.assertEqual(snapshot['quote_freshness_status'], 'fresh')
+        self.assertEqual(snapshot['quote_freshness_timestamp'], fresh_intraday_at)
+
+    def test_pre_decider_spread_metadata_never_mixes_quote_and_intraday_components(self):
+        market_date = date(2026, 4, 8)
+        quote_observed_at = '2026-04-08T09:57:00+09:00'
+        intraday_observed_at = '2026-04-08T09:57:01+09:00'
+
+        snapshot = _build_pre_decider_quote_orderbook_snapshot(
+            requested_market_date=market_date,
+            market_session={},
+            quote_context={
+                'status': 'available',
+                'source': 'kis',
+                'captured_at': quote_observed_at,
+                'price': 50_000,
+                'spread': {'spread_bps_of_price': 20},
+            },
+            quote_freshness_provenance={
+                'freshness_status': 'fresh',
+                'as_of_market_date': market_date.isoformat(),
+                'as_of_timestamp': quote_observed_at,
+            },
+            intraday_execution_context={
+                'status': 'available',
+                'source': 'kis_intraday_snapshot_v1',
+                'as_of_market_date': market_date.isoformat(),
+                'as_of_timestamp': intraday_observed_at,
+                'quote': {
+                    'price': 51_000,
+                    'bid_price': 50_950,
+                    'ask_price': 51_050,
+                    'spread_points': 100,
+                },
+            },
+            intraday_execution_freshness_provenance={
+                'freshness_status': 'fresh',
+                'as_of_market_date': market_date.isoformat(),
+                'as_of_timestamp': intraday_observed_at,
+            },
+            price_context=None,
+        )
+
+        self.assertEqual(snapshot['spread_source_context'], 'intraday_execution_context')
+        self.assertEqual(snapshot['current_price'], 51_000)
+        self.assertEqual(snapshot['bid_price'], 50_950)
+        self.assertEqual(snapshot['ask_price'], 51_050)
+        self.assertEqual(snapshot['spread_points'], 100)
+        self.assertEqual(snapshot['spread_bps'], 19.6078)
+        self.assertEqual(
+            set(snapshot['spread_component_source_context'].values()),
+            {'intraday_execution_context'},
+        )
 
     def test_get_symbol_day_context_marks_liquidity_context_storage_unavailable_when_price_context_store_fails(self):
         class EmptyFundamentalsRepository:

@@ -1110,6 +1110,16 @@ def build_signal_decider_payload(
     previous_decision_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     symbol_day_context = jsonable_encoder(strip_runtime_session_fields(item))
+    company_context = (
+        symbol_day_context.get('company')
+        if isinstance(symbol_day_context.get('company'), dict)
+        else {}
+    )
+    canonical_market = str(
+        symbol_day_context.get('market') or company_context.get('market') or ''
+    ).strip().upper()
+    if canonical_market:
+        symbol_day_context['market'] = canonical_market
     score_context = symbol_day_context.pop('scores', {}) if isinstance(symbol_day_context.get('scores'), dict) else {}
     factor_summary = (
         symbol_day_context.pop('factor_summary', {})

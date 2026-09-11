@@ -30,6 +30,7 @@ from app.agent_context.orchestrator_runtime_helpers import (
     dispatch_and_store,
     normalized_feedback_contract_failure,
 )
+from app.orders.signal_decider_performance_gates import evaluate_next_open_performance_gate
 
 
 def _attach_response_correlation(result: dict, *, expected_symbols: list[str]) -> dict:
@@ -566,6 +567,7 @@ class RepairJsonTailTests(unittest.TestCase):
                 'pre_decider_enrichment_context_authoritative'
             ]
         )
+
         self.assertTrue(
             payload['decision_support_constraints']['missing_context_policy'][
                 'market_regime_context_authoritative'
@@ -626,6 +628,24 @@ class RepairJsonTailTests(unittest.TestCase):
                 'do_not_limit_decider_improvement_to_reason_names_or_text_detail'
             ]
         )
+
+    def test_build_signal_decider_payload_promotes_company_market_to_canonical_context(self):
+        payload = build_signal_decider_payload(
+            item={
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'company': {'market': 'KOSPI'},
+            },
+            market_date=date(2026, 4, 14),
+            request_run_id='request-run-market-contract',
+            market_context={},
+            upstream_summaries={},
+            upstream_traceability={},
+            signal_decider_agent_name='signal-decider',
+            signal_decider_policy={},
+        )
+
+        self.assertEqual(payload['symbol_day_context']['market'], 'KOSPI')
 
     def test_signal_decider_performance_criteria_compacts_recent_calibration_report(self):
         service = AgentFeedbackOrchestrator()
@@ -707,6 +727,186 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertFalse(criteria['usage_policy']['allow_buy_authorization'])
         self.assertTrue(criteria['usage_policy']['reward_risk_and_outcome_path_override_name_only_reasoning'])
         self.assertFalse(criteria['usage_policy']['auto_apply_policy_changes'])
+
+    def test_signal_decider_rule_candidate_compaction_normalizes_type_and_activation_safely(self):
+        compacted = AgentFeedbackOrchestrator._compact_signal_decider_rule_candidates(
+            {
+                'items': [
+                    {
+                        'candidate_id': 'approved-legacy-veto',
+                        'candidate_type': 'veto',
+                        'predicate': {
+                            'schema_version': 'signal_decider_rule_predicate_v1',
+                            'all': [
+                                {
+                                    'field': 'decision.action',
+                                    'operator': 'eq',
+                                    'value': 'buy',
+                                }
+                            ],
+                        },
+                        'activation_status': 'active',
+                        'manual_review_only': False,
+                        'active_policy': True,
+                        'deterministic_gate_eligible': True,
+                    },
+                    {
+                        'candidate_id': 'unreviewed-legacy-downsize',
+                        'candidate_type': 'downsize',
+                        'predicate': {
+                            'schema_version': 'signal_decider_rule_predicate_v1',
+                            'all': [
+                                {
+                                    'field': 'decision.action',
+                                    'operator': 'eq',
+                                    'value': 'buy',
+                                }
+                            ],
+                        },
+                        'activation_status': 'needs_replay',
+                        'manual_review_only': True,
+                        'active_policy': True,
+                        'deterministic_gate_eligible': True,
+                    },
+                    {
+                        'candidate_id': 'active-with-noncanonical-predicate',
+                        'candidate_type': 'buy_veto',
+                        'predicate': {
+                            'schema_version': 'signal_decider_rule_predicate_v1',
+                            'operator': 'all',
+                            'conditions': [
+                                {
+                                    'field': 'decision.action',
+                                    'operator': 'eq',
+                                    'value': 'buy',
+                                }
+                            ],
+                        },
+                        'activation_status': 'active',
+                        'manual_review_only': False,
+                        'active_policy': True,
+                        'deterministic_gate_eligible': True,
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(compacted[0]['candidate_type'], 'buy_veto')
+        self.assertEqual(compacted[0]['activation_status'], 'active')
+        self.assertFalse(compacted[0]['manual_review_only'])
+        self.assertTrue(compacted[0]['active_policy'])
+        self.assertTrue(compacted[0]['deterministic_gate_eligible'])
+        self.assertEqual(compacted[1]['candidate_type'], 'tighten_buy_gate')
+        self.assertEqual(compacted[1]['activation_status'], 'needs_replay')
+        self.assertTrue(compacted[1]['manual_review_only'])
+        self.assertFalse(compacted[1]['active_policy'])
+        self.assertFalse(compacted[1]['deterministic_gate_eligible'])
+        self.assertFalse(compacted[2]['active_policy'])
+        self.assertFalse(compacted[2]['deterministic_gate_eligible'])
+
+    def test_approved_calibration_report_candidate_survives_compaction_and_blocks_matching_factor(self):
+        predicate = (
+            orchestrator_module.signal_decider_calibration_service._rule_candidate_predicate(
+                tokens=[
+                    {
+                        'key': 'factor.momentum.bucket',
+                        'value': 'available:high',
+                    }
+                ],
+                action_condition={
+                    'field': 'decision.action',
+                    'operator': 'eq',
+                    'value': 'buy',
+                },
+            )
+        )
+        report = {
+            'request': {
+                'market_date_from': '2026-06-13',
+                'market_date_to': '2026-07-13',
+                'policy_version': 'signal_decider_policy_v1',
+                'horizon_days': 5,
+            },
+            'summary': {
+                'status': 'ready',
+                'mature_computed_count': 12,
+                'ready_for_operator_review': True,
+                'decision_action_counts': {'buy': 12},
+                'grade_label_counts': {'bad_buy': 9},
+                'positive_outcome_rate': 0.25,
+                'negative_outcome_rate': 0.75,
+                'coverage_gap_count': 0,
+            },
+            'group_summaries': {},
+            'rule_candidates': {
+                'items': [
+                    {
+                        'candidate_id': 'approved-momentum-veto',
+                        'candidate_type': 'buy_veto',
+                        'predicate': predicate,
+                        'reason': 'Approved after replay and operator review.',
+                        'support_sample_count': 9,
+                        'evaluated_sample_count': 12,
+                        'negative_rate': 0.75,
+                        'activation_status': 'active',
+                        'manual_review_only': False,
+                        'active_policy': True,
+                        'deterministic_gate_eligible': True,
+                    }
+                ]
+            },
+            'calibration_hints': {},
+        }
+
+        with patch.object(
+            orchestrator_module.signal_decider_calibration_service,
+            'build_report',
+            return_value=report,
+        ):
+            criteria = AgentFeedbackOrchestrator()._build_signal_decider_performance_criteria(
+                policy_context={'current_version': 'signal_decider_policy_v1'},
+                market_date=date(2026, 7, 14),
+            )
+
+        result = evaluate_next_open_performance_gate(
+            request_payload={
+                'scores': {
+                    'momentum': {'status': 'available', 'score': 0.88},
+                },
+                'factor_summary': {
+                    'factor_scores': {
+                        'momentum': {'status': 'available', 'score': 0.88},
+                    },
+                },
+                'signal_decider_policy': {
+                    'performance_criteria': criteria,
+                },
+            },
+            decision_action='buy',
+            confidence_score_10=8,
+            expected_return_pct=3,
+            reference_price=50_000,
+            target_price=52_000,
+            stop_loss_price=49_000,
+            expected_slippage_bps=0,
+            expected_slippage_basis='quote_spread_bps',
+            base_min_confidence_score_10=6,
+            base_min_expected_return_pct=0,
+            base_min_reward_risk_ratio='1.30',
+        )
+
+        self.assertEqual(predicate['schema_version'], 'signal_decider_rule_predicate_v1')
+        self.assertIn('all', predicate)
+        self.assertEqual(criteria['rule_candidates'][0]['candidate_type'], 'buy_veto')
+        self.assertTrue(criteria['rule_candidates'][0]['deterministic_gate_eligible'])
+        self.assertEqual(
+            [item['candidate_id'] for item in result['matched_rule_candidates']],
+            ['approved-momentum-veto'],
+        )
+        self.assertIn(
+            'performance_rule_candidate_blocked',
+            {reason['code'] for reason in result['blocking_reasons']},
+        )
 
     def test_signal_decider_performance_criteria_are_ineligible_when_replay_sample_is_insufficient(self):
         service = AgentFeedbackOrchestrator()
@@ -2253,6 +2453,45 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertGreaterEqual(message.count('compressed_payload'), 2)
         self.assertIn('usage_policy.model_guidance_eligible=true', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
+
+    def test_compressed_batch_prompt_builds_and_includes_contract_suffix_once(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=60000,
+        )
+        signal_decider_spec = orchestrator_module.DISPATCH_SPECS[-1]
+        original_suffix_builder = orchestrator_module.build_contract_prompt_suffix
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'build_contract_prompt_suffix',
+                wraps=original_suffix_builder,
+            ) as suffix_builder:
+                client = OpenClawAgentClient()
+                message = client._build_batch_message(
+                    spec=signal_decider_spec,
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=[
+                        {
+                            'symbol': '005930',
+                            'market_date': '2026-04-14',
+                            'context_provenance': {'raw': 'x' * 80000},
+                            'upstream_summaries': {
+                                'technical-summarizer': {'raw_payload': 'y' * 80000},
+                            },
+                        }
+                    ],
+                    request_marker='batch-request::single-contract-suffix',
+                )
+
+        contract_suffix = original_suffix_builder(role=signal_decider_spec.role)
+        self.assertEqual(suffix_builder.call_count, 1)
+        self.assertEqual(message.count(contract_suffix), 1)
 
     def test_signal_decider_prompt_trim_final_fallback_compresses_large_one_symbol_payload(self):
         fake_settings = SimpleNamespace(

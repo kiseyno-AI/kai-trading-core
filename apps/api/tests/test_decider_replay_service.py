@@ -148,7 +148,9 @@ def _alignment_gate(alignment: str, action: str) -> dict:
             'metrics': {
                 'buy_quality_score': 76,
                 'return_percentile': 0.82,
+                'return_percentile_status': 'available',
                 'volume_percentile': 0.68,
+                'volume_percentile_status': 'available',
                 'reward_risk_ratio': 2.5,
                 'raw_trading_value_krw': 9_000_000_000,
                 'continuation_setup_detected': True,

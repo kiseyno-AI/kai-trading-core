@@ -1,7 +1,9 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Barrier
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 
 from app.db import engine, session_scope
 from app.db_models import CurrentMarketSnapshotCache
@@ -64,6 +66,245 @@ class MarketSnapshotCacheStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(loaded.last_refresh_attempted_at, attempted_at)
         self.assertEqual(loaded.last_refresh_succeeded_at, succeeded_at)
         self.assertEqual(loaded.refresh_trigger, 'test')
+
+    def test_older_failed_refresh_cannot_overwrite_newer_success(self) -> None:
+        newer_attempted_at = datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc)
+        older_attempted_at = datetime(2026, 4, 30, 1, 5, tzinfo=timezone.utc)
+        newer_payload = {
+            'as_of': '2026-04-30T10:10:00+09:00',
+            'collected_at': '2026-04-30T10:10:03+09:00',
+            'status': 'ready',
+            'markets': {'kospi': {'value': 2700.0}},
+        }
+        self.store.save(
+            payload=newer_payload,
+            last_refresh_attempted_at=newer_attempted_at,
+            last_refresh_succeeded_at=newer_attempted_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='newer_success',
+        )
+
+        saved = self.store.save(
+            payload={
+                **newer_payload,
+                'as_of': '2026-04-30T10:05:00+09:00',
+                'collected_at': '2026-04-30T10:05:02+09:00',
+                'status': 'stale',
+                'stale_reason': 'market_snapshot_kis_upstream_error',
+            },
+            last_refresh_attempted_at=older_attempted_at,
+            last_refresh_succeeded_at=None,
+            last_refresh_status='error',
+            last_refresh_error='slow older request failed',
+            refresh_trigger='older_failure',
+        )
+
+        self.assertEqual(saved.payload, newer_payload)
+        self.assertEqual(saved.last_refresh_attempted_at, newer_attempted_at)
+        self.assertEqual(saved.last_refresh_status, 'success')
+        self.assertEqual(saved.refresh_trigger, 'newer_success')
+
+    def test_newer_attempt_with_regressed_provider_observation_keeps_last_good_payload(self) -> None:
+        initial_attempted_at = datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc)
+        regressed_attempted_at = datetime(2026, 4, 30, 1, 15, tzinfo=timezone.utc)
+        last_good_payload = {
+            'as_of': '2026-04-30T10:10:00+09:00',
+            'collected_at': '2026-04-30T10:10:03+09:00',
+            'status': 'ready',
+            'markets': {'kospi': {'value': 2700.0}},
+        }
+        self.store.save(
+            payload=last_good_payload,
+            last_refresh_attempted_at=initial_attempted_at,
+            last_refresh_succeeded_at=initial_attempted_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='last_good',
+        )
+
+        saved = self.store.save(
+            payload={
+                **last_good_payload,
+                'as_of': '2026-04-30T10:09:00+09:00',
+                'collected_at': '2026-04-30T10:15:03+09:00',
+                'markets': {'kospi': {'value': 2690.0}},
+            },
+            last_refresh_attempted_at=regressed_attempted_at,
+            last_refresh_succeeded_at=regressed_attempted_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='regressed_provider_observation',
+        )
+
+        self.assertEqual(saved.payload, last_good_payload)
+        self.assertEqual(saved.last_refresh_attempted_at, regressed_attempted_at)
+        self.assertEqual(saved.last_refresh_succeeded_at, initial_attempted_at)
+        self.assertEqual(saved.last_refresh_status, 'error')
+        self.assertEqual(saved.last_refresh_error, 'market_snapshot_observation_regressed')
+
+    def test_newer_top_level_observation_cannot_hide_one_market_leg_regression(self) -> None:
+        initial_attempted_at = datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc)
+        candidate_attempted_at = datetime(2026, 4, 30, 1, 15, tzinfo=timezone.utc)
+        last_good_payload = {
+            'as_of': '2026-04-30T10:10:00+09:00',
+            'collected_at': '2026-04-30T10:10:03+09:00',
+            'status': 'ready',
+            'markets': {
+                'kospi': {
+                    'value': 2700.0,
+                    'provider_observed_at': '2026-04-30T10:10:00+09:00',
+                },
+                'kosdaq': {
+                    'value': 870.0,
+                    'provider_observed_at': '2026-04-30T10:10:00+09:00',
+                },
+            },
+        }
+        self.store.save(
+            payload=last_good_payload,
+            last_refresh_attempted_at=initial_attempted_at,
+            last_refresh_succeeded_at=initial_attempted_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='last_good_per_market',
+        )
+
+        saved = self.store.save(
+            payload={
+                'as_of': '2026-04-30T10:15:00+09:00',
+                'collected_at': '2026-04-30T10:15:03+09:00',
+                'status': 'ready',
+                'markets': {
+                    'kospi': {
+                        'value': 2710.0,
+                        'provider_observed_at': '2026-04-30T10:15:00+09:00',
+                    },
+                    'kosdaq': {
+                        'value': 865.0,
+                        'provider_observed_at': '2026-04-30T10:05:00+09:00',
+                    },
+                },
+            },
+            last_refresh_attempted_at=candidate_attempted_at,
+            last_refresh_succeeded_at=candidate_attempted_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='mixed_market_observations',
+        )
+
+        self.assertEqual(saved.payload, last_good_payload)
+        self.assertEqual(saved.last_refresh_attempted_at, candidate_attempted_at)
+        self.assertEqual(saved.last_refresh_succeeded_at, initial_attempted_at)
+        self.assertEqual(saved.last_refresh_status, 'error')
+        self.assertEqual(saved.last_refresh_error, 'market_snapshot_observation_regressed')
+
+    def test_equal_observation_with_lower_quality_cannot_replace_ready_snapshot(self) -> None:
+        observed_payload = {
+            'as_of': '2026-04-30T10:10:00+09:00',
+            'collected_at': '2026-04-30T10:10:03+09:00',
+            'status': 'ready',
+            'markets': {'kospi': {'value': 2700.0}},
+        }
+        self.store.save(
+            payload=observed_payload,
+            last_refresh_attempted_at=datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc),
+            last_refresh_succeeded_at=datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc),
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='ready_observation',
+        )
+
+        saved = self.store.save(
+            payload={
+                **observed_payload,
+                'status': 'stale',
+                'stale_reason': 'market_snapshot_kis_upstream_error',
+            },
+            last_refresh_attempted_at=datetime(2026, 4, 30, 1, 15, tzinfo=timezone.utc),
+            last_refresh_succeeded_at=None,
+            last_refresh_status='error',
+            last_refresh_error='late failure for the same observation',
+            refresh_trigger='same_observation_failure',
+        )
+
+        self.assertEqual(saved.payload, observed_payload)
+        self.assertEqual(saved.last_refresh_status, 'error')
+        self.assertEqual(saved.last_refresh_error, 'market_snapshot_observation_regressed')
+
+    def test_newer_observation_replaces_older_snapshot_even_when_optional_quality_degrades(self) -> None:
+        self.store.save(
+            payload={
+                'as_of': '2026-04-30T10:05:00+09:00',
+                'collected_at': '2026-04-30T10:05:03+09:00',
+                'status': 'ready',
+                'markets': {
+                    'kospi': {
+                        'value': 2690.0,
+                        'provider_observed_at': '2026-04-30T10:05:00+09:00',
+                    }
+                },
+            },
+            last_refresh_attempted_at=datetime(2026, 4, 30, 1, 5, tzinfo=timezone.utc),
+            last_refresh_succeeded_at=datetime(2026, 4, 30, 1, 5, tzinfo=timezone.utc),
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='older_ready',
+        )
+        newer_payload = {
+            'as_of': '2026-04-30T10:10:00+09:00',
+            'collected_at': '2026-04-30T10:10:03+09:00',
+            'status': 'partial',
+            'stale_reason': 'koreaexim_quota_exhausted',
+            'markets': {
+                'kospi': {
+                    'value': 2700.0,
+                    'provider_observed_at': '2026-04-30T10:10:00+09:00',
+                }
+            },
+        }
+
+        saved = self.store.save(
+            payload=newer_payload,
+            last_refresh_attempted_at=datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc),
+            last_refresh_succeeded_at=datetime(2026, 4, 30, 1, 10, tzinfo=timezone.utc),
+            last_refresh_status='degraded',
+            last_refresh_error='optional FX unavailable',
+            refresh_trigger='newer_partial',
+        )
+
+        self.assertEqual(saved.payload, newer_payload)
+        self.assertEqual(saved.last_refresh_status, 'degraded')
+
+    def test_refresh_bucket_claim_is_cross_store_and_first_insert_race_safe(self) -> None:
+        bucket_started_at = datetime(2026, 4, 30, 0, 5, tzinfo=timezone.utc)
+        attempted_at = datetime(2026, 4, 30, 0, 5, 2, tzinfo=timezone.utc)
+        barrier = Barrier(2)
+
+        def claim(index: int) -> bool:
+            barrier.wait(timeout=5)
+            return MarketSnapshotCacheStore().try_claim_refresh_bucket(
+                bucket_started_at=bucket_started_at,
+                attempted_at=attempted_at,
+                refresh_trigger=f'process:{index}',
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claims = list(executor.map(claim, (1, 2)))
+
+        self.assertEqual(sorted(claims), [False, True])
+        with session_scope() as session:
+            row_count = session.scalar(
+                select(func.count()).select_from(CurrentMarketSnapshotCache)
+            )
+        self.assertEqual(row_count, 1)
+
+        next_bucket_claimed = MarketSnapshotCacheStore().try_claim_refresh_bucket(
+            bucket_started_at=datetime(2026, 4, 30, 0, 10, tzinfo=timezone.utc),
+            attempted_at=datetime(2026, 4, 30, 0, 10, 1, tzinfo=timezone.utc),
+            refresh_trigger='process:next_bucket',
+        )
+        self.assertTrue(next_bucket_claimed)
 
 
 if __name__ == '__main__':

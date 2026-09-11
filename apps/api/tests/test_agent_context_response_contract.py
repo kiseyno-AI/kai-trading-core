@@ -499,6 +499,37 @@ class AgentContextResponseContractTests(unittest.TestCase):
                 self.assertEqual(result['preferred_action'], 'reject')
                 self.assertIn(expected_flag, result['response_schema_violation_flags'])
 
+    def test_numeric_contract_rejects_huge_integer_and_decimal_string_without_raising(self):
+        huge_integer = 10**400
+        cases = (
+            (
+                _complete_signal_decider_feedback(expected_return_pct=huge_integer),
+                'expected_return_pct',
+                'required_field_invalid_value:expected_return_pct',
+            ),
+            (
+                _complete_signal_decider_feedback(target_price='9' * 1000),
+                'target_price',
+                'required_field_invalid_type:target_price',
+            ),
+        )
+
+        for payload, field, expected_flag in cases:
+            with self.subTest(field=field):
+                result = normalize_agent_response(
+                    role='signal-decider',
+                    output_text=json.dumps(payload),
+                    raw_response={'id': f'resp-extreme-number-{field}'},
+                    market_date='2026-04-23',
+                    symbol='005930',
+                    agent_name='signal-decider',
+                )
+
+                self.assertFalse(result['response_contract_valid'])
+                self.assertEqual(result['preferred_action'], 'reject')
+                self.assertIsNone(result[field])
+                self.assertIn(expected_flag, result['response_schema_violation_flags'])
+
     def test_wait_and_reject_decisions_allow_declared_nullable_numeric_fields(self):
         signal_wait = _complete_signal_decider_feedback(
             preferred_action='wait',
@@ -724,6 +755,13 @@ class AgentContextResponseContractTests(unittest.TestCase):
             suffix,
         )
         self.assertIn('next_day_open_action and preferred_action must be one of buy, wait, reject exactly as written.', suffix)
+        self.assertIn(
+            'expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis',
+            suffix,
+        )
+        self.assertNotIn('conservative net return', suffix)
+        self.assertIn('Core recomputes a conservative slippage-adjusted pre-screen return', suffix)
+        self.assertIn('Exec applies its final full-cost check in dispatch mode', suffix)
 
     def test_fundamental_summarizer_contract_accepts_market_specific_dart_or_sec_inputs(self):
         suffix = build_contract_prompt_suffix(role='fundamental-summarizer')

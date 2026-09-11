@@ -4550,7 +4550,25 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['rule_candidates']['status'], 'empty')
         self.assertEqual(result['rule_candidates']['thresholds']['min_sample_size'], 3)
 
-    def test_signal_decider_calibration_rule_candidates_include_bad_buy_veto_or_downsize(self):
+    def test_signal_decider_calibration_factor_bucket_preserves_zero_server_score(self):
+        tokens = SignalDeciderCalibrationService()._build_group_tokens(
+            decision={'decision': {'action': 'buy'}},
+            factor_summary={
+                'factor_scores': {
+                    'momentum': {'status': 'available', 'score': 0.99},
+                }
+            },
+            liquidity_context={},
+            feature_snapshot={},
+            scores={
+                'momentum': {'status': 'available', 'score': 0},
+            },
+        )
+
+        momentum_token = next(token for token in tokens if token.key == 'factor.momentum.bucket')
+        self.assertEqual(momentum_token.value, 'available:low')
+
+    def test_signal_decider_calibration_rule_candidates_emit_canonical_gate_contract(self):
         result = _build_rule_candidate_report(outcome_kind='bad_buy')
 
         candidates = list(result['rule_candidates']['items'])
@@ -4584,7 +4602,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         risk_candidates = [
             candidate
             for candidate in candidates
-            if candidate['candidate_type'] in {'veto', 'downsize'}
+            if candidate['candidate_type'] in {'buy_veto', 'tighten_buy_gate'}
         ]
         self.assertTrue(risk_candidates)
         candidate = risk_candidates[0]
@@ -4593,28 +4611,34 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(candidate['negative_rate'], 1.0)
         self.assertEqual(candidate['bad_buy_rate'], 1.0)
         self.assertEqual(candidate['activation_status'], 'needs_replay')
+        self.assertTrue(candidate['manual_review_only'])
         self.assertEqual(candidate['recommended_replay_config']['candidate_id'], candidate['candidate_id'])
         self.assertEqual(candidate['recommended_replay_config']['candidate_type'], candidate['candidate_type'])
         self.assertEqual(candidate['recommended_replay_config']['primary_metric'], 'bad_buy_rate')
         self.assertFalse(candidate['active_policy'])
+        self.assertFalse(candidate['deterministic_gate_eligible'])
+        self.assertEqual(
+            set(candidate['predicate']),
+            {'schema_version', 'all'},
+        )
         self.assertTrue(
             any(
                 condition['field'] == 'decision.action'
                 and condition['operator'] == 'eq'
                 and condition['value'] == 'buy'
-                for condition in candidate['predicate']['conditions']
+                for condition in candidate['predicate']['all']
             )
         )
         non_action_conditions = [
             condition
-            for condition in candidate['predicate']['conditions']
+            for condition in candidate['predicate']['all']
             if condition['field'] != 'decision.action'
         ]
         self.assertTrue(non_action_conditions)
         for risk_candidate in risk_candidates:
-            predicate_conditions = list(risk_candidate['predicate']['conditions'])
+            predicate_conditions = list(risk_candidate['predicate']['all'])
             replay_conditions = list(
-                risk_candidate['recommended_replay_config']['predicate']['conditions']
+                risk_candidate['recommended_replay_config']['predicate']['all']
             )
             for condition in predicate_conditions + replay_conditions:
                 self.assertNotIn(condition['field'], outcome_predicate_fields)
@@ -4634,13 +4658,13 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(candidate['support_sample_count'], 3)
         self.assertEqual(candidate['negative_rate'], 1.0)
         self.assertEqual(candidate['recommended_replay_config']['primary_metric'], 'missed_opportunity_rate')
-        self.assertNotIn(candidate['candidate_type'], {'veto', 'downsize'})
+        self.assertNotIn(candidate['candidate_type'], {'buy_veto', 'tighten_buy_gate'})
         self.assertTrue(
             any(
                 condition['field'] == 'decision.action'
                 and condition['operator'] == 'eq'
                 and condition['value'] == 'wait'
-                for condition in candidate['predicate']['conditions']
+                for condition in candidate['predicate']['all']
             )
         )
 

@@ -1,6 +1,8 @@
+import hashlib
 import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,14 +20,36 @@ from app.db_models import (
 )
 from app.market_data_store import (
     _build_daily_market_relative_rows_query,
+    _build_prior_market_turnover_bars_query,
+    _build_prior_market_turnover_baselines_query,
+    load_current_market_snapshot_context,
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
+    load_prior_market_turnover_baselines,
     load_current_kis_intraday_snapshot,
     persist_daily_price_bar,
     persist_daily_price_bars,
     persist_kis_intraday_snapshot,
     upsert_daily_pykrx_enrichment_rows,
 )
+
+
+def _market_membership(by_market: dict[str, list[str]]) -> dict:
+    return {
+        'schema_version': 'pykrx_market_membership_v1',
+        'membership_basis': 'end_date_snapshot',
+        'symbol_count': sum(len(symbols) for symbols in by_market.values()),
+        'markets': {
+            market: {
+                'symbols': symbols,
+                'symbol_count': len(symbols),
+                'membership_sha256': hashlib.sha256(
+                    '\n'.join(sorted(symbols)).encode('utf-8')
+                ).hexdigest(),
+            }
+            for market, symbols in by_market.items()
+        },
+    }
 
 
 class HistoricalPriceBarPersistenceTests(unittest.TestCase):
@@ -148,6 +172,598 @@ class MarketRelativeQueryShapeTests(unittest.TestCase):
         self.assertIn('limit 2', compiled)
         self.assertIn("daily_price_bars.trade_date <= '2026-04-08'", compiled)
         self.assertNotIn('row_number', compiled)
+
+    def test_prior_market_turnover_queries_use_completed_run_and_eod_run_index(self) -> None:
+        statement = _build_prior_market_turnover_baselines_query(
+            markets=['KOSPI', 'KOSDAQ'],
+            market_date=date(2026, 4, 8),
+        )
+        bars_statement = _build_prior_market_turnover_bars_query(
+            run_id=73,
+            trade_date=date(2026, 4, 7),
+            markets=['KOSPI', 'KOSDAQ'],
+        )
+
+        compiled = str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={'literal_binds': True},
+            )
+        ).lower()
+
+        compiled_bars = str(
+            bars_statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={'literal_binds': True},
+            )
+        ).lower()
+
+        self.assertNotIn('join lateral', compiled)
+        self.assertIn("eod_collection_runs.trade_date < '2026-04-08'", compiled)
+        self.assertIn("eod_collection_runs.source = 'pykrx'", compiled)
+        self.assertIn("eod_collection_runs.status = 'completed'", compiled)
+        self.assertIn('eod_collection_runs.symbols_failed = 0', compiled)
+        self.assertIn("run_metadata ->> 'limited_run'", compiled)
+        self.assertIn("run_metadata -> 'universe_snapshot'", compiled)
+        self.assertIn('limit 8', compiled)
+        self.assertIn('daily_price_bars.eod_run_id = 73', compiled_bars)
+        self.assertNotIn("daily_price_bars.trade_date = '2026-04-07'", compiled_bars)
+        self.assertIn('daily_price_bars.trade_date', compiled_bars)
+        self.assertIn("daily_price_bars.source = 'pykrx'", compiled_bars)
+
+    def test_load_current_market_snapshot_context_preserves_cache_provenance(self) -> None:
+        cached_at = datetime(2026, 4, 8, 0, 10, tzinfo=timezone.utc)
+        row = SimpleNamespace(
+            payload={
+                'status': 'ready',
+                'as_of': '2026-04-08T09:10:00+09:00',
+                'markets': {'kospi': {'index_code': '0001', 'value': 2700.0}},
+            },
+            snapshot_status='ready',
+            stale_reason=None,
+            as_of=cached_at,
+            last_refresh_attempted_at=cached_at,
+            last_refresh_succeeded_at=cached_at,
+            last_refresh_status='success',
+            last_refresh_error=None,
+            refresh_trigger='background_runner:open_drive',
+            updated_at=cached_at,
+        )
+
+        class FakeResult:
+            def scalar_one_or_none(self):
+                return row
+
+        class FakeSession:
+            def execute(self, _statement):
+                return FakeResult()
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeSession()
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_current_market_snapshot_context()
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result['source'], 'kis_market_snapshot_v1')
+        self.assertEqual(result['source_table'], 'current_market_snapshot_cache')
+        self.assertEqual(result['as_of'], '2026-04-08T00:10:00+00:00')
+        self.assertEqual(result['last_refresh_status'], 'success')
+        self.assertEqual(result['payload']['markets']['kospi']['index_code'], '0001')
+
+    def test_load_prior_market_turnover_baselines_requires_exact_completed_eod_membership(self) -> None:
+        run_metadata = {
+            'markets': ['KOSPI'],
+            'symbol': None,
+            'limited_run': False,
+            'requested_symbols': ['005930', '000660'],
+            'failed_symbols': [],
+            'unattempted_symbols': [],
+            'universe_snapshot': {
+                'source': 'pykrx',
+                'complete': True,
+                'markets': ['KOSPI'],
+                'symbol_count': 2,
+                'persisted_count': 2,
+                'latest_trade_date': '2026-04-07',
+                'membership_basis': 'end_date_snapshot',
+                'unavailable_markets': [],
+                'market_membership': _market_membership(
+                    {'KOSPI': ['005930', '000660']}
+                ),
+            },
+        }
+        responses = iter(
+            (
+                [
+                    SimpleNamespace(
+                        _mapping={
+                            'run_id': 73,
+                            'trade_date': date(2026, 4, 7),
+                            'status': 'completed',
+                            'symbols_total': 2,
+                            'symbols_succeeded': 2,
+                            'symbols_failed': 0,
+                            'completed_at': datetime(2026, 4, 7, 16, 0, tzinfo=timezone.utc),
+                            'run_metadata': run_metadata,
+                        }
+                    )
+                ],
+                [
+                    SimpleNamespace(_mapping={'symbol': '005930', 'market': 'KOSPI', 'trade_date': date(2026, 4, 7), 'turnover_krw': 5_000}),
+                    SimpleNamespace(_mapping={'symbol': '000660', 'market': 'KOSPI', 'trade_date': date(2026, 4, 7), 'turnover_krw': 3_000}),
+                ],
+            )
+        )
+
+        class FakeResult:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def all(self):
+                return self.rows
+
+        class FakeSession:
+            def execute(self, _statement):
+                return FakeResult(next(responses))
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeSession()
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_prior_market_turnover_baselines(
+                market_date=date(2026, 4, 8),
+                markets=['KOSPI'],
+            )
+
+        self.assertEqual(result['KOSPI']['trade_date'], '2026-04-07')
+        self.assertEqual(result['KOSPI']['turnover_krw'], 8_000)
+        self.assertEqual(result['KOSPI']['coverage_ratio'], 1.0)
+        self.assertEqual(result['KOSPI']['source'], 'pykrx')
+        self.assertEqual(result['KOSPI']['source_table'], 'daily_price_bars')
+        self.assertEqual(result['KOSPI']['eod_run_id'], 73)
+        self.assertEqual(result['KOSPI']['coverage_proof']['membership_status'], 'exact')
+        expected_membership_sha256 = hashlib.sha256(
+            b'000660\n005930'
+        ).hexdigest()
+        self.assertEqual(
+            result['KOSPI']['coverage_proof']['requested_membership_sha256'],
+            expected_membership_sha256,
+        )
+        self.assertEqual(
+            result['KOSPI']['coverage_proof']['persisted_membership_sha256'],
+            expected_membership_sha256,
+        )
+        self.assertEqual(result['KOSPI']['coverage_proof']['universe_source'], 'pykrx')
+        self.assertEqual(
+            result['KOSPI']['coverage_proof']['membership_basis'],
+            'end_date_snapshot',
+        )
+
+    def test_load_prior_market_turnover_baselines_rejects_same_count_wrong_symbol_set(self) -> None:
+        run_metadata = {
+            'markets': ['KOSPI'],
+            'symbol': None,
+            'limited_run': False,
+            'requested_symbols': ['005930', '000660'],
+            'failed_symbols': [],
+            'unattempted_symbols': [],
+            'universe_snapshot': {
+                'source': 'pykrx',
+                'complete': True,
+                'markets': ['KOSPI'],
+                'symbol_count': 2,
+                'persisted_count': 2,
+                'latest_trade_date': '2026-04-07',
+                'membership_basis': 'end_date_snapshot',
+                'unavailable_markets': [],
+                'market_membership': _market_membership(
+                    {'KOSPI': ['005930', '000660']}
+                ),
+            },
+        }
+        responses = iter(
+            (
+                [
+                    SimpleNamespace(
+                        _mapping={
+                            'run_id': 73,
+                            'trade_date': date(2026, 4, 7),
+                            'status': 'completed',
+                            'symbols_total': 2,
+                            'symbols_succeeded': 2,
+                            'symbols_failed': 0,
+                            'completed_at': datetime(2026, 4, 7, 16, 0, tzinfo=timezone.utc),
+                            'run_metadata': run_metadata,
+                        }
+                    )
+                ],
+                [
+                    SimpleNamespace(_mapping={'symbol': '000660', 'market': 'KOSPI', 'trade_date': date(2026, 4, 7), 'turnover_krw': 3_000}),
+                    SimpleNamespace(_mapping={'symbol': '035420', 'market': 'KOSPI', 'trade_date': date(2026, 4, 7), 'turnover_krw': 5_000}),
+                ],
+            )
+        )
+
+        class FakeResult:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def all(self):
+                return self.rows
+
+        class FakeSession:
+            def execute(self, _statement):
+                return FakeResult(next(responses))
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeSession()
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_prior_market_turnover_baselines(
+                market_date=date(2026, 4, 8),
+                markets=['KOSPI'],
+            )
+
+        self.assertEqual(result, {})
+
+    def test_prior_turnover_uses_eod_market_membership_not_current_symbol_market(self) -> None:
+        run_metadata = {
+            'markets': ['KOSPI', 'KOSDAQ'],
+            'symbol': None,
+            'limited_run': False,
+            'requested_symbols': ['005930', '247540'],
+            'failed_symbols': [],
+            'unattempted_symbols': [],
+            'universe_snapshot': {
+                'source': 'pykrx',
+                'complete': True,
+                'markets': ['KOSPI', 'KOSDAQ'],
+                'symbol_count': 2,
+                'persisted_count': 2,
+                'latest_trade_date': '2026-04-07',
+                'membership_basis': 'end_date_snapshot',
+                'unavailable_markets': [],
+                'market_membership': {
+                    'schema_version': 'pykrx_market_membership_v1',
+                    'membership_basis': 'end_date_snapshot',
+                    'symbol_count': 2,
+                    'markets': {
+                        'KOSPI': {
+                            'symbols': ['005930'],
+                            'symbol_count': 1,
+                            'membership_sha256': hashlib.sha256(b'005930').hexdigest(),
+                        },
+                        'KOSDAQ': {
+                            'symbols': ['247540'],
+                            'symbol_count': 1,
+                            'membership_sha256': hashlib.sha256(b'247540').hexdigest(),
+                        },
+                    },
+                },
+            },
+        }
+        responses = iter(
+            (
+                [
+                    SimpleNamespace(
+                        _mapping={
+                            'run_id': 73,
+                            'trade_date': date(2026, 4, 7),
+                            'status': 'completed',
+                            'symbols_total': 2,
+                            'symbols_succeeded': 2,
+                            'symbols_failed': 0,
+                            'completed_at': datetime(2026, 4, 7, 16, 0, tzinfo=timezone.utc),
+                            'run_metadata': run_metadata,
+                        }
+                    )
+                ],
+                [
+                    SimpleNamespace(
+                        _mapping={
+                            'symbol': '005930',
+                            'market': 'KOSDAQ',
+                            'trade_date': date(2026, 4, 7),
+                            'turnover_krw': 5_000,
+                        }
+                    ),
+                    SimpleNamespace(
+                        _mapping={
+                            'symbol': '247540',
+                            'market': 'KOSPI',
+                            'trade_date': date(2026, 4, 7),
+                            'turnover_krw': 3_000,
+                        }
+                    ),
+                ],
+            )
+        )
+
+        class FakeResult:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def all(self):
+                return self.rows
+
+        class FakeSession:
+            def execute(self, _statement):
+                return FakeResult(next(responses))
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeSession()
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_prior_market_turnover_baselines(
+                market_date=date(2026, 4, 8),
+                markets=['KOSPI', 'KOSDAQ'],
+            )
+
+        self.assertEqual(result['KOSPI']['turnover_krw'], 5_000)
+        self.assertEqual(result['KOSDAQ']['turnover_krw'], 3_000)
+
+    def test_prior_turnover_rejects_legacy_run_without_market_membership_proof(self) -> None:
+        run_metadata = {
+            'markets': ['KOSPI'],
+            'symbol': None,
+            'limited_run': False,
+            'requested_symbols': ['005930'],
+            'failed_symbols': [],
+            'unattempted_symbols': [],
+            'universe_snapshot': {
+                'source': 'pykrx',
+                'complete': True,
+                'markets': ['KOSPI'],
+                'symbol_count': 1,
+                'persisted_count': 1,
+                'latest_trade_date': '2026-04-07',
+                'membership_basis': 'end_date_snapshot',
+                'unavailable_markets': [],
+            },
+        }
+        candidate = SimpleNamespace(
+            _mapping={
+                'run_id': 73,
+                'trade_date': date(2026, 4, 7),
+                'status': 'completed',
+                'symbols_total': 1,
+                'symbols_succeeded': 1,
+                'symbols_failed': 0,
+                'completed_at': datetime(2026, 4, 7, 16, 0, tzinfo=timezone.utc),
+                'run_metadata': run_metadata,
+            }
+        )
+
+        class FakeResult:
+            def all(self):
+                return [candidate]
+
+        class FakeSession:
+            def __init__(self):
+                self.execute_count = 0
+
+            def execute(self, _statement):
+                self.execute_count += 1
+                return FakeResult()
+
+        fake_session = FakeSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_prior_market_turnover_baselines(
+                market_date=date(2026, 4, 8),
+                markets=['KOSPI'],
+            )
+
+        self.assertEqual(result, {})
+        self.assertEqual(fake_session.execute_count, 1)
+
+    def test_incomplete_eod_universe_is_rejected_before_bar_read(self) -> None:
+        candidate = SimpleNamespace(
+            _mapping={
+                'run_id': 73,
+                'trade_date': date(2026, 4, 7),
+                'status': 'completed',
+                'symbols_total': 2,
+                'symbols_succeeded': 2,
+                'symbols_failed': 0,
+                'completed_at': datetime(2026, 4, 7, 16, 0, tzinfo=timezone.utc),
+                'run_metadata': {
+                    'markets': ['KOSPI'],
+                    'symbol': None,
+                    'limited_run': False,
+                    'requested_symbols': ['005930', '000660'],
+                    'failed_symbols': [],
+                    'unattempted_symbols': [],
+                    'universe_snapshot': {
+                        'source': 'pykrx',
+                        'complete': False,
+                        'markets': ['KOSPI'],
+                        'symbol_count': 2,
+                        'persisted_count': 2,
+                        'latest_trade_date': '2026-04-07',
+                        'membership_basis': 'end_date_snapshot',
+                        'unavailable_markets': ['KOSPI'],
+                    },
+                },
+            }
+        )
+
+        class FakeResult:
+            def all(self):
+                return [candidate]
+
+        class FakeSession:
+            def __init__(self):
+                self.execute_count = 0
+
+            def execute(self, _statement):
+                self.execute_count += 1
+                return FakeResult()
+
+        fake_session = FakeSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_prior_market_turnover_baselines(
+                market_date=date(2026, 4, 8),
+                markets=['KOSPI'],
+            )
+
+        self.assertEqual(result, {})
+        self.assertEqual(fake_session.execute_count, 1)
+
+    def test_malformed_eod_coverage_metadata_fails_closed_before_bar_read(self) -> None:
+        candidate = SimpleNamespace(
+            _mapping={
+                'run_id': 73,
+                'trade_date': date(2026, 4, 7),
+                'status': 'completed',
+                'symbols_total': 'not-a-count',
+                'symbols_succeeded': 2,
+                'symbols_failed': 0,
+                'completed_at': datetime(2026, 4, 7, 16, 0, tzinfo=timezone.utc),
+                'run_metadata': {
+                    'markets': ['KOSPI'],
+                    'symbol': None,
+                    'limited_run': False,
+                    'requested_symbols': ['005930', '000660'],
+                    'failed_symbols': [],
+                    'unattempted_symbols': [],
+                    'universe_snapshot': {
+                        'complete': True,
+                        'markets': ['KOSPI'],
+                        'symbol_count': 2,
+                        'latest_trade_date': 'invalid-date',
+                        'unavailable_markets': [],
+                    },
+                },
+            }
+        )
+
+        class FakeResult:
+            def all(self):
+                return [candidate]
+
+        class FakeSession:
+            def __init__(self):
+                self.execute_count = 0
+
+            def execute(self, _statement):
+                self.execute_count += 1
+                return FakeResult()
+
+        fake_session = FakeSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_prior_market_turnover_baselines(
+                market_date=date(2026, 4, 8),
+                markets=['KOSPI'],
+            )
+
+        self.assertEqual(result, {})
+        self.assertEqual(fake_session.execute_count, 1)
+
+    def test_completed_eod_turnover_loader_is_two_indexed_reads_at_operating_scale(self) -> None:
+        requested_symbols = [f'{index:06d}' for index in range(4000)]
+        run_metadata = {
+            'markets': ['KOSPI', 'KOSDAQ'],
+            'symbol': None,
+            'limited_run': False,
+            'requested_symbols': requested_symbols,
+            'failed_symbols': [],
+            'unattempted_symbols': [],
+            'universe_snapshot': {
+                'source': 'pykrx',
+                'complete': True,
+                'markets': ['KOSPI', 'KOSDAQ'],
+                'symbol_count': 4000,
+                'persisted_count': 4000,
+                'latest_trade_date': '2026-04-07',
+                'membership_basis': 'end_date_snapshot',
+                'unavailable_markets': [],
+                'market_membership': _market_membership(
+                    {
+                        'KOSPI': requested_symbols[:2000],
+                        'KOSDAQ': requested_symbols[2000:],
+                    }
+                ),
+            },
+        }
+        candidate = SimpleNamespace(
+            _mapping={
+                'run_id': 73,
+                'trade_date': date(2026, 4, 7),
+                'status': 'completed',
+                'symbols_total': 4000,
+                'symbols_succeeded': 4000,
+                'symbols_failed': 0,
+                'completed_at': datetime(2026, 4, 7, 16, 0, tzinfo=timezone.utc),
+                'run_metadata': run_metadata,
+            }
+        )
+        bars = [
+            SimpleNamespace(
+                _mapping={
+                    'symbol': symbol,
+                    'market': 'KOSPI' if index < 2000 else 'KOSDAQ',
+                    'trade_date': date(2026, 4, 7),
+                    'turnover_krw': 1_000,
+                }
+            )
+            for index, symbol in enumerate(requested_symbols)
+        ]
+        responses = iter(([candidate], bars))
+
+        class FakeResult:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def all(self):
+                return self.rows
+
+        class FakeSession:
+            def __init__(self):
+                self.execute_count = 0
+
+            def execute(self, _statement):
+                self.execute_count += 1
+                return FakeResult(next(responses))
+
+        fake_session = FakeSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        started = perf_counter()
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            result = load_prior_market_turnover_baselines(
+                market_date=date(2026, 4, 8),
+                markets=['KOSPI', 'KOSDAQ'],
+            )
+        elapsed = perf_counter() - started
+
+        self.assertEqual(fake_session.execute_count, 2)
+        self.assertEqual(result['KOSPI']['expected_symbol_count'], 2000)
+        self.assertEqual(result['KOSDAQ']['expected_symbol_count'], 2000)
+        self.assertLess(elapsed, 0.5)
 
 
 class MarketRelativeContextIntegrationTests(unittest.TestCase):

@@ -18,7 +18,22 @@ Short-term exec handoffs also carry signal-decider alignment audit metadata in `
 Core blocks classic signal-decider next-open exec dispatch when source-market-date PyKRX enrichment coverage is missing for `sector_classification`, `investor_flow_symbol`, or `short_selling`. Blocked dispatch responses expose `summary.reason="pykrx_enrichment_preflight_blocked"` and the full `enrichment_preflight` payload on `POST /trading/orders/next-open-execution/run-if-due`; actionable short-term watch candidates remain visible as conditional/degraded rows rather than being erased by the global preflight.
 
 ## Contract source
-Core-to-Exec dispatch payloads use `signal_decider_exec_plan_v2`, and nested exec-agent handoff context uses `exec_agent_decider_handoff_v1`; both are validated by `apps/api/app/orders/execution_handoff_contract.py`. Core owns strategy context and dispatch construction, Exec owns acceptance/sizing/order truth, and Web should read Core's aggregated view instead of querying Exec directly.
+Core-to-Exec dispatch payloads use `signal_decider_exec_plan_v4` with the
+`delegated_final_full_cost_gate_recheck_v1` capability and a complete material
+fingerprint. Nested exec-agent handoff context uses
+`exec_agent_decider_handoff_v1`; both are validated by
+`apps/api/app/orders/execution_handoff_contract.py`. Core owns strategy context
+and dispatch construction, Exec owns acceptance/sizing/order truth, and Web
+should read Core's aggregated view instead of querying Exec directly.
+
+Accepted authority is bound to the exact Core item key, Exec plan ID, and Exec
+plan-item ID from the validated ACK. Stable order/fill IDs, symbol, and side must
+all resolve consistently; conflicting aliases make the readback a contract
+error instead of falling back by symbol. Compact order/execution sections carry
+authoritative total and omitted counts, and a truncated source is excluded from
+fill, trigger, and P/L derivation. Plan-scoped positions are fetched with both
+external and internal plan IDs and must include a matching KIS/KRX
+`position_scope_proof` with one non-empty opaque account scope.
 
 ## Example request
 ```http
@@ -111,6 +126,7 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
         "orders": [
           {
             "id": "order-1",
+            "broker_order_id": "kis-order-1001",
             "execution_plan_item_id": "exec-item-1",
             "symbol": "005930",
             "status": "submitted"
@@ -118,7 +134,9 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
         ],
         "executions": [
           {
-            "broker_order_id": "order-1",
+            "execution_fill_id": "fill-1",
+            "broker_order_pk": "order-1",
+            "broker_order_id": "kis-order-1001",
             "symbol": "005930",
             "side": "buy",
             "quantity": "5"
@@ -127,7 +145,18 @@ GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=0059
         "positions": [
           {
             "symbol": "005930",
-            "quantity": "5"
+            "quantity": "5",
+            "provider": "kis",
+            "account_scope": "opaque-scope",
+            "exchange": "KRX",
+            "position_scope_proof": {
+              "schema_version": "execution_position_scope_proof_v1",
+              "plan_id": "core-signal-decider-20260430-KIS_12345678_01",
+              "execution_plan_id": "exec-plan-1",
+              "provider": "kis",
+              "account_scope": "opaque-scope",
+              "exchange": "KRX"
+            }
           }
         ]
       }

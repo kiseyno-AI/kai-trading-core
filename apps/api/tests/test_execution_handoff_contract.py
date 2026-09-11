@@ -8,6 +8,10 @@ from app.orders.exec_integration import SignalDeciderExecIntegrationService
 from app.orders.execution_handoff_contract import (
     EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
     EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+    EXECUTION_HANDOFF_CAPABILITY,
+    EXECUTION_HANDOFF_CONTRACT_VERSION,
+    EXECUTION_REVOCATION_CAPABILITY,
+    EXECUTION_REVOCATION_SCHEMA_VERSION,
     LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
     EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
     EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION,
@@ -17,14 +21,326 @@ from app.orders.execution_handoff_contract import (
     serialize_execution_dashboard_refresh_payload,
     serialize_execution_monitored_symbols_payload,
     serialize_execution_plan_dispatch_payload,
+    serialize_execution_revocation_payload,
     serialize_execution_runtime_status_payload,
     serialize_execution_symbol_detail_payload,
     serialize_portfolio_risk_equivalent_payload,
+    validate_execution_revocation_ack,
 )
 
 
 class ExecutionHandoffContractTests(unittest.TestCase):
     maxDiff = None
+
+    def test_live_market_risk_off_is_a_valid_execution_revocation_reason(self) -> None:
+        payload = serialize_execution_revocation_payload(
+            {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'required_capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'requested_at': '2026-09-11T13:30:00+00:00',
+                'reason_code': 'current_live_market_risk_off',
+                'replacement_decision_snapshot_id': 'observation:risk-off:1',
+                'replacement_action': 'buy',
+                'items': [
+                    {
+                        'core_item_key': 'entry',
+                        'execution_plan_item_id': 'exec-entry',
+                        'decision_snapshot_id': '101',
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(payload['reason_code'], 'current_live_market_risk_off')
+
+    def test_live_market_evidence_unavailable_is_a_valid_execution_revocation_reason(self) -> None:
+        payload = serialize_execution_revocation_payload(
+            {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'required_capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'requested_at': '2026-09-11T13:30:00+00:00',
+                'reason_code': 'current_live_market_evidence_unavailable',
+                'replacement_decision_snapshot_id': 'observation:evidence-unavailable:1',
+                'replacement_action': 'buy',
+                'items': [
+                    {
+                        'core_item_key': 'entry',
+                        'execution_plan_item_id': 'exec-entry',
+                        'decision_snapshot_id': '101',
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            payload['reason_code'],
+            'current_live_market_evidence_unavailable',
+        )
+
+    def test_revoked_ack_allows_only_protective_exits_to_remain_active(self) -> None:
+        keys = ['entry', 'target', 'stop']
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'exec-plan-v4',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'revoked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': key,
+                    'status': status,
+                    'execution_plan_id': 'exec-plan-v4',
+                    'execution_plan_item_id': f'exec-{key}',
+                }
+                for key, status in (
+                    ('entry', 'revoked'),
+                    ('target', 'preserved_protective_exit'),
+                    ('stop', 'preserved_protective_exit'),
+                )
+            ],
+            'reason_code': 'broker_commit_or_exposure_possible',
+            'revoked_item_count': 1,
+            'manual_review_item_count': 0,
+            'preserved_item_count': 2,
+        }
+        submitted_items = [
+            {
+                'core_item_key': 'entry',
+                'side': 'buy',
+                'intent': 'next_open_buy',
+                'exec_plan_id': 'exec-plan-v4',
+                'exec_plan_item_id': 'exec-entry',
+            },
+            {
+                'core_item_key': 'target',
+                'side': 'sell',
+                'intent': 'target_sell',
+                'exec_plan_id': 'exec-plan-v4',
+                'exec_plan_item_id': 'exec-target',
+            },
+            {
+                'core_item_key': 'stop',
+                'side': 'sell',
+                'intent': 'stop_sell',
+                'exec_plan_id': 'exec-plan-v4',
+                'exec_plan_item_id': 'exec-stop',
+            },
+        ]
+
+        status, _ = validate_execution_revocation_ack(
+            payload,
+            plan_id='plan-v4',
+            submitted_core_item_keys=keys,
+            submitted_items=submitted_items,
+            expected_reason_code='broker_commit_or_exposure_possible',
+        )
+        self.assertEqual(status, 'revoked')
+
+        invalid = copy.deepcopy(payload)
+        invalid['item_acks'][0]['status'] = 'preserved_protective_exit'
+        invalid['revoked_item_count'] = 0
+        invalid['preserved_item_count'] = 3
+        with self.assertRaisesRegex(ValueError, 'entry'):
+            validate_execution_revocation_ack(
+                invalid,
+                plan_id='plan-v4',
+                submitted_core_item_keys=keys,
+                submitted_items=submitted_items,
+                expected_reason_code='broker_commit_or_exposure_possible',
+            )
+
+    def test_revocation_ack_rejects_mismatched_execution_plan_item_identity(self) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'exec-plan-v4',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'revoked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'revoked',
+                    'execution_plan_id': 'exec-plan-v4',
+                    'execution_plan_item_id': 'wrong-exec-entry',
+                }
+            ],
+            'reason_code': 'current_live_market_risk_off',
+            'revoked_item_count': 1,
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
+        }
+
+        with self.assertRaisesRegex(ValueError, 'item identity'):
+            validate_execution_revocation_ack(
+                payload,
+                plan_id='plan-v4',
+                submitted_core_item_keys=['entry'],
+                submitted_items=[
+                    {
+                        'core_item_key': 'entry',
+                        'side': 'buy',
+                        'intent': 'next_open_buy',
+                        'exec_plan_id': 'exec-plan-v4',
+                        'exec_plan_item_id': 'exec-entry',
+                    }
+                ],
+                expected_reason_code='current_live_market_risk_off',
+            )
+
+    def test_revocation_ack_rejects_mismatched_execution_plan_identity(self) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'wrong-exec-plan',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'revoked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'revoked',
+                    'execution_plan_id': 'wrong-exec-plan',
+                    'execution_plan_item_id': 'exec-entry',
+                }
+            ],
+            'reason_code': 'current_live_market_risk_off',
+            'revoked_item_count': 1,
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
+        }
+
+        with self.assertRaisesRegex(ValueError, 'plan identity'):
+            validate_execution_revocation_ack(
+                payload,
+                plan_id='plan-v4',
+                submitted_core_item_keys=['entry'],
+                submitted_items=[
+                    {
+                        'core_item_key': 'entry',
+                        'side': 'buy',
+                        'intent': 'next_open_buy',
+                        'exec_plan_id': 'exec-plan-v4',
+                        'exec_plan_item_id': 'exec-entry',
+                    }
+                ],
+                expected_reason_code='current_live_market_risk_off',
+            )
+
+    def test_revocation_ack_rejects_missing_remote_identity_binding(self) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'exec-plan-v4',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'revoked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'revoked',
+                    'execution_plan_id': 'exec-plan-v4',
+                    'execution_plan_item_id': 'exec-entry',
+                }
+            ],
+            'reason_code': 'current_live_market_risk_off',
+            'revoked_item_count': 1,
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
+        }
+        submitted_item = {
+            'core_item_key': 'entry',
+            'side': 'buy',
+            'intent': 'next_open_buy',
+            'exec_plan_id': 'exec-plan-v4',
+            'exec_plan_item_id': 'exec-entry',
+        }
+        cases = []
+        for missing_field in ('exec_plan_id', 'exec_plan_item_id'):
+            missing_submitted = copy.deepcopy(submitted_item)
+            missing_submitted.pop(missing_field)
+            cases.append((f'submitted_{missing_field}', payload, missing_submitted))
+        missing_top_level_plan = copy.deepcopy(payload)
+        missing_top_level_plan['execution_plan_id'] = None
+        cases.append(('ack_execution_plan_id', missing_top_level_plan, submitted_item))
+        missing_item_plan = copy.deepcopy(payload)
+        missing_item_plan['item_acks'][0]['execution_plan_id'] = None
+        cases.append(('ack_item_execution_plan_id', missing_item_plan, submitted_item))
+        missing_item_id = copy.deepcopy(payload)
+        missing_item_id['item_acks'][0]['execution_plan_item_id'] = ''
+        cases.append(('ack_execution_plan_item_id', missing_item_id, submitted_item))
+
+        for label, candidate_payload, candidate_submitted_item in cases:
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ValueError,
+                'identity',
+            ):
+                validate_execution_revocation_ack(
+                    candidate_payload,
+                    plan_id='plan-v4',
+                    submitted_core_item_keys=['entry'],
+                    submitted_items=[candidate_submitted_item],
+                    expected_reason_code='current_live_market_risk_off',
+                )
+
+    def test_revocation_ack_rejects_mismatched_reason_code(self) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'exec-plan-v4',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'revoked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'revoked',
+                    'execution_plan_id': 'exec-plan-v4',
+                    'execution_plan_item_id': 'exec-entry',
+                }
+            ],
+            'reason_code': 'latest_snapshot_replaced',
+            'revoked_item_count': 1,
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
+        }
+
+        with self.assertRaisesRegex(ValueError, 'reason_code'):
+            validate_execution_revocation_ack(
+                payload,
+                plan_id='plan-v4',
+                submitted_core_item_keys=['entry'],
+                submitted_items=[
+                    {
+                        'core_item_key': 'entry',
+                        'side': 'buy',
+                        'intent': 'next_open_buy',
+                        'exec_plan_id': 'exec-plan-v4',
+                        'exec_plan_item_id': 'exec-entry',
+                    }
+                ],
+                expected_reason_code='current_live_market_risk_off',
+            )
 
     def _dispatch_payload(self, *, schema_version: str, item: dict) -> dict:
         return {
@@ -49,16 +365,14 @@ class ExecutionHandoffContractTests(unittest.TestCase):
             'metadata': {'schema_version': schema_version},
         }
 
-    def test_v2_krx_dispatch_is_backfilled_for_compatibility(self) -> None:
-        payload = serialize_execution_plan_dispatch_payload(
-            self._dispatch_payload(schema_version=LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION, item={})
-        )
-
-        item = payload['items'][0]
-        self.assertEqual((item['market'], item['exchange'], item['currency']), ('KRX', 'KRX', 'KRW'))
+    def test_v2_krx_dispatch_is_rejected_at_the_v4_boundary(self) -> None:
+        with self.assertRaises(ValueError):
+            serialize_execution_plan_dispatch_payload(
+                self._dispatch_payload(schema_version=LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION, item={})
+            )
 
     def test_v3_us_dispatch_rejects_missing_routing_fields(self) -> None:
-        with self.assertRaisesRegex(ValueError, 'missing routing fields'):
+        with self.assertRaises(ValueError):
             serialize_execution_plan_dispatch_payload(
                 self._dispatch_payload(
                     schema_version=EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
@@ -352,6 +666,7 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                 'items': [
                     {
                         'core_item_key': 'core-plan-81:next_open_buy',
+                        'source_plan_item_id': 'core-plan-81:next_open_buy',
                         'agent_name': 'signal-decider',
                         'decision_agent_name': 'signal-decider',
                         'symbol': '005930',
@@ -360,6 +675,8 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                         'exchange': 'KRX',
                         'currency': 'KRW',
                         'broker': 'kis',
+                        'provider': 'kis',
+                        'venue': 'kis',
                         'session_policy': {'session': 'regular', 'timezone': 'Asia/Seoul', 'allow_extended_hours': False},
                         'side': 'buy',
                         'intent': 'next_open_buy',
@@ -376,6 +693,7 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                     },
                     {
                         'core_item_key': 'core-plan-81:target_sell',
+                        'source_plan_item_id': 'core-plan-81:target_sell',
                         'agent_name': 'signal-decider',
                         'decision_agent_name': 'signal-decider',
                         'symbol': '005930',
@@ -384,6 +702,8 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                         'exchange': 'KRX',
                         'currency': 'KRW',
                         'broker': 'kis',
+                        'provider': 'kis',
+                        'venue': 'kis',
                         'session_policy': {'session': 'regular', 'timezone': 'Asia/Seoul', 'allow_extended_hours': False},
                         'side': 'sell',
                         'intent': 'target_sell',
@@ -399,6 +719,7 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                     },
                     {
                         'core_item_key': 'core-plan-81:stop_sell',
+                        'source_plan_item_id': 'core-plan-81:stop_sell',
                         'agent_name': 'signal-decider',
                         'decision_agent_name': 'signal-decider',
                         'symbol': '005930',
@@ -407,6 +728,8 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                         'exchange': 'KRX',
                         'currency': 'KRW',
                         'broker': 'kis',
+                        'provider': 'kis',
+                        'venue': 'kis',
                         'session_policy': {'session': 'regular', 'timezone': 'Asia/Seoul', 'allow_extended_hours': False},
                         'side': 'sell',
                         'intent': 'stop_sell',
@@ -423,9 +746,16 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                 ],
                 'metadata': {
                     'schema_version': EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+                    'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                    'required_capability': EXECUTION_HANDOFF_CAPABILITY,
                     'agent_name': 'signal-decider',
                     'decision_agent_name': 'signal-decider',
+                    'trigger': 'test',
+                    'requested_at': '2026-04-30T00:00:00+00:00',
+                    'source_market_date': '2026-04-29',
                     'target_trade_date': '2026-04-30',
+                    'dispatch_batch_type': 'initial',
+                    'dispatch_batch_key': None,
                 },
             }
         )

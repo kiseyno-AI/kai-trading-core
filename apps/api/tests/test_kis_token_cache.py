@@ -769,6 +769,117 @@ def test_token_cache_v1_has_stable_interop_identity_and_json_contract(tmp_path) 
     }
 
 
+@pytest.mark.parametrize('save_kind', ('token', 'issuance_attempt', 'failure'))
+def test_shared_cache_public_writes_reject_naive_datetimes(tmp_path, save_kind: str) -> None:
+    store = _store(tmp_path / 'cache')
+    naive_now = datetime.now()
+    if save_kind == 'token':
+        operation = lambda: store.save_token(
+            access_token='naive-cache-token',
+            token_type='Bearer',
+            issued_at=naive_now,
+            expires_at=naive_now + timedelta(hours=1),
+            refresh_after=naive_now + timedelta(minutes=30),
+        )
+    elif save_kind == 'issuance_attempt':
+        operation = lambda: store.save_issuance_attempt(
+            started_at=naive_now,
+            cooldown_until=naive_now + timedelta(seconds=90),
+            invalidates_generation=None,
+        )
+    else:
+        operation = lambda: store.save_failure(
+            error_kind='transport',
+            status_code=503,
+            retryable=True,
+            failed_at=naive_now,
+            cooldown_until=naive_now + timedelta(seconds=60),
+        )
+
+    with pytest.raises(KISTokenCacheError, match='timezone-aware'):
+        operation()
+
+
+@pytest.mark.parametrize(
+    'record_type',
+    ('token', 'revocation', 'issuance_attempt', 'failure', 'issuance_success'),
+)
+@pytest.mark.parametrize('mutation', ('extra', 'missing', 'unknown_record_type'))
+def test_shared_cache_records_require_exact_record_type_shape(
+    tmp_path,
+    record_type: str,
+    mutation: str,
+) -> None:
+    store = _store(tmp_path / 'cache')
+    now = datetime.now(timezone.utc)
+    if record_type in {'token', 'revocation'}:
+        record = store.save_token(
+            access_token='strict-schema-token',
+            token_type='Bearer',
+            issued_at=now,
+            expires_at=now + timedelta(hours=1),
+            refresh_after=now + timedelta(minutes=30),
+        )
+        if record_type == 'revocation':
+            assert asyncio.run(
+                store.invalidate_if_matches(
+                    access_token=record.access_token,
+                    generation=record.generation,
+                    minimum_issue_interval_seconds=60,
+                )
+            )
+        path = store.token_path
+        load = store.load_cache_state
+    elif record_type == 'issuance_attempt':
+        store.save_issuance_attempt(
+            started_at=now,
+            cooldown_until=now + timedelta(seconds=90),
+            invalidates_generation=None,
+        )
+        path = store.failure_path
+        load = lambda: store.load_failure(include_expired=True)
+    elif record_type == 'failure':
+        store.save_failure(
+            error_kind='transport',
+            status_code=503,
+            retryable=True,
+            failed_at=now,
+            cooldown_until=now + timedelta(seconds=60),
+        )
+        path = store.failure_path
+        load = lambda: store.load_failure(include_expired=True)
+    else:
+        store.save_token_after_issuance(
+            access_token='strict-success-token',
+            token_type='Bearer',
+            issued_at=now,
+            expires_at=now + timedelta(hours=1),
+            refresh_after=now + timedelta(minutes=30),
+            minimum_issue_interval_seconds=60,
+        )
+        path = store.failure_path
+        load = lambda: store.load_failure(include_expired=True)
+
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    if mutation == 'extra':
+        payload['unexpected'] = 'schema drift'
+    elif mutation == 'missing':
+        required_field = {
+            'token': 'access_token',
+            'revocation': 'revoked_generation',
+            'issuance_attempt': 'attempt_id',
+            'failure': 'error_kind',
+            'issuance_success': 'generation',
+        }[record_type]
+        payload.pop(required_field)
+    else:
+        payload['record_type'] = 'unknown'
+    path.write_text(json.dumps(payload), encoding='utf-8')
+
+    with pytest.raises(KISTokenCacheError):
+        load()
+
+
 def test_token_success_payload_rejects_noncanonical_values_and_shares_cooldown(tmp_path) -> None:
     invalid_payloads = [
         {'access_token': 'token', 'token_type': 'Bearer', 'expires_in': float('inf')},
@@ -1079,8 +1190,8 @@ def test_unsafe_or_corrupt_token_cache_files_fail_closed(tmp_path) -> None:
         assert call_count == 0, case
 
 
-def test_existing_private_token_file_accepts_unknown_optional_fields(tmp_path) -> None:
-    async def exercise() -> tuple[dict, int]:
+def test_existing_private_token_file_rejects_unknown_optional_fields(tmp_path) -> None:
+    async def exercise() -> tuple[object, int]:
         cache_directory = tmp_path / 'cache'
         store = KISTokenCacheStore(
             directory=str(cache_directory),
@@ -1116,13 +1227,15 @@ def test_existing_private_token_file_accepts_unknown_optional_fields(tmp_path) -
             patch.dict(settings.__dict__, overrides, clear=False),
             patch('app.brokers.kis.client.request_with_audit', side_effect=fake_request),
         ):
-            result = await KISClient(use_mock=False).issue_access_token()
-        return result, call_count
+            result = await asyncio.gather(
+                KISClient(use_mock=False).issue_access_token(),
+                return_exceptions=True,
+            )
+        return result[0], call_count
 
     result, call_count = asyncio.run(exercise())
 
-    assert result['access_token'] == 'safe-existing-token'
-    assert result['cached'] is True
+    assert isinstance(result, KISConfigurationError)
     assert call_count == 0
 
 
@@ -2233,7 +2346,7 @@ def test_order_post_401_invalidates_token_without_retransmission(tmp_path) -> No
     assert tombstone['record_type'] == 'revocation'
 
 
-def test_token_cas_prefers_token_bytes_and_uses_generation_only_as_fallback(tmp_path) -> None:
+def test_token_cas_requires_every_supplied_comparator_and_allows_single_fallbacks(tmp_path) -> None:
     async def exercise() -> tuple[bool, bool, bool, str]:
         store = _store(tmp_path / 'cache')
         now = datetime.now(timezone.utc) - timedelta(minutes=10)
@@ -2284,7 +2397,7 @@ def test_token_cas_prefers_token_bytes_and_uses_generation_only_as_fallback(tmp_
 
     result = asyncio.run(exercise())
 
-    assert result == (True, True, True, 'CachedKISTokenRevocation')
+    assert result == (False, True, True, 'CachedKISTokenRevocation')
 
 
 def test_egw00123_invalidates_exact_token_without_retrying_get_or_post(tmp_path) -> None:

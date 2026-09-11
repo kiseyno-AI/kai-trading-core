@@ -11,7 +11,10 @@ Returns a compact market-condition payload for the dashboard card from Core’s 
 Runtime requirements:
 - KIS reads resolve to the real domain by default through `MARKET_SNAPSHOT_KIS_USE_REAL=true`, because the selected KIS index and investor-flow APIs are real-domain only
 - required secrets: `KIS_APP_KEY`, `KIS_APP_SECRET`, `KOREAEXIM_API_KEY`
-- cache refresh cadence is controlled by `MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS` (default `3600`)
+- the full snapshot/optional-leg cadence is controlled by `MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS` (default `3600`)
+- while the provider-reported market clock is between `09:00:00` and `14:30:59` KST, the index leg is refreshed in independently claimed buckets controlled by `MARKET_SNAPSHOT_OPEN_DRIVE_REFRESH_INTERVAL_SECONDS` (default `300`)
+- `MARKET_SNAPSHOT_OPEN_DRIVE_MAX_AGE_SECONDS` (default `360`) is the maximum provider-observation age accepted by the open-drive decision path; the refresh interval cannot exceed it
+- a timed-out background refresh remains single-flight and shielded from cancellation. A later successful completion clears its timeout cooldown instead of allowing a duplicate provider request
 - `GET /broker/kis/health` exposes `market_snapshot_runtime` for readiness/debugging
 
 Degradation behavior:
@@ -22,6 +25,7 @@ Degradation behavior:
 - when a prior USD/KRW fetch succeeded, Core reuses the latest durable USD/KRW snapshot from `current_fx_rate_snapshots` and marks the FX leg stale instead of failing the whole snapshot
 - when no cached USD/KRW value exists, the snapshot becomes partial and `missing_fields` includes the missing FX fields
 - `freshness` reports the current cache cadence, last refresh attempt/success timestamps, next due time, and whether the last refresh was `success`, `degraded`, or `error`
+- each market row binds its value to `provider_business_date`, `provider_session_time`, and timezone-aware `provider_observed_at`; `index_leg.status: "ready"` also requires a matching KIS intraday-bar observation and receipt-time freshness proof
 - `trading_value` keeps KIS `acml_tr_pbmn` semantics and is paired with `trading_value_unit: "million_krw"`
 - `foreign_net_value` and `institution_net_value` are normalized from KIS `*_tr_pbmn` fields into raw KRW and are paired with `investor_flow_value_unit: "krw"`
 
@@ -50,6 +54,8 @@ GET /market/snapshot
       "volume": 305715,
       "trading_value": 4736153,
       "trading_value_unit": "million_krw",
+      "prior_trading_value": 18944612,
+      "prior_trading_value_unit": "million_krw",
       "advancers": 512,
       "unchanged": 94,
       "decliners": 330,
@@ -57,7 +63,21 @@ GET /market/snapshot
       "foreign_net_value": -1455933000000,
       "institution_net_quantity": 720,
       "institution_net_value": 283792000000,
-      "investor_flow_value_unit": "krw"
+      "investor_flow_value_unit": "krw",
+      "provider_business_date": "2026-04-30",
+      "provider_session_time": "13:15:00",
+      "provider_observed_at": "2026-04-30T13:15:00+09:00",
+      "index_leg": {
+        "status": "ready",
+        "observation_source": "kis_index_intraday_bar",
+        "collected_at": "2026-04-30T13:15:02+09:00",
+        "current_before_collected_at": "2026-04-30T13:15:01+09:00",
+        "current_after_collected_at": "2026-04-30T13:15:02+09:00",
+        "provider_observed_at": "2026-04-30T13:15:00+09:00",
+        "observation_age_seconds": 2.0,
+        "observation_payload_match": true,
+        "error": null
+      }
     },
     "kosdaq": {
       "label": "KOSDAQ",
@@ -71,6 +91,8 @@ GET /market/snapshot
       "volume": 1312496,
       "trading_value": 11507962,
       "trading_value_unit": "million_krw",
+      "prior_trading_value": 10372910,
+      "prior_trading_value_unit": "million_krw",
       "advancers": 828,
       "unchanged": 94,
       "decliners": 716,
@@ -78,7 +100,21 @@ GET /market/snapshot
       "foreign_net_value": -211205000000,
       "institution_net_quantity": -4738,
       "institution_net_value": -304502000000,
-      "investor_flow_value_unit": "krw"
+      "investor_flow_value_unit": "krw",
+      "provider_business_date": "2026-04-30",
+      "provider_session_time": "13:15:00",
+      "provider_observed_at": "2026-04-30T13:15:00+09:00",
+      "index_leg": {
+        "status": "ready",
+        "observation_source": "kis_index_intraday_bar",
+        "collected_at": "2026-04-30T13:15:03+09:00",
+        "current_before_collected_at": "2026-04-30T13:15:02+09:00",
+        "current_after_collected_at": "2026-04-30T13:15:03+09:00",
+        "provider_observed_at": "2026-04-30T13:15:00+09:00",
+        "observation_age_seconds": 3.0,
+        "observation_payload_match": true,
+        "error": null
+      }
     }
   },
   "usd_krw": {

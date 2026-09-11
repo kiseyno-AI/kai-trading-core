@@ -1,25 +1,30 @@
 import asyncio
-from datetime import date, datetime, timezone
+import copy
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event, select
 
 from app.agent_context.decider_replay_service import DeciderReplayCostAssumptions, DeciderReplayRepository
 from app.core.settings import settings
 from app.db import engine, session_scope
 from app.db_models import (
     AgentContextFeedback,
+    AgentContextFeedbackRun,
     BrokerOrder,
+    CurrentMarketSnapshotCache,
     OrderRequest,
     SignalDeciderActualExecutionOutcome,
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
     Symbol,
 )
+from app.market.clock import MarketState
 from app.market.session import (
     KisKrxTradingCalendarProvider,
     reset_krx_calendar_provider,
@@ -33,7 +38,28 @@ from app.orders.exec_integration import (
     EXEC_INTENT_TARGET_SELL,
     SignalDeciderExecClientError,
     SignalDeciderExecIntegrationService,
+    SignalDeciderExecPayloadContractError,
     _build_market_regime_sizing_policy,
+    _collect_items,
+    _delegated_gate_contract_error,
+    _delegated_gate_codes,
+    _delegated_gate_observed_at,
+    _delegated_gates,
+    _fingerprint_exec_plan,
+    _json_safe,
+    _row_readback_revision_binding,
+    _row_dispatch_revision_fingerprint,
+    _row_has_accepted_exec_dispatch,
+)
+from app.orders.execution_handoff_contract import (
+    EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
+    EXECUTION_HANDOFF_CAPABILITY,
+    EXECUTION_HANDOFF_CONTRACT_VERSION,
+    EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+    EXECUTION_REVOCATION_CAPABILITY,
+    EXECUTION_REVOCATION_SCHEMA_VERSION,
+    serialize_execution_plan_dispatch_payload,
+    validate_execution_plan_dispatch_ack,
 )
 from app.orders.exec_payload_slimming import (
     SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES,
@@ -44,14 +70,33 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
+    NextOpenAccountTarget,
+    _next_open_policy_fingerprint,
     _short_term_entry_quality_blocks,
     signal_decider_next_open_execution_service,
 )
 
 
 class FakeExecClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        bearer_token: str | None = None,
+    ) -> None:
+        self.base_url = (
+            settings.signal_decider_exec_base_url
+            if base_url is None
+            else base_url
+        )
+        self.bearer_token = (
+            settings.signal_decider_exec_bearer_token
+            if bearer_token is None
+            else bearer_token
+        )
         self.post_calls: list[dict] = []
+        self.revocation_calls: list[dict] = []
+        self.dispatch_events: list[str] = []
         self.runtime_calls = 0
         self.plan_calls: list[dict] = []
         self.order_calls: list[dict] = []
@@ -62,6 +107,8 @@ class FakeExecClient:
         self.order_response: dict = {'items': []}
         self.execution_response: dict = {'items': []}
         self.position_response: dict = {'items': []}
+        self.execution_plan_id_override: str | None = None
+        self.execution_plan_id_by_item_binding: dict[tuple[str, str], str] = {}
         self.agent_approved_quantities_by_agent: dict[str, str] = {}
         self.agent_approved_quantities_by_core_key: dict[str, str] = {}
         self.agent_sizing_payloads_by_agent: dict[str, dict] = {}
@@ -72,15 +119,23 @@ class FakeExecClient:
         return self.runtime_response
 
     async def post_execution_plan(self, payload: dict) -> dict:
+        self.dispatch_events.append('plan')
         self.post_calls.append(payload)
+        execution_plan_id = self.execution_plan_id_override or payload['plan_id']
         items = []
         for index, item in enumerate(payload['items'], start=1):
             response_item = {
                 'core_item_key': item['core_item_key'],
-                'execution_plan_id': payload['plan_id'],
+                'execution_plan_id': execution_plan_id,
                 'execution_plan_item_id': f'exec-item-{index}',
                 'status': 'accepted',
             }
+            self.execution_plan_id_by_item_binding[
+                (
+                    response_item['core_item_key'],
+                    response_item['execution_plan_item_id'],
+                )
+            ] = execution_plan_id
             if (
                 item.get('intent') in EXEC_ENTRY_BUY_INTENTS
                 and (item.get('quantity_policy') or {}).get('type') == 'exec_agent_sized'
@@ -102,9 +157,72 @@ class FakeExecClient:
                     }
             items.append(response_item)
         return {
+            'plan_id': payload['plan_id'],
+            'execution_plan_id': execution_plan_id,
+            'contract_ack': {
+                'schema_version': EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_HANDOFF_CAPABILITY,
+                'plan_id': payload['plan_id'],
+                'status': 'accepted',
+                'dispatch_material_fingerprint': payload['metadata'][
+                    'dispatch_material_fingerprint'
+                ],
+            },
             'accepted_item_count': len(items),
             'rejected_item_count': 0,
-            'items': items,
+            'item_acks': items,
+        }
+
+    async def post_execution_plan_revocation(self, payload: dict) -> dict:
+        self.dispatch_events.append('revocation')
+        self.revocation_calls.append(payload)
+        fallback_execution_plan_id = (
+            payload['plan_id']
+            if all(
+                str(item.get('execution_plan_item_id') or '').startswith('exec-item-')
+                for item in payload['items']
+            )
+            else 'exec-old-plan'
+        )
+        execution_plan_ids = {
+            self.execution_plan_id_by_item_binding.get(
+                (
+                    str(item.get('core_item_key') or ''),
+                    str(item.get('execution_plan_item_id') or ''),
+                ),
+                fallback_execution_plan_id,
+            )
+            for item in payload['items']
+        }
+        execution_plan_id = (
+            next(iter(execution_plan_ids))
+            if len(execution_plan_ids) == 1
+            else 'exec-old-plan'
+        )
+        return {
+            'plan_id': payload['plan_id'],
+            'execution_plan_id': execution_plan_id,
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': payload['plan_id'],
+                'status': 'revoked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': item['core_item_key'],
+                    'status': 'revoked',
+                    'execution_plan_id': execution_plan_id,
+                    'execution_plan_item_id': item['execution_plan_item_id'],
+                }
+                for item in payload['items']
+            ],
+            'reason_code': payload['reason_code'],
+            'revoked_item_count': len(payload['items']),
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
         }
 
     async def list_execution_plans(self, *, external_plan_id: str | None = None) -> dict:
@@ -119,9 +237,367 @@ class FakeExecClient:
         self.execution_calls.append({'external_plan_id': external_plan_id, 'symbols': symbols})
         return self.execution_response
 
-    async def list_positions(self, *, symbols=None) -> dict:
-        self.position_calls.append({'symbols': symbols})
-        return self.position_response
+    async def list_positions(
+        self,
+        *,
+        external_plan_id: str,
+        execution_plan_id: str,
+        symbols=None,
+    ) -> dict:
+        self.position_calls.append(
+            {
+                'external_plan_id': external_plan_id,
+                'execution_plan_id': execution_plan_id,
+                'symbols': symbols,
+            }
+        )
+        payload = copy.deepcopy(self.position_response)
+        items = _collect_items(payload)
+        for item in items:
+            item.setdefault('provider', 'kis')
+            item.setdefault('account_scope', 'a' * 24)
+            item.setdefault('exchange', 'KRX')
+            item.setdefault(
+                'position_scope_proof',
+                {
+                    'schema_version': 'execution_position_plan_scope_v1',
+                    'plan_id': external_plan_id,
+                    'execution_plan_id': execution_plan_id,
+                    'provider': item['provider'],
+                    'account_scope': item['account_scope'],
+                    'exchange': item['exchange'],
+                },
+            )
+        return {**payload, 'items': items}
+
+
+def test_exec_payload_json_normalization_removes_nonfinite_values() -> None:
+    normalized = _json_safe(
+        {
+            'decimal_nan': Decimal('NaN'),
+            'decimal_infinity': Decimal('Infinity'),
+            'float_nan': float('nan'),
+            'float_infinity': float('inf'),
+        }
+    )
+
+    assert normalized == {
+        'decimal_nan': None,
+        'decimal_infinity': None,
+        'float_nan': None,
+        'float_infinity': None,
+    }
+    json.dumps(normalized, allow_nan=False)
+
+
+def test_v4_dispatch_contract_requires_exact_schema_and_capability() -> None:
+    payload = {
+        'plan_id': 'core-contract-test',
+        'source': 'kai-trading-core',
+        'mode': 'mock',
+        'market_date': '2026-09-10',
+        'strategy_run_id': 'run-1',
+        'requested_at': '2026-09-09T12:00:00+00:00',
+        'items': [
+            {
+                'core_item_key': 'core-plan-1:next_open_buy',
+                'source_plan_item_id': 'core-plan-1:next_open_buy',
+                'agent_name': 'signal-decider',
+                'decision_agent_name': 'signal-decider',
+                'symbol': '005930',
+                'asset_class': 'stock',
+                'market': 'KRX',
+                'exchange': 'KRX',
+                'currency': 'KRW',
+                'broker': 'kis',
+                'provider': 'kis',
+                'venue': 'kis',
+                'session_policy': {
+                    'session': 'regular',
+                    'timezone': 'Asia/Seoul',
+                    'allow_extended_hours': False,
+                },
+                'side': 'buy',
+                'intent': 'next_open_buy',
+                'quantity_policy': {'type': 'exec_agent_sized'},
+                'limit_price': None,
+                'trigger_price': None,
+                'time_in_force': 'day',
+                'risk_context': {},
+                'decision_snapshot_id': '101',
+            }
+        ],
+        'metadata': {
+            'schema_version': EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+            'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+            'required_capability': EXECUTION_HANDOFF_CAPABILITY,
+            'agent_name': 'signal-decider',
+            'decision_agent_name': 'signal-decider',
+            'trigger': 'test',
+            'requested_at': '2026-09-09T12:00:00+00:00',
+            'account_reference': 'KIS:00000000-00',
+            'account_label': 'TEST',
+            'source_market_date': '2026-09-09',
+            'target_trade_date': '2026-09-10',
+            'dispatch_batch_type': 'initial',
+            'dispatch_batch_key': None,
+        },
+    }
+    entry = payload['items'][0]
+    for intent, trigger_price in (('target_sell', 54000), ('stop_sell', 47000)):
+        payload['items'].append(
+            {
+                **entry,
+                'core_item_key': f'core-plan-1:{intent}',
+                'source_plan_item_id': f'core-plan-1:{intent}',
+                'side': 'sell',
+                'intent': intent,
+                'quantity_policy': {
+                    'type': 'position_exit_from_entry',
+                    'linked_entry_item_key': entry['core_item_key'],
+                },
+                'trigger_price': trigger_price,
+            }
+        )
+
+    serialized = serialize_execution_plan_dispatch_payload(payload)
+    assert {
+        **serialized,
+        'metadata': {
+            **serialized['metadata'],
+            'dispatch_material_fingerprint': None,
+        },
+    } == {
+        **payload,
+        'metadata': {
+            **payload['metadata'],
+            'dispatch_material_fingerprint': None,
+        },
+    }
+    assert len(serialized['metadata']['dispatch_material_fingerprint']) == 64
+    assert set(serialized['metadata']['dispatch_material_fingerprint']) <= set(
+        '0123456789abcdef'
+    )
+    unsupported_us = json.loads(json.dumps(payload))
+    for item in unsupported_us['items']:
+        item.update(
+            {
+                'symbol': 'AAPL',
+                'asset_class': 'us_equity',
+                'market': 'US',
+                'exchange': 'NASD',
+                'currency': 'USD',
+                'session_policy': {
+                    'session': 'regular',
+                    'timezone': 'America/New_York',
+                    'allow_extended_hours': False,
+                    'whole_shares_only': True,
+                },
+            }
+        )
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        'currently supports KIS/KRX/KRW only',
+    ):
+        serialize_execution_plan_dispatch_payload(unsupported_us)
+    missing_protection = json.loads(json.dumps(payload))
+    missing_protection['items'] = missing_protection['items'][:1]
+    with unittest.TestCase().assertRaises(ValueError):
+        serialize_execution_plan_dispatch_payload(missing_protection)
+    for field, value in (
+        ('schema_version', 'signal_decider_exec_plan_v3'),
+        ('contract_version', 'execution_handoff_contract_v3'),
+        ('required_capability', 'legacy'),
+    ):
+        malformed = json.loads(json.dumps(payload))
+        malformed['metadata'][field] = value
+        with unittest.TestCase().assertRaises(ValueError):
+            serialize_execution_plan_dispatch_payload(malformed)
+
+
+def test_v4_dispatch_ack_requires_exact_one_to_one_items_and_durable_ids() -> None:
+    keys = ['core-plan-1:next_open_buy', 'core-plan-1:target_sell']
+    dispatch_material_fingerprint = 'a' * 64
+    valid = {
+        'plan_id': 'plan-1',
+        'execution_plan_id': 'exec-plan-1',
+        'accepted_item_count': 2,
+        'rejected_item_count': 0,
+        'contract_ack': {
+            'schema_version': EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
+            'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+            'capability': EXECUTION_HANDOFF_CAPABILITY,
+            'plan_id': 'plan-1',
+            'status': 'accepted',
+            'dispatch_material_fingerprint': dispatch_material_fingerprint,
+        },
+        'item_acks': [
+            {
+                'core_item_key': key,
+                'status': 'accepted',
+                'execution_plan_id': 'exec-plan-1',
+                'execution_plan_item_id': f'exec-item-{index}',
+            }
+            for index, key in enumerate(keys, start=1)
+        ],
+    }
+    assert set(
+        validate_execution_plan_dispatch_ack(
+            valid,
+            plan_id='plan-1',
+            submitted_core_item_keys=keys,
+            expected_dispatch_material_fingerprint=dispatch_material_fingerprint,
+        )
+    ) == set(keys)
+
+    malformed_variants = [
+        {},
+        {**valid, 'contract_ack': {**valid['contract_ack'], 'contract_version': 'v3'}},
+        {**valid, 'item_acks': valid['item_acks'][:1]},
+        {**valid, 'item_acks': [valid['item_acks'][0], valid['item_acks'][0]]},
+        {
+            **valid,
+            'item_acks': [
+                {**item, 'execution_plan_item_id': 'exec-item-duplicate'}
+                for item in valid['item_acks']
+            ],
+        },
+        {
+            **valid,
+            'item_acks': [
+                {**item, 'execution_plan_item_id': None}
+                for item in valid['item_acks']
+            ],
+        },
+        {
+            **valid,
+            'contract_ack': {**valid['contract_ack'], 'status': 'partial'},
+            'accepted_item_count': 1,
+            'rejected_item_count': 1,
+            'item_acks': [
+                valid['item_acks'][0],
+                {
+                    **valid['item_acks'][1],
+                    'status': 'rejected',
+                    'execution_plan_id': None,
+                    'execution_plan_item_id': None,
+                    'reason_code': 'invalid_item',
+                },
+            ],
+        },
+        {key: value for key, value in valid.items() if key != 'accepted_item_count'},
+    ]
+    for malformed in malformed_variants:
+        with unittest.TestCase().assertRaises(ValueError):
+            validate_execution_plan_dispatch_ack(
+                malformed,
+                plan_id='plan-1',
+                submitted_core_item_keys=keys,
+                expected_dispatch_material_fingerprint=dispatch_material_fingerprint,
+            )
+
+
+def test_exec_payload_delegation_codes_are_allowlisted() -> None:
+    validation = {
+        'warnings': [
+            {'code': 'short_term_liquidity_floor_block_delegated_to_exec_watch'},
+            {'code': 'short_term_reward_risk_ratio_block_delegated_to_exec_watch'},
+            {'code': 'transaction_cost_evidence_pending_live_delegated_to_exec_watch'},
+            {'code': 'short_term_buy_quality_score_block_delegated_to_exec_watch'},
+        ]
+    }
+
+    assert _delegated_gate_codes(
+        validation,
+        decision_agent_name='short-term-decider',
+    ) == [
+        'short_term_liquidity_floor_block_delegated_to_exec_watch',
+        'short_term_reward_risk_ratio_block_delegated_to_exec_watch',
+    ]
+    assert _delegated_gate_codes(
+        validation,
+        decision_agent_name='signal-decider',
+    ) == [
+        'transaction_cost_evidence_pending_live_delegated_to_exec_watch',
+    ]
+
+
+def test_delegated_gates_reject_naive_future_and_expired_observation_windows() -> None:
+    now = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+    row = SimpleNamespace(target_trade_date=date(2026, 4, 30))
+    validation = {
+        'short_term_entry_quality': {
+            'raw_trading_value_krw': 2_500_000_000,
+        }
+    }
+    code = 'short_term_liquidity_floor_block_delegated_to_exec_watch'
+
+    assert _delegated_gate_observed_at(
+        SimpleNamespace(feedback_received_at=datetime(2026, 4, 29, 15, 0))
+    ) is None
+    for observed_at, evaluated_at in (
+        (now + timedelta(seconds=1), now),
+        (now - timedelta(days=1), datetime(2026, 4, 30, 6, 30, tzinfo=timezone.utc)),
+        (None, now),
+    ):
+        assert _delegated_gates(
+            row=row,
+            snapshot=SimpleNamespace(feedback_received_at=observed_at),
+            validation=validation,
+            codes=[code],
+            now=evaluated_at,
+        ) == []
+
+
+def test_delegated_gate_contract_requires_exact_allowlisted_nine_field_binding() -> None:
+    now = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+    code = 'short_term_liquidity_floor_block_delegated_to_exec_watch'
+    gates = _delegated_gates(
+        row=SimpleNamespace(target_trade_date=date(2026, 4, 30)),
+        snapshot=SimpleNamespace(
+            feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc)
+        ),
+        validation={
+            'short_term_entry_quality': {
+                'raw_trading_value_krw': 2_500_000_000,
+            }
+        },
+        codes=[code],
+        now=now,
+    )
+
+    assert _delegated_gate_contract_error(
+        decision_agent_name='short-term-decider',
+        codes=[code],
+        confirmation_required=True,
+        gates=gates,
+        now=now,
+    ) is None
+    malformed_variants = (
+        {'codes': [code], 'confirmation_required': True, 'gates': []},
+        {'codes': [], 'confirmation_required': True, 'gates': gates},
+        {
+            'codes': [code],
+            'confirmation_required': True,
+            'gates': [{key: value for key, value in gates[0].items() if key != 'expires_at'}],
+        },
+        {
+            'codes': [code],
+            'confirmation_required': True,
+            'gates': [{**gates[0], 'unexpected': 'authority'}],
+        },
+        {
+            'codes': ['short_term_buy_quality_score_block_delegated_to_exec_watch'],
+            'confirmation_required': True,
+            'gates': [{**gates[0], 'code': 'short_term_buy_quality_score_block_delegated_to_exec_watch'}],
+        },
+    )
+    for variant in malformed_variants:
+        assert _delegated_gate_contract_error(
+            decision_agent_name='short-term-decider',
+            now=now,
+            **variant,
+        ) is not None
 
 
 class FailingRuntimeExecClient(FakeExecClient):
@@ -139,14 +615,26 @@ def _accepted_plan_readback_for_payload(payload: dict) -> dict:
         'items': [
             {
                 'external_plan_id': payload['plan_id'],
+                'plan_id': payload['plan_id'],
+                'execution_plan_id': payload['plan_id'],
                 'status': 'accepted',
-                'items': [
+                'accepted_item_count': len(payload['items']),
+                'rejected_item_count': 0,
+                'contract_ack': {
+                    'schema_version': EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
+                    'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                    'capability': EXECUTION_HANDOFF_CAPABILITY,
+                    'plan_id': payload['plan_id'],
+                    'status': 'accepted',
+                    'dispatch_material_fingerprint': payload['metadata'][
+                        'dispatch_material_fingerprint'
+                    ],
+                },
+                'item_acks': [
                     {
                         'core_item_key': item['core_item_key'],
                         'execution_plan_id': payload['plan_id'],
                         'execution_plan_item_id': f"exec-item-{index}",
-                        'symbol': item['symbol'],
-                        'intent': item['intent'],
                         'status': 'accepted',
                     }
                     for index, item in enumerate(payload['items'], start=1)
@@ -266,7 +754,7 @@ class MarketRegimeSizingPolicyTests(unittest.TestCase):
                 self.assertEqual(policy['quantity_multiplier'], 1)
                 self.assertEqual(policy['raw_quantity_multiplier'], 1)
 
-    def test_caps_aggressive_multiplier_and_carries_window_and_gate_requirements(self) -> None:
+    def test_uncalibrated_aggressive_context_cannot_enable_live_upsize(self) -> None:
         policy = _build_market_regime_sizing_policy(
             {
                 'schema_version': 'market_regime_context_v1',
@@ -275,6 +763,7 @@ class MarketRegimeSizingPolicyTests(unittest.TestCase):
                 'regime_reasons': ['breadth_strong', 'early_continuation_confirmed'],
                 'quantity_multiplier': 3.5,
                 'entry_priority_boost': True,
+                'live_upsize_status': 'shadow_only_uncalibrated',
                 'valid_until': '2026-04-30T09:20:00+09:00',
                 'sizing_window': {
                     'name': 'aggressive_open',
@@ -289,12 +778,15 @@ class MarketRegimeSizingPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(policy['market_regime'], 'aggressive_open')
-        self.assertEqual(policy['quantity_multiplier'], 2)
+        self.assertEqual(policy['quantity_multiplier'], 1)
         self.assertEqual(policy['raw_quantity_multiplier'], 3.5)
-        self.assertEqual(policy['quantity_multiplier_cap'], 2)
+        self.assertEqual(policy['quantity_multiplier_cap'], 1)
         self.assertEqual(policy['valid_until'], '2026-04-30T09:20:00+09:00')
         self.assertEqual(policy['sizing_window']['valid_from'], '2026-04-30T09:00:00+09:00')
-        self.assertTrue(policy['entry_priority_boost'])
+        self.assertEqual(policy['sizing_window']['quantity_multiplier_cap'], 1)
+        self.assertFalse(policy['sizing_window']['entry_priority_boost'])
+        self.assertFalse(policy['entry_priority_boost'])
+        self.assertEqual(policy['live_upsize_status'], 'shadow_only_uncalibrated')
         self.assertTrue(policy['exec_must_enforce_window'])
         self.assertFalse(policy['core_bypasses_safety_gates'])
         self.assertEqual(
@@ -501,6 +993,259 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_execution_identity_accepts_exact_broker_id_when_order_has_internal_id(self) -> None:
+        executions, mismatches = self.service._match_remote_executions(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[{'exec_plan_item_id': 'exec-item-1'}],
+            orders=[
+                {
+                    'id': 'internal-order-row-1',
+                    'broker_order_id': 'broker-order-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': '005930',
+                }
+            ],
+            executions=[
+                {
+                    'id': 'execution-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'broker_order_id': 'broker-order-1',
+                    'symbol': '005930',
+                }
+            ],
+        )
+
+        self.assertEqual([item['id'] for item in executions], ['execution-1'])
+        self.assertEqual(mismatches, [])
+
+    def test_execution_identity_accepts_exec_serializer_broker_order_pk_link(self) -> None:
+        executions, mismatches = self.service._match_remote_executions(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'core_item_key': 'core-item-1',
+                    'exec_plan_item_id': 'exec-item-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+            orders=[
+                {
+                    'broker_order_pk': 'internal-order-row-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'broker_order_id': 'broker-order-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                    'source_identity': {
+                        'source_plan_item_id': 'core-item-1',
+                        'core_plan_item_id': 'core-item-1',
+                    },
+                }
+            ],
+            executions=[
+                {
+                    'execution_fill_id': 'execution-1',
+                    'broker_order_pk': 'internal-order-row-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                    'source_identity': {
+                        'source_plan_item_id': 'core-item-1',
+                        'core_plan_item_id': 'core-item-1',
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(
+            [item['execution_fill_id'] for item in executions],
+            ['execution-1'],
+        )
+        self.assertEqual(mismatches, [])
+
+    def test_execution_identity_rejects_conflicting_plan_item_aliases(self) -> None:
+        executions, mismatches = self.service._match_remote_executions(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'exec_plan_item_id': 'exec-item-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+            orders=[
+                {
+                    'broker_order_pk': 'internal-order-row-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+            executions=[
+                {
+                    'execution_fill_id': 'execution-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'plan_item_id': 'foreign-exec-item',
+                    'broker_order_pk': 'internal-order-row-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+        )
+
+        self.assertEqual(executions, [])
+        self.assertEqual(len(mismatches), 1)
+
+    def test_execution_identity_rejects_order_ids_resolving_to_different_orders(
+        self,
+    ) -> None:
+        executions, mismatches = self.service._match_remote_executions(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'exec_plan_item_id': 'exec-item-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                },
+                {
+                    'exec_plan_item_id': 'exec-item-2',
+                    'symbol': '005930',
+                    'side': 'buy',
+                },
+            ],
+            orders=[
+                {
+                    'broker_order_pk': 'internal-order-row-1',
+                    'broker_order_id': 'broker-order-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                },
+                {
+                    'broker_order_pk': 'internal-order-row-2',
+                    'broker_order_id': 'broker-order-2',
+                    'execution_plan_item_id': 'exec-item-2',
+                    'symbol': '005930',
+                    'side': 'buy',
+                },
+            ],
+            executions=[
+                {
+                    'execution_fill_id': 'execution-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'broker_order_id': 'broker-order-1',
+                    'broker_order_pk': 'internal-order-row-2',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+        )
+
+        self.assertEqual(executions, [])
+        self.assertEqual(len(mismatches), 1)
+
+    def test_order_identity_rejects_conflicting_plan_item_aliases(self) -> None:
+        orders, mismatches = self.service._match_remote_orders(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'exec_plan_item_id': 'exec-item-1',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+            orders=[
+                {
+                    'broker_order_pk': 'internal-order-row-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'plan_item_id': 'foreign-exec-item',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+        )
+
+        self.assertEqual(orders, [])
+        self.assertEqual(len(mismatches), 1)
+
+    def test_order_identity_rejects_conflicting_symbol_or_side(self) -> None:
+        item_links = [
+            {
+                'exec_plan_item_id': 'exec-item-1',
+                'symbol': '005930',
+                'side': 'buy',
+            }
+        ]
+        conflicting_orders = (
+            {
+                'id': 'order-wrong-symbol',
+                'execution_plan_item_id': 'exec-item-1',
+                'symbol': '000660',
+                'side': 'buy',
+            },
+            {
+                'id': 'order-wrong-side',
+                'execution_plan_item_id': 'exec-item-1',
+                'symbol': '005930',
+                'side': 'sell',
+            },
+        )
+
+        for order in conflicting_orders:
+            with self.subTest(order_id=order['id']):
+                orders, mismatches = self.service._match_remote_orders(
+                    row=SimpleNamespace(symbol='005930'),
+                    item_links=item_links,
+                    orders=[order],
+                )
+
+                self.assertEqual(orders, [])
+                self.assertEqual(len(mismatches), 1)
+
+    def test_execution_identity_rejects_cross_linked_exact_item_and_order_ids(
+        self,
+    ) -> None:
+        executions, mismatches = self.service._match_remote_executions(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'exec_plan_item_id': 'exec-entry-item',
+                    'symbol': '005930',
+                    'side': 'buy',
+                },
+                {
+                    'exec_plan_item_id': 'exec-target-item',
+                    'symbol': '005930',
+                    'side': 'sell',
+                },
+            ],
+            orders=[
+                {
+                    'id': 'entry-order',
+                    'execution_plan_item_id': 'exec-entry-item',
+                    'symbol': '005930',
+                    'side': 'buy',
+                },
+                {
+                    'id': 'target-order',
+                    'execution_plan_item_id': 'exec-target-item',
+                    'symbol': '005930',
+                    'side': 'sell',
+                },
+            ],
+            executions=[
+                {
+                    'id': 'cross-linked-execution',
+                    'execution_plan_item_id': 'exec-entry-item',
+                    'broker_order_id': 'target-order',
+                    'symbol': '005930',
+                    'side': 'buy',
+                }
+            ],
+        )
+
+        self.assertEqual(executions, [])
+        self.assertEqual(len(mismatches), 1)
+
     def test_daily_board_distinguishes_no_activity_from_unavailable_exec_activity(self) -> None:
         refresh_state = {
             'requested': False,
@@ -560,11 +1305,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         AgentContextFeedback.__table__.create(bind=engine, checkfirst=True)
+        AgentContextFeedbackRun.__table__.create(bind=engine, checkfirst=True)
         OrderRequest.__table__.create(bind=engine, checkfirst=True)
         BrokerOrder.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderDecisionSnapshot.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderExecutionPlanItem.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderActualExecutionOutcome.__table__.create(bind=engine, checkfirst=True)
+        CurrentMarketSnapshotCache.__table__.create(bind=engine, checkfirst=True)
         Symbol.__table__.create(bind=engine, checkfirst=True)
 
     def setUp(self) -> None:
@@ -580,6 +1327,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.original_settings = {
             'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
             'signal_decider_exec_base_url': settings.signal_decider_exec_base_url,
+            'signal_decider_exec_bearer_token': settings.signal_decider_exec_bearer_token,
             'signal_decider_exec_dispatch_source': settings.signal_decider_exec_dispatch_source,
             'signal_decider_exec_runtime_mode': settings.signal_decider_exec_runtime_mode,
             'signal_decider_exec_request_timeout_seconds': settings.signal_decider_exec_request_timeout_seconds,
@@ -589,6 +1337,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         settings.signal_decider_exec_integration_mode = 'dispatch'
         settings.signal_decider_exec_base_url = 'http://exec.test'
+        settings.signal_decider_exec_bearer_token = ''
         settings.signal_decider_exec_dispatch_source = 'kai-trading-core'
         settings.signal_decider_exec_runtime_mode = 'mock'
         settings.signal_decider_exec_request_timeout_seconds = 5.0
@@ -597,6 +1346,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
         self.client = FakeExecClient()
         self.service = SignalDeciderExecIntegrationService(client=self.client)
+        self.utcnow_patcher = patch(
+            'app.orders.exec_integration._utcnow',
+            return_value=datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc),
+        )
+        self.utcnow_patcher.start()
+        self.addCleanup(self.utcnow_patcher.stop)
+        self.decision_quality_utcnow_patcher = patch(
+            'app.agent_context.decision_input_quality._utcnow',
+            return_value=datetime(2026, 4, 29, 0, 57, 10, tzinfo=timezone.utc),
+        )
+        self.decision_quality_utcnow_patcher.start()
+        self.addCleanup(self.decision_quality_utcnow_patcher.stop)
         self.enrichment_preflight_patcher = patch(
             'app.orders.next_open_execution.inspect_pykrx_enrichment_preflight',
             side_effect=lambda **kwargs: {
@@ -653,7 +1414,186 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     SignalDeciderDecisionSnapshot.market_date == self.market_date,
                 )
             )
+            session.execute(
+                delete(CurrentMarketSnapshotCache).where(
+                    CurrentMarketSnapshotCache.cache_key == 'dashboard'
+                )
+            )
             session.execute(delete(Symbol).where(Symbol.symbol.in_(self.seeded_symbols)))
+
+    def test_dispatch_revision_fingerprint_covers_server_owned_order_material(self) -> None:
+        row = SimpleNamespace(
+            id=71,
+            execution_window='next_open',
+            decision_snapshot_id=41,
+            decision_agent_name='signal-decider',
+            broker_name='kis',
+            target_trade_date=date(2026, 4, 30),
+            source_market_date=date(2026, 4, 29),
+            account_reference='KIS:98123456-01',
+            account_label='Main',
+            symbol='005930',
+            policy_version='policy-v1',
+            planned_side='buy',
+            planned_order_type='market',
+            planned_time_in_force='day',
+            allocation_budget_krw=Decimal('1500000'),
+            estimated_reference_price=50000,
+            planned_quantity=Decimal('30'),
+            estimated_notional_krw=Decimal('1500000'),
+            client_order_id='SDNO-20260430-005930',
+            validation_payload={'preopen_policy_fingerprint': 'fingerprint-v1'},
+            traceability_payload={
+                'market': 'KRX',
+                'target_price': 55000,
+                'stop_loss_price': 47000,
+            },
+            submission_payload={'readback_only': 'ignored'},
+        )
+        baseline = _row_dispatch_revision_fingerprint(row)
+        mutations = {
+            'id': 72,
+            'execution_window': 'intraday',
+            'decision_snapshot_id': 42,
+            'decision_agent_name': 'short-term-decider',
+            'broker_name': 'other',
+            'target_trade_date': date(2026, 5, 1),
+            'source_market_date': date(2026, 4, 28),
+            'account_reference': 'KIS:98999999-01',
+            'account_label': 'Secondary',
+            'symbol': '000660',
+            'policy_version': 'policy-v2',
+            'planned_side': 'sell',
+            'planned_order_type': 'limit',
+            'planned_time_in_force': 'ioc',
+            'allocation_budget_krw': Decimal('900000'),
+            'estimated_reference_price': 51000,
+            'planned_quantity': Decimal('17'),
+            'estimated_notional_krw': Decimal('867000'),
+            'client_order_id': 'SDNO-20260430-000660',
+            'validation_payload': {'preopen_policy_fingerprint': 'fingerprint-v2'},
+            'traceability_payload': {
+                'market': 'US',
+                'target_price': 56000,
+                'stop_loss_price': 46000,
+            },
+        }
+
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                revised = copy.deepcopy(row)
+                setattr(revised, field, value)
+                self.assertNotEqual(
+                    _row_dispatch_revision_fingerprint(revised),
+                    baseline,
+                )
+
+        readback_only_revision = copy.deepcopy(row)
+        readback_only_revision.submission_payload = {'readback_only': 'new-value'}
+        self.assertEqual(
+            _row_dispatch_revision_fingerprint(readback_only_revision),
+            baseline,
+        )
+
+    async def test_exec_payload_builder_rejects_us_route_before_krw_sizing_is_serialized(self) -> None:
+        route_markers = (
+            {'market': 'US'},
+            {'exchange': 'NASDAQ'},
+            {'exchange': 'NASD'},
+            {'currency': 'USD'},
+            {'asset_class': 'us_equity'},
+            {'session_policy': {'timezone': 'America/New_York'}},
+        )
+        route_keys = {'market', 'exchange', 'currency', 'asset_class', 'session_policy'}
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            base_traceability = {
+                key: value
+                for key, value in row.traceability_payload.items()
+                if key not in route_keys
+            }
+
+        for marker in route_markers:
+            with self.subTest(marker=marker):
+                with session_scope() as session:
+                    row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                    row.traceability_payload = {**base_traceability, **marker}
+
+                rows = self.service._load_next_open_rows(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                )
+                snapshots = self.service._load_snapshots(rows)
+
+                with self.assertRaisesRegex(
+                    SignalDeciderExecPayloadContractError,
+                    'unsupported_us_equity_exec_agent_sizing',
+                ):
+                    self.service._build_exec_plan_payload(
+                        rows=rows,
+                        snapshots=snapshots,
+                        trigger='us_route_safety_test',
+                    )
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='us_route_safety_test',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'contract_error')
+            self.assertEqual(
+                row.submission_payload['contract_error']['reason_code'],
+                'unsupported_us_equity_exec_agent_sizing',
+            )
+
+    async def test_unsupported_us_row_does_not_block_same_account_krx_dispatch(self) -> None:
+        domestic_symbol = f'K{uuid4().hex[:5].upper()}'
+        domestic_id = self._seed_signal_candidate(
+            symbol=domestic_symbol,
+            name_ko='Domestic candidate',
+            decision_run_id='mixed-route-domestic-run',
+            client_order_id=f'MIXED-KRX-{uuid4().hex[:8]}',
+        )
+        with session_scope() as session:
+            us_row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            us_row.traceability_payload = {
+                **us_row.traceability_payload,
+                'currency': 'USD',
+            }
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='mixed_route_safety_test',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(
+            {item['symbol'] for item in self.client.post_calls[0]['items']},
+            {domestic_symbol},
+        )
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        self.assertEqual(result['summary']['dispatched_group_count'], 1)
+        with session_scope() as session:
+            us_row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            domestic_row = session.get(SignalDeciderExecutionPlanItem, domestic_id)
+            self.assertEqual(us_row.execution_status, 'contract_error')
+            self.assertEqual(
+                domestic_row.execution_status,
+                EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+            )
 
     def _seed_snapshot(self) -> int:
         with session_scope() as session:
@@ -687,6 +1627,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 request_payload={
                     'signal_decider_policy': {'current_version': self.policy_version},
                     'market_regime_context': self._market_regime_context(),
+                    'symbol_day_context': {
+                        'company': {'market': 'KOSPI'},
+                    },
                 },
                 response_payload={'next_day_open_action': 'buy'},
                 response_summary_payload={'policy_version': self.policy_version},
@@ -758,6 +1701,97 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'missing_fields': [],
         }
 
+    def _signal_dispatch_validation(self) -> dict:
+        market_date = self.market_date.isoformat()
+        observed_at = f'{market_date}T09:57:00+09:00'
+        return {
+            'execution_cost_evidence_policy_version': 'next_open_cost_evidence_v1',
+            'preopen_policy_fingerprint': _next_open_policy_fingerprint(
+                [
+                    NextOpenAccountTarget(
+                        label='Main',
+                        account_reference=self.account_reference,
+                        budget_krw=Decimal('1500000'),
+                    )
+                ]
+            ),
+            'blocking_reasons': [],
+            'warnings': [],
+            'pre_decider_enrichment_context': {
+                'schema_version': 'pre_decider_enrichment_v1',
+                'quote_orderbook_snapshot': {
+                    'status': 'available',
+                    'snapshot_type': 'current_quote_cache',
+                    'market_date': market_date,
+                    'as_of_market_date': market_date,
+                    'quote_freshness_status': 'fresh',
+                    'quote_freshness_timestamp': observed_at,
+                    'current_price': 50000,
+                    'bid_price': 49975,
+                    'ask_price': 50000,
+                    'spread_points': 25,
+                    'spread_bps': 5,
+                    'spread_source_context': 'quote_context',
+                    'spread_component_source_context': {
+                        field: 'quote_context'
+                        for field in (
+                            'current_price',
+                            'bid_price',
+                            'ask_price',
+                            'spread_points',
+                            'spread_bps',
+                        )
+                    },
+                    'source': {'quote_context': 'kis'},
+                    'freshness': {
+                        'quote_context': {
+                            'freshness_status': 'fresh',
+                            'provenance_status': 'provider_sourced',
+                            'as_of_market_date': market_date,
+                            'as_of_timestamp': observed_at,
+                            'source_provider': 'kis',
+                            'source_tables': ['current_quote_cache', 'quote_snapshots'],
+                        },
+                    },
+                },
+            },
+            'performance_gate': {
+                'expected_return_economics': {
+                    'status': 'ready',
+                    'expected_slippage_bps': '5',
+                    'expected_slippage_basis': 'quote_spread_bps',
+                    'server_non_spread_round_trip_cost_basis': 'deferred_to_exec_final_full_cost_check',
+                    'estimated_total_transaction_cost_bps': None,
+                },
+            },
+        }
+
+    def _closed_market_pre_decider_context(self) -> dict:
+        return {
+            'schema_version': 'pre_decider_enrichment_v1',
+            'market_data_phase_contract': {
+                'schema_version': 'market_data_phase_contract_v1',
+                'recommendation_basis': 'latest_completed_eod',
+                'realtime_quote_orderbook_required': False,
+                'eod_reference_price_accepted': True,
+                'not_applicable_realtime_is_expected': True,
+            },
+            'quote_orderbook_snapshot': {
+                'status': 'stale_eod',
+                'snapshot_type': 'eod_stale',
+                'quote_freshness_status': 'stale',
+                'as_of_market_date': self.market_date.isoformat(),
+                'as_of_timestamp': f'{self.market_date.isoformat()}T15:30:00+09:00',
+                'spread_bps': None,
+            },
+            'trading_value': {
+                'status': 'available',
+                'source': 'raw',
+                'raw_trading_value_krw': 8_000_000_000,
+                'trading_value_krw': 8_000_000_000,
+            },
+        }
+
     def _seed_short_term_snapshot(
         self,
         *,
@@ -774,6 +1808,19 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
             generic_action = 'wait'
+        resolved_request_payload = copy.deepcopy(request_payload or {})
+        symbol_day_context = resolved_request_payload.setdefault(
+            'symbol_day_context',
+            {},
+        )
+        if isinstance(symbol_day_context, dict):
+            company = symbol_day_context.setdefault('company', {})
+            if (
+                not symbol_day_context.get('market')
+                and isinstance(company, dict)
+                and not company.get('market')
+            ):
+                company['market'] = 'KOSPI'
         with session_scope() as session:
             row = SignalDeciderDecisionSnapshot(
                 feedback_id=None,
@@ -810,7 +1857,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
                 input_feature_snapshot_payload=input_feature_snapshot_payload
                 or {'meta': {'source_agent_name': 'short-term-decider'}},
-                request_payload=request_payload or {},
+                request_payload=resolved_request_payload,
                 response_payload={
                     'role': 'short-term-decider',
                     'agent_name': 'short-term-decider',
@@ -860,6 +1907,22 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         input_feature_snapshot_payload: dict | None = None,
     ) -> int:
         self._seed_symbol(symbol=symbol, name_ko=name_ko)
+        resolved_request_payload = copy.deepcopy(
+            request_payload
+            or {'signal_decider_policy': {'current_version': self.policy_version}}
+        )
+        symbol_day_context = resolved_request_payload.setdefault(
+            'symbol_day_context',
+            {},
+        )
+        if isinstance(symbol_day_context, dict):
+            company = symbol_day_context.setdefault('company', {})
+            if (
+                not symbol_day_context.get('market')
+                and isinstance(company, dict)
+                and not company.get('market')
+            ):
+                company['market'] = 'KOSPI'
         with session_scope() as session:
             snapshot = SignalDeciderDecisionSnapshot(
                 feedback_id=None,
@@ -888,7 +1951,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 specialist_disagreement_payload=[],
                 traceability_payload={'gate_checks': {'missing_upstream_roles': []}},
                 input_feature_snapshot_payload=input_feature_snapshot_payload or {'technical': {'trend_state': 'uptrend'}},
-                request_payload=request_payload or {'signal_decider_policy': {'current_version': self.policy_version}},
+                request_payload=resolved_request_payload,
                 response_payload={'next_day_open_action': 'buy'},
                 response_summary_payload={'policy_version': self.policy_version},
             )
@@ -917,7 +1980,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 eligibility_status='eligible',
                 execution_status='planned',
                 client_order_id=client_order_id,
-                validation_payload={'blocking_reasons': [], 'warnings': []},
+                validation_payload=self._signal_dispatch_validation(),
                 traceability_payload={
                     'decision_snapshot_id': snapshot.id,
                     'decision_run_id': decision_run_id,
@@ -966,7 +2029,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 eligibility_status='eligible',
                 execution_status='planned',
                 client_order_id=self.main_client_order_id,
-                validation_payload={'blocking_reasons': [], 'warnings': []},
+                validation_payload=self._signal_dispatch_validation(),
                 traceability_payload={
                     'decision_snapshot_id': self.snapshot_id,
                     'decision_run_id': 'exec-run-1',
@@ -1024,6 +2087,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 execution_status='planned',
                 client_order_id=self.short_term_client_order_id,
                 validation_payload={
+                    'preopen_policy_fingerprint': _next_open_policy_fingerprint(
+                        [
+                            NextOpenAccountTarget(
+                                label='Main',
+                                account_reference=self.account_reference,
+                                budget_krw=Decimal('1500000'),
+                            )
+                        ]
+                    ),
                     'blocking_reasons': [],
                     'warnings': [],
                     'decision_agent_name': 'short-term-decider',
@@ -1132,6 +2204,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             for item in short_post_call['items']
             if item.get('intent') == EXEC_INTENT_INTRADAY_WATCH_BUY
         )
+        with session_scope() as session:
+            persisted_short_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            short_entry_link = next(
+                link
+                for link in persisted_short_row.submission_payload[
+                    'exec_dispatch'
+                ]['item_links']
+                if link['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
+            )
         original_blocking_reason = {
             'code': 'manual_recovery_gate_block',
             'message': 'Original core quality gate remained blocked before exec restore.',
@@ -1169,7 +2253,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'items': [
                         {
                             'core_item_key': short_entry_item['core_item_key'],
-                            'execution_plan_item_id': 'exec-short-watch-1',
+                            'execution_plan_id': short_entry_link['exec_plan_id'],
+                            'execution_plan_item_id': short_entry_link[
+                                'exec_plan_item_id'
+                            ],
                             'symbol': self.symbol,
                             'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
                             'status': response_item_status or exec_status,
@@ -1303,6 +2390,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             tactical_action='scalp_buy_candidate',
             request_payload={
                 'symbol_day_context': {
+                    'technical_snapshot': {
+                        'trend_state': 'uptrend',
+                        'breakout_20d': True,
+                        'breakdown_20d': False,
+                    },
                     'market_relative_context': {
                         'relative_strength': {
                             'return_percentile': 0.82,
@@ -1310,8 +2402,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         },
                     },
                 },
-            },
-            input_feature_snapshot_payload={
                 'liquidity_context': {
                     'turnover': {
                         'trading_value_source': 'raw',
@@ -1344,6 +2434,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_snapshot_id = self._seed_short_term_snapshot(
             request_payload={
                 'symbol_day_context': {
+                    'technical_snapshot': {
+                        'trend_state': 'uptrend',
+                        'breakout_20d': True,
+                        'breakdown_20d': False,
+                    },
                     'market_relative_context': {
                         'relative_strength': {
                             'return_percentile': 0.86,
@@ -1406,6 +2501,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_snapshot_id = self._seed_short_term_snapshot(
             request_payload={
                 'symbol_day_context': {
+                    'technical_snapshot': {
+                        'trend_state': 'uptrend',
+                        'breakout_20d': True,
+                        'breakdown_20d': False,
+                    },
                     'market_relative_context': {
                         'relative_strength': {
                             'return_percentile': 0.55,
@@ -1440,6 +2540,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         short_snapshot_id = self._seed_short_term_snapshot(
             request_payload={
                 'symbol_day_context': {
+                    'technical_snapshot': {
+                        'trend_state': 'uptrend',
+                        'breakout_20d': True,
+                        'breakdown_20d': False,
+                    },
                     'market_relative_context': {
                         'relative_strength': {
                             'return_percentile': 0.22,
@@ -1478,6 +2583,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             stop_loss_price=49200,
             request_payload={
                 'symbol_day_context': {
+                    'technical_snapshot': {
+                        'trend_state': 'uptrend',
+                        'breakout_20d': True,
+                        'breakdown_20d': False,
+                    },
                     'market_relative_context': {
                         'relative_strength': {
                             'return_percentile': 0.82,
@@ -1515,6 +2625,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
             refresh_plan=False,
             dry_run=False,
             force=False,
@@ -1599,6 +2710,1197 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(exec_dispatch['dispatch_status'], 'accepted')
             self.assertEqual(len(exec_dispatch['item_links']), 3)
 
+    async def test_dispatch_flushes_buy_to_wait_revocation_before_any_new_plan(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_buy_to_wait_revocation',
+        )
+        self.client.post_calls.clear()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            submission = copy.deepcopy(row.submission_payload)
+            exec_dispatch = submission['exec_dispatch']
+            item_links = copy.deepcopy(exec_dispatch['item_links'])
+            plan_id = exec_dispatch['plan_id']
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_pending'
+            row.submitted_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+            row.submission_payload = {
+                **submission,
+                'revision_history': [{'decision_snapshot_id': str(self.snapshot_id)}],
+                'revocation': {
+                    'status': 'pending',
+                    'reason_code': 'latest_snapshot_not_actionable',
+                    'requested_at': '2026-04-30T00:00:00+00:00',
+                    'prior_decision_snapshot_id': str(self.snapshot_id),
+                    'replacement_decision_snapshot_id': str(self.snapshot_id + 1),
+                    'replacement_action': 'wait',
+                    'replacement_actionable': False,
+                    'plan_id': plan_id,
+                    'destination_binding': copy.deepcopy(
+                        exec_dispatch['destination_binding']
+                    ),
+                    'item_links': item_links,
+                },
+            }
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test_revocation',
+        )
+
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.submission_payload['revocation']['status'], 'acknowledged')
+            self.assertEqual(len(row.submission_payload['revocation_history']), 1)
+
+    async def test_enrichment_block_preserves_and_flushes_live_market_revocation_to_exec(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_live_market_revocation',
+        )
+        self.client.post_calls.clear()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            submission = copy.deepcopy(row.submission_payload)
+            exec_dispatch = submission['exec_dispatch']
+            item_links = copy.deepcopy(exec_dispatch['item_links'])
+            plan_id = exec_dispatch['plan_id']
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_pending'
+            row.submitted_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+            row.submission_payload = {
+                **submission,
+                'revision_history': [{'decision_snapshot_id': str(self.snapshot_id)}],
+                'revocation': {
+                    'status': 'pending',
+                    'reason_code': 'current_live_market_risk_off',
+                    'requested_at': '2026-04-30T00:00:00+00:00',
+                    'prior_decision_snapshot_id': str(self.snapshot_id),
+                    'replacement_decision_snapshot_id': 'observation:risk-off:1',
+                    'replacement_action': 'buy',
+                    'replacement_actionable': False,
+                    'plan_id': plan_id,
+                    'destination_binding': copy.deepcopy(
+                        exec_dispatch['destination_binding']
+                    ),
+                    'item_links': item_links,
+                },
+            }
+
+        blocked_preflight = {
+            'market_date': self.market_date.isoformat(),
+            'status': 'blocked',
+            'allowed': False,
+            'required_categories': ['investor_flow_symbol'],
+            'failed_categories': ['investor_flow_symbol'],
+            'zero_coverage_categories': ['investor_flow_symbol'],
+            'category_row_counts': {'investor_flow_symbol': 0},
+        }
+        with patch(
+            'app.orders.next_open_execution.inspect_pykrx_enrichment_preflight',
+            return_value=blocked_preflight,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=True,
+                dry_run=False,
+                force=False,
+                trigger='test_live_market_risk_off_revocation',
+            )
+
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            self.client.revocation_calls[0]['reason_code'],
+            'current_live_market_risk_off',
+        )
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(
+            result['summary']['reason'],
+            'pykrx_enrichment_preflight_blocked',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.submission_payload['revocation']['status'], 'acknowledged')
+
+    async def test_critical_market_evidence_failure_revokes_buy_and_preserves_protective_exits(
+        self,
+    ) -> None:
+        dispatched = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='seed_accepted_exec_authority',
+        )
+        self.assertEqual(dispatched['summary']['dispatched_group_count'], 1)
+
+        async def revoke_with_protective_exits(payload: dict) -> dict:
+            self.client.revocation_calls.append(copy.deepcopy(payload))
+            item_acks = [
+                {
+                    'core_item_key': item['core_item_key'],
+                    'status': (
+                        'revoked'
+                        if item['core_item_key'].endswith(':next_open_buy')
+                        else 'preserved_protective_exit'
+                    ),
+                    'execution_plan_id': payload['plan_id'],
+                    'execution_plan_item_id': item['execution_plan_item_id'],
+                }
+                for item in payload['items']
+            ]
+            return {
+                'plan_id': payload['plan_id'],
+                'execution_plan_id': payload['plan_id'],
+                'contract_ack': {
+                    'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                    'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                    'capability': EXECUTION_REVOCATION_CAPABILITY,
+                    'plan_id': payload['plan_id'],
+                    'status': 'revoked',
+                },
+                'item_acks': item_acks,
+                'reason_code': 'current_live_market_evidence_unavailable',
+                'revoked_item_count': 1,
+                'manual_review_item_count': 0,
+                'preserved_item_count': 2,
+            }
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_revocation',
+            side_effect=revoke_with_protective_exits,
+        ):
+            result = await self.service.revoke_delegated_buys_for_unavailable_market_evidence(
+                target_trade_date=self.target_trade_date,
+                trigger='background_runner:market_snapshot_refresh_if_due_failed',
+            )
+
+        self.assertEqual(result['staged_count'], 1)
+        self.assertEqual(result['revocations'][0]['status'], 'revoked')
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            self.client.revocation_calls[0]['reason_code'],
+            'current_live_market_evidence_unavailable',
+        )
+        self.assertEqual(
+            {
+                item['core_item_key'].rsplit(':', 1)[-1]
+                for item in self.client.revocation_calls[0]['items']
+            },
+            {'next_open_buy', 'target_sell', 'stop_sell'},
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            response_items = row.submission_payload['revocation_history'][-1]['response'][
+                'item_acks'
+            ]
+            self.assertEqual(
+                {
+                    item['core_item_key'].rsplit(':', 1)[-1]: item['status']
+                    for item in response_items
+                },
+                {
+                    'next_open_buy': 'revoked',
+                    'target_sell': 'preserved_protective_exit',
+                    'stop_sell': 'preserved_protective_exit',
+                },
+            )
+
+    async def test_revocation_ack_with_wrong_reason_keeps_pending_authority_blocked(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_wrong_reason_revocation',
+        )
+        self.client.post_calls.clear()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            submission = copy.deepcopy(row.submission_payload)
+            exec_dispatch = submission['exec_dispatch']
+            item_links = copy.deepcopy(exec_dispatch['item_links'])
+            plan_id = exec_dispatch['plan_id']
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_pending'
+            row.submitted_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+            row.submission_payload = {
+                **submission,
+                'revocation': {
+                    'status': 'pending',
+                    'reason_code': 'current_live_market_risk_off',
+                    'requested_at': '2026-04-30T00:00:00+00:00',
+                    'prior_decision_snapshot_id': str(self.snapshot_id),
+                    'replacement_decision_snapshot_id': 'observation:risk-off:reason',
+                    'replacement_action': 'buy',
+                    'replacement_actionable': False,
+                    'plan_id': plan_id,
+                    'destination_binding': copy.deepcopy(
+                        exec_dispatch['destination_binding']
+                    ),
+                    'item_links': item_links,
+                },
+            }
+
+        original_revoke = self.client.post_execution_plan_revocation
+
+        async def respond_with_wrong_reason(payload: dict) -> dict:
+            response = await original_revoke(payload)
+            return {
+                **response,
+                'reason_code': 'latest_snapshot_replaced',
+            }
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_revocation',
+            side_effect=respond_with_wrong_reason,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_wrong_revocation_reason_ack',
+            )
+
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['revoked_group_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_pending')
+            self.assertEqual(row.submission_payload['revocation']['status'], 'pending')
+            self.assertNotIn('revocation_history', row.submission_payload)
+
+    async def test_revocation_not_found_ack_enters_manual_review_and_blocks_replacement(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_not_found_revocation',
+        )
+        self.client.post_calls.clear()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            submission = copy.deepcopy(row.submission_payload)
+            exec_dispatch = submission['exec_dispatch']
+            item_links = copy.deepcopy(exec_dispatch['item_links'])
+            plan_id = exec_dispatch['plan_id']
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_pending'
+            row.submitted_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+            row.submission_payload = {
+                **submission,
+                'revision_history': [{'decision_snapshot_id': str(self.snapshot_id)}],
+                'revocation': {
+                    'status': 'pending',
+                    'reason_code': 'latest_snapshot_replaced',
+                    'requested_at': '2026-04-30T00:00:00+00:00',
+                    'prior_decision_snapshot_id': str(self.snapshot_id),
+                    'replacement_decision_snapshot_id': str(self.snapshot_id + 1),
+                    'replacement_action': 'buy',
+                    'replacement_actionable': True,
+                    'plan_id': plan_id,
+                    'destination_binding': copy.deepcopy(
+                        exec_dispatch['destination_binding']
+                    ),
+                    'item_links': item_links,
+                },
+            }
+
+        original_revoke = self.client.post_execution_plan_revocation
+
+        async def respond_not_found(payload: dict) -> dict:
+            accepted_response = await original_revoke(payload)
+            return {
+                **accepted_response,
+                'contract_ack': {
+                    **accepted_response['contract_ack'],
+                    'status': 'not_found',
+                },
+                'item_acks': [
+                    {**item, 'status': 'not_found'}
+                    for item in accepted_response['item_acks']
+                ],
+                'revoked_item_count': 0,
+                'manual_review_item_count': 0,
+                'preserved_item_count': 0,
+            }
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_revocation',
+            side_effect=respond_not_found,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_not_found_revocation',
+            )
+
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['revoked_group_count'], 0)
+        self.assertEqual(result['summary']['revocation_manual_review_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(row.decision_snapshot_id, self.snapshot_id)
+            self.assertIsNotNone(row.submitted_at)
+            self.assertIn('exec_dispatch', row.submission_payload)
+            self.assertEqual(
+                row.submission_payload['revocation']['status'],
+                'manual_review_required',
+            )
+            self.assertEqual(
+                row.submission_payload['revocation']['ack_status'],
+                'manual_review_required',
+            )
+            self.assertEqual(
+                row.submission_payload['revocation_history'][-1]['response']['contract_ack']['status'],
+                'not_found',
+            )
+
+    async def test_dispatch_persistence_never_overwrites_newer_revocation_state(self) -> None:
+        detached_rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        snapshots = self.service._load_snapshots(detached_rows)
+        payload, row_links = self.service._build_exec_plan_payload(
+            rows=detached_rows,
+            snapshots=snapshots,
+            trigger='race_test',
+        )
+        dispatch_revision_fingerprints = {
+            int(row.id): _row_dispatch_revision_fingerprint(row)
+            for row in detached_rows
+        }
+        response = await self.client.post_execution_plan(payload)
+        pending_submission = {
+            'marker': 'newer-revocation-must-win',
+            'revocation': {
+                'status': 'pending',
+                'plan_id': 'already-handed-off-plan',
+                'replacement_decision_snapshot_id': str(self.snapshot_id + 1),
+            },
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_pending'
+            row.submission_payload = pending_submission
+
+        success = self.service._persist_dispatch_success(
+            rows=detached_rows,
+            submitted_revision_fingerprints=dispatch_revision_fingerprints,
+            row_links=row_links,
+            plan_id=payload['plan_id'],
+            fingerprint='race-fingerprint',
+            payload=payload,
+            response_payload=response,
+            trigger='race_test',
+        )
+        self.assertEqual(success['dispatch_status'], 'revocation_pending')
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_pending')
+            self.assertEqual(row.submission_payload, pending_submission)
+
+        self.service._persist_dispatch_failure(
+            rows=detached_rows,
+            submitted_revision_fingerprints=dispatch_revision_fingerprints,
+            row_links=row_links,
+            plan_id=payload['plan_id'],
+            fingerprint='race-fingerprint',
+            payload=payload,
+            trigger='race_test',
+            status='unavailable',
+            error={'code': 'timeout', 'message': 'ambiguous remote result'},
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_pending')
+            self.assertEqual(row.submission_payload, pending_submission)
+
+    async def test_dispatch_ack_revokes_remote_authority_after_material_row_revision(self) -> None:
+        original_post_execution_plan = self.client.post_execution_plan
+
+        async def mutate_row_before_ack(payload: dict) -> dict:
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                row.allocation_budget_krw = Decimal('900000')
+                row.validation_payload = {
+                    **(row.validation_payload or {}),
+                    'preopen_policy_fingerprint': 'new-policy-fingerprint',
+                }
+                row.traceability_payload = {
+                    **(row.traceability_payload or {}),
+                    'allocation_budget_krw': '900000',
+                }
+            return await original_post_execution_plan(payload)
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=mutate_row_before_ack,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_material_revision_race',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'revocation_pending')
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.allocation_budget_krw, Decimal('900000'))
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertNotIn('exec_dispatch', row.submission_payload)
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'policy_scope_changed',
+            )
+            self.assertEqual(row.submission_payload['revocation']['status'], 'acknowledged')
+            self.assertEqual(len(row.submission_payload['revocation_history']), 1)
+
+    async def test_predispatch_generation_fence_blocks_new_wait_without_post(self) -> None:
+        with session_scope() as session:
+            prior = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+            values = {
+                column.name: copy.deepcopy(getattr(prior, column.name))
+                for column in SignalDeciderDecisionSnapshot.__table__.columns
+                if column.name not in {'id', 'created_at', 'updated_at'}
+            }
+            values.update(
+                {
+                    'feedback_received_at': datetime(
+                        2026,
+                        4,
+                        29,
+                        6,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                    'decision_action': 'wait',
+                    'preferred_action': 'wait',
+                    'next_day_open_action': 'wait',
+                    'response_payload': {'next_day_open_action': 'wait'},
+                }
+            )
+            session.add(SignalDeciderDecisionSnapshot(**values))
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test_predispatch_new_wait_generation',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(
+            result['dispatch']['groups'][0]['dispatch_status'],
+            'skipped',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(
+                row.validation_payload['blocking_reasons'][0]['code'],
+                'latest_snapshot_not_actionable',
+            )
+
+    async def test_predispatch_generation_fence_blocks_new_risk_off_snapshot_without_post(
+        self,
+    ) -> None:
+        observed_at = datetime(
+            2026,
+            4,
+            30,
+            9,
+            9,
+            30,
+            tzinfo=timezone(timedelta(hours=9)),
+        )
+
+        def snapshot_payload(*, advancers: int, decliners: int) -> dict:
+            unchanged = 20
+            symbol_count = advancers + unchanged + decliners
+            observed_at_text = observed_at.isoformat()
+            return {
+                'status': 'ready',
+                'as_of': observed_at_text,
+                'missing_fields': [],
+                'legs': {
+                    'index': {'status': 'ready'},
+                    'flow': {'status': 'ready'},
+                    'fx': {'status': 'ready'},
+                },
+                'markets': {
+                    'kospi': {
+                        'label': 'KOSPI',
+                        'index_code': '0001',
+                        'value': 2673.0,
+                        'change': -27.0,
+                        'change_percent': -1.0,
+                        'open': 2690.0,
+                        'trading_value': 3_000_000,
+                        'trading_value_unit': 'million_krw',
+                        'upper_limit_count': 0,
+                        'advancers': advancers,
+                        'unchanged': unchanged,
+                        'decliners': decliners,
+                        'lower_limit_count': 0,
+                        'breadth_raw_buckets': {
+                            'upper_limit_count': 0,
+                            'advancers': advancers,
+                            'unchanged': unchanged,
+                            'decliners': decliners,
+                            'lower_limit_count': 0,
+                        },
+                        'breadth_completeness': {
+                            'status': 'verified',
+                            'expected_symbol_count': symbol_count,
+                            'observed_symbol_count': symbol_count,
+                            'limit_bucket_semantics': 'included_in_direction_counts',
+                            'expected_universe': {
+                                'provider': 'kis_master',
+                                'market_date': observed_at.date().isoformat(),
+                                'completed_at': observed_at.replace(
+                                    hour=8,
+                                    minute=0,
+                                    second=0,
+                                ).isoformat(),
+                                'symbol_count': symbol_count,
+                                'membership_sha256': 'a' * 64,
+                            },
+                        },
+                        'provider_business_date': observed_at.date().isoformat(),
+                        'provider_session_time': observed_at.strftime('%H:%M:%S'),
+                        'provider_observed_at': observed_at_text,
+                        'index_leg': {
+                            'status': 'ready',
+                            'observation_source': 'kis_index_intraday_bar',
+                            'provider_observed_at': observed_at_text,
+                        },
+                    },
+                },
+            }
+
+        with session_scope() as session:
+            session.add(
+                CurrentMarketSnapshotCache(
+                    cache_key='dashboard',
+                    payload=snapshot_payload(advancers=650, decliners=250),
+                    snapshot_status='ready',
+                    stale_reason=None,
+                    as_of=observed_at,
+                    last_refresh_attempted_at=observed_at,
+                    last_refresh_succeeded_at=observed_at,
+                    last_refresh_status='success',
+                    last_refresh_error=None,
+                    refresh_trigger='test',
+                )
+            )
+
+        open_market_state = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T09:10:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        expected_row_bindings = {
+            int(row.id): {
+                'decision_snapshot_id': int(row.decision_snapshot_id),
+                'row_revision_fingerprint': _row_dispatch_revision_fingerprint(row),
+            }
+            for row in rows
+        }
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            'market_state_getter',
+            return_value=open_market_state,
+        ) as market_state_getter:
+            healthy_generation = (
+                signal_decider_next_open_execution_service.inspect_dispatch_authority_generation(
+                    target_trade_date=self.target_trade_date,
+                    expected_row_bindings=expected_row_bindings,
+                )
+            )
+            self.assertEqual(healthy_generation['status'], 'valid')
+            market_state_getter.return_value = MarketState(
+                market='KRX',
+                state='OPEN',
+                is_trading_day=True,
+                is_open=True,
+                server_time='2026-04-30T09:10:01+09:00',
+                session_open_at='2026-04-30T09:00:00+09:00',
+                session_close_at='2026-04-30T15:30:00+09:00',
+            )
+            advanced_clock_generation = (
+                signal_decider_next_open_execution_service.inspect_dispatch_authority_generation(
+                    target_trade_date=self.target_trade_date,
+                    expected_row_bindings=expected_row_bindings,
+                )
+            )
+            self.assertEqual(advanced_clock_generation['status'], 'valid')
+            self.assertEqual(
+                advanced_clock_generation['generation_fingerprint'],
+                healthy_generation['generation_fingerprint'],
+            )
+            with session_scope() as session:
+                cache = session.execute(
+                    select(CurrentMarketSnapshotCache).where(
+                        CurrentMarketSnapshotCache.cache_key == 'dashboard'
+                    )
+                ).scalar_one()
+                cache.payload = snapshot_payload(advancers=250, decliners=680)
+                cache.as_of = observed_at
+                cache.last_refresh_attempted_at = observed_at
+                cache.last_refresh_succeeded_at = observed_at
+
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_predispatch_risk_off_generation',
+            )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(
+            result['dispatch']['groups'][0]['reason'],
+            'current_live_market_risk_off',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertIn(
+                'current_live_market_risk_off',
+                {
+                    item['code']
+                    for item in row.validation_payload['blocking_reasons']
+                },
+            )
+
+    async def test_dispatch_ack_generation_change_revokes_remote_acceptance(self) -> None:
+        original_post_execution_plan = self.client.post_execution_plan
+
+        async def publish_wait_before_ack(payload: dict) -> dict:
+            with session_scope() as session:
+                prior = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+                values = {
+                    column.name: copy.deepcopy(getattr(prior, column.name))
+                    for column in SignalDeciderDecisionSnapshot.__table__.columns
+                    if column.name not in {'id', 'created_at', 'updated_at'}
+                }
+                values.update(
+                    {
+                        'feedback_received_at': datetime(
+                            2026,
+                            4,
+                            29,
+                            6,
+                            1,
+                            tzinfo=timezone.utc,
+                        ),
+                        'decision_action': 'wait',
+                        'preferred_action': 'wait',
+                        'next_day_open_action': 'wait',
+                        'response_payload': {'next_day_open_action': 'wait'},
+                    }
+                )
+                session.add(SignalDeciderDecisionSnapshot(**values))
+            return await original_post_execution_plan(payload)
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=publish_wait_before_ack,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_http_generation_change',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'revocation_pending')
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'latest_snapshot_not_actionable',
+            )
+
+    async def test_dispatch_ack_uses_wait_when_concurrent_refresh_blocks_candidate(self) -> None:
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'generic_action': 'buy',
+            }
+        original_post_execution_plan = self.client.post_execution_plan
+
+        async def block_row_before_ack(payload: dict) -> dict:
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                row.eligibility_status = 'blocked'
+                row.validation_payload = {
+                    **(row.validation_payload or {}),
+                    'blocking_reasons': [
+                        {
+                            'code': 'latest_snapshot_not_actionable',
+                            'message': 'Concurrent refresh no longer allows this candidate.',
+                        }
+                    ],
+                }
+            return await original_post_execution_plan(payload)
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=block_row_before_ack,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_nonactionable_revision_race',
+            )
+
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            self.client.revocation_calls[0]['replacement_action'],
+            'wait',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revoked')
+
+    async def test_dispatch_timeout_after_material_revision_requires_manual_review(self) -> None:
+        async def mutate_row_then_timeout(payload: dict) -> dict:
+            self.client.post_calls.append(payload)
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                row.allocation_budget_krw = Decimal('875000')
+                row.validation_payload = {
+                    **(row.validation_payload or {}),
+                    'preopen_policy_fingerprint': 'timeout-policy-revision',
+                }
+                row.traceability_payload = {
+                    **(row.traceability_payload or {}),
+                    'allocation_budget_krw': '875000',
+                }
+            raise SignalDeciderExecClientError(
+                'exec request timed out after an ambiguous submit',
+                code='unavailable',
+                retryable=True,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=mutate_row_then_timeout,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_timeout_material_revision_race',
+            )
+
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.plan_calls), 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.allocation_budget_krw, Decimal('875000'))
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            reconciliation = row.submission_payload['dispatch_reconciliation']
+            self.assertEqual(reconciliation['status'], 'manual_review_required')
+            self.assertEqual(
+                reconciliation['reason_code'],
+                'ambiguous_remote_acceptance_after_core_revision',
+            )
+            exec_dispatch = row.submission_payload['exec_dispatch']
+            self.assertEqual(exec_dispatch['dispatch_status'], 'unavailable')
+            self.assertEqual(
+                exec_dispatch['plan_id'],
+                self.client.post_calls[0]['plan_id'],
+            )
+
+    async def test_timeout_readback_revokes_old_remote_authority_after_material_revision(self) -> None:
+        async def accept_old_revision_then_timeout(payload: dict) -> dict:
+            self.client.post_calls.append(payload)
+            self.client.plan_response = _accepted_plan_readback_for_payload(payload)
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                row.allocation_budget_krw = Decimal('825000')
+                row.validation_payload = {
+                    **(row.validation_payload or {}),
+                    'preopen_policy_fingerprint': 'readback-policy-revision',
+                }
+                row.traceability_payload = {
+                    **(row.traceability_payload or {}),
+                    'allocation_budget_krw': '825000',
+                }
+            raise SignalDeciderExecClientError(
+                'exec request timed out after accepting the old revision',
+                code='unavailable',
+                retryable=True,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=accept_old_revision_then_timeout,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_timeout_readback_revision_race',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.plan_calls), 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        self.assertEqual(
+            result['dispatch']['groups'][0]['dispatch_status'],
+            'revocation_pending',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.allocation_budget_krw, Decimal('825000'))
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertEqual(row.submission_payload['revocation']['status'], 'acknowledged')
+            self.assertNotIn('exec_dispatch', row.submission_payload)
+
+    async def test_ambiguous_material_revision_is_not_reposted_and_disabled_mode_revokes(self) -> None:
+        old_readback: dict = {}
+
+        async def timeout_after_remote_acceptance(payload: dict) -> dict:
+            nonlocal old_readback
+            self.client.post_calls.append(payload)
+            old_readback = _accepted_plan_readback_for_payload(payload)
+            self.client.plan_response = {'items': []}
+            raise SignalDeciderExecClientError(
+                'initial request timed out without readback visibility',
+                code='unavailable',
+                retryable=True,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=timeout_after_remote_acceptance,
+        ):
+            first_result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_initial_ambiguous_timeout',
+            )
+            self.assertEqual(first_result['summary']['failed_group_count'], 1)
+
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                row.allocation_budget_krw = Decimal('775000')
+                row.validation_payload = {
+                    **(row.validation_payload or {}),
+                    'preopen_policy_fingerprint': 'retry-policy-revision',
+                }
+                row.traceability_payload = {
+                    **(row.traceability_payload or {}),
+                    'allocation_budget_krw': '775000',
+                }
+
+            self.client.plan_response = old_readback
+            retry_result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_duplicate_after_material_revision',
+            )
+            settings.signal_decider_exec_integration_mode = 'disabled'
+            disabled_result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_disable_after_material_revision',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(retry_result['summary']['dispatched_group_count'], 0)
+        self.assertGreaterEqual(len(self.client.plan_calls), 2)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(disabled_result['summary']['revoked_group_count'], 1)
+        self.assertEqual(
+            disabled_result['summary']['reason'],
+            'execution_control_disabled',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.allocation_budget_krw, Decimal('775000'))
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.submission_payload['revocation']['status'], 'acknowledged')
+            exec_dispatch = row.submission_payload['exec_dispatch']
+            self.assertTrue(
+                all(
+                    isinstance(link.get('exec_plan_item_id'), str)
+                    for link in exec_dispatch['item_links']
+                )
+            )
+
+    async def test_readback_locks_and_preserves_newer_pending_revocation_state(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test_readback_race',
+        )
+        stale_rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        expected_readback_bindings = {
+            int(row.id): _row_readback_revision_binding(row)
+            for row in stale_rows
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            submission = copy.deepcopy(row.submission_payload)
+            item_links = copy.deepcopy(submission['exec_dispatch']['item_links'])
+            submission['revision_history'] = [
+                {
+                    'decision_snapshot_id': str(self.snapshot_id),
+                    'dispatch_evidence': {
+                        'plan_id': submission['exec_dispatch']['plan_id'],
+                        'item_links': item_links,
+                    },
+                }
+            ]
+            submission['revocation'] = {
+                'status': 'pending',
+                'reason_code': 'current_live_market_risk_off',
+                'requested_at': '2026-04-30T00:05:00+00:00',
+                'prior_decision_snapshot_id': str(self.snapshot_id),
+                'replacement_decision_snapshot_id': 'observation:risk-off:readback-race',
+                'replacement_action': 'buy',
+                'replacement_actionable': False,
+                'plan_id': submission['exec_dispatch']['plan_id'],
+                'item_links': item_links,
+            }
+            submission['revocation_history'] = [
+                {
+                    'acknowledged_at': '2026-04-29T23:59:00+00:00',
+                    'request': {'plan_id': 'prior-plan', 'items': []},
+                    'response': {'plan_id': 'prior-plan', 'item_acks': []},
+                }
+            ]
+            row.decision_agent_name = 'short-term-decider'
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'raw_action': 'watch_for_trigger',
+                'handoff_intent': 'intraday_watch_buy',
+            }
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_pending'
+            row.submission_payload = submission
+            expected_lifecycle = {
+                key: copy.deepcopy(submission[key])
+                for key in ('revision_history', 'revocation', 'revocation_history')
+            }
+
+        statements: list[str] = []
+
+        def capture_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+
+        event.listen(engine, 'before_cursor_execute', capture_statement)
+        try:
+            with patch(
+                'app.orders.exec_integration.signal_decider_execution_outcome_service.sync_entry_plan_items'
+            ):
+                self.service._persist_group_readback(
+                    rows=stale_rows,
+                    expected_row_bindings=expected_readback_bindings,
+                    trigger='test_readback_race',
+                    runtime_payload={
+                        'status': 'ok',
+                        'payload': {'ready': True, 'mode': 'mock'},
+                        'error': None,
+                    },
+                    plans_result={
+                        'status': 'ok',
+                        'payload': {'items': []},
+                        'items': [],
+                        'error': None,
+                    },
+                    orders_result={'status': 'ok', 'items': [], 'error': None},
+                    executions_result={'status': 'ok', 'items': [], 'error': None},
+                    positions_result={'status': 'ok', 'items': [], 'error': None},
+                )
+        finally:
+            event.remove(engine, 'before_cursor_execute', capture_statement)
+
+        self.assertTrue(
+            any(
+                'signal_decider_execution_plan_items' in statement
+                and 'FOR UPDATE' in statement.upper()
+                for statement in statements
+            )
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_pending')
+            for key, expected in expected_lifecycle.items():
+                self.assertEqual(row.submission_payload[key], expected)
+
+    async def test_exec_readback_discards_old_plan_when_binding_changes_during_fetch(
+        self,
+    ) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='seed_readback_binding',
+        )
+        with session_scope() as session:
+            before = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            old_exec_dispatch = copy.deepcopy(before.submission_payload['exec_dispatch'])
+
+        async def replace_plan_before_persist(
+            *,
+            external_plan_id: str,
+            execution_plan_id: str,
+            symbols=None,
+        ) -> dict:
+            self.client.position_calls.append(
+                {
+                    'external_plan_id': external_plan_id,
+                    'execution_plan_id': execution_plan_id,
+                    'symbols': symbols,
+                }
+            )
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                submission = copy.deepcopy(row.submission_payload)
+                replacement = copy.deepcopy(submission['exec_dispatch'])
+                replacement['plan_id'] = 'replacement-plan-after-readback-start'
+                replacement['plan_fingerprint'] = 'replacement-plan-fingerprint'
+                replacement['dispatch_revision_fingerprint'] = _row_dispatch_revision_fingerprint(row)
+                replacement['contract_proof']['contract_ack']['plan_id'] = replacement[
+                    'plan_id'
+                ]
+                for index, link in enumerate(replacement['item_links'], start=1):
+                    link['exec_plan_id'] = replacement['plan_id']
+                    link['exec_plan_item_id'] = f'replacement-exec-item-{index}'
+                submission['exec_dispatch'] = replacement
+                row.submission_payload = submission
+            return {'items': []}
+
+        with patch.object(
+            self.client,
+            'list_positions',
+            side_effect=replace_plan_before_persist,
+        ):
+            await self.service._refresh_exec_readback(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                symbol=None,
+                trigger='test_readback_plan_replacement_race',
+                runtime_payload={'status': 'ok', 'payload': {'ready': True}, 'error': None},
+            )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            current = row.submission_payload['exec_dispatch']
+            self.assertEqual(current['plan_id'], 'replacement-plan-after-readback-start')
+            self.assertNotEqual(current['item_links'], old_exec_dispatch['item_links'])
+            self.assertNotIn('readback', current)
+            self.assertEqual(
+                current['attempts'][-1]['status'],
+                'readback_discarded_revision_mismatch',
+            )
+            self.assertEqual(
+                current['attempts'][-1]['expected_plan_id'],
+                old_exec_dispatch['plan_id'],
+            )
+
     async def test_dispatch_mode_blocks_multiple_explicit_accounts_before_exec_http(self) -> None:
         second_account_reference = f'KIS:97{uuid4().hex[:6].upper()}-01'
         settings.signal_decider_next_open_account_targets = (
@@ -1628,6 +3930,98 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             result['dispatch']['groups'][0]['error']['code'],
             'multi_account_exec_endpoint_unsupported',
         )
+
+    def test_live_dispatch_status_requires_one_explicit_valid_account_target(self) -> None:
+        settings.signal_decider_exec_runtime_mode = 'live'
+
+        invalid_target_settings = (
+            '',
+            'Main=not-a-kis-account@1500000',
+            'Synthetic=KIS:00000000-00@1500000',
+        )
+        for raw_targets in invalid_target_settings:
+            with self.subTest(raw_targets=raw_targets):
+                settings.signal_decider_next_open_account_targets = raw_targets
+
+                status = self.service.integration_status()
+
+                self.assertEqual(status['config_status'], 'not_configured')
+                self.assertIn(
+                    'live_exec_account_target_required',
+                    {issue['code'] for issue in status['issues']},
+                )
+
+        settings.signal_decider_next_open_account_targets = (
+            f'Main={self.account_reference}@1500000'
+        )
+
+        status = self.service.integration_status()
+
+        self.assertEqual(status['config_status'], 'ready')
+        self.assertNotIn(
+            'live_exec_account_target_required',
+            {issue['code'] for issue in status['issues']},
+        )
+
+    def test_paper_and_mock_dispatch_status_allow_unspecified_monitor_route(self) -> None:
+        settings.signal_decider_next_open_account_targets = ''
+
+        for runtime_mode in ('mock', 'paper'):
+            with self.subTest(runtime_mode=runtime_mode):
+                settings.signal_decider_exec_runtime_mode = runtime_mode
+
+                status = self.service.integration_status()
+
+                self.assertEqual(status['config_status'], 'ready')
+                self.assertNotIn(
+                    'live_exec_account_target_required',
+                    {issue['code'] for issue in status['issues']},
+                )
+
+    async def test_live_dispatch_without_explicit_account_target_never_posts(self) -> None:
+        settings.signal_decider_exec_runtime_mode = 'live'
+        settings.signal_decider_next_open_account_targets = ''
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='live_without_account_target',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertFalse(result['summary']['triggered'])
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        self.assertIn(
+            'live_exec_account_target_required',
+            {issue['code'] for issue in result['integration']['issues']},
+        )
+        self.assertEqual(
+            result['dispatch']['groups'][0]['error']['code'],
+            'live_exec_account_target_required',
+        )
+
+    def test_live_handoff_rejects_stale_unspecified_route_even_with_configured_target(self) -> None:
+        settings.signal_decider_exec_runtime_mode = 'live'
+        rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        snapshots = self.service._load_snapshots(rows)
+        rows[0].account_reference = 'KIS:00000000-00'
+        rows[0].account_label = 'UNSPECIFIED_ROUTE'
+
+        with self.assertRaisesRegex(
+            SignalDeciderExecPayloadContractError,
+            'live_exec_account_target_required',
+        ):
+            self.service._build_exec_plan_payload(
+                rows=rows,
+                snapshots=snapshots,
+                trigger='live_stale_unspecified_route',
+            )
 
     def test_disabled_mode_keeps_multi_account_planning_configuration_available(self) -> None:
         second_account_reference = f'KIS:97{uuid4().hex[:6].upper()}-01'
@@ -1661,6 +4055,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'raw_request_payload': {'blob': 'y' * 12000},
             },
             'symbol_day_context': {
+                'company': {'market': 'KOSPI'},
                 'pre_decider_enrichment_context': {'quote': 'available'},
                 'decision_input_quality_context': {
                     'schema_version': 'decision_input_quality_v1',
@@ -1801,14 +4196,30 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertEqual(row.submission_payload, committed_payload)
 
-        applied = cleanup_signal_decider_exec_submission_payloads(
-            dry_run=False,
-            target_trade_date=self.target_trade_date,
-            min_payload_bytes=1024,
-            limit=10,
-        )
+        statements: list[str] = []
+
+        def capture_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+
+        event.listen(engine, 'before_cursor_execute', capture_statement)
+        try:
+            applied = cleanup_signal_decider_exec_submission_payloads(
+                dry_run=False,
+                target_trade_date=self.target_trade_date,
+                min_payload_bytes=1024,
+                limit=10,
+            )
+        finally:
+            event.remove(engine, 'before_cursor_execute', capture_statement)
 
         self.assertEqual(applied['updated_count'], 1)
+        self.assertTrue(
+            any(
+                'signal_decider_execution_plan_items' in statement
+                and 'FOR UPDATE' in statement.upper()
+                for statement in statements
+            )
+        )
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             payload_text = json.dumps(row.submission_payload, ensure_ascii=False, sort_keys=True)
@@ -1846,6 +4257,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'role': 'signal-decider',
                 'agent_name': 'signal-decider',
                 'signal_decider_policy': {'current_version': self.policy_version},
+                'symbol_day_context': {
+                    'company': {'market': 'KOSPI'},
+                },
             }
             snapshot.response_payload = {
                 'role': 'signal-decider',
@@ -1885,6 +4299,97 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'preview')
         self.assertEqual(len(self.client.post_calls), 0)
 
+    async def test_dispatch_next_open_plan_refreshes_closed_market_eod_into_pending_live_cost_gate(self) -> None:
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+            snapshot.request_payload = {
+                'signal_decider_policy': {'current_version': self.policy_version},
+                'symbol_day_context': {
+                    'company': {'market': 'KOSPI'},
+                    'pre_decider_enrichment_context': self._closed_market_pre_decider_context(),
+                },
+            }
+
+        with (
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50_000}],
+            ),
+            patch(
+                'app.orders.next_open_execution.signal_decider_loop_service.get_policy_prompt_context',
+                return_value={'status': 'active'},
+            ),
+        ):
+            await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=True,
+                dry_run=False,
+                force=True,
+                trigger='test',
+            )
+
+        signal_payload = next(
+            payload
+            for payload in self.client.post_calls
+            if payload['metadata']['decision_agent_name'] == 'signal-decider'
+        )
+        entry = next(item for item in signal_payload['items'] if item['side'] == 'buy')
+        self.assertEqual(
+            entry['risk_context']['delegated_gate_codes'],
+            ['transaction_cost_evidence_pending_live_delegated_to_exec_watch'],
+        )
+        self.assertEqual(
+            entry['risk_context']['delegated_gates'][0]['observed_value'],
+            None,
+        )
+        self.assertEqual(
+            entry['risk_context']['validation']['performance_gate']['expected_return_economics']['status'],
+            'pending_live_cost_confirmation',
+        )
+
+    async def test_dispatch_next_open_plan_fails_closed_before_post_when_delegated_gate_binding_is_incomplete(
+        self,
+    ) -> None:
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+            snapshot.feedback_received_at = None
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'pre_decider_enrichment_context': self._closed_market_pre_decider_context(),
+                'warnings': [
+                    {
+                        'code': 'transaction_cost_evidence_pending_live_delegated_to_exec_watch',
+                        'message': 'Exec must confirm live cost before any buy.',
+                    }
+                ],
+                'performance_gate': {
+                    'expected_return_economics': {
+                        'status': 'pending_live_cost_confirmation',
+                        'expected_slippage_bps': None,
+                        'expected_slippage_basis': 'unavailable',
+                        'server_non_spread_round_trip_cost_basis': 'deferred_to_exec_final_full_cost_check',
+                        'estimated_total_transaction_cost_bps': None,
+                    }
+                },
+            }
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'contract_error')
+        self.assertEqual(
+            result['dispatch']['groups'][0]['error']['code'],
+            'delegated_gate_contract_invalid',
+        )
+
     async def test_dispatch_next_open_plan_respects_execution_enabled_gate(self) -> None:
         settings.signal_decider_next_open_enabled = False
         settings.signal_decider_next_open_dry_run = False
@@ -1902,12 +4407,1136 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['summary']['triggered'])
         self.assertEqual(len(self.client.post_calls), 0)
 
+    async def test_disabled_mode_revokes_existing_exec_buy_authority_before_returning(self) -> None:
+        accepted = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_delegated_authority',
+        )
+        self.assertEqual(accepted['summary']['dispatched_group_count'], 1)
+        self.client.post_calls.clear()
+        settings.signal_decider_exec_integration_mode = 'disabled'
+
+        self.assertTrue(
+            self.service.should_manage_delegated_authority(
+                target_trade_date=self.target_trade_date,
+            )
+        )
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='explicit_mode_disable',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(result['summary']['reason'], 'execution_control_disabled')
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+        self.assertFalse(
+            self.service.should_manage_delegated_authority(
+                target_trade_date=self.target_trade_date,
+            )
+        )
+
+    async def test_accepted_dispatch_persists_secret_free_destination_binding(self) -> None:
+        secret_token = 'exec-token-must-never-be-persisted'
+        settings.signal_decider_exec_base_url = 'HTTP://EXEC-A.TEST:80/api/'
+        settings.signal_decider_exec_bearer_token = secret_token
+        settings.signal_decider_exec_runtime_mode = 'paper'
+        self.client.base_url = settings.signal_decider_exec_base_url
+        self.client.bearer_token = secret_token
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='persist_destination_binding',
+        )
+
+        self.assertEqual(result['summary']['dispatched_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            exec_dispatch = row.submission_payload['exec_dispatch']
+            destination = exec_dispatch['destination_binding']
+            self.assertEqual(
+                destination,
+                exec_dispatch['contract_proof']['destination_binding'],
+            )
+            self.assertEqual(
+                destination['schema_version'],
+                'core_exec_destination_binding_v1',
+            )
+            self.assertEqual(
+                destination['contract_version'],
+                EXECUTION_HANDOFF_CONTRACT_VERSION,
+            )
+            self.assertEqual(destination['base_url'], 'http://exec-a.test:80/api')
+            self.assertEqual(destination['runtime_mode'], 'paper')
+            self.assertEqual(destination['dispatch_source'], 'kai-trading-core')
+            self.assertEqual(destination['account_reference'], self.account_reference)
+            self.assertEqual(len(destination['destination_fingerprint']), 64)
+            self.assertNotIn('bearer_token', destination)
+            self.assertNotIn(secret_token, json.dumps(row.submission_payload))
+
+    def test_integration_status_never_echoes_credentials_from_unsafe_base_url(self) -> None:
+        settings.signal_decider_exec_base_url = 'https://operator:secret@exec-a.test/api'
+
+        status = self.service.integration_status()
+
+        self.assertIsNone(status['base_url'])
+        self.assertIn('unsafe_base_url', {item['code'] for item in status['issues']})
+        self.assertNotIn('operator', json.dumps(status))
+        self.assertNotIn('secret', json.dumps(status))
+
+    async def test_noncanonical_v4_dispatch_source_is_not_ready_or_posted(self) -> None:
+        settings.signal_decider_exec_dispatch_source = 'legacy-custom-source'
+
+        status = self.service.integration_status()
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='invalid_dispatch_source',
+        )
+
+        self.assertEqual(status['config_status'], 'not_configured')
+        self.assertEqual(status['dispatch_source'], 'kai-trading-core')
+        self.assertIn(
+            'invalid_dispatch_source',
+            {item['code'] for item in status['issues']},
+        )
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        self.assertEqual(self.client.post_calls, [])
+
+    async def test_restart_destination_change_never_revokes_old_authority_on_new_exec(
+        self,
+    ) -> None:
+        old_token = 'old-exec-token'
+        settings.signal_decider_exec_bearer_token = old_token
+        self.client.bearer_token = old_token
+        accepted = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_old_exec_authority',
+        )
+        self.assertEqual(accepted['summary']['dispatched_group_count'], 1)
+
+        settings.signal_decider_exec_base_url = 'https://exec-b.test/runtime/'
+        settings.signal_decider_exec_bearer_token = 'new-exec-token'
+        settings.signal_decider_exec_integration_mode = 'disabled'
+        restarted_client = FakeExecClient()
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=restarted_client
+        )
+
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='restart_with_different_exec_destination',
+        )
+
+        self.assertEqual(restarted_client.revocation_calls, [])
+        self.assertEqual(result['summary']['revoked_group_count'], 0)
+        self.assertEqual(result['summary']['revocation_manual_review_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'exec_destination_mismatch',
+            )
+            self.assertEqual(
+                row.submission_payload['revocation']['destination_binding'],
+                row.submission_payload['exec_dispatch']['destination_binding'],
+            )
+
+    async def test_restart_runtime_change_never_revokes_old_authority(self) -> None:
+        accepted = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_mock_exec_authority',
+        )
+        self.assertEqual(accepted['summary']['dispatched_group_count'], 1)
+
+        settings.signal_decider_exec_runtime_mode = 'live'
+        settings.signal_decider_exec_integration_mode = 'disabled'
+        restarted_client = FakeExecClient()
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=restarted_client
+        )
+
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='restart_with_different_exec_runtime',
+        )
+
+        self.assertEqual(restarted_client.revocation_calls, [])
+        self.assertEqual(result['summary']['revocation_manual_review_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'exec_destination_mismatch',
+            )
+
+    async def test_bearer_rotation_keeps_same_destination_revocation_safe(self) -> None:
+        settings.signal_decider_exec_bearer_token = 'token-before-rotation'
+        self.client.bearer_token = settings.signal_decider_exec_bearer_token
+        accepted = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_before_token_rotation',
+        )
+        self.assertEqual(accepted['summary']['dispatched_group_count'], 1)
+
+        settings.signal_decider_exec_bearer_token = 'token-after-rotation'
+        settings.signal_decider_exec_integration_mode = 'disabled'
+        restarted_client = FakeExecClient()
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=restarted_client
+        )
+
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='restart_after_token_rotation',
+        )
+
+        self.assertEqual(len(restarted_client.revocation_calls), 1)
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+
+    async def test_legacy_unproven_accepted_authority_is_never_redispatched(
+        self,
+    ) -> None:
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.execution_status = EXECUTION_STATUS_SUBMITTED
+            row.submitted_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+            row.submission_payload = {
+                'mode': 'exec_dispatch',
+                'exec_dispatch': {
+                    'plan_id': 'legacy-accepted-plan',
+                    'dispatch_status': 'accepted',
+                    'item_links': [
+                        {
+                            'core_item_key': f'core-plan-{self.plan_item_id}:next_open_buy',
+                            'intent': 'next_open_buy',
+                            'side': 'buy',
+                            'exec_plan_id': 'legacy-accepted-plan',
+                            'exec_plan_item_id': 'legacy-exec-item',
+                            'remote_status': 'accepted',
+                        }
+                    ],
+                },
+            }
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='legacy_rollout_guard',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertFalse(result['summary']['triggered'])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'unproven_remote_acceptance',
+            )
+
+    async def test_dispatch_write_ahead_survives_crash_after_remote_ack(self) -> None:
+        original_persist = self.service._persist_dispatch_success
+
+        with patch.object(
+            self.service,
+            '_persist_dispatch_success',
+            side_effect=SystemExit('simulated crash after remote ACK'),
+        ):
+            with self.assertRaisesRegex(SystemExit, 'simulated crash'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_after_remote_ack',
+                )
+
+        self.assertIsNotNone(original_persist)
+        self.assertEqual(len(self.client.post_calls), 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'dispatch_pending_remote_ack')
+            exec_dispatch = row.submission_payload['exec_dispatch']
+            self.assertEqual(exec_dispatch['dispatch_status'], 'pending_remote_ack')
+            self.assertEqual(
+                exec_dispatch['dispatch_material_fingerprint'],
+                self.client.post_calls[0]['metadata'][
+                    'dispatch_material_fingerprint'
+                ],
+            )
+            self.assertEqual(
+                exec_dispatch['destination_binding']['base_url'],
+                'http://exec.test:80',
+            )
+            self.assertEqual(
+                {link['core_item_key'] for link in exec_dispatch['item_links']},
+                {
+                    item['core_item_key']
+                    for item in self.client.post_calls[0]['items']
+                },
+            )
+
+    async def test_disabled_mode_recovers_pending_remote_ack_and_revokes_authority(self) -> None:
+        original_post = self.client.post_execution_plan
+
+        async def accept_and_publish_readback(payload: dict) -> dict:
+            response = await original_post(payload)
+            self.client.plan_response = {
+                'items': [
+                    {
+                        **copy.deepcopy(response),
+                        'external_plan_id': payload['plan_id'],
+                        'status': 'accepted',
+                    }
+                ]
+            }
+            return response
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=accept_and_publish_readback,
+        ), patch.object(
+            self.service,
+            '_persist_dispatch_success',
+            side_effect=SystemExit('simulated crash after remote ACK'),
+        ):
+            with self.assertRaises(SystemExit):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_before_disabled_recovery',
+                )
+
+        settings.signal_decider_exec_integration_mode = 'disabled'
+        restarted_service = SignalDeciderExecIntegrationService(client=self.client)
+        self.assertTrue(
+            restarted_service.should_manage_delegated_authority(
+                target_trade_date=self.target_trade_date,
+            )
+        )
+
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=False,
+            trigger='disabled_write_ahead_recovery',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertGreaterEqual(len(self.client.plan_calls), 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            self.client.revocation_calls[0]['reason_code'],
+            'policy_scope_changed',
+        )
+        self.assertEqual(result['summary']['reason'], 'execution_control_disabled')
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'policy_scope_changed',
+            )
+            self.assertEqual(
+                row.submission_payload['revocation']['status'],
+                'acknowledged',
+            )
+            self.assertNotIn('exec_dispatch', row.submission_payload)
+
+    async def test_restart_recovers_exact_accepted_write_ahead_before_refresh(
+        self,
+    ) -> None:
+        original_post = self.client.post_execution_plan
+
+        async def accept_and_publish_readback(payload: dict) -> dict:
+            response = await original_post(payload)
+            self.client.plan_response = {
+                'items': [
+                    {
+                        **copy.deepcopy(response),
+                        'external_plan_id': payload['plan_id'],
+                        'status': 'accepted',
+                    }
+                ]
+            }
+            return response
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=accept_and_publish_readback,
+        ), patch.object(
+            self.service,
+            '_persist_dispatch_success',
+            side_effect=SystemExit('simulated crash after remote ACK'),
+        ):
+            with self.assertRaises(SystemExit):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_before_success_persist',
+                )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=True,
+            force=False,
+            trigger='restart_reconcile_write_ahead',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertGreaterEqual(len(self.client.plan_calls), 1)
+        self.assertFalse(result['summary']['triggered'])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertIn(
+                row.execution_status,
+                {
+                    EXECUTION_STATUS_SUBMITTED,
+                    EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+                },
+            )
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+    async def test_restart_retries_exact_write_ahead_after_confirmed_not_found(
+        self,
+    ) -> None:
+        async def crash_before_remote_send(payload: dict) -> dict:
+            raise SystemExit('simulated crash before remote send')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_before_remote_send,
+        ):
+            with self.assertRaisesRegex(SystemExit, 'before remote send'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_before_remote_send',
+                )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=False,
+            trigger='restart_retry_exact_write_ahead',
+        )
+
+        self.assertEqual(len(self.client.plan_calls), 1)
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+    async def test_restart_drops_not_found_write_ahead_when_decision_changed(
+        self,
+    ) -> None:
+        async def crash_before_remote_send(payload: dict) -> dict:
+            raise SystemExit('simulated crash before remote send')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_before_remote_send,
+        ):
+            with self.assertRaises(SystemExit):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_before_changed_decision',
+                )
+
+        with session_scope() as session:
+            prior = session.get(
+                SignalDeciderDecisionSnapshot,
+                self.snapshot_id,
+            )
+            values = {
+                column.name: copy.deepcopy(getattr(prior, column.name))
+                for column in SignalDeciderDecisionSnapshot.__table__.columns
+                if column.name not in {'id', 'created_at', 'updated_at'}
+            }
+            values.update(
+                {
+                    'feedback_received_at': datetime(
+                        2026,
+                        4,
+                        29,
+                        6,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                    'decision_action': 'wait',
+                    'preferred_action': 'wait',
+                    'next_day_open_action': 'wait',
+                    'response_payload': {'next_day_open_action': 'wait'},
+                }
+            )
+            session.add(SignalDeciderDecisionSnapshot(**values))
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=True,
+            force=False,
+            trigger='restart_with_changed_decision',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(self.client.revocation_calls, [])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertNotEqual(
+                row.execution_status,
+                'dispatch_pending_remote_ack',
+            )
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(
+                row.validation_payload['blocking_reasons'][0]['code'],
+                'latest_snapshot_not_actionable',
+            )
+
+    async def test_concurrent_workers_converge_after_201_and_409(self) -> None:
+        first_started = asyncio.Event()
+        allow_first_to_finish = asyncio.Event()
+        first_published = asyncio.Event()
+        post_attempt_count = 0
+        original_post = self.client.post_execution_plan
+
+        async def concurrent_post(payload: dict) -> dict:
+            nonlocal post_attempt_count
+            post_attempt_count += 1
+            if post_attempt_count == 1:
+                first_started.set()
+                await allow_first_to_finish.wait()
+                response = await original_post(payload)
+                self.client.plan_response = {
+                    'items': [
+                        {
+                            **copy.deepcopy(response),
+                            'external_plan_id': payload['plan_id'],
+                            'status': 'accepted',
+                        }
+                    ]
+                }
+                first_published.set()
+                return response
+            allow_first_to_finish.set()
+            await first_published.wait()
+            raise SignalDeciderExecClientError(
+                'concurrent execution plan already accepted',
+                code='conflict',
+                retryable=False,
+                status_code=409,
+            )
+
+        second_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=concurrent_post,
+        ):
+            first_task = asyncio.create_task(
+                self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='concurrent_worker_one',
+                )
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            second_task = asyncio.create_task(
+                second_service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=False,
+                    trigger='concurrent_worker_two',
+                )
+            )
+            await asyncio.wait_for(
+                asyncio.gather(first_task, second_task),
+                timeout=5,
+            )
+
+        self.assertEqual(post_attempt_count, 2)
+        self.assertEqual(self.client.revocation_calls, [])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+            self.assertNotIn('revocation', row.submission_payload)
+
+    async def test_restart_destination_change_quarantines_pending_write_ahead(
+        self,
+    ) -> None:
+        with patch.object(
+            self.service,
+            '_persist_dispatch_success',
+            side_effect=SystemExit('simulated crash after remote ACK'),
+        ):
+            with self.assertRaises(SystemExit):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_before_destination_change',
+                )
+
+        settings.signal_decider_exec_base_url = 'http://exec-b.test'
+        replacement_client = FakeExecClient(base_url='http://exec-b.test')
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=replacement_client
+        )
+        await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=True,
+            force=True,
+            trigger='restart_on_different_destination',
+        )
+
+        self.assertEqual(replacement_client.plan_calls, [])
+        self.assertEqual(replacement_client.post_calls, [])
+        self.assertEqual(replacement_client.revocation_calls, [])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation'][
+                    'reason_code'
+                ],
+                'exec_destination_mismatch',
+            )
+
+    async def test_duplicate_success_persistence_is_idempotent(self) -> None:
+        detached_rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        payload, row_links = self.service._build_exec_plan_payload(
+            rows=detached_rows,
+            snapshots=self.service._load_snapshots(detached_rows),
+            trigger='concurrent_success_persistence',
+        )
+        revision_fingerprints = {
+            int(row.id): _row_dispatch_revision_fingerprint(row)
+            for row in detached_rows
+        }
+        fingerprint = _fingerprint_exec_plan(payload)
+        self.service._persist_dispatch_write_ahead(
+            rows=detached_rows,
+            submitted_revision_fingerprints=revision_fingerprints,
+            row_links=row_links,
+            plan_id=payload['plan_id'],
+            fingerprint=fingerprint,
+            payload=payload,
+            trigger='concurrent_success_persistence',
+            destination_binding=self.service._destination_binding_for_payload(
+                payload
+            ),
+            authority_generation_before=None,
+        )
+        response = await self.client.post_execution_plan(payload)
+
+        first = self.service._persist_dispatch_success(
+            rows=detached_rows,
+            submitted_revision_fingerprints=revision_fingerprints,
+            row_links=row_links,
+            plan_id=payload['plan_id'],
+            fingerprint=fingerprint,
+            payload=payload,
+            response_payload=response,
+            trigger='first_success_writer',
+        )
+        second = self.service._persist_dispatch_success(
+            rows=detached_rows,
+            submitted_revision_fingerprints=revision_fingerprints,
+            row_links=row_links,
+            plan_id=payload['plan_id'],
+            fingerprint=fingerprint,
+            payload=payload,
+            response_payload=response,
+            trigger='second_success_writer',
+        )
+
+        self.assertEqual(first['dispatch_status'], 'accepted')
+        self.assertEqual(second['dispatch_status'], 'accepted')
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+            self.assertNotIn('revocation', row.submission_payload)
+
+    async def test_write_ahead_409_recovers_only_exact_remote_material(
+        self,
+    ) -> None:
+        submitted_payload: dict = {}
+
+        async def crash_before_remote_send(payload: dict) -> dict:
+            submitted_payload.update(copy.deepcopy(payload))
+            raise SystemExit('simulated crash before remote send')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_before_remote_send,
+        ):
+            with self.assertRaises(SystemExit):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='seed_pending_for_409_recovery',
+                )
+
+        exact_response = await FakeExecClient.post_execution_plan(
+            self.client,
+            submitted_payload,
+        )
+        exact_readback = {
+            'items': [
+                {
+                    **copy.deepcopy(exact_response),
+                    'external_plan_id': submitted_payload['plan_id'],
+                    'status': 'accepted',
+                }
+            ]
+        }
+        self.client.post_calls.clear()
+        readback_count = 0
+
+        async def readback_after_duplicate(
+            *, external_plan_id: str | None = None
+        ) -> dict:
+            nonlocal readback_count
+            self.client.plan_calls.append(
+                {'external_plan_id': external_plan_id}
+            )
+            readback_count += 1
+            return {'items': []} if readback_count == 1 else exact_readback
+
+        async def duplicate_conflict(payload: dict) -> dict:
+            self.client.post_calls.append(copy.deepcopy(payload))
+            raise SignalDeciderExecClientError(
+                'execution plan already exists',
+                code='conflict',
+                retryable=False,
+                status_code=409,
+            )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        with patch.object(
+            self.client,
+            'list_execution_plans',
+            side_effect=readback_after_duplicate,
+        ), patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=duplicate_conflict,
+        ):
+            await restarted_service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                force=False,
+                trigger='recover_exact_409_material',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(readback_count, 2)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+            self.assertNotIn('revocation', row.submission_payload)
+
+    async def test_write_ahead_409_with_old_material_enters_manual_review(
+        self,
+    ) -> None:
+        submitted_payload: dict = {}
+
+        async def crash_before_remote_send(payload: dict) -> dict:
+            submitted_payload.update(copy.deepcopy(payload))
+            raise SystemExit('simulated crash before remote send')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_before_remote_send,
+        ):
+            with self.assertRaises(SystemExit):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='seed_pending_for_old_409',
+                )
+
+        old_response = await FakeExecClient.post_execution_plan(
+            self.client,
+            submitted_payload,
+        )
+        old_response['contract_ack']['dispatch_material_fingerprint'] = '0' * 64
+        old_readback = {
+            'items': [
+                {
+                    **copy.deepcopy(old_response),
+                    'external_plan_id': submitted_payload['plan_id'],
+                    'status': 'accepted',
+                }
+            ]
+        }
+        self.client.post_calls.clear()
+        readback_count = 0
+
+        async def readback_after_duplicate(
+            *, external_plan_id: str | None = None
+        ) -> dict:
+            nonlocal readback_count
+            self.client.plan_calls.append(
+                {'external_plan_id': external_plan_id}
+            )
+            readback_count += 1
+            return {'items': []} if readback_count == 1 else old_readback
+
+        async def duplicate_conflict(payload: dict) -> dict:
+            self.client.post_calls.append(copy.deepcopy(payload))
+            raise SignalDeciderExecClientError(
+                'plan id belongs to older dispatch material',
+                code='conflict',
+                retryable=False,
+                status_code=409,
+            )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        with patch.object(
+            self.client,
+            'list_execution_plans',
+            side_effect=readback_after_duplicate,
+        ), patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=duplicate_conflict,
+        ):
+            await restarted_service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                force=False,
+                trigger='reject_old_409_material',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.revocation_calls, [])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertIn(
+                row.submission_payload['dispatch_reconciliation'][
+                    'reason_code'
+                ],
+                {
+                    'ambiguous_remote_acceptance',
+                    'ambiguous_remote_acceptance_after_core_revision',
+                },
+            )
+
+    async def test_restart_revokes_recovered_ack_when_latest_decision_changed(
+        self,
+    ) -> None:
+        original_post = self.client.post_execution_plan
+
+        async def accept_and_publish_readback(payload: dict) -> dict:
+            response = await original_post(payload)
+            self.client.plan_response = {
+                'items': [
+                    {
+                        **copy.deepcopy(response),
+                        'external_plan_id': payload['plan_id'],
+                        'status': 'accepted',
+                    }
+                ]
+            }
+            return response
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=accept_and_publish_readback,
+        ), patch.object(
+            self.service,
+            '_persist_dispatch_success',
+            side_effect=SystemExit('simulated crash after remote ACK'),
+        ):
+            with self.assertRaises(SystemExit):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='crash_before_new_wait',
+                )
+
+        with session_scope() as session:
+            prior = session.get(
+                SignalDeciderDecisionSnapshot,
+                self.snapshot_id,
+            )
+            values = {
+                column.name: copy.deepcopy(getattr(prior, column.name))
+                for column in SignalDeciderDecisionSnapshot.__table__.columns
+                if column.name not in {'id', 'created_at', 'updated_at'}
+            }
+            values.update(
+                {
+                    'feedback_received_at': datetime(
+                        2026,
+                        4,
+                        29,
+                        6,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                    'decision_action': 'wait',
+                    'preferred_action': 'wait',
+                    'next_day_open_action': 'wait',
+                    'response_payload': {'next_day_open_action': 'wait'},
+                }
+            )
+            session.add(SignalDeciderDecisionSnapshot(**values))
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=True,
+            force=False,
+            trigger='restart_after_new_wait',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'latest_snapshot_not_actionable',
+            )
+
+    async def test_disabled_mode_reconciles_ambiguous_acceptance_before_revocation(self) -> None:
+        submitted_payload: dict = {}
+
+        async def timeout_without_visible_readback(payload: dict) -> dict:
+            submitted_payload.update(copy.deepcopy(payload))
+            self.client.post_calls.append(payload)
+            self.client.plan_response = {'items': []}
+            raise SignalDeciderExecClientError(
+                'exec request timed out before ACK',
+                code='unavailable',
+                retryable=True,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=timeout_without_visible_readback,
+        ):
+            await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='seed_ambiguous_remote_acceptance',
+            )
+
+        self.assertTrue(submitted_payload)
+        self.client.plan_response = _accepted_plan_readback_for_payload(
+            submitted_payload
+        )
+        settings.signal_decider_exec_integration_mode = 'disabled'
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='disable_after_ambiguous_acceptance',
+        )
+
+        self.assertGreaterEqual(len(self.client.plan_calls), 2)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'execution_control_disabled',
+            )
+
+    async def test_ambiguous_readback_never_crosses_exec_destination(self) -> None:
+        submitted_payload: dict = {}
+
+        async def timeout_after_send(payload: dict) -> dict:
+            submitted_payload.update(copy.deepcopy(payload))
+            raise SignalDeciderExecClientError(
+                'exec request timed out after send',
+                code='unavailable',
+                retryable=True,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=timeout_after_send,
+        ):
+            await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                force=True,
+                trigger='seed_ambiguous_destination_a',
+            )
+
+        self.assertTrue(submitted_payload)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            original_links = copy.deepcopy(
+                row.submission_payload['exec_dispatch']['item_links']
+            )
+
+        settings.signal_decider_exec_integration_mode = 'disabled'
+        settings.signal_decider_exec_base_url = 'http://exec-b.test'
+        destination_b = FakeExecClient(base_url='http://exec-b.test')
+        destination_b.plan_response = {
+            'items': [
+                {
+                    'external_plan_id': submitted_payload['plan_id'],
+                    'execution_plan_id': 'exec-plan-from-b',
+                    'status': 'accepted',
+                    'items': [
+                        {
+                            'core_item_key': item['core_item_key'],
+                            'execution_plan_id': 'exec-plan-from-b',
+                            'execution_plan_item_id': f'exec-b-{index}',
+                            'symbol': item['symbol'],
+                            'intent': item['intent'],
+                            'status': 'accepted',
+                        }
+                        for index, item in enumerate(
+                            submitted_payload['items'],
+                            start=1,
+                        )
+                    ],
+                }
+            ]
+        }
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=destination_b
+        )
+
+        await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='ambiguous_readback_on_destination_b',
+        )
+
+        self.assertEqual(destination_b.plan_calls, [])
+        self.assertEqual(destination_b.order_calls, [])
+        self.assertEqual(destination_b.execution_calls, [])
+        self.assertEqual(destination_b.position_calls, [])
+        self.assertEqual(destination_b.revocation_calls, [])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation'][
+                    'reason_code'
+                ],
+                'exec_destination_mismatch',
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['item_links'],
+                original_links,
+            )
+
+    async def test_next_open_disable_revokes_existing_exec_buy_authority_before_returning(self) -> None:
+        accepted = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_delegated_authority',
+        )
+        self.assertEqual(accepted['summary']['dispatched_group_count'], 1)
+        self.client.post_calls.clear()
+        settings.signal_decider_next_open_enabled = False
+
+        self.assertTrue(
+            self.service.should_manage_delegated_authority(
+                target_trade_date=self.target_trade_date,
+            )
+        )
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='explicit_next_open_disable',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(result['summary']['reason'], 'execution_disabled')
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+
     async def test_dispatch_next_open_plan_includes_short_term_groups_with_explicit_identity(self) -> None:
         decider_request_payload = {
             'symbol_day_context': {
+                'company': {'market': 'KOSPI'},
                 'pre_decider_enrichment_context': {
                     'schema_version': 'pre_decider_enrichment_v1',
-                    'quote_orderbook_snapshot': {'status': 'stale_eod'},
+                    'quote_orderbook_snapshot': {'status': 'stale_eod', 'spread_bps': 17.5},
                     'trading_value': {
                         'status': 'available',
                         'source': 'raw',
@@ -1934,6 +5563,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'status': 'usable',
                         'liquidity_tier': 'medium',
                         'max_safe_notional_krw': 49350000,
+                        'expected_slippage_bps': 17.5,
+                        'expected_slippage_basis': 'quote_spread_bps',
                         'sizing_hints': [{'code': 'max_safe_notional', 'max_safe_notional_krw': 49350000}],
                     },
                     'final_judgment': {
@@ -1973,9 +5604,43 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'probe_quantity': 1,
         }
         with session_scope() as session:
+            signal_row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            signal_row.validation_payload = {
+                **(signal_row.validation_payload or {}),
+                'pre_decider_enrichment_context': self._closed_market_pre_decider_context(),
+                'warnings': [
+                    {
+                        'code': 'transaction_cost_evidence_pending_live_delegated_to_exec_watch',
+                        'message': 'Exec must confirm live cost before any buy.',
+                    }
+                ],
+                'performance_gate': {
+                    'expected_return_economics': {
+                        'status': 'pending_live_cost_confirmation',
+                        'expected_slippage_bps': None,
+                        'expected_slippage_basis': 'unavailable',
+                        'server_non_spread_round_trip_cost_basis': 'deferred_to_exec_final_full_cost_check',
+                        'estimated_total_transaction_cost_bps': None,
+                    }
+                },
+            }
             row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
             row.validation_payload = {
                 **(row.validation_payload or {}),
+                'warnings': [
+                    {
+                        'code': 'short_term_liquidity_floor_block_delegated_to_exec_watch',
+                        'message': 'Exec must confirm liquidity at trigger time.',
+                    },
+                    {
+                        'code': 'short_term_reward_risk_ratio_block_delegated_to_exec_watch',
+                        'message': 'Exec must confirm reward/risk at trigger time.',
+                    },
+                ],
+                'short_term_entry_quality': {
+                    'raw_trading_value_krw': 2_500_000_000,
+                    'reward_risk_ratio': '1.50',
+                },
                 'alignment_gate': alignment_gate,
                 'signal_decider_alignment': 'wait_conflict_block',
                 'alignment_gate_action': 'report_only_block_candidate',
@@ -2018,6 +5683,31 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_entry['risk_context']['market_regime_context']['recommended_exec_action'], 'downsize')
         self.assertEqual(signal_entry['risk_context']['max_holding_close_policy']['enabled'], False)
         self.assertIsNone(signal_entry['risk_context']['max_holding_close_policy']['max_holding_trading_sessions'])
+        self.assertEqual(
+            signal_entry['risk_context']['delegated_gate_codes'],
+            ['transaction_cost_evidence_pending_live_delegated_to_exec_watch'],
+        )
+        self.assertEqual(
+            signal_entry['risk_context']['delegated_gates'],
+            [
+                {
+                    'code': 'transaction_cost_evidence_pending_live_delegated_to_exec_watch',
+                    'observed_value': None,
+                    'field_path': 'risk_context.execution_feasibility_context.expected_slippage_bps',
+                    'comparator': 'finite_non_negative_with_basis',
+                    'threshold': '0',
+                    'policy_version': 'core_delegated_gate_policy_v1',
+                    'observed_at': '2026-04-29T06:00:00+00:00',
+                    'recheck_source': 'exec_trigger_time_quote_and_cost_model',
+                    'expires_at': '2026-04-30T15:30:00+09:00',
+                }
+            ],
+        )
+        self.assertIsNone(signal_entry['risk_context']['delegated_gates'][0]['observed_value'])
+        self.assertLessEqual(
+            datetime.fromisoformat(signal_entry['risk_context']['delegated_gates'][0]['observed_at']),
+            datetime.fromisoformat(signal_entry['risk_context']['delegated_gates'][0]['expires_at']),
+        )
         self.assertNotIn('max_holding_close_sell', [item['intent'] for item in signal_payload['items']])
         short_entry = short_payload['items'][0]
         self.assertEqual(short_entry['decision_agent_name'], 'short-term-decider')
@@ -2125,6 +5815,57 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             short_entry['risk_context']['execution_feasibility_context']['liquidity_tier'],
             'medium',
         )
+        self.assertEqual(
+            short_entry['risk_context']['delegated_gate_codes'],
+            [
+                'short_term_liquidity_floor_block_delegated_to_exec_watch',
+                'short_term_reward_risk_ratio_block_delegated_to_exec_watch',
+            ],
+        )
+        self.assertTrue(short_entry['risk_context']['delegated_gate_confirmation_required'])
+        self.assertEqual(
+            short_entry['risk_context']['delegated_gates'],
+            [
+                {
+                    'code': 'short_term_liquidity_floor_block_delegated_to_exec_watch',
+                    'observed_value': '2500000000',
+                    'field_path': 'risk_context.validation.short_term_entry_quality.raw_trading_value_krw',
+                    'comparator': 'gte',
+                    'threshold': '3000000000',
+                    'policy_version': 'core_delegated_gate_policy_v1',
+                    'observed_at': '2026-04-29T06:00:00+00:00',
+                    'recheck_source': 'exec_trigger_time_market_liquidity',
+                    'expires_at': '2026-04-30T15:30:00+09:00',
+                },
+                {
+                    'code': 'short_term_reward_risk_ratio_block_delegated_to_exec_watch',
+                    'observed_value': '1.50',
+                    'field_path': 'risk_context.validation.short_term_entry_quality.reward_risk_ratio',
+                    'comparator': 'gte',
+                    'threshold': '1.80',
+                    'policy_version': 'core_delegated_gate_policy_v1',
+                    'observed_at': '2026-04-29T06:00:00+00:00',
+                    'recheck_source': 'exec_trigger_time_price_geometry_and_cost_model',
+                    'expires_at': '2026-04-30T15:30:00+09:00',
+                },
+            ],
+        )
+        self.assertEqual(
+            short_entry['risk_context']['execution_feasibility_context']['expected_slippage_bps'],
+            17.5,
+        )
+        self.assertEqual(
+            short_entry['risk_context']['execution_feasibility_context']['expected_slippage_basis'],
+            'quote_spread_bps',
+        )
+        self.assertNotIn('delegated_gate_codes', handoff['traceability'])
+        self.assertNotIn('delegated_gate_confirmation_required', handoff['traceability'])
+        self.assertNotIn('delegated_gates', handoff['traceability'])
+        for exit_intent in (EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL):
+            exit_risk = short_items_by_intent[exit_intent]['risk_context']
+            self.assertNotIn('delegated_gate_codes', exit_risk)
+            self.assertNotIn('delegated_gate_confirmation_required', exit_risk)
+            self.assertNotIn('delegated_gates', exit_risk)
         self.assertEqual(Decimal(str(handoff['decider_output']['confidence_score_10'])), Decimal('5.2'))
         self.assertIn('sizing_hints', short_entry['quantity_policy'])
         self.assertEqual(short_entry['quantity_policy']['max_safe_notional_krw'], 49350000)
@@ -2189,8 +5930,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             if payload['metadata']['decision_agent_name'] == 'short-term-decider'
         )
         entry = next(item for item in short_payload['items'] if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY)
-        self.assertEqual(entry['quantity_policy']['type'], 'fixed_quantity')
-        self.assertEqual(entry['quantity_policy']['quantity'], '2')
+        self.assertEqual(entry['quantity_policy']['type'], 'exec_agent_sized')
+        self.assertEqual(entry['quantity_policy']['max_quantity'], '2')
+        self.assertNotIn('quantity', entry['quantity_policy'])
         self.assertEqual(entry['quantity_policy']['enforcement_source'], 'core_wait_conflict_alignment_gate')
         self.assertEqual(entry['quantity_policy']['requested_quantity'], '29')
         self.assertEqual(entry['quantity_policy']['final_quantity'], '2')
@@ -2442,11 +6184,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
-            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMIT_FAILED)
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
             exec_dispatch = row.submission_payload['exec_dispatch']
             self.assertEqual(exec_dispatch['dispatch_status'], 'unavailable')
             self.assertIsNone(exec_dispatch.get('last_success_at'))
             self.assertEqual(exec_dispatch['last_error']['code'], 'unavailable')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'ambiguous_remote_acceptance',
+            )
             self.assertEqual(
                 {link['core_item_key'] for link in exec_dispatch['item_links']},
                 {
@@ -2455,6 +6201,42 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     f'core-plan-{self.plan_item_id}:stop_sell',
                 },
             )
+        self.assertTrue(
+            self.service.should_manage_delegated_authority(
+                target_trade_date=self.target_trade_date,
+            )
+        )
+
+    async def test_invalid_dispatch_ack_remains_managed_as_ambiguous_remote_acceptance(
+        self,
+    ) -> None:
+        async def invalid_ack(payload: dict) -> dict:
+            self.client.post_calls.append(payload)
+            return {'plan_id': payload['plan_id'], 'status': 'accepted'}
+
+        with patch.object(self.client, 'post_execution_plan', side_effect=invalid_ack):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_invalid_ack_ambiguous_acceptance',
+            )
+
+        self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'contract_error')
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'ambiguous_remote_acceptance',
+            )
+        self.assertTrue(
+            self.service.should_manage_delegated_authority(
+                target_trade_date=self.target_trade_date,
+            )
+        )
 
     async def test_dispatch_next_open_plan_short_term_idempotent_redispatch_skips_duplicate_payload(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
@@ -2495,6 +6277,372 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_group['dispatch_status'], 'already_dispatched')
         self.assertEqual(short_group['plan_id'], first_short_group['plan_id'])
         self.assertEqual(len(self.client.post_calls), first_post_call_count)
+
+    async def test_accepted_dispatch_proof_binds_request_and_response_material_fingerprint(
+        self,
+    ) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test_fingerprint_bound_proof',
+        )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            original = copy.deepcopy(row.submission_payload)
+            exec_dispatch = original['exec_dispatch']
+            expected = exec_dispatch['contract_proof'][
+                'dispatch_material_fingerprint'
+            ]
+            self.assertEqual(
+                exec_dispatch['last_request_summary']['metadata'][
+                    'dispatch_material_fingerprint'
+                ],
+                expected,
+            )
+            self.assertEqual(
+                exec_dispatch['last_response_summary']['contract_ack'][
+                    'dispatch_material_fingerprint'
+                ],
+                expected,
+            )
+            expected_item_bindings = [
+                {
+                    'core_item_key': link['core_item_key'],
+                    'execution_plan_id': link['exec_plan_id'],
+                    'execution_plan_item_id': link['exec_plan_item_id'],
+                }
+                for link in exec_dispatch['item_links']
+            ]
+            self.assertEqual(
+                exec_dispatch['contract_proof']['accepted_item_bindings'],
+                expected_item_bindings,
+            )
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+            for summary_key, path_key in (
+                ('last_request_summary', 'metadata'),
+                ('last_response_summary', 'contract_ack'),
+            ):
+                with self.subTest(summary_key=summary_key):
+                    mismatched = copy.deepcopy(original)
+                    mismatched['exec_dispatch'][summary_key][path_key][
+                        'dispatch_material_fingerprint'
+                    ] = 'b' * 64
+                    row.submission_payload = mismatched
+                    self.assertFalse(_row_has_accepted_exec_dispatch(row))
+            with self.subTest(summary_key='accepted_item_bindings'):
+                mismatched = copy.deepcopy(original)
+                mismatched['exec_dispatch']['contract_proof'][
+                    'accepted_item_bindings'
+                ][0]['execution_plan_item_id'] = 'exec-item-from-other-plan'
+                row.submission_payload = mismatched
+                self.assertFalse(_row_has_accepted_exec_dispatch(row))
+            with self.subTest(summary_key='item_links'):
+                mismatched = copy.deepcopy(original)
+                mismatched['exec_dispatch']['item_links'][0][
+                    'exec_plan_item_id'
+                ] = 'exec-item-from-other-plan'
+                row.submission_payload = mismatched
+                self.assertFalse(_row_has_accepted_exec_dispatch(row))
+            for summary_key in ('contract_proof', 'last_response_summary'):
+                with self.subTest(summary_key=summary_key, field='execution_plan_id'):
+                    mismatched = copy.deepcopy(original)
+                    mismatched['exec_dispatch'][summary_key][
+                        'execution_plan_id'
+                    ] = 'exec-plan-from-other-ack'
+                    row.submission_payload = mismatched
+                    self.assertFalse(_row_has_accepted_exec_dispatch(row))
+            row.submission_payload = original
+
+    async def test_accepted_dispatch_proof_binds_distinct_exec_internal_plan_id(
+        self,
+    ) -> None:
+        internal_execution_plan_id = '8b3ea236-90b2-4ec6-a68c-f86e05499f3c'
+        self.client.execution_plan_id_override = internal_execution_plan_id
+
+        first = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test_distinct_exec_internal_plan_id',
+        )
+
+        self.assertEqual(first['summary']['dispatched_group_count'], 1)
+        self.assertEqual(len(self.client.post_calls), 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            exec_dispatch = row.submission_payload['exec_dispatch']
+            external_plan_id = exec_dispatch['plan_id']
+            self.assertNotEqual(external_plan_id, internal_execution_plan_id)
+            self.assertEqual(
+                exec_dispatch['contract_proof']['execution_plan_id'],
+                internal_execution_plan_id,
+            )
+            self.assertEqual(
+                exec_dispatch['last_response_summary']['execution_plan_id'],
+                internal_execution_plan_id,
+            )
+            self.assertEqual(
+                {link['exec_plan_id'] for link in exec_dispatch['item_links']},
+                {internal_execution_plan_id},
+            )
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+            self.assertEqual(
+                self.service._fence_unproven_remote_acceptance(
+                    rows=[row],
+                    trigger='test_distinct_exec_internal_plan_id',
+                ),
+                0,
+            )
+        second = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test_distinct_exec_internal_plan_id_replay',
+        )
+        self.assertEqual(second['summary']['dispatched_group_count'], 0)
+        self.assertEqual(second['summary']['skipped_group_count'], 1)
+        self.assertEqual(len(self.client.post_calls), 1)
+
+    async def test_readback_cannot_replace_ack_bound_item_identity_before_revocation(
+        self,
+    ) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='seed_ack_bound_identity',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            submission = copy.deepcopy(row.submission_payload)
+            original_links = copy.deepcopy(
+                submission['exec_dispatch']['item_links']
+            )
+            submission['exec_dispatch']['readback'] = {
+                'last_synced_at': '2026-04-30T00:01:00+00:00',
+                'orders': {
+                    'status': 'ok',
+                    'count': 1,
+                    'items': [
+                        {
+                            'id': 'stale-filled-order',
+                            'execution_plan_item_id': original_links[0][
+                                'exec_plan_item_id'
+                            ],
+                            'symbol': self.symbol,
+                            'side': 'buy',
+                            'status': 'filled',
+                            'filled_quantity': '5',
+                        }
+                    ],
+                },
+                'executions': {'status': 'ok', 'count': 0, 'items': []},
+                'positions': {'status': 'ok', 'count': 0, 'items': []},
+                'derived_state': {
+                    'derived_status': 'open',
+                    'entry_filled_quantity': '5',
+                    'open_quantity': '5',
+                },
+            }
+            row.submission_payload = submission
+
+        self.client.plan_response = {
+            'items': [
+                {
+                    'external_plan_id': plan_id,
+                    'items': [
+                        {
+                            'core_item_key': link['core_item_key'],
+                            'execution_plan_id': 'exec-plan-b',
+                            'execution_plan_item_id': f'exec-plan-b-item-{index}',
+                            'symbol': link['symbol'],
+                            'intent': link['intent'],
+                            'status': 'filled',
+                        }
+                        for index, link in enumerate(original_links, start=1)
+                    ],
+                }
+            ]
+        }
+
+        await self.service._refresh_exec_readback(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            symbol=None,
+            trigger='mismatched_plan_readback',
+            runtime_payload={
+                'status': 'ok',
+                'payload': {'ready': True},
+                'error': None,
+            },
+        )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['item_links'],
+                original_links,
+            )
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'exec_readback_identity_mismatch',
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['attempts'][-1]['status'],
+                'readback_discarded_identity_mismatch',
+            )
+            invalidated_readback = row.submission_payload['exec_dispatch']['readback']
+            self.assertEqual(
+                invalidated_readback['execution_plans']['status'],
+                'contract_error',
+            )
+            self.assertEqual(invalidated_readback['orders']['status'], 'contract_error')
+            self.assertEqual(invalidated_readback['orders']['items'], [])
+            self.assertEqual(
+                invalidated_readback['derived_state']['derived_status'],
+                'unavailable',
+            )
+
+        settings.signal_decider_exec_integration_mode = 'disabled'
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            trigger='revoke_after_mismatched_readback',
+        )
+
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        revocation = self.client.revocation_calls[0]
+        self.assertEqual(revocation['plan_id'], plan_id)
+        self.assertEqual(
+            {
+                (
+                    item['core_item_key'],
+                    item['execution_plan_item_id'],
+                )
+                for item in revocation['items']
+            },
+            {
+                (link['core_item_key'], link['exec_plan_item_id'])
+                for link in original_links
+            },
+        )
+
+    async def test_readback_rejects_same_symbol_order_with_wrong_stable_item_id(
+        self,
+    ) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='seed_order_identity',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.plan_response = {
+            'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]
+        }
+        self.client.order_response = {
+            'items': [
+                {
+                    'id': 'foreign-order',
+                    'execution_plan_item_id': 'foreign-exec-item',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'status': 'filled',
+                    'filled_quantity': '99',
+                    'average_fill_price': '1',
+                }
+            ]
+        }
+
+        await self.service._refresh_exec_readback(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            symbol=self.symbol,
+            trigger='wrong_order_identity',
+            runtime_payload={'status': 'ok', 'payload': {'ready': True}, 'error': None},
+        )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            readback = row.submission_payload['exec_dispatch']['readback']
+            self.assertEqual(readback['orders']['status'], 'contract_error')
+            self.assertEqual(readback['orders']['count'], 0)
+            self.assertEqual(
+                readback['orders']['error']['code'],
+                'order_readback_identity_mismatch',
+            )
+            self.assertEqual(readback['derived_state']['derived_status'], 'unavailable')
+
+    async def test_readback_rejects_same_symbol_execution_with_wrong_stable_order_id(
+        self,
+    ) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='seed_execution_identity',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.plan_response = {
+            'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]
+        }
+        self.client.order_response = {
+            'items': [
+                {
+                    'id': 'accepted-order',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'status': 'submitted',
+                }
+            ]
+        }
+        self.client.execution_response = {
+            'items': [
+                {
+                    'id': 'foreign-execution',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'broker_order_id': 'foreign-order',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'quantity': '99',
+                    'price': '1',
+                }
+            ]
+        }
+
+        await self.service._refresh_exec_readback(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            symbol=self.symbol,
+            trigger='wrong_execution_identity',
+            runtime_payload={'status': 'ok', 'payload': {'ready': True}, 'error': None},
+        )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            readback = row.submission_payload['exec_dispatch']['readback']
+            self.assertEqual(readback['executions']['status'], 'contract_error')
+            self.assertEqual(readback['executions']['count'], 0)
+            self.assertEqual(
+                readback['executions']['error']['code'],
+                'execution_readback_identity_mismatch',
+            )
+            self.assertEqual(readback['derived_state']['derived_status'], 'unavailable')
 
     async def test_exec_overview_includes_both_deciders_without_symbol_collision(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
@@ -2560,11 +6708,19 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             trigger='test',
         )
         plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        with session_scope() as session:
+            dispatched_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            dispatch_revision_fingerprint = dispatched_row.submission_payload[
+                'exec_dispatch'
+            ]['dispatch_revision_fingerprint']
         self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
         self.client.order_response = {
             'items': [
                 {
-                    'id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'execution_plan_item_id': 'exec-item-1',
                     'symbol': self.symbol,
                     'status': 'submitted',
@@ -2574,7 +6730,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.execution_response = {
             'items': [
                 {
-                    'broker_order_id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'symbol': self.symbol,
                     'side': 'buy',
                     'quantity': '5',
@@ -2604,8 +6760,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             readback = row.submission_payload['exec_dispatch']['readback']
             self.assertEqual(readback['orders']['count'], 1)
             self.assertEqual(readback['derived_state']['derived_status'], 'open')
+            self.assertIn('contract_proof', row.submission_payload['exec_dispatch'])
+            self.assertEqual(
+                row.submission_payload['exec_dispatch'][
+                    'dispatch_revision_fingerprint'
+                ],
+                dispatch_revision_fingerprint,
+            )
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
 
-    async def test_exec_overview_refresh_filters_positions_to_current_account(self) -> None:
+    async def test_exec_overview_refresh_requests_positions_for_exact_exec_plan(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
             refresh_plan=False,
@@ -2617,16 +6781,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.plan_response = {'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]}
         self.client.order_response = {'items': []}
         self.client.execution_response = {'items': []}
-        self.client.position_response = {
-            'items': [
-                {
-                    'account_reference': 'KIS:00000000-01',
-                    'symbol': self.symbol,
-                    'quantity': '5',
-                    'average_price': '50000',
-                }
-            ]
-        }
+        self.client.position_response = {'items': []}
 
         overview = await self.service.list_signal_decider_exec_overview(
             target_trade_date=self.target_trade_date,
@@ -2638,6 +6793,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(overview['items'][0]['remote_state']['derived_status'], 'accepted')
         self.assertEqual(overview['items'][0]['remote_state']['positions'], [])
+        self.assertEqual(
+            self.client.position_calls[-1],
+            {
+                'external_plan_id': plan_id,
+                'execution_plan_id': plan_id,
+                'symbols': [self.symbol],
+            },
+        )
 
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
@@ -2673,7 +6836,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.order_response = {
             'items': [
                 {
-                    'id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'execution_plan_item_id': 'exec-item-1',
                     'symbol': self.symbol,
                     'status': 'submitted',
@@ -2683,7 +6846,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.execution_response = {
             'items': [
                 {
-                    'broker_order_id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'symbol': self.symbol,
                     'side': 'buy',
                     'quantity': '5',
@@ -2850,7 +7013,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.order_response = {
             'items': [
                 {
-                    'id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'execution_plan_item_id': 'exec-item-1',
                     'symbol': self.symbol,
                     'status': 'submitted',
@@ -2861,7 +7024,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.execution_response = {
             'items': [
                 {
-                    'broker_order_id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'symbol': self.symbol,
                     'side': 'buy',
                     'quantity': '5',
@@ -3673,7 +7836,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.order_response = {
             'items': [
                 {
-                    'id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'execution_plan_item_id': 'exec-item-1',
                     'symbol': self.symbol,
                     'status': 'submitted',
@@ -3684,7 +7847,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.execution_response = {
             'items': [
                 {
-                    'broker_order_id': 'order-1',
+                    'broker_order_pk': 'order-1',
                     'symbol': self.symbol,
                     'side': 'buy',
                     'quantity': '5',
@@ -3708,6 +7871,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             target_trade_date=self.target_trade_date,
             refresh=True,
             trigger='test',
+        )
+        self.assertEqual(
+            self.client.position_calls[-1],
+            {
+                'external_plan_id': plan_id,
+                'execution_plan_id': plan_id,
+                'symbols': [self.symbol],
+            },
         )
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
@@ -3756,6 +7927,148 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 len(self.client.position_calls),
             ),
         )
+
+    async def test_position_readback_with_mismatched_route_proof_fails_closed(self) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        self.client.plan_response = {
+            'items': [{'external_plan_id': plan_id, 'status': 'accepted'}]
+        }
+        self.client.order_response = {
+            'items': [
+                {
+                    'broker_order_pk': 'order-1',
+                    'execution_plan_item_id': 'exec-item-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'status': 'filled',
+                    'quantity': '5',
+                }
+            ]
+        }
+        self.client.execution_response = {
+            'items': [
+                {
+                    'broker_order_pk': 'order-1',
+                    'symbol': self.symbol,
+                    'side': 'buy',
+                    'quantity': '5',
+                }
+            ]
+        }
+        self.client.position_response = {
+            'items': [
+                {
+                    'provider': 'kis',
+                    'account_scope': 'b' * 24,
+                    'exchange': 'KRX',
+                    'symbol': self.symbol,
+                    'quantity': '100',
+                    'position_scope_proof': {
+                        'schema_version': 'execution_position_plan_scope_v1',
+                        'plan_id': plan_id,
+                        'execution_plan_id': 'different-exec-plan',
+                        'provider': 'kis',
+                        'account_scope': 'b' * 24,
+                        'exchange': 'KRX',
+                    },
+                }
+            ]
+        }
+
+        await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            refresh=True,
+            trigger='mismatched_position_scope',
+        )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            readback = row.submission_payload['exec_dispatch']['readback']
+            self.assertEqual(readback['positions']['status'], 'contract_error')
+            self.assertEqual(readback['positions']['count'], 0)
+            self.assertEqual(
+                readback['positions']['error']['code'],
+                'position_scope_proof_invalid',
+            )
+            self.assertEqual(
+                readback['derived_state']['derived_status'],
+                'unavailable',
+            )
+            self.assertIsNone(readback['derived_state']['open_quantity'])
+
+    def test_position_readback_rejects_self_consistent_non_kis_route(self) -> None:
+        result = self.service._validate_remote_position_scope_proofs(
+            result={
+                'status': 'ok',
+                'payload': {},
+                'error': None,
+                'items': [
+                    {
+                        'provider': 'alpaca',
+                        'account_scope': 'scope-a',
+                        'exchange': 'NASDAQ',
+                        'symbol': self.symbol,
+                        'quantity': '5',
+                        'position_scope_proof': {
+                            'schema_version': 'execution_position_plan_scope_v1',
+                            'plan_id': 'core-plan',
+                            'execution_plan_id': 'exec-plan',
+                            'provider': 'alpaca',
+                            'account_scope': 'scope-a',
+                            'exchange': 'NASDAQ',
+                        },
+                    }
+                ],
+            },
+            external_plan_id='core-plan',
+            execution_plan_id='exec-plan',
+        )
+
+        self.assertEqual(result['status'], 'contract_error')
+        self.assertEqual(result['error']['code'], 'position_scope_proof_invalid')
+
+    def test_position_readback_rejects_mixed_or_empty_account_scopes(self) -> None:
+        for scopes in (('scope-a', 'scope-b'), ('scope-a', '')):
+            with self.subTest(scopes=scopes):
+                result = self.service._validate_remote_position_scope_proofs(
+                    result={
+                        'status': 'ok',
+                        'payload': {},
+                        'error': None,
+                        'items': [
+                            {
+                                'provider': 'kis',
+                                'account_scope': account_scope,
+                                'exchange': 'KRX',
+                                'symbol': self.symbol,
+                                'quantity': '5',
+                                'position_scope_proof': {
+                                    'schema_version': 'execution_position_plan_scope_v1',
+                                    'plan_id': 'core-plan',
+                                    'execution_plan_id': 'exec-plan',
+                                    'provider': 'kis',
+                                    'account_scope': account_scope,
+                                    'exchange': 'KRX',
+                                },
+                            }
+                            for account_scope in scopes
+                        ],
+                    },
+                    external_plan_id='core-plan',
+                    execution_plan_id='exec-plan',
+                )
+                self.assertEqual(result['status'], 'contract_error')
+                self.assertEqual(
+                    result['error']['code'],
+                    'position_scope_proof_invalid',
+                )
 
     async def test_runtime_dashboard_filled_order_position_overrides_blocked_eligibility_without_execution(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
@@ -4537,11 +8850,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             scheduled = self.service.schedule_signal_decider_exec_readback_refresh(
                 target_trade_date=self.target_trade_date,
                 trigger='market_open_scheduler',
-                timeout_seconds=0.2,
+                timeout_seconds=1.0,
             )
 
             self.assertEqual(scheduled['refresh']['status'], 'scheduled')
-            self.assertAlmostEqual(scheduled['refresh']['timeout_seconds'], 0.2)
+            self.assertAlmostEqual(scheduled['refresh']['timeout_seconds'], 1.0)
             await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
             tasks = list(self.service._dashboard_refresh_tasks.values())
             self.assertEqual(len(tasks), 1)
@@ -4564,7 +8877,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 requested=True,
             )
             self.assertEqual(refresh_state['status'], 'succeeded')
-            self.assertAlmostEqual(refresh_state['timeout_seconds'], 0.2)
+            self.assertAlmostEqual(refresh_state['timeout_seconds'], 1.0)
             self.assertIsNone(refresh_state['last_error'])
         finally:
             release_refresh.set()
