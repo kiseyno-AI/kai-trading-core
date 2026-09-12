@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+import copy
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+import hashlib
 import inspect
 import json
 import logging
+import math
 from typing import Any, Callable, Sequence
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import defer
 
+from app.agent_context.read_service import (
+    _build_market_open_drive_context,
+    _build_market_regime_context,
+)
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
@@ -32,7 +42,12 @@ from app.orders.signal_decider_alignment_gate import (
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.core.settings import settings
 from app.db import session_scope
-from app.db_models import SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
+from app.db_models import (
+    AgentContextFeedbackRun,
+    CurrentMarketSnapshotCache,
+    SignalDeciderDecisionSnapshot,
+    SignalDeciderExecutionPlanItem,
+)
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
     inspect_pykrx_enrichment_preflight,
@@ -48,7 +63,11 @@ from app.market.session import (
     next_krx_open_date_on_or_after,
     previous_krx_trading_date,
 )
-from app.market_data_store import load_daily_bars_for_symbol_range, load_daily_pykrx_enrichment_rows
+from app.market_data_store import (
+    load_current_market_snapshot_context,
+    load_daily_bars_for_symbol_range,
+    load_daily_pykrx_enrichment_rows,
+)
 from app.orders.account_scope import parse_kis_account_reference
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 from app.orders.signal_decider_performance_gates import evaluate_next_open_performance_gate
@@ -72,7 +91,23 @@ EXECUTION_STATUS_DRY_RUN = 'dry_run'
 EXECUTION_STATUS_SUBMITTED = 'submitted'
 EXECUTION_STATUS_SUBMIT_FAILED = 'submit_failed'
 EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING = 'delegated_for_exec_agent_sizing'
+EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK = 'dispatch_pending_remote_ack'
+EXECUTION_STATUS_REVOCATION_PENDING = 'revocation_pending'
+EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW = 'revocation_manual_review'
+EXECUTION_STATUS_REVOKED = 'revoked'
+EXECUTION_REVISION_HISTORY_LIMIT = 5
+EXECUTION_REVOCATION_LOCKED_STATUSES = frozenset(
+    {
+        EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
+        EXECUTION_STATUS_REVOCATION_PENDING,
+        EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW,
+    }
+)
 ORDER_SOURCE = 'signal_decider_next_open'
+NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION = 'next_open_cost_evidence_v1'
+NEXT_OPEN_PREOPEN_POLICY_FINGERPRINT_VERSION = 'next_open_preopen_policy_v1'
+CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION = 'current_live_market_buy_authority_v1'
+KRX_NEXT_OPEN_MARKETS = frozenset({'KRX', 'KOSPI', 'KOSDAQ', 'KONEX'})
 SHORT_TERM_ACTIONABLE_ACTIONS = {'scalp_buy_candidate', 'watch_for_trigger'}
 SHORT_TERM_GENERIC_ACTION_BY_TACTICAL_ACTION = {
     'scalp_buy_candidate': 'buy',
@@ -85,21 +120,6 @@ SHORT_TERM_HANDOFF_INTENT_BY_TACTICAL_ACTION = {
     'scalp_buy_candidate': 'tactical_buy',
     'watch_for_trigger': 'intraday_watch_buy',
 }
-SHORT_TERM_CONFIRMATION_REQUIRED_MARKERS = (
-    '확인',
-    '재돌파',
-    '돌파 확인',
-    '추격 금지',
-    '기다',
-    'wait',
-    'confirm',
-    'confirmation',
-    'reclaim',
-    'breakout confirmation',
-    'avoid chase',
-    'do not chase',
-    'pullback',
-)
 SHORT_TERM_MIN_RETURN_PERCENTILE = Decimal('0.60')
 SHORT_TERM_HARD_MIN_RETURN_PERCENTILE = Decimal('0.50')
 SHORT_TERM_MIN_VOLUME_PERCENTILE = Decimal('0.45')
@@ -110,31 +130,9 @@ SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
 SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
 SHORT_TERM_WATCH_DELEGATED_ENTRY_QUALITY_BLOCK_CODES = frozenset(
     {
-        'short_term_buy_quality_score_block',
-        'short_term_high_atr_chase_block',
-        'short_term_high_atr_weak_trend_block',
         'short_term_liquidity_floor_block',
         'short_term_reward_risk_ratio_block',
     }
-)
-SHORT_TERM_CONTINUATION_SETUP_MARKERS = (
-    '눌림',
-    '재상승',
-    '재돌파',
-    '돌파',
-    '지지',
-    '회복',
-    '반등',
-    '거래량',
-    '수급',
-    'vwap',
-    'pullback',
-    'reclaim',
-    'breakout',
-    'continuation',
-    'support',
-    'volume',
-    'relative strength',
 )
 UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE = 'KIS:00000000-00'
 UNSPECIFIED_ROUTE_ACCOUNT_LABEL = 'UNSPECIFIED_ROUTE'
@@ -149,10 +147,28 @@ CALENDAR_FALLBACK_STATUSES = {
 # is treated as a routing/budget placeholder and does not drive fixed sizing.
 
 logger = logging.getLogger(__name__)
+KST = ZoneInfo('Asia/Seoul')
+
+
+class _PlanRefreshRevisionConflict(RuntimeError):
+    pass
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_aware_datetime(value: Any) -> datetime | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
 
 def _normalize_date(value: str | date | None, *, default: date) -> date:
@@ -184,21 +200,26 @@ def _to_decimal(value: Any) -> Decimal | None:
     if value is None or value == '':
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
+        return parsed if parsed.is_finite() else None
     except (InvalidOperation, ValueError):
         return None
 
 
 def _decimal_to_float(value: Decimal | None) -> float | None:
-    if value is None:
+    if value is None or not value.is_finite():
         return None
-    return float(value)
+    try:
+        rendered = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return rendered if math.isfinite(rendered) else None
 
 
 def _decimal_to_text(value: Decimal | None) -> str | None:
-    if value is None:
+    if value is None or not value.is_finite():
         return None
     return format(value, 'f')
 
@@ -206,6 +227,12 @@ def _decimal_to_text(value: Decimal | None) -> str | None:
 def _to_json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return _decimal_to_text(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
     if isinstance(value, dict):
         return {str(key): _to_json_safe(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -213,6 +240,111 @@ def _to_json_safe(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_to_json_safe(item) for item in value]
     return value
+
+
+def _snapshot_cohort_fingerprint(
+    snapshots: Sequence[SignalDeciderDecisionSnapshot],
+) -> str:
+    material = [
+        {
+            column.key: getattr(snapshot, column.key, None)
+            for column in SignalDeciderDecisionSnapshot.__table__.columns
+        }
+        for snapshot in sorted(snapshots, key=lambda item: int(item.id))
+    ]
+    canonical = json.dumps(
+        _to_json_safe(material),
+        default=str,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def _live_market_snapshot_fingerprint(
+    snapshot_context: dict[str, Any] | None,
+    *,
+    load_error: bool,
+) -> str:
+    canonical = json.dumps(
+        _to_json_safe(
+            {
+                'load_error': load_error,
+                'snapshot_context': snapshot_context,
+            }
+        ),
+        default=str,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def _load_live_market_snapshot_context() -> tuple[dict[str, Any] | None, bool]:
+    try:
+        return load_current_market_snapshot_context(), False
+    except (SQLAlchemyError, TimeoutError):
+        return None, True
+
+
+def _plan_refresh_advisory_lock_key(target_trade_date: date) -> int:
+    digest = hashlib.sha256(
+        f'signal-decider-next-open-refresh:{target_trade_date.isoformat()}'.encode('utf-8')
+    ).digest()
+    return int.from_bytes(digest[:8], byteorder='big', signed=False) & ((1 << 63) - 1)
+
+
+def _lock_dispatch_authority_source_tables(session: Any) -> None:
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != 'postgresql':
+        return
+    preparer = bind.dialect.identifier_preparer
+    for table in (
+        AgentContextFeedbackRun.__table__,
+        SignalDeciderDecisionSnapshot.__table__,
+    ):
+        session.execute(
+            text(f'LOCK TABLE {preparer.format_table(table)} IN SHARE MODE')
+        )
+
+
+def _execution_plan_row_authority_fingerprint(
+    row: SignalDeciderExecutionPlanItem,
+) -> str:
+    material = _to_json_safe(
+        {
+            'id': row.id,
+            'execution_window': row.execution_window,
+            'decision_snapshot_id': row.decision_snapshot_id,
+            'decision_agent_name': row.decision_agent_name,
+            'broker_name': row.broker_name,
+            'target_trade_date': row.target_trade_date,
+            'source_market_date': row.source_market_date,
+            'account_reference': row.account_reference,
+            'account_label': row.account_label,
+            'symbol': row.symbol,
+            'policy_version': row.policy_version,
+            'planned_side': row.planned_side,
+            'planned_order_type': row.planned_order_type,
+            'planned_time_in_force': row.planned_time_in_force,
+            'allocation_budget_krw': row.allocation_budget_krw,
+            'estimated_reference_price': row.estimated_reference_price,
+            'planned_quantity': row.planned_quantity,
+            'estimated_notional_krw': row.estimated_notional_krw,
+            'client_order_id': row.client_order_id,
+            'validation_payload': row.validation_payload,
+            'traceability_payload': row.traceability_payload,
+        }
+    )
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _to_int(value: Any) -> int | None:
@@ -223,6 +355,8 @@ def _to_int(value: Any) -> int | None:
     try:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
         return None
     if parsed != parsed.to_integral_value():
         return None
@@ -263,19 +397,421 @@ def _json_object_payload(value: Any) -> dict[str, Any]:
 
 
 def _snapshot_response_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
-    return _json_object_payload(snapshot.response_payload)
+    return _json_object_payload(getattr(snapshot, 'response_payload', None))
 
 
 def _snapshot_request_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
-    return _json_object_payload(snapshot.request_payload)
+    return _json_object_payload(getattr(snapshot, 'request_payload', None))
+
+
+def _snapshot_market_claims(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> tuple[str, ...]:
+    symbol_day_context = _snapshot_request_payload(snapshot).get('symbol_day_context')
+    if not isinstance(symbol_day_context, dict):
+        return ()
+    company = (
+        symbol_day_context.get('company')
+        if isinstance(symbol_day_context.get('company'), dict)
+        else {}
+    )
+    claims: list[str] = []
+    for value in (symbol_day_context.get('market'), company.get('market')):
+        market = _normalize_optional_text(value)
+        if market:
+            claims.append(market.upper())
+    return tuple(claims)
+
+
+def _is_krx_next_open_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
+    market_claims = _snapshot_market_claims(snapshot)
+    if not market_claims or any(
+        market not in KRX_NEXT_OPEN_MARKETS for market in market_claims
+    ):
+        return False
+    specific_markets = set(market_claims) - {'KRX'}
+    return len(specific_markets) <= 1
+
+
+def _current_live_market_authority_applies(
+    *,
+    market_state: object,
+    target_trade_date: date,
+) -> bool:
+    if (
+        str(getattr(market_state, 'market', '') or '').strip().upper() != 'KRX'
+        or str(getattr(market_state, 'state', '') or '').strip().upper() != 'OPEN'
+        or not bool(getattr(market_state, 'is_trading_day', False))
+    ):
+        return False
+    raw_server_time = getattr(market_state, 'server_time', None)
+    if not raw_server_time:
+        return True
+    try:
+        parsed = datetime.fromisoformat(str(raw_server_time).replace('Z', '+00:00'))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return True
+    return parsed.date() == target_trade_date
+
+
+def _specific_snapshot_krx_market(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> str | None:
+    specific_markets = set(_snapshot_market_claims(snapshot)) - {'KRX'}
+    if len(specific_markets) != 1:
+        return None
+    market = next(iter(specific_markets))
+    return market if market in {'KOSPI', 'KOSDAQ'} else None
+
+
+def _current_live_market_buy_authority(
+    *,
+    snapshot: SignalDeciderDecisionSnapshot,
+    target_trade_date: date,
+    market_state: object,
+    snapshot_context: dict[str, Any] | None,
+    snapshot_load_error: bool = False,
+) -> dict[str, Any]:
+    applies = _current_live_market_authority_applies(
+        market_state=market_state,
+        target_trade_date=target_trade_date,
+    )
+    base = {
+        'schema_version': CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION,
+        'applies': applies,
+        'market_date': target_trade_date.isoformat(),
+        'source': 'current_market_snapshot_cache',
+    }
+    if not applies:
+        return {
+            **base,
+            'status': 'not_applicable',
+            'authoritative': False,
+            'action': 'not_applicable',
+            'reason_code': 'market_session_not_open',
+        }
+
+    market = _specific_snapshot_krx_market(snapshot)
+    if market is None:
+        return {
+            **base,
+            'status': 'unavailable',
+            'authoritative': False,
+            'action': 'block_new_buy',
+            'reason_code': 'market_identity_missing_or_ambiguous',
+        }
+    if snapshot_load_error or not isinstance(snapshot_context, dict):
+        return {
+            **base,
+            'market': market,
+            'status': 'unavailable',
+            'authoritative': False,
+            'action': 'block_new_buy',
+            'reason_code': (
+                'market_snapshot_storage_unavailable'
+                if snapshot_load_error
+                else 'market_snapshot_unavailable'
+            ),
+        }
+
+    open_drive = _build_market_open_drive_context(
+        requested_market_date=target_trade_date,
+        market=market,
+        decision_time=getattr(market_state, 'server_time', None),
+        snapshot_context=snapshot_context,
+        prior_market_turnover_baseline=None,
+    )
+    breadth = (
+        open_drive.get('market_breadth_context')
+        if isinstance(open_drive.get('market_breadth_context'), dict)
+        else {}
+    )
+    breadth_provenance = (
+        open_drive.get('market_breadth_provenance')
+        if isinstance(open_drive.get('market_breadth_provenance'), dict)
+        else {}
+    )
+    breadth_authoritative = bool(
+        breadth.get('status') == 'available'
+        and breadth.get('market') == market
+        and breadth_provenance.get('freshness_status') == 'fresh'
+        and breadth_provenance.get('provenance_status') == 'provider_sourced'
+        and breadth_provenance.get('as_of_market_date') == target_trade_date.isoformat()
+        and breadth.get('captured_at') == breadth_provenance.get('as_of_timestamp')
+    )
+    if not breadth_authoritative:
+        return {
+            **base,
+            'market': market,
+            'status': 'unavailable',
+            'authoritative': False,
+            'action': 'block_new_buy',
+            'reason_code': str(
+                breadth.get('reason')
+                or open_drive.get('reason')
+                or 'live_market_breadth_unavailable'
+            ),
+            'observed_at': breadth.get('captured_at') or open_drive.get('observed_at'),
+        }
+
+    unavailable_context = {'status': 'unavailable', 'missing_fields': ['context']}
+    unavailable_provenance = {
+        'freshness_status': 'missing',
+        'provenance_status': 'missing',
+    }
+    regime = _build_market_regime_context(
+        requested_market_date=target_trade_date,
+        market=market,
+        market_breadth_context=breadth,
+        market_breadth_provenance=breadth_provenance,
+        sector_peer_context=unavailable_context,
+        sector_peer_provenance=unavailable_provenance,
+        market_relative_context=unavailable_context,
+        market_relative_provenance=unavailable_provenance,
+        open_drive_context=open_drive,
+    )
+    risk_off = bool(
+        regime.get('posture') == 'risk_off'
+        and regime.get('recommended_exec_action') == 'reject'
+    )
+    return {
+        **base,
+        'market': market,
+        'status': 'available',
+        'authoritative': True,
+        'action': 'reject' if risk_off else 'allow',
+        'posture': regime.get('posture'),
+        'market_regime': regime.get('market_regime'),
+        'recommended_exec_action': regime.get('recommended_exec_action'),
+        'reason_code': regime.get('reason_code'),
+        'observed_at': breadth.get('captured_at'),
+        'market_breadth': {
+            key: breadth.get(key)
+            for key in (
+                'market_symbol_count',
+                'up_count',
+                'down_count',
+                'flat_count',
+                'advance_decline_ratio',
+                'expected_symbol_count',
+                'observed_symbol_count',
+                'limit_bucket_semantics',
+            )
+        },
+        'provenance': breadth_provenance,
+    }
+
+
+def _stable_live_market_authority_generation_material(
+    authority: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(authority, dict):
+        return None
+    return {
+        key: copy.deepcopy(authority.get(key))
+        for key in (
+            'schema_version',
+            'applies',
+            'market_date',
+            'source',
+            'market',
+            'status',
+            'authoritative',
+            'action',
+            'posture',
+            'market_regime',
+            'recommended_exec_action',
+            'reason_code',
+            'observed_at',
+            'market_breadth',
+            'provenance',
+        )
+        if key in authority
+    }
+
+
+def _current_route_live_market_buy_authority(
+    *,
+    target_trade_date: date,
+    market_state: object,
+    snapshot_context: dict[str, Any] | None,
+    snapshot_load_error: bool = False,
+) -> dict[str, Any]:
+    """Aggregate the complete KRX route without depending on candidate rows."""
+
+    class _MarketSnapshot:
+        def __init__(self, market: str) -> None:
+            self.request_payload = {
+                'symbol_day_context': {
+                    'market': market,
+                    'company': {'market': market},
+                }
+            }
+
+    evaluated_at = _parse_aware_datetime(
+        getattr(market_state, 'server_time', None)
+    ) or _utcnow()
+    market_authorities = [
+        _current_live_market_buy_authority(
+            snapshot=_MarketSnapshot(market),  # type: ignore[arg-type]
+            target_trade_date=target_trade_date,
+            market_state=market_state,
+            snapshot_context=snapshot_context,
+            snapshot_load_error=snapshot_load_error,
+        )
+        for market in ('KOSPI', 'KOSDAQ')
+    ]
+    evidence: list[dict[str, Any]] = []
+    for market, authority in zip(
+        ('KOSPI', 'KOSDAQ'),
+        market_authorities,
+        strict=True,
+    ):
+        observed_at = _parse_aware_datetime(authority.get('observed_at'))
+        observed_at_is_trusted = bool(
+            observed_at is not None
+            and observed_at <= evaluated_at
+            and observed_at.astimezone(KST).date() == target_trade_date
+        )
+        source_ready = bool(
+            authority.get('status') == 'available'
+            and authority.get('authoritative') is True
+            and observed_at_is_trusted
+        )
+        source_allows = bool(source_ready and authority.get('action') == 'allow')
+        evidence.append(
+            {
+                'market': market,
+                'status': 'available' if source_ready else 'unavailable',
+                'authoritative': source_ready,
+                'action': 'allow' if source_allows else 'block_new_buy',
+                'observed_at': (
+                    observed_at.isoformat()
+                    if source_ready and observed_at is not None
+                    else None
+                ),
+                'reason_code': str(
+                    authority.get('reason_code')
+                    or (
+                        'market_authority_timestamp_unavailable'
+                        if observed_at is None
+                        else 'market_authority_unavailable'
+                    )
+                ),
+            }
+        )
+    observed_at_values = [
+        parsed
+        for item in evidence
+        if (parsed := _parse_aware_datetime(item.get('observed_at'))) is not None
+    ]
+    complete = bool(
+        len(observed_at_values) == 2
+        and all(
+            item['status'] == 'available' and item['authoritative'] is True
+            for item in evidence
+        )
+    )
+    allow = complete and all(item['action'] == 'allow' for item in evidence)
+    reason_codes = list(
+        dict.fromkeys(
+            str(item['reason_code'])
+            for item in evidence
+            if item['action'] != 'allow' or not complete
+        )
+    )
+    if not reason_codes:
+        reason_codes = ['current_live_market_authority_allow']
+    return {
+        'schema_version': CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION,
+        'applies': _current_live_market_authority_applies(
+            market_state=market_state,
+            target_trade_date=target_trade_date,
+        ),
+        'market_date': target_trade_date.isoformat(),
+        'source': 'current_market_snapshot_cache',
+        'market': 'KRX',
+        'status': 'available' if complete else 'unavailable',
+        'authoritative': complete,
+        'action': 'allow' if allow else 'block_new_buy',
+        'reason_codes': reason_codes,
+        'observed_at': (
+            min(observed_at_values).isoformat()
+            if len(observed_at_values) == 2
+            else None
+        ),
+        'evaluated_at': max([evaluated_at, *observed_at_values]).isoformat(),
+        'required_markets': ['KOSPI', 'KOSDAQ'],
+        'market_evidence': evidence,
+    }
+
+
+def _stable_market_state_generation_material(
+    market_state: object,
+) -> dict[str, Any]:
+    raw_server_time = getattr(market_state, 'server_time', None)
+    server_market_date: str | None = None
+    if raw_server_time:
+        try:
+            parsed = datetime.fromisoformat(
+                str(raw_server_time).replace('Z', '+00:00')
+            )
+        except ValueError:
+            server_market_date = 'invalid'
+        else:
+            server_market_date = (
+                parsed.date().isoformat()
+                if parsed.tzinfo is not None and parsed.utcoffset() is not None
+                else 'timezone_naive'
+            )
+    return {
+        'market': str(getattr(market_state, 'market', '') or '').strip().upper(),
+        'state': str(getattr(market_state, 'state', '') or '').strip().upper(),
+        'is_trading_day': bool(getattr(market_state, 'is_trading_day', False)),
+        'server_market_date': server_market_date,
+    }
+
+
+def _dispatch_authority_issue_reason(reason_code: str) -> dict[str, str]:
+    messages = {
+        'current_live_market_risk_off': (
+            'Fresh authoritative live market breadth is severely weak; new BUY '
+            'authority is blocked.'
+        ),
+        'current_live_market_evidence_unavailable': (
+            'The open-session live market breadth proof is unavailable, stale, or '
+            'ambiguous; new BUY authority fails closed.'
+        ),
+        'latest_snapshot_not_actionable': (
+            'The latest bound decision is no longer actionable; stale BUY authority '
+            'is blocked.'
+        ),
+        'latest_snapshot_replaced': (
+            'The decision snapshot bound to this BUY was replaced; stale authority '
+            'is blocked.'
+        ),
+        'candidate_removed': (
+            'The decision candidate bound to this BUY is no longer present; stale '
+            'authority is blocked.'
+        ),
+        'policy_scope_changed': (
+            'The execution policy, route, or dispatch material changed; stale BUY '
+            'authority is blocked.'
+        ),
+    }
+    return _reason(
+        reason_code,
+        messages.get(
+            reason_code,
+            'Dispatch authority changed; the stale BUY is blocked.',
+        ),
+    )
 
 
 def _snapshot_traceability_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
     return _json_object_payload(snapshot.traceability_payload)
-
-
-def _snapshot_input_feature_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
-    return _json_object_payload(snapshot.input_feature_snapshot_payload)
 
 
 def _snapshot_response_summary_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[str, Any]:
@@ -356,37 +892,13 @@ def _short_term_tactical_action(snapshot: SignalDeciderDecisionSnapshot) -> str:
     )
     action = action.lower() if action else 'wait'
     if action in SHORT_TERM_ACTIONABLE_ACTIONS or action in {'avoid_chase', 'wait', 'reject'}:
-        return _coerce_short_term_action_for_confirmation(snapshot=snapshot, tactical_action=action)
+        return action
     return 'wait'
 
 
-def _coerce_short_term_action_for_confirmation(
-    *,
-    snapshot: SignalDeciderDecisionSnapshot,
-    tactical_action: str,
-) -> str:
-    if tactical_action != 'scalp_buy_candidate':
-        return tactical_action
-    payload = _snapshot_response_payload(snapshot)
-    text_parts = [
-        snapshot.thesis_summary or '',
-        ' '.join(str(item) for item in (snapshot.supporting_evidence_payload or [])),
-        ' '.join(str(item) for item in (snapshot.decision_risks_payload or [])),
-        ' '.join(str(item) for item in (snapshot.invalidation_conditions_payload or [])),
-    ]
-    for key in ('thesis_summary', 'summary', 'trigger_conditions', 'tactical_risks', 'decision_risks'):
-        value = payload.get(key)
-        if isinstance(value, list):
-            text_parts.append(' '.join(str(item) for item in value))
-        elif value is not None:
-            text_parts.append(str(value))
-    joined = ' '.join(text_parts).lower()
-    if any(marker in joined for marker in SHORT_TERM_CONFIRMATION_REQUIRED_MARKERS):
-        return 'watch_for_trigger'
-    return tactical_action
-
-
 def _is_actionable_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
+    if not _is_krx_next_open_snapshot(snapshot):
+        return False
     decision_agent_name = _snapshot_agent_name(snapshot)
     if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
         return _normalize_action(snapshot.next_day_open_action or snapshot.decision_action) == 'buy'
@@ -434,76 +946,154 @@ def _latest_signal_decider_action_by_symbol(
     return actions
 
 
-def _flatten_numeric_feature(payload: Any, keys: set[str]) -> Decimal | None:
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            normalized_key = str(key or '').strip().lower()
-            if normalized_key in keys:
-                parsed = _to_decimal(value)
-                if parsed is not None:
-                    return parsed
-            found = _flatten_numeric_feature(value, keys)
-            if found is not None:
-                return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = _flatten_numeric_feature(item, keys)
-            if found is not None:
-                return found
-    return None
+def _normalize_objective_percentile(value: Any, *, unit: Any = None) -> Decimal | None:
+    """Normalize only explicitly bounded objective percentile evidence.
 
+    Untagged values use the unit interval. Values on a 0..100 scale must say
+    so explicitly; silently treating ``82`` as ``0.82`` lets malformed or LLM
+    supplied values become executable gate evidence.
+    """
 
-def _flatten_text_feature(payload: Any, keys: set[str]) -> str | None:
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            normalized_key = str(key or '').strip().lower()
-            if normalized_key in keys and value is not None:
-                text = str(value).strip()
-                if text:
-                    return text
-            found = _flatten_text_feature(value, keys)
-            if found is not None:
-                return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = _flatten_text_feature(item, keys)
-            if found is not None:
-                return found
-    return None
-
-
-def _as_unit_percentile(value: Decimal | None) -> Decimal | None:
-    if value is None:
+    parsed = _to_decimal(value)
+    if parsed is None or parsed < Decimal('0'):
         return None
-    if value > Decimal('1'):
-        return value / Decimal('100')
-    return value
+    normalized_unit = str(unit or '').strip().lower()
+    if normalized_unit in {'percent', 'percentage', 'pct', '0_to_100'}:
+        if parsed > Decimal('100'):
+            return None
+        return parsed / Decimal('100')
+    if normalized_unit not in {'', 'ratio', 'fraction', 'unit_interval', '0_to_1'}:
+        return None
+    return parsed if parsed <= Decimal('1') else None
 
 
-def _short_term_setup_text(snapshot: SignalDeciderDecisionSnapshot) -> str:
-    payload = _snapshot_response_payload(snapshot)
-    parts = [
-        snapshot.thesis_summary or '',
-        ' '.join(str(item) for item in (snapshot.supporting_evidence_payload or [])),
-        ' '.join(str(item) for item in (snapshot.decision_risks_payload or [])),
-        ' '.join(str(item) for item in (snapshot.invalidation_conditions_payload or [])),
-    ]
-    for key in (
-        'thesis_summary',
-        'summary',
-        'trigger_conditions',
-        'supporting_evidence',
-        'tactical_risks',
-        'risk_flags',
-        'details',
-        'decision_delta',
-    ):
-        value = payload.get(key)
-        if isinstance(value, list):
-            parts.append(' '.join(str(item) for item in value))
-        elif value is not None:
-            parts.append(str(value))
-    return ' '.join(parts).lower()
+def _short_term_objective_gate_features(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> dict[str, Any]:
+    """Read executable gate inputs from server-built request context only."""
+
+    request_payload = _snapshot_request_payload(snapshot)
+    symbol_day_context = (
+        request_payload.get('symbol_day_context')
+        if isinstance(request_payload.get('symbol_day_context'), dict)
+        else {}
+    )
+    technical = (
+        symbol_day_context.get('technical_snapshot')
+        if isinstance(symbol_day_context.get('technical_snapshot'), dict)
+        else {}
+    )
+    action_summary = (
+        symbol_day_context.get('action_summary')
+        if isinstance(symbol_day_context.get('action_summary'), dict)
+        else {}
+    )
+    action_summary_payload = (
+        action_summary.get('summary_payload')
+        if isinstance(action_summary.get('summary_payload'), dict)
+        else {}
+    )
+    market_relative_context = (
+        symbol_day_context.get('market_relative_context')
+        if isinstance(symbol_day_context.get('market_relative_context'), dict)
+        else {}
+    )
+    relative_strength = (
+        market_relative_context.get('relative_strength')
+        if isinstance(market_relative_context.get('relative_strength'), dict)
+        else {}
+    )
+    if not relative_strength:
+        market_regime = _snapshot_market_regime_context(snapshot)
+        relative_strength = (
+            market_regime.get('relative_strength_context')
+            if isinstance(market_regime.get('relative_strength_context'), dict)
+            else {}
+        )
+    pre_decider = _snapshot_pre_decider_enrichment_context(snapshot)
+    pre_decider_trading_value = (
+        pre_decider.get('trading_value')
+        if isinstance(pre_decider.get('trading_value'), dict)
+        else {}
+    )
+    liquidity_context = (
+        request_payload.get('liquidity_context')
+        if isinstance(request_payload.get('liquidity_context'), dict)
+        else symbol_day_context.get('liquidity_context')
+        if isinstance(symbol_day_context.get('liquidity_context'), dict)
+        else {}
+    )
+    trading_value = (
+        liquidity_context.get('turnover')
+        if isinstance(liquidity_context.get('turnover'), dict)
+        else pre_decider_trading_value
+    )
+    decision_input_quality = (
+        request_payload.get('decision_input_quality_context')
+        if isinstance(request_payload.get('decision_input_quality_context'), dict)
+        else symbol_day_context.get('decision_input_quality_context')
+        if isinstance(symbol_day_context.get('decision_input_quality_context'), dict)
+        else {}
+    )
+    final_judgment = (
+        decision_input_quality.get('final_judgment')
+        if isinstance(decision_input_quality.get('final_judgment'), dict)
+        else {}
+    )
+
+    return_raw = relative_strength.get('return_percentile')
+    volume_raw = relative_strength.get('volume_percentile')
+    common_percentile_unit = relative_strength.get('percentile_unit')
+    return_percentile = _normalize_objective_percentile(
+        return_raw,
+        unit=relative_strength.get('return_percentile_unit') or common_percentile_unit,
+    )
+    volume_percentile = _normalize_objective_percentile(
+        volume_raw,
+        unit=relative_strength.get('volume_percentile_unit') or common_percentile_unit,
+    )
+    setup_state = _normalize_optional_text(action_summary_payload.get('setup_state'))
+    normalized_setup_state = setup_state.lower() if setup_state else None
+    trend_state = _normalize_optional_text(technical.get('trend_state'))
+    normalized_trend_state = trend_state.lower() if trend_state else None
+    breakout_20d = technical.get('breakout_20d') is True
+    breakdown_20d = technical.get('breakdown_20d') is True
+    continuation_setup_detected = bool(
+        not breakdown_20d
+        and (
+            breakout_20d
+            or normalized_setup_state
+            in {'confirmed', 'continuation', 'breakout', 'pullback_support', 'reclaim'}
+        )
+    )
+    trading_value_source = _normalize_optional_text(
+        trading_value.get('source') or trading_value.get('trading_value_source')
+    )
+    raw_trading_value_krw = (
+        _to_decimal(trading_value.get('raw_trading_value_krw'))
+        if str(trading_value_source or '').lower() == 'raw'
+        else None
+    )
+    return {
+        'atr_pct_14': _to_decimal(technical.get('atr_pct_14')),
+        'ret20': _to_decimal(technical.get('return_20d')),
+        'ret5': _to_decimal(technical.get('return_5d')),
+        'return_percentile': return_percentile,
+        'return_percentile_status': (
+            'missing' if return_raw is None else 'available' if return_percentile is not None else 'invalid'
+        ),
+        'volume_percentile': volume_percentile,
+        'volume_percentile_status': (
+            'missing' if volume_raw is None else 'available' if volume_percentile is not None else 'invalid'
+        ),
+        'raw_trading_value_krw': raw_trading_value_krw,
+        'buy_quality_score': _to_decimal(final_judgment.get('buy_quality_score')),
+        'decision_band': _normalize_optional_text(final_judgment.get('decision_band')),
+        'trading_value_source': trading_value_source,
+        'trend_state': normalized_trend_state,
+        'setup_state': normalized_setup_state,
+        'continuation_setup_detected': continuation_setup_detected,
+    }
 
 
 def _short_term_entry_quality_blocks(
@@ -512,46 +1102,26 @@ def _short_term_entry_quality_blocks(
     signal_decider_crosscheck: dict[str, Any] | None,
     tactical_action: str | None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, Any]]:
-    payloads = [
-        _snapshot_input_feature_payload(snapshot),
-        _snapshot_request_payload(snapshot),
-        _snapshot_response_payload(snapshot),
-    ]
-    feature_payload = {'sources': payloads}
-    atr_pct = _flatten_numeric_feature(feature_payload, {'atr_pct_14', 'atr_pct', 'atr14_pct', 'atr_percent'})
-    ret20 = _flatten_numeric_feature(feature_payload, {'ret20', 'ret_20d', 'return_20d', 'pct_change_20d'})
-    ret5 = _flatten_numeric_feature(feature_payload, {'ret5', 'ret_5d', 'return_5d', 'pct_change_5d'})
-    return_percentile = _as_unit_percentile(
-        _flatten_numeric_feature(
-            feature_payload,
-            {'return_percentile', 'relative_return_percentile', 'market_relative_return_percentile'},
-        )
-    )
-    volume_percentile = _as_unit_percentile(
-        _flatten_numeric_feature(
-            feature_payload,
-            {'volume_percentile', 'relative_volume_percentile', 'market_relative_volume_percentile'},
-        )
-    )
-    raw_trading_value_krw = _flatten_numeric_feature(
-        feature_payload,
-        {'raw_trading_value_krw', 'provider_turnover_krw', 'trading_value_krw'},
-    )
-    buy_quality_score = _flatten_numeric_feature(feature_payload, {'buy_quality_score'})
-    decision_band = _flatten_text_feature(feature_payload, {'decision_band'})
-    trading_value_source = _flatten_text_feature(
-        feature_payload,
-        {'trading_value_source', 'trading_value_source_detail', 'turnover_source'},
-    )
-    trigger_price = _to_decimal(_flatten_numeric_feature(feature_payload, {'trigger_price'}))
+    objective_features = _short_term_objective_gate_features(snapshot)
+    atr_pct = objective_features['atr_pct_14']
+    ret20 = objective_features['ret20']
+    ret5 = objective_features['ret5']
+    return_percentile = objective_features['return_percentile']
+    volume_percentile = objective_features['volume_percentile']
+    raw_trading_value_krw = objective_features['raw_trading_value_krw']
+    buy_quality_score = objective_features['buy_quality_score']
+    decision_band = objective_features['decision_band']
+    trading_value_source = objective_features['trading_value_source']
+    response_payload = _snapshot_response_payload(snapshot)
+    trigger_price = _to_decimal(response_payload.get('trigger_price'))
     target_price = _to_decimal(snapshot.target_price) or _to_decimal(
-        _flatten_numeric_feature(feature_payload, {'target_price'})
+        response_payload.get('target_price')
     )
     stop_loss_price = _to_decimal(snapshot.stop_loss_price) or _to_decimal(
-        _flatten_numeric_feature(feature_payload, {'stop_loss_price'})
+        response_payload.get('stop_loss_price')
     )
-    trend_state = _flatten_text_feature(feature_payload, {'trend_state', 'technical_trend', 'market_regime'})
-    setup_state = _flatten_text_feature(feature_payload, {'setup_state', 'breakdown_state', 'pattern_state'})
+    trend_state = objective_features['trend_state']
+    setup_state = objective_features['setup_state']
     reward_risk_ratio: Decimal | None = None
     if trigger_price is not None and target_price is not None and stop_loss_price is not None:
         upside = target_price - trigger_price
@@ -564,7 +1134,9 @@ def _short_term_entry_quality_blocks(
         'ret20': _to_json_safe(ret20),
         'ret5': _to_json_safe(ret5),
         'return_percentile': _to_json_safe(return_percentile),
+        'return_percentile_status': objective_features['return_percentile_status'],
         'volume_percentile': _to_json_safe(volume_percentile),
+        'volume_percentile_status': objective_features['volume_percentile_status'],
         'raw_trading_value_krw': _to_json_safe(raw_trading_value_krw),
         'buy_quality_score': _to_json_safe(buy_quality_score),
         'decision_band': decision_band,
@@ -572,6 +1144,7 @@ def _short_term_entry_quality_blocks(
         'reward_risk_ratio': _to_json_safe(reward_risk_ratio),
         'trend_state': trend_state,
         'setup_state': setup_state,
+        'continuation_evidence_source': 'objective_request_payload',
         'signal_decider_crosscheck': signal_decider_crosscheck,
     }
     blocks: list[dict[str, str]] = []
@@ -642,7 +1215,14 @@ def _short_term_entry_quality_blocks(
                 'Decision input buy-quality score is below the preferred threshold; exec should size conservatively.',
             )
         )
-    if return_percentile is None:
+    if objective_features['return_percentile_status'] == 'invalid':
+        blocks.append(
+            _reason(
+                'short_term_return_percentile_invalid_block',
+                'Market-relative return percentile is non-finite, out of range, or missing an explicit percent unit.',
+            )
+        )
+    elif return_percentile is None:
         warnings.append(
             _reason(
                 'short_term_relative_strength_unverified_warning',
@@ -663,7 +1243,14 @@ def _short_term_entry_quality_blocks(
                 'Market-relative return percentile is below the preferred leadership threshold; exec should size conservatively.',
             )
         )
-    if volume_percentile is None:
+    if objective_features['volume_percentile_status'] == 'invalid':
+        blocks.append(
+            _reason(
+                'short_term_volume_percentile_invalid_block',
+                'Market-relative volume percentile is non-finite, out of range, or missing an explicit percent unit.',
+            )
+        )
+    elif volume_percentile is None:
         warnings.append(
             _reason(
                 'short_term_relative_volume_unverified_warning',
@@ -698,8 +1285,7 @@ def _short_term_entry_quality_blocks(
                 'Short-term candidate does not offer enough upside versus stop distance.',
             )
         )
-    setup_text = _short_term_setup_text(snapshot)
-    has_continuation_setup = any(marker in setup_text for marker in SHORT_TERM_CONTINUATION_SETUP_MARKERS)
+    has_continuation_setup = bool(objective_features['continuation_setup_detected'])
     feature_snapshot['continuation_setup_detected'] = has_continuation_setup
     if tactical_action == 'scalp_buy_candidate' and not has_continuation_setup:
         blocks.append(
@@ -850,6 +1436,77 @@ def _uses_exec_agent_sizing_for_dispatch(decision_agent_name: str) -> bool:
     }
 
 
+def _next_open_performance_cost_evidence(
+    *,
+    dispatches_to_exec: bool,
+    execution_feasibility_context: dict[str, Any],
+    pre_decider_enrichment_context: dict[str, Any],
+) -> tuple[Any, str]:
+    quote = pre_decider_enrichment_context.get('quote_orderbook_snapshot')
+    if (
+        not dispatches_to_exec
+        or pre_decider_enrichment_context.get('schema_version') != 'pre_decider_enrichment_v1'
+        or not isinstance(quote, dict)
+        or not quote
+    ):
+        return None, 'unavailable'
+    return (
+        execution_feasibility_context.get('expected_slippage_bps'),
+        str(execution_feasibility_context.get('expected_slippage_basis') or 'unavailable'),
+    )
+
+
+def _is_canonical_closed_market_cost_absence(
+    *,
+    pre_decider_enrichment_context: dict[str, Any],
+    execution_feasibility_context: dict[str, Any],
+) -> bool:
+    if (
+        execution_feasibility_context.get('expected_slippage_bps') is not None
+        or execution_feasibility_context.get('expected_slippage_basis') != 'unavailable'
+    ):
+        return False
+    phase_contract = pre_decider_enrichment_context.get('market_data_phase_contract')
+    quote = pre_decider_enrichment_context.get('quote_orderbook_snapshot')
+    if not isinstance(phase_contract, dict) or not isinstance(quote, dict):
+        return False
+    quote_status = str(quote.get('status') or '').strip().lower()
+    snapshot_type = str(quote.get('snapshot_type') or '').strip().lower()
+    quote_freshness_status = str(quote.get('quote_freshness_status') or '').strip().lower()
+    status_and_reason = (
+        execution_feasibility_context.get('expected_slippage_status'),
+        execution_feasibility_context.get('expected_slippage_reason'),
+    )
+    raw_spread = (
+        quote.get('spread_bps')
+        if 'spread_bps' in quote
+        else quote.get('quote_spread_bps_of_price')
+    )
+    if status_and_reason == ('missing', 'quote_spread_missing'):
+        if raw_spread is not None:
+            return False
+    elif status_and_reason == ('unavailable', 'quote_spread_not_executable_eod'):
+        parsed_spread = _to_decimal(raw_spread)
+        if parsed_spread is None or parsed_spread < 0:
+            return False
+    else:
+        return False
+    return bool(
+        phase_contract.get('schema_version') == 'market_data_phase_contract_v1'
+        and phase_contract.get('recommendation_basis') == 'latest_completed_eod'
+        and phase_contract.get('realtime_quote_orderbook_required') is False
+        and phase_contract.get('eod_reference_price_accepted') is True
+        and phase_contract.get('not_applicable_realtime_is_expected') is True
+        and (
+            (quote_status, snapshot_type, quote_freshness_status)
+            in {
+                ('stale_eod', 'eod_stale', 'stale'),
+                ('not_applicable', 'closed_market_no_eod_price', 'not_applicable'),
+            }
+        )
+    )
+
+
 def _pykrx_preflight_has_partial_coverage(preflight: dict[str, Any] | None) -> bool:
     if not isinstance(preflight, dict):
         return False
@@ -885,12 +1542,99 @@ class NextOpenAccountTarget:
     budget_krw: Decimal
 
 
+def _next_open_policy_fingerprint(account_targets: Sequence[NextOpenAccountTarget]) -> str:
+    payload = {
+        'schema_version': NEXT_OPEN_PREOPEN_POLICY_FINGERPRINT_VERSION,
+        'integration_mode': str(settings.signal_decider_exec_integration_mode or '').strip().lower(),
+        'next_open_execution_enabled': bool(settings.signal_decider_next_open_enabled),
+        'execution_cost_evidence_policy_version': NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION,
+        'non_spread_round_trip_cost_bps': _decimal_to_text(
+            _to_decimal(settings.signal_decider_next_open_non_spread_round_trip_cost_bps)
+        ),
+        'min_confidence_score_10': _decimal_to_text(
+            _to_decimal(settings.signal_decider_next_open_min_confidence_score_10)
+        ) or 'invalid',
+        'min_expected_return_pct': _decimal_to_text(
+            _to_decimal(settings.signal_decider_next_open_min_expected_return_pct)
+        ) or 'invalid',
+        'min_reward_risk_ratio': _decimal_to_text(
+            _to_decimal(settings.signal_decider_next_open_min_reward_risk_ratio)
+        ),
+        'require_active_policy': bool(
+            settings.signal_decider_next_open_require_active_policy
+        ),
+        'block_on_data_warnings': bool(
+            settings.signal_decider_next_open_block_on_data_warnings
+        ),
+        'block_on_specialist_disagreement': bool(
+            settings.signal_decider_next_open_block_on_specialist_disagreement
+        ),
+        'require_target_and_stop': bool(
+            settings.signal_decider_next_open_require_target_and_stop
+        ),
+        'wait_conflict_gate_mode': str(
+            settings.signal_decider_wait_conflict_gate_mode
+        ).strip(),
+        'wait_conflict_probe_quantity': int(
+            settings.signal_decider_wait_conflict_probe_quantity
+        ),
+        'account_targets': sorted(
+            (
+                {
+                    'label': target.label,
+                    'account_reference': target.account_reference,
+                    'budget_krw': _decimal_to_text(target.budget_krw),
+                }
+                for target in account_targets
+            ),
+            key=lambda item: (item['account_reference'], item['label'], item['budget_krw'] or ''),
+        ),
+    }
+    canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+    return f'{NEXT_OPEN_PREOPEN_POLICY_FINGERPRINT_VERSION}:{hashlib.sha256(canonical.encode("utf-8")).hexdigest()}'
+
+
 def _preopen_plan_covers_latest_snapshots(
     *,
     existing_rows: Sequence[SignalDeciderExecutionPlanItem],
     snapshots: Sequence[SignalDeciderDecisionSnapshot],
     account_targets: Sequence[NextOpenAccountTarget],
 ) -> bool:
+    if any(
+        not _is_dispatch_terminal_status(row.execution_status)
+        for row in existing_rows
+    ):
+        return False
+    latest_by_symbol_agent = {
+        (snapshot.symbol, _snapshot_agent_name(snapshot)): snapshot
+        for snapshot in snapshots
+    }
+    targets_by_reference = {target.account_reference: target for target in account_targets}
+    for row in existing_rows:
+        latest = latest_by_symbol_agent.get(
+            (row.symbol, _normalize_agent_name(row.decision_agent_name))
+        )
+        if (
+            latest is None
+            or not _is_actionable_snapshot(latest)
+            or int(row.decision_snapshot_id) != int(latest.id)
+        ):
+            return False
+        target = targets_by_reference.get(row.account_reference)
+        if target is None and _normalize_agent_name(row.decision_agent_name) == SHORT_TERM_DECIDER_AGENT_NAME:
+            target = NextOpenAccountTarget(
+                label=UNSPECIFIED_ROUTE_ACCOUNT_LABEL,
+                account_reference=UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE,
+                budget_krw=UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW,
+            )
+        validation = _row_validation_payload(row)
+        if (
+            target is None
+            or validation.get('preopen_policy_fingerprint')
+            != _next_open_policy_fingerprint([target])
+        ):
+            return False
+
     expected_snapshots: dict[tuple[str, str, str], SignalDeciderDecisionSnapshot] = {}
     for snapshot in snapshots:
         if not _is_actionable_snapshot(snapshot):
@@ -906,51 +1650,20 @@ def _preopen_plan_covers_latest_snapshots(
                 )
             ]
         for target in targets:
-            expected_snapshots[(target.account_reference, snapshot.symbol, decision_agent_name)] = snapshot
+            key = (target.account_reference, snapshot.symbol, decision_agent_name)
+            expected_snapshots[key] = snapshot
 
     existing_by_key = {
         (row.account_reference, row.symbol, _normalize_agent_name(row.decision_agent_name)): row
         for row in existing_rows
     }
+    if set(existing_by_key) != set(expected_snapshots):
+        return False
     for key, snapshot in expected_snapshots.items():
         row = existing_by_key.get(key)
         if row is None or int(row.decision_snapshot_id) != int(snapshot.id):
             return False
-        if (
-            _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
-            and not _is_dispatch_terminal_status(row.execution_status)
-        ):
-            validation = _row_validation_payload(row)
-            alignment_gate = (
-                validation.get('alignment_gate')
-                if isinstance(validation.get('alignment_gate'), dict)
-                else {}
-            )
-            if alignment_gate.get('enforcement_mode') != settings.signal_decider_wait_conflict_gate_mode:
-                return False
-            if int(alignment_gate.get('probe_quantity') or 0) != int(
-                settings.signal_decider_wait_conflict_probe_quantity
-            ):
-                return False
-        snapshot_updated_at = _normalized_utc_datetime(getattr(snapshot, 'updated_at', None))
-        row_updated_at = _normalized_utc_datetime(getattr(row, 'updated_at', None))
-        if snapshot_updated_at is not None and row_updated_at is not None and snapshot_updated_at > row_updated_at:
-            return False
-    for key, row in existing_by_key.items():
-        if _is_dispatch_terminal_status(row.execution_status):
-            continue
-        expected_snapshot = expected_snapshots.get(key)
-        if expected_snapshot is None or int(expected_snapshot.id) != int(row.decision_snapshot_id):
-            return False
     return True
-
-
-def _normalized_utc_datetime(value: Any) -> datetime | None:
-    if not isinstance(value, datetime):
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 class SignalDeciderNextOpenExecutionService:
@@ -990,6 +1703,369 @@ class SignalDeciderNextOpenExecutionService:
                 ),
                 'require_target_and_stop': bool(settings.signal_decider_next_open_require_target_and_stop),
             },
+        }
+
+    def inspect_dispatch_authority_generation(
+        self,
+        *,
+        target_trade_date: str | date,
+        expected_row_bindings: dict[int, dict[str, Any]],
+        _session: Any | None = None,
+    ) -> dict[str, Any]:
+        resolved_target_date = self._resolve_target_trade_date(target_trade_date)
+        source_market_date = _previous_trading_day(resolved_target_date)
+        normalized_bindings = {
+            int(row_id): copy.deepcopy(binding)
+            for row_id, binding in expected_row_bindings.items()
+            if isinstance(binding, dict)
+        }
+        row_ids = sorted(normalized_bindings)
+        snapshot_context: dict[str, Any] | None = None
+        snapshot_load_error = False
+
+        session_context = session_scope() if _session is None else nullcontext(_session)
+        with session_context as session:
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:lock_key)'),
+                {'lock_key': _plan_refresh_advisory_lock_key(resolved_target_date)},
+            )
+            _lock_dispatch_authority_source_tables(session)
+            market_state = self.market_state_getter()
+            live_market_authority_applies = _current_live_market_authority_applies(
+                market_state=market_state,
+                target_trade_date=resolved_target_date,
+            )
+            if live_market_authority_applies:
+                session.execute(
+                    select(CurrentMarketSnapshotCache.id)
+                    .where(CurrentMarketSnapshotCache.cache_key == 'dashboard')
+                    .with_for_update(read=True)
+                ).scalar_one_or_none()
+                snapshot_context, snapshot_load_error = (
+                    _load_live_market_snapshot_context()
+                )
+            rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update(read=True)
+            ).scalars().all()
+            latest_snapshots = self._load_latest_snapshots(
+                source_market_date=source_market_date
+            )
+            run_generation = session.execute(
+                select(AgentContextFeedbackRun)
+                .where(AgentContextFeedbackRun.market_date == source_market_date)
+                .order_by(
+                    AgentContextFeedbackRun.started_at.asc(),
+                    AgentContextFeedbackRun.id.asc(),
+                )
+            ).scalars().all()
+
+            account_targets, account_target_errors = self._parse_account_targets()
+            account_targets_by_reference = {
+                target.account_reference: target for target in account_targets
+            }
+            latest_by_scope = {
+                (snapshot.symbol.upper(), _snapshot_agent_name(snapshot)): snapshot
+                for snapshot in latest_snapshots
+            }
+            rows_by_id = {int(row.id): row for row in rows}
+            issues: list[dict[str, Any]] = []
+            row_generation: list[dict[str, Any]] = []
+
+            for row_id in row_ids:
+                expected = normalized_bindings[row_id]
+                row = rows_by_id.get(row_id)
+                if row is None:
+                    issues.append(
+                        {
+                            'row_id': row_id,
+                            'reason_code': 'latest_snapshot_replaced',
+                            'replacement_action': 'wait',
+                            'replacement_actionable': False,
+                        }
+                    )
+                    continue
+
+                decision_agent_name = _normalize_agent_name(row.decision_agent_name)
+                scope = (str(row.symbol or '').strip().upper(), decision_agent_name)
+                latest = latest_by_scope.get(scope)
+                latest_action = (
+                    _short_term_tactical_action(latest)
+                    if latest is not None
+                    and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    else _normalize_action(
+                        latest.next_day_open_action or latest.decision_action
+                    )
+                    if latest is not None
+                    else 'wait'
+                )
+                reason_code: str | None = None
+                replacement_action = latest_action
+                replacement_actionable = bool(
+                    latest is not None and _is_actionable_snapshot(latest)
+                )
+
+                if (
+                    row.target_trade_date != resolved_target_date
+                    or row.source_market_date != source_market_date
+                    or row.execution_window != EXECUTION_WINDOW_NEXT_OPEN
+                ):
+                    reason_code = 'latest_snapshot_replaced'
+                elif latest is None:
+                    reason_code = 'candidate_removed'
+                    replacement_action = 'wait'
+                    replacement_actionable = False
+                elif not _is_actionable_snapshot(latest):
+                    reason_code = 'latest_snapshot_not_actionable'
+                    replacement_actionable = False
+                elif int(row.decision_snapshot_id) != int(latest.id):
+                    reason_code = 'latest_snapshot_replaced'
+                elif int(expected.get('decision_snapshot_id') or 0) != int(
+                    row.decision_snapshot_id
+                ):
+                    reason_code = 'latest_snapshot_replaced'
+                elif expected.get('row_revision_fingerprint') != (
+                    _execution_plan_row_authority_fingerprint(row)
+                ):
+                    reason_code = 'policy_scope_changed'
+
+                target = account_targets_by_reference.get(row.account_reference)
+                if (
+                    target is None
+                    and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    and row.account_reference == UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
+                ):
+                    target = NextOpenAccountTarget(
+                        label=UNSPECIFIED_ROUTE_ACCOUNT_LABEL,
+                        account_reference=UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE,
+                        budget_krw=UNSPECIFIED_ROUTE_ACCOUNT_BUDGET_KRW,
+                    )
+                current_policy_fingerprint = (
+                    _next_open_policy_fingerprint([target])
+                    if target is not None
+                    else None
+                )
+                if reason_code is None and (
+                    account_target_errors
+                    or current_policy_fingerprint is None
+                    or _row_validation_payload(row).get(
+                        'preopen_policy_fingerprint'
+                    )
+                    != current_policy_fingerprint
+                ):
+                    reason_code = 'policy_scope_changed'
+
+                live_authority: dict[str, Any] | None = None
+                if latest is not None and row.planned_side == 'buy':
+                    live_authority = _current_live_market_buy_authority(
+                        snapshot=latest,
+                        target_trade_date=resolved_target_date,
+                        market_state=market_state,
+                        snapshot_context=snapshot_context,
+                        snapshot_load_error=snapshot_load_error,
+                    )
+                    authority_action = live_authority.get('action')
+                    if reason_code is None and authority_action == 'reject':
+                        reason_code = 'current_live_market_risk_off'
+                        replacement_action = 'reject'
+                        replacement_actionable = False
+                    elif reason_code is None and authority_action == 'block_new_buy':
+                        reason_code = 'current_live_market_evidence_unavailable'
+                        replacement_action = 'reject'
+                        replacement_actionable = False
+
+                if reason_code is not None:
+                    issues.append(
+                        {
+                            'row_id': row_id,
+                            'reason_code': reason_code,
+                            'replacement_action': replacement_action,
+                            'replacement_actionable': replacement_actionable,
+                        }
+                    )
+                row_generation.append(
+                    {
+                        'row_id': row_id,
+                        'row_revision_fingerprint': (
+                            _execution_plan_row_authority_fingerprint(row)
+                        ),
+                        'decision_snapshot_id': int(row.decision_snapshot_id),
+                        'latest_decision_snapshot_id': (
+                            int(latest.id) if latest is not None else None
+                        ),
+                        'current_policy_fingerprint': current_policy_fingerprint,
+                        'live_authority': (
+                            _stable_live_market_authority_generation_material(
+                                live_authority
+                            )
+                        ),
+                    }
+                )
+
+            generation_material = {
+                'schema_version': 'dispatch_authority_generation_v1',
+                'target_trade_date': resolved_target_date,
+                'source_market_date': source_market_date,
+                'row_bindings': normalized_bindings,
+                'rows': row_generation,
+                'latest_snapshot_cohort_fingerprint': (
+                    _snapshot_cohort_fingerprint(latest_snapshots)
+                ),
+                'run_generation': [
+                    {
+                        column.key: getattr(run, column.key, None)
+                        for column in AgentContextFeedbackRun.__table__.columns
+                    }
+                    for run in run_generation
+                ],
+                'market_state': _stable_market_state_generation_material(
+                    market_state
+                ),
+                'live_market_snapshot_fingerprint': (
+                    _live_market_snapshot_fingerprint(
+                        snapshot_context,
+                        load_error=snapshot_load_error,
+                    )
+                ),
+                'account_target_errors': account_target_errors,
+                'issues': issues,
+            }
+            canonical = json.dumps(
+                _to_json_safe(generation_material),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(',', ':'),
+            )
+            generation_fingerprint = hashlib.sha256(
+                canonical.encode('utf-8')
+            ).hexdigest()
+
+        first_issue = issues[0] if issues else {}
+        return {
+            'status': 'invalid' if issues else 'valid',
+            'generation_fingerprint': generation_fingerprint,
+            'reason_code': first_issue.get('reason_code'),
+            'replacement_action': first_issue.get('replacement_action'),
+            'replacement_actionable': first_issue.get(
+                'replacement_actionable'
+            ),
+            'issues': issues,
+        }
+
+    def apply_dispatch_authority_generation_fence(
+        self,
+        *,
+        target_trade_date: str | date,
+        expected_row_bindings: dict[int, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Durably fence exact rows after a dispatch-generation mismatch."""
+        normalized_bindings = {
+            int(row_id): copy.deepcopy(binding)
+            for row_id, binding in expected_row_bindings.items()
+            if isinstance(binding, dict)
+        }
+        now = _utcnow()
+        blocked_count = 0
+        staged_revocation_count = 0
+        with session_scope() as session:
+            generation = self.inspect_dispatch_authority_generation(
+                target_trade_date=target_trade_date,
+                expected_row_bindings=normalized_bindings,
+                _session=session,
+            )
+            if generation.get('status') == 'valid':
+                return {
+                    **generation,
+                    'blocked_count': 0,
+                    'staged_revocation_count': 0,
+                }
+
+            issue_by_row_id = {
+                int(issue['row_id']): issue
+                for issue in generation.get('issues') or []
+                if isinstance(issue, dict) and issue.get('row_id') is not None
+            }
+            rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(
+                    SignalDeciderExecutionPlanItem.id.in_(
+                        sorted(normalized_bindings)
+                    )
+                )
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
+            ).scalars().all()
+            for row in rows:
+                issue = issue_by_row_id.get(int(row.id))
+                if issue is None:
+                    continue
+                reason_code = (
+                    _normalize_optional_text(issue.get('reason_code'))
+                    or 'current_live_market_evidence_unavailable'
+                )
+                reason = _dispatch_authority_issue_reason(reason_code)
+                submission = (
+                    row.submission_payload
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                exec_dispatch = (
+                    submission.get('exec_dispatch')
+                    if isinstance(submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                item_links = exec_dispatch.get('item_links')
+                has_exact_remote_acceptance = bool(
+                    str(exec_dispatch.get('dispatch_status') or '').strip().lower()
+                    == 'accepted'
+                    and isinstance(item_links, list)
+                    and item_links
+                    and all(
+                        isinstance(link, dict)
+                        and _normalize_optional_text(link.get('core_item_key'))
+                        and _normalize_optional_text(link.get('exec_plan_id'))
+                        and _normalize_optional_text(link.get('exec_plan_item_id'))
+                        for link in item_links
+                    )
+                )
+                if _is_dispatch_terminal_status(row.execution_status) and (
+                    has_exact_remote_acceptance
+                ):
+                    observation_material = '|'.join(
+                        (
+                            reason_code,
+                            str(generation.get('generation_fingerprint') or ''),
+                            str(row.id),
+                            str(row.decision_snapshot_id),
+                        )
+                    )
+                    self._stage_terminal_revocation(
+                        row=row,
+                        replacement_snapshot=None,
+                        replacement_observation_id=(
+                            'observation:dispatch_authority_generation:'
+                            f'{hashlib.sha256(observation_material.encode("utf-8")).hexdigest()[:20]}'
+                        ),
+                        replacement_action=(
+                            _normalize_optional_text(
+                                issue.get('replacement_action')
+                            )
+                            or 'reject'
+                        ),
+                        reason=reason,
+                        now=now,
+                    )
+                    staged_revocation_count += 1
+                    continue
+                self._set_blocked_row(row=row, reason=reason, now=now)
+                blocked_count += 1
+            session.flush()
+        return {
+            **generation,
+            'blocked_count': blocked_count,
+            'staged_revocation_count': staged_revocation_count,
         }
 
     async def _get_market_state_async(self) -> MarketState:
@@ -1138,9 +2214,50 @@ class SignalDeciderNextOpenExecutionService:
         trigger: str = 'manual',
         force: bool = False,
     ) -> dict[str, Any]:
+        for attempt in range(2):
+            try:
+                return self._refresh_plan_items_once(
+                    target_trade_date=target_trade_date,
+                    trigger=trigger,
+                    force=force,
+                )
+            except _PlanRefreshRevisionConflict:
+                if attempt == 1:
+                    raise RuntimeError(
+                        'next-open plan refresh could not bind stable decision inputs'
+                    )
+                logger.info(
+                    'Retrying next-open plan refresh after decision inputs changed: %s',
+                    target_trade_date,
+                )
+        raise AssertionError('unreachable next-open plan refresh retry state')
+
+    def _refresh_plan_items_once(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+        trigger: str = 'manual',
+        force: bool = False,
+    ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
         runtime = self.runtime_status()
+        current_market_state = self.market_state_getter()
+        live_market_authority_applies = _current_live_market_authority_applies(
+            market_state=current_market_state,
+            target_trade_date=resolved_target_date,
+        )
+        live_market_snapshot_context: dict[str, Any] | None = None
+        live_market_snapshot_load_error = False
+        if live_market_authority_applies:
+            (
+                live_market_snapshot_context,
+                live_market_snapshot_load_error,
+            ) = _load_live_market_snapshot_context()
+        live_market_snapshot_fingerprint = _live_market_snapshot_fingerprint(
+            live_market_snapshot_context,
+            load_error=live_market_snapshot_load_error,
+        )
         existing_rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
             account_reference=None,
@@ -1153,10 +2270,20 @@ class SignalDeciderNextOpenExecutionService:
         )
         snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
         account_targets, account_target_errors = self._parse_account_targets()
+        account_targets_setting_configured = bool(
+            settings.signal_decider_next_open_account_targets.strip()
+        )
+        plan_policy_fingerprint = _next_open_policy_fingerprint(account_targets)
         if (
             existing_rows
             and not force
             and trigger == 'preopen_scheduler'
+            and not live_market_authority_applies
+            and not account_target_errors
+            and all(
+                _is_dispatch_terminal_status(row.execution_status)
+                for row in existing_rows
+            )
             and _preopen_plan_covers_latest_snapshots(
                 existing_rows=existing_rows,
                 snapshots=snapshots,
@@ -1202,6 +2329,15 @@ class SignalDeciderNextOpenExecutionService:
             candidate_symbols=[snapshot.symbol for snapshot in snapshots],
         )
         signal_decider_action_by_symbol = _latest_signal_decider_action_by_symbol(snapshots)
+        actionable_snapshot_scopes = {
+            (snapshot.symbol, _snapshot_agent_name(snapshot))
+            for snapshot in snapshots
+            if _is_actionable_snapshot(snapshot)
+        }
+        latest_snapshot_scopes = {
+            (snapshot.symbol, _snapshot_agent_name(snapshot))
+            for snapshot in snapshots
+        }
         actionable_short_term_symbols = [
             snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
         ]
@@ -1252,28 +2388,90 @@ class SignalDeciderNextOpenExecutionService:
                 'enrichment_preflight': enrichment_preflight,
                 'items': [self._serialize_row(row) for row in rows],
             }
-        account_targets_setting_configured = bool(settings.signal_decider_next_open_account_targets.strip())
         policy_cache: dict[str, dict[str, Any]] = {}
         price_cache: dict[str, int | None] = {}
         desired_keys: set[tuple[str, str, str]] = set()
         now = _utcnow()
 
         with session_scope() as session:
-            attached_existing = {
-                (row.account_reference, row.symbol, _normalize_agent_name(row.decision_agent_name)): session.get(
-                    SignalDeciderExecutionPlanItem,
-                    row.id,
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:lock_key)'),
+                {'lock_key': _plan_refresh_advisory_lock_key(resolved_target_date)},
+            )
+            _lock_dispatch_authority_source_tables(session)
+            if (
+                live_market_authority_applies
+                and live_market_snapshot_context is not None
+                and not live_market_snapshot_load_error
+            ):
+                session.execute(
+                    select(CurrentMarketSnapshotCache.id)
+                    .where(CurrentMarketSnapshotCache.cache_key == 'dashboard')
+                    .with_for_update(read=True)
+                ).scalar_one_or_none()
+                (
+                    current_live_market_snapshot_context,
+                    current_live_market_snapshot_load_error,
+                ) = _load_live_market_snapshot_context()
+                if _live_market_snapshot_fingerprint(
+                    current_live_market_snapshot_context,
+                    load_error=current_live_market_snapshot_load_error,
+                ) != live_market_snapshot_fingerprint:
+                    raise _PlanRefreshRevisionConflict
+                live_market_snapshot_context = current_live_market_snapshot_context
+                live_market_snapshot_load_error = current_live_market_snapshot_load_error
+            locked_existing_rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(
+                    SignalDeciderExecutionPlanItem.execution_window
+                    == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.target_trade_date
+                    == resolved_target_date,
                 )
-                for row in existing_rows
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
+            ).scalars().all()
+            current_snapshots = self._load_latest_snapshots(
+                source_market_date=source_market_date
+            )
+            if _snapshot_cohort_fingerprint(
+                current_snapshots
+            ) != _snapshot_cohort_fingerprint(snapshots):
+                raise _PlanRefreshRevisionConflict
+            current_account_targets, current_account_target_errors = (
+                self._parse_account_targets()
+            )
+            if (
+                current_account_target_errors != account_target_errors
+                or bool(settings.signal_decider_next_open_account_targets.strip())
+                != account_targets_setting_configured
+                or _next_open_policy_fingerprint(current_account_targets)
+                != plan_policy_fingerprint
+            ):
+                raise _PlanRefreshRevisionConflict
+            attached_existing = {
+                (
+                    row.account_reference,
+                    row.symbol,
+                    _normalize_agent_name(row.decision_agent_name),
+                ): row
+                for row in locked_existing_rows
             }
             for snapshot in snapshots:
                 decision_agent_name = _snapshot_agent_name(snapshot)
+                current_live_market_authority = _current_live_market_buy_authority(
+                    snapshot=snapshot,
+                    target_trade_date=resolved_target_date,
+                    market_state=current_market_state,
+                    snapshot_context=live_market_snapshot_context,
+                    snapshot_load_error=live_market_snapshot_load_error,
+                )
                 latest_action = (
                     _normalize_action(snapshot.next_day_open_action or snapshot.decision_action)
                     if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
                     else _short_term_tactical_action(snapshot)
                 )
-                actionable = latest_action == 'buy' if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME else latest_action in SHORT_TERM_ACTIONABLE_ACTIONS
+                actionable = _is_actionable_snapshot(snapshot)
                 if not actionable:
                     self._block_missing_symbol_rows(
                         rows=attached_existing,
@@ -1284,6 +2482,8 @@ class SignalDeciderNextOpenExecutionService:
                             f'Latest {source_market_date.isoformat()} {decision_agent_name} action is {latest_action}.',
                         ),
                         now=now,
+                        replacement_snapshot=snapshot,
+                        replacement_action=latest_action,
                     )
                     continue
 
@@ -1340,7 +2540,111 @@ class SignalDeciderNextOpenExecutionService:
                         session.add(row)
                         attached_existing[(target.account_reference, snapshot.symbol, decision_agent_name)] = row
 
+                    if row.execution_status in EXECUTION_REVOCATION_LOCKED_STATUSES:
+                        continue
+                    if row.execution_status == EXECUTION_STATUS_REVOKED:
+                        if not self._recover_acknowledged_market_evidence_revocation(
+                            row=row,
+                            snapshot=snapshot,
+                            target=target,
+                            current_live_market_authority=current_live_market_authority,
+                            now=now,
+                        ):
+                            continue
                     if _is_dispatch_terminal_status(row.execution_status):
+                        planned_side = _normalize_optional_text(row.planned_side)
+                        if (
+                            planned_side == 'buy'
+                            and current_live_market_authority.get('applies') is True
+                        ):
+                            row.validation_payload = {
+                                **(
+                                    copy.deepcopy(row.validation_payload)
+                                    if isinstance(row.validation_payload, dict)
+                                    else {}
+                                ),
+                                'current_live_market_authority': copy.deepcopy(
+                                    current_live_market_authority
+                                ),
+                            }
+                        if int(row.decision_snapshot_id) != int(snapshot.id):
+                            self._stage_terminal_revocation(
+                                row=row,
+                                replacement_snapshot=snapshot,
+                                replacement_action=latest_action,
+                                reason=_reason(
+                                    'latest_snapshot_replaced',
+                                    (
+                                        f'Latest {source_market_date.isoformat()} {decision_agent_name} '
+                                        f'decision snapshot changed from {row.decision_snapshot_id} to {snapshot.id}.'
+                                    ),
+                                ),
+                                now=now,
+                            )
+                            continue
+                        policy_fingerprint = _next_open_policy_fingerprint([target])
+                        if (
+                            _row_validation_payload(row).get('preopen_policy_fingerprint')
+                            != policy_fingerprint
+                        ):
+                            self._stage_terminal_revocation(
+                                row=row,
+                                replacement_snapshot=snapshot,
+                                replacement_observation_id=(
+                                    'observation:policy_scope_changed:'
+                                    f'{hashlib.sha256(policy_fingerprint.encode("utf-8")).hexdigest()[:20]}'
+                                ),
+                                replacement_action=latest_action,
+                                reason=_reason(
+                                    'policy_scope_changed',
+                                    'Current execution policy or account-route budget no longer matches '
+                                    'the delegated plan authority.',
+                                ),
+                                now=now,
+                            )
+                            continue
+                        authority_action = current_live_market_authority.get('action')
+                        if (
+                            planned_side == 'buy'
+                            and authority_action in {'reject', 'block_new_buy'}
+                        ):
+                            revocation_reason_code = (
+                                'current_live_market_risk_off'
+                                if authority_action == 'reject'
+                                else 'current_live_market_evidence_unavailable'
+                            )
+                            observation_material = '|'.join(
+                                (
+                                    revocation_reason_code,
+                                    resolved_target_date.isoformat(),
+                                    row.account_reference,
+                                    row.symbol,
+                                    str(current_live_market_authority.get('market') or ''),
+                                    str(current_live_market_authority.get('observed_at') or ''),
+                                    str(current_live_market_authority.get('reason_code') or ''),
+                                )
+                            )
+                            self._stage_terminal_revocation(
+                                row=row,
+                                replacement_snapshot=snapshot,
+                                replacement_observation_id=(
+                                    f'observation:{revocation_reason_code}:'
+                                    f'{hashlib.sha256(observation_material.encode("utf-8")).hexdigest()[:20]}'
+                                ),
+                                replacement_action=latest_action,
+                                reason=_reason(
+                                    revocation_reason_code,
+                                    (
+                                        'Fresh authoritative live market breadth is severely weak; '
+                                        'unfilled delegated BUY authority must be revoked.'
+                                        if authority_action == 'reject'
+                                        else 'The open-session live market breadth proof is unavailable, stale, '
+                                        'or ambiguous; unfilled delegated BUY authority must be revoked.'
+                                    ),
+                                ),
+                                now=now,
+                            )
+                            continue
                         continue
                     policy_context = None
                     if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and snapshot.policy_version not in policy_cache:
@@ -1363,6 +2667,29 @@ class SignalDeciderNextOpenExecutionService:
                         ),
                         agent_context_completeness=agent_context_completeness,
                     )
+                    if current_live_market_authority.get('applies') is True:
+                        validation['current_live_market_authority'] = copy.deepcopy(
+                            current_live_market_authority
+                        )
+                        authority_action = current_live_market_authority.get('action')
+                        if authority_action == 'reject':
+                            validation['blocking_reasons'] = [
+                                *(validation.get('blocking_reasons') or []),
+                                _reason(
+                                    'current_live_market_risk_off',
+                                    'Fresh authoritative live market breadth is severely weak; '
+                                    'new BUY authority is blocked.',
+                                ),
+                            ]
+                        elif authority_action != 'allow':
+                            validation['blocking_reasons'] = [
+                                *(validation.get('blocking_reasons') or []),
+                                _reason(
+                                    'current_live_market_evidence_unavailable',
+                                    'The open-session live market breadth proof is unavailable, stale, '
+                                    'or ambiguous; new BUY authority fails closed.',
+                                ),
+                            ]
                     if account_target_blocking_reasons:
                         validation['blocking_reasons'] = [
                             *(validation.get('blocking_reasons') or []),
@@ -1389,14 +2716,66 @@ class SignalDeciderNextOpenExecutionService:
             for key, row in attached_existing.items():
                 if key in desired_keys or row is None:
                     continue
+                if (
+                    (row.symbol, _normalize_agent_name(row.decision_agent_name))
+                    in latest_snapshot_scopes
+                    and (
+                        row.symbol,
+                        _normalize_agent_name(row.decision_agent_name),
+                    )
+                    not in actionable_snapshot_scopes
+                ):
+                    continue
+                removal_code = (
+                    'account_route_removed'
+                    if (row.symbol, _normalize_agent_name(row.decision_agent_name))
+                    in actionable_snapshot_scopes
+                    else 'candidate_removed'
+                )
+                removal_reason = _reason(
+                    removal_code,
+                    (
+                        f'Configured account route no longer permits {row.decision_agent_name} '
+                        f'for {row.symbol}.'
+                        if removal_code == 'account_route_removed'
+                        else (
+                            f'No latest decision candidate remains for {row.decision_agent_name} '
+                            f'on this account and symbol.'
+                        )
+                    ),
+                )
                 if _is_dispatch_terminal_status(row.execution_status):
+                    observation_material = '|'.join(
+                        (
+                            removal_code,
+                            source_market_date.isoformat(),
+                            resolved_target_date.isoformat(),
+                            row.account_reference,
+                            row.symbol,
+                            _normalize_agent_name(row.decision_agent_name),
+                        )
+                    )
+                    observation_id = (
+                        f'observation:{removal_code}:'
+                        f'{hashlib.sha256(observation_material.encode("utf-8")).hexdigest()[:20]}'
+                    )
+                    self._stage_terminal_revocation(
+                        row=row,
+                        replacement_snapshot=None,
+                        replacement_observation_id=observation_id,
+                        replacement_action='reject',
+                        reason=removal_reason,
+                        now=now,
+                    )
+                    continue
+                if (
+                    row.execution_status in EXECUTION_REVOCATION_LOCKED_STATUSES
+                    or row.execution_status == EXECUTION_STATUS_REVOKED
+                ):
                     continue
                 self._set_blocked_row(
                     row=row,
-                    reason=_reason(
-                        'candidate_removed',
-                        f'No latest actionable decision remains for {row.decision_agent_name} on this account and symbol.',
-                    ),
+                    reason=removal_reason,
                     now=now,
                 )
 
@@ -1606,6 +2985,15 @@ class SignalDeciderNextOpenExecutionService:
             for row in candidate_rows
             if _normalize_agent_name(row.decision_agent_name) == SIGNAL_DECIDER_AGENT_NAME
         ]
+        core_local_execution_reason = (
+            'exec_dispatch_owns_submission'
+            if _exec_agent_sizing_dispatch_enabled()
+            else 'core_local_execution_disabled'
+        )
+        # Core has no execution-time executable quote/cost recheck. It may
+        # prepare plans for Exec, but it must never submit a next-open buy
+        # through the legacy local order path in any integration mode.
+        candidate_rows = []
         if effective_dry_run:
             selected = [
                 row.id
@@ -1658,7 +3046,8 @@ class SignalDeciderNextOpenExecutionService:
                 'calendar_source_status': getattr(market_state, 'calendar_source_status', None),
             },
             'summary': {
-                'triggered': True,
+                'triggered': False,
+                'reason': core_local_execution_reason,
                 'selected_count': len(selected),
                 'submitted_count': submitted_count,
                 'dry_run_count': dry_run_count,
@@ -1763,7 +3152,11 @@ class SignalDeciderNextOpenExecutionService:
                     and _normalize_agent_name(row.decision_agent_name) not in normalized_agent_names
                 ):
                     continue
-                if _is_dispatch_terminal_status(row.execution_status):
+                if (
+                    _is_dispatch_terminal_status(row.execution_status)
+                    or row.execution_status in EXECUTION_REVOCATION_LOCKED_STATUSES
+                    or row.execution_status == EXECUTION_STATUS_REVOKED
+                ):
                     continue
                 existing = row.validation_payload if isinstance(row.validation_payload, dict) else {}
                 existing_reasons = [
@@ -1972,64 +3365,109 @@ class SignalDeciderNextOpenExecutionService:
 
     def _load_latest_snapshots(self, *, source_market_date: date) -> list[SignalDeciderDecisionSnapshot]:
         with session_scope() as session:
-            ranked_ids = (
-                select(
-                    SignalDeciderDecisionSnapshot.id.label('id'),
-                    func.row_number()
-                    .over(
-                        partition_by=(
-                            SignalDeciderDecisionSnapshot.symbol,
-                            SignalDeciderDecisionSnapshot.agent_name,
-                        ),
-                        order_by=(
-                            SignalDeciderDecisionSnapshot.created_at.desc(),
-                            SignalDeciderDecisionSnapshot.id.desc(),
-                        ),
-                    )
-                    .label('rank'),
-                )
+            snapshots = session.execute(
+                select(SignalDeciderDecisionSnapshot)
                 .where(
                     SignalDeciderDecisionSnapshot.agent_name.in_(
                         [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
                     ),
                     SignalDeciderDecisionSnapshot.market_date == source_market_date,
-                    or_(
-                        SignalDeciderDecisionSnapshot.agent_name == SIGNAL_DECIDER_AGENT_NAME,
-                        and_(
-                            SignalDeciderDecisionSnapshot.agent_name == SHORT_TERM_DECIDER_AGENT_NAME,
-                            or_(
-                                SignalDeciderDecisionSnapshot.next_day_open_action == 'buy',
-                                SignalDeciderDecisionSnapshot.decision_action == 'buy',
-                                SignalDeciderDecisionSnapshot.decision_action.in_(
-                                    list(SHORT_TERM_ACTIONABLE_ACTIONS)
-                                ),
-                            ),
-                        ),
-                    ),
                 )
-                .subquery()
-            )
-            snapshot_ids = [
-                int(row.id)
-                for row in session.execute(
-                    select(ranked_ids.c.id)
-                    .where(ranked_ids.c.rank == 1)
-                    .order_by(ranked_ids.c.id.asc())
-                )
-            ]
-            if not snapshot_ids:
-                return []
-            rows = session.execute(
-                select(SignalDeciderDecisionSnapshot)
-                .where(SignalDeciderDecisionSnapshot.id.in_(snapshot_ids))
                 .order_by(
-                    SignalDeciderDecisionSnapshot.symbol.asc(),
-                    SignalDeciderDecisionSnapshot.agent_name.asc(),
+                    SignalDeciderDecisionSnapshot.created_at.desc(),
+                    SignalDeciderDecisionSnapshot.id.desc(),
                 )
             ).scalars().all()
-            for row in rows:
-                session.expunge(row)
-        return rows
+            run_rows = session.execute(
+                select(AgentContextFeedbackRun)
+                .where(AgentContextFeedbackRun.market_date == source_market_date)
+                .order_by(
+                    AgentContextFeedbackRun.started_at.desc(),
+                    AgentContextFeedbackRun.id.desc(),
+                )
+            ).scalars().all()
+            run_snapshots = [
+                agent_context_feedback_run_state_service._serialize_run(row)
+                for row in run_rows
+            ]
+            for snapshot in snapshots:
+                session.expunge(snapshot)
+
+        snapshots_by_run_key: dict[
+            tuple[str, tuple[str, str]],
+            SignalDeciderDecisionSnapshot,
+        ] = {}
+        for snapshot in snapshots:
+            run_id = str(snapshot.decision_run_id or '').strip()
+            if not run_id:
+                continue
+            key = (snapshot.symbol.upper(), _snapshot_agent_name(snapshot))
+            snapshots_by_run_key.setdefault((run_id, key), snapshot)
+
+        selected_by_key: dict[
+            tuple[str, str],
+            SignalDeciderDecisionSnapshot | None,
+        ] = {}
+        explicitly_scoped_run_ids: set[str] = set()
+        relevant_agents = {SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME}
+        for run in run_snapshots:
+            run_id = str(run.get('run_id') or '').strip()
+            if not run_id:
+                continue
+            status = str(run.get('status') or '').strip().lower()
+            if status == 'abandoned' or agent_context_feedback_run_state_service._is_stale_running_row(run):
+                explicitly_scoped_run_ids.add(run_id)
+                continue
+            request_payload = run.get('request_payload') if isinstance(run.get('request_payload'), dict) else {}
+            raw_role_scopes = request_payload.get('role_symbol_scopes')
+            role_scopes: dict[str, list[str]] = {}
+            if isinstance(raw_role_scopes, dict):
+                for raw_role, raw_symbols in raw_role_scopes.items():
+                    agent_name = _normalize_agent_name(raw_role)
+                    if agent_name not in relevant_agents or not isinstance(raw_symbols, list):
+                        continue
+                    role_scopes[agent_name] = sorted(
+                        {
+                            str(symbol or '').strip().upper()
+                            for symbol in raw_symbols
+                            if str(symbol or '').strip()
+                        }
+                    )
+            if not role_scopes:
+                requested_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
+                    run_snapshot=run
+                )
+                raw_roles = request_payload.get('roles')
+                if requested_symbols is not None and isinstance(raw_roles, list):
+                    for raw_role in raw_roles:
+                        agent_name = _normalize_agent_name(raw_role)
+                        if agent_name in relevant_agents:
+                            role_scopes[agent_name] = requested_symbols
+            if not role_scopes:
+                continue
+            explicitly_scoped_run_ids.add(run_id)
+            for agent_name, symbols in role_scopes.items():
+                for symbol in symbols:
+                    key = (symbol, agent_name)
+                    if key in selected_by_key:
+                        continue
+                    # A requested-but-missing result is a deliberate tombstone: never
+                    # mix an older BUY into this newer run's partial/failure cohort.
+                    selected_by_key[key] = snapshots_by_run_key.get((run_id, key))
+
+        for snapshot in snapshots:
+            key = (snapshot.symbol.upper(), _snapshot_agent_name(snapshot))
+            if key in selected_by_key:
+                continue
+            run_id = str(snapshot.decision_run_id or '').strip()
+            if run_id and run_id in explicitly_scoped_run_ids:
+                continue
+            selected_by_key[key] = snapshot
+
+        return sorted(
+            (snapshot for snapshot in selected_by_key.values() if snapshot is not None),
+            key=lambda snapshot: (snapshot.symbol, _snapshot_agent_name(snapshot), snapshot.id),
+        )
 
     def _load_plan_rows(
         self,
@@ -2105,6 +3543,26 @@ class SignalDeciderNextOpenExecutionService:
         alignment_gate_payload: dict[str, Any] | None = None
         blocking_reasons: list[dict[str, str]] = []
         warnings: list[dict[str, str]] = []
+        min_confidence_threshold = _to_decimal(
+            settings.signal_decider_next_open_min_confidence_score_10
+        )
+        min_expected_return_threshold = _to_decimal(
+            settings.signal_decider_next_open_min_expected_return_pct
+        )
+        threshold_configuration_invalid = bool(
+            min_confidence_threshold is None
+            or min_confidence_threshold < Decimal('0')
+            or min_confidence_threshold > Decimal('10')
+            or min_expected_return_threshold is None
+            or min_expected_return_threshold < Decimal('0')
+        )
+        if threshold_configuration_invalid:
+            blocking_reasons.append(
+                _reason(
+                    'next_open_threshold_configuration_invalid',
+                    'Next-open confidence or expected-return threshold is invalid; automated buy planning is disabled.',
+                )
+            )
         gate_checks = _snapshot_traceability_payload(snapshot).get('gate_checks') or {}
         missing_upstream_roles = _normalize_text_list(gate_checks.get('missing_upstream_roles'))
         if missing_upstream_roles:
@@ -2139,37 +3597,25 @@ class SignalDeciderNextOpenExecutionService:
             )
 
         confidence_score = _to_decimal(snapshot.confidence_score_10)
-        if confidence_score is None or confidence_score < Decimal(str(settings.signal_decider_next_open_min_confidence_score_10)):
-            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and _exec_agent_sizing_dispatch_enabled():
-                warnings.append(
-                    _reason(
-                        'confidence_below_threshold',
-                        'Confidence score is below the next-open automation threshold; dispatched to exec for intraday monitoring only.',
-                    )
+        if (
+            confidence_score is None
+            or min_confidence_threshold is None
+            or confidence_score < min_confidence_threshold
+        ):
+            blocking_reasons.append(
+                _reason(
+                    'confidence_below_threshold',
+                    'Confidence score is below the next-open automation threshold.',
                 )
-            else:
-                blocking_reasons.append(
-                    _reason(
-                        'confidence_below_threshold',
-                        'Confidence score is below the next-open automation threshold.',
-                    )
-                )
+            )
         data_quality_warnings = _normalize_text_list(snapshot.data_quality_warnings_payload)
         if settings.signal_decider_next_open_block_on_data_warnings and data_quality_warnings:
-            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and _exec_agent_sizing_dispatch_enabled():
-                warnings.append(
-                    _reason(
-                        'data_quality_warnings_present',
-                        'Snapshot has data quality warnings; delegated to exec-agent for account-aware sizing and risk decision.',
-                    )
+            blocking_reasons.append(
+                _reason(
+                    'data_quality_warnings_present',
+                    'Snapshot has data quality warnings that Exec cannot independently revalidate.',
                 )
-            else:
-                blocking_reasons.append(
-                    _reason(
-                        'data_quality_warnings_present',
-                        'Snapshot has data quality warnings.',
-                    )
-                )
+            )
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
             snapshot.specialist_disagreement_payload
         ):
@@ -2272,7 +3718,11 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
             expected_return = _to_decimal(snapshot.expected_return_pct)
-            if expected_return is None or expected_return < Decimal(str(settings.signal_decider_next_open_min_expected_return_pct)):
+            if (
+                expected_return is None
+                or min_expected_return_threshold is None
+                or expected_return < min_expected_return_threshold
+            ):
                 blocking_reasons.append(
                     _reason(
                         'expected_return_below_threshold',
@@ -2522,8 +3972,32 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
 
+        decision_input_quality_context = _snapshot_decision_input_quality_context(
+            snapshot,
+            target=target,
+            estimated_reference_price=estimated_reference_price,
+            estimated_notional_krw=estimated_notional,
+        )
+        execution_feasibility_context = (
+            decision_input_quality_context.get('execution_feasibility')
+            if isinstance(decision_input_quality_context.get('execution_feasibility'), dict)
+            else {}
+        )
         performance_gate: dict[str, Any] = {'status': 'not_applicable'}
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            dispatches_to_exec = _uses_exec_agent_sizing_for_dispatch(decision_agent_name)
+            expected_slippage_bps, expected_slippage_basis = _next_open_performance_cost_evidence(
+                dispatches_to_exec=dispatches_to_exec,
+                execution_feasibility_context=execution_feasibility_context,
+                pre_decider_enrichment_context=pre_decider_enrichment_context,
+            )
+            allow_pending_live_cost_confirmation = bool(
+                dispatches_to_exec
+                and _is_canonical_closed_market_cost_absence(
+                    pre_decider_enrichment_context=pre_decider_enrichment_context,
+                    execution_feasibility_context=execution_feasibility_context,
+                )
+            )
             performance_gate = evaluate_next_open_performance_gate(
                 request_payload=_snapshot_request_payload(snapshot),
                 decision_action=generic_action,
@@ -2532,6 +4006,15 @@ class SignalDeciderNextOpenExecutionService:
                 reference_price=estimated_reference_price,
                 target_price=snapshot.target_price,
                 stop_loss_price=snapshot.stop_loss_price,
+                expected_slippage_bps=expected_slippage_bps,
+                expected_slippage_basis=expected_slippage_basis,
+                allow_pending_live_cost_confirmation=allow_pending_live_cost_confirmation,
+                server_non_spread_round_trip_cost_bps=(
+                    None
+                    if dispatches_to_exec
+                    else settings.signal_decider_next_open_non_spread_round_trip_cost_bps
+                ),
+                defer_non_spread_round_trip_cost_to_exec=dispatches_to_exec,
                 base_min_confidence_score_10=settings.signal_decider_next_open_min_confidence_score_10,
                 base_min_expected_return_pct=settings.signal_decider_next_open_min_expected_return_pct,
                 base_min_reward_risk_ratio=settings.signal_decider_next_open_min_reward_risk_ratio,
@@ -2547,12 +4030,6 @@ class SignalDeciderNextOpenExecutionService:
                 if isinstance(warning, dict)
             )
 
-        decision_input_quality_context = _snapshot_decision_input_quality_context(
-            snapshot,
-            target=target,
-            estimated_reference_price=estimated_reference_price,
-            estimated_notional_krw=estimated_notional,
-        )
         quality_hard_blocks = (
             ((decision_input_quality_context.get('final_judgment') or {}).get('hard_blocks') or [])
             if isinstance(decision_input_quality_context, dict)
@@ -2623,6 +4100,7 @@ class SignalDeciderNextOpenExecutionService:
             'pre_decider_enrichment_context': pre_decider_enrichment_context,
             'market_regime_context': market_regime_context,
             'decision_input_quality_context': decision_input_quality_context,
+            'preopen_policy_fingerprint': _next_open_policy_fingerprint([target]),
             'handoff': {
                 'decision_agent_name': decision_agent_name,
                 'raw_action': short_term_tactical_action or generic_action,
@@ -2647,6 +4125,10 @@ class SignalDeciderNextOpenExecutionService:
             validation_payload['pykrx_enrichment_preflight'] = enrichment_preflight
         if candidate_enrichment is not None:
             validation_payload['candidate_pykrx_enrichment'] = candidate_enrichment
+        if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            validation_payload['execution_cost_evidence_policy_version'] = (
+                NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION
+            )
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             validation_payload['short_term'] = {
                 'raw_action': short_term_tactical_action,
@@ -2818,7 +4300,9 @@ class SignalDeciderNextOpenExecutionService:
             'expected_holding_period': _short_term_field_text(snapshot, 'expected_holding_period')
             or suggested_holding_period,
             'core_execution_classification': (
-                EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                'blocked'
+                if blocking_reasons
+                else EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
                 if _uses_exec_agent_sizing_for_dispatch(decision_agent_name)
                 else 'core_fixed_quantity_next_open_candidate'
             ),
@@ -2909,16 +4393,370 @@ class SignalDeciderNextOpenExecutionService:
         decision_agent_name: str,
         reason: dict[str, str],
         now: datetime,
+        replacement_snapshot: SignalDeciderDecisionSnapshot | None = None,
+        replacement_action: str | None = None,
     ) -> None:
         for key, row in rows.items():
             if (
                 row is None
                 or key[1] != symbol
                 or key[2] != decision_agent_name
-                or _is_dispatch_terminal_status(row.execution_status)
             ):
                 continue
+            if _is_dispatch_terminal_status(row.execution_status):
+                if replacement_snapshot is not None and replacement_action is not None:
+                    self._stage_terminal_revocation(
+                        row=row,
+                        replacement_snapshot=replacement_snapshot,
+                        replacement_action=replacement_action,
+                        reason=reason,
+                        now=now,
+                    )
+                continue
             self._set_blocked_row(row=row, reason=reason, now=now)
+
+    def _stage_terminal_revocation(
+        self,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        replacement_snapshot: SignalDeciderDecisionSnapshot | None,
+        replacement_observation_id: str | None = None,
+        replacement_action: str,
+        reason: dict[str, str],
+        now: datetime,
+    ) -> None:
+        existing_submission = (
+            copy.deepcopy(row.submission_payload)
+            if isinstance(row.submission_payload, dict)
+            else {}
+        )
+        existing_revocation = (
+            existing_submission.get('revocation')
+            if isinstance(existing_submission.get('revocation'), dict)
+            else {}
+        )
+        replacement_revision_id = (
+            str(replacement_observation_id)
+            if replacement_observation_id
+            else str(replacement_snapshot.id)
+            if replacement_snapshot is not None
+            else ''
+        )
+        if not replacement_revision_id:
+            raise ValueError('terminal revocation requires a stable replacement revision identity')
+        if (
+            row.execution_status == EXECUTION_STATUS_REVOCATION_PENDING
+            and str(existing_revocation.get('replacement_decision_snapshot_id') or '')
+            == replacement_revision_id
+        ):
+            return
+
+        prior_row_authority_fingerprint = _execution_plan_row_authority_fingerprint(
+            row
+        )
+        exec_dispatch = (
+            existing_submission.get('exec_dispatch')
+            if isinstance(existing_submission.get('exec_dispatch'), dict)
+            else {}
+        )
+        prior_evidence = {
+            'decision_snapshot_id': str(row.decision_snapshot_id),
+            'decision_agent_name': row.decision_agent_name,
+            'symbol': row.symbol,
+            'eligibility_status': row.eligibility_status,
+            'execution_status': row.execution_status,
+            'validation_payload': copy.deepcopy(row.validation_payload),
+            'traceability_payload': copy.deepcopy(row.traceability_payload),
+            'dispatch_evidence': {
+                'plan_id': exec_dispatch.get('plan_id'),
+                'execution_plan_id': exec_dispatch.get('execution_plan_id'),
+                'plan_fingerprint': exec_dispatch.get('plan_fingerprint'),
+                'dispatch_status': exec_dispatch.get('dispatch_status'),
+                'destination_binding': copy.deepcopy(
+                    exec_dispatch.get('destination_binding')
+                ),
+                'item_links': copy.deepcopy(exec_dispatch.get('item_links') or []),
+                'last_success_at': exec_dispatch.get('last_success_at'),
+                'contract_proof': copy.deepcopy(
+                    exec_dispatch.get('contract_proof')
+                ),
+                'last_request_summary': copy.deepcopy(
+                    exec_dispatch.get('last_request_summary')
+                ),
+                'last_response_summary': copy.deepcopy(
+                    exec_dispatch.get('last_response_summary')
+                ),
+            },
+            'row_authority_fingerprint': prior_row_authority_fingerprint,
+            'archived_at': now.isoformat(),
+        }
+        history = [
+            copy.deepcopy(item)
+            for item in (existing_submission.get('revision_history') or [])
+            if isinstance(item, dict)
+        ]
+        if not any(
+            str(item.get('decision_snapshot_id') or '') == str(row.decision_snapshot_id)
+            and (item.get('dispatch_evidence') or {}).get('plan_id') == exec_dispatch.get('plan_id')
+            for item in history
+        ):
+            history.append(prior_evidence)
+        history = history[-EXECUTION_REVISION_HISTORY_LIMIT:]
+        revocation = {
+            'schema_version': 'core_execution_revocation_state_v1',
+            'status': 'pending',
+            'reason_code': reason['code'],
+            'reason': copy.deepcopy(reason),
+            'requested_at': now.isoformat(),
+            'prior_decision_snapshot_id': str(row.decision_snapshot_id),
+            'replacement_decision_snapshot_id': replacement_revision_id,
+            'replacement_observation_id': replacement_observation_id,
+            'replacement_action': replacement_action,
+            'replacement_actionable': bool(
+                replacement_snapshot is not None
+                and _is_actionable_snapshot(replacement_snapshot)
+            ),
+            'plan_id': exec_dispatch.get('plan_id'),
+            'destination_binding': copy.deepcopy(
+                exec_dispatch.get('destination_binding')
+            ),
+            'item_links': copy.deepcopy(exec_dispatch.get('item_links') or []),
+            'prior_row_authority_fingerprint': prior_row_authority_fingerprint,
+        }
+        row.eligibility_status = ELIGIBILITY_BLOCKED
+        row.execution_status = EXECUTION_STATUS_REVOCATION_PENDING
+        row.last_evaluated_at = now
+        row.validation_payload = {
+            **(
+                copy.deepcopy(row.validation_payload)
+                if isinstance(row.validation_payload, dict)
+                else {}
+            ),
+            'blocking_reasons': [reason],
+        }
+        revocation['revoked_row_authority_fingerprint'] = (
+            _execution_plan_row_authority_fingerprint(row)
+        )
+        row.submission_payload = {
+            **existing_submission,
+            'revision_history': history,
+            'revocation': revocation,
+        }
+
+    def _recover_acknowledged_market_evidence_revocation(
+        self,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        snapshot: SignalDeciderDecisionSnapshot,
+        target: NextOpenAccountTarget,
+        current_live_market_authority: dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        """Retire an ACKed transient BUY authority only after exact live revalidation."""
+        submission = (
+            copy.deepcopy(row.submission_payload)
+            if isinstance(row.submission_payload, dict)
+            else {}
+        )
+        revocation = (
+            copy.deepcopy(submission.get('revocation'))
+            if isinstance(submission.get('revocation'), dict)
+            else {}
+        )
+        exec_dispatch = (
+            copy.deepcopy(submission.get('exec_dispatch'))
+            if isinstance(submission.get('exec_dispatch'), dict)
+            else {}
+        )
+        expected_policy_fingerprint = _next_open_policy_fingerprint([target])
+        revoked_row_authority_fingerprint = _normalize_optional_text(
+            revocation.get('revoked_row_authority_fingerprint')
+        )
+        prior_row_authority_fingerprint = _normalize_optional_text(
+            revocation.get('prior_row_authority_fingerprint')
+        )
+        replacement_revision_id = _normalize_optional_text(
+            revocation.get('replacement_decision_snapshot_id')
+        )
+        expected_links = revocation.get('item_links')
+        dispatch_links = exec_dispatch.get('item_links')
+        revision_history = [
+            copy.deepcopy(item)
+            for item in (submission.get('revision_history') or [])
+            if isinstance(item, dict)
+        ]
+        archived_revision = next(
+            (
+                item
+                for item in reversed(revision_history)
+                if str(item.get('decision_snapshot_id') or '')
+                == str(row.decision_snapshot_id)
+                and isinstance(item.get('dispatch_evidence'), dict)
+                and item['dispatch_evidence'].get('plan_id')
+                == revocation.get('plan_id')
+                and item.get('row_authority_fingerprint')
+                == prior_row_authority_fingerprint
+            ),
+            None,
+        )
+        revocation_history = [
+            item
+            for item in (submission.get('revocation_history') or [])
+            if isinstance(item, dict)
+        ]
+        acknowledged_record = revocation_history[-1] if revocation_history else {}
+        acknowledged_request = (
+            acknowledged_record.get('request')
+            if isinstance(acknowledged_record.get('request'), dict)
+            else {}
+        )
+        acknowledged_response = (
+            acknowledged_record.get('response')
+            if isinstance(acknowledged_record.get('response'), dict)
+            else {}
+        )
+        response_contract_ack = (
+            acknowledged_response.get('contract_ack')
+            if isinstance(acknowledged_response.get('contract_ack'), dict)
+            else {}
+        )
+
+        expected_item_bindings = {
+            str(link.get('core_item_key')): str(link.get('exec_plan_item_id'))
+            for link in expected_links or []
+            if isinstance(link, dict)
+            and link.get('core_item_key')
+            and link.get('exec_plan_item_id')
+        }
+        requested_item_bindings = {
+            str(item.get('core_item_key')): str(item.get('execution_plan_item_id'))
+            for item in acknowledged_request.get('items') or []
+            if isinstance(item, dict)
+            and item.get('core_item_key')
+            and item.get('execution_plan_item_id')
+        }
+        response_items = {
+            str(item.get('core_item_key')): item
+            for item in acknowledged_response.get('item_acks') or []
+            if isinstance(item, dict) and item.get('core_item_key')
+        }
+        response_item_bindings = {
+            key: str(item.get('execution_plan_item_id'))
+            for key, item in response_items.items()
+            if item.get('execution_plan_item_id')
+        }
+        revoked_buy_keys = {
+            str(link.get('core_item_key'))
+            for link in expected_links or []
+            if isinstance(link, dict)
+            and str(link.get('side') or '').strip().lower() == 'buy'
+        }
+
+        if (
+            revocation.get('schema_version') != 'core_execution_revocation_state_v1'
+            or revocation.get('status') != 'acknowledged'
+            or revocation.get('ack_status') != 'revoked'
+            or revocation.get('reason_code')
+            != 'current_live_market_evidence_unavailable'
+            or revocation.get('replacement_action') != 'reject'
+            or revocation.get('replacement_actionable') is not False
+            or not replacement_revision_id
+            or not replacement_revision_id.startswith(
+                'observation:current_live_market_evidence_unavailable:'
+            )
+            or str(revocation.get('prior_decision_snapshot_id') or '')
+            != str(row.decision_snapshot_id)
+            or int(row.decision_snapshot_id) != int(snapshot.id)
+            or row.execution_window != EXECUTION_WINDOW_NEXT_OPEN
+            or _normalize_optional_text(row.planned_side) != 'buy'
+            or row.account_reference != target.account_reference
+            or _row_validation_payload(row).get('preopen_policy_fingerprint')
+            != expected_policy_fingerprint
+            or not revoked_row_authority_fingerprint
+            or _execution_plan_row_authority_fingerprint(row)
+            != revoked_row_authority_fingerprint
+            or not prior_row_authority_fingerprint
+            or archived_revision is None
+            or str(exec_dispatch.get('dispatch_status') or '').strip().lower()
+            != 'accepted'
+            or exec_dispatch.get('plan_id') != revocation.get('plan_id')
+            or exec_dispatch.get('destination_binding')
+            != revocation.get('destination_binding')
+            or not isinstance(expected_links, list)
+            or not expected_links
+            or dispatch_links != expected_links
+            or acknowledged_request.get('plan_id') != revocation.get('plan_id')
+            or str(
+                acknowledged_request.get('replacement_decision_snapshot_id') or ''
+            )
+            != replacement_revision_id
+            or expected_item_bindings != requested_item_bindings
+            or expected_item_bindings != response_item_bindings
+            or not revoked_buy_keys
+            or any(
+                str(response_items.get(key, {}).get('status') or '').strip().lower()
+                != 'revoked'
+                for key in revoked_buy_keys
+            )
+            or str(response_contract_ack.get('status') or '').strip().lower()
+            != 'revoked'
+            or current_live_market_authority.get('schema_version')
+            != CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION
+            or current_live_market_authority.get('applies') is not True
+            or current_live_market_authority.get('authoritative') is not True
+            or current_live_market_authority.get('status') != 'available'
+            or current_live_market_authority.get('action') != 'allow'
+            or current_live_market_authority.get('market_date')
+            != row.target_trade_date.isoformat()
+        ):
+            return False
+
+        recovery_material = json.dumps(
+            {
+                'row_id': row.id,
+                'plan_id': revocation.get('plan_id'),
+                'replacement_revision_id': replacement_revision_id,
+                'revoked_row_authority_fingerprint': (
+                    revoked_row_authority_fingerprint
+                ),
+                'live_market_authority': current_live_market_authority,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        recovery_generation = hashlib.sha256(
+            recovery_material.encode('utf-8')
+        ).hexdigest()
+        archived_dispatch_evidence = archived_revision.get('dispatch_evidence')
+        if isinstance(archived_dispatch_evidence, dict):
+            archived_dispatch_evidence.update(
+                {
+                    'retired_at': now.isoformat(),
+                    'retirement_reason': 'transient_market_evidence_recovered',
+                    'recovery_generation': recovery_generation,
+                }
+            )
+        revocation['recovery'] = {
+            'schema_version': 'core_execution_authority_recovery_v1',
+            'status': 'authority_revalidated',
+            'recovered_at': now.isoformat(),
+            'recovery_generation': recovery_generation,
+            'row_authority_fingerprint': revoked_row_authority_fingerprint,
+            'live_market_observed_at': current_live_market_authority.get(
+                'observed_at'
+            ),
+        }
+        submission['revision_history'] = revision_history[
+            -EXECUTION_REVISION_HISTORY_LIMIT:
+        ]
+        submission['revocation'] = revocation
+        submission.pop('exec_dispatch', None)
+        submission.pop('latest', None)
+        row.submission_payload = submission
+        row.execution_status = EXECUTION_STATUS_PLANNED
+        row.submitted_at = None
+        return True
 
     def _set_blocked_row(
         self,
@@ -2929,7 +4767,11 @@ class SignalDeciderNextOpenExecutionService:
     ) -> None:
         existing = row.validation_payload if isinstance(row.validation_payload, dict) else {}
         row.eligibility_status = ELIGIBILITY_BLOCKED
-        if not _is_dispatch_terminal_status(row.execution_status):
+        if (
+            not _is_dispatch_terminal_status(row.execution_status)
+            and row.execution_status not in EXECUTION_REVOCATION_LOCKED_STATUSES
+            and row.execution_status != EXECUTION_STATUS_REVOKED
+        ):
             row.execution_status = EXECUTION_STATUS_PLANNED
         row.last_evaluated_at = now
         row.validation_payload = {
@@ -2937,6 +4779,263 @@ class SignalDeciderNextOpenExecutionService:
             'blocking_reasons': [reason],
             'warnings': existing.get('warnings') or [],
         }
+
+    def _stage_delegated_buy_revocations(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        reason_code: str,
+        reason_message: str,
+        observation_scope: str,
+        observation_state: str,
+    ) -> dict[str, int]:
+        now = _utcnow()
+        staged_count = 0
+        pending_count = 0
+        with session_scope() as session:
+            stmt = (
+                select(SignalDeciderExecutionPlanItem)
+                .where(
+                    SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+                    SignalDeciderExecutionPlanItem.target_trade_date == target_trade_date,
+                )
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
+            )
+            if account_reference:
+                stmt = stmt.where(
+                    SignalDeciderExecutionPlanItem.account_reference == account_reference
+                )
+            rows = session.execute(stmt).scalars().all()
+            for row in rows:
+                if row.execution_status == EXECUTION_STATUS_REVOCATION_PENDING:
+                    pending_count += 1
+                    continue
+                submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+                reconciliation = (
+                    submission.get('dispatch_reconciliation')
+                    if isinstance(submission.get('dispatch_reconciliation'), dict)
+                    else {}
+                )
+                ambiguous_remote_acceptance = bool(
+                    row.execution_status == EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW
+                    and str(reconciliation.get('reason_code') or '').strip().lower()
+                    in {
+                        'ambiguous_remote_acceptance',
+                        'ambiguous_remote_acceptance_after_core_revision',
+                    }
+                )
+                if (
+                    not (
+                        _is_dispatch_terminal_status(row.execution_status)
+                        or ambiguous_remote_acceptance
+                    )
+                    or str(_normalize_optional_text(row.planned_side) or '').lower() != 'buy'
+                ):
+                    continue
+                exec_dispatch = (
+                    submission.get('exec_dispatch')
+                    if isinstance(submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                item_links = exec_dispatch.get('item_links')
+                exact_remote_links = bool(
+                    isinstance(item_links, list)
+                    and item_links
+                    and any(
+                        isinstance(link, dict)
+                        and str(link.get('side') or '').strip().lower() == 'buy'
+                        for link in item_links
+                    )
+                    and all(
+                        isinstance(link, dict)
+                        and _normalize_optional_text(link.get('core_item_key'))
+                        and _normalize_optional_text(link.get('exec_plan_id'))
+                        and _normalize_optional_text(link.get('exec_plan_item_id'))
+                        for link in item_links
+                    )
+                )
+                if (
+                    not exact_remote_links
+                    or (
+                        str(exec_dispatch.get('dispatch_status') or '').strip().lower()
+                        != 'accepted'
+                        and not ambiguous_remote_acceptance
+                    )
+                ):
+                    continue
+                observation_material = '|'.join(
+                    (
+                        reason_code,
+                        target_trade_date.isoformat(),
+                        row.account_reference,
+                        row.symbol,
+                        _normalize_agent_name(row.decision_agent_name),
+                        observation_state,
+                    )
+                )
+                observation_id = (
+                    f'observation:{observation_scope}:'
+                    f'{hashlib.sha256(observation_material.encode("utf-8")).hexdigest()[:20]}'
+                )
+                self._stage_terminal_revocation(
+                    row=row,
+                    replacement_snapshot=None,
+                    replacement_observation_id=observation_id,
+                    replacement_action='reject',
+                    reason=_reason(
+                        reason_code,
+                        reason_message,
+                    ),
+                    now=now,
+                )
+                staged_count += 1
+                pending_count += 1
+            session.flush()
+        return {
+            'staged_count': staged_count,
+            'pending_count': pending_count,
+        }
+
+    def stage_execution_control_revocations(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None = None,
+    ) -> dict[str, int]:
+        """Freeze delegated BUY authority after an explicit execution-control change."""
+        control_state = '|'.join(
+            (
+                str(settings.signal_decider_exec_integration_mode or '').strip().lower(),
+                str(bool(settings.signal_decider_next_open_enabled)).lower(),
+            )
+        )
+        return self._stage_delegated_buy_revocations(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            reason_code='execution_control_disabled',
+            reason_message=(
+                'Explicit execution integration settings no longer permit this delegated BUY authority.'
+            ),
+            observation_scope='execution_control_disabled',
+            observation_state=control_state,
+        )
+
+    def stage_market_evidence_unavailable_revocations(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None = None,
+        failure_source: str,
+    ) -> dict[str, int]:
+        """Freeze delegated BUY authority when the critical live-decision chain fails."""
+        return self._stage_delegated_buy_revocations(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            reason_code='current_live_market_evidence_unavailable',
+            reason_message=(
+                'The critical market evidence or decision-plan refresh failed; '
+                'unfilled delegated BUY authority must be revoked.'
+            ),
+            observation_scope='current_live_market_evidence_unavailable',
+            observation_state=failure_source,
+        )
+
+    def apply_exec_revocation_ack(
+        self,
+        *,
+        row_id: int,
+        request_payload: dict[str, Any],
+        response_payload: dict[str, Any],
+        ack_status: str,
+    ) -> dict[str, Any]:
+        """Persist an exact Exec revocation ACK before allowing a replacement plan."""
+        now = _utcnow()
+        with session_scope() as session:
+            row = session.scalar(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id == row_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise ValueError('revocation row no longer exists')
+            submission = (
+                copy.deepcopy(row.submission_payload)
+                if isinstance(row.submission_payload, dict)
+                else {}
+            )
+            revocation = (
+                copy.deepcopy(submission.get('revocation'))
+                if isinstance(submission.get('revocation'), dict)
+                else {}
+            )
+            if row.execution_status != EXECUTION_STATUS_REVOCATION_PENDING:
+                raise ValueError('row is not awaiting an Exec revocation ACK')
+            if (
+                request_payload.get('plan_id') != revocation.get('plan_id')
+                or str(request_payload.get('replacement_decision_snapshot_id') or '')
+                != str(revocation.get('replacement_decision_snapshot_id') or '')
+            ):
+                raise ValueError('revocation ACK does not bind the pending Core revision')
+
+            expected_items = {
+                str(link.get('core_item_key')): str(link.get('exec_plan_item_id'))
+                for link in (revocation.get('item_links') or [])
+                if link.get('core_item_key') and link.get('exec_plan_item_id')
+            }
+            requested_items = {
+                str(item.get('core_item_key')): str(item.get('execution_plan_item_id'))
+                for item in (request_payload.get('items') or [])
+                if isinstance(item, dict)
+            }
+            response_items = {
+                str(item.get('core_item_key')): str(item.get('execution_plan_item_id'))
+                for item in (response_payload.get('item_acks') or [])
+                if isinstance(item, dict)
+            }
+            if not expected_items or requested_items != expected_items or response_items != expected_items:
+                raise ValueError('revocation ACK item identities do not match pending Exec items')
+            if ack_status not in {'revoked', 'manual_review_required'}:
+                raise ValueError('revocation ACK status is not terminal')
+
+            revocation_record = {
+                'acknowledged_at': now.isoformat(),
+                'request': copy.deepcopy(request_payload),
+                'response': copy.deepcopy(response_payload),
+            }
+            revocation_history = [
+                copy.deepcopy(item)
+                for item in (submission.get('revocation_history') or [])
+                if isinstance(item, dict)
+            ]
+            revocation_history.append(revocation_record)
+            submission['revocation_history'] = revocation_history[-EXECUTION_REVISION_HISTORY_LIMIT:]
+            submission['revocation'] = {
+                **revocation,
+                'status': (
+                    'acknowledged'
+                    if ack_status == 'revoked'
+                    else 'manual_review_required'
+                ),
+                'acknowledged_at': now.isoformat(),
+                'ack_status': ack_status,
+            }
+
+            if ack_status == 'manual_review_required':
+                row.execution_status = EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW
+            elif revocation.get('replacement_actionable'):
+                submission.pop('exec_dispatch', None)
+                submission.pop('latest', None)
+                row.execution_status = EXECUTION_STATUS_PLANNED
+                row.submitted_at = None
+            else:
+                row.execution_status = EXECUTION_STATUS_REVOKED
+            row.eligibility_status = ELIGIBILITY_BLOCKED
+            row.last_evaluated_at = now
+            row.submission_payload = submission
+            session.flush()
+            return self._serialize_row(row)
 
     def _build_client_order_id(self, *, target_trade_date: date, symbol: str, decision_agent_name: str) -> str:
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:

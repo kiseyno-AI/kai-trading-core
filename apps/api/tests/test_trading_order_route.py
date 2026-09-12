@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -127,6 +128,8 @@ class FakeNextOpenExecutionService:
     def __init__(self) -> None:
         self.list_calls: list[dict] = []
         self.run_calls: list[dict] = []
+        self.resolve_calls: list[date | None] = []
+        self.resolved_target_trade_date = date(2026, 4, 30)
 
     def list_plan_items(self, **kwargs):
         self.list_calls.append(kwargs)
@@ -141,6 +144,10 @@ class FakeNextOpenExecutionService:
             'summary': {'triggered': True, 'selected_count': 1, 'submitted_count': 1},
             'items': [{'plan_item_id': 8, 'symbol': '005930', 'execution_status': 'submitted'}],
         }
+
+    async def _resolve_target_trade_date_async(self, target_trade_date):
+        self.resolve_calls.append(target_trade_date)
+        return target_trade_date or self.resolved_target_trade_date
 
 
 class FakeIntradayAutoSellService:
@@ -166,6 +173,8 @@ class FakeIntradayAutoSellService:
 class FakeSignalDeciderExecIntegrationService:
     def __init__(self) -> None:
         self.delegate_execution = False
+        self.manage_delegated_authority = False
+        self.manage_calls: list[dict] = []
         self.dispatch_calls: list[dict] = []
         self.runtime_calls: list[dict] = []
         self.overview_calls: list[dict] = []
@@ -173,6 +182,10 @@ class FakeSignalDeciderExecIntegrationService:
 
     def should_delegate_execution(self) -> bool:
         return self.delegate_execution
+
+    def should_manage_delegated_authority(self, **kwargs) -> bool:
+        self.manage_calls.append(kwargs)
+        return self.manage_delegated_authority
 
     async def runtime_status(self, **kwargs):
         self.runtime_calls.append(kwargs)
@@ -393,6 +406,45 @@ class TradingOrderRouteTests(unittest.TestCase):
         self.assertEqual(run_response.json()['summary']['submitted_count'], 1)
         self.assertEqual(self.next_open_service.run_calls[0]['target_trade_date'].isoformat(), '2026-04-30')
         self.assertTrue(self.next_open_service.run_calls[0]['force'])
+
+    def test_next_open_execution_route_scopes_current_run_to_one_resolved_trade_date(self) -> None:
+        client = TestClient(self.app)
+
+        response = client.post(
+            '/trading/orders/next-open-execution/run-if-due',
+            json={'dry_run': False, 'force': False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.next_open_service.resolve_calls, [None])
+        self.assertEqual(
+            self.exec_integration_service.manage_calls,
+            [{'target_trade_date': date(2026, 4, 30)}],
+        )
+        self.assertEqual(
+            self.next_open_service.run_calls[0]['target_trade_date'],
+            date(2026, 4, 30),
+        )
+
+    def test_next_open_execution_route_dispatches_managed_authority_for_resolved_trade_date(self) -> None:
+        self.exec_integration_service.manage_delegated_authority = True
+        client = TestClient(self.app)
+
+        response = client.post(
+            '/trading/orders/next-open-execution/run-if-due',
+            json={'dry_run': False, 'force': False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.next_open_service.resolve_calls, [None])
+        self.assertEqual(
+            self.exec_integration_service.manage_calls,
+            [{'target_trade_date': date(2026, 4, 30)}],
+        )
+        self.assertEqual(
+            self.exec_integration_service.dispatch_calls[0]['target_trade_date'],
+            date(2026, 4, 30),
+        )
 
     def test_intraday_auto_sell_routes_use_service(self) -> None:
         client = TestClient(self.app)

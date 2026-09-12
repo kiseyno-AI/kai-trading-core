@@ -60,9 +60,10 @@ def _to_decimal(value: Any) -> Decimal | None:
     if value is None or value == '' or isinstance(value, bool):
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
+        return parsed if parsed.is_finite() else None
     except (InvalidOperation, ValueError):
         return None
 
@@ -95,10 +96,8 @@ def _json_safe(value: Any) -> Any:
 
 def _as_unit_percentile(value: Any) -> Decimal | None:
     parsed = _to_decimal(value)
-    if parsed is None:
+    if parsed is None or parsed < Decimal('0') or parsed > Decimal('1'):
         return None
-    if parsed > Decimal('1'):
-        return parsed / Decimal('100')
     return parsed
 
 
@@ -249,11 +248,19 @@ def build_alignment_override_evidence(
 ) -> dict[str, Any]:
     quality = short_term_entry_quality if isinstance(short_term_entry_quality, dict) else {}
     buy_quality_score = _to_decimal(quality.get('buy_quality_score'))
-    return_percentile = _as_unit_percentile(quality.get('return_percentile'))
-    volume_percentile = _as_unit_percentile(quality.get('volume_percentile'))
+    return_percentile = (
+        _as_unit_percentile(quality.get('return_percentile'))
+        if quality.get('return_percentile_status') == 'available'
+        else None
+    )
+    volume_percentile = (
+        _as_unit_percentile(quality.get('volume_percentile'))
+        if quality.get('volume_percentile_status') == 'available'
+        else None
+    )
     reward_risk_ratio = _to_decimal(quality.get('reward_risk_ratio'))
     raw_trading_value_krw = _to_decimal(quality.get('raw_trading_value_krw'))
-    continuation_setup = bool(quality.get('continuation_setup_detected'))
+    continuation_setup = quality.get('continuation_setup_detected') is True
 
     checks = {
         'continuation_setup_detected': continuation_setup,

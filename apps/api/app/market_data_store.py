@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Sequence
@@ -12,6 +14,7 @@ from sqlalchemy.orm import aliased
 from app.db import engine, session_scope
 from app.db_models import (
     CurrentKISIntradaySnapshotCache,
+    CurrentMarketSnapshotCache,
     CurrentQuoteCache,
     DailyActionSummary,
     DailyAdvancedValueFactorResult,
@@ -39,6 +42,11 @@ from app.db_models import (
     QuoteSnapshot,
     Symbol,
     TrackedSymbol,
+)
+from app.eod.market_membership import (
+    MARKET_MEMBERSHIP_SCHEMA_VERSION,
+    market_membership_sha256,
+    validate_market_membership_snapshot,
 )
 from app.market.clock import MarketState
 from app.repositories.eod_run_repository import (
@@ -256,6 +264,40 @@ def load_current_quotes(
             _serialize_current_quote_cache_row(row, symbol=symbol)
             for row, symbol in rows
         ]
+
+
+def load_current_market_snapshot_context() -> dict[str, Any] | None:
+    """Load the persisted KIS market snapshot with its cache-write provenance."""
+    with session_scope() as session:
+        row = session.execute(
+            select(CurrentMarketSnapshotCache).where(
+                CurrentMarketSnapshotCache.cache_key == 'dashboard'
+            )
+        ).scalar_one_or_none()
+        if row is None or not isinstance(row.payload, dict):
+            return None
+        return {
+            'source': 'kis_market_snapshot_v1',
+            'source_table': 'current_market_snapshot_cache',
+            'payload': deepcopy(row.payload),
+            'snapshot_status': row.snapshot_status,
+            'stale_reason': row.stale_reason,
+            'as_of': row.as_of.isoformat() if row.as_of else None,
+            'last_refresh_attempted_at': (
+                row.last_refresh_attempted_at.isoformat()
+                if row.last_refresh_attempted_at
+                else None
+            ),
+            'last_refresh_succeeded_at': (
+                row.last_refresh_succeeded_at.isoformat()
+                if row.last_refresh_succeeded_at
+                else None
+            ),
+            'last_refresh_status': row.last_refresh_status,
+            'last_refresh_error': row.last_refresh_error,
+            'refresh_trigger': row.refresh_trigger,
+            'cached_at': row.updated_at.isoformat() if row.updated_at else None,
+        }
 
 
 def persist_kis_intraday_snapshot(snapshot: dict) -> None:
@@ -1072,6 +1114,305 @@ def load_daily_market_relative_contexts(
             }
         )
     return items
+
+
+def _build_prior_market_turnover_baselines_query(
+    *,
+    markets: list[str],
+    market_date: date,
+):
+    del markets
+    return (
+        select(
+            EODCollectionRun.id.label('run_id'),
+            EODCollectionRun.trade_date,
+            EODCollectionRun.status,
+            EODCollectionRun.symbols_total,
+            EODCollectionRun.symbols_succeeded,
+            EODCollectionRun.symbols_failed,
+            EODCollectionRun.completed_at,
+            EODCollectionRun.run_metadata,
+        )
+        .where(
+            EODCollectionRun.market == 'KRX',
+            EODCollectionRun.trade_date < market_date,
+            EODCollectionRun.source == 'pykrx',
+            EODCollectionRun.status == 'completed',
+            EODCollectionRun.completed_at.is_not(None),
+            EODCollectionRun.symbols_failed == 0,
+            EODCollectionRun.symbols_total > 0,
+            EODCollectionRun.symbols_succeeded == EODCollectionRun.symbols_total,
+            EODCollectionRun.run_metadata['limited_run'].as_boolean().is_(False),
+            EODCollectionRun.run_metadata['universe_snapshot']['complete'].as_boolean().is_(True),
+        )
+        .order_by(
+            EODCollectionRun.trade_date.desc(),
+            EODCollectionRun.started_at.desc(),
+            EODCollectionRun.id.desc(),
+        )
+        .limit(8)
+    )
+
+
+def _build_prior_market_turnover_bars_query(
+    *,
+    run_id: int,
+    trade_date: date,
+    markets: list[str],
+):
+    # Read the whole run membership, not merely the requested markets. Exact
+    # set equality against run_metadata is the completeness proof; filtering
+    # first would let a same-count missing-name error pass unnoticed.
+    del markets, trade_date
+    return (
+        select(
+            Symbol.symbol,
+            DailyPriceBar.trade_date,
+            DailyPriceBar.turnover.label('turnover_krw'),
+        )
+        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+        .where(
+            DailyPriceBar.eod_run_id == run_id,
+            DailyPriceBar.source == 'pykrx',
+        )
+        .order_by(Symbol.symbol.asc())
+    )
+
+
+def _mapping_for_row(row: Any) -> dict[str, Any]:
+    mapping = getattr(row, '_mapping', None)
+    if mapping is not None:
+        return dict(mapping)
+    if isinstance(row, dict):
+        return row
+    return {}
+
+
+def _completed_eod_turnover_run_is_eligible(
+    row: dict[str, Any],
+    *,
+    markets: list[str],
+) -> tuple[bool, list[str], dict[str, list[str]]]:
+    metadata = row.get('run_metadata') if isinstance(row.get('run_metadata'), dict) else {}
+    universe = metadata.get('universe_snapshot') if isinstance(metadata.get('universe_snapshot'), dict) else {}
+    requested_symbol_values = metadata.get('requested_symbols')
+    requested_market_values = metadata.get('markets')
+    universe_market_values = universe.get('markets')
+    failed_symbol_values = metadata.get('failed_symbols')
+    unattempted_symbol_values = metadata.get('unattempted_symbols')
+    if not all(
+        isinstance(value, list)
+        for value in (
+            requested_symbol_values,
+            requested_market_values,
+            universe_market_values,
+            failed_symbol_values,
+            unattempted_symbol_values,
+        )
+    ):
+        return False, [], {}
+    requested_symbols = [
+        str(symbol).strip().upper()
+        for symbol in requested_symbol_values
+        if str(symbol).strip()
+    ]
+    requested_markets = {
+        str(market).strip().upper()
+        for market in requested_market_values
+        if str(market).strip()
+    }
+    universe_markets = {
+        str(market).strip().upper()
+        for market in universe_market_values
+        if str(market).strip()
+    }
+    required_markets = set(markets)
+    numeric_proof_values = (
+        row.get('symbols_total'),
+        row.get('symbols_succeeded'),
+        row.get('symbols_failed'),
+        universe.get('symbol_count'),
+        universe.get('persisted_count'),
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in numeric_proof_values
+    ):
+        return False, [], {}
+    try:
+        universe_latest_date = _normalize_optional_trade_date(universe.get('latest_trade_date'))
+    except (TypeError, ValueError):
+        return False, [], {}
+    total, succeeded, failed, universe_symbol_count, universe_persisted_count = numeric_proof_values
+    historical_point_in_time_universe = bool(
+        metadata.get('mode') == 'historical_backfill'
+        and universe.get('point_in_time') is True
+        and universe.get('current_universe_mutated') is False
+        and universe_persisted_count == 0
+    )
+    eligible = bool(
+        row.get('status') == 'completed'
+        and row.get('completed_at') is not None
+        and total > 0
+        and succeeded == total
+        and failed == 0
+        and metadata.get('limited_run') is False
+        and metadata.get('symbol') in (None, '')
+        and not failed_symbol_values
+        and not unattempted_symbol_values
+        and len(requested_symbols) == total
+        and len(set(requested_symbols)) == total
+        and universe.get('complete') is True
+        and universe.get('source') == 'pykrx'
+        and universe.get('membership_basis') == 'end_date_snapshot'
+        and isinstance(universe.get('unavailable_markets'), list)
+        and not universe.get('unavailable_markets')
+        and universe_symbol_count == total
+        and (
+            universe_persisted_count == total
+            or historical_point_in_time_universe
+        )
+        and universe_latest_date == row.get('trade_date')
+        and required_markets.issubset(requested_markets)
+        and required_markets.issubset(universe_markets)
+    )
+    market_membership = validate_market_membership_snapshot(
+        universe.get('market_membership'),
+        requested_symbols=requested_symbols,
+        markets=sorted(requested_markets),
+    )
+    eligible = eligible and market_membership is not None
+    return eligible, requested_symbols, market_membership or {}
+
+
+def load_prior_market_turnover_baselines(
+    *,
+    market_date: str | date,
+    markets: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    normalized_market_date = _normalize_trade_date(market_date)
+    normalized_markets = list(
+        dict.fromkeys(str(market).strip().upper() for market in markets if str(market).strip())
+    )
+    if not normalized_markets:
+        return {}
+
+    result: dict[str, dict[str, Any]] = {}
+    with session_scope() as session:
+        candidate_rows = session.execute(
+            _build_prior_market_turnover_baselines_query(
+                markets=normalized_markets,
+                market_date=normalized_market_date,
+            )
+        ).all()
+        for candidate_row in candidate_rows:
+            candidate = _mapping_for_row(candidate_row)
+            eligible, requested_symbols, market_membership = _completed_eod_turnover_run_is_eligible(
+                candidate,
+                markets=normalized_markets,
+            )
+            if not eligible:
+                continue
+            bar_rows = session.execute(
+                _build_prior_market_turnover_bars_query(
+                    run_id=int(candidate['run_id']),
+                    trade_date=candidate['trade_date'],
+                    markets=normalized_markets,
+                )
+            ).all()
+            bars = [_mapping_for_row(row) for row in bar_rows]
+            if any(bar.get('trade_date') != candidate['trade_date'] for bar in bars):
+                continue
+            persisted_symbols = [
+                str(row.get('symbol') or '').strip().upper()
+                for row in bars
+                if str(row.get('symbol') or '').strip()
+            ]
+            if (
+                len(persisted_symbols) != len(requested_symbols)
+                or len(set(persisted_symbols)) != len(persisted_symbols)
+                or set(persisted_symbols) != set(requested_symbols)
+            ):
+                continue
+            requested_membership_sha256 = hashlib.sha256(
+                '\n'.join(sorted(requested_symbols)).encode('utf-8')
+            ).hexdigest()
+            persisted_membership_sha256 = hashlib.sha256(
+                '\n'.join(sorted(persisted_symbols)).encode('utf-8')
+            ).hexdigest()
+            if requested_membership_sha256 != persisted_membership_sha256:
+                continue
+
+            symbol_to_market = {
+                symbol: market
+                for market, market_symbols in market_membership.items()
+                for symbol in market_symbols
+            }
+            by_market: dict[str, list[dict[str, Any]]] = {}
+            invalid_turnover = False
+            for bar in bars:
+                symbol = str(bar.get('symbol') or '').strip().upper()
+                market = symbol_to_market.get(symbol)
+                turnover = bar.get('turnover_krw')
+                if (
+                    market is None
+                    or isinstance(turnover, bool)
+                    or turnover is None
+                    or int(turnover) < 0
+                ):
+                    invalid_turnover = True
+                    break
+                by_market.setdefault(market, []).append(bar)
+            if invalid_turnover:
+                continue
+
+            candidate_result: dict[str, dict[str, Any]] = {}
+            for market in normalized_markets:
+                market_rows = by_market.get(market) or []
+                turnover_krw = sum(int(row['turnover_krw']) for row in market_rows)
+                if not market_rows or turnover_krw <= 0:
+                    continue
+                symbol_count = len(market_rows)
+                expected_market_symbols = market_membership.get(market) or []
+                expected_symbol_count = len(expected_market_symbols)
+                if symbol_count != expected_symbol_count:
+                    continue
+                candidate_result[market] = {
+                    'market': market,
+                    'trade_date': candidate['trade_date'].isoformat(),
+                    'turnover_krw': turnover_krw,
+                    'observed_symbol_count': symbol_count,
+                    'expected_symbol_count': expected_symbol_count,
+                    'coverage_ratio': 1.0,
+                    'source': 'pykrx',
+                    'source_table': 'daily_price_bars',
+                    'basis': 'prior_complete_market_session_positive_provider_turnover_sum',
+                    'eod_run_id': int(candidate['run_id']),
+                    'eod_run_status': 'completed',
+                    'eod_run_completed_at': candidate['completed_at'].isoformat(),
+                    'coverage_proof': {
+                        'status': 'verified',
+                        'membership_status': 'exact',
+                        'requested_symbol_count': len(requested_symbols),
+                        'persisted_symbol_count': len(persisted_symbols),
+                        'market_symbol_count': symbol_count,
+                        'market_membership_schema_version': MARKET_MEMBERSHIP_SCHEMA_VERSION,
+                        'market_membership_source': 'eod_run_metadata',
+                        'market_membership_sha256': market_membership_sha256(
+                            expected_market_symbols
+                        ),
+                        'universe_complete': True,
+                        'universe_source': 'pykrx',
+                        'membership_basis': 'end_date_snapshot',
+                        'membership_trade_date': candidate['trade_date'].isoformat(),
+                        'requested_membership_sha256': requested_membership_sha256,
+                        'persisted_membership_sha256': persisted_membership_sha256,
+                    },
+                }
+            if candidate_result:
+                result = candidate_result
+                break
+    return result
 
 
 def _build_market_relative_trade_dates_subquery(

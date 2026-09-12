@@ -1,22 +1,51 @@
+import asyncio
 import unittest
 from copy import deepcopy
 from datetime import date, datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from app.brokers.kis.client import KISClient, KISClientError
 from app.core.settings import settings
 from app.fx.snapshot_store import FXRateSnapshotRecord
 from app.integrations.fx.client import KoreaEximAPIError
 from app.market.snapshot import (
+    MARKET_SNAPSHOT_TARGETS,
     MarketSnapshotConfigurationError,
     MarketSnapshotService,
+    MarketSnapshotUpstreamError,
+    _parse_float,
+    _parse_int,
 )
 from app.market.snapshot_store import MarketSnapshotCacheRecord
+
+
+def test_market_snapshot_numeric_parsers_reject_nonfinite_values() -> None:
+    for value in ('NaN', 'Infinity', '-Infinity', float('nan'), float('inf')):
+        with unittest.TestCase().assertRaises(MarketSnapshotUpstreamError):
+            _parse_float(value, field_name='test_float')
+        with unittest.TestCase().assertRaises(MarketSnapshotUpstreamError):
+            _parse_int(value, field_name='test_int')
+
+
+def test_market_snapshot_integer_parser_rejects_fractional_and_exponent_values() -> None:
+    for value in ('1.9', '-2.5', '1e3', '1E+3', '1,23', '1,234.5'):
+        with unittest.TestCase().assertRaises(MarketSnapshotUpstreamError):
+            _parse_int(value, field_name='test_int')
+
+    for value, expected in (('1,234', 1234), ('1.0', 1), ('-2.000', -2)):
+        with unittest.TestCase().subTest(value=value):
+            assert _parse_int(value, field_name='test_int') == expected
 
 
 class FakeKISClient:
     def __init__(self) -> None:
         self.index_calls: list[str] = []
+        self.index_time_calls: list[str] = []
         self.flow_calls: list[tuple[str, str]] = []
         self.token_calls = 0
+        self.provider_business_date = '20260429'
+        self.provider_session_time = '100500'
 
     async def issue_access_token(self, force_refresh: bool = False) -> dict:
         self.token_calls += 1
@@ -35,9 +64,12 @@ class FakeKISClient:
                     'bstp_nmix_lwpr': '2634.29',
                     'acml_vol': '305715',
                     'acml_tr_pbmn': '4736153',
+                    'prdy_tr_pbmn': '18944612',
+                    'uplm_issu_cnt': '3',
                     'ascn_issu_cnt': '512',
                     'stnr_issu_cnt': '94',
                     'down_issu_cnt': '330',
+                    'lslm_issu_cnt': '1',
                 }
             }
         return {
@@ -50,10 +82,27 @@ class FakeKISClient:
                 'bstp_nmix_lwpr': '854.72',
                 'acml_vol': '1312496',
                 'acml_tr_pbmn': '11507962',
+                'prdy_tr_pbmn': '46031848',
+                'uplm_issu_cnt': '7',
                 'ascn_issu_cnt': '828',
                 'stnr_issu_cnt': '94',
                 'down_issu_cnt': '716',
+                'lslm_issu_cnt': '2',
             }
+        }
+
+    async def fetch_market_index_time_series(self, *, index_code: str) -> dict:
+        self.index_time_calls.append(index_code)
+        return {
+            'output1': {},
+            'output2': [
+                {
+                    'stck_bsop_date': self.provider_business_date,
+                    'stck_cntg_hour': self.provider_session_time,
+                    'bstp_nmix_prpr': '2642.07' if index_code == '0001' else '857.60',
+                    'acml_tr_pbmn': '4736153' if index_code == '0001' else '11507962',
+                }
+            ],
         }
 
     async def fetch_investor_time_by_market(self, *, market_code: str, sector_code: str) -> dict:
@@ -79,6 +128,146 @@ class FakeKISClient:
                 }
             ]
         }
+
+
+class RecordingKISClient(KISClient):
+    def __init__(self) -> None:
+        super().__init__(use_mock=False)
+        self.request: tuple[str, str, dict] | None = None
+
+    async def _get(self, path: str, *, tr_id: str, params: dict) -> dict:
+        self.request = (path, tr_id, dict(params))
+        return {'output1': {}, 'output2': []}
+
+
+class FailingFlowKISClient(FakeKISClient):
+    async def fetch_investor_time_by_market(self, *, market_code: str, sector_code: str) -> dict:
+        self.flow_calls.append((market_code, sector_code))
+        raise KISClientError('flow unavailable')
+
+
+class FailingIndexObservationKISClient(FakeKISClient):
+    async def fetch_market_index_time_series(self, *, index_code: str) -> dict:
+        self.index_time_calls.append(index_code)
+        raise KISClientError('index observation unavailable')
+
+
+class MismatchedIndexObservationKISClient(FakeKISClient):
+    async def fetch_market_index_time_series(self, *, index_code: str) -> dict:
+        payload = await super().fetch_market_index_time_series(index_code=index_code)
+        payload['output2'][0]['bstp_nmix_prpr'] = '2500.00'
+        return payload
+
+
+class PriorSessionIndexObservationKISClient(FakeKISClient):
+    async def fetch_market_index_time_series(self, *, index_code: str) -> dict:
+        payload = await super().fetch_market_index_time_series(index_code=index_code)
+        payload['output2'][0]['stck_bsop_date'] = '20260428'
+        return payload
+
+
+class AfterHoursIndexObservationKISClient(FakeKISClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.provider_session_time = '153000'
+
+
+class BlockingKISClient(FakeKISClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.index_started = asyncio.Event()
+        self.release_index = asyncio.Event()
+
+    async def fetch_market_index_price(self, *, index_code: str) -> dict:
+        result = await super().fetch_market_index_price(index_code=index_code)
+        self.index_started.set()
+        await self.release_index.wait()
+        return result
+
+
+class ReceiptTimedKISClient(FakeKISClient):
+    def __init__(self, *, clock: dict[str, datetime], receipt_at: datetime) -> None:
+        super().__init__()
+        self.clock = clock
+        self.receipt_at = receipt_at
+
+    async def fetch_market_index_time_series(self, *, index_code: str) -> dict:
+        payload = await super().fetch_market_index_time_series(index_code=index_code)
+        self.clock['now'] = self.receipt_at
+        return payload
+
+
+class BracketedIndexKISClient(FakeKISClient):
+    def __init__(
+        self,
+        *,
+        clock: dict[str, datetime],
+        before_turnover: int,
+        bar_turnover: int,
+        after_turnover: int,
+        before_price: str = '2642.07',
+        bar_price: str = '2640.50',
+        after_price: str = '2643.10',
+        provider_session_time: str = '100510',
+    ) -> None:
+        super().__init__()
+        self.clock = clock
+        self.before_turnover = before_turnover
+        self.bar_turnover = bar_turnover
+        self.after_turnover = after_turnover
+        self.before_price = before_price
+        self.bar_price = bar_price
+        self.after_price = after_price
+        self.provider_session_time = provider_session_time
+        self.current_call_count = 0
+
+    async def fetch_market_index_price(self, *, index_code: str) -> dict:
+        payload = await super().fetch_market_index_price(index_code=index_code)
+        self.current_call_count += 1
+        if self.current_call_count == 1:
+            payload['output']['acml_tr_pbmn'] = str(self.before_turnover)
+            payload['output']['bstp_nmix_prpr'] = self.before_price
+            self.clock['now'] = datetime.fromisoformat(
+                '2026-04-29T10:05:05+09:00'
+            )
+        else:
+            payload['output']['acml_tr_pbmn'] = str(self.after_turnover)
+            payload['output']['bstp_nmix_prpr'] = self.after_price
+            self.clock['now'] = datetime.fromisoformat(
+                '2026-04-29T10:05:15+09:00'
+            )
+        return payload
+
+    async def fetch_market_index_time_series(self, *, index_code: str) -> dict:
+        payload = await super().fetch_market_index_time_series(
+            index_code=index_code
+        )
+        payload['output2'][0]['acml_tr_pbmn'] = str(self.bar_turnover)
+        payload['output2'][0]['bstp_nmix_prpr'] = self.bar_price
+        return payload
+
+
+class KISMarketIndexObservationContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_market_index_time_series_uses_official_intraday_index_contract(self) -> None:
+        client = RecordingKISClient()
+
+        result = await client.fetch_market_index_time_series(index_code='0001')
+
+        self.assertEqual(result, {'output1': {}, 'output2': []})
+        self.assertEqual(
+            client.request,
+            (
+                '/uapi/domestic-stock/v1/quotations/inquire-time-indexchartprice',
+                'FHKUP03500200',
+                {
+                    'FID_COND_MRKT_DIV_CODE': 'U',
+                    'FID_ETC_CLS_CODE': '0',
+                    'FID_INPUT_ISCD': '0001',
+                    'FID_INPUT_HOUR_1': '60',
+                    'FID_PW_DATA_INCU_YN': 'N',
+                },
+            ),
+        )
 
 
 class FakeFXService:
@@ -137,9 +326,15 @@ def _parse_date(value) -> date:
 class InMemoryCacheStore:
     def __init__(self) -> None:
         self.record: MarketSnapshotCacheRecord | None = None
+        self.claim_result = True
+        self.claim_calls: list[dict] = []
 
     def load(self) -> MarketSnapshotCacheRecord | None:
         return deepcopy(self.record)
+
+    def try_claim_refresh_bucket(self, **kwargs) -> bool:
+        self.claim_calls.append(dict(kwargs))
+        return self.claim_result
 
     def save(
         self,
@@ -229,6 +424,12 @@ class InMemoryFXSnapshotStore:
 
 class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        self.now_patcher = patch.object(
+            MarketSnapshotService,
+            '_now',
+            return_value=datetime.fromisoformat('2026-04-29T10:05:20+09:00'),
+        )
+        self.now_patcher.start()
         self.original_settings = {
             'kis_use_mock': settings.kis_use_mock,
             'market_snapshot_kis_use_real': settings.market_snapshot_kis_use_real,
@@ -242,6 +443,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.fx_snapshot_store = InMemoryFXSnapshotStore()
 
     def tearDown(self) -> None:
+        self.now_patcher.stop()
         for field_name, value in self.original_settings.items():
             setattr(settings, field_name, value)
 
@@ -265,7 +467,9 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(refreshed)
         self.assertEqual(client.token_calls, 1)
-        self.assertEqual(client.index_calls, ['0001', '1001'])
+        self.assertEqual(len(client.index_calls), 4)
+        self.assertEqual(client.index_calls.count('0001'), 2)
+        self.assertEqual(client.index_calls.count('1001'), 2)
         self.assertEqual(client.flow_calls, [('KSP', '0001'), ('KSQ', '1001')])
         self.assertEqual(len(fx_service.calls), 1)
         self.assertEqual(first_read['status'], 'ready')
@@ -281,6 +485,563 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_read['freshness']['last_refresh_status'], 'success')
         self.assertEqual(first_read['as_of'], second_read['as_of'])
         self.assertEqual(len(fx_service.calls), 1)
+
+    async def test_refresh_preserves_provider_session_prior_turnover_and_all_breadth_buckets(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: datetime.fromisoformat('2026-04-29T10:05:20+09:00')
+
+        result = await service.refresh_market_snapshot_if_due(trigger='provider_provenance', force=True)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        kospi = result['markets']['kospi']
+        self.assertEqual(client.index_time_calls, ['0001', '1001'])
+        self.assertEqual(kospi['provider_business_date'], '2026-04-29')
+        self.assertEqual(kospi['provider_session_time'], '10:05:00')
+        self.assertEqual(kospi['provider_observed_at'], '2026-04-29T10:05:00+09:00')
+        self.assertEqual(kospi['prior_trading_value'], 18_944_612)
+        self.assertEqual(kospi['prior_trading_value_unit'], 'million_krw')
+        self.assertEqual(
+            kospi['breadth_raw_buckets'],
+            {
+                'upper_limit_count': 3,
+                'advancers': 512,
+                'unchanged': 94,
+                'decliners': 330,
+                'lower_limit_count': 1,
+            },
+        )
+        self.assertEqual(kospi['index_leg']['status'], 'ready')
+        self.assertEqual(kospi['index_leg']['observation_source'], 'kis_index_intraday_bar')
+        self.assertEqual(kospi['breadth_completeness']['status'], 'unverified')
+
+    async def test_refresh_binds_provider_age_and_success_to_response_receipt_time(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        refresh_started_at = datetime.fromisoformat('2026-04-29T10:05:00+09:00')
+        response_received_at = datetime.fromisoformat('2026-04-29T10:05:02+09:00')
+        clock = {'now': refresh_started_at}
+        client = ReceiptTimedKISClient(
+            clock=clock,
+            receipt_at=response_received_at,
+        )
+        client.provider_session_time = '100501'
+        cache_store = InMemoryCacheStore()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=cache_store,
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: clock['now']
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='receipt_time_provenance',
+            force=True,
+        )
+
+        assert result is not None
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['collected_at'], response_received_at.isoformat())
+        self.assertEqual(
+            result['markets']['kospi']['index_leg']['collected_at'],
+            response_received_at.isoformat(),
+        )
+        self.assertEqual(
+            result['markets']['kospi']['index_leg']['observation_age_seconds'],
+            1.0,
+        )
+        self.assertEqual(
+            result['freshness']['last_refresh_attempted_at'],
+            refresh_started_at.isoformat(),
+        )
+        self.assertEqual(
+            result['freshness']['last_refresh_succeeded_at'],
+            response_received_at.isoformat(),
+        )
+
+    async def test_completed_same_date_kis_master_proves_five_bucket_breadth_completeness(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: datetime.fromisoformat('2026-04-29T10:05:20+09:00')
+        master_symbols = [
+            *(SimpleNamespace(symbol=f'P{index:04d}', market='KOSPI') for index in range(940)),
+            *(SimpleNamespace(symbol=f'Q{index:04d}', market='KOSDAQ') for index in range(1647)),
+        ]
+        master_state = SimpleNamespace(
+            symbols=master_symbols,
+            snapshot=lambda: {
+                'market_date': '2026-04-29',
+                'last_status': 'completed',
+                'last_completed_at': '2026-04-29T00:00:00+00:00',
+                'symbol_count': 2587,
+                'kospi_count': 940,
+                'kosdaq_count': 1647,
+            },
+        )
+
+        with patch('app.market.snapshot.master_refresh_state', master_state):
+            result = await service.refresh_market_snapshot_if_due(
+                trigger='breadth_completeness',
+                force=True,
+            )
+
+        assert result is not None
+        kospi = result['markets']['kospi']
+        kosdaq = result['markets']['kosdaq']
+        self.assertEqual(kospi['breadth_completeness']['status'], 'verified')
+        self.assertEqual(kospi['breadth_completeness']['expected_symbol_count'], 940)
+        self.assertEqual(
+            kospi['breadth_completeness']['limit_bucket_semantics'],
+            'disjoint_from_direction_counts',
+        )
+        self.assertEqual(kosdaq['breadth_completeness']['status'], 'verified')
+        self.assertEqual(kosdaq['breadth_completeness']['expected_symbol_count'], 1647)
+        self.assertEqual(
+            kospi['breadth_completeness']['expected_universe']['provider'],
+            'kis_master',
+        )
+
+    async def test_flow_failure_keeps_fresh_index_leg_available(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        service = MarketSnapshotService(
+            kis_api_client=FailingFlowKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+
+        result = await service.refresh_market_snapshot_if_due(trigger='flow_failure', force=True)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['legs']['index']['status'], 'ready')
+        self.assertEqual(result['legs']['flow']['status'], 'unavailable')
+        self.assertEqual(result['legs']['fx']['status'], 'ready')
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'ready')
+        self.assertEqual(result['markets']['kospi']['flow_leg']['status'], 'unavailable')
+        self.assertEqual(result['markets']['kospi']['value'], 2642.07)
+        self.assertIsNone(result['markets']['kospi']['foreign_net_value'])
+
+    async def test_missing_fx_configuration_does_not_block_index_leg(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        settings.koreaexim_api_key = ''
+        fx_service = FakeFXService()
+        service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=fx_service,
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+
+        result = await service.refresh_market_snapshot_if_due(trigger='fx_unconfigured', force=True)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['legs']['index']['status'], 'ready')
+        self.assertEqual(result['legs']['fx']['status'], 'missing')
+        self.assertEqual(result['usd_krw']['stale_reason'], 'koreaexim_not_configured')
+        self.assertEqual(fx_service.calls, [])
+        self.assertTrue(service.runtime_status()['ready'])
+
+    async def test_missing_provider_time_proof_preserves_price_but_marks_index_unverified(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        service = MarketSnapshotService(
+            kis_api_client=FailingIndexObservationKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+
+        result = await service.refresh_market_snapshot_if_due(trigger='observation_failure', force=True)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['legs']['index']['status'], 'unverified')
+        self.assertEqual(result['markets']['kospi']['value'], 2642.07)
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'unverified')
+        self.assertIsNone(result['markets']['kospi']['provider_observed_at'])
+        self.assertIsNone(result['as_of'])
+
+    async def test_nonmonotonic_price_move_does_not_invalidate_same_provider_turnover_proof(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        service = MarketSnapshotService(
+            kis_api_client=MismatchedIndexObservationKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='mismatched_index_observation',
+            force=True,
+        )
+
+        assert result is not None
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['markets']['kospi']['value'], 2642.07)
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'ready')
+        self.assertTrue(
+            result['markets']['kospi']['index_leg']['observation_payload_match']
+        )
+
+    async def test_async_current_reads_bracket_intraday_turnover(self) -> None:
+        clock = {
+            'now': datetime.fromisoformat('2026-04-29T10:05:00+09:00')
+        }
+        client = BracketedIndexKISClient(
+            clock=clock,
+            before_turnover=4_736_153,
+            bar_turnover=4_736_160,
+            after_turnover=4_736_170,
+        )
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: clock['now']
+
+        result = await service._fetch_market_row(
+            client,
+            MARKET_SNAPSHOT_TARGETS[0],
+            include_optional_legs=False,
+            cached_market_row=None,
+        )
+
+        self.assertEqual(client.index_calls, ['0001', '0001'])
+        self.assertEqual(client.index_time_calls, ['0001'])
+        self.assertEqual(result['value'], 2643.10)
+        self.assertEqual(result['trading_value'], 4_736_170)
+        self.assertEqual(result['index_leg']['status'], 'ready')
+        self.assertTrue(result['index_leg']['observation_payload_match'])
+        self.assertEqual(
+            result['index_leg']['collected_at'],
+            '2026-04-29T10:05:15+09:00',
+        )
+
+    async def test_decreasing_current_turnover_fails_provider_bracket(self) -> None:
+        clock = {
+            'now': datetime.fromisoformat('2026-04-29T10:05:00+09:00')
+        }
+        client = BracketedIndexKISClient(
+            clock=clock,
+            before_turnover=4_736_170,
+            bar_turnover=4_736_170,
+            after_turnover=4_736_150,
+            before_price='2642.07',
+            bar_price='2642.07',
+            after_price='2642.07',
+            provider_session_time='100500',
+        )
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: clock['now']
+
+        result = await service._fetch_market_row(
+            client,
+            MARKET_SNAPSHOT_TARGETS[0],
+            include_optional_legs=False,
+            cached_market_row=None,
+        )
+
+        self.assertEqual(client.index_calls, ['0001', '0001'])
+        self.assertEqual(result['index_leg']['status'], 'unverified')
+        self.assertFalse(result['index_leg']['observation_payload_match'])
+
+    async def test_client_collection_time_never_relabels_prior_session_provider_row(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        service = MarketSnapshotService(
+            kis_api_client=PriorSessionIndexObservationKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: datetime.fromisoformat('2026-04-29T10:05:20+09:00')
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='prior_session_provenance',
+            force=True,
+        )
+
+        assert result is not None
+        self.assertEqual(result['as_of'], '2026-04-28T10:05:00+09:00')
+        self.assertEqual(result['collected_at'], '2026-04-29T10:05:20+09:00')
+        self.assertEqual(
+            result['markets']['kospi']['provider_business_date'],
+            '2026-04-28',
+        )
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'unverified')
+        self.assertEqual(
+            result['markets']['kospi']['provider_observed_at'],
+            '2026-04-28T10:05:00+09:00',
+        )
+
+    async def test_after_hours_collection_does_not_mark_closing_bar_fresh(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        service = MarketSnapshotService(
+            kis_api_client=AfterHoursIndexObservationKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: datetime.fromisoformat('2026-04-29T20:00:00+09:00')
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='after_hours_provenance',
+            force=True,
+        )
+
+        assert result is not None
+        self.assertEqual(result['markets']['kospi']['provider_observed_at'], '2026-04-29T15:30:00+09:00')
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'unverified')
+        self.assertEqual(result['legs']['index']['status'], 'unverified')
+
+    async def test_weekend_refresh_does_not_relabel_prior_session_bar(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        client.provider_business_date = '20260424'
+        client.provider_session_time = '153000'
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: datetime.fromisoformat('2026-04-26T10:00:00+09:00')
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='weekend_provenance',
+            force=True,
+        )
+
+        assert result is not None
+        self.assertEqual(result['collected_at'], '2026-04-26T10:00:00+09:00')
+        self.assertEqual(result['as_of'], '2026-04-24T15:30:00+09:00')
+        self.assertEqual(result['markets']['kospi']['provider_business_date'], '2026-04-24')
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'unverified')
+
+    async def test_concurrent_forced_refreshes_share_one_process_local_flight(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = BlockingKISClient()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+
+        first = asyncio.create_task(
+            service.refresh_market_snapshot_if_due(trigger='concurrent:first', force=True)
+        )
+        await client.index_started.wait()
+        second = asyncio.create_task(
+            service.refresh_market_snapshot_if_due(trigger='concurrent:second', force=True)
+        )
+        await asyncio.sleep(0)
+        client.release_index.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertIsNotNone(first_result)
+        self.assertIsNotNone(second_result)
+        self.assertEqual(client.token_calls, 1)
+        self.assertEqual(len(client.index_calls), 4)
+        self.assertEqual(client.index_calls.count('0001'), 2)
+        self.assertEqual(client.index_calls.count('1001'), 2)
+        self.assertEqual(client.index_time_calls, ['0001', '1001'])
+
+    async def test_index_refresh_skips_provider_when_another_process_owns_bucket(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        cache_store = InMemoryCacheStore()
+        cache_store.claim_result = False
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=cache_store,
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='other_process_same_bucket',
+            force_index=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.token_calls, 0)
+        self.assertEqual(len(cache_store.claim_calls), 1)
+        self.assertEqual(
+            cache_store.claim_calls[0]['refresh_trigger'],
+            'other_process_same_bucket',
+        )
+
+    async def test_forced_index_refresh_reuses_optional_legs_until_their_own_cadence_is_due(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        fx_service = FakeFXService()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=fx_service,
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+            refresh_interval_seconds=3600,
+        )
+        current = datetime.fromisoformat('2026-04-29T09:00:20+09:00')
+        client.provider_session_time = '090000'
+        service._now = lambda: current
+        await service.refresh_market_snapshot_if_due(trigger='initial', force=True)
+        current = datetime.fromisoformat('2026-04-29T09:05:20+09:00')
+        client.provider_session_time = '090500'
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='five_minute_index',
+            force_index=True,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(len(client.index_calls), 8)
+        self.assertEqual(client.index_calls.count('0001'), 4)
+        self.assertEqual(client.index_calls.count('1001'), 4)
+        self.assertEqual(client.flow_calls, [('KSP', '0001'), ('KSQ', '1001')])
+        self.assertEqual(len(fx_service.calls), 1)
+        self.assertEqual(result['legs']['flow']['status'], 'cached')
+        self.assertEqual(result['legs']['fx']['status'], 'cached')
+        self.assertEqual(result['markets']['kospi']['flow_leg']['status'], 'cached')
+        self.assertEqual(result['markets']['kospi']['foreign_net_value'], -1_455_933_000_000)
+
+    async def test_index_only_refresh_does_not_relabel_unavailable_flow_as_cached(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FailingFlowKISClient()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+            refresh_interval_seconds=3600,
+        )
+        current = datetime.fromisoformat('2026-04-29T10:05:20+09:00')
+        service._now = lambda: current
+        await service.refresh_market_snapshot_if_due(trigger='flow_failure', force=True)
+        current = datetime.fromisoformat('2026-04-29T10:10:20+09:00')
+        client.provider_session_time = '101000'
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='index_only_after_flow_failure',
+            force_index=True,
+        )
+
+        assert result is not None
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'ready')
+        self.assertEqual(result['markets']['kospi']['flow_leg']['status'], 'unavailable')
+        self.assertEqual(result['legs']['flow']['status'], 'unavailable')
+        self.assertEqual(result['status'], 'partial')
+
+    async def test_index_only_refresh_does_not_relabel_missing_fx_as_cached(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        settings.koreaexim_api_key = ''
+        client = FakeKISClient()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+            refresh_interval_seconds=3600,
+        )
+        current = datetime.fromisoformat('2026-04-29T10:05:20+09:00')
+        service._now = lambda: current
+        await service.refresh_market_snapshot_if_due(trigger='fx_missing', force=True)
+        current = datetime.fromisoformat('2026-04-29T10:10:20+09:00')
+        client.provider_session_time = '101000'
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='index_only_after_fx_missing',
+            force_index=True,
+        )
+
+        assert result is not None
+        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'ready')
+        self.assertEqual(result['legs']['fx']['status'], 'missing')
+        self.assertEqual(result['usd_krw']['status'], 'missing')
+        self.assertEqual(result['status'], 'partial')
+
+    async def test_index_only_refresh_does_not_delay_hourly_optional_leg_due_time(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        fx_service = FakeFXService()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=fx_service,
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+            refresh_interval_seconds=3600,
+        )
+        current = datetime.fromisoformat('2026-04-29T14:00:20+09:00')
+        client.provider_session_time = '140000'
+        service._now = lambda: current
+        await service.refresh_market_snapshot_if_due(trigger='initial', force=True)
+
+        current = datetime.fromisoformat('2026-04-29T14:30:20+09:00')
+        client.provider_session_time = '143000'
+        index_only_result = await service.refresh_market_snapshot_if_due(
+            trigger='last_index_window_bucket',
+            force_index=True,
+        )
+        assert index_only_result is not None
+        self.assertEqual(
+            index_only_result['freshness']['next_refresh_due_at'],
+            '2026-04-29T15:00:20+09:00',
+        )
+
+        current = datetime.fromisoformat('2026-04-29T15:00:20+09:00')
+        client.provider_session_time = '150000'
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='regular_hourly_due',
+        )
+
+        assert result is not None
+        self.assertEqual(len(client.index_calls), 12)
+        self.assertEqual(client.index_calls.count('0001'), 6)
+        self.assertEqual(client.index_calls.count('1001'), 6)
+        self.assertEqual(client.flow_calls, [('KSP', '0001'), ('KSQ', '1001')] * 2)
+        self.assertEqual(len(fx_service.calls), 2)
+        self.assertEqual(result['legs']['flow']['status'], 'ready')
+        self.assertEqual(result['legs']['fx']['status'], 'ready')
 
     async def test_get_market_snapshot_normalizes_legacy_cached_investor_flow_values(self) -> None:
         settings.kis_use_mock = False

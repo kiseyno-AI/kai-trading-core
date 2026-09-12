@@ -1068,8 +1068,24 @@ class SignalDeciderExecutionOutcomeService:
         side: str,
     ) -> dict[str, Any]:
         readback = self._load_exec_readback(entry_row=entry_row)
-        orders = self._readback_items(readback=readback, key='orders')
-        executions = self._readback_items(readback=readback, key='executions')
+        orders_complete = self._exec_readback_section_is_complete(
+            readback=readback,
+            key='orders',
+        )
+        executions_complete = self._exec_readback_section_is_complete(
+            readback=readback,
+            key='executions',
+        )
+        orders = (
+            self._readback_items(readback=readback, key='orders')
+            if orders_complete
+            else []
+        )
+        executions = (
+            self._readback_items(readback=readback, key='executions')
+            if executions_complete
+            else []
+        )
         item_links = self._load_exec_item_links(entry_row=entry_row)
         order_link_by_broker_order_id = self._readback_order_link_by_broker_order_id(
             orders=orders,
@@ -1101,11 +1117,23 @@ class SignalDeciderExecutionOutcomeService:
                 )
             )
         ]
-        execution_quantity_total, execution_weighted_price_notional = self._readback_fact_totals(
-            facts=execution_facts,
+        if readback and (
+            (not orders_complete and not execution_facts)
+            or (not executions_complete and not order_facts)
+        ):
+            return self._unavailable_exec_readback_metrics(
+                readback=readback,
+                reason_code='exec_readback_fact_sources_incomplete',
+            )
+        execution_quantity_total, execution_weighted_price_notional = (
+            self._readback_fact_totals(facts=execution_facts)
+            if executions_complete
+            else (Decimal('0'), Decimal('0'))
         )
-        order_quantity_total, order_weighted_price_notional = self._readback_fact_totals(
-            facts=order_facts,
+        order_quantity_total, order_weighted_price_notional = (
+            self._readback_fact_totals(facts=order_facts)
+            if orders_complete
+            else (Decimal('0'), Decimal('0'))
         )
         if execution_facts and execution_quantity_total >= order_quantity_total:
             selected_facts = execution_facts
@@ -1181,10 +1209,13 @@ class SignalDeciderExecutionOutcomeService:
                     average_fill_price = fallback_weighted_price_notional / fallback_quantity_total
         if latest_order_status is None and filled_quantity_total > Decimal('0'):
             latest_order_status = BrokerOrderStatus.FILLED.value
-        has_terminal_order_evidence = self._readback_has_terminal_order_evidence(
-            side=side,
-            order_facts=order_facts,
-            item_links=item_links,
+        has_terminal_order_evidence = bool(
+            orders_complete
+            and self._readback_has_terminal_order_evidence(
+                side=side,
+                order_facts=order_facts,
+                item_links=item_links,
+            )
         )
         return {
             'filled_quantity': filled_quantity_total,
@@ -1207,6 +1238,7 @@ class SignalDeciderExecutionOutcomeService:
             'metric_source': 'exec_readback' if selected_facts else None,
             'has_terminal_order_evidence': has_terminal_order_evidence,
             'readback': {
+                'status': 'available',
                 'last_synced_at': readback.get('last_synced_at') if isinstance(readback, dict) else None,
                 'source': readback_source,
                 'execution_count': len(execution_facts),
@@ -1214,6 +1246,81 @@ class SignalDeciderExecutionOutcomeService:
                 'remote_execution_ids': remote_execution_ids,
                 'remote_order_ids': remote_order_ids,
                 'remote_exec_plan_item_ids': remote_exec_plan_item_ids,
+            },
+        }
+
+    def _exec_readback_section_is_complete(
+        self,
+        *,
+        readback: dict[str, Any],
+        key: str,
+    ) -> bool:
+        section = readback.get(key) if isinstance(readback, dict) else None
+        if not isinstance(section, dict):
+            return False
+        if _normalize_optional_text(section.get('status'), lowercase=True) != 'ok':
+            return False
+        declared_count = _safe_decimal(section.get('count'))
+        if (
+            declared_count is None
+            or declared_count < Decimal('0')
+            or declared_count != declared_count.to_integral_value()
+        ):
+            return False
+        raw_items = section.get('items')
+        if not isinstance(raw_items, list) or any(
+            not isinstance(item, dict) for item in raw_items
+        ):
+            return False
+        items = raw_items
+        omitted_count = _safe_decimal(section.get('items_omitted_count', 0))
+        if (
+            omitted_count is None
+            or omitted_count < Decimal('0')
+            or omitted_count != omitted_count.to_integral_value()
+        ):
+            return False
+        return bool(
+            omitted_count == Decimal('0')
+            and int(declared_count) == len(items)
+        )
+
+    @staticmethod
+    def _unavailable_exec_readback_metrics(
+        *,
+        readback: dict[str, Any],
+        reason_code: str,
+    ) -> dict[str, Any]:
+        return {
+            'filled_quantity': Decimal('0'),
+            'average_fill_price': None,
+            'submitted_at': None,
+            'first_fill_at': None,
+            'last_fill_at': None,
+            'latest_request_status': None,
+            'latest_order_status': None,
+            'latest_order_request_id': None,
+            'latest_broker_order_row_id': None,
+            'latest_client_order_id': None,
+            'latest_broker_order_id': None,
+            'client_order_ids': [],
+            'broker_order_ids': [],
+            'order_request_ids': [],
+            'broker_order_row_ids': [],
+            'fill_event_ids': [],
+            'pair_count': 0,
+            'metric_source': None,
+            'has_terminal_order_evidence': False,
+            'readback': {
+                'status': 'unavailable',
+                'reason_code': reason_code,
+                'last_synced_at': readback.get('last_synced_at'),
+                'source': None,
+                'execution_count': None,
+                'order_count': None,
+                'remote_execution_ids': [],
+                'remote_order_ids': [],
+                'remote_exec_plan_item_ids': [],
             },
         }
 
@@ -1256,6 +1363,19 @@ class SignalDeciderExecutionOutcomeService:
             return selected
         selected = dict(local_metrics)
         selected['metric_source'] = 'broker_orders' if local_quantity > Decimal('0') else 'plan_or_order_state'
+        readback_status = _normalize_optional_text(
+            (readback_metrics.get('readback') or {}).get('status')
+            if isinstance(readback_metrics.get('readback'), dict)
+            else None,
+            lowercase=True,
+        )
+        if (
+            readback_status == 'unavailable'
+            and local_quantity <= Decimal('0')
+            and not local_has_state
+        ):
+            selected['metric_source'] = 'exec_readback_unavailable'
+            selected['readback_unavailable'] = True
         return selected
 
     def _load_exec_readback(self, *, entry_row: SignalDeciderExecutionPlanItem) -> dict[str, Any]:
@@ -1480,8 +1600,24 @@ class SignalDeciderExecutionOutcomeService:
         entry_row: SignalDeciderExecutionPlanItem,
     ) -> str | None:
         readback = self._load_exec_readback(entry_row=entry_row)
-        orders = self._readback_items(readback=readback, key='orders')
-        executions = self._readback_items(readback=readback, key='executions')
+        orders_complete = self._exec_readback_section_is_complete(
+            readback=readback,
+            key='orders',
+        )
+        executions_complete = self._exec_readback_section_is_complete(
+            readback=readback,
+            key='executions',
+        )
+        orders = (
+            self._readback_items(readback=readback, key='orders')
+            if orders_complete
+            else []
+        )
+        executions = (
+            self._readback_items(readback=readback, key='executions')
+            if executions_complete
+            else []
+        )
         item_links = self._load_exec_item_links(entry_row=entry_row)
         order_link_by_broker_order_id = self._readback_order_link_by_broker_order_id(
             orders=orders,
@@ -1514,10 +1650,16 @@ class SignalDeciderExecutionOutcomeService:
         return None
 
     def _serialize_exec_readback_metrics(self, metrics: dict[str, Any]) -> dict[str, Any] | None:
-        if (_safe_decimal(metrics.get('filled_quantity')) or Decimal('0')) <= Decimal('0') and not metrics.get('pair_count'):
-            return None
         readback = metrics.get('readback') if isinstance(metrics.get('readback'), dict) else {}
+        if (
+            (_safe_decimal(metrics.get('filled_quantity')) or Decimal('0')) <= Decimal('0')
+            and not metrics.get('pair_count')
+            and readback.get('status') != 'unavailable'
+        ):
+            return None
         return {
+            'status': readback.get('status') or 'available',
+            'reason_code': readback.get('reason_code'),
             'source': readback.get('source'),
             'last_synced_at': readback.get('last_synced_at'),
             'filled_quantity': _decimal_to_text(_safe_decimal(metrics.get('filled_quantity'))),
@@ -1703,6 +1845,11 @@ class SignalDeciderExecutionOutcomeService:
         open_quantity: Decimal,
         manual_candidate_fill_quantity: Decimal,
     ) -> tuple[str, str | None]:
+        if entry_metrics.get('readback_unavailable') or exit_metrics.get(
+            'readback_unavailable'
+        ):
+            return LIFECYCLE_UNRESOLVED, EXIT_REASON_UNRESOLVED
+
         entry_request_status = _normalize_optional_text(
             entry_request.submission_status if entry_request is not None else None,
             lowercase=True,

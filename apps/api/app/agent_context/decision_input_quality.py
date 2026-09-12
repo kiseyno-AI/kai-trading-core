@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from datetime import date, datetime, timezone
+from decimal import Decimal, DecimalException, InvalidOperation
+import math
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from app.core.settings import settings
 
 DECISION_INPUT_QUALITY_SCHEMA_VERSION = 'decision_input_quality_v1'
 
@@ -41,6 +46,29 @@ AUXILIARY_BLOCKS = frozenset({'disclosures_news', 'financials_cashflow'})
 
 RAW_TURNOVER_SAFE_NOTIONAL_RATE = Decimal('0.005')
 ESTIMATED_TURNOVER_SAFE_NOTIONAL_RATE = Decimal('0.002')
+_KRX_TIMEZONE = ZoneInfo('Asia/Seoul')
+
+_EXECUTABLE_SPREAD_PROVENANCE = {
+    'quote_context': {
+        'source': 'kis',
+        'source_tables': frozenset({'current_quote_cache', 'quote_snapshots'}),
+    },
+    'intraday_execution_context': {
+        'source': 'kis_intraday_snapshot_v1',
+        'source_tables': frozenset({'current_kis_intraday_snapshot_cache', 'kis_intraday_snapshots'}),
+    },
+}
+_EXECUTABLE_SNAPSHOT_SPREAD_CONTEXTS = {
+    'current_quote_cache': frozenset({'quote_context'}),
+    'live_intraday': frozenset({'quote_context', 'intraday_execution_context'}),
+}
+_EXECUTABLE_SPREAD_COMPONENT_FIELDS = frozenset(
+    {'current_price', 'bid_price', 'ask_price', 'spread_points', 'spread_bps'}
+)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -62,14 +90,21 @@ def _as_decimal(value: Any) -> Decimal | None:
     if value in (None, ''):
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
+        return parsed if parsed.is_finite() else None
     except (InvalidOperation, ValueError):
         return None
 
 
 def _as_float(value: Any) -> float | None:
     decimal_value = _as_decimal(value)
-    return float(decimal_value) if decimal_value is not None else None
+    if decimal_value is None:
+        return None
+    try:
+        rendered = float(decimal_value)
+    except (OverflowError, ValueError):
+        return None
+    return rendered if math.isfinite(rendered) else None
 
 
 def _as_int(value: Any) -> int | None:
@@ -256,6 +291,127 @@ def _eod_reference_price_is_expected(
     return snapshot_type in {'eod_stale', 'closed_market_no_eod_price'}
 
 
+def _aware_timestamp(value: Any) -> datetime | None:
+    text = _as_text(value)
+    if text is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _executable_spread_provenance(
+    quote: dict[str, Any],
+    *,
+    market_date: str | None,
+) -> tuple[bool, str, str]:
+    if str(quote.get('status') or '').strip().lower() != STATUS_AVAILABLE:
+        return False, 'unavailable', 'quote_status_not_executable'
+
+    snapshot_type = str(quote.get('snapshot_type') or '').strip().lower()
+    allowed_source_contexts = _EXECUTABLE_SNAPSHOT_SPREAD_CONTEXTS.get(snapshot_type)
+    if allowed_source_contexts is None:
+        return False, 'invalid', 'quote_snapshot_type_not_executable'
+
+    requested_market_date = _as_text(market_date)
+    try:
+        parsed_market_date = date.fromisoformat(requested_market_date or '')
+    except ValueError:
+        return False, 'invalid', 'quote_market_date_invalid'
+    if _as_text(quote.get('market_date')) != requested_market_date:
+        return False, 'invalid', 'quote_market_date_mismatch'
+    if _as_text(quote.get('as_of_market_date')) != requested_market_date:
+        return False, 'invalid', 'quote_as_of_market_date_mismatch'
+    if str(quote.get('quote_freshness_status') or '').strip().lower() != 'fresh':
+        return False, 'unavailable', 'quote_freshness_not_fresh'
+
+    observed_at = _aware_timestamp(quote.get('quote_freshness_timestamp'))
+    if observed_at is None:
+        return False, 'invalid', 'quote_timestamp_invalid_or_timezone_missing'
+    if observed_at.astimezone(_KRX_TIMEZONE).date() != parsed_market_date:
+        return False, 'invalid', 'quote_timestamp_market_date_mismatch'
+    evaluated_at = _utcnow()
+    if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
+        return False, 'invalid', 'quote_evaluation_timestamp_invalid'
+    evaluated_at = evaluated_at.astimezone(timezone.utc)
+    observed_at_utc = observed_at.astimezone(timezone.utc)
+    if observed_at_utc > evaluated_at:
+        return False, 'invalid', 'quote_timestamp_in_future'
+    stale_after_seconds = _as_float(settings.kis_realtime_price_stale_after_seconds)
+    if (
+        stale_after_seconds is None
+        or stale_after_seconds <= 0
+        or stale_after_seconds > 300
+    ):
+        return False, 'invalid', 'quote_staleness_setting_invalid'
+    if (evaluated_at - observed_at_utc).total_seconds() > stale_after_seconds:
+        return False, 'unavailable', 'quote_timestamp_stale'
+
+    context_name = _as_text(quote.get('spread_source_context'))
+    if context_name not in allowed_source_contexts:
+        return False, 'invalid', 'quote_spread_source_context_mismatch'
+    contract = _EXECUTABLE_SPREAD_PROVENANCE[context_name]
+    source = _as_dict(quote.get('source'))
+    if _as_text(source.get(context_name)) != contract['source']:
+        return False, 'invalid', 'quote_source_provenance_unrecognized'
+    provenance = _as_dict(_as_dict(quote.get('freshness')).get(context_name))
+    provenance_timestamp = _aware_timestamp(provenance.get('as_of_timestamp'))
+    source_tables = [str(value).strip() for value in _as_list(provenance.get('source_tables'))]
+    if (
+        str(provenance.get('freshness_status') or '').strip().lower() != 'fresh'
+        or str(provenance.get('provenance_status') or '').strip().lower() != SOURCE_QUALITY_PROVIDER
+        or _as_text(provenance.get('as_of_market_date')) != requested_market_date
+        or provenance_timestamp != observed_at
+        or _as_text(provenance.get('source_provider')) != contract['source']
+        or len(source_tables) != len(set(source_tables))
+        or set(source_tables) != contract['source_tables']
+    ):
+        return False, 'invalid', 'quote_provider_provenance_unverified'
+
+    component_sources = _as_dict(quote.get('spread_component_source_context'))
+    if (
+        set(component_sources) != _EXECUTABLE_SPREAD_COMPONENT_FIELDS
+        or any(component_sources.get(field) != context_name for field in _EXECUTABLE_SPREAD_COMPONENT_FIELDS)
+    ):
+        return False, 'invalid', 'quote_spread_component_provenance_mismatch'
+    current_price = _as_decimal(quote.get('current_price'))
+    bid_price = _as_decimal(quote.get('bid_price'))
+    ask_price = _as_decimal(quote.get('ask_price'))
+    spread_points = _as_decimal(quote.get('spread_points'))
+    spread_bps = _as_decimal(quote.get('spread_bps'))
+    if (
+        current_price is None
+        or bid_price is None
+        or ask_price is None
+        or spread_points is None
+        or spread_bps is None
+        or current_price <= 0
+        or bid_price <= 0
+        or ask_price <= bid_price
+        or spread_points <= 0
+        or spread_bps <= 0
+    ):
+        return False, 'invalid', 'quote_book_not_positive_and_coherent'
+    try:
+        spread_is_coherent = (
+            spread_points == ask_price - bid_price
+            and abs(
+                spread_bps
+                - ((spread_points / current_price) * Decimal('10000'))
+            )
+            <= Decimal('0.0001')
+        )
+    except DecimalException:
+        return False, 'invalid', 'quote_book_not_positive_and_coherent'
+    if not spread_is_coherent:
+        return False, 'invalid', 'quote_book_not_positive_and_coherent'
+    return True, 'available', 'current_quote_spread'
+
+
 def _is_quote_stale_or_fallback(
     quote: dict[str, Any],
     *,
@@ -283,7 +439,7 @@ def _is_quote_stale_or_fallback(
 
 def _liquidity_tier(trading_value_krw: int | None, avg_trading_value_20d: float | None) -> str:
     reference_value = trading_value_krw if trading_value_krw is not None else avg_trading_value_20d
-    if reference_value is None:
+    if reference_value is None or reference_value <= 0:
         return 'unknown'
     if reference_value >= 10_000_000_000:
         return 'high'
@@ -301,12 +457,16 @@ def _safe_notional(
     estimated_trading_value_krw: int | None,
     avg_trading_value_20d: float | None,
 ) -> int | None:
-    if trading_value_source == 'raw' and raw_trading_value_krw is not None:
+    if (
+        trading_value_source == 'raw'
+        and raw_trading_value_krw is not None
+        and raw_trading_value_krw > 0
+    ):
         return int(Decimal(raw_trading_value_krw) * RAW_TURNOVER_SAFE_NOTIONAL_RATE)
     fallback_value = estimated_trading_value_krw
     if fallback_value is None and avg_trading_value_20d is not None:
         fallback_value = int(avg_trading_value_20d)
-    if fallback_value is not None:
+    if fallback_value is not None and fallback_value > 0:
         return int(Decimal(fallback_value) * ESTIMATED_TURNOVER_SAFE_NOTIONAL_RATE)
     return None
 
@@ -318,6 +478,7 @@ def _execution_feasibility(
     allocation_budget_krw: Decimal | None,
     estimated_reference_price: Decimal | None,
     planned_notional_krw: Decimal | None,
+    market_date: str | None,
 ) -> dict[str, Any]:
     quote = _quote_context(pre_decider_enrichment_context)
     phase_contract = _market_data_phase_contract(pre_decider_enrichment_context)
@@ -346,27 +507,104 @@ def _execution_feasibility(
         )
     )
     avg_trading_value_20d = _as_float(liquidity_ranking.get('avg_trading_value_20d'))
-    liquidity_tier = _liquidity_tier(raw_trading_value_krw or estimated_trading_value_krw, avg_trading_value_20d)
-    max_safe_notional_krw = _safe_notional(
-        trading_value_source=trading_value_source,
-        raw_trading_value_krw=raw_trading_value_krw,
-        estimated_trading_value_krw=estimated_trading_value_krw,
-        avg_trading_value_20d=avg_trading_value_20d,
+    reference_trading_value_krw = _as_int(
+        _first_present(
+            trading_value.get('trading_value_krw'),
+            turnover.get('trading_value_krw'),
+            turnover.get('turnover_krw'),
+        )
     )
-    spread_bps = _as_float(_first_present(quote.get('spread_bps'), quote.get('quote_spread_bps_of_price')))
-    if spread_bps is None:
-        spread_bps = {
-            'high': 10.0,
-            'medium': 25.0,
-            'weak': 75.0,
-            'very_weak': 150.0,
-        }.get(liquidity_tier)
-
+    invalid_turnover_fields = [
+        field_name
+        for field_name, value in (
+            ('raw_trading_value_krw', raw_trading_value_krw),
+            ('estimated_trading_value_krw', estimated_trading_value_krw),
+            ('reference_trading_value_krw', reference_trading_value_krw),
+            ('avg_trading_value_20d', avg_trading_value_20d),
+        )
+        if value is not None and value <= 0
+    ]
+    usable_raw_trading_value_krw = (
+        raw_trading_value_krw
+        if raw_trading_value_krw is not None and raw_trading_value_krw > 0
+        else None
+    )
+    usable_estimated_trading_value_krw = (
+        estimated_trading_value_krw
+        if estimated_trading_value_krw is not None
+        and estimated_trading_value_krw > 0
+        else None
+    )
+    usable_avg_trading_value_20d = (
+        avg_trading_value_20d
+        if avg_trading_value_20d is not None and avg_trading_value_20d > 0
+        else None
+    )
+    liquidity_tier = _liquidity_tier(
+        usable_raw_trading_value_krw or usable_estimated_trading_value_krw,
+        usable_avg_trading_value_20d,
+    )
+    max_safe_notional_krw = (
+        None
+        if invalid_turnover_fields
+        else _safe_notional(
+            trading_value_source=trading_value_source,
+            raw_trading_value_krw=usable_raw_trading_value_krw,
+            estimated_trading_value_krw=usable_estimated_trading_value_krw,
+            avg_trading_value_20d=usable_avg_trading_value_20d,
+        )
+    )
     blocking_reasons: list[dict[str, Any]] = []
     quote_degraded, quote_reasons = _is_quote_stale_or_fallback(
         quote,
         market_data_phase_contract=phase_contract,
     )
+    if 'spread_bps' in quote:
+        raw_spread_bps = quote.get('spread_bps')
+        spread_field_present = True
+    elif 'quote_spread_bps_of_price' in quote:
+        raw_spread_bps = quote.get('quote_spread_bps_of_price')
+        spread_field_present = True
+    else:
+        raw_spread_bps = None
+        spread_field_present = False
+    parsed_spread_bps = _as_decimal(raw_spread_bps)
+    parsed_spread_float = _as_float(parsed_spread_bps)
+    spread_bps: float | None = None
+    quote_status = str(quote.get('status') or '').strip().lower()
+    spread_is_invalid = spread_field_present and raw_spread_bps is not None and (
+        parsed_spread_bps is None
+        or parsed_spread_bps < 0
+        or parsed_spread_float is None
+    )
+    if spread_is_invalid:
+        expected_slippage_status = 'invalid'
+        expected_slippage_reason = 'quote_spread_nonfinite_or_negative'
+        expected_slippage_basis = 'unavailable'
+    elif raw_spread_bps is None and quote_status in {
+        'available',
+        'not_applicable',
+        'stale_eod',
+    }:
+        expected_slippage_status = 'missing'
+        expected_slippage_reason = 'quote_spread_missing'
+        expected_slippage_basis = 'unavailable'
+    elif raw_spread_bps is None:
+        expected_slippage_status = 'unavailable'
+        expected_slippage_reason = 'quote_unavailable'
+        expected_slippage_basis = 'unavailable'
+    elif _eod_reference_price_is_expected(quote, phase_contract):
+        expected_slippage_status = 'unavailable'
+        expected_slippage_reason = 'quote_spread_not_executable_eod'
+        expected_slippage_basis = 'unavailable'
+    else:
+        (
+            spread_is_executable,
+            expected_slippage_status,
+            expected_slippage_reason,
+        ) = _executable_spread_provenance(quote, market_date=market_date)
+        expected_slippage_basis = 'quote_spread_bps' if spread_is_executable else 'unavailable'
+        spread_bps = parsed_spread_float if spread_is_executable else None
     if quote_degraded:
         blocking_reasons.append(
             {
@@ -375,7 +613,25 @@ def _execution_feasibility(
                 'reasons': quote_reasons,
             }
         )
-    if trading_value_source == 'missing':
+    source_value_missing = (
+        trading_value_source == 'raw' and raw_trading_value_krw is None
+    ) or (
+        trading_value_source == 'estimated'
+        and estimated_trading_value_krw is None
+    )
+    if invalid_turnover_fields:
+        blocking_reasons.append(
+            {
+                'code': 'source_turnover_invalid',
+                'decision_effect': EFFECT_HARD_BLOCK,
+                'reasons': [
+                    'Trading value must be strictly positive; invalid fields: '
+                    + ', '.join(invalid_turnover_fields)
+                    + '.',
+                ],
+            }
+        )
+    elif trading_value_source == 'missing' or source_value_missing:
         blocking_reasons.append(
             {
                 'code': 'source_turnover_missing',
@@ -421,16 +677,19 @@ def _execution_feasibility(
         sizing_hints.append(
             {
                 'code': 'max_safe_notional_unavailable',
-                'reason': 'No raw or estimated trading value was available for sizing hints.',
+                'reason': 'No valid positive trading value was available for sizing hints.',
             }
         )
 
     score = 100
-    score -= 35 if any(item['code'] == 'source_turnover_missing' for item in blocking_reasons) else 0
+    score -= 35 if any(
+        item['code'] in {'source_turnover_missing', 'source_turnover_invalid'}
+        for item in blocking_reasons
+    ) else 0
     score -= 20 if quote_degraded else 0
     score -= 15 if trading_value_source not in {'raw', 'missing'} else 0
     score -= {'high': 0, 'medium': 8, 'weak': 20, 'very_weak': 35, 'unknown': 25}.get(liquidity_tier, 20)
-    score -= 8 if spread_bps is not None and spread_bps >= 100 else 0
+    score -= 8 if parsed_spread_float is not None and parsed_spread_float >= 100 else 0
     score = max(0, min(100, score))
 
     return {
@@ -438,6 +697,9 @@ def _execution_feasibility(
         'liquidity_tier': liquidity_tier,
         'max_safe_notional_krw': max_safe_notional_krw,
         'expected_slippage_bps': spread_bps,
+        'expected_slippage_basis': expected_slippage_basis,
+        'expected_slippage_status': expected_slippage_status,
+        'expected_slippage_reason': expected_slippage_reason,
         'blocking_reasons': blocking_reasons,
         'sizing_hints': sizing_hints,
         'inputs': {
@@ -604,6 +866,7 @@ def build_decision_input_quality_envelope(
         allocation_budget_krw=allocation_budget,
         estimated_reference_price=reference_price,
         planned_notional_krw=planned_notional,
+        market_date=market_date,
     )
     market_setup_edge = _market_setup_edge(normalized_blocks)
     final_judgment = _final_judgment(

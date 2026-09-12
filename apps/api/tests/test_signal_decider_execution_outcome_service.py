@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 import unittest
 from uuid import uuid4
 
@@ -829,10 +830,18 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
         item = payload['items'][0]
         self.assertEqual(item['lifecycle_status'], 'unresolved')
         self.assertEqual(item['exit_reason'], 'unresolved')
-        self.assertEqual(item['entry_filled_quantity'], '5.00000000')
-        self.assertEqual(item['closed_quantity'], '5.00000000')
+        self.assertEqual(item['entry_filled_quantity'], '0.00000000')
+        self.assertEqual(item['closed_quantity'], '0.00000000')
         self.assertEqual(item['open_quantity'], '0.00000000')
-        self.assertEqual(item['diagnostics']['entry']['order_status'], 'filled')
+        self.assertIsNone(item['realized_pnl_krw'])
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['status'],
+            'unavailable',
+        )
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['reason_code'],
+            'exec_readback_fact_sources_incomplete',
+        )
 
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, entry_plan_item_id)
@@ -912,11 +921,11 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
         self.assertEqual(item['diagnostics']['exit']['exec_readback']['source'], 'orders')
         self.assertEqual(
             item['diagnostics']['entry']['exec_readback']['remote_execution_ids'],
-            ['exec-buy-compact-1'],
+            [],
         )
         self.assertEqual(
             item['diagnostics']['exit']['exec_readback']['remote_execution_ids'],
-            ['exec-sell-compact-1'],
+            [],
         )
         self.assertEqual(
             item['diagnostics']['entry']['exec_readback']['remote_order_ids'],
@@ -925,6 +934,194 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
         self.assertEqual(
             item['diagnostics']['exit']['exec_readback']['remote_order_ids'],
             ['exec-sell-order-1'],
+        )
+
+    def test_exec_readback_with_both_fact_sources_truncated_is_unavailable(self) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id='SDNO-20260430-005930-LOSSY-READBACK',
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='submitted',
+            traceability_payload={'target_price': 54000, 'stop_loss_price': 47000},
+        )
+        self._attach_partial_exec_full_order_readback_submission(
+            entry_plan_item_id=entry_plan_item_id
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, entry_plan_item_id)
+            self.assertIsNotNone(row)
+            submission_payload = deepcopy(row.submission_payload)
+            readback = submission_payload['exec_dispatch']['readback']
+            readback['orders']['count'] = 12
+            readback['orders']['items_omitted_count'] = 10
+            readback['executions']['count'] = 12
+            readback['executions']['items_omitted_count'] = 10
+            row.submission_payload = submission_payload
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(payload['summary']['closed_count'], 0)
+        self.assertEqual(payload['summary']['unresolved_count'], 1)
+        item = payload['items'][0]
+        self.assertEqual(item['lifecycle_status'], 'unresolved')
+        self.assertIsNone(item['realized_pnl_krw'])
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['status'],
+            'unavailable',
+        )
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['reason_code'],
+            'exec_readback_fact_sources_incomplete',
+        )
+
+    def test_exec_readback_completeness_rejects_malformed_items_container(self) -> None:
+        for malformed_items in ({}, 'not-a-list', [None]):
+            with self.subTest(malformed_items=malformed_items):
+                self.assertFalse(
+                    signal_decider_execution_outcome_service._exec_readback_section_is_complete(
+                        readback={
+                            'orders': {
+                                'status': 'ok',
+                                'count': 0,
+                                'items': malformed_items,
+                            }
+                        },
+                        key='orders',
+                    )
+                )
+
+    def test_exec_exit_trigger_ignores_fills_from_incomplete_source(self) -> None:
+        for incomplete_key, complete_key, intent, expected_reason in (
+            ('executions', 'orders', 'stop_sell', 'stop_loss_hit'),
+            ('orders', 'executions', 'target_sell', 'target_hit'),
+        ):
+            with self.subTest(incomplete_key=incomplete_key):
+                item_id = f'{incomplete_key}-sell-item'
+                readback = {
+                    complete_key: {'status': 'ok', 'count': 0, 'items': []},
+                    incomplete_key: {
+                        'status': 'ok',
+                        'count': 2,
+                        'items_omitted_count': 1,
+                        'items': [
+                            {
+                                'id': f'{incomplete_key}-sell-fill',
+                                'execution_plan_item_id': item_id,
+                                'symbol': self.symbol,
+                                'side': 'sell',
+                                'status': 'filled',
+                                'filled_quantity': '5',
+                                'quantity': '5',
+                                'price': '54000',
+                            }
+                        ],
+                    },
+                }
+                row = SimpleNamespace(
+                    submission_payload={
+                        'exec_dispatch': {
+                            'item_links': [
+                                {
+                                    'exec_plan_item_id': item_id,
+                                    'symbol': self.symbol,
+                                    'side': 'sell',
+                                    'intent': intent,
+                                }
+                            ],
+                            'readback': readback,
+                        }
+                    }
+                )
+
+                trigger = signal_decider_execution_outcome_service._resolve_exec_readback_exit_trigger_rule(
+                    entry_row=row
+                )
+
+                self.assertIsNone(trigger, expected_reason)
+
+    def test_exec_readback_with_truncated_orders_and_empty_complete_executions_is_unavailable(
+        self,
+    ) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id='SDNO-20260430-005930-LOSSY-ORDERS',
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='submitted',
+            traceability_payload={'target_price': 54000, 'stop_loss_price': 47000},
+        )
+        self._attach_partial_exec_full_order_readback_submission(
+            entry_plan_item_id=entry_plan_item_id
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, entry_plan_item_id)
+            self.assertIsNotNone(row)
+            submission_payload = deepcopy(row.submission_payload)
+            readback = submission_payload['exec_dispatch']['readback']
+            readback['orders']['count'] = 12
+            readback['orders']['items_omitted_count'] = 10
+            readback['executions'] = {'status': 'ok', 'count': 0, 'items': []}
+            row.submission_payload = submission_payload
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        item = payload['items'][0]
+        self.assertEqual(item['lifecycle_status'], 'unresolved')
+        self.assertIsNone(item['realized_pnl_krw'])
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['status'],
+            'unavailable',
+        )
+
+    def test_exec_readback_with_truncated_executions_and_empty_complete_orders_is_unavailable(
+        self,
+    ) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id='SDNO-20260430-005930-LOSSY-EXECUTIONS',
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='submitted',
+            traceability_payload={'target_price': 54000, 'stop_loss_price': 47000},
+        )
+        self._attach_partial_exec_full_order_readback_submission(
+            entry_plan_item_id=entry_plan_item_id
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, entry_plan_item_id)
+            self.assertIsNotNone(row)
+            submission_payload = deepcopy(row.submission_payload)
+            readback = submission_payload['exec_dispatch']['readback']
+            readback['orders'] = {'status': 'ok', 'count': 0, 'items': []}
+            row.submission_payload = submission_payload
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        item = payload['items'][0]
+        self.assertEqual(item['lifecycle_status'], 'unresolved')
+        self.assertIsNone(item['realized_pnl_krw'])
+        self.assertEqual(
+            item['diagnostics']['entry']['exec_readback']['status'],
+            'unavailable',
         )
 
     def test_agent_context_route_returns_persisted_outcomes_with_filters(self) -> None:

@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     kis_use_mock: bool = True
     market_snapshot_kis_use_real: bool = True
     market_snapshot_refresh_interval_seconds: int = 3600
+    market_snapshot_open_drive_refresh_interval_seconds: int = Field(default=300, ge=60, le=600)
+    market_snapshot_open_drive_max_age_seconds: int = Field(default=360, ge=60, le=900)
     kis_hts_id: str = ''
     kis_token_refresh_margin_seconds: int = Field(default=300, ge=0, le=172_799)
     kis_token_failure_cooldown_seconds: int = Field(default=60, ge=60, le=3600)
@@ -74,7 +76,12 @@ class Settings(BaseSettings):
     kis_realtime_price_max_subscriptions: int = 40
     kis_realtime_price_subscription_refresh_seconds: float = 30.0
     kis_realtime_price_idle_poll_seconds: float = 5.0
-    kis_realtime_price_stale_after_seconds: float = 30.0
+    kis_realtime_price_stale_after_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=300,
+        allow_inf_nan=False,
+    )
     kis_realtime_price_subscribe_pause_seconds: float = 0.05
     kis_realtime_price_unsubscribe_tr_type: str = '2'
     kis_realtime_price_sse_interval_seconds: float = 1.0
@@ -105,9 +112,23 @@ class Settings(BaseSettings):
     signal_decider_next_open_enabled: bool = False
     signal_decider_next_open_dry_run: bool = True
     signal_decider_next_open_account_targets: str = ''
-    signal_decider_next_open_min_confidence_score_10: float = 6.0
-    signal_decider_next_open_min_expected_return_pct: float = 0.0
+    signal_decider_next_open_min_confidence_score_10: float = Field(
+        default=6.0,
+        ge=0,
+        le=10,
+        allow_inf_nan=False,
+    )
+    signal_decider_next_open_min_expected_return_pct: float = Field(
+        default=0.0,
+        ge=0,
+        allow_inf_nan=False,
+    )
     signal_decider_next_open_min_reward_risk_ratio: float = Field(default=1.30, gt=0, le=10)
+    signal_decider_next_open_non_spread_round_trip_cost_bps: float = Field(
+        default=50.0,
+        ge=0,
+        le=1000,
+    )
     signal_decider_next_open_require_active_policy: bool = True
     signal_decider_next_open_block_on_data_warnings: bool = True
     signal_decider_next_open_block_on_specialist_disagreement: bool = True
@@ -122,7 +143,7 @@ class Settings(BaseSettings):
     signal_decider_exec_integration_mode: str = 'disabled'
     signal_decider_exec_base_url: str = 'http://127.0.0.1:8010'
     signal_decider_exec_bearer_token: Optional[str] = None
-    signal_decider_exec_dispatch_source: str = 'kai-trading-core'
+    signal_decider_exec_dispatch_source: Literal['kai-trading-core'] = 'kai-trading-core'
     signal_decider_exec_runtime_mode: str = 'mock'
     signal_decider_exec_request_timeout_seconds: float = 10.0
     us_equity_execution_enabled: bool = False
@@ -228,6 +249,8 @@ class Settings(BaseSettings):
     openclaw_base_url: str = 'http://127.0.0.1:18789'
     openclaw_gateway_token: Optional[str] = None
     openclaw_state_dir: str = '~/.openclaw'
+    openclaw_signal_decider_expected_model: str = 'openai/gpt-5.6-sol'
+    openclaw_short_term_decider_expected_model: str = 'openai/gpt-5.6-sol'
     openclaw_agent_timeout_seconds: float = 0.0
     openclaw_agent_max_retries: int = 2
     openclaw_agent_retry_backoff_seconds: float = 2.0
@@ -291,6 +314,18 @@ class Settings(BaseSettings):
             return None
         normalized = str(value).strip()
         return normalized or None
+
+    @model_validator(mode='after')
+    def validate_market_snapshot_open_drive_timing(self):
+        if (
+            self.market_snapshot_open_drive_refresh_interval_seconds
+            > self.market_snapshot_open_drive_max_age_seconds
+        ):
+            raise ValueError(
+                'MARKET_SNAPSHOT_OPEN_DRIVE_REFRESH_INTERVAL_SECONDS cannot exceed '
+                'MARKET_SNAPSHOT_OPEN_DRIVE_MAX_AGE_SECONDS'
+            )
+        return self
 
     @model_validator(mode='after')
     def validate_kis_token_issuance_timing(self):

@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME
+from app.agent_context.model_identity import build_observed_model_identity
 from app.agent_context.signal_decider_calibration_service import SignalDeciderCalibrationService
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
@@ -246,7 +247,18 @@ def _feedback_row(
         },
         request_payload=request_payload,
         response_payload=response_payload,
-        response_summary_payload={'model': 'openclaw/signal-decider', 'policy_version': policy_version},
+        response_summary_payload={
+            'model': 'openclaw/signal-decider',
+            'policy_version': policy_version,
+            'decision_provenance': {
+                'model_identity': build_observed_model_identity(
+                    role='signal-decider',
+                    expected_model='openai/gpt-5.6-sol',
+                    actual_provider='openai',
+                    actual_model='gpt-5.6-sol',
+                )
+            },
+        },
         created_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
     )
 
@@ -4407,6 +4419,66 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['review_boundary']['manual_review_only'], True)
         self.assertEqual(result['review_boundary']['auto_apply_prompt_changes'], False)
 
+    def test_signal_decider_calibration_never_mixes_actual_model_identity_cohorts(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+        expected_identity = build_observed_model_identity(
+            role='signal-decider',
+            expected_model='openai/gpt-5.6-sol',
+            actual_provider='openai',
+            actual_model='gpt-5.6-sol',
+        )
+        other_identity = {
+            **expected_identity,
+            'expected_model': 'openai/gpt-5.7',
+            'actual_model': 'gpt-5.7',
+            'actual_model_ref': 'openai/gpt-5.7',
+            'cohort': 'signal-decider|openai/gpt-5.7',
+        }
+        rows = loop_service.repository.snapshot_rows
+        rows[0].response_summary_payload['decision_provenance'] = {
+            'model_identity': expected_identity,
+        }
+        rows[1].response_summary_payload['decision_provenance'] = {
+            'model_identity': other_identity,
+        }
+        rows[2].response_summary_payload['decision_provenance'] = {
+            'model_identity': expected_identity,
+        }
+        for row in rows[3:]:
+            row.response_summary_payload['decision_provenance'] = {}
+
+        with patch(
+            'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+            side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        self.assertEqual(
+            result['request']['model_identity_cohort'],
+            'signal-decider|openai/gpt-5.6-sol',
+        )
+        self.assertEqual(result['summary']['mature_computed_count'], 2)
+        self.assertEqual(
+            result['exclusions']['status_reason_counts'],
+            {
+                'model_identity_cohort_mismatch': 1,
+                'model_identity_unverified': 4,
+            },
+        )
+
     def test_signal_decider_calibration_excludes_stale_evaluation_for_a_different_action(self):
         loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
 
@@ -4550,7 +4622,25 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['rule_candidates']['status'], 'empty')
         self.assertEqual(result['rule_candidates']['thresholds']['min_sample_size'], 3)
 
-    def test_signal_decider_calibration_rule_candidates_include_bad_buy_veto_or_downsize(self):
+    def test_signal_decider_calibration_factor_bucket_preserves_zero_server_score(self):
+        tokens = SignalDeciderCalibrationService()._build_group_tokens(
+            decision={'decision': {'action': 'buy'}},
+            factor_summary={
+                'factor_scores': {
+                    'momentum': {'status': 'available', 'score': 0.99},
+                }
+            },
+            liquidity_context={},
+            feature_snapshot={},
+            scores={
+                'momentum': {'status': 'available', 'score': 0},
+            },
+        )
+
+        momentum_token = next(token for token in tokens if token.key == 'factor.momentum.bucket')
+        self.assertEqual(momentum_token.value, 'available:low')
+
+    def test_signal_decider_calibration_rule_candidates_emit_canonical_gate_contract(self):
         result = _build_rule_candidate_report(outcome_kind='bad_buy')
 
         candidates = list(result['rule_candidates']['items'])
@@ -4584,7 +4674,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         risk_candidates = [
             candidate
             for candidate in candidates
-            if candidate['candidate_type'] in {'veto', 'downsize'}
+            if candidate['candidate_type'] in {'buy_veto', 'tighten_buy_gate'}
         ]
         self.assertTrue(risk_candidates)
         candidate = risk_candidates[0]
@@ -4593,28 +4683,34 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(candidate['negative_rate'], 1.0)
         self.assertEqual(candidate['bad_buy_rate'], 1.0)
         self.assertEqual(candidate['activation_status'], 'needs_replay')
+        self.assertTrue(candidate['manual_review_only'])
         self.assertEqual(candidate['recommended_replay_config']['candidate_id'], candidate['candidate_id'])
         self.assertEqual(candidate['recommended_replay_config']['candidate_type'], candidate['candidate_type'])
         self.assertEqual(candidate['recommended_replay_config']['primary_metric'], 'bad_buy_rate')
         self.assertFalse(candidate['active_policy'])
+        self.assertFalse(candidate['deterministic_gate_eligible'])
+        self.assertEqual(
+            set(candidate['predicate']),
+            {'schema_version', 'all'},
+        )
         self.assertTrue(
             any(
                 condition['field'] == 'decision.action'
                 and condition['operator'] == 'eq'
                 and condition['value'] == 'buy'
-                for condition in candidate['predicate']['conditions']
+                for condition in candidate['predicate']['all']
             )
         )
         non_action_conditions = [
             condition
-            for condition in candidate['predicate']['conditions']
+            for condition in candidate['predicate']['all']
             if condition['field'] != 'decision.action'
         ]
         self.assertTrue(non_action_conditions)
         for risk_candidate in risk_candidates:
-            predicate_conditions = list(risk_candidate['predicate']['conditions'])
+            predicate_conditions = list(risk_candidate['predicate']['all'])
             replay_conditions = list(
-                risk_candidate['recommended_replay_config']['predicate']['conditions']
+                risk_candidate['recommended_replay_config']['predicate']['all']
             )
             for condition in predicate_conditions + replay_conditions:
                 self.assertNotIn(condition['field'], outcome_predicate_fields)
@@ -4634,13 +4730,13 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(candidate['support_sample_count'], 3)
         self.assertEqual(candidate['negative_rate'], 1.0)
         self.assertEqual(candidate['recommended_replay_config']['primary_metric'], 'missed_opportunity_rate')
-        self.assertNotIn(candidate['candidate_type'], {'veto', 'downsize'})
+        self.assertNotIn(candidate['candidate_type'], {'buy_veto', 'tighten_buy_gate'})
         self.assertTrue(
             any(
                 condition['field'] == 'decision.action'
                 and condition['operator'] == 'eq'
                 and condition['value'] == 'wait'
-                for condition in candidate['predicate']['conditions']
+                for condition in candidate['predicate']['all']
             )
         )
 

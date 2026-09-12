@@ -16,6 +16,11 @@ from app.agent_context.roles import (
     SIGNAL_DECIDER_AGENT_NAME,
     canonical_evaluation_action,
 )
+from app.agent_context.model_identity import (
+    expected_decider_model,
+    select_model_identity_cohort_rows,
+)
+from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
     DeciderPostDecisionEvaluation,
@@ -981,6 +986,15 @@ class DeciderReplayRepository:
                 and row.decision_action == 'buy'
             ]
             source_decision_count = len(candidate_snapshot_rows)
+            (
+                candidate_snapshot_rows,
+                model_identity_exclusions,
+                model_identity_cohort,
+            ) = select_model_identity_cohort_rows(
+                candidate_snapshot_rows,
+                role=agent_name,
+                expected_model=expected_decider_model(agent_name, settings_obj=settings),
+            )
             canonical_action_exclusions: Counter[str] = Counter()
             snapshot_rows = []
             for row in candidate_snapshot_rows:
@@ -1053,6 +1067,9 @@ class DeciderReplayRepository:
 
             trades: list[DeciderReplayTrade] = []
             excluded_reason_counts: Counter[str] = Counter(canonical_action_exclusions)
+            excluded_reason_counts.update(
+                str(item['status_reason']) for item in model_identity_exclusions
+            )
             for snapshot in snapshot_rows:
                 snapshot_id = int(snapshot.id)
                 realized = realized_by_snapshot.get(snapshot_id)
@@ -1098,6 +1115,7 @@ class DeciderReplayRepository:
                     'actual_lifecycle_excluded_reason_counts': dict(
                         sorted(actual_excluded_reason_counts.items())
                     ),
+                    'model_identity_cohort': model_identity_cohort,
                 },
             )
 
@@ -1152,7 +1170,22 @@ class DeciderReplayRepository:
                     diagnostics={'actual_lifecycle_outcome_count': 0},
                 )
 
-            excluded_reason_counts: Counter[str] = Counter()
+            source_decision_count = len(rows)
+            selected_snapshots, model_identity_exclusions, model_identity_cohort = (
+                select_model_identity_cohort_rows(
+                    [row[2] for row in rows],
+                    role=SHORT_TERM_DECIDER_AGENT_NAME,
+                    expected_model=expected_decider_model(
+                        SHORT_TERM_DECIDER_AGENT_NAME,
+                        settings_obj=settings,
+                    ),
+                )
+            )
+            selected_snapshot_ids = {int(row.id) for row in selected_snapshots}
+            rows = [row for row in rows if int(row[2].id) in selected_snapshot_ids]
+            excluded_reason_counts: Counter[str] = Counter(
+                str(item['status_reason']) for item in model_identity_exclusions
+            )
             for row in rows:
                 exclusion_reason = _actual_outcome_exclusion_reason(row[0])
                 if exclusion_reason is not None:
@@ -1244,14 +1277,15 @@ class DeciderReplayRepository:
                 trades=tuple(
                     sorted(trades, key=lambda item: (item.market_date, item.symbol, item.replay_trade_id))
                 ),
-                source_decision_count=len(rows),
+                source_decision_count=source_decision_count,
                 excluded_reason_counts=dict(sorted(excluded_reason_counts.items())),
                 cohort_basis='complete_closed_actual_execution',
                 diagnostics={
-                    'actual_lifecycle_outcome_count': len(rows),
+                    'actual_lifecycle_outcome_count': source_decision_count,
                     'actual_lifecycle_eligible_count': (
-                        len(rows) - sum(excluded_reason_counts.values())
+                        source_decision_count - sum(excluded_reason_counts.values())
                     ),
+                    'model_identity_cohort': model_identity_cohort,
                     'alignment_context_source_counts': dict(
                         sorted(alignment_context_source_counts.items())
                     ),
@@ -2101,6 +2135,7 @@ class DeciderReplayService:
                 'notional_krw': _to_json_number(resolved_costs.notional_krw),
             },
             'top_examples_limit': resolved_top_examples_limit,
+            'model_identity_cohort': dataset.diagnostics.get('model_identity_cohort'),
         }
         summary = {
             'baseline_trade_count': baseline['trade_count'],

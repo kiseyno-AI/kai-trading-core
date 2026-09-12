@@ -62,6 +62,7 @@ from app.agent_context.orchestrator_runtime_helpers import (
     dispatch_for_symbols_via_subagents as _dispatch_for_symbols_via_subagents_helper,
     normalize_symbol_feedback as _normalize_symbol_feedback,
     normalized_feedback_contract_failure as _normalized_feedback_contract_failure,
+    response_failure_audit as _response_failure_audit,
     resolve_batch_dispatch_context as _resolve_batch_dispatch_context,
 )
 from app.agent_context.logging import (
@@ -71,7 +72,16 @@ from app.agent_context.logging import (
     log_agent_feedback_event,
     make_attempt_id,
 )
+from app.agent_context.model_identity import (
+    apply_decider_model_identity_fence,
+    build_dispatch_runtime_contract_provenance,
+    build_requested_model_identity,
+    build_observed_model_identity,
+    build_runtime_contract_provenance,
+    expected_decider_model,
+)
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
+from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import agent_context_read_service
 from app.agent_context.roles import DEFAULT_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES, SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
@@ -101,6 +111,9 @@ from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
 
 logger = logging.getLogger(__name__)
+
+OPENCLAW_SESSION_REGISTRY_WARNING_BYTES = 64 * 1024 * 1024
+OPENCLAW_SESSION_REGISTRY_MAX_BYTES = 128 * 1024 * 1024
 
 
 class AgentDispatchError(RuntimeError):
@@ -787,6 +800,82 @@ class OpenClawAgentClient:
     def _session_artifacts_dir(self, *, agent_name: str) -> Path:
         return Path(settings.openclaw_state_dir).expanduser() / 'agents' / agent_name / 'sessions'
 
+    def _observe_post_dispatch_model_identity(
+        self,
+        *,
+        role: str,
+        agent_name: str,
+        session_key: str,
+        expected_model: str | None,
+        dispatch_started_at: datetime,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if expected_model is None:
+            return build_observed_model_identity(
+                role=role,
+                expected_model=expected_model,
+                actual_provider=None,
+                actual_model=None,
+            )
+        registry_path = self._session_artifacts_dir(agent_name=agent_name) / 'sessions.json'
+        registry_snapshot = None
+        try:
+            registry_snapshot = read_bounded_regular_file(
+                registry_path,
+                max_bytes=OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
+            )
+            registry_size = registry_snapshot.fingerprint['size']
+            if registry_size >= OPENCLAW_SESSION_REGISTRY_WARNING_BYTES:
+                logger.warning(
+                    'OpenClaw session registry is approaching the model identity verification limit',
+                    extra={
+                        'agent_name': agent_name,
+                        'registry_size_bytes': registry_size,
+                        'registry_max_bytes': OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
+                    },
+                )
+            registry = json.loads(registry_snapshot.content)
+        except (SafeFileReadError, UnicodeError, json.JSONDecodeError, RecursionError):
+            entry = None
+        else:
+            entry = registry.get(session_key) if isinstance(registry, dict) else None
+        if not isinstance(entry, dict):
+            entry = {}
+        started_ms = int(dispatch_started_at.timestamp() * 1000)
+        observed_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        entry_started_ms = entry.get('startedAt')
+        entry_ended_ms = entry.get('endedAt')
+        entry_updated_ms = entry.get('updatedAt')
+        observed_session_id = str(entry.get('sessionId') or '').strip() or None
+        timing_valid = all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in (entry_started_ms, entry_ended_ms, entry_updated_ms)
+        )
+        timing_valid = bool(
+            timing_valid
+            and entry_started_ms >= started_ms - 5_000
+            and entry_started_ms <= observed_ms + 5_000
+            and entry_ended_ms >= entry_started_ms
+            and entry_ended_ms <= observed_ms + 5_000
+            and entry_updated_ms >= entry_ended_ms
+            and entry_updated_ms <= observed_ms + 5_000
+        )
+        session_valid = observed_session_id is not None and (
+            session_id is None or observed_session_id == session_id
+        )
+        status_valid = str(entry.get('status') or '').lower() in {'completed', 'done'}
+        if not timing_valid or not session_valid or not status_valid:
+            entry = {}
+        return build_observed_model_identity(
+            role=role,
+            expected_model=expected_model,
+            actual_provider=str(entry.get('modelProvider') or '') or None,
+            actual_model=str(entry.get('model') or '') or None,
+            actual_source_fingerprint=(
+                registry_snapshot.fingerprint if registry_snapshot is not None else None
+            ),
+        )
+
     def _find_trajectory_file(
         self,
         *,
@@ -994,6 +1083,7 @@ class OpenClawAgentClient:
             if str(item.get('symbol') or '').strip()
         ]
         assigned_symbols_json = json.dumps(assigned_symbols, ensure_ascii=False)
+        contract_prompt_suffix = build_contract_prompt_suffix(role=spec.role)
         is_us_batch = any(
             str((item.get('symbol_day_context') or {}).get('market') or '').upper() == 'US'
             for item in batch_items
@@ -1184,7 +1274,7 @@ class OpenClawAgentClient:
             "Do not restate the request, do not describe what you will do, and do not explain the schema. Output the final JSON only.\n"
             "Immediately before sending, re-check the final JSON formatting one last time. If any closing brace/bracket count is wrong, fix it before answering.\n"
             "Your final answer must be a raw JSON object only, beginning with { and ending with }.\n"
-            f"{build_contract_prompt_suffix(role=spec.role)}\n"
+            f"{contract_prompt_suffix}\n"
             f"JSON example:\n{json.dumps(example, ensure_ascii=False)}\n\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
@@ -1212,7 +1302,7 @@ class OpenClawAgentClient:
             "Empty recent news means no captured recent news and is neutral unless separate risk evidence exists.\n"
             "Do not forecast price reaction from news alone; use external news only as source-backed material/noise context, and do not treat headline-only, paywalled, or fetch-failed items as full-text summaries.\n"
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
-            f"{build_contract_prompt_suffix(role=spec.role)}\n"
+            f"{contract_prompt_suffix}\n"
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False)}"
         )
@@ -1232,6 +1322,11 @@ class OpenClawAgentClient:
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
         request_session_key = str(payload.get('session_key') or f"agent:{spec.agent_name}:feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}")
+        expected_model = expected_decider_model(spec.role, settings_obj=settings)
+        requested_model_identity = build_requested_model_identity(
+            role=spec.role,
+            expected_model=expected_model,
+        )
         body = {
             'model': f'openclaw/{spec.agent_name}',
             'input': self._build_message(spec=spec, payload=payload),
@@ -1239,14 +1334,20 @@ class OpenClawAgentClient:
         attempt = 0
         last_error: Exception | None = None
         last_error_details: dict[str, Any] | None = None
+        retry_contract_anchor: dict[str, Any] | None = None
+        dispatch_started_at: datetime | None = None
         while attempt <= self.max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
+            if dispatch_started_at is None:
+                dispatch_started_at = started_at
             try:
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
                     'x-openclaw-agent-id': spec.agent_name,
                 }
+                if expected_model is not None:
+                    headers['x-openclaw-model'] = expected_model
                 log_agent_feedback_event(
                     'dispatch_single_http_target',
                     status='started',
@@ -1256,8 +1357,37 @@ class OpenClawAgentClient:
                     http_target={'url': url, 'headers': headers},
                     request_snapshot=build_request_snapshot(body),
                 )
+                pre_runtime_contract = build_runtime_contract_provenance(
+                    spec.role,
+                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
+                )
+                if retry_contract_anchor is None:
+                    retry_contract_anchor = pre_runtime_contract
+                else:
+                    retry_contract_proof = build_dispatch_runtime_contract_provenance(
+                        pre_dispatch=retry_contract_anchor,
+                        post_dispatch=pre_runtime_contract,
+                    )
+                    if retry_contract_proof is not None and retry_contract_proof.get('verified') is not True:
+                        raise AgentDispatchTerminalError(
+                            'OpenClaw runtime contract changed between retry attempts',
+                            details={'runtime_contract': retry_contract_proof},
+                        )
                 with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
+                post_runtime_contract = build_runtime_contract_provenance(
+                    spec.role,
+                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
+                )
+                runtime_contract = build_dispatch_runtime_contract_provenance(
+                    pre_dispatch=pre_runtime_contract,
+                    post_dispatch=post_runtime_contract,
+                )
+                if response.status_code >= 400 and runtime_contract is not None and runtime_contract.get('verified') is not True:
+                    raise AgentDispatchTerminalError(
+                        'OpenClaw runtime contract changed during failed dispatch attempt',
+                        details={'runtime_contract': runtime_contract},
+                    )
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
                 if response.status_code in (408, 409, 429):
@@ -1275,6 +1405,33 @@ class OpenClawAgentClient:
                             break
                     if output_text:
                         break
+                normalized_feedback = normalize_agent_response(
+                    role=spec.role,
+                    output_text=output_text,
+                    raw_response=parsed,
+                    market_date=payload.get('market_date') or payload.get('trade_date'),
+                    symbol=str(payload.get('symbol') or '') or None,
+                    agent_name=spec.agent_name,
+                )
+                model_identity = self._observe_post_dispatch_model_identity(
+                    role=spec.role,
+                    agent_name=spec.agent_name,
+                    session_key=request_session_key,
+                    expected_model=expected_model,
+                    dispatch_started_at=dispatch_started_at,
+                    session_id=(
+                        str(parsed.get('session_id')).strip()
+                        if parsed.get('session_id') is not None
+                        else None
+                    ),
+                )
+                normalized_feedback = apply_decider_model_identity_fence(
+                    role=spec.role,
+                    normalized_feedback=normalized_feedback,
+                    model_identity=model_identity,
+                    expected_model=expected_model,
+                    runtime_contract=runtime_contract,
+                )
                 return {
                     'ok': True,
                     'attempt': attempt,
@@ -1283,14 +1440,15 @@ class OpenClawAgentClient:
                     'response': parsed,
                     'output_text': output_text,
                     'session_ref': self._extract_session_ref(parsed, explicit_session_key=request_session_key),
-                    'normalized_feedback': normalize_agent_response(
-                        role=spec.role,
-                        output_text=output_text,
-                        raw_response=parsed,
-                        market_date=payload.get('market_date') or payload.get('trade_date'),
-                        symbol=str(payload.get('symbol') or '') or None,
-                        agent_name=spec.agent_name,
-                    ),
+                    'normalized_feedback': normalized_feedback,
+                    'model_identity': model_identity,
+                    'request_provenance': {
+                        'model': body['model'],
+                        'role': spec.role,
+                        'requested_model_identity': requested_model_identity,
+                        'model_identity': model_identity,
+                        'runtime_contract': runtime_contract,
+                    },
                 }
             except AgentDispatchTerminalError as exc:
                 log_agent_feedback_event(
@@ -1517,6 +1675,11 @@ class OpenClawAgentClient:
         batch_items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
         url = f'{self.base_url}/v1/responses'
+        expected_model = expected_decider_model(spec.role, settings_obj=settings)
+        requested_model_identity = build_requested_model_identity(
+            role=spec.role,
+            expected_model=expected_model,
+        )
         request_run_id = _request_scope_from_items(batch_items, 'request_run_id')
         batch_symbols = [str(item.get('symbol') or '').strip() for item in batch_items if str(item.get('symbol') or '').strip()]
         slot = _slot_from_items(batch_items)
@@ -1532,9 +1695,13 @@ class OpenClawAgentClient:
             dispatch_id = f'{request_run_id or "adhoc-run"}:{spec.role}:slot-{slot_token}:{uuid.uuid4().hex[:8]}'
         attempt = 0
         last_error: Exception | None = None
+        retry_contract_anchor: dict[str, Any] | None = None
+        dispatch_started_at: datetime | None = None
         while attempt <= self.max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
+            if dispatch_started_at is None:
+                dispatch_started_at = started_at
             response: httpx.Response | None = None
             attempt_id = make_attempt_id(dispatch_id=dispatch_id, attempt=attempt)
             request_marker = f"batch-request::{attempt_id or dispatch_id}"
@@ -1550,6 +1717,9 @@ class OpenClawAgentClient:
                 'model': model_name,
                 'prompt_sha256': f"sha256:{hashlib.sha256(prompt_text.encode('utf-8')).hexdigest()}",
                 'prompt_chars': len(prompt_text),
+                'requested_model_identity': requested_model_identity,
+                'model_identity': None,
+                'runtime_contract': None,
             }
             body = {
                 'model': model_name,
@@ -1561,6 +1731,8 @@ class OpenClawAgentClient:
                     'x-openclaw-session-key': request_session_key,
                     'x-openclaw-agent-id': spec.agent_name,
                 }
+                if expected_model is not None:
+                    headers['x-openclaw-model'] = expected_model
                 log_agent_feedback_event(
                     'dispatch_batch_request',
                     status='started',
@@ -1578,8 +1750,38 @@ class OpenClawAgentClient:
                     request_snapshot=build_request_snapshot(body),
                     http_target={'url': url, 'headers': headers},
                 )
+                pre_runtime_contract = build_runtime_contract_provenance(
+                    spec.role,
+                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
+                )
+                if retry_contract_anchor is None:
+                    retry_contract_anchor = pre_runtime_contract
+                else:
+                    retry_contract_proof = build_dispatch_runtime_contract_provenance(
+                        pre_dispatch=retry_contract_anchor,
+                        post_dispatch=pre_runtime_contract,
+                    )
+                    if retry_contract_proof is not None and retry_contract_proof.get('verified') is not True:
+                        raise AgentDispatchTerminalError(
+                            'OpenClaw runtime contract changed between batch retry attempts',
+                            details={'runtime_contract': retry_contract_proof},
+                        )
                 with httpx.Client(timeout=self.batch_http_timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
+                post_runtime_contract = build_runtime_contract_provenance(
+                    spec.role,
+                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
+                )
+                runtime_contract = build_dispatch_runtime_contract_provenance(
+                    pre_dispatch=pre_runtime_contract,
+                    post_dispatch=post_runtime_contract,
+                )
+                request_provenance['runtime_contract'] = runtime_contract
+                if response.status_code >= 400 and runtime_contract is not None and runtime_contract.get('verified') is not True:
+                    raise AgentDispatchTerminalError(
+                        'OpenClaw runtime contract changed during failed batch dispatch attempt',
+                        details={'runtime_contract': runtime_contract},
+                    )
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')
                 if response.status_code in (408, 409, 429):
@@ -1629,6 +1831,19 @@ class OpenClawAgentClient:
                 }
                 if session_ref.get('response_id') is None:
                     session_ref['response_id'] = parsed.get('id')
+                model_identity = self._observe_post_dispatch_model_identity(
+                    role=spec.role,
+                    agent_name=spec.agent_name,
+                    session_key=request_session_key,
+                    expected_model=expected_model,
+                    dispatch_started_at=dispatch_started_at,
+                    session_id=(
+                        str(session_ref.get('session_id')).strip()
+                        if session_ref.get('session_id') is not None
+                        else None
+                    ),
+                )
+                request_provenance['model_identity'] = model_identity
                 response_id = (
                     str(session_ref.get('response_id')).strip()
                     if session_ref.get('response_id') is not None
@@ -1869,6 +2084,7 @@ class OpenClawAgentClient:
                     'response_correlation': response_correlation,
                     'session_reuse_mode': session_reuse_mode,
                     'request_provenance': request_provenance,
+                    'model_identity': model_identity,
                 }
             except AgentDispatchTerminalError:
                 raise
@@ -2254,23 +2470,56 @@ class AgentFeedbackOrchestrator:
         items = rule_candidates.get('items') if isinstance(rule_candidates, dict) else None
         if not isinstance(items, list):
             return []
+        candidate_type_aliases = {
+            'veto': 'buy_veto',
+            'downsize': 'tighten_buy_gate',
+        }
         compacted: list[dict[str, Any]] = []
         for item in items[:8]:
             if not isinstance(item, dict):
                 continue
+            candidate_type = candidate_type_aliases.get(
+                str(item.get('candidate_type') or '').strip(),
+                str(item.get('candidate_type') or '').strip(),
+            )
+            predicate = item.get('predicate') if isinstance(item.get('predicate'), dict) else {}
+            predicate_branch = (
+                'all' if 'all' in predicate and 'any' not in predicate
+                else 'any' if 'any' in predicate and 'all' not in predicate
+                else None
+            )
+            predicate_items = predicate.get(predicate_branch) if predicate_branch else None
+            canonical_predicate = bool(
+                predicate.get('schema_version') == 'signal_decider_rule_predicate_v1'
+                and predicate_branch
+                and set(predicate) == {'schema_version', predicate_branch}
+                and isinstance(predicate_items, list)
+                and predicate_items
+                and all(isinstance(predicate_item, dict) for predicate_item in predicate_items)
+            )
+            activation_status = str(item.get('activation_status') or 'needs_replay').strip()
+            manual_review_only = item.get('manual_review_only') is not False
+            deterministic_gate_eligible = bool(
+                candidate_type in {'buy_veto', 'tighten_buy_gate'}
+                and canonical_predicate
+                and activation_status == 'active'
+                and item.get('active_policy') is True
+                and item.get('deterministic_gate_eligible') is True
+                and not manual_review_only
+            )
             compacted.append(
                 {
                     'candidate_id': item.get('candidate_id'),
-                    'candidate_type': item.get('candidate_type'),
-                    'predicate': item.get('predicate'),
+                    'candidate_type': candidate_type,
+                    'predicate': predicate,
                     'reason': item.get('reason'),
                     'support_sample_count': item.get('support_sample_count'),
                     'evaluated_sample_count': item.get('evaluated_sample_count'),
                     'negative_rate': item.get('negative_rate'),
-                    'activation_status': item.get('activation_status'),
-                    'manual_review_only': item.get('manual_review_only'),
-                    'active_policy': item.get('active_policy'),
-                    'deterministic_gate_eligible': item.get('deterministic_gate_eligible'),
+                    'activation_status': activation_status,
+                    'manual_review_only': manual_review_only,
+                    'active_policy': deterministic_gate_eligible,
+                    'deterministic_gate_eligible': deterministic_gate_eligible,
                 }
             )
         return compacted
@@ -3979,6 +4228,7 @@ class AgentFeedbackOrchestrator:
                                     contract_failure = _batch_response_contract_failure(batch_result)
                                     contract_mismatch_flags: list[str] = []
                                     contract_snapshot: dict[str, Any] | None = None
+                                    contract_model_identity: dict[str, Any] | None = None
                                     staged_feedback: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
                                     if contract_failure is None:
                                         for source_item in batch:
@@ -3999,6 +4249,29 @@ class AgentFeedbackOrchestrator:
                                                 ),
                                                 symbol=symbol,
                                             )
+                                            normalized_feedback = apply_decider_model_identity_fence(
+                                                role=spec.role,
+                                                normalized_feedback=normalized_feedback,
+                                                model_identity=(
+                                                    batch_result.get('model_identity')
+                                                    if isinstance(batch_result.get('model_identity'), dict)
+                                                    else None
+                                                ),
+                                                expected_model=expected_decider_model(
+                                                    spec.role,
+                                                    settings_obj=settings,
+                                                ),
+                                                runtime_contract=(
+                                                    batch_result.get('request_provenance', {}).get(
+                                                        'runtime_contract'
+                                                    )
+                                                    if isinstance(
+                                                        batch_result.get('request_provenance'),
+                                                        dict,
+                                                    )
+                                                    else None
+                                                ),
+                                            )
                                             normalized_contract_failure = _normalized_feedback_contract_failure(
                                                 normalized_feedback
                                             )
@@ -4009,6 +4282,14 @@ class AgentFeedbackOrchestrator:
                                                 )
                                                 contract_snapshot = build_normalized_feedback_snapshot(
                                                     normalized_feedback
+                                                )
+                                                contract_model_identity = (
+                                                    normalized_feedback.get('model_identity')
+                                                    if isinstance(
+                                                        normalized_feedback.get('model_identity'),
+                                                        dict,
+                                                    )
+                                                    else None
                                                 )
                                                 break
                                             staged_feedback.append(
@@ -4047,6 +4328,8 @@ class AgentFeedbackOrchestrator:
                                                 **source_item,
                                                 'contract_failure': contract_failure,
                                                 'response_correlation': response_correlation or None,
+                                                'response_audit': _response_failure_audit(batch_result),
+                                                'model_identity': contract_model_identity,
                                             }
                                             if contract_mismatch_flags:
                                                 failure_context['mismatch_flags'] = contract_mismatch_flags

@@ -7,9 +7,9 @@ Only mature rows with `coverage.status_reason=computed` and `evaluation_status=g
 
 The route is read-only. It does not change prompts, policies, or scores in production. `review_boundary.manual_review_only=true` and every hint includes `auto_apply=false`.
 
-The response also includes `rule_candidates`, a backward-compatible section of deterministic, replay-only policy-rule candidates derived from negative condition clusters. These candidates are not active policy; every item defaults to `activation_status="needs_replay"` and includes a structured predicate plus replay configuration for later validation.
+The response also includes `rule_candidates`, a backward-compatible section of deterministic, replay-only policy-rule candidates derived from negative condition clusters. These candidates are not active policy; every item defaults to `activation_status="needs_replay"`, `manual_review_only=true`, `active_policy=false`, and `deterministic_gate_eligible=false`, and includes a canonical structured predicate plus replay configuration for later validation.
 
-`group_summaries.outcome_path_buckets` and `group_summaries.reward_risk_buckets` describe realized replay outcomes for operator review. They are reporting-only because they are known after the decision horizon matures, so they are excluded from `condition_clusters` and from every `rule_candidates[*].predicate.conditions` replay predicate.
+`group_summaries.outcome_path_buckets` and `group_summaries.reward_risk_buckets` describe realized replay outcomes for operator review. They are reporting-only because they are known after the decision horizon matures, so they are excluded from `condition_clusters` and from every `rule_candidates[*].predicate.all|any` replay predicate.
 
 ## Example request
 ```http
@@ -258,8 +258,7 @@ GET /agent-context/signal-decider/calibration?market_date_from=2026-04-20&market
         "target_decider": "signal-decider",
         "predicate": {
           "schema_version": "signal_decider_rule_predicate_v1",
-          "operator": "all",
-          "conditions": [
+          "all": [
             {
               "field": "decision.action",
               "operator": "eq",
@@ -291,8 +290,7 @@ GET /agent-context/signal-decider/calibration?market_date_from=2026-04-20&market
           "evaluation_version": "signal_decider_eval_v1",
           "predicate": {
             "schema_version": "signal_decider_rule_predicate_v1",
-            "operator": "all",
-            "conditions": [
+            "all": [
               {
                 "field": "decision.action",
                 "operator": "eq",
@@ -314,7 +312,8 @@ GET /agent-context/signal-decider/calibration?market_date_from=2026-04-20&market
         },
         "activation_status": "needs_replay",
         "manual_review_only": true,
-        "active_policy": false
+        "active_policy": false,
+        "deterministic_gate_eligible": false
       }
     ]
   },

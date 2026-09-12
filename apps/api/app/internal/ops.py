@@ -839,10 +839,18 @@ def run_next_open_execution_if_due(
     force: bool = False,
 ) -> dict[str, Any]:
     bootstrap_runtime()
-    if signal_decider_exec_integration_service.should_delegate_execution():
+    resolved_target_trade_date = signal_decider_next_open_execution_service._resolve_target_trade_date(
+        target_trade_date,
+    )
+    if (
+        signal_decider_exec_integration_service.should_delegate_execution()
+        or signal_decider_exec_integration_service.should_manage_delegated_authority(
+            target_trade_date=resolved_target_trade_date,
+        )
+    ):
         return asyncio.run(
             signal_decider_exec_integration_service.dispatch_next_open_plan(
-                target_trade_date=target_trade_date,
+                target_trade_date=resolved_target_trade_date,
                 refresh_plan=True,
                 dry_run=dry_run,
                 force=force,
@@ -851,7 +859,7 @@ def run_next_open_execution_if_due(
         )
     return asyncio.run(
         signal_decider_next_open_execution_service.run_market_open_execution_if_due(
-            target_trade_date=target_trade_date,
+            target_trade_date=resolved_target_trade_date,
             dry_run=dry_run,
             force=force,
             trigger='internal_ops_cli',

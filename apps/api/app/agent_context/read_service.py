@@ -3,6 +3,7 @@ from __future__ import annotations
 from calendar import monthrange
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
+from math import isfinite
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
@@ -45,6 +46,7 @@ from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market_data_store import (
+    load_current_market_snapshot_context,
     load_current_kis_intraday_snapshots,
     load_daily_advanced_value_factor_results,
     load_daily_action_summaries,
@@ -61,6 +63,7 @@ from app.market_data_store import (
     load_daily_unified_value_factor_results,
     load_daily_value_factor_results,
     load_current_quotes,
+    load_prior_market_turnover_baselines,
     load_symbols,
 )
 from app.signals.momentum_factor import enrich_momentum_audit_fields
@@ -102,12 +105,29 @@ MARKET_REGIME_OPEN_GAP_UP_PCT = 0.30
 MARKET_REGIME_OPEN_INDEX_STRENGTH_PCT = 0.50
 MARKET_REGIME_EARLY_CONTINUATION_PCT = 0.15
 MARKET_REGIME_TRADING_VALUE_EXPANSION_RATIO = 1.35
-MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = 2.0
-MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = 1.25
+MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = 1.0
+MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = 1.0
+MARKET_REGIME_AGGRESSIVE_OPEN_SHADOW_MULTIPLIER_CAP = 2.0
+MARKET_REGIME_TREND_DAY_SHADOW_MULTIPLIER_CAP = 1.25
 MARKET_REGIME_OPEN_WINDOW_START = '09:00:00+09:00'
 MARKET_REGIME_OPEN_WINDOW_END = '09:20:00+09:00'
 MARKET_REGIME_TREND_WINDOW_START = '09:20:00+09:00'
 MARKET_REGIME_TREND_WINDOW_END = '14:30:00+09:00'
+MARKET_OPEN_DRIVE_SOURCE = 'kis_market_snapshot_v1'
+MARKET_OPEN_DRIVE_SOURCE_TABLE = 'current_market_snapshot_cache'
+MARKET_OPEN_DRIVE_BASELINE_SOURCE = 'pykrx'
+MARKET_OPEN_DRIVE_BASELINE_SOURCE_TABLE = 'daily_price_bars'
+MARKET_OPEN_DRIVE_BASELINE_BASIS = 'prior_complete_market_session_positive_provider_turnover_sum'
+MARKET_OPEN_DRIVE_MAX_BASELINE_AGE_DAYS = 7
+MARKET_OPEN_DRIVE_SESSION_MINUTES = 390
+# A linear opening-volume extrapolation is unsafe because KRX turnover is U-shaped.
+# Requiring at least 25% of prior full-session value in the denominator makes the
+# opening comparison deliberately harder to pass while preserving a deterministic baseline.
+MARKET_OPEN_DRIVE_MIN_ELAPSED_FRACTION = 0.25
+MARKET_OPEN_DRIVE_MARKET_METADATA: dict[str, dict[str, str]] = {
+    'KOSPI': {'snapshot_key': 'kospi', 'label': 'KOSPI', 'index_code': '0001'},
+    'KOSDAQ': {'snapshot_key': 'kosdaq', 'label': 'KOSDAQ', 'index_code': '1001'},
+}
 MARKET_REGIME_EXPORTER_FX_KEYWORDS: tuple[str, ...] = (
     'semiconductor',
     'electronics',
@@ -790,8 +810,10 @@ def _compact_provenance_summary(metadata: dict[str, Any] | None) -> dict[str, An
         'provenance_status': metadata.get('provenance_status'),
         'issue_types': list(metadata.get('issue_types') or []),
         'as_of_market_date': metadata.get('as_of_market_date'),
+        'as_of_timestamp': metadata.get('as_of_timestamp'),
         'latest_available_market_date': metadata.get('latest_available_market_date'),
         'source_tables': list(metadata.get('source_tables') or []),
+        'source_provider': metadata.get('source_provider'),
         'reason': metadata.get('reason'),
     }
     return {key: value for key, value in compact.items() if value not in (None, [], {})}
@@ -1532,22 +1554,69 @@ def _resolve_turnover_candidate(price_context: dict[str, Any] | None) -> dict[st
     volume = _to_int(price_context.get('volume'))
     raw_turnover = _to_int(price_context.get('turnover'))
     provider_turnover_krw = _to_int(liquidity.get('provider_turnover_krw'))
-    if provider_turnover_krw in (None, 0) and raw_turnover not in (None, 0):
-        provider_turnover_krw = raw_turnover
     derived_turnover_krw = _to_int(liquidity.get('estimated_turnover_krw'))
-    if derived_turnover_krw is None and close_price not in (None, 0) and volume not in (None, 0):
+    reported_turnover_krw = _to_int(liquidity.get('turnover_krw'))
+    if any(
+        value is not None and value < 0
+        for value in (
+            raw_turnover,
+            provider_turnover_krw,
+            derived_turnover_krw,
+            reported_turnover_krw,
+        )
+    ):
+        return {
+            'trade_date': price_context.get('trade_date'),
+            'source': price_context.get('source'),
+            'captured_at': price_context.get('captured_at'),
+            'close_price': close_price,
+            'volume': volume,
+            'turnover': None,
+            'turnover_krw': None,
+            'trading_value_krw': None,
+            'provider_turnover_krw': None,
+            'derived_turnover_krw': None,
+            'raw_trading_value_krw': None,
+            'estimated_trading_value_krw': None,
+            'turnover_source': None,
+            'trading_value_source': TRADING_VALUE_SOURCE_MISSING,
+            'trading_value_source_detail': None,
+            'status': LIQUIDITY_TURNOVER_STATUS_MISSING_PRICE_OR_VOLUME,
+            'reason': 'nonpositive_turnover_value',
+            'price_bar_issue_codes': list(
+                dict.fromkeys(
+                    [
+                        *list(price_bar_quality.get('issue_codes') or []),
+                        'nonpositive_turnover_value',
+                    ]
+                )
+            ),
+        }
+    if (
+        provider_turnover_krw in (None, 0)
+        and raw_turnover is not None
+        and raw_turnover > 0
+    ):
+        provider_turnover_krw = raw_turnover
+    if (
+        derived_turnover_krw in (None, 0)
+        and close_price is not None
+        and close_price > 0
+        and volume is not None
+        and volume > 0
+    ):
         derived_turnover_krw = close_price * volume
-    turnover_krw = _to_int(liquidity.get('turnover_krw'))
-    if turnover_krw in (None, 0):
+    turnover_krw = reported_turnover_krw
+    if turnover_krw is None or turnover_krw <= 0:
         turnover_krw = provider_turnover_krw or derived_turnover_krw
 
-    if provider_turnover_krw not in (None, 0):
+    if provider_turnover_krw is not None and provider_turnover_krw > 0:
         status = LIQUIDITY_TURNOVER_STATUS_AVAILABLE
         reason = None
         turnover_source = 'provider'
         trading_value_source = TRADING_VALUE_SOURCE_RAW
         trading_value_source_detail = 'daily_price_context.provider_turnover_krw'
-    elif derived_turnover_krw not in (None, 0):
+    elif derived_turnover_krw is not None and derived_turnover_krw > 0:
         status = LIQUIDITY_TURNOVER_STATUS_DERIVED
         reason = 'derived_from_close_price_x_volume'
         turnover_source = 'derived'
@@ -1595,12 +1664,33 @@ def _resolve_valuation_trading_value_candidate(
 ) -> dict[str, Any] | None:
     payload = _maybe_dict(_maybe_dict(valuation_context).get('valuation_snapshot'))
     raw_trading_value_krw = _to_int(payload.get('trading_value'))
-    if raw_trading_value_krw in (None, 0):
-        return None
-
     provenance = _maybe_dict(valuation_context_freshness_provenance) or _maybe_dict(
         _maybe_dict(valuation_context).get('freshness_provenance')
     )
+    if raw_trading_value_krw in (None, 0):
+        return None
+    if raw_trading_value_krw < 0:
+        return {
+            'trade_date': provenance.get('as_of_market_date') or provenance.get('latest_available_market_date'),
+            'source': 'pykrx',
+            'captured_at': provenance.get('latest_available_timestamp'),
+            'close_price': _to_int(payload.get('close_price')),
+            'volume': _to_int(payload.get('volume')),
+            'turnover': None,
+            'turnover_krw': None,
+            'trading_value_krw': None,
+            'provider_turnover_krw': None,
+            'derived_turnover_krw': None,
+            'raw_trading_value_krw': None,
+            'estimated_trading_value_krw': None,
+            'turnover_source': None,
+            'trading_value_source': TRADING_VALUE_SOURCE_MISSING,
+            'trading_value_source_detail': None,
+            'status': LIQUIDITY_TURNOVER_STATUS_MISSING_PRICE_OR_VOLUME,
+            'reason': 'nonpositive_turnover_value',
+            'price_bar_issue_codes': ['nonpositive_turnover_value'],
+            'provenance': provenance,
+        }
     return {
         'trade_date': provenance.get('as_of_market_date') or provenance.get('latest_available_market_date'),
         'source': 'pykrx',
@@ -1938,38 +2028,188 @@ def _build_pre_decider_quote_orderbook_snapshot(
     price_payload = _maybe_dict(price_context)
     market_session_payload = _maybe_dict(market_session)
 
-    current_price = _to_int(intraday_quote.get('price'))
-    if current_price is None:
-        current_price = _to_int(quote_payload.get('price'))
-    if current_price is None:
-        current_price = _to_int(price_payload.get('close_price'))
+    def coherent_spread_bundle(
+        *,
+        current_price: int | None,
+        bid_price: int | None,
+        ask_price: int | None,
+        spread_points: int | None,
+        spread_bps: float | None,
+    ) -> dict[str, int | float] | None:
+        if (
+            current_price is None
+            or bid_price is None
+            or ask_price is None
+            or current_price <= 0
+            or bid_price <= 0
+            or ask_price <= bid_price
+        ):
+            return None
+        expected_points = ask_price - bid_price
+        if spread_points is not None and spread_points != expected_points:
+            return None
+        resolved_points = spread_points if spread_points is not None else expected_points
+        expected_bps = round((resolved_points / current_price) * 10000, 4)
+        if spread_bps is not None and abs(spread_bps - expected_bps) > 0.0001:
+            return None
+        return {
+            'current_price': current_price,
+            'bid_price': bid_price,
+            'ask_price': ask_price,
+            'spread_points': resolved_points,
+            'spread_bps': spread_bps if spread_bps is not None else expected_bps,
+        }
 
-    bid_price = _to_int(spread.get('bid_price'))
-    if bid_price is None:
-        bid_price = _to_int(intraday_quote.get('bid_price'))
-    if bid_price is None:
-        bid_price = _to_int(intraday_orderbook.get('best_bid_price'))
-    ask_price = _to_int(spread.get('ask_price'))
-    if ask_price is None:
-        ask_price = _to_int(intraday_quote.get('ask_price'))
-    if ask_price is None:
-        ask_price = _to_int(intraday_orderbook.get('best_ask_price'))
-    spread_points = _to_int(spread.get('spread_points'))
-    if spread_points is None:
-        spread_points = _to_int(intraday_quote.get('spread_points'))
-    if spread_points is None and ask_price is not None and bid_price is not None and ask_price >= bid_price:
-        spread_points = ask_price - bid_price
-    spread_bps = _to_float(spread.get('spread_bps_of_price'))
-    if spread_bps is None and spread_points is not None and current_price not in (None, 0):
-        spread_bps = round((spread_points / current_price) * 10000, 4)
-
-    quote_timestamp = (
-        intraday_payload.get('as_of_timestamp')
-        or quote_payload.get('captured_at')
-        or quote_payload.get('cached_at')
-        or quote_payload.get('as_of')
-        or price_payload.get('captured_at')
+    quote_bundle = coherent_spread_bundle(
+        current_price=_to_int(quote_payload.get('price')),
+        bid_price=_to_int(spread.get('bid_price')),
+        ask_price=_to_int(spread.get('ask_price')),
+        spread_points=_to_int(spread.get('spread_points')),
+        spread_bps=_to_float(spread.get('spread_bps_of_price')),
     )
+    intraday_bid_price = _to_int(intraday_quote.get('bid_price'))
+    if intraday_bid_price is None:
+        intraday_bid_price = _to_int(intraday_orderbook.get('best_bid_price'))
+    intraday_ask_price = _to_int(intraday_quote.get('ask_price'))
+    if intraday_ask_price is None:
+        intraday_ask_price = _to_int(intraday_orderbook.get('best_ask_price'))
+    intraday_bundle = coherent_spread_bundle(
+        current_price=_to_int(intraday_quote.get('price')),
+        bid_price=intraday_bid_price,
+        ask_price=intraday_ask_price,
+        spread_points=_to_int(intraday_quote.get('spread_points')),
+        spread_bps=_to_float(intraday_quote.get('spread_bps_of_price')),
+    )
+
+    def authoritative_bundle_timestamp(
+        *,
+        context_name: str,
+        payload: dict[str, Any],
+        provenance: dict[str, Any],
+        status: str,
+    ) -> datetime | None:
+        expected_sources = {
+            'quote_context': 'kis',
+            'intraday_execution_context': 'kis_intraday_snapshot_v1',
+        }
+        expected_tables = {
+            'quote_context': {'current_quote_cache', 'quote_snapshots'},
+            'intraday_execution_context': {
+                'current_kis_intraday_snapshot_cache',
+                'kis_intraday_snapshots',
+            },
+        }
+        source_tables = [
+            str(value).strip()
+            for value in provenance.get('source_tables') or []
+        ]
+        observed_at = _parse_iso_datetime(
+            str(
+                provenance.get('as_of_timestamp')
+                or payload.get('as_of_timestamp')
+                or payload.get('captured_at')
+                or ''
+            )
+        )
+        expected_source = expected_sources[context_name]
+        if (
+            status != DECIDER_QUALITY_STATUS_AVAILABLE
+            or provenance.get('freshness_status') != FRESHNESS_STATUS_FRESH
+            or provenance.get('provenance_status') != PROVENANCE_STATUS_PROVIDER_SOURCED
+            or provenance.get('as_of_market_date') != requested_market_date.isoformat()
+            or provenance.get('source_provider') != expected_source
+            or payload.get('source') != expected_source
+            or len(source_tables) != len(set(source_tables))
+            or set(source_tables) != expected_tables[context_name]
+            or observed_at is None
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+        ):
+            return None
+        return observed_at.astimezone(timezone.utc)
+
+    ranked_bundles: list[
+        tuple[datetime, int, str, dict[str, int | float]]
+    ] = []
+    if quote_bundle is not None:
+        quote_authoritative_at = authoritative_bundle_timestamp(
+            context_name='quote_context',
+            payload=quote_payload,
+            provenance=quote_freshness_provenance,
+            status=quote_status,
+        )
+        if quote_authoritative_at is not None:
+            ranked_bundles.append(
+                (quote_authoritative_at, 1, 'quote_context', quote_bundle)
+            )
+    if intraday_bundle is not None:
+        intraday_authoritative_at = authoritative_bundle_timestamp(
+            context_name='intraday_execution_context',
+            payload=intraday_payload,
+            provenance=intraday_execution_freshness_provenance,
+            status=intraday_status,
+        )
+        if intraday_authoritative_at is not None:
+            ranked_bundles.append(
+                (
+                    intraday_authoritative_at,
+                    0,
+                    'intraday_execution_context',
+                    intraday_bundle,
+                )
+            )
+    if ranked_bundles:
+        _, _, spread_source_context, selected_bundle = max(ranked_bundles)
+    elif quote_bundle is not None:
+        spread_source_context = 'quote_context'
+        selected_bundle = quote_bundle
+    elif intraday_bundle is not None:
+        spread_source_context = 'intraday_execution_context'
+        selected_bundle = intraday_bundle
+    else:
+        spread_source_context = None
+        selected_bundle = None
+
+    if selected_bundle is not None:
+        current_price = int(selected_bundle['current_price'])
+        bid_price = int(selected_bundle['bid_price'])
+        ask_price = int(selected_bundle['ask_price'])
+        spread_points = int(selected_bundle['spread_points'])
+        spread_bps = float(selected_bundle['spread_bps'])
+        spread_component_source_context = {
+            field: spread_source_context
+            for field in ('current_price', 'bid_price', 'ask_price', 'spread_points', 'spread_bps')
+        }
+    else:
+        current_price = _to_int(intraday_quote.get('price'))
+        if current_price is None:
+            current_price = _to_int(quote_payload.get('price'))
+        if current_price is None:
+            current_price = _to_int(price_payload.get('close_price'))
+        bid_price = None
+        ask_price = None
+        spread_points = None
+        spread_bps = None
+        spread_component_source_context = {}
+
+    if spread_source_context == 'quote_context':
+        spread_provenance = quote_freshness_provenance
+        spread_observed_at = (
+            spread_provenance.get('as_of_timestamp')
+            or quote_payload.get('captured_at')
+            or quote_payload.get('cached_at')
+            or quote_payload.get('as_of')
+        )
+        spread_market_date = spread_provenance.get('as_of_market_date') or quote_payload.get('trade_date')
+    elif spread_source_context == 'intraday_execution_context':
+        spread_provenance = intraday_execution_freshness_provenance
+        spread_observed_at = spread_provenance.get('as_of_timestamp') or intraday_payload.get('as_of_timestamp')
+        spread_market_date = spread_provenance.get('as_of_market_date') or intraday_payload.get('as_of_market_date')
+    else:
+        spread_provenance = {}
+        spread_observed_at = price_payload.get('captured_at')
+        spread_market_date = price_payload.get('trade_date')
+
     closed_market = (
         quote_status == DECIDER_QUALITY_STATUS_NOT_APPLICABLE
         and intraday_status == DECIDER_QUALITY_STATUS_NOT_APPLICABLE
@@ -1999,10 +2239,7 @@ def _build_pre_decider_quote_orderbook_snapshot(
         )
         reason = intraday_payload.get('reason') or quote_payload.get('reason')
         snapshot_type = 'live_intraday' if _context_block_has_signal(intraday_payload) else 'current_quote_cache'
-        freshness_status = (
-            intraday_execution_freshness_provenance.get('freshness_status')
-            or quote_freshness_provenance.get('freshness_status')
-        )
+        freshness_status = spread_provenance.get('freshness_status') or FRESHNESS_STATUS_MISSING
     elif closed_market:
         status = DECIDER_QUALITY_STATUS_NOT_APPLICABLE
         reason = intraday_payload.get('reason') or quote_payload.get('reason') or 'closed_market'
@@ -2034,6 +2271,8 @@ def _build_pre_decider_quote_orderbook_snapshot(
         'ask_price': ask_price,
         'spread_points': spread_points,
         'spread_bps': spread_bps,
+        'spread_source_context': spread_source_context,
+        'spread_component_source_context': spread_component_source_context,
         'orderbook_depth': {
             'ask_total_size': _to_int(intraday_orderbook.get('ask_total_size'))
             or _to_int(intraday_orderbook.get('total_ask_depth')),
@@ -2041,10 +2280,10 @@ def _build_pre_decider_quote_orderbook_snapshot(
             or _to_int(intraday_orderbook.get('total_bid_depth')),
         },
         'orderbook_imbalance': _to_float(intraday_orderbook.get('imbalance')),
-        'quote_freshness_timestamp': quote_timestamp,
+        'quote_freshness_timestamp': spread_observed_at,
         'quote_freshness_status': freshness_status,
-        'as_of_market_date': intraday_payload.get('as_of_market_date') or price_payload.get('trade_date'),
-        'as_of_timestamp': intraday_payload.get('as_of_timestamp') or price_payload.get('captured_at'),
+        'as_of_market_date': spread_market_date,
+        'as_of_timestamp': spread_observed_at,
         'execution_strength': {
             'volume_power': _to_float(intraday_liquidity.get('volume_power')),
             'volume_power_rank': _to_int(intraday_liquidity.get('volume_power_rank')),
@@ -2378,90 +2617,606 @@ def _build_market_regime_fx_context(
     )
 
 
-def _to_bool(value: Any) -> bool | None:
+def _open_drive_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        parsed = _parse_iso_datetime(value)
+    else:
+        return None
+    if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(ZoneInfo('Asia/Seoul'))
+
+
+def _finite_float(value: Any) -> float | None:
     if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {'true', 'yes', '1'}:
-            return True
-        if normalized in {'false', 'no', '0'}:
-            return False
-    return None
+        return None
+    parsed = _to_float(value)
+    if parsed is None or not isfinite(parsed):
+        return None
+    return parsed
 
 
-def _first_numeric_value(payload: dict[str, Any], keys: Sequence[str]) -> float | None:
-    for key in keys:
-        value = _to_float(payload.get(key))
-        if value is not None:
-            return value
-    return None
+def _finite_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    parsed = _finite_float(value)
+    if parsed is None or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _build_market_open_drive_context(
+    *,
+    requested_market_date: date,
+    market: str | None,
+    decision_time: datetime | str | None,
+    snapshot_context: dict[str, Any] | None,
+    prior_market_turnover_baseline: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized_market = str(market or '').strip().upper()
+    market_metadata = MARKET_OPEN_DRIVE_MARKET_METADATA.get(normalized_market)
+    source_payload = _maybe_dict(snapshot_context)
+    baseline_payload = _maybe_dict(prior_market_turnover_baseline)
+    decision_at = _open_drive_datetime(decision_time)
+
+    def unavailable(reason: str, *missing_fields: str, phase: str | None = None) -> dict[str, Any]:
+        return {
+            'status': 'unavailable',
+            'authoritative': False,
+            'reason': reason,
+            'market': normalized_market or None,
+            'market_date': requested_market_date.isoformat(),
+            'phase': phase,
+            'source': source_payload.get('source'),
+            'source_table': source_payload.get('source_table'),
+            'missing_fields': list(dict.fromkeys(missing_fields)),
+            'provenance': {
+                'validation_status': 'rejected',
+                'reason': reason,
+                'snapshot_source': source_payload.get('source'),
+                'snapshot_source_table': source_payload.get('source_table'),
+                'baseline_source': baseline_payload.get('source'),
+                'baseline_source_table': baseline_payload.get('source_table'),
+            },
+        }
+
+    if market_metadata is None:
+        return unavailable('unsupported_market', 'market')
+    if decision_at is None:
+        return unavailable('decision_time_missing_or_timezone_naive', 'decision_time')
+    if decision_at.date() != requested_market_date:
+        return unavailable('decision_time_market_date_mismatch', 'decision_time')
+
+    local_time = decision_at.time().replace(tzinfo=None)
+    if time(9, 0) <= local_time <= time(9, 20):
+        phase = 'opening'
+    elif time(9, 20) < local_time <= time(14, 30):
+        phase = 'trend'
+    else:
+        return unavailable('outside_supported_open_drive_window', 'decision_time')
+
+    if source_payload.get('source') != MARKET_OPEN_DRIVE_SOURCE:
+        return unavailable('snapshot_source_invalid', 'snapshot.source', phase=phase)
+    if source_payload.get('source_table') != MARKET_OPEN_DRIVE_SOURCE_TABLE:
+        return unavailable('snapshot_source_table_invalid', 'snapshot.source_table', phase=phase)
+    if str(source_payload.get('snapshot_status') or '').strip().lower() not in {'ready', 'partial', 'stale'}:
+        return unavailable('snapshot_status_invalid', 'snapshot.snapshot_status', phase=phase)
+    if str(source_payload.get('last_refresh_status') or '').strip().lower() not in {'success', 'degraded'}:
+        return unavailable('snapshot_refresh_status_invalid', 'snapshot.last_refresh_status', phase=phase)
+
+    snapshot_payload = _maybe_dict(source_payload.get('payload'))
+    if str(snapshot_payload.get('status') or '').strip().lower() not in {'ready', 'partial', 'stale'}:
+        return unavailable('snapshot_payload_status_invalid', 'snapshot.payload.status', phase=phase)
+    market_row = _maybe_dict(
+        _maybe_dict(snapshot_payload.get('markets')).get(market_metadata['snapshot_key'])
+    )
+    if not market_row:
+        return unavailable(
+            'snapshot_market_row_missing',
+            f"snapshot.markets.{market_metadata['snapshot_key']}",
+            phase=phase,
+        )
+    if market_row.get('label') != market_metadata['label']:
+        return unavailable('snapshot_market_label_mismatch', 'snapshot.market.label', phase=phase)
+    if str(market_row.get('index_code') or '') != market_metadata['index_code']:
+        return unavailable('snapshot_index_code_mismatch', 'snapshot.market.index_code', phase=phase)
+    index_leg = _maybe_dict(market_row.get('index_leg'))
+    if str(index_leg.get('status') or '').strip().lower() != 'ready':
+        return unavailable('snapshot_index_leg_not_ready', 'snapshot.market.index_leg.status', phase=phase)
+    if index_leg.get('observation_source') != 'kis_index_intraday_bar':
+        return unavailable(
+            'snapshot_index_observation_source_invalid',
+            'snapshot.market.index_leg.observation_source',
+            phase=phase,
+        )
+    observed_at = _open_drive_datetime(market_row.get('provider_observed_at'))
+    index_leg_observed_at = _open_drive_datetime(index_leg.get('provider_observed_at'))
+    if observed_at is None or index_leg_observed_at is None or observed_at != index_leg_observed_at:
+        return unavailable(
+            'snapshot_provider_observation_missing_or_mismatched',
+            'snapshot.market.provider_observed_at',
+            phase=phase,
+        )
+    if market_row.get('provider_business_date') != observed_at.date().isoformat():
+        return unavailable(
+            'snapshot_provider_business_date_mismatch',
+            'snapshot.market.provider_business_date',
+            phase=phase,
+        )
+    if market_row.get('provider_session_time') != observed_at.strftime('%H:%M:%S'):
+        return unavailable(
+            'snapshot_provider_session_time_mismatch',
+            'snapshot.market.provider_session_time',
+            phase=phase,
+        )
+    if observed_at.date() != requested_market_date:
+        return unavailable(
+            'snapshot_provider_observation_market_date_mismatch',
+            'snapshot.market.provider_observed_at',
+            phase=phase,
+        )
+    observed_local_time = observed_at.time().replace(tzinfo=None)
+    if not time(9, 0) <= observed_local_time <= time(15, 30):
+        return unavailable(
+            'snapshot_provider_observation_outside_regular_session',
+            'snapshot.market.provider_session_time',
+            phase=phase,
+        )
+    age_seconds = (decision_at - observed_at).total_seconds()
+    if age_seconds < 0:
+        return unavailable('snapshot_from_future', 'snapshot.market.provider_observed_at', phase=phase)
+    if age_seconds > settings.market_snapshot_open_drive_max_age_seconds:
+        return unavailable('snapshot_stale', 'snapshot.market.provider_observed_at', phase=phase)
+    if str(market_row.get('trading_value_unit') or '').strip().lower() != 'million_krw':
+        return unavailable('snapshot_trading_value_unit_invalid', 'snapshot.market.trading_value_unit', phase=phase)
+
+    index_value = _finite_float(market_row.get('value'))
+    index_change = _finite_float(market_row.get('change'))
+    index_change_pct = _finite_float(market_row.get('change_percent'))
+    index_open = _finite_float(market_row.get('open'))
+    trading_value_million_krw = _finite_int(market_row.get('trading_value'))
+    upper_limit_count = _finite_int(market_row.get('upper_limit_count'))
+    advancers = _finite_int(market_row.get('advancers'))
+    unchanged = _finite_int(market_row.get('unchanged'))
+    decliners = _finite_int(market_row.get('decliners'))
+    lower_limit_count = _finite_int(market_row.get('lower_limit_count'))
+    required_values = {
+        'snapshot.market.value': index_value,
+        'snapshot.market.change': index_change,
+        'snapshot.market.change_percent': index_change_pct,
+        'snapshot.market.open': index_open,
+        'snapshot.market.trading_value': trading_value_million_krw,
+    }
+    missing_provider_fields = [key for key, value in required_values.items() if value is None]
+    if missing_provider_fields:
+        return unavailable('snapshot_required_provider_fields_missing', *missing_provider_fields, phase=phase)
+    assert index_value is not None
+    assert index_change is not None
+    assert index_change_pct is not None
+    assert index_open is not None
+    assert trading_value_million_krw is not None
+    previous_close = index_value - index_change
+    if index_value <= 0 or index_open <= 0 or previous_close <= 0:
+        return unavailable('snapshot_index_prices_invalid', 'snapshot.market.price_fields', phase=phase)
+    if trading_value_million_krw <= 0:
+        return unavailable('snapshot_trading_value_invalid', 'snapshot.market.trading_value', phase=phase)
+
+    derived_index_change_pct = ((index_value - previous_close) / previous_close) * 100.0
+    if abs(derived_index_change_pct - index_change_pct) > 0.15:
+        return unavailable('snapshot_index_change_inconsistent', 'snapshot.market.change_percent', phase=phase)
+
+    provider_prior_turnover = _finite_int(market_row.get('prior_trading_value'))
+    provider_prior_unit = str(market_row.get('prior_trading_value_unit') or '').strip().lower()
+    baseline_date: date | None = None
+    coverage_ratio: float | None = None
+    baseline_source: str | None = None
+    baseline_source_table: str | None = None
+    baseline_provider_field: str | None = None
+    baseline_relative_session: str | None = None
+    baseline_validation_reason: str | None = None
+    prior_turnover_krw: int | None = None
+    if provider_prior_turnover is not None and provider_prior_turnover > 0 and provider_prior_unit == 'million_krw':
+        prior_turnover_krw = provider_prior_turnover * 1_000_000
+        baseline_source = MARKET_OPEN_DRIVE_SOURCE
+        baseline_source_table = MARKET_OPEN_DRIVE_SOURCE_TABLE
+        baseline_provider_field = 'prdy_tr_pbmn'
+        baseline_relative_session = 'previous'
+    else:
+        baseline_source = str(baseline_payload.get('source') or '') or None
+        baseline_source_table = str(baseline_payload.get('source_table') or '') or None
+        baseline_date = _parse_iso_date(baseline_payload.get('trade_date'))
+        candidate_prior_turnover = _finite_int(baseline_payload.get('turnover_krw'))
+        baseline_observed_symbol_count = _finite_int(baseline_payload.get('observed_symbol_count'))
+        baseline_expected_symbol_count = _finite_int(baseline_payload.get('expected_symbol_count'))
+        coverage_ratio = _finite_float(baseline_payload.get('coverage_ratio'))
+        eod_run_id = _finite_int(baseline_payload.get('eod_run_id'))
+        eod_completed_at = _open_drive_datetime(baseline_payload.get('eod_run_completed_at'))
+        coverage_proof = _maybe_dict(baseline_payload.get('coverage_proof'))
+        requested_count_proof = _finite_int(coverage_proof.get('requested_symbol_count'))
+        persisted_count_proof = _finite_int(coverage_proof.get('persisted_symbol_count'))
+        market_count_proof = _finite_int(coverage_proof.get('market_symbol_count'))
+        requested_membership_sha256 = str(
+            coverage_proof.get('requested_membership_sha256') or ''
+        ).strip().lower()
+        persisted_membership_sha256 = str(
+            coverage_proof.get('persisted_membership_sha256') or ''
+        ).strip().lower()
+        membership_digest_valid = bool(
+            len(requested_membership_sha256) == 64
+            and all(character in '0123456789abcdef' for character in requested_membership_sha256)
+            and requested_membership_sha256 == persisted_membership_sha256
+        )
+        if baseline_payload.get('market') != normalized_market:
+            baseline_validation_reason = 'baseline_market_mismatch'
+        elif baseline_source != MARKET_OPEN_DRIVE_BASELINE_SOURCE:
+            baseline_validation_reason = 'baseline_source_invalid'
+        elif baseline_source_table != MARKET_OPEN_DRIVE_BASELINE_SOURCE_TABLE:
+            baseline_validation_reason = 'baseline_source_table_invalid'
+        elif baseline_payload.get('basis') != MARKET_OPEN_DRIVE_BASELINE_BASIS:
+            baseline_validation_reason = 'baseline_basis_invalid'
+        elif baseline_date is None or baseline_date >= requested_market_date:
+            baseline_validation_reason = 'baseline_trade_date_invalid'
+        elif (requested_market_date - baseline_date).days > MARKET_OPEN_DRIVE_MAX_BASELINE_AGE_DAYS:
+            baseline_validation_reason = 'baseline_stale'
+        elif any(
+            value is None
+            for value in (
+                candidate_prior_turnover,
+                baseline_observed_symbol_count,
+                baseline_expected_symbol_count,
+                coverage_ratio,
+                eod_run_id,
+                eod_completed_at,
+            )
+        ):
+            baseline_validation_reason = 'baseline_required_fields_missing'
+        elif (
+            candidate_prior_turnover <= 0
+            or baseline_observed_symbol_count < MARKET_REGIME_MIN_SYMBOL_COUNT
+            or baseline_expected_symbol_count <= 0
+        ):
+            baseline_validation_reason = 'baseline_values_invalid'
+        elif (
+            coverage_ratio != 1.0
+            or baseline_observed_symbol_count != baseline_expected_symbol_count
+        ):
+            baseline_validation_reason = 'baseline_coverage_invalid'
+        elif (
+            eod_run_id <= 0
+            or baseline_payload.get('eod_run_status') != 'completed'
+            or eod_completed_at > decision_at
+            or coverage_proof.get('status') != 'verified'
+            or coverage_proof.get('membership_status') != 'exact'
+            or coverage_proof.get('universe_complete') is not True
+            or coverage_proof.get('universe_source') != MARKET_OPEN_DRIVE_BASELINE_SOURCE
+            or coverage_proof.get('membership_basis') != 'end_date_snapshot'
+            or coverage_proof.get('membership_trade_date') != baseline_date.isoformat()
+            or not membership_digest_valid
+            or requested_count_proof is None
+            or persisted_count_proof is None
+            or requested_count_proof != persisted_count_proof
+            or market_count_proof != baseline_observed_symbol_count
+        ):
+            baseline_validation_reason = 'baseline_completed_eod_membership_proof_invalid'
+        else:
+            prior_turnover_krw = candidate_prior_turnover
+            baseline_source = MARKET_OPEN_DRIVE_BASELINE_SOURCE
+            baseline_source_table = MARKET_OPEN_DRIVE_BASELINE_SOURCE_TABLE
+
+    session_open_at = decision_at.replace(hour=9, minute=0, second=0, microsecond=0)
+    elapsed_minutes = max((decision_at - session_open_at).total_seconds() / 60.0, 0.0)
+    elapsed_fraction_actual = min(elapsed_minutes / MARKET_OPEN_DRIVE_SESSION_MINUTES, 1.0)
+    elapsed_fraction_denominator = max(
+        elapsed_fraction_actual,
+        MARKET_OPEN_DRIVE_MIN_ELAPSED_FRACTION,
+    )
+    elapsed_fraction_adjusted = elapsed_fraction_denominator > elapsed_fraction_actual
+    current_trading_value_krw = trading_value_million_krw * 1_000_000
+    comparison_turnover_krw = (
+        prior_turnover_krw * elapsed_fraction_denominator
+        if prior_turnover_krw is not None
+        else None
+    )
+    trading_value_expansion_ratio = (
+        current_trading_value_krw / comparison_turnover_krw
+        if comparison_turnover_krw is not None and comparison_turnover_krw > 0
+        else None
+    )
+    gap_up_pct = ((index_open - previous_close) / previous_close) * 100.0
+    early_continuation_pct = ((index_value - index_open) / index_open) * 100.0
+
+    raw_breadth_payload = _maybe_dict(market_row.get('breadth_raw_buckets'))
+    raw_breadth_buckets = {
+        'upper_limit_count': upper_limit_count,
+        'advancers': advancers,
+        'unchanged': unchanged,
+        'decliners': decliners,
+        'lower_limit_count': lower_limit_count,
+    }
+    completeness = _maybe_dict(market_row.get('breadth_completeness'))
+    expected_symbol_count = _finite_int(completeness.get('expected_symbol_count'))
+    observed_symbol_count = _finite_int(completeness.get('observed_symbol_count'))
+    limit_bucket_semantics = str(completeness.get('limit_bucket_semantics') or '').strip().lower()
+    all_breadth_buckets_valid = all(
+        value is not None and value >= 0
+        for value in raw_breadth_buckets.values()
+    )
+    raw_buckets_match = all(
+        _finite_int(raw_breadth_payload.get(name)) == value
+        for name, value in raw_breadth_buckets.items()
+    )
+    directional_count = (
+        (advancers or 0) + (unchanged or 0) + (decliners or 0)
+        if all(value is not None for value in (advancers, unchanged, decliners))
+        else None
+    )
+    five_bucket_count = (
+        sum(value or 0 for value in raw_breadth_buckets.values())
+        if all_breadth_buckets_valid
+        else None
+    )
+    calculated_observed_count = (
+        directional_count
+        if limit_bucket_semantics == 'included_in_direction_counts'
+        else five_bucket_count
+        if limit_bucket_semantics == 'disjoint_from_direction_counts'
+        else None
+    )
+    normalized_up_count = (
+        (advancers or 0) + (upper_limit_count or 0)
+        if limit_bucket_semantics == 'disjoint_from_direction_counts'
+        and advancers is not None
+        and upper_limit_count is not None
+        else advancers
+    )
+    normalized_down_count = (
+        (decliners or 0) + (lower_limit_count or 0)
+        if limit_bucket_semantics == 'disjoint_from_direction_counts'
+        and decliners is not None
+        and lower_limit_count is not None
+        else decliners
+    )
+    normalized_directional_count = (
+        normalized_up_count + unchanged + normalized_down_count
+        if normalized_up_count is not None
+        and unchanged is not None
+        and normalized_down_count is not None
+        else None
+    )
+    breadth_complete = bool(
+        str(completeness.get('status') or '').strip().lower() == 'verified'
+        and all_breadth_buckets_valid
+        and raw_buckets_match
+        and expected_symbol_count is not None
+        and expected_symbol_count >= MARKET_REGIME_MIN_SYMBOL_COUNT
+        and observed_symbol_count is not None
+        and observed_symbol_count == expected_symbol_count
+        and calculated_observed_count == observed_symbol_count
+        and normalized_directional_count == observed_symbol_count
+    )
+    if breadth_complete:
+        assert normalized_up_count is not None
+        assert unchanged is not None
+        assert normalized_down_count is not None
+        market_breadth_context = {
+            'status': 'available',
+            'market': normalized_market,
+            'market_symbol_count': expected_symbol_count,
+            'up_count': normalized_up_count,
+            'down_count': normalized_down_count,
+            'flat_count': unchanged,
+            'advance_decline_ratio': (
+                round(normalized_up_count / normalized_down_count, 4)
+                if normalized_down_count > 0
+                else float(normalized_up_count)
+            ),
+            'raw_buckets': raw_breadth_buckets,
+            'expected_symbol_count': expected_symbol_count,
+            'observed_symbol_count': observed_symbol_count,
+            'limit_bucket_semantics': limit_bucket_semantics,
+            'basis': 'kis_intraday_issue_direction_counts_with_verified_universe',
+            'source': MARKET_OPEN_DRIVE_SOURCE,
+            'captured_at': observed_at.isoformat(),
+            'missing_fields': [],
+        }
+        market_breadth_provenance = {
+            'freshness_status': FRESHNESS_STATUS_FRESH,
+            'provenance_status': PROVENANCE_STATUS_PROVIDER_SOURCED,
+            'as_of_market_date': requested_market_date.isoformat(),
+            'as_of_timestamp': observed_at.isoformat(),
+            'latest_available_market_date': requested_market_date.isoformat(),
+            'latest_available_timestamp': observed_at.isoformat(),
+            'source_tables': [MARKET_OPEN_DRIVE_SOURCE_TABLE, 'symbols'],
+            'source_provider': MARKET_OPEN_DRIVE_SOURCE,
+            'reason': 'fresh_same_market_date_kis_snapshot_with_verified_universe',
+        }
+    else:
+        market_breadth_context = {
+            'status': 'unavailable',
+            'authoritative': False,
+            'reason': 'breadth_completeness_unverified',
+            'market': normalized_market,
+            'market_symbol_count': expected_symbol_count,
+            'up_count': advancers,
+            'down_count': decliners,
+            'flat_count': unchanged,
+            'raw_buckets': raw_breadth_buckets,
+            'expected_symbol_count': expected_symbol_count,
+            'observed_symbol_count': observed_symbol_count,
+            'limit_bucket_semantics': limit_bucket_semantics or 'unknown',
+            'basis': 'kis_intraday_issue_direction_counts_unverified',
+            'source': MARKET_OPEN_DRIVE_SOURCE,
+            'captured_at': observed_at.isoformat(),
+            'missing_fields': ['breadth.expected_universe_or_bucket_semantics_proof'],
+        }
+        market_breadth_provenance = {
+            'freshness_status': FRESHNESS_STATUS_MISSING,
+            'provenance_status': 'missing',
+            'as_of_market_date': requested_market_date.isoformat(),
+            'as_of_timestamp': observed_at.isoformat(),
+            'latest_available_market_date': requested_market_date.isoformat(),
+            'latest_available_timestamp': observed_at.isoformat(),
+            'source_tables': [MARKET_OPEN_DRIVE_SOURCE_TABLE],
+            'source_provider': MARKET_OPEN_DRIVE_SOURCE,
+            'reason': 'breadth_completeness_unverified',
+        }
+    context_complete = baseline_validation_reason is None and trading_value_expansion_ratio is not None
+    return {
+        'status': 'available' if context_complete else 'partial',
+        'authoritative': context_complete,
+        'reason': baseline_validation_reason,
+        'market': normalized_market,
+        'market_date': requested_market_date.isoformat(),
+        'phase': phase,
+        'source': MARKET_OPEN_DRIVE_SOURCE,
+        'source_table': MARKET_OPEN_DRIVE_SOURCE_TABLE,
+        'observed_at': observed_at.isoformat(),
+        'decision_time': decision_at.isoformat(),
+        'age_seconds': round(age_seconds, 3),
+        'gap_up_pct': round(gap_up_pct, 4),
+        'index_change_pct': round(index_change_pct, 4),
+        'early_continuation_pct': round(early_continuation_pct, 4),
+        'trading_value_expansion_ratio': (
+            round(trading_value_expansion_ratio, 4)
+            if trading_value_expansion_ratio is not None
+            else None
+        ),
+        'index_leg': {
+            'status': 'available',
+            'source': MARKET_OPEN_DRIVE_SOURCE,
+            'observed_at': observed_at.isoformat(),
+            'provider_business_date': observed_at.date().isoformat(),
+            'provider_session_time': observed_at.strftime('%H:%M:%S'),
+        },
+        'baseline': {
+            'status': 'available' if context_complete else 'unavailable',
+            'reason': baseline_validation_reason,
+            'source': baseline_source,
+            'source_table': baseline_source_table,
+            'trade_date': baseline_date.isoformat() if baseline_date is not None else None,
+        },
+        'market_breadth_context': market_breadth_context,
+        'market_breadth_provenance': market_breadth_provenance,
+        'missing_fields': [] if context_complete else ['trading_value_expansion_ratio'],
+        'provenance': {
+            'validation_status': 'validated' if context_complete else 'partial',
+            'snapshot_source': MARKET_OPEN_DRIVE_SOURCE,
+            'snapshot_source_table': MARKET_OPEN_DRIVE_SOURCE_TABLE,
+            'snapshot_status': source_payload.get('snapshot_status'),
+            'snapshot_refresh_status': source_payload.get('last_refresh_status'),
+            'baseline_source': baseline_source,
+            'baseline_source_table': baseline_source_table,
+            'baseline_provider_field': baseline_provider_field,
+            'baseline_relative_session': baseline_relative_session,
+            'baseline_market_date': baseline_date.isoformat() if baseline_date is not None else None,
+            'baseline_coverage_ratio': coverage_ratio,
+            'breadth_completeness': {
+                'status': 'verified' if breadth_complete else 'unverified',
+                'expected_symbol_count': expected_symbol_count,
+                'observed_symbol_count': observed_symbol_count,
+                'limit_bucket_semantics': limit_bucket_semantics or 'unknown',
+                'raw_buckets_match': raw_buckets_match,
+            },
+            'calculation': {
+                'previous_close_method': 'current_index_value_minus_provider_change',
+                'gap_method': 'provider_open_vs_derived_previous_close',
+                'continuation_method': 'current_index_value_vs_provider_open',
+                'trading_value_expansion_method': (
+                    'current_cumulative_krw_divided_by_prior_full_session_krw_times_conservative_elapsed_fraction'
+                ),
+                'provider_trading_value_unit': 'million_krw',
+                'normalized_trading_value_unit': 'krw',
+                'baseline_available': context_complete,
+                'elapsed_session_minutes': round(elapsed_minutes, 4),
+                'elapsed_fraction_actual': round(elapsed_fraction_actual, 6),
+                'elapsed_fraction_denominator': round(elapsed_fraction_denominator, 6),
+                'minimum_elapsed_fraction': MARKET_OPEN_DRIVE_MIN_ELAPSED_FRACTION,
+                'elapsed_fraction_adjusted': elapsed_fraction_adjusted,
+                'full_session_linear_extrapolation_used': False,
+            },
+        },
+    }
 
 
 def _build_open_drive_evidence(
     *,
+    requested_market_date: date,
+    market: str | None,
     market_breadth_payload: dict[str, Any],
     market_relative_payload: dict[str, Any],
     open_drive_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    payloads = [
-        _maybe_dict(open_drive_context),
-        _maybe_dict(market_breadth_payload.get('open_drive')),
-        _maybe_dict(market_relative_payload.get('open_drive')),
-        market_breadth_payload,
-        market_relative_payload,
-    ]
-    combined: dict[str, Any] = {}
-    for payload in reversed(payloads):
-        combined.update({key: value for key, value in payload.items() if value is not None})
+    del market_breadth_payload, market_relative_payload
+    combined = _maybe_dict(open_drive_context)
+    provenance = _maybe_dict(combined.get('provenance'))
+    normalized_market = str(market or '').strip().upper()
+    baseline_provenance_valid = bool(
+        provenance.get('baseline_source') == MARKET_OPEN_DRIVE_BASELINE_SOURCE
+        or (
+            provenance.get('baseline_source') == MARKET_OPEN_DRIVE_SOURCE
+            and provenance.get('baseline_provider_field') == 'prdy_tr_pbmn'
+            and provenance.get('baseline_relative_session') == 'previous'
+        )
+    )
+    authoritative = bool(
+        combined.get('status') == 'available'
+        and combined.get('authoritative') is True
+        and combined.get('market_date') == requested_market_date.isoformat()
+        and str(combined.get('market') or '').strip().upper() == normalized_market
+        and combined.get('source') == MARKET_OPEN_DRIVE_SOURCE
+        and combined.get('source_table') == MARKET_OPEN_DRIVE_SOURCE_TABLE
+        and provenance.get('validation_status') == 'validated'
+        and provenance.get('snapshot_source') == MARKET_OPEN_DRIVE_SOURCE
+        and baseline_provenance_valid
+        and combined.get('phase') in {'opening', 'trend'}
+    )
+    numeric_values = {
+        'gap_up_pct': _finite_float(combined.get('gap_up_pct')),
+        'index_change_pct': _finite_float(combined.get('index_change_pct')),
+        'early_continuation_pct': _finite_float(combined.get('early_continuation_pct')),
+        'trading_value_expansion_ratio': _finite_float(combined.get('trading_value_expansion_ratio')),
+    }
+    missing_fields = [key for key, value in numeric_values.items() if value is None]
+    if not authoritative or missing_fields:
+        return {
+            'status': 'unavailable',
+            'authoritative': False,
+            'reason': combined.get('reason') or 'open_drive_provenance_or_fields_invalid',
+            'phase': combined.get('phase'),
+            **numeric_values,
+            'trading_value_expanded': False,
+            'gap_up_confirmed': False,
+            'broad_market_strength': False,
+            'early_continuation_confirmed': False,
+            'gap_fade_detected': False,
+            'weak_continuation_detected': False,
+            'missing_fields': missing_fields or list(combined.get('missing_fields') or []),
+            'index_leg': _maybe_dict(combined.get('index_leg')),
+            'baseline': _maybe_dict(combined.get('baseline')),
+            'provenance': provenance,
+        }
 
-    gap_up_pct = _first_numeric_value(combined, ('gap_up_pct', 'open_gap_pct', 'index_gap_pct'))
-    index_change_pct = _first_numeric_value(
-        combined,
-        ('index_change_pct', 'market_change_pct', 'combined_index_change_pct', 'early_index_change_pct'),
-    )
-    early_continuation_pct = _first_numeric_value(
-        combined,
-        ('early_continuation_pct', 'continuation_pct', 'index_slope_pct', 'early_slope_pct'),
-    )
-    trading_value_expansion_ratio = _first_numeric_value(
-        combined,
-        ('trading_value_expansion_ratio', 'volume_expansion_ratio', 'early_volume_expansion_ratio'),
-    )
-    explicit_gap = _to_bool(combined.get('gap_up_confirmed'))
-    explicit_strength = _to_bool(combined.get('broad_market_strength'))
-    explicit_continuation = _to_bool(combined.get('early_continuation_confirmed'))
-    explicit_fade = _to_bool(combined.get('gap_fade_detected')) or _to_bool(combined.get('weak_continuation_detected'))
-
-    gap_up_confirmed = (
-        explicit_gap
-        if explicit_gap is not None
-        else gap_up_pct is not None and gap_up_pct >= MARKET_REGIME_OPEN_GAP_UP_PCT
-    )
-    broad_market_strength = (
-        explicit_strength
-        if explicit_strength is not None
-        else index_change_pct is not None and index_change_pct >= MARKET_REGIME_OPEN_INDEX_STRENGTH_PCT
-    )
-    trading_value_expanded = (
-        trading_value_expansion_ratio is not None
-        and trading_value_expansion_ratio >= MARKET_REGIME_TRADING_VALUE_EXPANSION_RATIO
-    )
-    if explicit_continuation is not None:
-        early_continuation_confirmed = explicit_continuation
-    else:
-        early_continuation_confirmed = (
-            early_continuation_pct is not None
-            and early_continuation_pct >= MARKET_REGIME_EARLY_CONTINUATION_PCT
-        ) or trading_value_expanded
-    gap_fade_detected = (
-        explicit_fade
-        if explicit_fade is not None
-        else early_continuation_pct is not None
-        and early_continuation_pct <= -MARKET_REGIME_EARLY_CONTINUATION_PCT
-    )
+    gap_up_pct = numeric_values['gap_up_pct']
+    index_change_pct = numeric_values['index_change_pct']
+    early_continuation_pct = numeric_values['early_continuation_pct']
+    trading_value_expansion_ratio = numeric_values['trading_value_expansion_ratio']
+    assert gap_up_pct is not None
+    assert index_change_pct is not None
+    assert early_continuation_pct is not None
+    assert trading_value_expansion_ratio is not None
+    gap_up_confirmed = gap_up_pct >= MARKET_REGIME_OPEN_GAP_UP_PCT
+    broad_market_strength = index_change_pct >= MARKET_REGIME_OPEN_INDEX_STRENGTH_PCT
+    trading_value_expanded = trading_value_expansion_ratio >= MARKET_REGIME_TRADING_VALUE_EXPANSION_RATIO
+    early_continuation_confirmed = early_continuation_pct >= MARKET_REGIME_EARLY_CONTINUATION_PCT
+    gap_fade_detected = early_continuation_pct <= -MARKET_REGIME_EARLY_CONTINUATION_PCT
+    weak_continuation_detected = early_continuation_pct < MARKET_REGIME_EARLY_CONTINUATION_PCT
     return {
-        'status': 'available' if any(payloads[:3]) else 'unavailable',
+        'status': 'available',
+        'authoritative': True,
+        'reason': None,
+        'phase': combined.get('phase'),
         'gap_up_pct': gap_up_pct,
         'index_change_pct': index_change_pct,
         'early_continuation_pct': early_continuation_pct,
@@ -2471,6 +3226,11 @@ def _build_open_drive_evidence(
         'broad_market_strength': bool(broad_market_strength),
         'early_continuation_confirmed': bool(early_continuation_confirmed),
         'gap_fade_detected': bool(gap_fade_detected),
+        'weak_continuation_detected': bool(weak_continuation_detected),
+        'missing_fields': [],
+        'index_leg': _maybe_dict(combined.get('index_leg')),
+        'baseline': _maybe_dict(combined.get('baseline')),
+        'provenance': provenance,
     }
 
 
@@ -2482,7 +3242,10 @@ def _market_regime_window(*, requested_market_date: date, market_regime: str) ->
             'valid_from': f'{requested_market_date.isoformat()}T{MARKET_REGIME_OPEN_WINDOW_START}',
             'valid_until': f'{requested_market_date.isoformat()}T{MARKET_REGIME_OPEN_WINDOW_END}',
             'quantity_multiplier_cap': MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP,
-            'entry_priority_boost': True,
+            'shadow_quantity_multiplier_cap': MARKET_REGIME_AGGRESSIVE_OPEN_SHADOW_MULTIPLIER_CAP,
+            'entry_priority_boost': False,
+            'shadow_entry_priority_boost': True,
+            'live_upsize_status': 'shadow_only_uncalibrated',
             'exec_enforced': True,
         }
     if market_regime == 'trend_day':
@@ -2492,7 +3255,10 @@ def _market_regime_window(*, requested_market_date: date, market_regime: str) ->
             'valid_from': f'{requested_market_date.isoformat()}T{MARKET_REGIME_TREND_WINDOW_START}',
             'valid_until': f'{requested_market_date.isoformat()}T{MARKET_REGIME_TREND_WINDOW_END}',
             'quantity_multiplier_cap': MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP,
+            'shadow_quantity_multiplier_cap': MARKET_REGIME_TREND_DAY_SHADOW_MULTIPLIER_CAP,
             'entry_priority_boost': False,
+            'shadow_entry_priority_boost': False,
+            'live_upsize_status': 'shadow_only_uncalibrated',
             'exec_enforced': True,
         }
     return None
@@ -2645,6 +3411,8 @@ def _build_market_regime_context(
         and not weak_breadth
     )
     open_drive_evidence = _build_open_drive_evidence(
+        requested_market_date=requested_market_date,
+        market=market,
         market_breadth_payload=market_breadth_payload,
         market_relative_payload=market_relative_payload,
         open_drive_context=open_drive_context,
@@ -2664,21 +3432,23 @@ def _build_market_regime_context(
         missing_fields = list(dict.fromkeys(missing_fields))
     broad_market_strength_confirmed = bool(open_drive_evidence.get('broad_market_strength')) and strong_breadth
     aggressive_open_confirmed = bool(
-        broad_market_strength_confirmed
+        open_drive_evidence.get('phase') == 'opening'
+        and broad_market_strength_confirmed
         and open_drive_evidence.get('gap_up_confirmed')
         and open_drive_evidence.get('early_continuation_confirmed')
+        and open_drive_evidence.get('trading_value_expanded')
         and not open_drive_evidence.get('gap_fade_detected')
     )
     trend_day_confirmed = bool(
-        broad_market_strength_confirmed
+        open_drive_evidence.get('phase') == 'trend'
+        and broad_market_strength_confirmed
+        and open_drive_evidence.get('early_continuation_confirmed')
+        and open_drive_evidence.get('trading_value_expanded')
         and not open_drive_evidence.get('gap_fade_detected')
-        and (
-            bool(open_drive_evidence.get('early_continuation_confirmed'))
-            or bool(open_drive_evidence.get('trading_value_expanded'))
-            or strong_sector
-            or relative_leader
-        )
     )
+    shadow_quantity_multiplier: float | None = None
+    shadow_regime_confidence: float | None = None
+    live_upsize_status = 'not_applicable'
 
     if market_breadth_state == DECIDER_QUALITY_STATUS_STALE:
         posture = 'stale'
@@ -2749,11 +3519,15 @@ def _build_market_regime_context(
         reason_code = 'aggressive_open_drive_confirmed'
         reason_summary = 'Broad market strength, gap-up evidence, and early continuation support an aggressive opening-window handoff.'
         recommended_exec_action = 'allow'
-        recommended_sizing_multiplier = round(
-            min(MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP, max(1.0, 2.0 - fx_penalty)),
+        shadow_quantity_multiplier = round(
+            min(
+                MARKET_REGIME_AGGRESSIVE_OPEN_SHADOW_MULTIPLIER_CAP,
+                max(1.0, 2.0 - fx_penalty),
+            ),
             4,
         )
-        regime_confidence = round(
+        recommended_sizing_multiplier = MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP
+        shadow_regime_confidence = round(
             min(
                 0.95,
                 0.62
@@ -2764,6 +3538,8 @@ def _build_market_regime_context(
             ),
             4,
         )
+        regime_confidence = round(max(0.0, 0.62 - (fx_penalty * 0.20)), 4)
+        live_upsize_status = 'shadow_only_uncalibrated'
         regime_reasons = [
             'breadth_strong',
             'market_gap_up_confirmed',
@@ -2778,14 +3554,20 @@ def _build_market_regime_context(
         reason_code = 'trend_day_context_confirmed'
         reason_summary = 'Broad market strength supports continuation or selected pullback entries after the opening window.'
         recommended_exec_action = 'allow'
-        recommended_sizing_multiplier = round(
-            min(MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP, max(1.0, 1.25 - (fx_penalty * 0.5))),
+        shadow_quantity_multiplier = round(
+            min(
+                MARKET_REGIME_TREND_DAY_SHADOW_MULTIPLIER_CAP,
+                max(1.0, 1.25 - (fx_penalty * 0.5)),
+            ),
             4,
         )
-        regime_confidence = round(
+        recommended_sizing_multiplier = MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP
+        shadow_regime_confidence = round(
             min(0.88, 0.58 + (0.10 if strong_breadth else 0.0) + (0.08 if relative_leader else 0.0) - (fx_penalty * 0.15)),
             4,
         )
+        regime_confidence = round(max(0.0, 0.58 - (fx_penalty * 0.15)), 4)
+        live_upsize_status = 'shadow_only_uncalibrated'
         regime_reasons = ['breadth_strong', 'broad_market_strength_confirmed']
         if strong_sector:
             regime_reasons.append('sector_participation_strong')
@@ -2793,7 +3575,7 @@ def _build_market_regime_context(
             regime_reasons.append('candidate_relative_strength_leader')
         if open_drive_evidence.get('early_continuation_confirmed'):
             regime_reasons.append('early_continuation_confirmed')
-    elif open_drive_evidence.get('gap_fade_detected'):
+    elif open_drive_evidence.get('gap_fade_detected') or open_drive_evidence.get('weak_continuation_detected'):
         posture = 'normal'
         market_regime = 'normal'
         reason_code = 'gap_fade_or_weak_continuation'
@@ -2853,6 +3635,7 @@ def _build_market_regime_context(
         'market_regime': market_regime,
         'risk_mode': market_regime,
         'regime_confidence': regime_confidence,
+        'shadow_regime_confidence': shadow_regime_confidence,
         'regime_reasons': regime_reasons,
         'reason_code': reason_code,
         'reason_summary': reason_summary,
@@ -2923,6 +3706,8 @@ def _build_market_regime_context(
         'recommended_exec_action': recommended_exec_action,
         'recommended_sizing_multiplier': recommended_sizing_multiplier,
         'quantity_multiplier': recommended_sizing_multiplier,
+        'shadow_quantity_multiplier': shadow_quantity_multiplier,
+        'live_upsize_status': live_upsize_status,
         'entry_priority_boost': entry_priority_boost,
         'valid_until': valid_until,
         'sizing_window': regime_window,
@@ -5760,6 +6545,59 @@ class AgentContextReadService:
             requested_date=normalized_market_date,
             current_state=current_market_state,
         )
+        open_drive_snapshot_context: dict[str, Any] | None = None
+        open_drive_turnover_baselines: dict[str, dict[str, Any]] = {}
+        current_state_name = str(getattr(current_market_state, 'state', '') or '').strip().upper()
+        current_state_time = _open_drive_datetime(getattr(current_market_state, 'server_time', None))
+        open_drive_markets = list(
+            dict.fromkeys(
+                market
+                for symbol in normalized_symbols
+                if (market := symbol_market_by_code.get(symbol)) in MARKET_OPEN_DRIVE_MARKET_METADATA
+            )
+        )
+        if (
+            current_state_name == 'OPEN'
+            and current_state_time is not None
+            and current_state_time.date() == normalized_market_date
+            and open_drive_markets
+        ):
+            try:
+                open_drive_snapshot_context = load_current_market_snapshot_context()
+            except (SQLAlchemyError, TimeoutError):
+                open_drive_snapshot_context = None
+            snapshot_markets = _maybe_dict(
+                _maybe_dict(_maybe_dict(open_drive_snapshot_context).get('payload')).get('markets')
+            )
+            fallback_markets = [
+                market
+                for market in open_drive_markets
+                if not (
+                    (_finite_int(
+                        _maybe_dict(
+                            snapshot_markets.get(
+                                MARKET_OPEN_DRIVE_MARKET_METADATA[market]['snapshot_key']
+                            )
+                        ).get('prior_trading_value')
+                    ) or 0) > 0
+                    and str(
+                        _maybe_dict(
+                            snapshot_markets.get(
+                                MARKET_OPEN_DRIVE_MARKET_METADATA[market]['snapshot_key']
+                            )
+                        ).get('prior_trading_value_unit')
+                        or ''
+                    ).strip().lower() == 'million_krw'
+                )
+            ]
+            if open_drive_snapshot_context is not None and fallback_markets:
+                try:
+                    open_drive_turnover_baselines = load_prior_market_turnover_baselines(
+                        market_date=normalized_market_date,
+                        markets=fallback_markets,
+                    )
+                except (SQLAlchemyError, TimeoutError):
+                    open_drive_turnover_baselines = {}
 
         technical_rows = load_daily_technical_snapshots(
             market_date=normalized_market_date,
@@ -5886,10 +6724,17 @@ class AgentContextReadService:
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
-        pykrx_enrichment_inputs = pykrx_enrichment_service.load_symbol_day_context_inputs(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-        )
+        try:
+            pykrx_enrichment_inputs = pykrx_enrichment_service.load_symbol_day_context_inputs(
+                market_date=normalized_market_date,
+                symbols=normalized_symbols,
+            )
+        except (SQLAlchemyError, TimeoutError):
+            pykrx_enrichment_inputs = {
+                'by_symbol': {},
+                'by_market': {},
+                'sector_rows_by_market': {},
+            }
         dart_storage_unavailable = False
         try:
             fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
@@ -6063,6 +6908,21 @@ class AgentContextReadService:
             market_breadth_context = _build_market_breadth_context(
                 market_enrichment_rows.get('market_breadth'),
             )
+            market_open_drive_context = _build_market_open_drive_context(
+                requested_market_date=normalized_market_date,
+                market=company_market or None,
+                decision_time=current_state_time,
+                snapshot_context=open_drive_snapshot_context,
+                prior_market_turnover_baseline=open_drive_turnover_baselines.get(company_market),
+            )
+            live_market_breadth_context = _maybe_dict(
+                market_open_drive_context.get('market_breadth_context')
+            )
+            live_market_breadth_available = (
+                live_market_breadth_context.get('status') == 'available'
+            )
+            if live_market_breadth_available:
+                market_breadth_context = dict(live_market_breadth_context)
             investor_flow_context = _build_investor_flow_context(
                 symbol_row=symbol_enrichment_rows.get('investor_flow_symbol'),
                 market_row=market_enrichment_rows.get('investor_flow_market'),
@@ -6272,6 +7132,11 @@ class AgentContextReadService:
                 provenance_status=PROVENANCE_STATUS_DERIVED,
                 extra={'category': 'market_breadth'},
             )
+            if live_market_breadth_available:
+                market_breadth_context_provenance = dict(
+                    market_open_drive_context.get('market_breadth_provenance')
+                    or market_breadth_context_provenance
+                )
             investor_flow_context_provenance = _build_pykrx_block_freshness_provenance(
                 requested_market_date=normalized_market_date,
                 rows=(
@@ -6428,6 +7293,7 @@ class AgentContextReadService:
                 market_relative_context=market_relative_context,
                 market_relative_provenance=market_relative_context_provenance,
                 macro_context=macro_context,
+                open_drive_context=market_open_drive_context,
             )
             context_completeness['market_regime_context'] = {
                 'status': market_regime_context.get('status'),

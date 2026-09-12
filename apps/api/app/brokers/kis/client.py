@@ -1102,6 +1102,20 @@ class KISClient:
             },
         )
 
+    async def fetch_market_index_time_series(self, *, index_code: str) -> dict:
+        """Fetch current-session index bars with KIS business-date/time fields."""
+        return await self._get(
+            '/uapi/domestic-stock/v1/quotations/inquire-time-indexchartprice',
+            tr_id='FHKUP03500200',
+            params={
+                'FID_COND_MRKT_DIV_CODE': 'U',
+                'FID_ETC_CLS_CODE': '0',
+                'FID_INPUT_ISCD': index_code,
+                'FID_INPUT_HOUR_1': '60',
+                'FID_PW_DATA_INCU_YN': 'N',
+            },
+        )
+
     async def fetch_investor_time_by_market(self, *, market_code: str, sector_code: str) -> dict:
         return await self._get(
             '/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market',

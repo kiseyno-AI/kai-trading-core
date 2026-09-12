@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from types import SimpleNamespace
 from contextlib import ExitStack, contextmanager
@@ -647,6 +648,48 @@ class PykrxBackfillServiceTests(TestCase):
         )
         load_active_universe.assert_not_called()
         find_symbol.assert_not_called()
+
+    def test_pipeline_persists_point_in_time_market_membership_proof(self) -> None:
+        service = PykrxBackfillService()
+        symbols = [
+            PykrxSymbol(symbol='005930', market='KOSPI', name_ko='삼성전자'),
+            PykrxSymbol(symbol='247540', market='KOSDAQ', name_ko='에코프로비엠'),
+        ]
+
+        with (
+            patch.object(
+                service,
+                'fetch_recent_universe_snapshot',
+                return_value=_point_in_time_universe_snapshot(
+                    symbols,
+                    market_date='2026-04-07',
+                ),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                side_effect=RuntimeError('stop after run admission'),
+            ) as create_run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'stop after run admission'):
+                service._run_market_data_pipeline(
+                    start_date='20260407',
+                    end_date='20260407',
+                    markets=('KOSPI', 'KOSDAQ'),
+                    trigger='test',
+                    refresh_universe=True,
+                    mode='historical_backfill',
+                )
+
+        metadata = create_run.call_args.kwargs['run_metadata']
+        membership = metadata['universe_snapshot']['market_membership']
+        self.assertEqual(membership['schema_version'], 'pykrx_market_membership_v1')
+        self.assertEqual(membership['symbol_count'], 2)
+        self.assertEqual(membership['markets']['KOSPI']['symbols'], ['005930'])
+        self.assertEqual(membership['markets']['KOSDAQ']['symbols'], ['247540'])
+        self.assertEqual(
+            membership['markets']['KOSPI']['membership_sha256'],
+            hashlib.sha256(b'005930').hexdigest(),
+        )
 
     def test_historical_pipeline_rejects_symbol_override_membership_bypass(self) -> None:
         service = PykrxBackfillService()

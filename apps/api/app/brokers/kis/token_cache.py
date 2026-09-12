@@ -19,6 +19,55 @@ TOKEN_CACHE_SCHEMA_VERSION = 1
 _CACHE_FILE_MAX_BYTES = 64 * 1024
 _ALLOWED_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
 _MAX_REVOCATION_WINDOW = timedelta(seconds=3_600) + _ALLOWED_FUTURE_CLOCK_SKEW
+_COMMON_RECORD_FIELDS = frozenset(
+    {
+        'schema_version',
+        'record_type',
+        'provider',
+        'environment',
+        'credential_fingerprint',
+    }
+)
+_RECORD_FIELDS = {
+    'token': _COMMON_RECORD_FIELDS
+    | {
+        'generation',
+        'access_token',
+        'token_type',
+        'issued_at',
+        'expires_at',
+        'refresh_after',
+    },
+    'revocation': _COMMON_RECORD_FIELDS
+    | {
+        'revoked_generation',
+        'revoked_token_fingerprint',
+        'revoked_at',
+        'not_before',
+    },
+    'failure': _COMMON_RECORD_FIELDS
+    | {
+        'error_kind',
+        'status_code',
+        'retryable',
+        'invalidates_generation',
+        'failed_at',
+        'cooldown_until',
+    },
+    'issuance_attempt': _COMMON_RECORD_FIELDS
+    | {
+        'attempt_id',
+        'invalidates_generation',
+        'started_at',
+        'cooldown_until',
+    },
+    'issuance_success': _COMMON_RECORD_FIELDS
+    | {
+        'generation',
+        'issued_at',
+        'cooldown_until',
+    },
+}
 _P = ParamSpec('_P')
 _T = TypeVar('_T')
 
@@ -254,6 +303,7 @@ class KISTokenCacheStore:
         self._validate_common_record(payload)
         current_time = now or datetime.now(timezone.utc)
         record_type = payload.get('record_type')
+        self._validate_record_fields(payload, record_type)
         if record_type == 'token':
             return self._parse_token_record(payload, now=current_time)
         if record_type == 'revocation':
@@ -355,7 +405,7 @@ class KISTokenCacheStore:
             if access_token is not None:
                 if not hmac.compare_digest(state.access_token, access_token):
                     return False
-            elif generation is not None and not hmac.compare_digest(
+            if generation is not None and not hmac.compare_digest(
                 state.generation,
                 generation,
             ):
@@ -395,6 +445,7 @@ class KISTokenCacheStore:
         expires_at: datetime,
         refresh_after: datetime,
     ) -> CachedKISToken:
+        _require_timezone_aware(issued_at, expires_at, refresh_after)
         record = CachedKISToken(
             access_token=access_token,
             token_type=token_type,
@@ -441,6 +492,19 @@ class KISTokenCacheStore:
             or payload.get('credential_fingerprint') != self.credential_fingerprint
         ):
             raise KISTokenCacheError('KIS token cache identity or schema is invalid')
+
+    @staticmethod
+    def _validate_record_fields(
+        payload: dict[str, Any],
+        record_type: object,
+    ) -> None:
+        expected_fields = (
+            _RECORD_FIELDS.get(record_type)
+            if isinstance(record_type, str)
+            else None
+        )
+        if expected_fields is None or set(payload) != expected_fields:
+            raise KISTokenCacheError('KIS token cache record fields are invalid')
 
     def _parse_token_record(
         self,
@@ -513,8 +577,12 @@ class KISTokenCacheStore:
             return None
         self._validate_common_record(payload)
         record_type = payload.get('record_type')
-        if record_type not in {'failure', 'issuance_attempt', 'issuance_success'}:
+        if (
+            not isinstance(record_type, str)
+            or record_type not in {'failure', 'issuance_attempt', 'issuance_success'}
+        ):
             raise KISTokenCacheError('KIS token failure record type is invalid')
+        self._validate_record_fields(payload, record_type)
 
         error_kind = payload.get('error_kind')
         status_code_value = payload.get('status_code')
@@ -604,6 +672,7 @@ class KISTokenCacheStore:
         cooldown_until: datetime,
         invalidates_generation: str | None,
     ) -> str:
+        _require_timezone_aware(started_at, cooldown_until)
         duration_seconds = (cooldown_until - started_at).total_seconds()
         if not self.issuance_lease_seconds <= duration_seconds <= 3600:
             raise KISTokenCacheError('KIS token issuance lease does not match cache contract')
@@ -633,6 +702,7 @@ class KISTokenCacheStore:
         failed_at: datetime,
         cooldown_until: datetime,
     ) -> None:
+        _require_timezone_aware(failed_at, cooldown_until)
         duration_seconds = (cooldown_until - failed_at).total_seconds()
         if not self.minimum_issue_interval_seconds <= duration_seconds <= 3600:
             raise KISTokenCacheError('KIS token failure cooldown does not match cache contract')
@@ -827,6 +897,18 @@ class KISTokenCacheStore:
             and (not hasattr(os, 'getuid') or file_stat.st_uid == os.getuid())
             and stat.S_IMODE(file_stat.st_mode) == 0o600
             and file_stat.st_nlink == 1
+        )
+
+
+def _require_timezone_aware(*values: datetime) -> None:
+    if any(
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+        for value in values
+    ):
+        raise KISTokenCacheError(
+            'KIS token cache write timestamps must be timezone-aware'
         )
 
 

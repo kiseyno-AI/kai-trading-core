@@ -9,7 +9,7 @@
 - `downsize_probe`: deterministically caps final quantity at `SIGNAL_DECIDER_WAIT_CONFLICT_PROBE_QUANTITY` without increasing a smaller request.
 - `disabled`: retains an explicit disabled audit state.
 
-`allow_by_override` remains valid only when every documented continuation, reward/risk, quality/return, volume, and raw-liquidity check passes. Missing or stale same-date signal-decider context is explicitly classified and follows the configured conflict action; it is never silently approved. Core persists `enforcement_decision`, `requested_quantity`, and `final_quantity` in the plan validation, traceability, Exec handoff, and item risk context. A downsized handoff uses a binding fixed quantity so Exec cannot restore full size.
+`allow_by_override` remains valid only when every documented continuation, reward/risk, quality/return, volume, and raw-liquidity check passes. Missing or stale same-date signal-decider context is explicitly classified and follows the configured conflict action; it is never silently approved. Core persists `enforcement_decision`, `requested_quantity`, and `final_quantity` in the plan validation, traceability, Exec handoff, and item risk context. A downsized v4 handoff remains `exec_agent_sized` and carries the probe as a binding `max_quantity` ceiling; Exec may reduce or reject it but cannot size above the cap.
 
 ## Weekly operator replay
 

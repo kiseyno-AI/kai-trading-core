@@ -21,6 +21,7 @@ from app.agent_context.decider_replay_service import (
     _replay_alignment_gate,
 )
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.model_identity import build_observed_model_identity
 from app.db_models import (
     AgentContextFeedback,
     Base,
@@ -148,7 +149,9 @@ def _alignment_gate(alignment: str, action: str) -> dict:
             'metrics': {
                 'buy_quality_score': 76,
                 'return_percentile': 0.82,
+                'return_percentile_status': 'available',
                 'volume_percentile': 0.68,
+                'volume_percentile_status': 'available',
                 'reward_risk_ratio': 2.5,
                 'raw_trading_value_krw': 9_000_000_000,
                 'continuation_setup_detected': True,
@@ -250,7 +253,16 @@ def _snapshot_object(*, snapshot_id: int = 1, symbol: str = '005930') -> SignalD
         input_feature_snapshot_payload={},
         request_payload={},
         response_payload={},
-        response_summary_payload={},
+        response_summary_payload={
+            'decision_provenance': {
+                'model_identity': build_observed_model_identity(
+                    role=SHORT_TERM_DECIDER_AGENT_NAME,
+                    expected_model='openai/gpt-5.6-sol',
+                    actual_provider='openai',
+                    actual_model='gpt-5.6-sol',
+                )
+            }
+        },
     )
 
 
@@ -1092,6 +1104,93 @@ class DeciderReplayServiceTests(unittest.TestCase):
 
 
 class DeciderReplayRepositoryTests(unittest.TestCase):
+    def test_replay_dataset_excludes_other_and_unverified_model_cohorts(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        tables = [
+            SignalDeciderDecisionSnapshot.__table__,
+            SignalDeciderRealizedOutcome.__table__,
+            DeciderPostDecisionEvaluation.__table__,
+            SignalDeciderActualExecutionOutcome.__table__,
+        ]
+        Base.metadata.create_all(engine, tables=tables)
+        TestSessionLocal = sessionmaker(bind=engine, future=True)
+
+        @contextmanager
+        def test_session_scope():
+            with TestSessionLocal() as session:
+                yield session
+
+        expected_identity = build_observed_model_identity(
+            role=SHORT_TERM_DECIDER_AGENT_NAME,
+            expected_model='openai/gpt-5.6-sol',
+            actual_provider='openai',
+            actual_model='gpt-5.6-sol',
+        )
+        other_identity = {
+            **expected_identity,
+            'expected_model': 'openai/gpt-5.7',
+            'actual_model': 'gpt-5.7',
+            'actual_model_ref': 'openai/gpt-5.7',
+            'cohort': f'{SHORT_TERM_DECIDER_AGENT_NAME}|openai/gpt-5.7',
+        }
+        try:
+            with TestSessionLocal() as session:
+                for snapshot_id, symbol, identity in (
+                    (1, '111111', expected_identity),
+                    (2, '222222', other_identity),
+                    (3, '333333', None),
+                ):
+                    snapshot = _snapshot_object(snapshot_id=snapshot_id, symbol=symbol)
+                    snapshot.response_payload = {'tactical_action': 'scalp_buy_candidate'}
+                    snapshot.response_summary_payload = {
+                        'decision_provenance': {'model_identity': identity}
+                        if identity is not None
+                        else {}
+                    }
+                    session.add(snapshot)
+                    session.flush()
+                    session.add(
+                        SignalDeciderRealizedOutcome(
+                            decision_snapshot_id=snapshot.id,
+                            market_date=snapshot.market_date,
+                            symbol=symbol,
+                            policy_version=snapshot.policy_version,
+                            decision_action='buy',
+                            horizon_days=5,
+                            outcome_status='complete',
+                            bars_observed=5,
+                            close_return_pct=Decimal('0.01'),
+                        )
+                    )
+                session.commit()
+
+            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+                dataset = DeciderReplayRepository().list_replay_trades(
+                    market_date_from=date(2026, 6, 16),
+                    market_date_to=date(2026, 6, 16),
+                    agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                    symbols=None,
+                    horizon_days=5,
+                    cost_assumptions=DeciderReplayCostAssumptions(),
+                )
+
+            self.assertEqual([trade.snapshot_id for trade in dataset], [1])
+            self.assertEqual(dataset.source_decision_count, 3)
+            self.assertEqual(
+                dataset.excluded_reason_counts,
+                {
+                    'model_identity_cohort_mismatch': 1,
+                    'model_identity_unverified': 1,
+                },
+            )
+            self.assertEqual(
+                dataset.diagnostics['model_identity_cohort'],
+                f'{SHORT_TERM_DECIDER_AGENT_NAME}|openai/gpt-5.6-sol',
+            )
+        finally:
+            Base.metadata.drop_all(engine, tables=reversed(tables))
+            engine.dispose()
+
     def test_short_term_replay_uses_tactical_action_instead_of_legacy_generic_buy(self) -> None:
         engine = create_engine('sqlite+pysqlite:///:memory:')
         event.listen(engine, 'connect', _enable_sqlite_foreign_keys)
@@ -1129,6 +1228,16 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                 for snapshot_id, agent_name, symbol, response_payload in snapshot_specs:
                     snapshot = _snapshot_object(snapshot_id=snapshot_id, symbol=symbol)
                     snapshot.agent_name = agent_name
+                    snapshot.response_summary_payload = {
+                        'decision_provenance': {
+                            'model_identity': build_observed_model_identity(
+                                role=agent_name,
+                                expected_model='openai/gpt-5.6-sol',
+                                actual_provider='openai',
+                                actual_model='gpt-5.6-sol',
+                            )
+                        }
+                    }
                     snapshot.response_payload = response_payload
                     session.add(snapshot)
                     session.flush()
@@ -1281,6 +1390,16 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     snapshot.feedback_id = feedback_id
                     snapshot.market_date = market_date
                     snapshot.agent_name = SIGNAL_DECIDER_AGENT_NAME
+                    snapshot.response_summary_payload = {
+                        'decision_provenance': {
+                            'model_identity': build_observed_model_identity(
+                                role=SIGNAL_DECIDER_AGENT_NAME,
+                                expected_model='openai/gpt-5.6-sol',
+                                actual_provider='openai',
+                                actual_model='gpt-5.6-sol',
+                            )
+                        }
+                    }
                     snapshot.decision_run_id = f'run-{snapshot_id}'
                     snapshot.decision_action = action
                     snapshot.policy_version = policy_version
@@ -1392,7 +1511,16 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                 input_feature_snapshot_payload={},
                 request_payload={'symbol_day_context': {'symbol': symbol}},
                 response_payload={'tactical_action': 'watch_for_trigger'},
-                response_summary_payload={},
+                response_summary_payload={
+                    'decision_provenance': {
+                        'model_identity': build_observed_model_identity(
+                            role=SHORT_TERM_DECIDER_AGENT_NAME,
+                            expected_model='openai/gpt-5.6-sol',
+                            actual_provider='openai',
+                            actual_model='gpt-5.6-sol',
+                        )
+                    }
+                },
             )
             session.add(snapshot)
             session.flush()

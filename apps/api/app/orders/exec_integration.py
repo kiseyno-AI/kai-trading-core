@@ -4,12 +4,14 @@ import asyncio
 from collections import Counter, defaultdict
 import copy
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import math
 import re
 from typing import Any, Iterable, Sequence
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -32,7 +34,13 @@ from app.market.session import (
 )
 from app.orders.execution_handoff_contract import (
     EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
+    EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
+    EXECUTION_HANDOFF_CAPABILITY,
+    EXECUTION_HANDOFF_CONTRACT_VERSION,
+    EXECUTION_HANDOFF_SOURCE,
     EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+    EXECUTION_REVOCATION_CAPABILITY,
+    EXECUTION_REVOCATION_SCHEMA_VERSION,
     EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
     EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION,
     serialize_exec_agent_decider_handoff_payload,
@@ -40,10 +48,17 @@ from app.orders.execution_handoff_contract import (
     serialize_execution_dashboard_freshness_payload,
     serialize_execution_monitored_symbols_payload,
     serialize_execution_plan_dispatch_payload,
+    serialize_execution_revocation_payload,
     serialize_execution_runtime_exec_card_payload,
     serialize_execution_runtime_status_payload,
     serialize_execution_symbol_detail_payload,
     serialize_execution_today_activity_payload,
+    validate_execution_plan_dispatch_ack,
+    validate_execution_revocation_ack,
+)
+from app.orders.buy_authority_bridge import (
+    build_core_buy_authority_observation,
+    core_exec_buy_authority_bridge,
 )
 from app.orders.exec_payload_slimming import (
     compact_exec_item_link,
@@ -60,10 +75,19 @@ from app.orders.next_open_execution import (
     ELIGIBILITY_MONITOR_CANDIDATE,
     EXECUTION_STATUS_AWAITING_TRIGGER,
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+    EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
     EXECUTION_STATUS_PLANNED,
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     EXECUTION_WINDOW_NEXT_OPEN,
+    NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION,
+    SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW,
+    SHORT_TERM_MIN_REWARD_RISK_RATIO,
+    UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE,
+    _execution_plan_row_authority_fingerprint,
+    _current_route_live_market_buy_authority,
+    _is_canonical_closed_market_cost_absence,
+    _load_live_market_snapshot_context,
     _async_previous_trading_day,
     async_normalize_next_open_target_trade_date,
     signal_decider_next_open_execution_service,
@@ -76,7 +100,6 @@ from app.quotes.display_prices import (
 )
 from app.quotes.kis_realtime_prices import kis_realtime_price_service
 from app.repositories.symbol_repository import load_symbols
-from app.us_equities.kis_market_codes import to_kis_order_exchange
 
 INTEGRATION_MODE_DISABLED = 'disabled'
 INTEGRATION_MODE_OBSERVE = 'observe'
@@ -96,6 +119,7 @@ EXEC_ENTRY_BUY_INTENTS = {EXEC_INTENT_NEXT_OPEN_BUY, EXEC_INTENT_INTRADAY_WATCH_
 EXEC_SOURCE_SCHEMA_VERSION = EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION
 
 EXEC_DISPATCH_STATUS_PREVIEW = 'preview'
+EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK = 'pending_remote_ack'
 EXEC_DISPATCH_STATUS_ACCEPTED = 'accepted'
 EXEC_DISPATCH_STATUS_PARTIAL = 'partial'
 EXEC_DISPATCH_STATUS_FAILED = 'failed'
@@ -105,6 +129,10 @@ EXEC_DISPATCH_STATUS_NOT_CONFIGURED = 'not_configured'
 EXEC_DISPATCH_STATUS_CONTRACT_ERROR = 'contract_error'
 EXEC_DISPATCH_STATUS_UNAVAILABLE = 'unavailable'
 MULTI_ACCOUNT_EXEC_ENDPOINT_UNSUPPORTED = 'multi_account_exec_endpoint_unsupported'
+LIVE_EXEC_ACCOUNT_TARGET_REQUIRED = 'live_exec_account_target_required'
+EXEC_DESTINATION_BINDING_SCHEMA_VERSION = 'core_exec_destination_binding_v1'
+EXEC_DISPATCH_PROOF_SCHEMA_VERSION = 'core_exec_dispatch_proof_v2'
+EXEC_POSITION_SCOPE_PROOF_SCHEMA_VERSION = 'execution_position_plan_scope_v1'
 
 REMOTE_FETCH_STATUS_OK = 'ok'
 REMOTE_FETCH_STATUS_DISABLED = 'disabled'
@@ -225,8 +253,8 @@ EXEC_WATCH_READBACK_ACTIVE_STATUSES = EXEC_MONITORING_ACTIVE_STATUSES | EXEC_AGE
     'watch_buy_submitted',
     'watch_monitoring_pending',
 }
-MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = Decimal('2.0')
-MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = Decimal('1.25')
+MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = Decimal('1.0')
+MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_DEFAULT_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_REQUIRED_EXEC_GATES = [
     'kill_switch',
@@ -256,6 +284,23 @@ DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION = EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEM
 DASHBOARD_TODAY_ACTIVITY_BROKER_ORDER_ID_LIMIT = 5
 
 MARKET_TIME_ZONE = ZoneInfo('Asia/Seoul')
+DELEGATED_GATE_POLICY_VERSION = 'core_delegated_gate_policy_v1'
+DELEGATED_GATE_LIQUIDITY_CODE = 'short_term_liquidity_floor_block_delegated_to_exec_watch'
+DELEGATED_GATE_REWARD_RISK_CODE = 'short_term_reward_risk_ratio_block_delegated_to_exec_watch'
+DELEGATED_GATE_LIVE_COST_CODE = 'transaction_cost_evidence_pending_live_delegated_to_exec_watch'
+DELEGATED_GATE_REQUIRED_FIELDS = frozenset(
+    {
+        'code',
+        'observed_value',
+        'field_path',
+        'comparator',
+        'threshold',
+        'policy_version',
+        'observed_at',
+        'recheck_source',
+        'expires_at',
+    }
+)
 CALENDAR_FALLBACK_STATUSES = {
     CALENDAR_SOURCE_STATUS_FALLBACK,
     CALENDAR_SOURCE_STATUS_MISSING_DATE,
@@ -282,6 +327,47 @@ def _normalize_optional_text(value: Any, *, lowercase: bool = False) -> str | No
     return normalized.lower() if lowercase else normalized
 
 
+def _unsupported_exec_sizing_route_reason(
+    traceability: object,
+) -> str | None:
+    payload = traceability if isinstance(traceability, dict) else {}
+    market = str(payload.get('market') or '').strip().upper()
+    exchange = str(payload.get('exchange') or '').strip().upper()
+    currency = str(payload.get('currency') or '').strip().upper()
+    asset_class = str(payload.get('asset_class') or '').strip().lower()
+    broker = str(payload.get('broker') or '').strip().lower()
+    provider = str(payload.get('provider') or '').strip().lower()
+    venue = str(payload.get('venue') or '').strip().lower()
+    session_policy = (
+        payload.get('session_policy')
+        if isinstance(payload.get('session_policy'), dict)
+        else {}
+    )
+    timezone_name = str(session_policy.get('timezone') or '').strip().lower()
+    us_route_markers = {'US', 'NASDAQ', 'NASD', 'NYSE', 'NYSE_AMERICAN', 'AMEX'}
+    if (
+        market in us_route_markers
+        or exchange in us_route_markers
+        or currency == 'USD'
+        or asset_class == 'us_equity'
+        or timezone_name == 'america/new_york'
+    ):
+        return 'unsupported_us_equity_exec_agent_sizing'
+    if (
+        (market and market not in {'KRX', 'KOSPI', 'KOSDAQ', 'KONEX'})
+        or (exchange and exchange not in {'KRX', 'KOSPI', 'KOSDAQ', 'KONEX'})
+        or (currency and currency != 'KRW')
+        or (asset_class and asset_class not in {'stock', 'kr_equity'})
+        or (broker and broker != 'kis')
+        or (provider and provider != 'kis')
+        or (venue and venue != 'kis')
+        or (timezone_name and timezone_name != 'asia/seoul')
+        or session_policy.get('allow_extended_hours') is True
+    ):
+        return 'unsupported_execution_route_for_v4'
+    return None
+
+
 def _normalize_date(value: str | date | None) -> date:
     if isinstance(value, date):
         return value
@@ -303,9 +389,10 @@ def _safe_decimal(value: Any) -> Decimal | None:
     if value is None or value == '':
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
+        return parsed if parsed.is_finite() else None
     except (InvalidOperation, ValueError):
         return None
 
@@ -318,17 +405,18 @@ def _positive_decimal(value: Any) -> Decimal | None:
 
 
 def _decimal_to_text(value: Decimal | None) -> str | None:
-    if value is None:
+    if value is None or not value.is_finite():
         return None
     return format(value, 'f')
 
 
 def _to_json_number(value: Decimal | None) -> int | float | None:
-    if value is None:
+    if value is None or not value.is_finite():
         return None
     if value == value.to_integral():
         return int(value)
-    return float(value)
+    rendered = float(value)
+    return rendered if math.isfinite(rendered) else None
 
 
 def _market_regime_multiplier_cap(market_regime: str | None) -> Decimal:
@@ -353,13 +441,30 @@ def _build_market_regime_sizing_policy(market_regime_context: dict[str, Any]) ->
         raw_multiplier = recommended_sizing_multiplier
     else:
         raw_multiplier = Decimal('1')
-    cap = _market_regime_multiplier_cap(market_regime)
-    multiplier = min(max(raw_multiplier, Decimal('0')), cap)
     sizing_window = (
         copy.deepcopy(market_regime_context.get('sizing_window'))
         if isinstance(market_regime_context.get('sizing_window'), dict)
         else None
     )
+    cap = _market_regime_multiplier_cap(market_regime)
+    sizing_window_cap = _safe_decimal((sizing_window or {}).get('quantity_multiplier_cap'))
+    if sizing_window_cap is not None:
+        cap = min(cap, max(sizing_window_cap, Decimal('0')))
+    multiplier = min(max(raw_multiplier, Decimal('0')), cap)
+    live_upsize_status = _normalize_optional_text(
+        market_regime_context.get('live_upsize_status'),
+        lowercase=True,
+    )
+    if live_upsize_status is None:
+        live_upsize_status = (
+            'shadow_only_uncalibrated'
+            if market_regime in {'aggressive_open', 'trend_day'}
+            else 'not_applicable'
+        )
+    if sizing_window is not None:
+        sizing_window['quantity_multiplier_cap'] = _to_json_number(cap)
+        sizing_window['entry_priority_boost'] = False
+        sizing_window['live_upsize_status'] = live_upsize_status
     valid_until = (
         _normalize_optional_text(market_regime_context.get('valid_until'))
         or _normalize_optional_text((sizing_window or {}).get('valid_until'))
@@ -372,7 +477,8 @@ def _build_market_regime_sizing_policy(market_regime_context: dict[str, Any]) ->
         'quantity_multiplier': _to_json_number(multiplier),
         'raw_quantity_multiplier': _to_json_number(raw_multiplier),
         'quantity_multiplier_cap': _to_json_number(cap),
-        'entry_priority_boost': bool(market_regime_context.get('entry_priority_boost')),
+        'entry_priority_boost': False,
+        'live_upsize_status': live_upsize_status,
         'valid_until': valid_until,
         'sizing_window': sizing_window,
         'exec_must_enforce_window': market_regime in {'aggressive_open', 'trend_day'},
@@ -385,6 +491,8 @@ def _build_market_regime_sizing_policy(market_regime_context: dict[str, Any]) ->
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return _decimal_to_text(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, date):
@@ -439,6 +547,217 @@ def _collect_items(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload.get('plan'), dict):
         return [payload['plan']]
     return []
+
+
+def _delegated_gate_codes(
+    validation: dict[str, Any],
+    *,
+    decision_agent_name: str,
+) -> list[str]:
+    warnings = validation.get('warnings') if isinstance(validation.get('warnings'), list) else []
+    normalized_agent_name = _normalize_optional_text(decision_agent_name, lowercase=True)
+    allowed_codes = (
+        {DELEGATED_GATE_LIQUIDITY_CODE, DELEGATED_GATE_REWARD_RISK_CODE}
+        if normalized_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+        else {DELEGATED_GATE_LIVE_COST_CODE}
+        if normalized_agent_name == SIGNAL_DECIDER_AGENT_NAME
+        else set()
+    )
+    codes: list[str] = []
+    for warning in warnings:
+        if not isinstance(warning, dict):
+            continue
+        code = _normalize_optional_text(warning.get('code'), lowercase=True)
+        if code not in allowed_codes or code in codes:
+            continue
+        codes.append(code)
+    return codes
+
+
+def _delegated_gate_observed_at(snapshot: SignalDeciderDecisionSnapshot | None) -> datetime | None:
+    observed_at = getattr(snapshot, 'feedback_received_at', None)
+    if not isinstance(observed_at, datetime):
+        return None
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        return None
+    return observed_at.astimezone(timezone.utc)
+
+
+def _delegated_gates(
+    *,
+    row: SignalDeciderExecutionPlanItem,
+    snapshot: SignalDeciderDecisionSnapshot | None,
+    validation: dict[str, Any],
+    codes: Sequence[str],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    observed_at = _delegated_gate_observed_at(snapshot)
+    evaluated_at = now or _utcnow()
+    if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
+        return []
+    evaluated_at = evaluated_at.astimezone(timezone.utc)
+    expires_at = datetime.combine(
+        row.target_trade_date,
+        time(hour=15, minute=30),
+        tzinfo=MARKET_TIME_ZONE,
+    )
+    if (
+        observed_at is None
+        or observed_at > evaluated_at
+        or observed_at > expires_at
+        or evaluated_at >= expires_at
+    ):
+        return []
+    observed_at_text = observed_at.isoformat()
+    expires_at_text = expires_at.isoformat()
+    short_term_quality = (
+        validation.get('short_term_entry_quality')
+        if isinstance(validation.get('short_term_entry_quality'), dict)
+        else {}
+    )
+    performance_gate = (
+        validation.get('performance_gate')
+        if isinstance(validation.get('performance_gate'), dict)
+        else {}
+    )
+    economics = (
+        performance_gate.get('expected_return_economics')
+        if isinstance(performance_gate.get('expected_return_economics'), dict)
+        else {}
+    )
+    gate_specs: dict[str, dict[str, Any]] = {
+        DELEGATED_GATE_LIQUIDITY_CODE: {
+            'observed_value': _decimal_to_text(
+                _safe_decimal(short_term_quality.get('raw_trading_value_krw'))
+            ),
+            'field_path': 'risk_context.validation.short_term_entry_quality.raw_trading_value_krw',
+            'comparator': 'gte',
+            'threshold': _decimal_to_text(SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW),
+            'recheck_source': 'exec_trigger_time_market_liquidity',
+        },
+        DELEGATED_GATE_REWARD_RISK_CODE: {
+            'observed_value': _decimal_to_text(
+                _safe_decimal(short_term_quality.get('reward_risk_ratio'))
+            ),
+            'field_path': 'risk_context.validation.short_term_entry_quality.reward_risk_ratio',
+            'comparator': 'gte',
+            'threshold': _decimal_to_text(SHORT_TERM_MIN_REWARD_RISK_RATIO),
+            'recheck_source': 'exec_trigger_time_price_geometry_and_cost_model',
+        },
+    }
+    if (
+        economics.get('status') == 'pending_live_cost_confirmation'
+        and economics.get('expected_slippage_bps') is None
+        and economics.get('expected_slippage_basis') == 'unavailable'
+    ):
+        gate_specs[DELEGATED_GATE_LIVE_COST_CODE] = {
+            'observed_value': None,
+            'field_path': 'risk_context.execution_feasibility_context.expected_slippage_bps',
+            'comparator': 'finite_non_negative_with_basis',
+            'threshold': '0',
+            'recheck_source': 'exec_trigger_time_quote_and_cost_model',
+        }
+    return [
+        {
+            'code': code,
+            **gate_specs[code],
+            'policy_version': DELEGATED_GATE_POLICY_VERSION,
+            'observed_at': observed_at_text,
+            'expires_at': expires_at_text,
+        }
+        for code in codes
+        if code in gate_specs
+    ]
+
+
+def _delegated_gate_contract_error(
+    *,
+    decision_agent_name: str,
+    codes: Any,
+    confirmation_required: Any,
+    gates: Any,
+    now: datetime | None = None,
+) -> str | None:
+    if not isinstance(codes, list) or not isinstance(gates, list):
+        return 'delegated_gate_collections_invalid'
+    if confirmation_required is not bool(codes):
+        return 'delegated_gate_confirmation_mismatch'
+    normalized_agent_name = _normalize_optional_text(decision_agent_name, lowercase=True)
+    allowed_codes = (
+        {DELEGATED_GATE_LIQUIDITY_CODE, DELEGATED_GATE_REWARD_RISK_CODE}
+        if normalized_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+        else {DELEGATED_GATE_LIVE_COST_CODE}
+        if normalized_agent_name == SIGNAL_DECIDER_AGENT_NAME
+        else set()
+    )
+    if (
+        any(not isinstance(code, str) or code not in allowed_codes for code in codes)
+        or len(codes) != len(set(codes))
+    ):
+        return 'delegated_gate_code_not_allowlisted'
+    if len(gates) != len(codes):
+        return 'delegated_gate_count_mismatch'
+    if any(not isinstance(gate, dict) for gate in gates):
+        return 'delegated_gate_shape_invalid'
+    if [gate.get('code') for gate in gates] != codes:
+        return 'delegated_gate_code_binding_mismatch'
+
+    evaluated_at = now or _utcnow()
+    if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
+        return 'delegated_gate_evaluation_time_invalid'
+    evaluated_at = evaluated_at.astimezone(timezone.utc)
+    field_contracts = {
+        DELEGATED_GATE_LIQUIDITY_CODE: {
+            'field_path': 'risk_context.validation.short_term_entry_quality.raw_trading_value_krw',
+            'comparator': 'gte',
+            'threshold': _decimal_to_text(SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW),
+            'recheck_source': 'exec_trigger_time_market_liquidity',
+        },
+        DELEGATED_GATE_REWARD_RISK_CODE: {
+            'field_path': 'risk_context.validation.short_term_entry_quality.reward_risk_ratio',
+            'comparator': 'gte',
+            'threshold': _decimal_to_text(SHORT_TERM_MIN_REWARD_RISK_RATIO),
+            'recheck_source': 'exec_trigger_time_price_geometry_and_cost_model',
+        },
+        DELEGATED_GATE_LIVE_COST_CODE: {
+            'field_path': 'risk_context.execution_feasibility_context.expected_slippage_bps',
+            'comparator': 'finite_non_negative_with_basis',
+            'threshold': '0',
+            'recheck_source': 'exec_trigger_time_quote_and_cost_model',
+        },
+    }
+    for gate in gates:
+        if set(gate) != DELEGATED_GATE_REQUIRED_FIELDS:
+            return 'delegated_gate_fields_invalid'
+        code = gate['code']
+        expected_fields = field_contracts[code]
+        if gate.get('policy_version') != DELEGATED_GATE_POLICY_VERSION or any(
+            gate.get(key) != value for key, value in expected_fields.items()
+        ):
+            return 'delegated_gate_policy_binding_invalid'
+        try:
+            observed_at = datetime.fromisoformat(str(gate.get('observed_at') or ''))
+            expires_at = datetime.fromisoformat(str(gate.get('expires_at') or ''))
+        except ValueError:
+            return 'delegated_gate_timestamp_invalid'
+        if (
+            observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+            or observed_at.astimezone(timezone.utc) > evaluated_at
+            or evaluated_at >= expires_at.astimezone(timezone.utc)
+        ):
+            return 'delegated_gate_timestamp_invalid'
+        if code == DELEGATED_GATE_LIVE_COST_CODE:
+            if gate.get('observed_value') is not None:
+                return 'delegated_gate_observed_value_invalid'
+        else:
+            observed_value = _safe_decimal(gate.get('observed_value'))
+            threshold = _safe_decimal(gate.get('threshold'))
+            if observed_value is None or threshold is None or observed_value >= threshold:
+                return 'delegated_gate_observed_value_invalid'
+    return None
 
 
 def _extract_field(payload: dict[str, Any], *names: str) -> Any:
@@ -597,20 +916,334 @@ def _fingerprint_exec_plan(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _row_has_accepted_exec_dispatch(row: SignalDeciderExecutionPlanItem) -> bool:
-    submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
-    exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
-    return _normalize_status(exec_dispatch.get('dispatch_status')) in {
-        EXEC_DISPATCH_STATUS_ACCEPTED,
-        EXEC_DISPATCH_STATUS_PARTIAL,
+def _row_dispatch_revision_fingerprint(
+    row: SignalDeciderExecutionPlanItem,
+) -> str:
+    return _execution_plan_row_authority_fingerprint(row)
+
+
+def _dispatch_authority_row_bindings(
+    rows: Sequence[SignalDeciderExecutionPlanItem],
+    *,
+    revision_fingerprints: dict[int, str],
+) -> dict[int, dict[str, Any]]:
+    return {
+        int(row.id): {
+            'decision_snapshot_id': int(row.decision_snapshot_id),
+            'row_revision_fingerprint': revision_fingerprints[int(row.id)],
+        }
+        for row in rows
     }
 
 
-def _delta_dispatch_batch_key(rows: Sequence[SignalDeciderExecutionPlanItem]) -> str:
-    identities = sorted(
-        f'{row.id}:{row.decision_snapshot_id}:{row.symbol}'
-        for row in rows
+def _dispatch_authority_generation_conflict(
+    *,
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any] | None:
+    before_fingerprint = _normalize_optional_text(
+        before.get('generation_fingerprint')
     )
+    after_fingerprint = _normalize_optional_text(
+        after.get('generation_fingerprint')
+    )
+    if (
+        before.get('status') == 'valid'
+        and after.get('status') == 'valid'
+        and before_fingerprint
+        and before_fingerprint == after_fingerprint
+    ):
+        return None
+    reason_code = _normalize_optional_text(after.get('reason_code'))
+    if not reason_code:
+        reason_code = (
+            'current_live_market_evidence_unavailable'
+            if after.get('status') != 'valid'
+            else 'latest_snapshot_replaced'
+        )
+    return {
+        'reason_code': reason_code,
+        'replacement_action': (
+            _normalize_optional_text(after.get('replacement_action')) or 'wait'
+        ),
+        'replacement_actionable': bool(
+            after.get('replacement_actionable')
+        ),
+        'before_generation_fingerprint': before_fingerprint,
+        'after_generation_fingerprint': after_fingerprint,
+    }
+
+
+def _row_readback_revision_binding(
+    row: SignalDeciderExecutionPlanItem,
+) -> dict[str, Any]:
+    submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+    exec_dispatch = (
+        submission.get('exec_dispatch')
+        if isinstance(submission.get('exec_dispatch'), dict)
+        else {}
+    )
+    contract_proof = (
+        exec_dispatch.get('contract_proof')
+        if isinstance(exec_dispatch.get('contract_proof'), dict)
+        else None
+    )
+    normalized_proof = _json_safe(contract_proof)
+    proof_fingerprint = None
+    if normalized_proof is not None:
+        encoded_proof = json.dumps(
+            normalized_proof,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+        proof_fingerprint = hashlib.sha256(encoded_proof).hexdigest()
+    return {
+        'plan_id': _normalize_optional_text(exec_dispatch.get('plan_id')),
+        'dispatch_revision_fingerprint': _normalize_optional_text(
+            exec_dispatch.get('dispatch_revision_fingerprint')
+        ),
+        'current_row_revision_fingerprint': _row_dispatch_revision_fingerprint(row),
+        'accepted_contract_proof': _row_has_accepted_exec_dispatch(row),
+        'contract_proof_fingerprint': proof_fingerprint,
+    }
+
+
+def _recovered_dispatch_revision_fingerprints(
+    rows: Sequence[SignalDeciderExecutionPlanItem],
+    *,
+    plan_id: str,
+    plan_fingerprint: str,
+    current_revision_fingerprints: dict[int, str],
+) -> dict[int, str]:
+    recovered_revision_fingerprints = dict(current_revision_fingerprints)
+    for row in rows:
+        row_id = int(row.id)
+        submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+        exec_dispatch = (
+            submission.get('exec_dispatch')
+            if isinstance(submission.get('exec_dispatch'), dict)
+            else {}
+        )
+        if _normalize_optional_text(exec_dispatch.get('plan_id')) != plan_id:
+            continue
+        prior_plan_fingerprint = _normalize_optional_text(
+            exec_dispatch.get('plan_fingerprint')
+        )
+        if not prior_plan_fingerprint or prior_plan_fingerprint == plan_fingerprint:
+            continue
+        prior_revision_fingerprint = _normalize_optional_text(
+            exec_dispatch.get('dispatch_revision_fingerprint')
+        )
+        if prior_revision_fingerprint:
+            recovered_revision_fingerprints[row_id] = prior_revision_fingerprint
+            continue
+        legacy_binding = '|'.join((plan_id, str(row_id), prior_plan_fingerprint))
+        recovered_revision_fingerprints[row_id] = (
+            'unbound-legacy-dispatch:'
+            f'{hashlib.sha256(legacy_binding.encode("utf-8")).hexdigest()}'
+        )
+    return recovered_revision_fingerprints
+
+
+def _accepted_item_bindings_from_links(
+    item_links: Any,
+) -> list[dict[str, str]] | None:
+    if not isinstance(item_links, list) or not item_links:
+        return None
+    bindings: list[dict[str, str]] = []
+    for link in item_links:
+        if not isinstance(link, dict):
+            return None
+        core_item_key = _normalize_optional_text(link.get('core_item_key'))
+        execution_plan_id = _normalize_optional_text(link.get('exec_plan_id'))
+        execution_plan_item_id = _normalize_optional_text(
+            link.get('exec_plan_item_id')
+        )
+        if not core_item_key or not execution_plan_id or not execution_plan_item_id:
+            return None
+        bindings.append(
+            {
+                'core_item_key': core_item_key,
+                'execution_plan_id': execution_plan_id,
+                'execution_plan_item_id': execution_plan_item_id,
+            }
+        )
+    return bindings
+
+
+def _accepted_item_bindings_from_response_summary(
+    response_summary: Any,
+) -> list[dict[str, str]] | None:
+    if not isinstance(response_summary, dict):
+        return None
+    row_items = response_summary.get('row_items')
+    if not isinstance(row_items, list) or not row_items:
+        return None
+    bindings: list[dict[str, str]] = []
+    for item in row_items:
+        if not isinstance(item, dict):
+            return None
+        core_item_key = _normalize_optional_text(item.get('core_item_key'))
+        execution_plan_id = _normalize_optional_text(item.get('execution_plan_id'))
+        execution_plan_item_id = _normalize_optional_text(
+            item.get('execution_plan_item_id')
+        )
+        if not core_item_key or not execution_plan_id or not execution_plan_item_id:
+            return None
+        bindings.append(
+            {
+                'core_item_key': core_item_key,
+                'execution_plan_id': execution_plan_id,
+                'execution_plan_item_id': execution_plan_item_id,
+            }
+        )
+    return bindings
+
+
+def _row_has_accepted_exec_dispatch(row: SignalDeciderExecutionPlanItem) -> bool:
+    submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+    exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
+    if _normalize_status(exec_dispatch.get('dispatch_status')) != EXEC_DISPATCH_STATUS_ACCEPTED:
+        return False
+    plan_id = _normalize_optional_text(exec_dispatch.get('plan_id'))
+    proof = exec_dispatch.get('contract_proof') if isinstance(exec_dispatch.get('contract_proof'), dict) else {}
+    contract_ack = proof.get('contract_ack') if isinstance(proof.get('contract_ack'), dict) else {}
+    submitted_keys = proof.get('submitted_core_item_keys')
+    dispatch_material_fingerprint = _normalize_optional_text(
+        proof.get('dispatch_material_fingerprint')
+    )
+    request_summary = (
+        exec_dispatch.get('last_request_summary')
+        if isinstance(exec_dispatch.get('last_request_summary'), dict)
+        else {}
+    )
+    request_metadata = (
+        request_summary.get('metadata')
+        if isinstance(request_summary.get('metadata'), dict)
+        else {}
+    )
+    response_summary = (
+        exec_dispatch.get('last_response_summary')
+        if isinstance(exec_dispatch.get('last_response_summary'), dict)
+        else {}
+    )
+    response_contract_ack = (
+        response_summary.get('contract_ack')
+        if isinstance(response_summary.get('contract_ack'), dict)
+        else {}
+    )
+    proof_execution_plan_id = _normalize_optional_text(
+        proof.get('execution_plan_id')
+    )
+    response_execution_plan_id = _normalize_optional_text(
+        response_summary.get('execution_plan_id')
+    )
+    destination_binding = _exec_dispatch_destination_binding(exec_dispatch)
+    if (
+        not plan_id
+        or destination_binding is None
+        or destination_binding.get('account_reference')
+        != _normalize_optional_text(getattr(row, 'account_reference', None))
+        or not dispatch_material_fingerprint
+        or len(dispatch_material_fingerprint) != 64
+        or any(
+            character not in '0123456789abcdef'
+            for character in dispatch_material_fingerprint
+        )
+        or proof.get('schema_version') != EXEC_DISPATCH_PROOF_SCHEMA_VERSION
+        or not proof_execution_plan_id
+        or not response_execution_plan_id
+        or proof_execution_plan_id != response_execution_plan_id
+        or contract_ack != {
+            'schema_version': EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
+            'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+            'capability': EXECUTION_HANDOFF_CAPABILITY,
+            'plan_id': plan_id,
+            'status': EXEC_DISPATCH_STATUS_ACCEPTED,
+            'dispatch_material_fingerprint': dispatch_material_fingerprint,
+        }
+        or request_metadata.get('dispatch_material_fingerprint')
+        != dispatch_material_fingerprint
+        or response_contract_ack != contract_ack
+        or not isinstance(submitted_keys, list)
+        or not submitted_keys
+        or len(submitted_keys) != len(set(submitted_keys))
+        or proof.get('accepted_item_count') != len(submitted_keys)
+        or proof.get('rejected_item_count') != 0
+    ):
+        return False
+    item_links = exec_dispatch.get('item_links') if isinstance(exec_dispatch.get('item_links'), list) else []
+    accepted_item_bindings = _accepted_item_bindings_from_links(item_links)
+    proof_item_bindings = proof.get('accepted_item_bindings')
+    response_item_bindings = _accepted_item_bindings_from_response_summary(
+        response_summary
+    )
+    link_keys = [
+        _normalize_optional_text(link.get('core_item_key'))
+        for link in item_links
+        if isinstance(link, dict)
+    ]
+    exec_plan_ids = [
+        _normalize_optional_text(link.get('exec_plan_id'))
+        for link in item_links
+        if isinstance(link, dict)
+    ]
+    exec_plan_item_ids = [
+        _normalize_optional_text(link.get('exec_plan_item_id'))
+        for link in item_links
+        if isinstance(link, dict)
+    ]
+    links_by_key = {
+        _normalize_optional_text(link.get('core_item_key')): link
+        for link in item_links
+        if isinstance(link, dict) and _normalize_optional_text(link.get('core_item_key'))
+    }
+    return bool(
+        len(item_links) == len(submitted_keys)
+        and len(link_keys) == len(submitted_keys)
+        and len(set(link_keys)) == len(submitted_keys)
+        and len(exec_plan_ids) == len(submitted_keys)
+        and None not in exec_plan_ids
+        and len(set(exec_plan_ids)) == 1
+        and exec_plan_ids[0] == proof_execution_plan_id
+        and len(exec_plan_item_ids) == len(submitted_keys)
+        and None not in exec_plan_item_ids
+        and len(set(exec_plan_item_ids)) == len(submitted_keys)
+        and set(links_by_key) == set(submitted_keys)
+        and accepted_item_bindings is not None
+        and proof_item_bindings == accepted_item_bindings
+        and response_item_bindings == accepted_item_bindings
+        and [binding['core_item_key'] for binding in accepted_item_bindings]
+        == submitted_keys
+        and all(
+            _normalize_status(link.get('remote_status')) == EXEC_DISPATCH_STATUS_ACCEPTED
+            and _normalize_optional_text(link.get('exec_plan_id'))
+            and _normalize_optional_text(link.get('exec_plan_item_id'))
+            for link in links_by_key.values()
+        )
+    )
+
+
+def _delta_dispatch_batch_key(rows: Sequence[SignalDeciderExecutionPlanItem]) -> str:
+    identities: list[str] = []
+    for row in rows:
+        validation = row.__dict__.get('validation_payload')
+        validation = validation if isinstance(validation, dict) else {}
+        submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+        revocation = submission.get('revocation') if isinstance(submission.get('revocation'), dict) else {}
+        identities.append(
+            ':'.join(
+                (
+                    str(row.id),
+                    str(row.decision_snapshot_id),
+                    str(row.symbol),
+                    str(validation.get('preopen_policy_fingerprint') or ''),
+                    str(revocation.get('replacement_decision_snapshot_id') or ''),
+                )
+            )
+        )
+    identities.sort()
     return hashlib.sha256('|'.join(identities).encode('utf-8')).hexdigest()[:12]
 
 
@@ -624,11 +1257,29 @@ def _partition_exec_dispatch_rows(
     *,
     force: bool,
 ) -> tuple[list[SignalDeciderExecutionPlanItem], list[SignalDeciderExecutionPlanItem]]:
-    if force:
-        return [], list(rows)
-    already_dispatched = [row for row in rows if _row_has_accepted_exec_dispatch(row)]
-    pending = [row for row in rows if not _row_has_accepted_exec_dispatch(row)]
-    return already_dispatched, pending
+    del force  # Explicit retries never override a remote authority claim.
+
+    def has_remote_authority_claim(row: SignalDeciderExecutionPlanItem) -> bool:
+        if _row_has_accepted_exec_dispatch(row):
+            return True
+        submission = (
+            row.submission_payload
+            if isinstance(row.submission_payload, dict)
+            else {}
+        )
+        exec_dispatch = (
+            submission.get('exec_dispatch')
+            if isinstance(submission.get('exec_dispatch'), dict)
+            else {}
+        )
+        return _normalize_status(exec_dispatch.get('dispatch_status')) in {
+            EXEC_DISPATCH_STATUS_ACCEPTED,
+            'pending_remote_ack',
+        }
+
+    guarded = [row for row in rows if has_remote_authority_claim(row)]
+    pending = [row for row in rows if not has_remote_authority_claim(row)]
+    return guarded, pending
 
 
 def _normalize_status(value: Any) -> str | None:
@@ -686,6 +1337,109 @@ def _serialize_issue(code: str, message: str, *, retryable: bool = False, status
     return _serialize_error(code=code, message=message, retryable=retryable, status_code=status_code)
 
 
+def _normalize_exec_destination_base_url(value: Any) -> str | None:
+    raw = _normalize_optional_text(value)
+    if raw is None:
+        return None
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname.lower() if parsed.hostname else None
+    if (
+        scheme not in {'http', 'https'}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    effective_port = port or (443 if scheme == 'https' else 80)
+    rendered_host = f'[{hostname}]' if ':' in hostname else hostname
+    path = parsed.path.rstrip('/')
+    return f'{scheme}://{rendered_host}:{effective_port}{path}'
+
+
+def _exec_destination_binding_fingerprint(material: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_exec_destination_binding(
+    *,
+    base_url: Any,
+    runtime_mode: Any,
+    dispatch_source: Any,
+    account_reference: Any,
+) -> dict[str, Any]:
+    normalized_base_url = _normalize_exec_destination_base_url(base_url)
+    normalized_runtime_mode = _normalize_optional_text(runtime_mode, lowercase=True)
+    normalized_dispatch_source = _normalize_optional_text(dispatch_source)
+    normalized_account_reference = _normalize_optional_text(account_reference)
+    if normalized_base_url is None:
+        raise ValueError('Exec destination base URL is missing or unsafe')
+    if normalized_runtime_mode not in {'mock', 'paper', 'live'}:
+        raise ValueError('Exec destination runtime mode is invalid')
+    if normalized_dispatch_source is None:
+        raise ValueError('Exec destination dispatch source is missing')
+    if normalized_account_reference is None:
+        raise ValueError('Exec destination account reference is missing')
+    material = {
+        'schema_version': EXEC_DESTINATION_BINDING_SCHEMA_VERSION,
+        'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+        'base_url': normalized_base_url,
+        'runtime_mode': normalized_runtime_mode,
+        'dispatch_source': normalized_dispatch_source,
+        'account_reference': normalized_account_reference,
+    }
+    return {
+        **material,
+        'destination_fingerprint': _exec_destination_binding_fingerprint(material),
+    }
+
+
+def _validated_exec_destination_binding(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        canonical = _build_exec_destination_binding(
+            base_url=value.get('base_url'),
+            runtime_mode=value.get('runtime_mode'),
+            dispatch_source=value.get('dispatch_source'),
+            account_reference=value.get('account_reference'),
+        )
+    except ValueError:
+        return None
+    return canonical if value == canonical else None
+
+
+def _exec_dispatch_destination_binding(
+    exec_dispatch: dict[str, Any],
+) -> dict[str, Any] | None:
+    direct = _validated_exec_destination_binding(
+        exec_dispatch.get('destination_binding')
+    )
+    proof = (
+        exec_dispatch.get('contract_proof')
+        if isinstance(exec_dispatch.get('contract_proof'), dict)
+        else {}
+    )
+    proof_binding = _validated_exec_destination_binding(
+        proof.get('destination_binding')
+    )
+    if direct is None or proof_binding is None or direct != proof_binding:
+        return None
+    return direct
+
+
 class SignalDeciderExecClientError(RuntimeError):
     def __init__(
         self,
@@ -701,6 +1455,24 @@ class SignalDeciderExecClientError(RuntimeError):
         self.retryable = retryable
         self.status_code = status_code
         self.payload = payload or {}
+
+
+class SignalDeciderExecPayloadContractError(RuntimeError):
+    """Raised before dispatch when a Core-owned Exec payload cannot be proven safe."""
+
+
+def _dispatch_group_requires_core_krx_buy_authority(
+    *,
+    route_family: str,
+    rows: Sequence[SignalDeciderExecutionPlanItem],
+) -> bool:
+    return bool(
+        route_family == 'kis_krx_krw'
+        and any(
+            str(row.planned_side or '').strip().lower() == 'buy'
+            for row in rows
+        )
+    )
 
 
 class SignalDeciderExecClient:
@@ -723,11 +1495,28 @@ class SignalDeciderExecClient:
         return await self._request_json('GET', '/runtime/status')
 
     async def post_execution_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request_json('POST', '/execution-plans', json_body=payload)
+        return await self._request_json('POST', '/v4/execution-plans', json_body=payload)
+
+    async def post_buy_authority_observation(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._request_json(
+            'POST',
+            '/runtime/core-buy-authority/observations',
+            json_body=payload,
+        )
 
     async def list_execution_plans(self, *, external_plan_id: str | None = None) -> dict[str, Any]:
         params = {'external_plan_id': external_plan_id} if external_plan_id else None
-        return await self._request_json('GET', '/execution-plans', params=params)
+        return await self._request_json('GET', '/v4/execution-plans', params=params)
+
+    async def post_execution_plan_revocation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request_json(
+            'POST',
+            '/v4/execution-plans/revocations',
+            json_body=payload,
+        )
 
     async def list_orders(self, *, external_plan_id: str | None = None, symbols: Sequence[str] | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -750,11 +1539,19 @@ class SignalDeciderExecClient:
             params['symbols'] = ','.join(sorted({_normalize_optional_text(item) for item in symbols if item}))
         return await self._request_json('GET', '/executions', params=params or None)
 
-    async def list_positions(self, *, symbols: Sequence[str] | None = None) -> dict[str, Any]:
+    async def list_positions(
+        self,
+        *,
+        external_plan_id: str,
+        execution_plan_id: str,
+        symbols: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {}
+        params['external_plan_id'] = external_plan_id
+        params['execution_plan_id'] = execution_plan_id
         if symbols:
             params['symbols'] = ','.join(sorted({_normalize_optional_text(item) for item in symbols if item}))
-        return await self._request_json('GET', '/positions', params=params or None)
+        return await self._request_json('GET', '/positions', params=params)
 
     async def _request_json(
         self,
@@ -843,6 +1640,200 @@ class SignalDeciderExecIntegrationService:
         self._dashboard_refresh_tasks: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
         self._dashboard_refresh_state: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
 
+    async def _synchronize_open_buy_authority(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        integration: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Deliver deterministic KRX authority before any OPEN buy dispatch."""
+
+        market_state = await async_get_market_state()
+        snapshot_context, snapshot_load_error = await asyncio.to_thread(
+            _load_live_market_snapshot_context
+        )
+        route_authority = _current_route_live_market_buy_authority(
+            target_trade_date=target_trade_date,
+            market_state=market_state,
+            snapshot_context=snapshot_context,
+            snapshot_load_error=snapshot_load_error,
+        )
+        sync: dict[str, Any] = {
+            'applies': route_authority.get('applies') is True,
+            'route_action': route_authority.get('action'),
+            'route_status': route_authority.get('status'),
+            'source_observed_at': route_authority.get('observed_at'),
+            'accounts': {},
+            'errors': [],
+        }
+        if not sync['applies']:
+            return sync
+
+        configured_targets, target_errors = (
+            signal_decider_next_open_execution_service._parse_account_targets()
+        )
+        if target_errors:
+            sync['errors'].extend(target_errors)
+        targets = [
+            target
+            for target in configured_targets
+            if account_reference is None
+            or target.account_reference == account_reference
+        ]
+        if not targets:
+            sync['errors'].append(
+                'No explicit configured KIS account target matched the OPEN buy-authority scope.'
+            )
+            return sync
+
+        runtime_mode = str(integration.get('runtime_mode') or '').strip().lower()
+        for target in targets:
+            try:
+                observation = build_core_buy_authority_observation(
+                    route_authority=route_authority,
+                    runtime_mode=runtime_mode,
+                    account_reference=target.account_reference,
+                )
+                staged = await asyncio.to_thread(
+                    core_exec_buy_authority_bridge.stage,
+                    observation,
+                )
+                flushed = await core_exec_buy_authority_bridge.flush_scope(
+                    scope_key=staged.scope_key,
+                    client=self.client,
+                )
+                sync['accounts'][target.account_reference] = {
+                    'scope_key': staged.scope_key,
+                    'observation_id': staged.observation_id,
+                    'dispatch_allowed': flushed.dispatch_allowed,
+                    'errors': list(flushed.errors),
+                    'ack': (
+                        flushed.ack.model_dump(mode='json')
+                        if flushed.ack is not None
+                        else None
+                    ),
+                }
+            except Exception as exc:  # noqa: BLE001 - uncertainty is a buy fence
+                sync['accounts'][target.account_reference] = {
+                    'scope_key': None,
+                    'observation_id': None,
+                    'dispatch_allowed': False,
+                    'errors': [f'{type(exc).__name__}: {exc}'],
+                    'ack': None,
+                }
+        return sync
+
+    def _destination_binding_for_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+        raw_client_base_url = getattr(self.client, 'base_url', None)
+        client_base_url = (
+            raw_client_base_url
+            if isinstance(raw_client_base_url, str)
+            and raw_client_base_url.strip()
+            else settings.signal_decider_exec_base_url
+        )
+        return _build_exec_destination_binding(
+            base_url=client_base_url,
+            runtime_mode=payload.get('mode'),
+            dispatch_source=payload.get('source'),
+            account_reference=metadata.get('account_reference'),
+        )
+
+    def _active_destination_binding(
+        self,
+        *,
+        account_reference: str,
+        integration: dict[str, Any],
+    ) -> dict[str, Any]:
+        settings_base_url = _normalize_exec_destination_base_url(
+            integration.get('base_url')
+        )
+        raw_client_base_url = getattr(self.client, 'base_url', None)
+        client_base_url = (
+            _normalize_exec_destination_base_url(raw_client_base_url)
+            if isinstance(raw_client_base_url, str)
+            and raw_client_base_url.strip()
+            else settings_base_url
+        )
+        if settings_base_url is None or client_base_url is None:
+            raise ValueError('Exec destination is not configured safely')
+        if settings_base_url != client_base_url:
+            raise ValueError('Exec client destination does not match current settings')
+        return _build_exec_destination_binding(
+            base_url=client_base_url,
+            runtime_mode=integration.get('runtime_mode'),
+            dispatch_source=integration.get('dispatch_source'),
+            account_reference=account_reference,
+        )
+
+    @staticmethod
+    def _mark_exec_destination_manual_review(
+        *,
+        row_id: int,
+        trigger: str,
+        reason_code: str,
+        expected_destination: dict[str, Any] | None,
+        active_destination: dict[str, Any] | None,
+    ) -> None:
+        now = _utcnow()
+        with session_scope() as session:
+            row = session.scalar(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id == row_id)
+                .with_for_update()
+            )
+            if row is None or row.execution_status not in {
+                'revocation_pending',
+                'revocation_manual_review',
+                EXECUTION_STATUS_SUBMITTED,
+                EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+                EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
+            }:
+                return
+            submission = (
+                copy.deepcopy(row.submission_payload)
+                if isinstance(row.submission_payload, dict)
+                else {}
+            )
+            revocation = (
+                copy.deepcopy(submission.get('revocation'))
+                if isinstance(submission.get('revocation'), dict)
+                else {}
+            )
+            exec_dispatch = (
+                submission.get('exec_dispatch')
+                if isinstance(submission.get('exec_dispatch'), dict)
+                else {}
+            )
+            reconciliation = {
+                'status': 'manual_review_required',
+                'reason_code': reason_code,
+                'observed_at': now.isoformat(),
+                'trigger': trigger,
+                'plan_id': revocation.get('plan_id')
+                or exec_dispatch.get('plan_id'),
+                'expected_destination': copy.deepcopy(expected_destination),
+                'active_destination': copy.deepcopy(active_destination),
+            }
+            submission['dispatch_reconciliation'] = reconciliation
+            if row.execution_status == 'revocation_pending':
+                submission['revocation'] = {
+                    **revocation,
+                    'status': 'manual_review_required',
+                    'manual_review_reason_code': reason_code,
+                    'manual_review_observed_at': now.isoformat(),
+                }
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_manual_review'
+            row.submission_payload = slim_signal_decider_exec_submission_payload(
+                submission
+            ).payload
+            session.flush()
+
     def integration_status(self) -> dict[str, Any]:
         mode = _normalize_optional_text(settings.signal_decider_exec_integration_mode, lowercase=True) or INTEGRATION_MODE_DISABLED
         issues: list[dict[str, Any]] = []
@@ -857,7 +1848,85 @@ class SignalDeciderExecIntegrationService:
                     message='SIGNAL_DECIDER_EXEC_BASE_URL must be configured when exec integration is enabled.',
                 )
             )
-        configured_account_targets, _ = signal_decider_next_open_execution_service._parse_account_targets()
+        normalized_base_url = _normalize_exec_destination_base_url(base_url)
+        if enabled and base_url and normalized_base_url is None:
+            issues.append(
+                _serialize_error(
+                    code='unsafe_base_url',
+                    message=(
+                        'SIGNAL_DECIDER_EXEC_BASE_URL must be an HTTP(S) origin/path '
+                        'without credentials, query parameters, or fragments.'
+                    ),
+                )
+            )
+        raw_client_base_url = getattr(self.client, 'base_url', None)
+        if (
+            enabled
+            and isinstance(raw_client_base_url, str)
+            and raw_client_base_url.strip()
+        ):
+            client_base_url = _normalize_exec_destination_base_url(
+                raw_client_base_url
+            )
+            if normalized_base_url != client_base_url:
+                issues.append(
+                    _serialize_error(
+                        code='exec_client_destination_mismatch',
+                        message=(
+                            'The active Exec client destination does not match current '
+                            'settings; restart or rebuild the client before dispatch.'
+                        ),
+                    )
+                )
+        runtime_mode = _normalize_optional_text(
+            settings.signal_decider_exec_runtime_mode,
+            lowercase=True,
+        ) or 'mock'
+        configured_dispatch_source = _normalize_optional_text(
+            settings.signal_decider_exec_dispatch_source
+        )
+        if configured_dispatch_source != EXECUTION_HANDOFF_SOURCE:
+            issues.append(
+                _serialize_error(
+                    code='invalid_dispatch_source',
+                    message=(
+                        'SIGNAL_DECIDER_EXEC_DISPATCH_SOURCE must be the canonical '
+                        f'v4 source "{EXECUTION_HANDOFF_SOURCE}".'
+                    ),
+                )
+            )
+        (
+            configured_account_targets,
+            account_target_errors,
+        ) = signal_decider_next_open_execution_service._parse_account_targets()
+        if (
+            mode == INTEGRATION_MODE_DISPATCH
+            and runtime_mode == 'live'
+            and (
+                account_target_errors
+                or len(configured_account_targets) != 1
+                or configured_account_targets[0].account_reference
+                == UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
+            )
+        ):
+            issues.append(
+                {
+                    **_serialize_error(
+                        code=LIVE_EXEC_ACCOUNT_TARGET_REQUIRED,
+                        message=(
+                            'Live Exec dispatch requires exactly one explicit valid KIS '
+                            'account target; the synthetic unspecified route is monitor-only.'
+                        ),
+                    ),
+                    'configured_account_target_count': len(
+                        configured_account_targets
+                    ),
+                    'account_target_error_count': len(account_target_errors),
+                    'required_contract': (
+                        'one_explicit_valid_kis_account_target_for_live_exec'
+                    ),
+                }
+            )
         if mode == INTEGRATION_MODE_DISPATCH and len(configured_account_targets) > 1:
             issues.append(
                 {
@@ -872,7 +1941,6 @@ class SignalDeciderExecIntegrationService:
                     'required_contract': 'one_explicit_account_target_per_exec_endpoint',
                 }
             )
-        runtime_mode = _normalize_optional_text(settings.signal_decider_exec_runtime_mode, lowercase=True) or 'mock'
         config_status = 'ready'
         if not enabled:
             config_status = REMOTE_FETCH_STATUS_DISABLED
@@ -883,16 +1951,165 @@ class SignalDeciderExecIntegrationService:
             'enabled': enabled,
             'delegate_execution': mode == INTEGRATION_MODE_DISPATCH,
             'config_status': config_status,
-            'base_url': base_url,
+            'base_url': base_url if normalized_base_url is not None else None,
             'bearer_token_configured': bool(_normalize_optional_text(settings.signal_decider_exec_bearer_token)),
-            'dispatch_source': _normalize_optional_text(settings.signal_decider_exec_dispatch_source) or 'kai-trading-core',
+            'dispatch_source': EXECUTION_HANDOFF_SOURCE,
             'runtime_mode': runtime_mode,
             'request_timeout_seconds': float(settings.signal_decider_exec_request_timeout_seconds),
             'issues': issues,
         }
 
     def should_delegate_execution(self) -> bool:
-        return self.integration_status()['delegate_execution']
+        return bool(
+            self.integration_status()['delegate_execution']
+            and settings.signal_decider_next_open_enabled
+        )
+
+    @staticmethod
+    def _row_requires_ambiguous_acceptance_reconciliation(
+        row: SignalDeciderExecutionPlanItem,
+    ) -> bool:
+        submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+        reconciliation = (
+            submission.get('dispatch_reconciliation')
+            if isinstance(submission.get('dispatch_reconciliation'), dict)
+            else {}
+        )
+        return bool(
+            row.execution_status == 'revocation_manual_review'
+            and _normalize_optional_text(
+                reconciliation.get('reason_code'),
+                lowercase=True,
+            )
+            in {
+                'ambiguous_remote_acceptance',
+                'ambiguous_remote_acceptance_after_core_revision',
+            }
+        )
+
+    @staticmethod
+    def _row_requires_destination_manual_review(
+        row: SignalDeciderExecutionPlanItem,
+    ) -> bool:
+        submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+        reconciliation = (
+            submission.get('dispatch_reconciliation')
+            if isinstance(submission.get('dispatch_reconciliation'), dict)
+            else {}
+        )
+        return bool(
+            row.execution_status == 'revocation_manual_review'
+            and _normalize_optional_text(
+                reconciliation.get('reason_code'),
+                lowercase=True,
+            )
+            in {
+                'exec_destination_binding_missing',
+                'exec_destination_binding_mismatch',
+                'exec_destination_mismatch',
+                'unproven_remote_acceptance',
+            }
+        )
+
+    def _has_ambiguous_remote_acceptance(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+    ) -> bool:
+        rows = self._load_next_open_rows(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            include_payloads=True,
+        )
+        return any(
+            self._row_requires_ambiguous_acceptance_reconciliation(row)
+            for row in rows
+        )
+
+    def should_manage_delegated_authority(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+    ) -> bool:
+        integration = self.integration_status()
+        if (
+            integration['delegate_execution']
+            and settings.signal_decider_next_open_enabled
+        ):
+            return True
+        with session_scope() as session:
+            stmt = select(SignalDeciderExecutionPlanItem).where(
+                SignalDeciderExecutionPlanItem.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+            )
+            if target_trade_date is not None:
+                stmt = stmt.where(
+                    SignalDeciderExecutionPlanItem.target_trade_date
+                    == _normalize_date(target_trade_date)
+                )
+            rows = session.execute(stmt).scalars().all()
+            for row in rows:
+                session.expunge(row)
+        for row in rows:
+            if row.execution_status in {
+                'revocation_pending',
+                EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
+            }:
+                return True
+            submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+            dispatch = (
+                submission.get('exec_dispatch')
+                if isinstance(submission.get('exec_dispatch'), dict)
+                else {}
+            )
+            if (
+                _normalize_status(dispatch.get('dispatch_status'))
+                == EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+            ):
+                return True
+            if self._row_requires_ambiguous_acceptance_reconciliation(row):
+                return True
+            if self._row_requires_destination_manual_review(row):
+                return True
+            if row.execution_status not in {
+                EXECUTION_STATUS_SUBMITTED,
+                EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+            }:
+                continue
+            if (
+                _normalize_status(dispatch.get('dispatch_status')) == EXEC_DISPATCH_STATUS_ACCEPTED
+                and isinstance(dispatch.get('item_links'), list)
+                and bool(dispatch['item_links'])
+            ):
+                return True
+        return False
+
+    async def revoke_delegated_buys_for_unavailable_market_evidence(
+        self,
+        *,
+        target_trade_date: str | date,
+        trigger: str,
+        account_reference: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably stage and synchronously flush the critical-chain BUY safety fence."""
+        resolved_target_date = _normalize_date(target_trade_date)
+        resolved_account_reference = _normalize_optional_text(account_reference)
+        staged = await asyncio.to_thread(
+            signal_decider_next_open_execution_service.stage_market_evidence_unavailable_revocations,
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            failure_source=trigger,
+        )
+        revocations = await self._flush_pending_exec_revocations(
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            integration=self.integration_status(),
+            trigger=trigger,
+        )
+        return {
+            **staged,
+            'revocations': revocations,
+        }
 
     async def runtime_status(self, *, refresh: bool = True) -> dict[str, Any]:
         integration = self.integration_status()
@@ -930,6 +2147,519 @@ class SignalDeciderExecIntegrationService:
             'runtime': runtime,
         }
 
+    @staticmethod
+    async def _inspect_dispatch_authority_generation(
+        *,
+        target_trade_date: date,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        revision_fingerprints: dict[int, str],
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                signal_decider_next_open_execution_service.inspect_dispatch_authority_generation,
+                target_trade_date=target_trade_date,
+                expected_row_bindings=_dispatch_authority_row_bindings(
+                    rows,
+                    revision_fingerprints=revision_fingerprints,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - dispatch must fail closed
+            return {
+                'status': 'invalid',
+                'generation_fingerprint': None,
+                'reason_code': 'current_live_market_evidence_unavailable',
+                'replacement_action': 'reject',
+                'replacement_actionable': False,
+                'error_type': type(exc).__name__,
+            }
+
+    async def _reconcile_pending_dispatch_write_ahead(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        integration: dict[str, Any],
+        buy_authority_sync: dict[str, Any],
+        trigger: str,
+    ) -> list[dict[str, Any]]:
+        rows = self._load_next_open_rows(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            include_payloads=True,
+        )
+        pending_rows = [
+            row
+            for row in rows
+            if row.execution_status
+            == EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+            or _normalize_status(
+                (
+                    row.submission_payload.get('exec_dispatch')
+                    if isinstance(row.submission_payload, dict)
+                    and isinstance(row.submission_payload.get('exec_dispatch'), dict)
+                    else {}
+                ).get('dispatch_status')
+            )
+            == 'pending_remote_ack'
+        ]
+        results: list[dict[str, Any]] = []
+        for plan_id, group_rows in self._group_rows_by_plan_id(pending_rows).items():
+            if not plan_id or not group_rows:
+                continue
+            exec_states = [
+                row.submission_payload['exec_dispatch']
+                for row in group_rows
+                if isinstance(row.submission_payload, dict)
+                and isinstance(row.submission_payload.get('exec_dispatch'), dict)
+            ]
+            expected_destination = (
+                _validated_exec_destination_binding(
+                    exec_states[0].get('destination_binding')
+                )
+                if len(exec_states) == len(group_rows)
+                else None
+            )
+            try:
+                active_destination = self._active_destination_binding(
+                    account_reference=str(group_rows[0].account_reference),
+                    integration=integration,
+                )
+            except ValueError:
+                active_destination = None
+            destination_matches = bool(
+                expected_destination is not None
+                and active_destination == expected_destination
+                and all(
+                    _validated_exec_destination_binding(
+                        state.get('destination_binding')
+                    )
+                    == expected_destination
+                    for state in exec_states
+                )
+            )
+            if not destination_matches:
+                reason_code = (
+                    'exec_destination_binding_missing'
+                    if expected_destination is None
+                    else 'exec_destination_mismatch'
+                )
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code=reason_code,
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': reason_code,
+                    }
+                )
+                continue
+
+            if any(
+                str(row.planned_side or '').strip().lower() != 'buy'
+                for row in group_rows
+            ):
+                reason_code = (
+                    'dispatch_write_ahead_non_buy_invariant_violation'
+                )
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code=reason_code,
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': reason_code,
+                    }
+                )
+                continue
+
+            dispatch_material_fingerprints = {
+                _normalize_optional_text(
+                    state.get('dispatch_material_fingerprint')
+                )
+                for state in exec_states
+            }
+            plan_fingerprints = {
+                _normalize_optional_text(state.get('plan_fingerprint'))
+                for state in exec_states
+            }
+            revision_fingerprints = {
+                int(row.id): _normalize_optional_text(
+                    row.submission_payload['exec_dispatch'].get(
+                        'dispatch_revision_fingerprint'
+                    )
+                )
+                for row in group_rows
+            }
+            if (
+                None in dispatch_material_fingerprints
+                or len(dispatch_material_fingerprints) != 1
+                or None in plan_fingerprints
+                or len(plan_fingerprints) != 1
+                or any(value is None for value in revision_fingerprints.values())
+            ):
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code='dispatch_write_ahead_invalid',
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': 'dispatch_write_ahead_invalid',
+                    }
+                )
+                continue
+
+            batch_keys = {
+                _normalize_optional_text(state.get('dispatch_batch_key'))
+                for state in exec_states
+            }
+            delta_batch_key = next(iter(batch_keys)) if len(batch_keys) == 1 else None
+            try:
+                payload, row_links = self._build_exec_plan_payload(
+                    rows=group_rows,
+                    snapshots=self._load_snapshots(group_rows),
+                    trigger=f'{trigger}_write_ahead_recovery',
+                    delta_batch_key=delta_batch_key,
+                )
+            except SignalDeciderExecPayloadContractError:
+                payload = {}
+                row_links = {}
+            expected_material_fingerprint = next(
+                iter(dispatch_material_fingerprints)
+            )
+            expected_plan_fingerprint = next(iter(plan_fingerprints))
+            reconstructed_core_keys = {
+                str(link.get('core_item_key'))
+                for links in row_links.values()
+                for link in links
+                if isinstance(link, dict) and link.get('core_item_key')
+            }
+            stored_core_keys = {
+                str(link.get('core_item_key'))
+                for state in exec_states
+                for link in (state.get('item_links') or [])
+                if isinstance(link, dict) and link.get('core_item_key')
+            }
+            row_core_key_bindings_match = all(
+                {
+                    str(link.get('core_item_key'))
+                    for link in (
+                        row.submission_payload['exec_dispatch'].get(
+                            'item_links'
+                        )
+                        or []
+                    )
+                    if isinstance(link, dict) and link.get('core_item_key')
+                }
+                == {
+                    str(link.get('core_item_key'))
+                    for link in row_links.get(int(row.id), [])
+                    if isinstance(link, dict) and link.get('core_item_key')
+                }
+                for row in group_rows
+            )
+            local_material_matches = bool(
+                payload
+                and payload.get('plan_id') == plan_id
+                and payload.get('metadata', {}).get(
+                    'dispatch_material_fingerprint'
+                )
+                == expected_material_fingerprint
+                and _fingerprint_exec_plan(payload) == expected_plan_fingerprint
+                and reconstructed_core_keys == stored_core_keys
+                and reconstructed_core_keys
+                and row_core_key_bindings_match
+            )
+            if not local_material_matches:
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code='dispatch_write_ahead_material_mismatch',
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': 'dispatch_write_ahead_material_mismatch',
+                    }
+                )
+                continue
+
+            try:
+                readback = await self.client.list_execution_plans(
+                    external_plan_id=plan_id
+                )
+            except SignalDeciderExecClientError as exc:
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'reconciliation_unavailable',
+                        'error': _serialize_error(
+                            code=exc.code,
+                            message=str(exc),
+                            retryable=exc.retryable,
+                            status_code=exc.status_code,
+                        ),
+                    }
+                )
+                continue
+            remote_plans = _collect_items(readback)
+            remote_plan = next(
+                (
+                    item
+                    for item in remote_plans
+                    if _normalize_optional_text(
+                        item.get('plan_id') or item.get('external_plan_id')
+                    )
+                    == plan_id
+                ),
+                None,
+            )
+            if remote_plan is None:
+                can_retry = bool(
+                    integration.get('delegate_execution')
+                    and integration.get('config_status') == 'ready'
+                    and settings.signal_decider_next_open_enabled
+                )
+                authority_generation_before = (
+                    exec_states[0].get('authority_generation_before')
+                    if isinstance(
+                        exec_states[0].get('authority_generation_before'),
+                        dict,
+                    )
+                    else None
+                )
+                authority_generation_after = (
+                    await self._inspect_dispatch_authority_generation(
+                        target_trade_date=target_trade_date,
+                        rows=group_rows,
+                        revision_fingerprints={
+                            row_id: str(value)
+                            for row_id, value in revision_fingerprints.items()
+                        },
+                    )
+                )
+                generation_unchanged = bool(
+                    authority_generation_before is not None
+                    and _dispatch_authority_generation_conflict(
+                        before=authority_generation_before,
+                        after=authority_generation_after,
+                    )
+                    is None
+                )
+                if not generation_unchanged:
+                    self._release_not_found_dispatch_write_ahead(
+                        rows=group_rows,
+                        submitted_revision_fingerprints={
+                            row_id: str(value)
+                            for row_id, value in revision_fingerprints.items()
+                        },
+                        plan_id=plan_id,
+                        plan_fingerprint=str(expected_plan_fingerprint),
+                        dispatch_material_fingerprint=str(
+                            expected_material_fingerprint
+                        ),
+                        destination_binding=expected_destination,
+                        trigger=trigger,
+                        reason_code='dispatch_authority_generation_changed',
+                    )
+                    results.append(
+                        {
+                            'plan_id': plan_id,
+                            'status': 'not_found_write_ahead_released',
+                            'reason_code': 'dispatch_authority_generation_changed',
+                        }
+                    )
+                    continue
+                if not can_retry:
+                    results.append(
+                        {
+                            'plan_id': plan_id,
+                            'status': 'not_found_pending_retry',
+                            'reason_code': 'execution_control_disabled',
+                        }
+                    )
+                    continue
+                required_authority_accounts = {
+                    scoped_account
+                    for (
+                        scoped_account,
+                        _decision_agent_name,
+                        route_family,
+                    ), scoped_rows in self._group_rows_by_dispatch_scope(
+                        group_rows
+                    ).items()
+                    if _dispatch_group_requires_core_krx_buy_authority(
+                        route_family=route_family,
+                        rows=scoped_rows,
+                    )
+                }
+                if (
+                    required_authority_accounts
+                    and buy_authority_sync.get('applies') is True
+                ):
+                    synchronized_accounts = buy_authority_sync.get('accounts')
+                    account_results = (
+                        synchronized_accounts
+                        if isinstance(synchronized_accounts, dict)
+                        else {}
+                    )
+                    blocked_accounts = sorted(
+                        scoped_account
+                        for scoped_account in required_authority_accounts
+                        if not isinstance(
+                            account_results.get(scoped_account),
+                            dict,
+                        )
+                        or not account_results[scoped_account].get(
+                            'dispatch_allowed'
+                        )
+                    )
+                    if blocked_accounts:
+                        results.append(
+                            {
+                                'plan_id': plan_id,
+                                'status': 'not_found_pending_retry',
+                                'reason_code': (
+                                    'core_exec_buy_authority_not_acknowledged'
+                                ),
+                                'blocked_account_references': blocked_accounts,
+                            }
+                        )
+                        continue
+                try:
+                    candidate_response = await self.client.post_execution_plan(
+                        payload
+                    )
+                except SignalDeciderExecClientError as exc:
+                    candidate_response = (
+                        await self._recover_duplicate_dispatch_response(
+                            plan_id=plan_id,
+                            row_links=row_links,
+                            expected_dispatch_material_fingerprint=str(
+                                expected_material_fingerprint
+                            ),
+                        )
+                        if (
+                            exc.status_code == 409
+                            or exc.retryable
+                            or exc.code == EXEC_DISPATCH_STATUS_UNAVAILABLE
+                        )
+                        else None
+                    )
+                    if candidate_response is None:
+                        self._persist_dispatch_failure(
+                            rows=group_rows,
+                            submitted_revision_fingerprints={
+                                row_id: str(value)
+                                for row_id, value in revision_fingerprints.items()
+                            },
+                            row_links=row_links,
+                            plan_id=plan_id,
+                            fingerprint=str(expected_plan_fingerprint),
+                            payload=payload,
+                            trigger=f'{trigger}_write_ahead_retry',
+                            status=self._client_error_status(exc),
+                            error=_serialize_error(
+                                code=exc.code,
+                                message=str(exc),
+                                retryable=exc.retryable,
+                                status_code=exc.status_code,
+                            ),
+                            remote_acceptance_ambiguous=True,
+                        )
+                        results.append(
+                            {
+                                'plan_id': plan_id,
+                                'status': 'manual_review_required',
+                                'reason_code': 'ambiguous_remote_acceptance',
+                            }
+                        )
+                        continue
+                persisted = self._persist_dispatch_success(
+                    rows=group_rows,
+                    submitted_revision_fingerprints={
+                        row_id: str(value)
+                        for row_id, value in revision_fingerprints.items()
+                    },
+                    row_links=row_links,
+                    plan_id=plan_id,
+                    fingerprint=str(expected_plan_fingerprint),
+                    payload=payload,
+                    response_payload=candidate_response,
+                    trigger=f'{trigger}_write_ahead_retry',
+                    authority_generation_before=authority_generation_before,
+                )
+                results.append({'plan_id': plan_id, **persisted})
+                if persisted.get('dispatch_status') == 'revocation_pending':
+                    await self._flush_pending_exec_revocations(
+                        target_trade_date=target_trade_date,
+                        account_reference=str(
+                            group_rows[0].account_reference
+                        ),
+                        integration=integration,
+                        trigger=(
+                            f'{trigger}_write_ahead_retry_revision_fence'
+                        ),
+                    )
+                continue
+            candidate_response = {
+                'plan_id': remote_plan.get('plan_id') or plan_id,
+                'execution_plan_id': remote_plan.get('execution_plan_id'),
+                'contract_ack': remote_plan.get('contract_ack'),
+                'accepted_item_count': remote_plan.get('accepted_item_count'),
+                'rejected_item_count': remote_plan.get('rejected_item_count'),
+                'item_acks': remote_plan.get('item_acks'),
+            }
+            authority_generation_before = (
+                exec_states[0].get('authority_generation_before')
+                if isinstance(exec_states[0].get('authority_generation_before'), dict)
+                else None
+            )
+            persisted = self._persist_dispatch_success(
+                rows=group_rows,
+                submitted_revision_fingerprints={
+                    row_id: str(value)
+                    for row_id, value in revision_fingerprints.items()
+                },
+                row_links=row_links,
+                plan_id=plan_id,
+                fingerprint=str(expected_plan_fingerprint),
+                payload=payload,
+                response_payload=candidate_response,
+                trigger=f'{trigger}_write_ahead_recovery',
+                authority_generation_before=authority_generation_before,
+            )
+            results.append({'plan_id': plan_id, **persisted})
+            if persisted.get('dispatch_status') == 'revocation_pending':
+                await self._flush_pending_exec_revocations(
+                    target_trade_date=target_trade_date,
+                    account_reference=str(group_rows[0].account_reference),
+                    integration=integration,
+                    trigger=f'{trigger}_write_ahead_recovery_revision_fence',
+                )
+        return results
+
     async def dispatch_next_open_plan(
         self,
         *,
@@ -954,6 +2684,116 @@ class SignalDeciderExecIntegrationService:
         )
         calendar_day = await async_get_krx_calendar_day(resolved_target_date, allow_fallback=True)
         source_market_date = await _async_previous_trading_day(resolved_target_date)
+
+        execution_control_disabled = bool(
+            integration['mode'] != INTEGRATION_MODE_DISPATCH
+            or not settings.signal_decider_next_open_enabled
+        )
+        buy_authority_sync: dict[str, Any] = {
+            'applies': False,
+            'accounts': {},
+            'errors': [],
+        }
+        if not execution_control_disabled:
+            buy_authority_sync = await self._synchronize_open_buy_authority(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                integration=integration,
+            )
+
+        await self._reconcile_pending_dispatch_write_ahead(
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            integration=integration,
+            buy_authority_sync=buy_authority_sync,
+            trigger=trigger,
+        )
+
+        managed_delegated_authority = bool(
+            execution_control_disabled
+            and self.should_manage_delegated_authority(
+                target_trade_date=resolved_target_date,
+            )
+        )
+        if execution_control_disabled and (
+            not resolved_dry_run
+            or managed_delegated_authority
+        ):
+            if (
+                managed_delegated_authority
+                and _normalize_optional_text(integration.get('base_url'))
+                and self._has_ambiguous_remote_acceptance(
+                    target_trade_date=resolved_target_date,
+                    account_reference=resolved_account_reference,
+                )
+            ):
+                await self._refresh_exec_readback(
+                    target_trade_date=resolved_target_date,
+                    account_reference=resolved_account_reference,
+                    symbol=None,
+                    trigger=f'{trigger}_ambiguous_acceptance_reconciliation',
+                    runtime_payload={
+                        'status': 'reconciliation',
+                        'payload': None,
+                        'error': None,
+                    },
+                )
+            await asyncio.to_thread(
+                signal_decider_next_open_execution_service.stage_execution_control_revocations,
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+            )
+            revocation_results = await self._flush_pending_exec_revocations(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                integration=integration,
+                trigger=trigger,
+            )
+            plan_view = signal_decider_next_open_execution_service.list_plan_items(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                refresh=False,
+            )
+            return {
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'account_reference': resolved_account_reference,
+                    'refresh_plan': refresh_plan,
+                    'dry_run': resolved_dry_run,
+                    'force': force,
+                    'trigger': trigger,
+                },
+                'integration': integration,
+                'dispatch': {'groups': [], 'preview_plans': []},
+                'summary': {
+                    **(plan_view.get('summary') or {}),
+                    'delegated_to_exec': True,
+                    'triggered': False,
+                    'reason': (
+                        'execution_disabled'
+                        if not settings.signal_decider_next_open_enabled
+                        else 'execution_control_disabled'
+                    ),
+                    'dispatch_mode': integration['mode'],
+                    'translated_item_count': 0,
+                    'dispatched_group_count': 0,
+                    'failed_group_count': sum(
+                        result.get('status') not in {'revoked', 'manual_review_required'}
+                        for result in revocation_results
+                    ),
+                    'skipped_group_count': 0,
+                    'preview_group_count': 0,
+                    'revoked_group_count': sum(
+                        result.get('status') == 'revoked'
+                        for result in revocation_results
+                    ),
+                    'revocation_manual_review_count': sum(
+                        result.get('status') == 'manual_review_required'
+                        for result in revocation_results
+                    ),
+                },
+                'items': plan_view.get('items') or [],
+            }
 
         if not force and not resolved_dry_run and _calendar_day_requires_operator_override(calendar_day):
             plan_view = signal_decider_next_open_execution_service.list_plan_items(
@@ -1057,6 +2897,23 @@ class SignalDeciderExecIntegrationService:
                 trigger=f'{trigger}_dispatch',
             )
 
+        revocation_results = await self._flush_pending_exec_revocations(
+            target_trade_date=resolved_target_date,
+            account_reference=resolved_account_reference,
+            integration=integration,
+            trigger=trigger,
+        )
+        if any(
+            result.get('status') == 'revoked' and result.get('replacement_actionable')
+            for result in revocation_results
+        ):
+            await asyncio.to_thread(
+                signal_decider_next_open_execution_service.refresh_plan_items,
+                target_trade_date=resolved_target_date,
+                trigger=f'{trigger}_revocation_ack_refresh',
+                force=force,
+            )
+
         if enrichment_preflight is not None and not force and not enrichment_preflight.get('allowed'):
             existing_rows = self._load_next_open_rows(
                 target_trade_date=resolved_target_date,
@@ -1102,6 +2959,7 @@ class SignalDeciderExecIntegrationService:
                         'trigger': trigger,
                     },
                     'integration': integration,
+                    'buy_authority_sync': buy_authority_sync,
                     'dispatch': {
                         'groups': [],
                         'preview_plans': [],
@@ -1129,6 +2987,14 @@ class SignalDeciderExecIntegrationService:
             target_trade_date=resolved_target_date,
             account_reference=resolved_account_reference,
         )
+        if self._fence_unproven_remote_acceptance(
+            rows=rows,
+            trigger=trigger,
+        ):
+            rows = self._load_next_open_rows(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+            )
         snapshots = self._load_snapshots(rows)
         grouped = self._group_rows_by_dispatch_scope(rows)
 
@@ -1139,7 +3005,7 @@ class SignalDeciderExecIntegrationService:
         skipped_group_count = 0
         preview_plans: list[dict[str, Any]] = []
 
-        for (account_key, decision_agent_name), account_rows in grouped.items():
+        for (account_key, decision_agent_name, route_family), account_rows in grouped.items():
             eligible_rows = [row for row in account_rows if self._row_is_dispatchable(row)]
             if not eligible_rows:
                 skipped_group_count += 1
@@ -1153,6 +3019,41 @@ class SignalDeciderExecIntegrationService:
                     }
                 )
                 continue
+
+            if (
+                _dispatch_group_requires_core_krx_buy_authority(
+                    route_family=route_family,
+                    rows=eligible_rows,
+                )
+                and buy_authority_sync.get('applies') is True
+            ):
+                account_authority = (
+                    buy_authority_sync.get('accounts', {}).get(account_key)
+                    if isinstance(buy_authority_sync.get('accounts'), dict)
+                    else None
+                )
+                if not isinstance(account_authority, dict) or not account_authority.get(
+                    'dispatch_allowed'
+                ):
+                    skipped_group_count += 1
+                    group_results.append(
+                        {
+                            'account_reference': account_key,
+                            'decision_agent_name': decision_agent_name,
+                            'dispatch_status': EXEC_DISPATCH_STATUS_SKIPPED,
+                            'message': (
+                                'Core OPEN buy authority was not acknowledged as '
+                                'allowing this exact Exec account scope.'
+                            ),
+                            'reason': 'core_exec_buy_authority_not_acknowledged',
+                            'eligible_count': len(eligible_rows),
+                            'buy_authority': account_authority,
+                            'buy_authority_errors': (
+                                buy_authority_sync.get('errors') or []
+                            ),
+                        }
+                    )
+                    continue
 
             already_dispatched_rows, dispatch_rows = _partition_exec_dispatch_rows(
                 eligible_rows,
@@ -1185,15 +3086,133 @@ class SignalDeciderExecIntegrationService:
                 if already_dispatched_rows
                 else None
             )
-            plan_payload, row_links = self._build_exec_plan_payload(
-                rows=dispatch_rows,
-                snapshots=snapshots,
-                trigger=trigger,
-                delta_batch_key=delta_batch_key,
-            )
+            try:
+                plan_payload, row_links = self._build_exec_plan_payload(
+                    rows=dispatch_rows,
+                    snapshots=snapshots,
+                    trigger=trigger,
+                    delta_batch_key=delta_batch_key,
+                )
+            except SignalDeciderExecPayloadContractError as exc:
+                contract_message = str(exc)
+                contract_reason_code = next(
+                    (
+                        reason_code
+                        for reason_code in (
+                            'unsupported_us_equity_exec_agent_sizing',
+                            'unsupported_execution_route_for_v4',
+                            LIVE_EXEC_ACCOUNT_TARGET_REQUIRED,
+                        )
+                        if reason_code in contract_message
+                    ),
+                    None,
+                )
+                unsupported_route_reason = (
+                    contract_reason_code
+                    if contract_reason_code
+                    in {
+                        'unsupported_us_equity_exec_agent_sizing',
+                        'unsupported_execution_route_for_v4',
+                    }
+                    else None
+                )
+                if unsupported_route_reason is not None:
+                    self._persist_unsupported_execution_route(
+                        rows=dispatch_rows,
+                        trigger=trigger,
+                        reason_code=unsupported_route_reason,
+                    )
+                failed_group_count += 1
+                group_results.append(
+                    {
+                        'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
+                        'dispatch_status': EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
+                        'eligible_count': len(eligible_rows),
+                        'already_dispatched_count': len(already_dispatched_rows),
+                        'dispatch_candidate_count': len(dispatch_rows),
+                        'translated_item_count': 0,
+                        'error': _serialize_error(
+                            code=(
+                                'execution_handoff_route_unsupported'
+                                if unsupported_route_reason is not None
+                                else contract_reason_code
+                                or 'delegated_gate_contract_invalid'
+                            ),
+                            message=contract_message,
+                        ),
+                    }
+                )
+                continue
             translated_item_count += len(plan_payload['items'])
             plan_id = _normalize_optional_text(plan_payload.get('plan_id')) or 'unknown-plan'
             fingerprint = _fingerprint_exec_plan(plan_payload)
+            dispatch_revision_fingerprints = {
+                int(row.id): _row_dispatch_revision_fingerprint(row)
+                for row in dispatch_rows
+            }
+            authority_generation_before: dict[str, Any] | None = None
+            if not resolved_dry_run:
+                authority_generation_before = (
+                    await self._inspect_dispatch_authority_generation(
+                        target_trade_date=resolved_target_date,
+                        rows=dispatch_rows,
+                        revision_fingerprints=dispatch_revision_fingerprints,
+                    )
+                )
+                if authority_generation_before.get('status') != 'valid':
+                    reason_code = _normalize_optional_text(
+                        authority_generation_before.get('reason_code')
+                    ) or 'current_live_market_evidence_unavailable'
+                    fence_error: dict[str, Any] | None = None
+                    generation_fence: dict[str, Any] | None = None
+                    try:
+                        generation_fence = await asyncio.to_thread(
+                            signal_decider_next_open_execution_service.apply_dispatch_authority_generation_fence,
+                            target_trade_date=resolved_target_date,
+                            expected_row_bindings=_dispatch_authority_row_bindings(
+                                dispatch_rows,
+                                revision_fingerprints=dispatch_revision_fingerprints,
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - no POST on uncertain authority
+                        fence_error = _serialize_error(
+                            code='dispatch_authority_fence_failed',
+                            message=str(exc),
+                            retryable=True,
+                        )
+                        if reason_code == 'current_live_market_evidence_unavailable':
+                            await asyncio.to_thread(
+                                signal_decider_next_open_execution_service.stage_market_evidence_unavailable_revocations,
+                                target_trade_date=resolved_target_date,
+                                account_reference=account_key,
+                                failure_source=f'{trigger}_predispatch_generation_fence',
+                            )
+                    generation_revocations = await self._flush_pending_exec_revocations(
+                        target_trade_date=resolved_target_date,
+                        account_reference=account_key,
+                        integration=integration,
+                        trigger=f'{trigger}_predispatch_generation_fence',
+                    )
+                    revocation_results.extend(generation_revocations)
+                    skipped_group_count += 1
+                    group_results.append(
+                        {
+                            'account_reference': account_key,
+                            'decision_agent_name': decision_agent_name,
+                            'plan_id': plan_id,
+                            'dispatch_status': EXEC_DISPATCH_STATUS_SKIPPED,
+                            'eligible_count': len(eligible_rows),
+                            'already_dispatched_count': len(already_dispatched_rows),
+                            'dispatch_candidate_count': len(dispatch_rows),
+                            'translated_item_count': len(plan_payload['items']),
+                            'reason': reason_code,
+                            'authority_generation': authority_generation_before,
+                            'generation_fence': generation_fence,
+                            'error': fence_error,
+                        }
+                    )
+                    continue
 
             if not force and self._rows_match_existing_dispatch(dispatch_rows, plan_id=plan_id, fingerprint=fingerprint):
                 skipped_group_count += 1
@@ -1239,6 +3258,7 @@ class SignalDeciderExecIntegrationService:
                 failed_group_count += 1
                 self._persist_dispatch_failure(
                     rows=dispatch_rows,
+                    submitted_revision_fingerprints=dispatch_revision_fingerprints,
                     row_links=row_links,
                     plan_id=plan_id,
                     fingerprint=fingerprint,
@@ -1269,6 +3289,42 @@ class SignalDeciderExecIntegrationService:
                 continue
 
             try:
+                destination_binding = self._destination_binding_for_payload(
+                    plan_payload
+                )
+                self._persist_dispatch_write_ahead(
+                    rows=dispatch_rows,
+                    submitted_revision_fingerprints=dispatch_revision_fingerprints,
+                    row_links=row_links,
+                    plan_id=plan_id,
+                    fingerprint=fingerprint,
+                    payload=plan_payload,
+                    trigger=trigger,
+                    destination_binding=destination_binding,
+                    authority_generation_before=authority_generation_before,
+                )
+            except ValueError as exc:
+                failed_group_count += 1
+                group_results.append(
+                    {
+                        'account_reference': account_key,
+                        'decision_agent_name': decision_agent_name,
+                        'plan_id': plan_id,
+                        'dispatch_status': EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
+                        'eligible_count': len(eligible_rows),
+                        'already_dispatched_count': len(already_dispatched_rows),
+                        'dispatch_candidate_count': len(dispatch_rows),
+                        'translated_item_count': len(plan_payload['items']),
+                        'error': _serialize_error(
+                            code='dispatch_write_ahead_failed',
+                            message=str(exc),
+                            retryable=True,
+                        ),
+                    }
+                )
+                continue
+
+            try:
                 response_payload = await self.client.post_execution_plan(plan_payload)
             except SignalDeciderExecClientError as exc:
                 recoverable_dispatch_error = bool(
@@ -1280,18 +3336,50 @@ class SignalDeciderExecIntegrationService:
                     response_payload = await self._recover_duplicate_dispatch_response(
                         plan_id=plan_id,
                         row_links=row_links,
+                        expected_dispatch_material_fingerprint=plan_payload['metadata'][
+                            'dispatch_material_fingerprint'
+                        ],
                     )
                     if response_payload is not None:
+                        recovered_revision_fingerprints = (
+                            _recovered_dispatch_revision_fingerprints(
+                                dispatch_rows,
+                                plan_id=plan_id,
+                                plan_fingerprint=fingerprint,
+                                current_revision_fingerprints=(
+                                    dispatch_revision_fingerprints
+                                ),
+                            )
+                        )
                         persisted_group_result = self._persist_dispatch_success(
                             rows=dispatch_rows,
+                            submitted_revision_fingerprints=(
+                                recovered_revision_fingerprints
+                            ),
                             row_links=row_links,
                             plan_id=plan_id,
                             fingerprint=fingerprint,
                             payload=plan_payload,
                             response_payload=response_payload,
                             trigger=trigger,
+                            authority_generation_before=(
+                                authority_generation_before
+                            ),
                         )
-                        dispatched_group_count += 1
+                        if persisted_group_result['dispatch_status'] == 'revocation_pending':
+                            post_ack_revocations = await self._flush_pending_exec_revocations(
+                                target_trade_date=resolved_target_date,
+                                account_reference=account_key,
+                                integration=integration,
+                                trigger=f'{trigger}_revision_fence',
+                            )
+                            revocation_results.extend(post_ack_revocations)
+                        if persisted_group_result['dispatch_status'] == EXEC_DISPATCH_STATUS_CONTRACT_ERROR:
+                            failed_group_count += 1
+                        elif persisted_group_result['dispatch_status'] == 'revocation_pending':
+                            skipped_group_count += 1
+                        else:
+                            dispatched_group_count += 1
                         group_results.append(
                             {
                                 'account_reference': account_key,
@@ -1315,6 +3403,7 @@ class SignalDeciderExecIntegrationService:
                 failed_group_count += 1
                 self._persist_dispatch_failure(
                     rows=dispatch_rows,
+                    submitted_revision_fingerprints=dispatch_revision_fingerprints,
                     row_links=row_links,
                     plan_id=plan_id,
                     fingerprint=fingerprint,
@@ -1327,6 +3416,7 @@ class SignalDeciderExecIntegrationService:
                         retryable=exc.retryable,
                         status_code=exc.status_code,
                     ),
+                    remote_acceptance_ambiguous=True,
                 )
                 group_results.append(
                     {
@@ -1350,14 +3440,29 @@ class SignalDeciderExecIntegrationService:
 
             persisted_group_result = self._persist_dispatch_success(
                 rows=dispatch_rows,
+                submitted_revision_fingerprints=dispatch_revision_fingerprints,
                 row_links=row_links,
                 plan_id=plan_id,
                 fingerprint=fingerprint,
                 payload=plan_payload,
                 response_payload=response_payload,
                 trigger=trigger,
+                authority_generation_before=authority_generation_before,
             )
-            dispatched_group_count += 1
+            if persisted_group_result['dispatch_status'] == 'revocation_pending':
+                post_ack_revocations = await self._flush_pending_exec_revocations(
+                    target_trade_date=resolved_target_date,
+                    account_reference=account_key,
+                    integration=integration,
+                    trigger=f'{trigger}_revision_fence',
+                )
+                revocation_results.extend(post_ack_revocations)
+            if persisted_group_result['dispatch_status'] == EXEC_DISPATCH_STATUS_CONTRACT_ERROR:
+                failed_group_count += 1
+            elif persisted_group_result['dispatch_status'] == 'revocation_pending':
+                skipped_group_count += 1
+            else:
+                dispatched_group_count += 1
             group_results.append(
                 {
                     'account_reference': account_key,
@@ -1386,6 +3491,13 @@ class SignalDeciderExecIntegrationService:
             'failed_group_count': failed_group_count,
             'skipped_group_count': skipped_group_count,
             'preview_group_count': len(preview_plans),
+            'revoked_group_count': sum(
+                result.get('status') == 'revoked' for result in revocation_results
+            ),
+            'revocation_manual_review_count': sum(
+                result.get('status') == 'manual_review_required'
+                for result in revocation_results
+            ),
             'enrichment_preflight_allowed': (
                 bool(enrichment_preflight.get('allowed')) if enrichment_preflight else None
             ),
@@ -1406,6 +3518,7 @@ class SignalDeciderExecIntegrationService:
                 'trigger': trigger,
             },
             'integration': integration,
+            'buy_authority_sync': buy_authority_sync,
             'dispatch': {
                 'groups': group_results,
                 'preview_plans': preview_plans,
@@ -1415,11 +3528,182 @@ class SignalDeciderExecIntegrationService:
             'items': plan_view.get('items') or [],
         }
 
+    async def _flush_pending_exec_revocations(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        integration: dict[str, Any],
+        trigger: str,
+    ) -> list[dict[str, Any]]:
+        rows = self._load_next_open_rows(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            include_payloads=True,
+        )
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            if row.execution_status != 'revocation_pending':
+                continue
+            submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+            revocation = submission.get('revocation') if isinstance(submission.get('revocation'), dict) else {}
+            item_links = revocation.get('item_links') if isinstance(revocation.get('item_links'), list) else []
+            expected_destination = _validated_exec_destination_binding(
+                revocation.get('destination_binding')
+            )
+            exec_dispatch = (
+                submission.get('exec_dispatch')
+                if isinstance(submission.get('exec_dispatch'), dict)
+                else {}
+            )
+            accepted_destination = (
+                _exec_dispatch_destination_binding(exec_dispatch)
+                if exec_dispatch
+                else None
+            )
+            try:
+                active_destination = self._active_destination_binding(
+                    account_reference=str(row.account_reference),
+                    integration=integration,
+                )
+            except ValueError:
+                active_destination = None
+            destination_reason_code: str | None = None
+            if expected_destination is None:
+                destination_reason_code = 'exec_destination_binding_missing'
+            elif accepted_destination is not None and (
+                accepted_destination != expected_destination
+            ):
+                destination_reason_code = 'exec_destination_binding_mismatch'
+            elif active_destination is not None and (
+                active_destination != expected_destination
+            ):
+                destination_reason_code = 'exec_destination_mismatch'
+            if destination_reason_code is not None:
+                self._mark_exec_destination_manual_review(
+                    row_id=int(row.id),
+                    trigger=trigger,
+                    reason_code=destination_reason_code,
+                    expected_destination=expected_destination,
+                    active_destination=active_destination,
+                )
+                results.append(
+                    {
+                        'row_id': row.id,
+                        'status': 'manual_review_required',
+                        'reason_code': destination_reason_code,
+                        'trigger': trigger,
+                    }
+                )
+                continue
+            if active_destination is None:
+                results.append({'row_id': row.id, 'status': 'not_configured'})
+                continue
+            try:
+                request_payload = serialize_execution_revocation_payload(
+                    {
+                        'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                        'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                        'required_capability': EXECUTION_REVOCATION_CAPABILITY,
+                        'plan_id': revocation.get('plan_id'),
+                        'requested_at': revocation.get('requested_at') or _utcnow().isoformat(),
+                        'reason_code': revocation.get('reason_code'),
+                        'replacement_decision_snapshot_id': revocation.get(
+                            'replacement_decision_snapshot_id'
+                        ),
+                        'replacement_action': revocation.get('replacement_action'),
+                        'items': [
+                            {
+                                'core_item_key': link.get('core_item_key'),
+                                'execution_plan_item_id': link.get('exec_plan_item_id'),
+                                'decision_snapshot_id': revocation.get('prior_decision_snapshot_id'),
+                            }
+                            for link in item_links
+                        ],
+                    }
+                )
+            except ValueError as exc:
+                results.append(
+                    {
+                        'row_id': row.id,
+                        'status': 'contract_error',
+                        'error': _serialize_error(
+                            code='execution_revocation_request_invalid',
+                            message=str(exc),
+                        ),
+                    }
+                )
+                continue
+            if not _normalize_optional_text(integration.get('base_url')):
+                results.append({'row_id': row.id, 'status': 'not_configured'})
+                continue
+            try:
+                response_payload = await self.client.post_execution_plan_revocation(request_payload)
+            except SignalDeciderExecClientError as exc:
+                if exc.status_code == 409 and isinstance(exc.payload, dict):
+                    response_payload = exc.payload
+                else:
+                    results.append(
+                        {
+                            'row_id': row.id,
+                            'status': exc.code,
+                            'error': _serialize_error(
+                                code=exc.code,
+                                message=str(exc),
+                                retryable=exc.retryable,
+                                status_code=exc.status_code,
+                            ),
+                        }
+                    )
+                    continue
+            try:
+                ack_status, _ = validate_execution_revocation_ack(
+                    response_payload,
+                    plan_id=request_payload['plan_id'],
+                    submitted_core_item_keys=[
+                        item['core_item_key'] for item in request_payload['items']
+                    ],
+                    expected_reason_code=request_payload['reason_code'],
+                    submitted_items=item_links,
+                )
+                if ack_status == 'not_found':
+                    ack_status = 'manual_review_required'
+                signal_decider_next_open_execution_service.apply_exec_revocation_ack(
+                    row_id=int(row.id),
+                    request_payload=request_payload,
+                    response_payload=response_payload,
+                    ack_status=ack_status,
+                )
+            except ValueError as exc:
+                results.append(
+                    {
+                        'row_id': row.id,
+                        'status': 'contract_error',
+                        'error': _serialize_error(
+                            code='execution_revocation_ack_invalid',
+                            message=str(exc),
+                        ),
+                    }
+                )
+                continue
+            results.append(
+                {
+                    'row_id': row.id,
+                    'status': ack_status,
+                    'replacement_actionable': bool(
+                        revocation.get('replacement_actionable')
+                    ),
+                    'trigger': trigger,
+                }
+            )
+        return results
+
     async def _recover_duplicate_dispatch_response(
         self,
         *,
         plan_id: str,
         row_links: dict[int, list[dict[str, Any]]],
+        expected_dispatch_material_fingerprint: str,
     ) -> dict[str, Any] | None:
         try:
             readback = await self.client.list_execution_plans(external_plan_id=plan_id)
@@ -1436,53 +3720,34 @@ class SignalDeciderExecIntegrationService:
         )
         if not isinstance(plan, dict):
             return None
-        status = _normalize_status(plan.get('status'))
-        if status not in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL, 'accepted'}:
+        if _normalize_status(plan.get('status')) != EXEC_DISPATCH_STATUS_ACCEPTED:
             return None
-        exec_items = _collect_items(plan)
-        items_by_core_key: dict[str, dict[str, Any]] = {}
-        for item in exec_items:
-            for core_key in self._exec_plan_item_core_keys(item):
-                items_by_core_key[core_key] = item
-
-        submitted_links: list[dict[str, Any]] = []
-        submitted_core_keys: set[str] = set()
+        submitted_core_keys: list[str] = []
         for links in row_links.values():
             for link in links:
                 core_key = _normalize_optional_text(link.get('core_item_key'))
                 if core_key:
-                    submitted_links.append(link)
-                    submitted_core_keys.add(core_key)
-
-        if not submitted_core_keys:
-            return None
-        if not submitted_core_keys.issubset(set(items_by_core_key)):
-            return None
-
-        recovered_items: list[dict[str, Any]] = []
-        for link in submitted_links:
-            core_key = _normalize_optional_text(link.get('core_item_key'))
-            item = items_by_core_key.get(core_key or '')
-            if item is None:
-                return None
-            recovered_items.append(
-                {
-                    **item,
-                    'core_item_key': core_key,
-                    'status': item.get('status') or EXEC_DISPATCH_STATUS_ACCEPTED,
-                }
-            )
-        if not recovered_items:
-            return None
-        return {
-            'plan_id': plan_id,
-            'execution_plan_id': plan.get('execution_plan_id') or plan.get('id'),
-            'status': EXEC_DISPATCH_STATUS_ACCEPTED,
-            'accepted_item_count': len(recovered_items),
-            'rejected_item_count': 0,
-            'items': recovered_items,
-            'duplicate_recovered': True,
+                    submitted_core_keys.append(core_key)
+        candidate = {
+            'plan_id': plan.get('plan_id'),
+            'execution_plan_id': plan.get('execution_plan_id'),
+            'accepted_item_count': plan.get('accepted_item_count'),
+            'rejected_item_count': plan.get('rejected_item_count'),
+            'contract_ack': plan.get('contract_ack'),
+            'item_acks': plan.get('item_acks'),
         }
+        try:
+            recovered_by_key = validate_execution_plan_dispatch_ack(
+                candidate,
+                plan_id=plan_id,
+                submitted_core_item_keys=submitted_core_keys,
+                expected_dispatch_material_fingerprint=(
+                    expected_dispatch_material_fingerprint
+                ),
+            )
+        except ValueError:
+            return None
+        return candidate
 
     async def list_signal_decider_exec_overview(
         self,
@@ -2965,6 +5230,76 @@ class SignalDeciderExecIntegrationService:
                 session.expunge(row)
             return rows
 
+    @staticmethod
+    def _fence_unproven_remote_acceptance(
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        trigger: str,
+    ) -> int:
+        candidate_ids: list[int] = []
+        for row in rows:
+            submission = (
+                row.submission_payload
+                if isinstance(row.submission_payload, dict)
+                else {}
+            )
+            exec_dispatch = (
+                submission.get('exec_dispatch')
+                if isinstance(submission.get('exec_dispatch'), dict)
+                else {}
+            )
+            if (
+                _normalize_status(exec_dispatch.get('dispatch_status'))
+                == EXEC_DISPATCH_STATUS_ACCEPTED
+                and not _row_has_accepted_exec_dispatch(row)
+            ):
+                candidate_ids.append(int(row.id))
+        if not candidate_ids:
+            return 0
+
+        now = _utcnow()
+        fenced_count = 0
+        with session_scope() as session:
+            persisted_rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(candidate_ids))
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
+            ).scalars().all()
+            for row in persisted_rows:
+                submission = (
+                    copy.deepcopy(row.submission_payload)
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                exec_dispatch = (
+                    submission.get('exec_dispatch')
+                    if isinstance(submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                if (
+                    _normalize_status(exec_dispatch.get('dispatch_status'))
+                    != EXEC_DISPATCH_STATUS_ACCEPTED
+                    or _row_has_accepted_exec_dispatch(row)
+                ):
+                    continue
+                submission['dispatch_reconciliation'] = {
+                    'status': 'manual_review_required',
+                    'reason_code': 'unproven_remote_acceptance',
+                    'observed_at': now.isoformat(),
+                    'trigger': trigger,
+                    'plan_id': exec_dispatch.get('plan_id'),
+                    'raw_dispatch_status': exec_dispatch.get('dispatch_status'),
+                }
+                row.eligibility_status = 'blocked'
+                row.execution_status = 'revocation_manual_review'
+                row.submission_payload = slim_signal_decider_exec_submission_payload(
+                    submission
+                ).payload
+                fenced_count += 1
+            session.flush()
+        return fenced_count
+
     def _load_snapshots(
         self,
         rows: Sequence[SignalDeciderExecutionPlanItem],
@@ -2985,23 +5320,95 @@ class SignalDeciderExecIntegrationService:
     @staticmethod
     def _group_rows_by_dispatch_scope(
         rows: Sequence[SignalDeciderExecutionPlanItem],
-    ) -> dict[tuple[str, str], list[SignalDeciderExecutionPlanItem]]:
-        grouped: dict[tuple[str, str], list[SignalDeciderExecutionPlanItem]] = defaultdict(list)
+    ) -> dict[tuple[str, str, str], list[SignalDeciderExecutionPlanItem]]:
+        grouped: dict[
+            tuple[str, str, str],
+            list[SignalDeciderExecutionPlanItem],
+        ] = defaultdict(list)
         for row in rows:
-            grouped[(row.account_reference, _normalize_decision_agent_name(row.decision_agent_name))].append(row)
+            route_family = _unsupported_exec_sizing_route_reason(
+                row.traceability_payload
+            ) or 'kis_krx_krw'
+            grouped[
+                (
+                    row.account_reference,
+                    _normalize_decision_agent_name(row.decision_agent_name),
+                    route_family,
+                )
+            ].append(row)
         return grouped
 
     @staticmethod
     def _row_is_dispatchable(row: SignalDeciderExecutionPlanItem) -> bool:
+        if str(row.planned_side or '').strip().lower() != 'buy':
+            return False
         decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
         if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
             if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
                 return False
         elif row.eligibility_status != ELIGIBILITY_ELIGIBLE:
             return False
-        if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
-            return True
         validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+        if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+            if (
+                validation.get('execution_cost_evidence_policy_version')
+                != NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION
+                or validation.get('blocking_reasons')
+            ):
+                return False
+            pre_decider_context = validation.get('pre_decider_enrichment_context')
+            if (
+                not isinstance(pre_decider_context, dict)
+                or pre_decider_context.get('schema_version') != 'pre_decider_enrichment_v1'
+            ):
+                return False
+            rebuilt_quality = build_decision_input_quality_envelope(
+                market_date=row.source_market_date.isoformat(),
+                pre_decider_enrichment_context=pre_decider_context,
+            )
+            execution_feasibility = rebuilt_quality['execution_feasibility']
+            performance_gate = validation.get('performance_gate')
+            economics = (
+                performance_gate.get('expected_return_economics')
+                if isinstance(performance_gate, dict)
+                and isinstance(performance_gate.get('expected_return_economics'), dict)
+                else {}
+            )
+            if economics.get('status') == 'pending_live_cost_confirmation':
+                warning_codes = {
+                    item.get('code')
+                    for item in validation.get('warnings') or []
+                    if isinstance(item, dict)
+                }
+                return bool(
+                    DELEGATED_GATE_LIVE_COST_CODE in warning_codes
+                    and 'expected_slippage_bps' in economics
+                    and economics.get('expected_slippage_bps') is None
+                    and economics.get('expected_slippage_basis') == 'unavailable'
+                    and economics.get('server_non_spread_round_trip_cost_basis')
+                    == 'deferred_to_exec_final_full_cost_check'
+                    and 'estimated_total_transaction_cost_bps' in economics
+                    and economics.get('estimated_total_transaction_cost_bps') is None
+                    and _is_canonical_closed_market_cost_absence(
+                        pre_decider_enrichment_context=pre_decider_context,
+                        execution_feasibility_context=execution_feasibility,
+                    )
+                )
+            rebuilt_slippage = _safe_decimal(execution_feasibility.get('expected_slippage_bps'))
+            admitted_slippage = _safe_decimal(economics.get('expected_slippage_bps'))
+            return bool(
+                economics.get('status') == 'ready'
+                and rebuilt_slippage is not None
+                and rebuilt_slippage >= 0
+                and rebuilt_slippage == admitted_slippage
+                and execution_feasibility.get('expected_slippage_basis') == 'quote_spread_bps'
+                and economics.get('expected_slippage_basis') == 'quote_spread_bps'
+                and economics.get('server_non_spread_round_trip_cost_basis')
+                == 'deferred_to_exec_final_full_cost_check'
+                and economics.get('estimated_total_transaction_cost_bps') is None
+            )
+        if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
+            return False
         if validation.get('blocking_reasons'):
             return False
         traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
@@ -3255,10 +5662,37 @@ class SignalDeciderExecIntegrationService:
             f'core-{_sanitize_key(decision_agent_name)}-{first_row.target_trade_date.strftime("%Y%m%d")}-'
             f'{_sanitize_key(first_row.account_reference)}'
         )
-        if delta_batch_key:
-            plan_id = _delta_dispatch_plan_id(plan_id, delta_batch_key)
+        effective_batch_key = delta_batch_key
+        if effective_batch_key is None and any(
+            isinstance(row.submission_payload, dict)
+            and bool(row.submission_payload.get('revision_history'))
+            for row in rows
+        ):
+            effective_batch_key = _delta_dispatch_batch_key(rows)
+        if effective_batch_key:
+            plan_id = _delta_dispatch_plan_id(plan_id, effective_batch_key)
         runtime_mode = _normalize_optional_text(settings.signal_decider_exec_runtime_mode, lowercase=True) or 'mock'
-        dispatch_source = _normalize_optional_text(settings.signal_decider_exec_dispatch_source) or 'kai-trading-core'
+        dispatch_source = EXECUTION_HANDOFF_SOURCE
+        if runtime_mode == 'live':
+            (
+                configured_account_targets,
+                account_target_errors,
+            ) = signal_decider_next_open_execution_service._parse_account_targets()
+            expected_account_reference = (
+                configured_account_targets[0].account_reference
+                if not account_target_errors
+                and len(configured_account_targets) == 1
+                and configured_account_targets[0].account_reference
+                != UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
+                else None
+            )
+            if expected_account_reference is None or any(
+                row.account_reference != expected_account_reference for row in rows
+            ):
+                raise SignalDeciderExecPayloadContractError(
+                    f'{LIVE_EXEC_ACCOUNT_TARGET_REQUIRED}:'
+                    'live handoff rows must exactly match the one explicit KIS account target'
+                )
         items: list[dict[str, Any]] = []
         row_links: dict[int, list[dict[str, Any]]] = defaultdict(list)
         requested_at = _utcnow().isoformat()
@@ -3267,46 +5701,28 @@ class SignalDeciderExecIntegrationService:
             snapshot = snapshots.get(int(row.decision_snapshot_id))
             row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
             traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
-            raw_market = _normalize_optional_text(traceability.get('market')) or 'KRX'
-            raw_exchange = _normalize_optional_text(traceability.get('exchange')) or raw_market
-            is_us_equity = raw_market.upper() in {'US', 'NASDAQ', 'NYSE', 'NYSE_AMERICAN'}
-            if is_us_equity:
-                canonical_exchange = (
-                    raw_exchange
-                    if raw_exchange.upper() in {'NASD', 'NYSE', 'AMEX'}
-                    else to_kis_order_exchange(raw_exchange)
+            unsupported_route_reason = _unsupported_exec_sizing_route_reason(
+                traceability
+            )
+            if unsupported_route_reason is not None:
+                raise SignalDeciderExecPayloadContractError(
+                    f'{row_decision_agent_name}:{row.id}:'
+                    f'{unsupported_route_reason}'
                 )
-                execution_scope = {
-                    'asset_class': 'us_equity',
-                    'market': 'US',
-                    'exchange': canonical_exchange.upper(),
-                    'currency': 'USD',
-                    'broker': 'kis',
-                    'provider': 'kis',
-                    'venue': 'kis',
-                    'session_policy': traceability.get('session_policy')
-                    or {
-                        'session': 'regular',
-                        'timezone': 'America/New_York',
-                        'allow_extended_hours': False,
-                        'whole_shares_only': True,
-                    },
-                }
-            else:
-                execution_scope = {
-                    'asset_class': 'stock',
-                    'market': 'KRX',
-                    'exchange': 'KRX',
-                    'currency': 'KRW',
-                    'broker': 'kis',
-                    'provider': 'kis',
-                    'venue': 'kis',
-                    'session_policy': {
-                        'session': 'regular',
-                        'timezone': 'Asia/Seoul',
-                        'allow_extended_hours': False,
-                    },
-                }
+            execution_scope = {
+                'asset_class': 'stock',
+                'market': 'KRX',
+                'exchange': 'KRX',
+                'currency': 'KRW',
+                'broker': 'kis',
+                'provider': 'kis',
+                'venue': 'kis',
+                'session_policy': {
+                    'session': 'regular',
+                    'timezone': 'Asia/Seoul',
+                    'allow_extended_hours': False,
+                },
+            }
             validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
             validation = _strip_signal_decider_fixed_sizing_preview(
                 validation,
@@ -3389,6 +5805,31 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(decision_input_quality_context.get('execution_feasibility'), dict)
                 else {}
             )
+            requested_delegated_gate_codes = _delegated_gate_codes(
+                validation,
+                decision_agent_name=row_decision_agent_name,
+            )
+            delegated_gate_evaluated_at = _utcnow()
+            delegated_gates = _delegated_gates(
+                row=row,
+                snapshot=snapshot,
+                validation=validation,
+                codes=requested_delegated_gate_codes,
+                now=delegated_gate_evaluated_at,
+            )
+            delegated_gate_error = _delegated_gate_contract_error(
+                decision_agent_name=row_decision_agent_name,
+                codes=requested_delegated_gate_codes,
+                confirmation_required=bool(requested_delegated_gate_codes),
+                gates=delegated_gates,
+                now=delegated_gate_evaluated_at,
+            )
+            if delegated_gate_error is not None:
+                raise SignalDeciderExecPayloadContractError(
+                    f'{row_decision_agent_name}:{row.id}:{delegated_gate_error}'
+                )
+            delegated_gate_codes = [gate['code'] for gate in delegated_gates]
+            delegated_gate_confirmation_required = bool(delegated_gates)
             alignment_gate = (
                 traceability.get('alignment_gate')
                 if isinstance(traceability.get('alignment_gate'), dict)
@@ -3504,9 +5945,15 @@ class SignalDeciderExecIntegrationService:
             )
             if enforced_probe:
                 quantity_policy = {
-                    'type': 'fixed_quantity',
-                    'quantity': _decimal_to_text(final_enforcement_quantity),
+                    'type': 'exec_agent_sized',
+                    # The v4 boundary delegates the final order quantity to
+                    # Exec. Core's WAIT-conflict decision is a hard ceiling,
+                    # not executable fixed sizing.
+                    'max_quantity': _decimal_to_text(final_enforcement_quantity),
                     'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
+                    'allocation_mode': traceability.get('allocation_mode') or 'specified',
+                    'account_reference': row.account_reference,
+                    'account_label': row.account_label,
                     'estimated_reference_price': row.estimated_reference_price,
                     'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
                     'pricing_note': 'Core-enforced deterministic WAIT-conflict probe quantity.',
@@ -3578,6 +6025,9 @@ class SignalDeciderExecIntegrationService:
                 'time_in_force': row.planned_time_in_force,
                 'risk_context': {
                     **common_risk_context,
+                    'delegated_gate_codes': delegated_gate_codes,
+                    'delegated_gate_confirmation_required': delegated_gate_confirmation_required,
+                    'delegated_gates': delegated_gates,
                     'entry_price_basis': snapshot.entry_price_basis if snapshot is not None else 'next_open',
                     'expected_return_pct': _to_json_number(_safe_decimal(snapshot.expected_return_pct if snapshot else None)),
                     'confidence_score_10': _to_json_number(
@@ -3708,6 +6158,8 @@ class SignalDeciderExecIntegrationService:
             'items': items,
             'metadata': {
                 'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'required_capability': EXECUTION_HANDOFF_CAPABILITY,
                 'agent_name': decision_agent_name,
                 'decision_agent_name': decision_agent_name,
                 'trigger': trigger,
@@ -3716,8 +6168,8 @@ class SignalDeciderExecIntegrationService:
                 'account_label': first_row.account_label,
                 'source_market_date': source_market_date,
                 'target_trade_date': first_row.target_trade_date.isoformat(),
-                'dispatch_batch_type': 'delta' if delta_batch_key else 'initial',
-                'dispatch_batch_key': delta_batch_key,
+                'dispatch_batch_type': 'delta' if effective_batch_key else 'initial',
+                'dispatch_batch_key': effective_batch_key,
             },
         }
         return serialize_execution_plan_dispatch_payload(payload), row_links
@@ -3739,10 +6191,7 @@ class SignalDeciderExecIntegrationService:
             if exec_dispatch.get('plan_fingerprint') != fingerprint:
                 matching = False
                 break
-            if _normalize_status(exec_dispatch.get('dispatch_status')) not in {
-                EXEC_DISPATCH_STATUS_ACCEPTED,
-                EXEC_DISPATCH_STATUS_PARTIAL,
-            }:
+            if not _row_has_accepted_exec_dispatch(row):
                 matching = False
                 break
         return matching
@@ -3751,6 +6200,7 @@ class SignalDeciderExecIntegrationService:
         self,
         *,
         rows: Sequence[SignalDeciderExecutionPlanItem],
+        submitted_revision_fingerprints: dict[int, str],
         row_links: dict[int, list[dict[str, Any]]],
         plan_id: str,
         fingerprint: str,
@@ -3758,20 +6208,85 @@ class SignalDeciderExecIntegrationService:
         trigger: str,
         status: str,
         error: dict[str, Any],
+        remote_acceptance_ambiguous: bool = False,
     ) -> None:
         now = _utcnow()
         row_ids = [int(row.id) for row in rows]
+        submitted_by_id = {int(row.id): row for row in rows}
+        if set(submitted_revision_fingerprints) != set(row_ids):
+            raise ValueError('dispatch revision fingerprints must bind every submitted row')
         with session_scope() as session:
             persisted_rows = session.execute(
-                select(SignalDeciderExecutionPlanItem).where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                .with_for_update()
             ).scalars().all()
             for row in persisted_rows:
-                row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
-                existing_submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+                submitted_row = submitted_by_id[int(row.id)]
+                submitted_revision_fingerprint = submitted_revision_fingerprints[
+                    int(row.id)
+                ]
+                current_revision_fingerprint = _row_dispatch_revision_fingerprint(row)
+                if row.execution_status in {
+                    'revocation_pending',
+                    'revocation_manual_review',
+                    'revoked',
+                }:
+                    continue
+                existing_submission = (
+                    copy.deepcopy(row.submission_payload)
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
                 existing_exec = (
                     existing_submission.get('exec_dispatch')
                     if isinstance(existing_submission.get('exec_dispatch'), dict)
                     else {}
+                )
+                expected_core_keys = {
+                    str(link['core_item_key'])
+                    for link in row_links.get(int(row.id), [])
+                }
+                write_ahead_core_keys = {
+                    str(link.get('core_item_key'))
+                    for link in (existing_exec.get('item_links') or [])
+                    if isinstance(link, dict) and link.get('core_item_key')
+                }
+                write_ahead_matches = bool(
+                    row.execution_status
+                    == EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+                    and _normalize_status(existing_exec.get('dispatch_status'))
+                    == 'pending_remote_ack'
+                    and existing_exec.get('plan_id') == plan_id
+                    and existing_exec.get('plan_fingerprint') == fingerprint
+                    and existing_exec.get('dispatch_revision_fingerprint')
+                    == submitted_revision_fingerprint
+                    and existing_exec.get('dispatch_material_fingerprint')
+                    == payload['metadata']['dispatch_material_fingerprint']
+                    and existing_exec.get('prior_execution_status')
+                    == submitted_row.execution_status
+                    and existing_exec.get('prior_eligibility_status')
+                    == submitted_row.eligibility_status
+                    and write_ahead_core_keys == expected_core_keys
+                )
+                row_revision_changed = bool(
+                    int(row.decision_snapshot_id)
+                    != int(submitted_row.decision_snapshot_id)
+                    or current_revision_fingerprint
+                    != submitted_revision_fingerprint
+                    or (
+                        not write_ahead_matches
+                        and (
+                            row.execution_status != submitted_row.execution_status
+                            or row.eligibility_status
+                            != submitted_row.eligibility_status
+                        )
+                    )
+                    or (
+                        write_ahead_matches
+                        and row.eligibility_status
+                        != existing_exec.get('prior_eligibility_status')
+                    )
                 )
                 attempt = {
                     'attempted_at': now.isoformat(),
@@ -3784,88 +6299,765 @@ class SignalDeciderExecIntegrationService:
                     for link in (existing_exec.get('item_links') or row_links.get(row.id, []))
                     if (compact := compact_exec_item_link(link))
                 ]
-                exec_dispatch = {
+                failed_exec_dispatch = {
                     'plan_id': plan_id,
                     'plan_fingerprint': fingerprint,
+                    'dispatch_revision_fingerprint': submitted_revision_fingerprint,
+                    'dispatch_material_fingerprint': existing_exec.get(
+                        'dispatch_material_fingerprint'
+                    )
+                    or payload['metadata'].get('dispatch_material_fingerprint'),
+                    'dispatch_batch_key': existing_exec.get('dispatch_batch_key'),
                     'dispatch_status': status,
+                    'prior_execution_status': existing_exec.get(
+                        'prior_execution_status'
+                    ),
+                    'prior_eligibility_status': existing_exec.get(
+                        'prior_eligibility_status'
+                    ),
                     'last_attempt_at': now.isoformat(),
                     'last_success_at': existing_exec.get('last_success_at'),
                     'last_error': summarize_error(error),
                     'item_links': compact_existing_links,
+                    'destination_binding': copy.deepcopy(
+                        existing_exec.get('destination_binding')
+                    ),
+                    'authority_generation_before': copy.deepcopy(
+                        existing_exec.get('authority_generation_before')
+                    ),
                     'attempts': _append_limited(existing_exec.get('attempts') or [], attempt),
                     'last_request_summary': compact_exec_request_summary(
                         payload,
                         item_links=row_links.get(row.id, []),
                     ),
                 }
+                if remote_acceptance_ambiguous:
+                    existing_submission['dispatch_reconciliation'] = {
+                        'status': 'manual_review_required',
+                        'plan_id': plan_id,
+                        'plan_fingerprint': fingerprint,
+                        'observed_at': now.isoformat(),
+                        'reason_code': (
+                            'ambiguous_remote_acceptance_after_core_revision'
+                            if row_revision_changed
+                            else 'ambiguous_remote_acceptance'
+                        ),
+                        'submitted_dispatch_revision_fingerprint': (
+                            submitted_revision_fingerprint
+                        ),
+                        'current_dispatch_revision_fingerprint': (
+                            current_revision_fingerprint
+                        ),
+                        'error': summarize_error(error),
+                    }
+                    if not _row_has_accepted_exec_dispatch(row):
+                        existing_submission.update(
+                            {
+                                'mode': 'exec_dispatch',
+                                'latest': attempt,
+                                'exec_dispatch': failed_exec_dispatch,
+                            }
+                        )
+                    row.eligibility_status = 'blocked'
+                    row.execution_status = 'revocation_manual_review'
+                    row.submission_payload = slim_signal_decider_exec_submission_payload(
+                        existing_submission
+                    ).payload
+                    continue
+                if row_revision_changed:
+                    continue
+                row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
                 submission = {
                     **existing_submission,
                     'mode': 'exec_dispatch',
                     'latest': attempt,
-                    'exec_dispatch': exec_dispatch,
+                    'exec_dispatch': failed_exec_dispatch,
                 }
                 row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
+            session.flush()
+
+    @staticmethod
+    def _release_not_found_dispatch_write_ahead(
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        submitted_revision_fingerprints: dict[int, str],
+        plan_id: str,
+        plan_fingerprint: str,
+        dispatch_material_fingerprint: str,
+        destination_binding: dict[str, Any],
+        trigger: str,
+        reason_code: str,
+    ) -> None:
+        now = _utcnow()
+        row_ids = [int(row.id) for row in rows]
+        with session_scope() as session:
+            persisted_rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
+            ).scalars().all()
+            if len(persisted_rows) != len(row_ids):
+                return
+            for row in persisted_rows:
+                submission = (
+                    row.submission_payload
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                exec_dispatch = (
+                    submission.get('exec_dispatch')
+                    if isinstance(submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                if not (
+                    row.execution_status
+                    == EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+                    and _normalize_status(exec_dispatch.get('dispatch_status'))
+                    == 'pending_remote_ack'
+                    and exec_dispatch.get('plan_id') == plan_id
+                    and exec_dispatch.get('plan_fingerprint')
+                    == plan_fingerprint
+                    and exec_dispatch.get('dispatch_revision_fingerprint')
+                    == submitted_revision_fingerprints.get(int(row.id))
+                    and exec_dispatch.get('dispatch_material_fingerprint')
+                    == dispatch_material_fingerprint
+                    and _validated_exec_destination_binding(
+                        exec_dispatch.get('destination_binding')
+                    )
+                    == destination_binding
+                ):
+                    return
+
+            for row in persisted_rows:
+                submission = copy.deepcopy(row.submission_payload)
+                exec_dispatch = submission.pop('exec_dispatch')
+                submission['dispatch_reconciliation'] = {
+                    'status': 'confirmed_not_found',
+                    'reason_code': reason_code,
+                    'observed_at': now.isoformat(),
+                    'trigger': trigger,
+                    'plan_id': plan_id,
+                    'plan_fingerprint': plan_fingerprint,
+                    'dispatch_material_fingerprint': (
+                        dispatch_material_fingerprint
+                    ),
+                    'destination_binding': copy.deepcopy(
+                        destination_binding
+                    ),
+                    'remote_authority_created': False,
+                }
+                row.execution_status = (
+                    _normalize_optional_text(
+                        exec_dispatch.get('prior_execution_status'),
+                        lowercase=True,
+                    )
+                    or EXECUTION_STATUS_PLANNED
+                )
+                row.eligibility_status = (
+                    _normalize_optional_text(
+                        exec_dispatch.get('prior_eligibility_status'),
+                        lowercase=True,
+                    )
+                    or row.eligibility_status
+                )
+                row.submission_payload = submission
+            session.flush()
+
+    @staticmethod
+    def _persist_dispatch_write_ahead(
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        submitted_revision_fingerprints: dict[int, str],
+        row_links: dict[int, list[dict[str, Any]]],
+        plan_id: str,
+        fingerprint: str,
+        payload: dict[str, Any],
+        trigger: str,
+        destination_binding: dict[str, Any],
+        authority_generation_before: dict[str, Any] | None,
+    ) -> None:
+        now = _utcnow()
+        row_ids = [int(row.id) for row in rows]
+        submitted_by_id = {int(row.id): row for row in rows}
+        if set(submitted_revision_fingerprints) != set(row_ids):
+            raise ValueError('dispatch revision fingerprints must bind every submitted row')
+        with session_scope() as session:
+            persisted_rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
+            ).scalars().all()
+            if len(persisted_rows) != len(row_ids):
+                raise ValueError('dispatch write-ahead rows changed before POST')
+            for row in persisted_rows:
+                submitted = submitted_by_id[int(row.id)]
+                if (
+                    int(row.decision_snapshot_id)
+                    != int(submitted.decision_snapshot_id)
+                    or row.execution_status != submitted.execution_status
+                    or row.eligibility_status != submitted.eligibility_status
+                    or _row_dispatch_revision_fingerprint(row)
+                    != submitted_revision_fingerprints[int(row.id)]
+                ):
+                    raise ValueError('dispatch write-ahead revision changed before POST')
+                submission = (
+                    row.submission_payload
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                existing_exec = (
+                    submission.get('exec_dispatch')
+                    if isinstance(submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                if _normalize_status(existing_exec.get('dispatch_status')) in {
+                    EXEC_DISPATCH_STATUS_ACCEPTED,
+                    'pending_remote_ack',
+                }:
+                    raise ValueError('dispatch write-ahead found existing remote authority')
+
+            for row in persisted_rows:
+                existing_submission = (
+                    copy.deepcopy(row.submission_payload)
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                existing_exec = (
+                    existing_submission.get('exec_dispatch')
+                    if isinstance(existing_submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                attempt = {
+                    'attempted_at': now.isoformat(),
+                    'trigger': trigger,
+                    'dispatch_status': 'pending_remote_ack',
+                }
+                exec_dispatch = {
+                    'plan_id': plan_id,
+                    'plan_fingerprint': fingerprint,
+                    'dispatch_revision_fingerprint': (
+                        submitted_revision_fingerprints[int(row.id)]
+                    ),
+                    'dispatch_material_fingerprint': payload['metadata'][
+                        'dispatch_material_fingerprint'
+                    ],
+                    'dispatch_batch_key': payload['metadata'].get(
+                        'dispatch_batch_key'
+                    ),
+                    'dispatch_status': 'pending_remote_ack',
+                    'prior_execution_status': row.execution_status,
+                    'prior_eligibility_status': row.eligibility_status,
+                    'last_attempt_at': now.isoformat(),
+                    'last_success_at': existing_exec.get('last_success_at'),
+                    'last_error': None,
+                    'item_links': [
+                        compact
+                        for link in row_links.get(int(row.id), [])
+                        if (compact := compact_exec_item_link(link))
+                    ],
+                    'destination_binding': copy.deepcopy(destination_binding),
+                    'authority_generation_before': (
+                        {
+                            'status': authority_generation_before.get('status'),
+                            'generation_fingerprint': authority_generation_before.get(
+                                'generation_fingerprint'
+                            ),
+                        }
+                        if isinstance(authority_generation_before, dict)
+                        else None
+                    ),
+                    'attempts': _append_limited(
+                        existing_exec.get('attempts') or [],
+                        attempt,
+                    ),
+                    'last_request_summary': compact_exec_request_summary(
+                        payload,
+                        item_links=row_links.get(int(row.id), []),
+                    ),
+                }
+                row.execution_status = EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+                row.submission_payload = slim_signal_decider_exec_submission_payload(
+                    {
+                        **existing_submission,
+                        'mode': 'exec_dispatch',
+                        'latest': attempt,
+                        'exec_dispatch': exec_dispatch,
+                    }
+                ).payload
+            session.flush()
+
+    @staticmethod
+    def _persist_unsupported_execution_route(
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        trigger: str,
+        reason_code: str,
+    ) -> None:
+        now = _utcnow()
+        submitted_by_id = {int(row.id): row for row in rows}
+        with session_scope() as session:
+            persisted_rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(submitted_by_id))
+                .with_for_update()
+            ).scalars().all()
+            for row in persisted_rows:
+                submitted = submitted_by_id[int(row.id)]
+                if row.execution_status in {
+                    'revocation_pending',
+                    'revocation_manual_review',
+                    'revoked',
+                }:
+                    continue
+                if int(row.decision_snapshot_id) != int(submitted.decision_snapshot_id):
+                    continue
+                existing_submission = (
+                    copy.deepcopy(row.submission_payload)
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                existing_submission['contract_error'] = {
+                    'reason_code': reason_code,
+                    'trigger': trigger,
+                    'observed_at': now.isoformat(),
+                    'retryable': False,
+                }
+                row.eligibility_status = 'blocked'
+                row.execution_status = EXEC_DISPATCH_STATUS_CONTRACT_ERROR
+                row.submission_payload = slim_signal_decider_exec_submission_payload(
+                    existing_submission
+                ).payload
             session.flush()
 
     def _persist_dispatch_success(
         self,
         *,
         rows: Sequence[SignalDeciderExecutionPlanItem],
+        submitted_revision_fingerprints: dict[int, str],
         row_links: dict[int, list[dict[str, Any]]],
         plan_id: str,
         fingerprint: str,
         payload: dict[str, Any],
         response_payload: dict[str, Any],
         trigger: str,
+        authority_generation_before: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response_items = _collect_items(response_payload)
-        response_by_key = {}
-        for item in response_items:
-            key = (
-                _normalize_optional_text(item.get('core_item_key'))
-                or _normalize_optional_text(item.get('client_key'))
-                or _normalize_optional_text(item.get('external_item_key'))
+        destination_binding = self._destination_binding_for_payload(payload)
+        submitted_core_item_keys = [
+            str(link['core_item_key'])
+            for row in rows
+            for link in row_links.get(row.id, [])
+        ]
+        try:
+            response_by_key = validate_execution_plan_dispatch_ack(
+                response_payload,
+                plan_id=plan_id,
+                submitted_core_item_keys=submitted_core_item_keys,
+                expected_dispatch_material_fingerprint=payload['metadata'][
+                    'dispatch_material_fingerprint'
+                ],
             )
-            if key:
-                response_by_key[key] = item
+        except ValueError as exc:
+            error = _serialize_error(
+                code='execution_handoff_ack_invalid',
+                message=str(exc),
+                retryable=False,
+            )
+            self._persist_dispatch_failure(
+                rows=rows,
+                submitted_revision_fingerprints=submitted_revision_fingerprints,
+                row_links=row_links,
+                plan_id=plan_id,
+                fingerprint=fingerprint,
+                payload=payload,
+                trigger=trigger,
+                status=EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
+                error=error,
+                remote_acceptance_ambiguous=True,
+            )
+            return {
+                'dispatch_status': EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
+                'eligible_count': len(rows),
+                'translated_item_count': len(submitted_core_item_keys),
+                'accepted_item_count': 0,
+                'rejected_item_count': len(submitted_core_item_keys),
+                'error': error,
+            }
 
         now = _utcnow()
         row_ids = [int(row.id) for row in rows]
-        row_statuses: Counter[str] = Counter()
+        submitted_by_id = {int(row.id): row for row in rows}
+        if set(submitted_revision_fingerprints) != set(row_ids):
+            raise ValueError('dispatch revision fingerprints must bind every submitted row')
         accepted_item_count = 0
-        rejected_item_count = 0
+        revision_conflict_count = 0
 
         with session_scope() as session:
+            authority_generation_conflict: dict[str, Any] | None = None
+            if authority_generation_before is not None and rows:
+                authority_generation_after = (
+                    signal_decider_next_open_execution_service.inspect_dispatch_authority_generation(
+                        target_trade_date=rows[0].target_trade_date,
+                        expected_row_bindings=_dispatch_authority_row_bindings(
+                            rows,
+                            revision_fingerprints=submitted_revision_fingerprints,
+                        ),
+                        _session=session,
+                    )
+                )
+                authority_generation_conflict = (
+                    _dispatch_authority_generation_conflict(
+                        before=authority_generation_before,
+                        after=authority_generation_after,
+                    )
+                )
             persisted_rows = session.execute(
-                select(SignalDeciderExecutionPlanItem).where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                .with_for_update()
             ).scalars().all()
             for row in persisted_rows:
+                submitted_row = submitted_by_id[int(row.id)]
+                submitted_revision_fingerprint = submitted_revision_fingerprints[
+                    int(row.id)
+                ]
+                current_revision_fingerprint = _row_dispatch_revision_fingerprint(row)
+                if row.execution_status in {
+                    'revocation_pending',
+                    'revocation_manual_review',
+                    'revoked',
+                }:
+                    revision_conflict_count += 1
+                    continue
+                snapshot_changed = int(row.decision_snapshot_id) != int(
+                    submitted_row.decision_snapshot_id
+                )
+                dispatch_material_changed = (
+                    current_revision_fingerprint
+                    != submitted_revision_fingerprint
+                )
+                current_submission = (
+                    row.submission_payload
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                current_exec = (
+                    current_submission.get('exec_dispatch')
+                    if isinstance(current_submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                existing_links_by_key = {
+                    _normalize_optional_text(link.get('core_item_key')): link
+                    for link in (current_exec.get('item_links') or [])
+                    if isinstance(link, dict)
+                    and _normalize_optional_text(link.get('core_item_key'))
+                }
+                exact_accepted_replay = bool(
+                    _row_has_accepted_exec_dispatch(row)
+                    and current_exec.get('plan_id') == plan_id
+                    and current_exec.get('plan_fingerprint') == fingerprint
+                    and _exec_dispatch_destination_binding(current_exec)
+                    == destination_binding
+                    and set(existing_links_by_key)
+                    == {
+                        str(link['core_item_key'])
+                        for link in row_links.get(int(row.id), [])
+                    }
+                    and all(
+                        _normalize_optional_text(
+                            existing_links_by_key[core_key].get(
+                                'exec_plan_id'
+                            )
+                        )
+                        == _normalize_optional_text(
+                            response_by_key[core_key].get(
+                                'execution_plan_id'
+                            )
+                        )
+                        and _normalize_optional_text(
+                            existing_links_by_key[core_key].get(
+                                'exec_plan_item_id'
+                            )
+                        )
+                        == _normalize_optional_text(
+                            response_by_key[core_key].get(
+                                'execution_plan_item_id'
+                            )
+                        )
+                        for core_key in existing_links_by_key
+                    )
+                )
+                if exact_accepted_replay:
+                    accepted_item_count += len(
+                        row_links.get(int(row.id), [])
+                    )
+                    continue
+                expected_core_keys = {
+                    str(link['core_item_key'])
+                    for link in row_links.get(int(row.id), [])
+                }
+                write_ahead_core_keys = {
+                    str(link.get('core_item_key'))
+                    for link in (current_exec.get('item_links') or [])
+                    if isinstance(link, dict) and link.get('core_item_key')
+                }
+                write_ahead_matches = bool(
+                    row.execution_status
+                    == EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+                    and current_exec.get('dispatch_status') == 'pending_remote_ack'
+                    and current_exec.get('plan_id') == plan_id
+                    and current_exec.get('plan_fingerprint') == fingerprint
+                    and current_exec.get('dispatch_revision_fingerprint')
+                    == submitted_revision_fingerprint
+                    and current_exec.get('dispatch_material_fingerprint')
+                    == payload['metadata']['dispatch_material_fingerprint']
+                    and _validated_exec_destination_binding(
+                        current_exec.get('destination_binding')
+                    )
+                    == destination_binding
+                    and current_exec.get('prior_execution_status')
+                    == submitted_row.execution_status
+                    and current_exec.get('prior_eligibility_status')
+                    == submitted_row.eligibility_status
+                    and write_ahead_core_keys == expected_core_keys
+                )
+                row_state_changed = bool(
+                    not write_ahead_matches
+                    and (
+                        row.execution_status != submitted_row.execution_status
+                        or row.eligibility_status != submitted_row.eligibility_status
+                    )
+                )
+                if (
+                    snapshot_changed
+                    or dispatch_material_changed
+                    or row_state_changed
+                    or authority_generation_conflict is not None
+                ):
+                    response_links = []
+                    for link in row_links.get(row.id, []):
+                        response_item = response_by_key[link['core_item_key']]
+                        response_links.append(
+                            {
+                                **link,
+                                'exec_plan_id': response_item['execution_plan_id'],
+                                'exec_plan_item_id': response_item['execution_plan_item_id'],
+                                'remote_status': 'accepted',
+                            }
+                        )
+                    current_submission = (
+                        copy.deepcopy(row.submission_payload)
+                        if isinstance(row.submission_payload, dict)
+                        else {}
+                    )
+                    current_history = [
+                        copy.deepcopy(item)
+                        for item in (current_submission.get('revision_history') or [])
+                        if isinstance(item, dict)
+                    ]
+                    current_history.append(
+                        {
+                            'decision_snapshot_id': str(submitted_row.decision_snapshot_id),
+                            'decision_agent_name': submitted_row.decision_agent_name,
+                            'symbol': submitted_row.symbol,
+                            'dispatch_evidence': {
+                                'plan_id': plan_id,
+                                'plan_fingerprint': fingerprint,
+                                'dispatch_revision_fingerprint': (
+                                    submitted_revision_fingerprint
+                                ),
+                                'dispatch_status': 'accepted',
+                                'destination_binding': copy.deepcopy(
+                                    destination_binding
+                                ),
+                                'item_links': copy.deepcopy(response_links),
+                            },
+                            'archived_at': now.isoformat(),
+                        }
+                    )
+                    current_traceability = (
+                        row.traceability_payload
+                        if isinstance(row.traceability_payload, dict)
+                        else {}
+                    )
+                    current_validation = (
+                        row.validation_payload
+                        if isinstance(row.validation_payload, dict)
+                        else {}
+                    )
+                    current_blocking_reasons = [
+                        item
+                        for item in (current_validation.get('blocking_reasons') or [])
+                        if isinstance(item, dict)
+                        and _normalize_optional_text(item.get('code'))
+                    ]
+                    if (
+                        row_state_changed
+                        or dispatch_material_changed
+                        or snapshot_changed
+                    ) and current_blocking_reasons:
+                        reason_code = str(current_blocking_reasons[0]['code'])
+                        replacement_action = (
+                            'reject'
+                            if reason_code
+                            in {
+                                'current_live_market_risk_off',
+                                'current_live_market_evidence_unavailable',
+                            }
+                            else 'wait'
+                        )
+                        replacement_actionable = False
+                    elif authority_generation_conflict is not None:
+                        replacement_action = (
+                            _normalize_optional_text(
+                                authority_generation_conflict.get(
+                                    'replacement_action'
+                                )
+                            )
+                            or 'wait'
+                        )
+                        replacement_actionable = bool(
+                            authority_generation_conflict.get(
+                                'replacement_actionable'
+                            )
+                        )
+                        reason_code = str(
+                            authority_generation_conflict['reason_code']
+                        )
+                    else:
+                        replacement_action = (
+                            current_traceability.get('raw_action')
+                            or current_traceability.get('generic_action')
+                            or 'buy'
+                            if row.eligibility_status in {
+                                'eligible',
+                                'monitor_candidate',
+                            }
+                            else 'wait'
+                        )
+                        replacement_actionable = row.eligibility_status in {
+                            'eligible',
+                            'monitor_candidate',
+                        }
+                        reason_code = (
+                            'latest_snapshot_replaced'
+                            if snapshot_changed
+                            else 'policy_scope_changed'
+                        )
+                    replacement_observation_id = None
+                    replacement_revision_id = str(row.decision_snapshot_id)
+                    if authority_generation_conflict is not None:
+                        revision_material = '|'.join(
+                            (
+                                reason_code,
+                                str(
+                                    authority_generation_conflict.get(
+                                        'before_generation_fingerprint'
+                                    )
+                                    or ''
+                                ),
+                                str(
+                                    authority_generation_conflict.get(
+                                        'after_generation_fingerprint'
+                                    )
+                                    or ''
+                                ),
+                            )
+                        )
+                        replacement_observation_id = (
+                            'observation:dispatch_authority_generation:'
+                            f'{hashlib.sha256(revision_material.encode("utf-8")).hexdigest()[:20]}'
+                        )
+                        replacement_revision_id = replacement_observation_id
+                    elif not snapshot_changed:
+                        revision_material = '|'.join(
+                            (
+                                current_revision_fingerprint,
+                                str(row.execution_status),
+                                str(row.eligibility_status),
+                            )
+                        )
+                        replacement_observation_id = (
+                            'observation:dispatch_material_changed:'
+                            f'{hashlib.sha256(revision_material.encode("utf-8")).hexdigest()[:20]}'
+                        )
+                        replacement_revision_id = replacement_observation_id
+                    current_submission.update(
+                        {
+                            'revision_history': current_history[-5:],
+                            'revocation': {
+                                'schema_version': 'core_execution_revocation_state_v1',
+                                'status': 'pending',
+                                'reason_code': reason_code,
+                                'requested_at': now.isoformat(),
+                                'prior_decision_snapshot_id': str(submitted_row.decision_snapshot_id),
+                                'replacement_decision_snapshot_id': replacement_revision_id,
+                                'replacement_observation_id': replacement_observation_id,
+                                'prior_dispatch_revision_fingerprint': (
+                                    submitted_revision_fingerprint
+                                ),
+                                'replacement_dispatch_revision_fingerprint': (
+                                    current_revision_fingerprint
+                                ),
+                                'prior_authority_generation_fingerprint': (
+                                    authority_generation_conflict.get(
+                                        'before_generation_fingerprint'
+                                    )
+                                    if authority_generation_conflict is not None
+                                    else None
+                                ),
+                                'replacement_authority_generation_fingerprint': (
+                                    authority_generation_conflict.get(
+                                        'after_generation_fingerprint'
+                                    )
+                                    if authority_generation_conflict is not None
+                                    else None
+                                ),
+                                'replacement_action': replacement_action,
+                                'replacement_actionable': replacement_actionable,
+                                'plan_id': plan_id,
+                                'destination_binding': copy.deepcopy(
+                                    destination_binding
+                                ),
+                                'item_links': response_links,
+                            },
+                        }
+                    )
+                    row.eligibility_status = 'blocked'
+                    row.execution_status = 'revocation_pending'
+                    updated_validation = (
+                        copy.deepcopy(row.validation_payload)
+                        if isinstance(row.validation_payload, dict)
+                        else {}
+                    )
+                    updated_validation['blocking_reasons'] = [
+                        {
+                            'code': reason_code,
+                            'message': (
+                                'Dispatch authority changed while Exec was accepting the plan; '
+                                'the newly accepted BUY authority must be revoked.'
+                            ),
+                        }
+                    ]
+                    row.validation_payload = updated_validation
+                    row.submission_payload = current_submission
+                    revision_conflict_count += 1
+                    continue
                 links = []
-                row_dispatch_status = EXEC_DISPATCH_STATUS_ACCEPTED
                 entry_response_item: dict[str, Any] = {}
                 for link in row_links.get(row.id, []):
-                    response_item = response_by_key.get(link['core_item_key']) or {}
-                    item_status = _normalize_status(
-                        response_item.get('status')
-                        or response_item.get('plan_item_status')
-                        or response_item.get('decision_status')
-                    ) or EXEC_DISPATCH_STATUS_ACCEPTED
-                    if item_status in REMOTE_FAILED_STATUSES:
-                        row_dispatch_status = EXEC_DISPATCH_STATUS_PARTIAL
-                        rejected_item_count += 1
-                    else:
-                        accepted_item_count += 1
+                    response_item = response_by_key[link['core_item_key']]
+                    item_status = str(response_item['status'])
+                    accepted_item_count += 1
                     if link.get('intent') in EXEC_ENTRY_BUY_INTENTS:
                         entry_response_item = response_item
                     links.append(
                         {
                             **link,
                             'exec_plan_id': _normalize_optional_text(response_item.get('execution_plan_id')),
-                            'exec_plan_item_id': _normalize_optional_text(
-                                response_item.get('execution_plan_item_id')
-                                or response_item.get('plan_item_id')
-                                or response_item.get('id')
-                            ),
+                            'exec_plan_item_id': _normalize_optional_text(response_item.get('execution_plan_item_id')),
                             'remote_status': item_status,
                             'response_item': compact_exec_response_item(response_item) if response_item else None,
                         }
@@ -3885,13 +7077,16 @@ class SignalDeciderExecIntegrationService:
                 attempt = {
                     'attempted_at': now.isoformat(),
                     'trigger': trigger,
-                    'dispatch_status': row_dispatch_status,
+                    'dispatch_status': EXEC_DISPATCH_STATUS_ACCEPTED,
                     'response_summary': response_summary,
                 }
                 exec_dispatch = {
                     'plan_id': plan_id,
                     'plan_fingerprint': fingerprint,
-                    'dispatch_status': row_dispatch_status,
+                    'dispatch_revision_fingerprint': (
+                        submitted_revision_fingerprint
+                    ),
+                    'dispatch_status': EXEC_DISPATCH_STATUS_ACCEPTED,
                     'last_attempt_at': now.isoformat(),
                     'last_success_at': now.isoformat(),
                     'last_error': None,
@@ -3900,6 +7095,42 @@ class SignalDeciderExecIntegrationService:
                         for item in links
                         if (compact := compact_exec_item_link(item))
                     ],
+                    'destination_binding': copy.deepcopy(destination_binding),
+                    'contract_proof': {
+                        'schema_version': EXEC_DISPATCH_PROOF_SCHEMA_VERSION,
+                        'execution_plan_id': str(
+                            response_payload['execution_plan_id']
+                        ),
+                        'dispatch_material_fingerprint': payload['metadata'][
+                            'dispatch_material_fingerprint'
+                        ],
+                        'destination_binding': copy.deepcopy(
+                            destination_binding
+                        ),
+                        'contract_ack': copy.deepcopy(response_payload.get('contract_ack')),
+                        'submitted_core_item_keys': [
+                            str(link['core_item_key'])
+                            for link in row_links.get(row.id, [])
+                        ],
+                        'accepted_item_bindings': [
+                            {
+                                'core_item_key': str(link['core_item_key']),
+                                'execution_plan_id': str(
+                                    response_by_key[link['core_item_key']][
+                                        'execution_plan_id'
+                                    ]
+                                ),
+                                'execution_plan_item_id': str(
+                                    response_by_key[link['core_item_key']][
+                                        'execution_plan_item_id'
+                                    ]
+                                ),
+                            }
+                            for link in row_links.get(row.id, [])
+                        ],
+                        'accepted_item_count': len(row_links.get(row.id, [])),
+                        'rejected_item_count': 0,
+                    },
                     'attempts': _append_limited(existing_exec.get('attempts') or [], attempt),
                     'last_request_summary': compact_exec_request_summary(
                         payload,
@@ -3911,19 +7142,16 @@ class SignalDeciderExecIntegrationService:
                     ),
                 }
                 row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
-                if row_dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}:
-                    if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
-                        row.execution_status = EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
-                    elif row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
-                        row.execution_status = (
-                            EXECUTION_STATUS_SUBMITTED
-                            if _extract_agent_approved_quantity(entry_response_item) is not None
-                            else EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
-                        )
-                    else:
-                        row.execution_status = EXECUTION_STATUS_SUBMITTED
+                if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+                    row.execution_status = EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                elif row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
+                    row.execution_status = (
+                        EXECUTION_STATUS_SUBMITTED
+                        if _extract_agent_approved_quantity(entry_response_item) is not None
+                        else EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
+                    )
                 else:
-                    row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
+                    row.execution_status = EXECUTION_STATUS_SUBMITTED
                 row.submitted_at = row.submitted_at or now
                 submission = {
                     **existing_submission,
@@ -3932,20 +7160,19 @@ class SignalDeciderExecIntegrationService:
                     'exec_dispatch': exec_dispatch,
                 }
                 row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
-                row_statuses[row_dispatch_status] += 1
             session.flush()
 
-        overall_status = (
-            EXEC_DISPATCH_STATUS_PARTIAL
-            if row_statuses.get(EXEC_DISPATCH_STATUS_PARTIAL)
-            else EXEC_DISPATCH_STATUS_ACCEPTED
-        )
         return {
-            'dispatch_status': overall_status,
+            'dispatch_status': (
+                'revocation_pending'
+                if revision_conflict_count
+                else EXEC_DISPATCH_STATUS_ACCEPTED
+            ),
             'eligible_count': len(rows),
             'translated_item_count': sum(len(row_links.get(row.id, [])) for row in rows),
             'accepted_item_count': accepted_item_count,
-            'rejected_item_count': rejected_item_count,
+            'rejected_item_count': 0,
+            'revision_conflict_count': revision_conflict_count,
         }
 
     async def _refresh_exec_readback(
@@ -3964,11 +7191,61 @@ class SignalDeciderExecIntegrationService:
             include_payloads=True,
         )
         grouped = self._group_rows_by_plan_id(rows)
+        integration = self.integration_status()
         for plan_id, group_rows in grouped.items():
             if not plan_id:
                 continue
+            group_exec_dispatches = [
+                row.submission_payload['exec_dispatch']
+                for row in group_rows
+                if isinstance(row.submission_payload, dict)
+                and isinstance(row.submission_payload.get('exec_dispatch'), dict)
+            ]
+            expected_destination = (
+                _validated_exec_destination_binding(
+                    group_exec_dispatches[0].get('destination_binding')
+                )
+                if len(group_exec_dispatches) == len(group_rows)
+                else None
+            )
+            try:
+                active_destination = self._active_destination_binding(
+                    account_reference=str(group_rows[0].account_reference),
+                    integration=integration,
+                )
+            except ValueError:
+                active_destination = None
+            destination_matches = bool(
+                expected_destination is not None
+                and active_destination == expected_destination
+                and all(
+                    _validated_exec_destination_binding(
+                        exec_dispatch.get('destination_binding')
+                    )
+                    == expected_destination
+                    for exec_dispatch in group_exec_dispatches
+                )
+            )
+            if not destination_matches:
+                reason_code = (
+                    'exec_destination_binding_missing'
+                    if expected_destination is None
+                    else 'exec_destination_mismatch'
+                )
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code=reason_code,
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                continue
+            expected_row_bindings = {
+                int(row.id): _row_readback_revision_binding(row)
+                for row in group_rows
+            }
             symbols = sorted({row.symbol for row in group_rows if row.symbol})
-            group_account_reference = _normalize_optional_text(group_rows[0].account_reference) if group_rows else None
             plans_result = await self._fetch_remote_endpoint(
                 lambda: self.client.list_execution_plans(external_plan_id=plan_id)
             )
@@ -3978,18 +7255,33 @@ class SignalDeciderExecIntegrationService:
             executions_result = await self._fetch_remote_endpoint(
                 lambda: self.client.list_executions(external_plan_id=plan_id, symbols=symbols)
             )
-            positions_result = await self._fetch_remote_endpoint(
-                lambda: self.client.list_positions(symbols=symbols)
+            execution_plan_id = self._accepted_execution_plan_id_for_rows(
+                group_rows
             )
-            positions_result = {
-                **positions_result,
-                'items': self._filter_remote_positions_for_account(
-                    positions=positions_result['items'],
-                    account_reference=group_account_reference,
-                ),
-            }
+            if execution_plan_id is None:
+                positions_result = self._position_scope_contract_error(
+                    code='position_plan_scope_unavailable',
+                    message=(
+                        'Accepted Exec plan identity is unavailable for scoped '
+                        'position readback.'
+                    ),
+                )
+            else:
+                positions_result = await self._fetch_remote_endpoint(
+                    lambda: self.client.list_positions(
+                        external_plan_id=plan_id,
+                        execution_plan_id=execution_plan_id,
+                        symbols=symbols,
+                    )
+                )
+                positions_result = self._validate_remote_position_scope_proofs(
+                    result=positions_result,
+                    external_plan_id=plan_id,
+                    execution_plan_id=execution_plan_id,
+                )
             self._persist_group_readback(
                 rows=group_rows,
+                expected_row_bindings=expected_row_bindings,
                 trigger=trigger,
                 runtime_payload=runtime_payload,
                 plans_result=plans_result,
@@ -4061,7 +7353,14 @@ class SignalDeciderExecIntegrationService:
             if not isinstance(candidate, dict):
                 return
             nested_items: list[dict[str, Any]] = []
-            for key in ('items', 'plan_items', 'execution_plan_items', 'execution_items', 'orders'):
+            for key in (
+                'items',
+                'item_acks',
+                'plan_items',
+                'execution_plan_items',
+                'execution_items',
+                'orders',
+            ):
                 value = candidate.get(key)
                 if isinstance(value, list):
                     nested_items.extend(item for item in value if isinstance(item, dict))
@@ -4116,6 +7415,19 @@ class SignalDeciderExecIntegrationService:
         return {value for value in values if value}
 
     @staticmethod
+    def _exec_plan_ids(payload: dict[str, Any]) -> set[str]:
+        values = {
+            _normalize_optional_text(payload.get(key))
+            for key in (
+                'execution_plan_id',
+                'exec_plan_id',
+                'external_plan_id',
+                'plan_id',
+            )
+        }
+        return {value for value in values if value}
+
+    @staticmethod
     def _exec_plan_item_core_keys(payload: dict[str, Any]) -> set[str]:
         values = {
             _normalize_optional_text(payload.get(key))
@@ -4128,36 +7440,177 @@ class SignalDeciderExecIntegrationService:
         return {value for value in values if value}
 
     @classmethod
+    def _bind_ambiguous_dispatch_from_strict_readback_ack(
+        cls,
+        *,
+        exec_dispatch: dict[str, Any],
+        plans_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        plan_id = _normalize_optional_text(exec_dispatch.get('plan_id'))
+        dispatch_material_fingerprint = _normalize_optional_text(
+            exec_dispatch.get('dispatch_material_fingerprint')
+        )
+        item_links = [
+            dict(link)
+            for link in (exec_dispatch.get('item_links') or [])
+            if isinstance(link, dict)
+        ]
+        submitted_core_item_keys = [
+            str(link.get('core_item_key'))
+            for link in item_links
+            if _normalize_optional_text(link.get('core_item_key'))
+        ]
+        destination_binding = _validated_exec_destination_binding(
+            exec_dispatch.get('destination_binding')
+        )
+        request_summary = (
+            exec_dispatch.get('last_request_summary')
+            if isinstance(exec_dispatch.get('last_request_summary'), dict)
+            else {}
+        )
+        request_metadata = (
+            request_summary.get('metadata')
+            if isinstance(request_summary.get('metadata'), dict)
+            else {}
+        )
+        if (
+            not plan_id
+            or not dispatch_material_fingerprint
+            or not item_links
+            or len(submitted_core_item_keys) != len(item_links)
+            or destination_binding is None
+            or request_metadata.get('dispatch_material_fingerprint')
+            != dispatch_material_fingerprint
+        ):
+            return None
+        payload = (
+            plans_result.get('payload')
+            if isinstance(plans_result.get('payload'), dict)
+            else {}
+        )
+        remote_plan = next(
+            (
+                item
+                for item in _collect_items(payload)
+                if _normalize_optional_text(
+                    item.get('plan_id') or item.get('external_plan_id')
+                )
+                == plan_id
+            ),
+            None,
+        )
+        if not isinstance(remote_plan, dict):
+            return None
+        raw_item_acks = remote_plan.get('item_acks')
+        if not isinstance(raw_item_acks, list):
+            raw_item_acks = remote_plan.get('items')
+        candidate_response = {
+            'plan_id': remote_plan.get('plan_id') or plan_id,
+            'execution_plan_id': remote_plan.get('execution_plan_id'),
+            'contract_ack': remote_plan.get('contract_ack'),
+            'accepted_item_count': remote_plan.get('accepted_item_count'),
+            'rejected_item_count': remote_plan.get('rejected_item_count'),
+            'item_acks': raw_item_acks,
+        }
+        try:
+            response_by_key = validate_execution_plan_dispatch_ack(
+                candidate_response,
+                plan_id=plan_id,
+                submitted_core_item_keys=submitted_core_item_keys,
+                expected_dispatch_material_fingerprint=(
+                    dispatch_material_fingerprint
+                ),
+            )
+        except ValueError:
+            return None
+        bound_links = []
+        for link in item_links:
+            core_item_key = str(link['core_item_key'])
+            response_item = response_by_key[core_item_key]
+            bound_links.append(
+                {
+                    **link,
+                    'exec_plan_id': str(response_item['execution_plan_id']),
+                    'exec_plan_item_id': str(
+                        response_item['execution_plan_item_id']
+                    ),
+                    'remote_status': str(response_item['status']),
+                    'response_item': compact_exec_response_item(response_item),
+                }
+            )
+        accepted_item_bindings = _accepted_item_bindings_from_links(bound_links)
+        if accepted_item_bindings is None:
+            return None
+        return {
+            'item_links': bound_links,
+            'contract_proof': {
+                'schema_version': EXEC_DISPATCH_PROOF_SCHEMA_VERSION,
+                'execution_plan_id': str(
+                    candidate_response['execution_plan_id']
+                ),
+                'dispatch_material_fingerprint': dispatch_material_fingerprint,
+                'destination_binding': copy.deepcopy(destination_binding),
+                'contract_ack': copy.deepcopy(candidate_response['contract_ack']),
+                'submitted_core_item_keys': submitted_core_item_keys,
+                'accepted_item_bindings': accepted_item_bindings,
+                'accepted_item_count': len(submitted_core_item_keys),
+                'rejected_item_count': 0,
+            },
+            'last_response_summary': compact_exec_response_summary(
+                candidate_response,
+                item_links=item_links,
+            ),
+        }
+
+    @classmethod
     def _match_exec_plan_readback_item(
         cls,
         *,
         link: dict[str, Any],
         plan_items: Sequence[dict[str, Any]],
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         link_core_key = _normalize_optional_text(link.get('core_item_key'))
-        if link_core_key:
-            for item in plan_items:
-                if link_core_key in cls._exec_plan_item_core_keys(item):
-                    return item
-
         link_item_id = _normalize_optional_text(link.get('exec_plan_item_id'))
-        if link_item_id:
-            for item in plan_items:
-                if link_item_id in cls._exec_plan_item_ids(item):
-                    return item
+        link_plan_id = _normalize_optional_text(link.get('exec_plan_id'))
+        if not link_core_key or not link_item_id or not link_plan_id:
+            return None, {
+                'core_item_key': link_core_key,
+                'expected_execution_plan_id': link_plan_id,
+                'expected_execution_plan_item_id': link_item_id,
+                'reason_code': 'accepted_item_binding_missing',
+            }
 
-        link_symbol = _normalize_optional_text(link.get('symbol'))
-        link_intent = _normalize_optional_text(link.get('intent'), lowercase=True)
-        if link_symbol and link_intent:
-            for item in plan_items:
-                item_symbol = _normalize_optional_text(item.get('symbol'))
-                item_intent = _normalize_optional_text(
-                    item.get('intent') or item.get('handoff_intent') or item.get('monitoring_intent'),
-                    lowercase=True,
-                )
-                if item_symbol == link_symbol and item_intent == link_intent:
-                    return item
-        return None
+        related_items = [
+            item
+            for item in plan_items
+            if link_core_key in cls._exec_plan_item_core_keys(item)
+            or link_item_id in cls._exec_plan_item_ids(item)
+        ]
+        for item in related_items:
+            if (
+                link_core_key in cls._exec_plan_item_core_keys(item)
+                and link_item_id in cls._exec_plan_item_ids(item)
+                and link_plan_id in cls._exec_plan_ids(item)
+            ):
+                return item, None
+        if not related_items:
+            return None, None
+        return None, {
+            'core_item_key': link_core_key,
+            'expected_execution_plan_id': link_plan_id,
+            'expected_execution_plan_item_id': link_item_id,
+            'observed_candidates': [
+                {
+                    'core_item_keys': sorted(cls._exec_plan_item_core_keys(item)),
+                    'execution_plan_ids': sorted(cls._exec_plan_ids(item)),
+                    'execution_plan_item_ids': sorted(
+                        cls._exec_plan_item_ids(item)
+                    ),
+                }
+                for item in related_items[:5]
+            ],
+            'reason_code': 'exec_readback_identity_mismatch',
+        }
 
     @classmethod
     def _merge_exec_plan_readback_links(
@@ -4165,17 +7618,26 @@ class SignalDeciderExecIntegrationService:
         *,
         item_links: Sequence[dict[str, Any]],
         plans_result: dict[str, Any],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         plan_items = cls._collect_exec_plan_readback_items(plans_result=plans_result)
         if not plan_items:
-            return [dict(link) for link in item_links if isinstance(link, dict)]
+            return (
+                [dict(link) for link in item_links if isinstance(link, dict)],
+                [],
+            )
 
         merged_links: list[dict[str, Any]] = []
+        identity_mismatches: list[dict[str, Any]] = []
         for raw_link in item_links:
             if not isinstance(raw_link, dict):
                 continue
             link = dict(raw_link)
-            matched_item = cls._match_exec_plan_readback_item(link=link, plan_items=plan_items)
+            matched_item, identity_mismatch = cls._match_exec_plan_readback_item(
+                link=link,
+                plan_items=plan_items,
+            )
+            if identity_mismatch is not None:
+                identity_mismatches.append(identity_mismatch)
             if matched_item is None:
                 merged_links.append(link)
                 continue
@@ -4183,13 +7645,6 @@ class SignalDeciderExecIntegrationService:
             status = cls._exec_plan_item_status(matched_item)
             if status:
                 link['remote_status'] = status
-            exec_plan_item_id = (
-                _normalize_optional_text(matched_item.get('execution_plan_item_id'))
-                or _normalize_optional_text(matched_item.get('plan_item_id'))
-                or _normalize_optional_text(matched_item.get('id'))
-            )
-            if exec_plan_item_id:
-                link['exec_plan_item_id'] = exec_plan_item_id
             response_item = dict(link.get('response_item') or {})
             compact_item = compact_exec_response_item(matched_item)
             if compact_item:
@@ -4197,7 +7652,7 @@ class SignalDeciderExecIntegrationService:
             if response_item:
                 link['response_item'] = response_item
             merged_links.append(link)
-        return merged_links
+        return merged_links, identity_mismatches
 
     @classmethod
     def _entry_link_active_statuses(cls, *, item_links: Sequence[dict[str, Any]]) -> list[str]:
@@ -4260,6 +7715,12 @@ class SignalDeciderExecIntegrationService:
         trigger: str,
     ) -> dict[str, Any] | None:
         if not self._is_short_term_watch_buy_row(row):
+            return None
+        if _normalize_optional_text(row.execution_status, lowercase=True) in {
+            'revocation_pending',
+            'revocation_manual_review',
+            'revoked',
+        }:
             return None
         active_statuses = self._entry_link_active_statuses(item_links=item_links)
         if not active_statuses:
@@ -4334,6 +7795,7 @@ class SignalDeciderExecIntegrationService:
         self,
         *,
         rows: Sequence[SignalDeciderExecutionPlanItem],
+        expected_row_bindings: dict[int, dict[str, Any]],
         trigger: str,
         runtime_payload: dict[str, Any],
         plans_result: dict[str, Any],
@@ -4343,9 +7805,12 @@ class SignalDeciderExecIntegrationService:
     ) -> None:
         now = _utcnow()
         row_ids = [int(row.id) for row in rows]
+        applied_row_ids: list[int] = []
         with session_scope() as session:
             persisted_rows = session.execute(
-                select(SignalDeciderExecutionPlanItem).where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                .with_for_update()
             ).scalars().all()
             for row in persisted_rows:
                 existing_submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
@@ -4354,17 +7819,210 @@ class SignalDeciderExecIntegrationService:
                     if isinstance(existing_submission.get('exec_dispatch'), dict)
                     else {}
                 )
-                item_links = self._merge_exec_plan_readback_links(
+                expected_binding = expected_row_bindings.get(int(row.id))
+                current_binding = _row_readback_revision_binding(row)
+                if expected_binding is None or current_binding != expected_binding:
+                    discard_attempt = {
+                        'attempted_at': now.isoformat(),
+                        'trigger': trigger,
+                        'status': 'readback_discarded_revision_mismatch',
+                        'expected_plan_id': (
+                            expected_binding.get('plan_id')
+                            if isinstance(expected_binding, dict)
+                            else None
+                        ),
+                        'current_plan_id': current_binding.get('plan_id'),
+                        'expected_dispatch_revision_fingerprint': (
+                            expected_binding.get('dispatch_revision_fingerprint')
+                            if isinstance(expected_binding, dict)
+                            else None
+                        ),
+                        'current_dispatch_revision_fingerprint': current_binding.get(
+                            'dispatch_revision_fingerprint'
+                        ),
+                        'expected_row_revision_fingerprint': (
+                            expected_binding.get('current_row_revision_fingerprint')
+                            if isinstance(expected_binding, dict)
+                            else None
+                        ),
+                        'current_row_revision_fingerprint': current_binding.get(
+                            'current_row_revision_fingerprint'
+                        ),
+                        'expected_contract_proof_fingerprint': (
+                            expected_binding.get('contract_proof_fingerprint')
+                            if isinstance(expected_binding, dict)
+                            else None
+                        ),
+                        'current_contract_proof_fingerprint': current_binding.get(
+                            'contract_proof_fingerprint'
+                        ),
+                    }
+                    preserved_exec_dispatch = {
+                        **copy.deepcopy(exec_dispatch),
+                        'attempts': _append_limited(
+                            exec_dispatch.get('attempts') or [],
+                            discard_attempt,
+                        ),
+                    }
+                    row.submission_payload = slim_signal_decider_exec_submission_payload(
+                        {
+                            **existing_submission,
+                            'exec_dispatch': preserved_exec_dispatch,
+                        }
+                    ).payload
+                    continue
+                contract_proof = (
+                    copy.deepcopy(exec_dispatch.get('contract_proof'))
+                    if _row_has_accepted_exec_dispatch(row)
+                    and isinstance(exec_dispatch.get('contract_proof'), dict)
+                    else None
+                )
+                if (
+                    contract_proof is None
+                    and self._row_requires_ambiguous_acceptance_reconciliation(
+                        row
+                    )
+                ):
+                    recovered_binding = (
+                        self._bind_ambiguous_dispatch_from_strict_readback_ack(
+                            exec_dispatch=exec_dispatch,
+                            plans_result=plans_result,
+                        )
+                    )
+                    if recovered_binding is not None:
+                        exec_dispatch = {
+                            **exec_dispatch,
+                            'dispatch_status': EXEC_DISPATCH_STATUS_ACCEPTED,
+                            'last_success_at': now.isoformat(),
+                            'last_error': None,
+                            'item_links': recovered_binding['item_links'],
+                            'contract_proof': recovered_binding[
+                                'contract_proof'
+                            ],
+                            'last_response_summary': recovered_binding[
+                                'last_response_summary'
+                            ],
+                        }
+                        contract_proof = copy.deepcopy(
+                            recovered_binding['contract_proof']
+                        )
+                item_links, identity_mismatches = self._merge_exec_plan_readback_links(
                     item_links=exec_dispatch.get('item_links') or [],
                     plans_result=plans_result,
                 )
-                matched_orders = self._match_remote_orders(row=row, item_links=item_links, orders=orders_result['items'])
-                matched_executions = self._match_remote_executions(
+                if identity_mismatches:
+                    identity_error = _serialize_error(
+                        code='exec_readback_identity_mismatch',
+                        message=(
+                            'Exec plan readback identities conflict with the accepted '
+                            'Core dispatch binding.'
+                        ),
+                    )
+                    discard_attempt = {
+                        'attempted_at': now.isoformat(),
+                        'trigger': trigger,
+                        'status': 'readback_discarded_identity_mismatch',
+                        'reason_code': 'exec_readback_identity_mismatch',
+                        'mismatch_count': len(identity_mismatches),
+                    }
+                    preserved_exec_dispatch = {
+                        **copy.deepcopy(exec_dispatch),
+                        'attempts': _append_limited(
+                            exec_dispatch.get('attempts') or [],
+                            discard_attempt,
+                        ),
+                        'readback': compact_exec_readback(
+                            {
+                                'last_synced_at': now.isoformat(),
+                                'trigger': trigger,
+                                'runtime': runtime_payload,
+                                'execution_plans': {
+                                    'status': REMOTE_FETCH_STATUS_CONTRACT_ERROR,
+                                    'error': identity_error,
+                                },
+                                'orders': {
+                                    'status': REMOTE_FETCH_STATUS_CONTRACT_ERROR,
+                                    'count': 0,
+                                    'items': [],
+                                    'error': identity_error,
+                                },
+                                'executions': {
+                                    'status': REMOTE_FETCH_STATUS_CONTRACT_ERROR,
+                                    'count': 0,
+                                    'items': [],
+                                    'error': identity_error,
+                                },
+                                'positions': {
+                                    'status': REMOTE_FETCH_STATUS_CONTRACT_ERROR,
+                                    'count': 0,
+                                    'items': [],
+                                    'error': identity_error,
+                                },
+                                'derived_state': {
+                                    'derived_status': REMOTE_FETCH_STATUS_UNAVAILABLE,
+                                    'entry_filled_quantity': None,
+                                    'exit_filled_quantity': None,
+                                    'open_quantity': None,
+                                    'closed_quantity': None,
+                                    'plan_item_status_counts': {},
+                                    'order_status_counts': {},
+                                    'endpoint_statuses': {
+                                        key: REMOTE_FETCH_STATUS_CONTRACT_ERROR
+                                        for key in (
+                                            'plans',
+                                            'orders',
+                                            'executions',
+                                            'positions',
+                                        )
+                                    },
+                                },
+                            }
+                        ),
+                    }
+                    row.submission_payload = slim_signal_decider_exec_submission_payload(
+                        {
+                            **existing_submission,
+                            'dispatch_reconciliation': {
+                                'status': 'manual_review_required',
+                                'reason_code': 'exec_readback_identity_mismatch',
+                                'observed_at': now.isoformat(),
+                                'trigger': trigger,
+                                'plan_id': exec_dispatch.get('plan_id'),
+                                'identity_mismatches': identity_mismatches,
+                            },
+                            'exec_dispatch': preserved_exec_dispatch,
+                        }
+                    ).payload
+                    continue
+                matched_orders, order_identity_mismatches = self._match_remote_orders(
+                    row=row,
+                    item_links=item_links,
+                    orders=orders_result['items'],
+                )
+                row_orders_result = orders_result
+                if order_identity_mismatches:
+                    row_orders_result = self._position_scope_contract_error(
+                        code='order_readback_identity_mismatch',
+                        message=(
+                            'Exec order readback returned an explicit plan-item identity '
+                            'that does not match the accepted Core item binding.'
+                        ),
+                    )
+                matched_executions, execution_identity_mismatches = self._match_remote_executions(
                     row=row,
                     item_links=item_links,
                     executions=executions_result['items'],
                     orders=matched_orders,
                 )
+                row_executions_result = executions_result
+                if execution_identity_mismatches:
+                    row_executions_result = self._position_scope_contract_error(
+                        code='execution_readback_identity_mismatch',
+                        message=(
+                            'Exec execution readback returned an explicit order or '
+                            'plan-item identity that does not match the accepted Core item binding.'
+                        ),
+                    )
                 matched_positions = self._match_remote_positions(row=row, positions=positions_result['items'])
                 derived_state = self._derive_remote_state(
                     row=row,
@@ -4374,8 +8032,8 @@ class SignalDeciderExecIntegrationService:
                     positions=matched_positions,
                     endpoint_statuses={
                         'plans': plans_result['status'],
-                        'orders': orders_result['status'],
-                        'executions': executions_result['status'],
+                        'orders': row_orders_result['status'],
+                        'executions': row_executions_result['status'],
                         'positions': positions_result['status'],
                     },
                 )
@@ -4388,16 +8046,16 @@ class SignalDeciderExecIntegrationService:
                         'error': plans_result['error'],
                     },
                     'orders': {
-                        'status': orders_result['status'],
-                        'count': len(matched_orders),
-                        'items': matched_orders,
-                        'error': orders_result['error'],
+                        'status': row_orders_result['status'],
+                        'count': 0 if order_identity_mismatches else len(matched_orders),
+                        'items': [] if order_identity_mismatches else matched_orders,
+                        'error': row_orders_result['error'],
                     },
                     'executions': {
-                        'status': executions_result['status'],
-                        'count': len(matched_executions),
-                        'items': matched_executions,
-                        'error': executions_result['error'],
+                        'status': row_executions_result['status'],
+                        'count': 0 if execution_identity_mismatches else len(matched_executions),
+                        'items': [] if execution_identity_mismatches else matched_executions,
+                        'error': row_executions_result['error'],
                     },
                     'positions': {
                         'status': positions_result['status'],
@@ -4417,7 +8075,22 @@ class SignalDeciderExecIntegrationService:
                 exec_dispatch = {
                     'plan_id': exec_dispatch.get('plan_id'),
                     'plan_fingerprint': exec_dispatch.get('plan_fingerprint'),
+                    'dispatch_revision_fingerprint': exec_dispatch.get(
+                        'dispatch_revision_fingerprint'
+                    ),
+                    'dispatch_material_fingerprint': exec_dispatch.get(
+                        'dispatch_material_fingerprint'
+                    ),
+                    'dispatch_batch_key': exec_dispatch.get(
+                        'dispatch_batch_key'
+                    ),
                     'dispatch_status': exec_dispatch.get('dispatch_status'),
+                    'prior_execution_status': exec_dispatch.get(
+                        'prior_execution_status'
+                    ),
+                    'prior_eligibility_status': exec_dispatch.get(
+                        'prior_eligibility_status'
+                    ),
                     'last_attempt_at': exec_dispatch.get('last_attempt_at'),
                     'last_success_at': exec_dispatch.get('last_success_at'),
                     'last_error': summarize_error(exec_dispatch.get('last_error')),
@@ -4426,6 +8099,12 @@ class SignalDeciderExecIntegrationService:
                         for item in item_links
                         if (compact := compact_exec_item_link(item))
                     ],
+                    'destination_binding': copy.deepcopy(
+                        exec_dispatch.get('destination_binding')
+                    ),
+                    'authority_generation_before': copy.deepcopy(
+                        exec_dispatch.get('authority_generation_before')
+                    ),
                     'attempts': exec_dispatch.get('attempts') or [],
                     'last_request_summary': exec_dispatch.get('last_request_summary'),
                     'last_response_summary': exec_dispatch.get('last_response_summary'),
@@ -4433,15 +8112,19 @@ class SignalDeciderExecIntegrationService:
                 }
                 if isinstance(core_state_sync, dict):
                     exec_dispatch['core_state_sync'] = core_state_sync
+                if contract_proof is not None:
+                    exec_dispatch['contract_proof'] = contract_proof
                 submission = {
                     **existing_submission,
                     'exec_dispatch': exec_dispatch,
                 }
                 row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
+                applied_row_ids.append(int(row.id))
             session.flush()
-        signal_decider_execution_outcome_service.sync_entry_plan_items(
-            entry_plan_item_ids=row_ids,
-        )
+        if applied_row_ids:
+            signal_decider_execution_outcome_service.sync_entry_plan_items(
+                entry_plan_item_ids=applied_row_ids,
+            )
 
     @staticmethod
     def _match_remote_orders(
@@ -4449,26 +8132,79 @@ class SignalDeciderExecIntegrationService:
         row: SignalDeciderExecutionPlanItem,
         item_links: Sequence[dict[str, Any]],
         orders: Sequence[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        exec_item_ids = {
-            _normalize_optional_text(link.get('exec_plan_item_id'))
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        links_by_exec_item_id = {
+            exec_item_id: link
             for link in item_links
-            if _normalize_optional_text(link.get('exec_plan_item_id'))
+            if (exec_item_id := _normalize_optional_text(link.get('exec_plan_item_id')))
         }
+        exec_item_ids = set(links_by_exec_item_id)
         matched: list[dict[str, Any]] = []
+        identity_mismatches: list[dict[str, Any]] = []
         for order in orders:
-            order_item_id = (
-                _normalize_optional_text(order.get('execution_plan_item_id'))
-                or _normalize_optional_text(order.get('plan_item_id'))
-                or _normalize_optional_text(_extract_field(order, 'execution_plan_item', 'id'))
-            )
+            order_item_ids = {
+                normalized_item_id
+                for raw_item_id in (
+                    order.get('execution_plan_item_id'),
+                    order.get('plan_item_id'),
+                    _extract_field(order, 'execution_plan_item', 'id'),
+                )
+                if (normalized_item_id := _normalize_optional_text(raw_item_id))
+            }
+            order_item_id = next(iter(order_item_ids)) if len(order_item_ids) == 1 else None
             symbol = _normalize_optional_text(order.get('symbol'))
-            if exec_item_ids and order_item_id and order_item_id in exec_item_ids:
-                matched.append(order)
+            if order_item_ids:
+                expected_link = links_by_exec_item_id.get(order_item_id)
+                expected_symbol = (
+                    _normalize_optional_text(expected_link.get('symbol'))
+                    if expected_link is not None
+                    else None
+                ) or row.symbol
+                expected_side = (
+                    _normalize_optional_text(
+                        expected_link.get('side'),
+                        lowercase=True,
+                    )
+                    if expected_link is not None
+                    else None
+                )
+                observed_side = _normalize_optional_text(
+                    order.get('side'),
+                    lowercase=True,
+                )
+                content_matches = bool(
+                    (symbol is None or symbol == expected_symbol)
+                    and (
+                        observed_side is None
+                        or expected_side is None
+                        or observed_side == expected_side
+                    )
+                )
+                if (
+                    len(order_item_ids) == 1
+                    and expected_link is not None
+                    and content_matches
+                ):
+                    matched.append(order)
+                elif (
+                    any(item_id in exec_item_ids for item_id in order_item_ids)
+                    or (symbol and symbol == row.symbol)
+                ):
+                    identity_mismatches.append(
+                        {
+                            'observed_execution_plan_item_id': order_item_id,
+                            'observed_execution_plan_item_ids': sorted(order_item_ids),
+                            'expected_execution_plan_item_ids': sorted(exec_item_ids),
+                            'observed_symbol': symbol,
+                            'expected_symbol': expected_symbol,
+                            'observed_side': observed_side,
+                            'expected_side': expected_side,
+                        }
+                    )
                 continue
             if symbol and symbol == row.symbol:
                 matched.append(order)
-        return matched
+        return matched, identity_mismatches
 
     @staticmethod
     def _match_remote_executions(
@@ -4477,65 +8213,326 @@ class SignalDeciderExecIntegrationService:
         item_links: Sequence[dict[str, Any]],
         executions: Sequence[dict[str, Any]],
         orders: Sequence[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        order_ids = {
-            _normalize_optional_text(order.get('id'))
-            or _normalize_optional_text(order.get('broker_order_id'))
-            for order in orders
-            if _normalize_optional_text(order.get('id')) or _normalize_optional_text(order.get('broker_order_id'))
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        links_by_exec_item_id = {
+            exec_item_id: link
+            for link in item_links
+            if (exec_item_id := _normalize_optional_text(link.get('exec_plan_item_id')))
         }
+        exec_item_ids = set(links_by_exec_item_id)
+        internal_order_indexes: dict[str, set[int]] = defaultdict(set)
+        external_order_indexes: dict[str, set[int]] = defaultdict(set)
+        any_order_indexes: dict[str, set[int]] = defaultdict(set)
+        for order_index, order in enumerate(orders):
+            for raw_order_id in (order.get('id'), order.get('broker_order_pk')):
+                if normalized_order_id := _normalize_optional_text(raw_order_id):
+                    internal_order_indexes[normalized_order_id].add(order_index)
+                    any_order_indexes[normalized_order_id].add(order_index)
+            for raw_order_id in (order.get('broker_order_id'), order.get('order_id')):
+                if normalized_order_id := _normalize_optional_text(raw_order_id):
+                    external_order_indexes[normalized_order_id].add(order_index)
+                    any_order_indexes[normalized_order_id].add(order_index)
+        order_ids = set(any_order_indexes)
         matched: list[dict[str, Any]] = []
+        identity_mismatches: list[dict[str, Any]] = []
         for execution in executions:
             symbol = _normalize_optional_text(execution.get('symbol'))
-            linked_order_id = (
-                _normalize_optional_text(execution.get('broker_order_id'))
-                or _normalize_optional_text(execution.get('order_id'))
-                or _normalize_optional_text(execution.get('broker_order_pk'))
+            execution_item_ids = {
+                normalized_item_id
+                for raw_item_id in (
+                    execution.get('execution_plan_item_id'),
+                    execution.get('plan_item_id'),
+                    execution.get('exec_plan_item_id'),
+                )
+                if (normalized_item_id := _normalize_optional_text(raw_item_id))
+            }
+            execution_item_id = (
+                next(iter(execution_item_ids))
+                if len(execution_item_ids) == 1
+                else None
             )
-            if linked_order_id and linked_order_id in order_ids:
-                matched.append(execution)
+            observed_order_identities = [
+                (field_name, normalized_order_id, index)
+                for field_name, raw_order_id, index in (
+                    (
+                        'broker_order_pk',
+                        execution.get('broker_order_pk'),
+                        internal_order_indexes,
+                    ),
+                    (
+                        'broker_order_id',
+                        execution.get('broker_order_id'),
+                        external_order_indexes,
+                    ),
+                    ('order_id', execution.get('order_id'), any_order_indexes),
+                )
+                if (normalized_order_id := _normalize_optional_text(raw_order_id))
+            ]
+            linked_order_indexes: set[int] | None = None
+            for _, normalized_order_id, index in observed_order_identities:
+                candidates = set(index.get(normalized_order_id, set()))
+                linked_order_indexes = (
+                    candidates
+                    if linked_order_indexes is None
+                    else linked_order_indexes & candidates
+                )
+            linked_order_index = (
+                next(iter(linked_order_indexes))
+                if linked_order_indexes is not None and len(linked_order_indexes) == 1
+                else None
+            )
+            linked_order = (
+                orders[linked_order_index]
+                if linked_order_index is not None
+                else None
+            )
+            linked_order_id = (
+                observed_order_identities[0][1]
+                if observed_order_identities
+                else None
+            )
+            explicit_identity_present = bool(
+                execution_item_ids or observed_order_identities
+            )
+            item_identity_matches = bool(
+                len(execution_item_ids) == 1
+                and execution_item_id in exec_item_ids
+            )
+            order_identity_matches = bool(
+                observed_order_identities and linked_order is not None
+            )
+            if explicit_identity_present:
+                expected_link = links_by_exec_item_id.get(execution_item_id)
+                linked_order_item_ids = (
+                    {
+                        normalized_item_id
+                        for raw_item_id in (
+                            linked_order.get('execution_plan_item_id'),
+                            linked_order.get('plan_item_id'),
+                            _extract_field(
+                                linked_order,
+                                'execution_plan_item',
+                                'id',
+                            ),
+                        )
+                        if (
+                            normalized_item_id := _normalize_optional_text(
+                                raw_item_id
+                            )
+                        )
+                    }
+                    if linked_order is not None
+                    else set()
+                )
+                linked_order_item_id = (
+                    next(iter(linked_order_item_ids))
+                    if len(linked_order_item_ids) == 1
+                    else None
+                )
+                cross_binding_matches = bool(
+                    not (execution_item_ids and observed_order_identities)
+                    or (
+                        linked_order_item_id is not None
+                        and linked_order_item_id == execution_item_id
+                    )
+                )
+                expected_symbol = (
+                    _normalize_optional_text(expected_link.get('symbol'))
+                    if expected_link is not None
+                    else _normalize_optional_text(linked_order.get('symbol'))
+                    if linked_order is not None
+                    else None
+                ) or row.symbol
+                expected_side = (
+                    _normalize_optional_text(
+                        expected_link.get('side'),
+                        lowercase=True,
+                    )
+                    if expected_link is not None
+                    else _normalize_optional_text(
+                        linked_order.get('side'),
+                        lowercase=True,
+                    )
+                    if linked_order is not None
+                    else None
+                )
+                observed_side = _normalize_optional_text(
+                    execution.get('side'),
+                    lowercase=True,
+                )
+                content_matches = bool(
+                    (symbol is None or symbol == expected_symbol)
+                    and (
+                        observed_side is None
+                        or expected_side is None
+                        or observed_side == expected_side
+                    )
+                )
+                all_explicit_identities_match = bool(
+                    (not execution_item_ids or item_identity_matches)
+                    and (not observed_order_identities or order_identity_matches)
+                    and cross_binding_matches
+                    and content_matches
+                )
+                if all_explicit_identities_match:
+                    matched.append(execution)
+                elif (
+                    expected_link is not None
+                    or linked_order is not None
+                    or (symbol and symbol == row.symbol)
+                ):
+                    identity_mismatches.append(
+                        {
+                            'observed_execution_plan_item_id': execution_item_id,
+                            'observed_execution_plan_item_ids': sorted(
+                                execution_item_ids
+                            ),
+                            'observed_broker_order_id': linked_order_id,
+                            'observed_order_identities': {
+                                field_name: value
+                                for field_name, value, _ in observed_order_identities
+                            },
+                            'expected_execution_plan_item_ids': sorted(exec_item_ids),
+                            'expected_broker_order_ids': sorted(order_ids),
+                            'linked_order_execution_plan_item_id': linked_order_item_id,
+                            'observed_symbol': symbol,
+                            'expected_symbol': expected_symbol,
+                            'observed_side': observed_side,
+                            'expected_side': expected_side,
+                        }
+                    )
                 continue
             if symbol and symbol == row.symbol:
                 matched.append(execution)
-        return matched
+        return matched, identity_mismatches
 
     @staticmethod
-    def _extract_remote_account_reference(payload: dict[str, Any]) -> str | None:
-        for candidate in (
-            payload.get('account_reference'),
-            payload.get('accountReference'),
-            _extract_field(payload, 'account', 'account_reference'),
-            _extract_field(payload, 'account', 'accountReference'),
-            _extract_field(payload, 'account', 'reference'),
-            _extract_field(payload, 'metadata', 'account_reference'),
-            _extract_field(payload, 'metadata', 'accountReference'),
-            _extract_field(payload, 'risk_context', 'account_reference'),
-            _extract_field(payload, 'riskContext', 'accountReference'),
-        ):
-            normalized = _normalize_optional_text(candidate)
-            if normalized:
-                return normalized
-        return None
+    def _accepted_execution_plan_id_for_rows(
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+    ) -> str | None:
+        execution_plan_ids: set[str] = set()
+        for row in rows:
+            if not _row_has_accepted_exec_dispatch(row):
+                return None
+            submission = (
+                row.submission_payload
+                if isinstance(row.submission_payload, dict)
+                else {}
+            )
+            exec_dispatch = (
+                submission.get('exec_dispatch')
+                if isinstance(submission.get('exec_dispatch'), dict)
+                else {}
+            )
+            proof = (
+                exec_dispatch.get('contract_proof')
+                if isinstance(exec_dispatch.get('contract_proof'), dict)
+                else {}
+            )
+            execution_plan_id = _normalize_optional_text(
+                proof.get('execution_plan_id')
+            )
+            if execution_plan_id is None:
+                return None
+            execution_plan_ids.add(execution_plan_id)
+        return (
+            next(iter(execution_plan_ids))
+            if len(execution_plan_ids) == 1
+            else None
+        )
+
+    @staticmethod
+    def _position_scope_contract_error(
+        *,
+        code: str,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            'status': REMOTE_FETCH_STATUS_CONTRACT_ERROR,
+            'payload': None,
+            'items': [],
+            'error': _serialize_error(code=code, message=message),
+        }
 
     @classmethod
-    def _filter_remote_positions_for_account(
+    def _validate_remote_position_scope_proofs(
         cls,
         *,
-        positions: Sequence[dict[str, Any]],
-        account_reference: str | None,
-    ) -> list[dict[str, Any]]:
-        resolved_account_reference = _normalize_optional_text(account_reference)
-        normalized_positions = list(positions)
-        if not resolved_account_reference:
-            return normalized_positions
-        scoped_accounts = [cls._extract_remote_account_reference(item) for item in normalized_positions]
-        if not any(account is not None for account in scoped_accounts):
-            return normalized_positions
-        return [
-            item
-            for item, position_account_reference in zip(normalized_positions, scoped_accounts)
-            if position_account_reference == resolved_account_reference
-        ]
+        result: dict[str, Any],
+        external_plan_id: str,
+        execution_plan_id: str,
+    ) -> dict[str, Any]:
+        if result.get('status') != REMOTE_FETCH_STATUS_OK:
+            return result
+        required_proof_fields = {
+            'schema_version',
+            'plan_id',
+            'execution_plan_id',
+            'provider',
+            'account_scope',
+            'exchange',
+        }
+        account_scopes: set[str] = set()
+        for position in result.get('items') or []:
+            proof = (
+                position.get('position_scope_proof')
+                if isinstance(position, dict)
+                and isinstance(position.get('position_scope_proof'), dict)
+                else None
+            )
+            proof_provider = _normalize_optional_text(
+                proof.get('provider') if proof else None,
+                lowercase=True,
+            )
+            position_provider = _normalize_optional_text(
+                position.get('provider') if isinstance(position, dict) else None,
+                lowercase=True,
+            )
+            proof_account_scope = _normalize_optional_text(
+                proof.get('account_scope') if proof else None
+            )
+            position_account_scope = _normalize_optional_text(
+                position.get('account_scope') if isinstance(position, dict) else None
+            )
+            proof_exchange = _normalize_optional_text(
+                proof.get('exchange') if proof else None
+            )
+            position_exchange = _normalize_optional_text(
+                position.get('exchange') if isinstance(position, dict) else None
+            )
+            if (
+                proof is None
+                or set(proof) != required_proof_fields
+                or proof.get('schema_version')
+                != EXEC_POSITION_SCOPE_PROOF_SCHEMA_VERSION
+                or _normalize_optional_text(proof.get('plan_id'))
+                != external_plan_id
+                or _normalize_optional_text(proof.get('execution_plan_id'))
+                != execution_plan_id
+                or proof_provider != position_provider
+                or proof_provider != 'kis'
+                or proof_account_scope != position_account_scope
+                or proof_account_scope is None
+                or proof_exchange != position_exchange
+                or str(proof_exchange or '').upper() != 'KRX'
+            ):
+                return cls._position_scope_contract_error(
+                    code='position_scope_proof_invalid',
+                    message=(
+                        'Exec position readback was not bound to the requested '
+                        'plan and opaque account route.'
+                    ),
+                )
+            account_scopes.add(proof_account_scope)
+        if len(account_scopes) > 1:
+            return cls._position_scope_contract_error(
+                code='position_scope_proof_invalid',
+                message=(
+                    'Exec position readback mixed multiple opaque account routes '
+                    'for one accepted execution plan.'
+                ),
+            )
+        return result
 
     @staticmethod
     def _match_remote_positions(

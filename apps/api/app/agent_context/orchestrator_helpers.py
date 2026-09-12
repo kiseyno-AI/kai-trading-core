@@ -14,6 +14,7 @@ from app.agent_context.signal_envelope import (
 )
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.agent_context.response_contract import build_agent_contract_provenance
+from app.agent_context.model_identity import build_runtime_contract_provenance
 
 ABORTLIKE_ERROR_MARKERS = (
     'this operation was aborted',
@@ -451,8 +452,23 @@ def build_response_storage_payload(
         else {}
     )
     canonical_contract_provenance = build_agent_contract_provenance(role=spec.role)
+    model_identity = (
+        normalized_feedback.get('model_identity')
+        if isinstance(normalized_feedback.get('model_identity'), dict)
+        else batch_result.get('model_identity')
+        if isinstance(batch_result.get('model_identity'), dict)
+        else request_provenance.get('model_identity')
+        if isinstance(request_provenance.get('model_identity'), dict)
+        else None
+    )
+    runtime_contract = (
+        request_provenance.get('runtime_contract')
+        if isinstance(request_provenance.get('runtime_contract'), dict)
+        else build_runtime_contract_provenance(spec.role)
+    )
     decision_provenance = {
         'model': resolved_model_name,
+        'model_identity': model_identity,
         'prompt_sha256': request_provenance.get('prompt_sha256'),
         'prompt_chars': request_provenance.get('prompt_chars'),
         'contract_version': (
@@ -464,6 +480,7 @@ def build_response_storage_payload(
             or canonical_contract_provenance['contract_sha256']
         ),
         'role': request_provenance.get('role') or spec.role,
+        'runtime_contract': runtime_contract,
     }
     return {
         'attempt': batch_result.get('attempt', 1),
@@ -1110,6 +1127,16 @@ def build_signal_decider_payload(
     previous_decision_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     symbol_day_context = jsonable_encoder(strip_runtime_session_fields(item))
+    company_context = (
+        symbol_day_context.get('company')
+        if isinstance(symbol_day_context.get('company'), dict)
+        else {}
+    )
+    canonical_market = str(
+        symbol_day_context.get('market') or company_context.get('market') or ''
+    ).strip().upper()
+    if canonical_market:
+        symbol_day_context['market'] = canonical_market
     score_context = symbol_day_context.pop('scores', {}) if isinstance(symbol_day_context.get('scores'), dict) else {}
     factor_summary = (
         symbol_day_context.pop('factor_summary', {})

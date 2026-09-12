@@ -174,6 +174,7 @@ class KISRealtimeOrderNoticeServiceTests(unittest.TestCase):
 
     def test_duplicate_and_older_notice_do_not_regress_filled_snapshot(self) -> None:
         self._seed_order()
+        received_at = datetime(2026, 4, 28, 0, 20, tzinfo=timezone.utc)
 
         fill_notice = self._build_notice(
             cntg_yn='2',
@@ -181,8 +182,14 @@ class KISRealtimeOrderNoticeServiceTests(unittest.TestCase):
             cntg_qty='10',
             cntg_unpr='70100',
         )
-        first_fill = self.service.ingest_notice_fields(fill_notice)
-        duplicate_fill = self.service.ingest_notice_fields(fill_notice)
+        first_fill = self.service.ingest_notice_fields(
+            fill_notice,
+            received_at=received_at,
+        )
+        duplicate_fill = self.service.ingest_notice_fields(
+            fill_notice,
+            received_at=received_at,
+        )
         older_partial = self.service.ingest_notice_fields(
             self._build_notice(
                 cntg_yn='2',
@@ -190,6 +197,7 @@ class KISRealtimeOrderNoticeServiceTests(unittest.TestCase):
                 cntg_qty='4',
                 cntg_unpr='70010',
             ),
+            received_at=received_at,
         )
 
         order_row = load_broker_order(

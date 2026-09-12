@@ -18,6 +18,32 @@ from app.agent_context.orchestrator_helpers import (
     build_failed_dispatch_item,
     resolve_dispatch_status,
 )
+from app.agent_context.model_identity import (
+    apply_decider_model_identity_fence,
+    expected_decider_model,
+)
+from app.core.settings import settings
+
+
+def response_failure_audit(
+    response: dict[str, Any] | None,
+    *,
+    model_identity_verdict: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(response, dict):
+        return None
+    request_provenance = response.get('request_provenance')
+    return jsonable_encoder(
+        {
+            'response': response.get('response'),
+            'output_text': response.get('output_text'),
+            'request_provenance': (
+                request_provenance if isinstance(request_provenance, dict) else None
+            ),
+            'model_identity': response.get('model_identity'),
+            'model_identity_verdict': model_identity_verdict,
+        }
+    )
 
 
 def batch_response_contract_failure(batch_result: dict[str, Any]) -> str | None:
@@ -305,6 +331,22 @@ def dispatch_and_store(
                 if isinstance(response.get('normalized_feedback'), dict)
                 else {}
             )
+            normalized_feedback = apply_decider_model_identity_fence(
+                role=spec.role,
+                normalized_feedback=normalized_feedback,
+                model_identity=(
+                    response.get('model_identity')
+                    if isinstance(response.get('model_identity'), dict)
+                    else None
+                ),
+                expected_model=expected_decider_model(spec.role, settings_obj=settings),
+                runtime_contract=(
+                    response.get('request_provenance', {}).get('runtime_contract')
+                    if isinstance(response.get('request_provenance'), dict)
+                    else None
+                ),
+            )
+            response = {**response, 'normalized_feedback': normalized_feedback}
             contract_failure = normalized_feedback_contract_failure(
                 normalized_feedback,
                 require_symbol_identity=symbol != '__MARKET__',
@@ -317,7 +359,17 @@ def dispatch_and_store(
                     retryable=True,
                     error=contract_failure,
                     failure_kind=contract_failure,
-                    context=payload,
+                    context={
+                        **payload,
+                        'response_audit': response_failure_audit(
+                            response,
+                            model_identity_verdict=(
+                                normalized_feedback.get('model_identity')
+                                if isinstance(normalized_feedback.get('model_identity'), dict)
+                                else None
+                            ),
+                        ),
+                    },
                     session_key=session_key,
                 )
             else:
@@ -492,6 +544,7 @@ def dispatch_for_symbols_via_subagents(
                 }
                 staged_feedback: list[tuple[dict[str, Any], dict[str, Any]]] = []
                 normalized_contract_failure: str | None = None
+                rejected_model_identity: dict[str, Any] | None = None
                 for source_item in batch:
                     symbol = source_item['symbol']
                     feedback_candidate = by_symbol.get(symbol, {}).get('feedback')
@@ -506,8 +559,28 @@ def dispatch_for_symbols_via_subagents(
                         market_date=source_item.get('market_date') or normalized_market_date.isoformat(),
                         symbol=symbol,
                     )
+                    normalized_feedback = apply_decider_model_identity_fence(
+                        role=spec.role,
+                        normalized_feedback=normalized_feedback,
+                        model_identity=(
+                            batch_result.get('model_identity')
+                            if isinstance(batch_result.get('model_identity'), dict)
+                            else None
+                        ),
+                        expected_model=expected_decider_model(spec.role, settings_obj=settings),
+                        runtime_contract=(
+                            batch_result.get('request_provenance', {}).get('runtime_contract')
+                            if isinstance(batch_result.get('request_provenance'), dict)
+                            else None
+                        ),
+                    )
                     normalized_contract_failure = normalized_feedback_contract_failure(normalized_feedback)
                     if normalized_contract_failure is not None:
+                        rejected_model_identity = (
+                            normalized_feedback.get('model_identity')
+                            if isinstance(normalized_feedback.get('model_identity'), dict)
+                            else None
+                        )
                         break
                     staged_feedback.append((source_item, normalized_feedback))
 
@@ -525,6 +598,13 @@ def dispatch_for_symbols_via_subagents(
                             retryable=True,
                             error=normalized_contract_failure,
                             failure_kind=failure_kind,
+                            context={
+                                **source_item,
+                                'response_audit': response_failure_audit(
+                                    batch_result,
+                                    model_identity_verdict=rejected_model_identity,
+                                ),
+                            },
                         )
                         for source_item in batch
                     )

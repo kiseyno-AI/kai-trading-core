@@ -5,6 +5,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -2108,6 +2109,75 @@ class SignalDeciderExecutionPlanItem(Base, TimestampMixin):
     first_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CoreExecBuyAuthorityState(Base, TimestampMixin):
+    __tablename__ = 'core_exec_buy_authority_states'
+    __table_args__ = (
+        UniqueConstraint(
+            'provider',
+            'market',
+            'currency',
+            'runtime_mode',
+            'account_reference',
+            name='uq_core_exec_buy_authority_states_scope',
+        ),
+        CheckConstraint(
+            "provider = 'kis' AND market = 'KRX' AND currency = 'KRW'",
+            name='ck_core_exec_buy_authority_states_krx_scope',
+        ),
+    )
+
+    scope_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    runtime_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    account_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    latest_observation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    latest_delivery_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    latest_material_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    latest_action: Mapped[str] = mapped_column(String(32), nullable=False)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    delivery_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    remote_scope_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    remote_fence_active: Mapped[bool | None] = mapped_column(Boolean)
+    last_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class CoreExecBuyAuthorityOutbox(Base, TimestampMixin):
+    __tablename__ = 'core_exec_buy_authority_outbox'
+    __table_args__ = (
+        UniqueConstraint(
+            'scope_key',
+            'delivery_sequence',
+            name='uq_core_exec_buy_authority_outbox_scope_sequence',
+        ),
+        Index(
+            'ix_core_exec_buy_authority_outbox_pending',
+            'scope_key',
+            'status',
+            'created_at',
+        ),
+    )
+
+    observation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(
+        ForeignKey('core_exec_buy_authority_states.scope_key', ondelete='CASCADE'),
+        nullable=False,
+    )
+    delivery_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    material_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending')
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ack_payload: Mapped[dict | None] = mapped_column(JSON)
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class SignalDeciderActualExecutionOutcome(Base, TimestampMixin):

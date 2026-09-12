@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
 BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS = 45
 BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS = 600
+MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(9, 0)
+MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(14, 31)
+SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
 def is_preopen_exec_dispatch_due(market: object) -> bool:
@@ -42,6 +46,64 @@ class EODBackgroundRunner:
         self._running = False
         self._step_timeout_cooldowns: dict[str, datetime] = {}
         self._blocking_step_tasks: dict[str, asyncio.Task] = {}
+        self._async_step_tasks: dict[str, asyncio.Task] = {}
+        self._last_open_drive_market_snapshot_refresh_at: datetime | None = None
+
+    @staticmethod
+    def _open_drive_market_time(market: object) -> datetime | None:
+        if (
+            str(getattr(market, 'market', '') or '').strip().upper() != 'KRX'
+            or str(getattr(market, 'state', '') or '').strip().upper() != 'OPEN'
+            or not bool(getattr(market, 'is_trading_day', False))
+        ):
+            return None
+        server_time = getattr(market, 'server_time', None)
+        if not server_time:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(server_time).replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        current = parsed.astimezone(SEOUL_TZ)
+        local_time = current.time().replace(tzinfo=None)
+        if not (
+            MARKET_SNAPSHOT_OPEN_DRIVE_START_KST
+            <= local_time
+            < MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST
+        ):
+            return None
+        return current
+
+    def _next_poll_interval_seconds(self, market: object | None) -> int:
+        if self._open_drive_market_time(market) is None:
+            return self.interval_seconds
+        return min(
+            self.interval_seconds,
+            settings.market_snapshot_open_drive_refresh_interval_seconds,
+        )
+
+    def _claim_market_snapshot_open_drive_refresh(self, market: object) -> bool:
+        current = self._open_drive_market_time(market)
+        if current is None:
+            return False
+
+        interval_seconds = settings.market_snapshot_open_drive_refresh_interval_seconds
+        window_start = current.replace(hour=9, minute=0, second=0, microsecond=0)
+        elapsed_seconds = int((current - window_start).total_seconds())
+        bucket_started_at = window_start + timedelta(
+            seconds=(elapsed_seconds // interval_seconds) * interval_seconds
+        )
+        previous_bucket = self._last_open_drive_market_snapshot_refresh_at
+        if (
+            previous_bucket is not None
+            and previous_bucket.date() == current.date()
+            and bucket_started_at <= previous_bucket
+        ):
+            return False
+        self._last_open_drive_market_snapshot_refresh_at = bucket_started_at
+        return True
 
     def _step_in_timeout_cooldown(self, name: str) -> bool:
         cooldown_until = self._step_timeout_cooldowns.get(name)
@@ -72,25 +134,33 @@ class EODBackgroundRunner:
     async def stop(self) -> None:
         self._running = False
         await auto_pykrx_eod_scheduler.stop()
-        for task in list(self._blocking_step_tasks.values()):
-            task.cancel()
-        if self._blocking_step_tasks:
-            await asyncio.gather(*self._blocking_step_tasks.values(), return_exceptions=True)
-            self._blocking_step_tasks.clear()
+        # Cancelling an asyncio.to_thread wrapper cannot stop its worker thread.
+        # Keep the task registered until its callback observes real completion so
+        # a same-process restart cannot launch a duplicate critical refresh.
         if self._task:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
 
-    async def _run_blocking_step(self, name: str, func) -> None:
+    async def _run_blocking_step(
+        self,
+        name: str,
+        func,
+        *,
+        fail_closed: bool = False,
+    ) -> None:
         running_task = self._blocking_step_tasks.get(name)
         if running_task is not None and not running_task.done():
             logger.info('Background runner blocking step already in flight: %s', name)
+            if fail_closed:
+                raise RuntimeError(f'blocking step still in flight: {name}')
             return
         if running_task is not None:
             self._blocking_step_tasks.pop(name, None)
         if self._step_in_timeout_cooldown(name):
+            if fail_closed:
+                raise RuntimeError(f'blocking step is in timeout cooldown: {name}')
             return
         task = asyncio.create_task(asyncio.to_thread(func), name=f'eod-background-blocking:{name}')
         self._blocking_step_tasks[name] = task
@@ -105,6 +175,8 @@ class EODBackgroundRunner:
                 name,
                 BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS,
             )
+            if fail_closed:
+                raise RuntimeError(f'blocking step timed out: {name}')
 
     def _finalize_blocking_step(self, name: str, task: asyncio.Task) -> None:
         if self._blocking_step_tasks.get(name) is task:
@@ -117,21 +189,65 @@ class EODBackgroundRunner:
         else:
             self._step_timeout_cooldowns.pop(name, None)
 
-    async def _run_async_step(self, name: str, awaitable) -> None:
+    async def _run_async_step(
+        self,
+        name: str,
+        awaitable,
+        *,
+        fail_closed: bool = False,
+    ) -> None:
+        running_task = self._async_step_tasks.get(name)
+        if running_task is not None and not running_task.done():
+            with suppress(Exception):
+                awaitable.close()
+            logger.info('Background runner async step already in flight: %s', name)
+            if fail_closed:
+                raise RuntimeError(f'async step still in flight: {name}')
+            return
+        if running_task is not None:
+            self._finalize_async_step(name, running_task)
         if self._step_in_timeout_cooldown(name):
             with suppress(Exception):
                 awaitable.close()
+            if fail_closed:
+                raise RuntimeError(f'async step is in timeout cooldown: {name}')
             return
+        task = asyncio.create_task(awaitable, name=f'eod-background-async:{name}')
+        self._async_step_tasks[name] = task
+        task.add_done_callback(
+            lambda completed, step_name=name: self._finalize_async_step(
+                step_name,
+                completed,
+            )
+        )
         try:
-            await asyncio.wait_for(awaitable, timeout=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+            )
         except asyncio.TimeoutError:
             self._mark_step_timed_out(name)
+            if task.done():
+                self._finalize_async_step(name, task)
             logger.warning(
-                'Background runner async step timed out after %ss: %s; cooling down for %ss',
+                'Background runner async step still running after %ss: %s; keeping single-flight lock and cooling down for %ss',
                 BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
                 name,
                 BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS,
             )
+            if fail_closed:
+                raise RuntimeError(f'async step timed out: {name}')
+
+    def _finalize_async_step(self, name: str, task: asyncio.Task) -> None:
+        if self._async_step_tasks.get(name) is task:
+            self._async_step_tasks.pop(name, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning('Background runner async step failed: %s: %s', name, exc)
+        else:
+            self._step_timeout_cooldowns.pop(name, None)
 
     def _schedule_exec_readback_refresh(self, *, target_trade_date: str, trigger: str) -> None:
         result = signal_decider_exec_integration_service.schedule_signal_decider_exec_readback_refresh(
@@ -158,20 +274,92 @@ class EODBackgroundRunner:
             },
         )
 
+    async def _run_buy_authority_critical_step(
+        self,
+        *,
+        name: str,
+        market: object,
+        awaitable,
+    ) -> None:
+        try:
+            await awaitable
+        except Exception:
+            trigger = f'background_runner:{name}_failed'
+            try:
+                await signal_decider_exec_integration_service.revoke_delegated_buys_for_unavailable_market_evidence(
+                    target_trade_date=str(getattr(market, 'server_time', ''))[:10],
+                    trigger=trigger,
+                )
+            except Exception as revocation_exc:
+                logger.exception(
+                    'Critical BUY authority revocation failed after %s: %s',
+                    name,
+                    revocation_exc,
+                )
+            raise
+
     async def _run_loop(self) -> None:
         while self._running:
+            market: object | None = None
             try:
                 market = await async_get_market_state()
                 runtime_background_enabled = settings.background_runner_enabled
+                open_snapshot_refreshed = False
+                if runtime_background_enabled and market.state == 'OPEN':
+                    await self._run_buy_authority_critical_step(
+                        name='refresh_master_if_due',
+                        market=market,
+                        awaitable=self._run_blocking_step(
+                            'refresh_master_if_due',
+                            refresh_master_if_due,
+                            fail_closed=True,
+                        ),
+                    )
+                    force_index_refresh = self._claim_market_snapshot_open_drive_refresh(market)
+                    await self._run_buy_authority_critical_step(
+                        name='market_snapshot_refresh_if_due',
+                        market=market,
+                        awaitable=self._run_async_step(
+                            'market_snapshot_refresh_if_due',
+                            market_snapshot_service.refresh_market_snapshot_if_due(
+                                trigger='background_runner:open',
+                                force_index=force_index_refresh,
+                            ),
+                            fail_closed=True,
+                        ),
+                    )
+                    open_snapshot_refreshed = True
                 if runtime_background_enabled and market.state == 'PREOPEN':
-                    await self._run_blocking_step('refresh_master_if_due', refresh_master_if_due)
-                    await self._run_blocking_step(
-                        'signal_decider_next_open_execution_refresh_plan_if_due',
-                        signal_decider_next_open_execution_service.refresh_plan_if_due,
+                    await self._run_buy_authority_critical_step(
+                        name='refresh_master_if_due',
+                        market=market,
+                        awaitable=self._run_blocking_step(
+                            'refresh_master_if_due',
+                            refresh_master_if_due,
+                            fail_closed=True,
+                        ),
+                    )
+                    await self._run_buy_authority_critical_step(
+                        name='signal_decider_next_open_execution_refresh_plan_if_due',
+                        market=market,
+                        awaitable=self._run_blocking_step(
+                            'signal_decider_next_open_execution_refresh_plan_if_due',
+                            signal_decider_next_open_execution_service.refresh_plan_if_due,
+                            fail_closed=True,
+                        ),
+                    )
+                    delegate_execution = (
+                        signal_decider_exec_integration_service.should_delegate_execution()
+                    )
+                    reconcile_delegated_authority = (
+                        not delegate_execution
+                        and signal_decider_exec_integration_service.should_manage_delegated_authority(
+                            target_trade_date=market.server_time[:10],
+                        )
                     )
                     if (
-                        signal_decider_exec_integration_service.should_delegate_execution()
-                        and is_preopen_exec_dispatch_due(market)
+                        (delegate_execution and is_preopen_exec_dispatch_due(market))
+                        or reconcile_delegated_authority
                     ):
                         await self._run_async_step(
                             'signal_decider_exec_dispatch_next_open_plan',
@@ -183,10 +371,15 @@ class EODBackgroundRunner:
                         )
                 elif runtime_background_enabled and market.state == 'OPEN':
                     if signal_decider_exec_integration_service.should_delegate_execution():
-                        await self._run_blocking_step(
-                            'signal_decider_open_execution_refresh_plan_if_due',
-                            lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
-                                target_trade_date=market.server_time[:10]
+                        await self._run_buy_authority_critical_step(
+                            name='signal_decider_open_execution_refresh_plan_if_due',
+                            market=market,
+                            awaitable=self._run_blocking_step(
+                                'signal_decider_open_execution_refresh_plan_if_due',
+                                lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
+                                    target_trade_date=market.server_time[:10]
+                                ),
+                                fail_closed=True,
                             ),
                         )
                         await self._run_async_step(
@@ -200,6 +393,17 @@ class EODBackgroundRunner:
                         self._schedule_exec_readback_refresh(
                             target_trade_date=market.server_time[:10],
                             trigger='market_open_scheduler',
+                        )
+                    elif signal_decider_exec_integration_service.should_manage_delegated_authority(
+                        target_trade_date=market.server_time[:10],
+                    ):
+                        await self._run_async_step(
+                            'signal_decider_exec_reconcile_disabled_authority',
+                            signal_decider_exec_integration_service.dispatch_next_open_plan(
+                                target_trade_date=market.server_time[:10],
+                                refresh_plan=False,
+                                trigger='market_open_exec_control_reconciliation',
+                            ),
                         )
                     else:
                         await self._run_async_step(
@@ -227,12 +431,14 @@ class EODBackgroundRunner:
                         'trading_order_reconciliation_periodic',
                         trading_order_reconciliation_service.run_periodic_if_due(),
                     )
-                    await self._run_async_step(
-                        'market_snapshot_refresh_if_due',
-                        market_snapshot_service.refresh_market_snapshot_if_due(
-                            trigger=f'background_runner:{market.state.lower()}'
-                        ),
-                    )
+                    if not open_snapshot_refreshed:
+                        await self._run_async_step(
+                            'market_snapshot_refresh_if_due',
+                            market_snapshot_service.refresh_market_snapshot_if_due(
+                                trigger=f'background_runner:{market.state.lower()}',
+                                force_index=False,
+                            ),
+                        )
                     await self._run_async_step(
                         'portfolio_summary_refresh_if_due',
                         portfolio_summary_service.refresh_portfolio_summary_if_due(
@@ -241,7 +447,7 @@ class EODBackgroundRunner:
                     )
             except Exception as exc:
                 logger.exception('Background runner loop failed: %s', exc)
-            await asyncio.sleep(self.interval_seconds)
+            await asyncio.sleep(self._next_poll_interval_seconds(market))
 
 
 background_runner = EODBackgroundRunner(interval_seconds=settings.eod_auto_pykrx_poll_seconds)

@@ -1,5 +1,6 @@
 from app.orders.signal_decider_alignment_gate import (
     apply_alignment_quantity_enforcement,
+    build_alignment_override_evidence,
     build_signal_decider_alignment_gate,
 )
 
@@ -8,11 +9,36 @@ def _strong_override_quality() -> dict:
     return {
         'buy_quality_score': 76,
         'return_percentile': 0.82,
+        'return_percentile_status': 'available',
         'volume_percentile': 0.68,
+        'volume_percentile_status': 'available',
         'reward_risk_ratio': 2.5,
         'raw_trading_value_krw': 9_000_000_000,
         'continuation_setup_detected': True,
     }
+
+
+def test_override_rejects_ambiguous_or_non_finite_percentiles_without_crashing() -> None:
+    for value in (-0.01, 1.01, 82, 101, 'NaN', 'Infinity', '-Infinity', True):
+        quality = _strong_override_quality()
+        quality['return_percentile'] = value
+        quality['volume_percentile'] = value
+
+        evidence = build_alignment_override_evidence(quality)
+
+        assert evidence['allowed'] is False
+        assert evidence['metrics']['return_percentile'] is None
+        assert evidence['metrics']['volume_percentile'] is None
+
+
+def test_override_requires_validated_percentile_status() -> None:
+    quality = _strong_override_quality()
+    quality.pop('return_percentile_status')
+    quality.pop('volume_percentile_status')
+
+    evidence = build_alignment_override_evidence(quality)
+
+    assert evidence['allowed'] is False
 
 
 def test_hard_block_enforces_zero_quantity_for_wait_conflict() -> None:

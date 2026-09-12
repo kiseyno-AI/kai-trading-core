@@ -194,14 +194,11 @@ def _normalize_text_list(value: Any) -> list[str]:
 def _normalize_number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        normalized = float(value)
-        return normalized if math.isfinite(normalized) else None
-    if isinstance(value, str):
+    if isinstance(value, (int, float, str)):
         try:
-            normalized = float(value.strip())
+            normalized = float(value.strip() if isinstance(value, str) else value)
             return normalized if math.isfinite(normalized) else None
-        except ValueError:
+        except (OverflowError, ValueError):
             return None
     return None
 
@@ -227,7 +224,7 @@ def _is_raw_numeric_type(value: Any) -> bool:
 
 
 def _is_raw_number(value: Any) -> bool:
-    return _is_raw_numeric_type(value) and math.isfinite(float(value))
+    return _is_raw_numeric_type(value) and _normalize_number(value) is not None
 
 
 def _non_finite_number_flags(value: Any, *, path: str = '') -> list[str]:
@@ -1306,6 +1303,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'When wait repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that would upgrade the setup to buy. '
             'entry_price_basis should be next_open unless the supplied inputs justify a different explicit basis. '
             'target_price and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; if a concrete level is genuinely not supportable, keep the keys and explain the limitation in data_quality_warnings instead of omitting them. '
+            'expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis; never report an upside that the supplied price levels do not support. Core recomputes a conservative slippage-adjusted pre-screen return from target, reference entry, and trusted quote-spread evidence; Core-local orders also include the server-owned non-spread round-trip allowance, while Exec applies its final full-cost check in dispatch mode before any live buy can qualify. '
             'Use null rather than fake precision when a numeric field is not well-supported by the inputs. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
             'thesis_summary must be a concise decision-support explanation in Korean. '
