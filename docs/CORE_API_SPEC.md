@@ -1581,9 +1581,9 @@ than silently changing the evidence window.
 Reuse and durable cycle resume use the normalized effective cutoff as part of
 their identity. Equivalent timezone offsets match, while a missing, earlier,
 or later cutoff cannot be reused or resumed and therefore requires fresh work.
-Active retry runs join only when scope,
-scope mode, and effective cutoff all match. Separate current/future requests
-whose omitted cutoffs resolve to different request-time instants do not join.
+Active retry runs join only when scope, scope mode, and effective cutoff all
+match. Separate current/future requests whose omitted cutoffs resolve to
+different request-time instants do not join.
 
 ### Example request
 ```http

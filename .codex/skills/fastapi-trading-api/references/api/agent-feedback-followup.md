@@ -21,8 +21,8 @@ duplicate that field.
 Feedback reuse, prior-cycle resume, and active-run joins require the same
 UTC-normalized effective cutoff. Equivalent timezone offsets match; a missing,
 earlier, or later cutoff requires fresh work instead of reuse or resume.
-Omitted current/future cutoffs that
-resolve to different request-time instants do not exact-join.
+Omitted current/future cutoffs that resolve to different request-time instants
+do not exact-join.
 
 ## Example request
 
