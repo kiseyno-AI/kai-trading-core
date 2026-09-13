@@ -1287,6 +1287,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     'max_cycles': 2,
                     'outer_batch_size': 10,
                     'feedback_scope_mode': 'broad_feedback_universe',
+                    'knowledge_cutoff_at': '2026-04-14T15:30:00+09:00',
                     'reuse_existing': False,
                 },
             )
@@ -1300,6 +1301,10 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_config.max_cycles, 2)
         self.assertEqual(fake_service.last_config.outer_batch_size, 10)
         self.assertEqual(fake_service.last_config.feedback_scope_mode, 'broad_feedback_universe')
+        self.assertEqual(
+            fake_service.last_config.knowledge_cutoff_at,
+            datetime.fromisoformat('2026-04-14T15:30:00+09:00'),
+        )
         self.assertFalse(fake_service.last_config.reuse_existing)
         self.assertEqual(response.json()['feedback_scope_mode'], 'broad_feedback_universe')
         self.assertEqual(response.json()['requested_symbols'], ['005930'])
@@ -1307,6 +1312,80 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')
         self.assertEqual(summary['completed_feedback_per_minute'], 0.6)
         self.assertEqual(summary['estimated_completion_at'], '2026-04-14T01:05:00+00:00')
+
+    def test_feedback_followup_route_preserves_knowledge_cutoff(self):
+        fake_service = FakeAgentFeedbackRetryService()
+        original_service = routes_agent_context.agent_feedback_retry_service
+        routes_agent_context.agent_feedback_retry_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/feedback/followup',
+                json={
+                    'market_date': '2026-04-14',
+                    'symbols': ['005930'],
+                    'roles': ['signal-decider'],
+                    'knowledge_cutoff_at': '2026-04-14T15:30:00+09:00',
+                    'max_cycles': 1,
+                },
+            )
+        finally:
+            routes_agent_context.agent_feedback_retry_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_service.last_config.knowledge_cutoff_at,
+            datetime.fromisoformat('2026-04-14T15:30:00+09:00'),
+        )
+        self.assertEqual(response.json()['requested_symbols'], ['005930'])
+
+    def test_feedback_run_routes_reject_invalid_cutoff_before_admission(self):
+        client = TestClient(self.app)
+        requests = (
+            (
+                '/agent-context/feedback/dispatch/symbols',
+                {
+                    'market_date': '2026-04-14',
+                    'symbols': ['005930'],
+                    'wait_for_completion': False,
+                },
+            ),
+            (
+                '/agent-context/feedback/retry-cycles',
+                {
+                    'market_date': '2026-04-14',
+                    'symbols': ['005930'],
+                },
+            ),
+            (
+                '/agent-context/feedback/followup',
+                {
+                    'market_date': '2026-04-14',
+                    'symbols': ['005930'],
+                },
+            ),
+        )
+        for endpoint, base_payload in requests:
+            for cutoff, detail in (
+                (
+                    '2026-04-14T15:30:00',
+                    'knowledge_cutoff_at must include a timezone offset',
+                ),
+                (
+                    '2040-04-14T15:30:00+09:00',
+                    'knowledge_cutoff_at must not be later than the current time',
+                ),
+            ):
+                with self.subTest(endpoint=endpoint, cutoff=cutoff):
+                    response = client.post(
+                        endpoint,
+                        json={
+                            **base_payload,
+                            'knowledge_cutoff_at': cutoff,
+                        },
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(response.json()['detail'], detail)
 
     def test_symbol_dispatch_route_returns_waiting_gate_when_prerequisites_are_not_ready(self):
         with patch(
@@ -1351,6 +1430,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     'market_date': '2026-04-14',
                     'symbols': ['005930', '000660'],
                     'roles': ['eod-summarizer', 'technical-summarizer'],
+                    'knowledge_cutoff_at': '2026-04-14T15:30:00+09:00',
                     'reuse_existing': False,
                     'wait_for_completion': False,
                 },
@@ -1379,12 +1459,26 @@ class AgentContextRouteTests(unittest.TestCase):
             ['market_risk_filter', 'piotroski_filter'],
         )
         self.assertEqual(
+            fake_run_state_service.started[0]['request_payload'][
+                'knowledge_cutoff_at'
+            ],
+            '2026-04-14T06:30:00+00:00',
+        )
+        self.assertEqual(
+            payload['request']['knowledge_cutoff_at'],
+            '2026-04-14T06:30:00+00:00',
+        )
+        self.assertEqual(
             payload['request']['scope'],
             'requested_symbols_scored_by_strategy_aware_prefilter',
         )
         self.assertEqual(fake_orchestrator.calls[0]['request_run_id'], request_run_id)
         self.assertEqual(fake_orchestrator.calls[0]['symbols'], ['005930', '000660'])
         self.assertEqual(fake_orchestrator.calls[0]['roles'], ['eod-summarizer', 'technical-summarizer'])
+        self.assertEqual(
+            fake_orchestrator.calls[0]['knowledge_cutoff_at'],
+            datetime.fromisoformat('2026-04-14T15:30:00+09:00'),
+        )
 
     def test_symbol_dispatch_background_route_marks_queued_run_failed_when_startup_raises(self):
         fake_orchestrator = FailingBackgroundDispatchOrchestrator(RuntimeError('unknown roles during startup'))

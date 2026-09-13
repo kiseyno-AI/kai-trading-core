@@ -5918,35 +5918,64 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         second_service = SignalDeciderExecIntegrationService(
             client=self.client
         )
-        with patch.object(
-            self.client,
-            'post_execution_plan',
-            side_effect=concurrent_post,
-        ):
-            first_task = asyncio.create_task(
-                self.service.dispatch_next_open_plan(
-                    target_trade_date=self.target_trade_date,
-                    refresh_plan=False,
-                    force=True,
-                    trigger='concurrent_worker_one',
+        first_task: asyncio.Task | None = None
+        second_task: asyncio.Task | None = None
+        combined_future: asyncio.Future | None = None
+        try:
+            with patch.object(
+                self.client,
+                'post_execution_plan',
+                side_effect=concurrent_post,
+            ):
+                first_task = asyncio.create_task(
+                    self.service.dispatch_next_open_plan(
+                        target_trade_date=self.target_trade_date,
+                        refresh_plan=False,
+                        force=True,
+                        trigger='concurrent_worker_one',
+                    )
                 )
-            )
-            await asyncio.wait_for(first_started.wait(), timeout=2)
-            second_task = asyncio.create_task(
-                second_service.dispatch_next_open_plan(
-                    target_trade_date=self.target_trade_date,
-                    refresh_plan=False,
-                    force=False,
-                    trigger='concurrent_worker_two',
+                await asyncio.wait_for(first_started.wait(), timeout=2)
+                second_task = asyncio.create_task(
+                    second_service.dispatch_next_open_plan(
+                        target_trade_date=self.target_trade_date,
+                        refresh_plan=False,
+                        force=False,
+                        trigger='concurrent_worker_two',
+                    )
                 )
-            )
-            await asyncio.wait_for(
-                asyncio.gather(first_task, second_task),
-                timeout=5,
-            )
+                combined_future = asyncio.gather(first_task, second_task)
+                first_result, second_result = await asyncio.wait_for(
+                    asyncio.shield(combined_future),
+                    timeout=5,
+                )
+        finally:
+            # A timeout must not cancel a task while its asyncio.to_thread DB
+            # work continues beyond teardown. Release the controlled waits and
+            # drain both tasks to their natural terminal state.
+            allow_first_to_finish.set()
+            first_published.set()
+            tasks = [
+                task
+                for task in (first_task, second_task)
+                if task is not None
+            ]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         self.assertEqual(post_attempt_count, 2)
         self.assertEqual(self.client.revocation_calls, [])
+        dispatch_statuses = {
+            result['dispatch']['groups'][0]['dispatch_status']
+            for result in (first_result, second_result)
+        }
+        self.assertIn('accepted', dispatch_statuses)
+        self.assertTrue(
+            dispatch_statuses.issubset(
+                {'accepted', 'already_dispatched', 'pending_remote_ack'}
+            ),
+            dispatch_statuses,
+        )
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertTrue(_row_has_accepted_exec_dispatch(row))

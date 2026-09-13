@@ -84,6 +84,7 @@ from app.orders.next_open_execution import (
     SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW,
     SHORT_TERM_MIN_REWARD_RISK_RATIO,
     UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE,
+    _PlanRefreshRevisionConflict,
     _execution_plan_row_authority_fingerprint,
     _current_route_live_market_buy_authority,
     _is_canonical_closed_market_cost_absence,
@@ -4635,7 +4636,10 @@ class SignalDeciderExecIntegrationService:
                             revocation_results.extend(post_ack_revocations)
                         if persisted_group_result['dispatch_status'] == EXEC_DISPATCH_STATUS_CONTRACT_ERROR:
                             failed_group_count += 1
-                        elif persisted_group_result['dispatch_status'] == 'revocation_pending':
+                        elif persisted_group_result['dispatch_status'] in {
+                            'revocation_pending',
+                            EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK,
+                        }:
                             skipped_group_count += 1
                         else:
                             dispatched_group_count += 1
@@ -4731,7 +4735,10 @@ class SignalDeciderExecIntegrationService:
                 revocation_results.extend(post_ack_revocations)
             if persisted_group_result['dispatch_status'] == EXEC_DISPATCH_STATUS_CONTRACT_ERROR:
                 failed_group_count += 1
-            elif persisted_group_result['dispatch_status'] == 'revocation_pending':
+            elif persisted_group_result['dispatch_status'] in {
+                'revocation_pending',
+                EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK,
+            }:
                 skipped_group_count += 1
             else:
                 dispatched_group_count += 1
@@ -7980,16 +7987,49 @@ class SignalDeciderExecIntegrationService:
         with session_scope() as session:
             authority_generation_conflict: dict[str, Any] | None = None
             if authority_generation_before is not None and rows:
-                authority_generation_after = (
-                    signal_decider_next_open_execution_service.inspect_dispatch_authority_generation(
-                        target_trade_date=rows[0].target_trade_date,
-                        expected_row_bindings=_dispatch_authority_row_bindings(
-                            rows,
-                            revision_fingerprints=submitted_revision_fingerprints,
-                        ),
-                        _session=session,
+                try:
+                    authority_generation_after = (
+                        signal_decider_next_open_execution_service
+                        .inspect_dispatch_authority_generation(
+                            target_trade_date=rows[0].target_trade_date,
+                            expected_row_bindings=_dispatch_authority_row_bindings(
+                                rows,
+                                revision_fingerprints=(
+                                    submitted_revision_fingerprints
+                                ),
+                            ),
+                            _session=session,
+                        )
                     )
-                )
+                except _PlanRefreshRevisionConflict:
+                    # The remote ACK is durable, but another worker currently
+                    # owns the authority fence. Preserve the write-ahead state
+                    # so exact readback reconciliation can finish later; never
+                    # let contention escape while a peer transaction may still
+                    # be committing the same ACK.
+                    return {
+                        'dispatch_status': (
+                            EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+                        ),
+                        'eligible_count': len(rows),
+                        'translated_item_count': len(
+                            submitted_core_item_keys
+                        ),
+                        'accepted_item_count': 0,
+                        'rejected_item_count': 0,
+                        'pending_item_count': len(
+                            submitted_core_item_keys
+                        ),
+                        'error': _serialize_error(
+                            code='dispatch_ack_authority_fence_busy',
+                            message=(
+                                'Core authority validation is busy; the '
+                                'remote ACK remains quarantined for exact '
+                                'readback reconciliation.'
+                            ),
+                            retryable=True,
+                        ),
+                    }
                 authority_generation_conflict = (
                     _dispatch_authority_generation_conflict(
                         before=authority_generation_before,

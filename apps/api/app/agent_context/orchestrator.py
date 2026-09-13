@@ -88,7 +88,10 @@ from app.agent_context.model_identity import (
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
 from app.agent_context.payload_builder import agent_payload_builder
-from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.read_service import (
+    agent_context_read_service,
+    resolve_external_news_knowledge_cutoff_for_symbols,
+)
 from app.agent_context.roles import DEFAULT_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES, SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.response_contract import (
@@ -4597,13 +4600,14 @@ class AgentFeedbackOrchestrator:
         funnel_diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
-        requested_knowledge_cutoff_at = (
-            knowledge_cutoff_at.isoformat()
-            if isinstance(knowledge_cutoff_at, datetime)
-            else str(knowledge_cutoff_at).strip()
-            if knowledge_cutoff_at is not None
-            else None
+        effective_knowledge_cutoff_at, _knowledge_cutoff_source = (
+            resolve_external_news_knowledge_cutoff_for_symbols(
+                market_date=normalized_market_date,
+                symbols=symbols,
+                knowledge_cutoff_at=knowledge_cutoff_at,
+            )
         )
+        requested_knowledge_cutoff_at = effective_knowledge_cutoff_at.isoformat()
         normalized_parent_run_id = str(parent_run_id or '').strip() or None
         specs = self._select_specs(roles=roles)
         requested_role_names = [spec.role for spec in specs]

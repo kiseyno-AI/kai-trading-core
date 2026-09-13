@@ -27,7 +27,10 @@ from app.agent_context.missing_data_report_service import agent_context_missing_
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.reuse_service import agent_context_reuse_service
-from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.read_service import (
+    agent_context_read_service,
+    resolve_external_news_knowledge_cutoff_for_symbols,
+)
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
@@ -54,6 +57,13 @@ logger = logging.getLogger(__name__)
 
 _FEEDBACK_PROGRESS_CACHE_TTL_SECONDS = 5.0
 _FEEDBACK_PROGRESS_CACHE_MAX_ITEMS = 64
+_KNOWLEDGE_CUTOFF_DESCRIPTION = (
+    'Timezone-aware exclusive upper bound for news publication and collection '
+    'timestamps used by every dispatched role. Historical dates default to '
+    'the KRX or XNYS session close; mixed-market requests require an explicit '
+    'value. When omitted, current or future dates use request time. '
+    'Timezone-naive or explicit future values are rejected.'
+)
 _feedback_progress_cache: dict[tuple[str, tuple[str, ...] | None, str | None], tuple[float, dict]] = {}
 
 
@@ -124,7 +134,10 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
     roles: list[str] | None = None
     fs_div: str | None = None
     disclosures_limit: int = Field(default=5, ge=0, le=20)
-    knowledge_cutoff_at: datetime | None = None
+    knowledge_cutoff_at: datetime | None = Field(
+        default=None,
+        description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
+    )
     reuse_existing: bool = True
     wait_for_completion: bool = True
     force: bool = False
@@ -137,7 +150,10 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
-    knowledge_cutoff_at: datetime | None = None
+    knowledge_cutoff_at: datetime | None = Field(
+        default=None,
+        description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
+    )
     feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=200)
@@ -161,7 +177,10 @@ class AgentFeedbackFollowupRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
-    knowledge_cutoff_at: datetime | None = None
+    knowledge_cutoff_at: datetime | None = Field(
+        default=None,
+        description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
+    )
     feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=500)
@@ -763,6 +782,13 @@ async def dispatch_symbol_agent_feedback(
     background_tasks: BackgroundTasks,
 ) -> dict:
     try:
+        effective_knowledge_cutoff_at, _knowledge_cutoff_source = (
+            resolve_external_news_knowledge_cutoff_for_symbols(
+                market_date=payload.market_date,
+                symbols=payload.symbols,
+                knowledge_cutoff_at=payload.knowledge_cutoff_at,
+            )
+        )
         if payload.wait_for_completion:
             return await run_in_threadpool(
                 agent_feedback_orchestrator.dispatch_for_symbols,
@@ -771,7 +797,7 @@ async def dispatch_symbol_agent_feedback(
                 roles=payload.roles,
                 fs_div=payload.fs_div,
                 disclosures_limit=payload.disclosures_limit,
-                knowledge_cutoff_at=payload.knowledge_cutoff_at,
+                knowledge_cutoff_at=effective_knowledge_cutoff_at,
                 reuse_existing=payload.reuse_existing,
                 force=payload.force,
                 force_recompute=payload.force_recompute,
@@ -793,9 +819,7 @@ async def dispatch_symbol_agent_feedback(
             'fs_div': payload.fs_div,
             'disclosures_limit': payload.disclosures_limit,
             'knowledge_cutoff_at': (
-                payload.knowledge_cutoff_at.isoformat()
-                if payload.knowledge_cutoff_at is not None
-                else None
+                effective_knowledge_cutoff_at.isoformat()
             ),
             'reuse_existing': payload.reuse_existing,
             'force_recompute': payload.force_recompute,
@@ -908,7 +932,7 @@ async def dispatch_symbol_agent_feedback(
                     roles=requested_roles,
                     fs_div=payload.fs_div,
                     disclosures_limit=payload.disclosures_limit,
-                    knowledge_cutoff_at=payload.knowledge_cutoff_at,
+                    knowledge_cutoff_at=effective_knowledge_cutoff_at,
                     reuse_existing=payload.reuse_existing,
                     request_run_id=request_run_id,
                     force=payload.force,
@@ -951,9 +975,7 @@ async def dispatch_symbol_agent_feedback(
                 'fs_div': payload.fs_div,
                 'disclosures_limit': payload.disclosures_limit,
                 'knowledge_cutoff_at': (
-                    payload.knowledge_cutoff_at.isoformat()
-                    if payload.knowledge_cutoff_at is not None
-                    else None
+                    effective_knowledge_cutoff_at.isoformat()
                 ),
                 'reuse_existing': payload.reuse_existing,
                 'force_recompute': payload.force_recompute,

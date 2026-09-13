@@ -1038,6 +1038,65 @@ def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
     return normalized
 
 
+def resolve_external_news_knowledge_cutoff_for_symbols(
+    *,
+    market_date: str | date,
+    symbols: Sequence[str] | None,
+    knowledge_cutoff_at: datetime | str | None,
+    now: datetime | None = None,
+) -> tuple[datetime, str]:
+    """Resolve one canonical news cutoff for an entire requested symbol scope."""
+
+    normalized_market_date = (
+        market_date
+        if isinstance(market_date, date)
+        else date.fromisoformat(market_date)
+    )
+    # Explicit cutoffs have market-independent validation semantics. Avoid a
+    # symbol-table read on this hot admission path and normalize the instant to
+    # UTC through the same resolver used by symbol-day context assembly.
+    if knowledge_cutoff_at is not None:
+        return _resolve_external_news_knowledge_cutoff_at(
+            normalized_market_date,
+            knowledge_cutoff_at,
+            market='KRX',
+            now=now,
+        )
+
+    normalized_symbols = _normalize_symbols(symbols) if symbols else []
+    symbol_rows = (
+        load_symbols(
+            symbols=normalized_symbols,
+            limit=max(len(normalized_symbols), 1000),
+        )
+        if normalized_symbols
+        else []
+    )
+    symbol_market_by_code = {
+        str(row.get('symbol') or '').strip(): str(
+            row.get('market') or ''
+        ).strip().upper()
+        for row in symbol_rows
+    }
+    requested_market_kinds = {
+        'US'
+        if symbol_market_by_code.get(symbol) in US_EQUITY_MARKETS
+        else 'KRX'
+        for symbol in normalized_symbols
+    }
+    external_news_market = (
+        'MIXED'
+        if len(requested_market_kinds) > 1
+        else next(iter(requested_market_kinds), 'KRX')
+    )
+    return _resolve_external_news_knowledge_cutoff_at(
+        normalized_market_date,
+        None,
+        market=external_news_market,
+        now=now,
+    )
+
+
 def _normalize_fs_div(fs_div: str | None) -> str | None:
     if fs_div is None:
         return None

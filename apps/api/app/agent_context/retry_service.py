@@ -26,6 +26,9 @@ from app.agent_context.eligibility import (
 )
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
+from app.agent_context.read_service import (
+    resolve_external_news_knowledge_cutoff_for_symbols,
+)
 from app.agent_context.reuse_service import agent_context_reuse_service
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
@@ -106,6 +109,21 @@ def _feedback_retry_admission_lock_key(
 
 def _feedback_retry_owner_token_hash(owner_token: str) -> str:
     return hashlib.sha256(owner_token.encode('utf-8')).hexdigest()
+
+
+def _normalize_admission_knowledge_cutoff(
+    value: datetime | str | None,
+) -> str | None:
+    if value is None:
+        return None
+    parsed = (
+        value
+        if isinstance(value, datetime)
+        else datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+    )
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError('knowledge_cutoff_at must include a timezone offset')
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _normalized_admission_scope(
@@ -229,6 +247,7 @@ def _claim_feedback_retry_run(
     feedback_scope_mode: str,
     run_id: str,
     started_at: datetime,
+    admission_knowledge_cutoff_at: datetime | str | None = None,
 ) -> dict[str, Any]:
     """Atomically claim a durable retry scope without holding a pool slot."""
 
@@ -245,6 +264,14 @@ def _claim_feedback_retry_run(
         tuple(sorted(_normalize_optional_symbol_scope(requested_symbols)))
         if requested_symbols is not None
         else None
+    )
+    normalized_feedback_scope_mode = normalize_feedback_scope_mode(
+        feedback_scope_mode
+    )
+    normalized_admission_knowledge_cutoff_at = (
+        _normalize_admission_knowledge_cutoff(
+            admission_knowledge_cutoff_at
+        )
     )
     requested_scope = _normalized_admission_scope(
         roles=normalized_roles,
@@ -323,12 +350,37 @@ def _claim_feedback_retry_run(
             active_scope = _admission_scope_from_payload(payload)
             if not _admission_scopes_overlap(requested_scope, active_scope):
                 continue
+            try:
+                active_feedback_scope_mode = normalize_feedback_scope_mode(
+                    payload.get('feedback_scope_mode')
+                )
+            except ValueError:
+                active_feedback_scope_mode = '__invalid_active_scope_mode__'
+            raw_active_cutoff = (
+                payload.get('admission_knowledge_cutoff_at')
+                if 'admission_knowledge_cutoff_at' in payload
+                else payload.get('requested_knowledge_cutoff_at')
+                if 'requested_knowledge_cutoff_at' in payload
+                else payload.get('knowledge_cutoff_at')
+            )
+            try:
+                active_knowledge_cutoff_at = (
+                    _normalize_admission_knowledge_cutoff(raw_active_cutoff)
+                )
+            except (TypeError, ValueError):
+                active_knowledge_cutoff_at = '__invalid_active_cutoff__'
             return {
                 'acquired': False,
                 'run_id': None,
                 'owner_token': None,
                 'conflict_run': snapshot,
-                'exact_scope': requested_scope == active_scope,
+                'exact_scope': bool(
+                    requested_scope == active_scope
+                    and normalized_feedback_scope_mode
+                    == active_feedback_scope_mode
+                    and normalized_admission_knowledge_cutoff_at
+                    == active_knowledge_cutoff_at
+                ),
             }
 
         admission_scope_payload = {
@@ -356,7 +408,10 @@ def _claim_feedback_retry_run(
                         if normalized_symbols is not None
                         else None
                     ),
-                    'feedback_scope_mode': feedback_scope_mode,
+                    'feedback_scope_mode': normalized_feedback_scope_mode,
+                    'admission_knowledge_cutoff_at': (
+                        normalized_admission_knowledge_cutoff_at
+                    ),
                     'admission_scope_by_role': admission_scope_payload,
                     'retry_admission': {
                         'schema_version': RETRY_ADMISSION_SCHEMA_VERSION,
@@ -2221,6 +2276,18 @@ class AgentFeedbackRetryService:
         feedback_scope_mode = normalize_feedback_scope_mode(
             getattr(config, 'feedback_scope_mode', None)
         )
+        raw_knowledge_cutoff_at = getattr(config, 'knowledge_cutoff_at', None)
+        effective_knowledge_cutoff_at: datetime | None = None
+        knowledge_cutoff_source: str | None = None
+        if requested_symbols is not None or raw_knowledge_cutoff_at is not None:
+            (
+                effective_knowledge_cutoff_at,
+                knowledge_cutoff_source,
+            ) = resolve_external_news_knowledge_cutoff_for_symbols(
+                market_date=config.market_date,
+                symbols=requested_symbols,
+                knowledge_cutoff_at=raw_knowledge_cutoff_at,
+            )
         should_bypass_prerequisite_gate = bool(
             force or bypass_prerequisite_gate
         )
@@ -2236,6 +2303,25 @@ class AgentFeedbackRetryService:
                 bypass_prerequisite_gate=bypass_prerequisite_gate,
                 prerequisites=prerequisites,
             )
+
+        eligible_symbols = self._load_eligible_symbols(
+            market_date=config.market_date,
+            requested_symbols=requested_symbols,
+        )
+        if effective_knowledge_cutoff_at is None:
+            (
+                effective_knowledge_cutoff_at,
+                knowledge_cutoff_source,
+            ) = resolve_external_news_knowledge_cutoff_for_symbols(
+                market_date=config.market_date,
+                symbols=eligible_symbols,
+                knowledge_cutoff_at=None,
+            )
+        requested_knowledge_cutoff_at = (
+            effective_knowledge_cutoff_at.isoformat()
+            if raw_knowledge_cutoff_at is not None
+            else None
+        )
 
         previous_run = None
         if not bool(force or getattr(config, 'force_recompute', False)):
@@ -2262,6 +2348,9 @@ class AgentFeedbackRetryService:
             feedback_scope_mode=feedback_scope_mode,
             run_id=request_run_id,
             started_at=parent_started_at,
+            admission_knowledge_cutoff_at=(
+                effective_knowledge_cutoff_at.isoformat()
+            ),
         )
         if not admission['acquired']:
             active_run = admission.get('conflict_run')
@@ -2340,6 +2429,14 @@ class AgentFeedbackRetryService:
                     prerequisites=prerequisites,
                     previous_run=previous_run,
                     claim_lease=claim_lease,
+                    preloaded_eligible_symbols=eligible_symbols,
+                    effective_knowledge_cutoff_at=(
+                        effective_knowledge_cutoff_at
+                    ),
+                    knowledge_cutoff_source=knowledge_cutoff_source,
+                    requested_knowledge_cutoff_at=(
+                        requested_knowledge_cutoff_at
+                    ),
                 )
         except Exception as exc:
             _finish_feedback_retry_claim_if_running(
@@ -2367,19 +2464,15 @@ class AgentFeedbackRetryService:
         prerequisites: dict[str, Any] | None = None,
         previous_run: dict[str, Any] | None = None,
         claim_lease: _FeedbackRetryClaimLease | None = None,
+        preloaded_eligible_symbols: Sequence[str] | None = None,
+        effective_knowledge_cutoff_at: datetime | None = None,
+        knowledge_cutoff_source: str | None = None,
+        requested_knowledge_cutoff_at: str | None = None,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
         progress_callback = getattr(config, 'progress_callback', None)
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
-        raw_knowledge_cutoff_at = getattr(config, 'knowledge_cutoff_at', None)
-        knowledge_cutoff_at = (
-            raw_knowledge_cutoff_at.isoformat()
-            if isinstance(raw_knowledge_cutoff_at, datetime)
-            else str(raw_knowledge_cutoff_at).strip()
-            if raw_knowledge_cutoff_at is not None
-            else None
-        )
         should_bypass_prerequisite_gate = bool(force or bypass_prerequisite_gate)
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
@@ -2419,9 +2512,13 @@ class AgentFeedbackRetryService:
                 'prerequisites': prerequisites,
                 'progress': progress,
             }
-        eligible_symbols = self._load_eligible_symbols(
-            market_date=config.market_date,
-            requested_symbols=requested_symbols,
+        eligible_symbols = (
+            list(preloaded_eligible_symbols)
+            if preloaded_eligible_symbols is not None
+            else self._load_eligible_symbols(
+                market_date=config.market_date,
+                requested_symbols=requested_symbols,
+            )
         )
         eligibility_records = load_agent_feedback_eligibility_records(
             market_date=config.market_date,
@@ -2450,6 +2547,30 @@ class AgentFeedbackRetryService:
         scoped_feedback_symbols = _ordered_symbol_union(
             [role_symbol_scopes.get(role, ()) for role in roles]
         ) or list(eligible_symbols)
+        if effective_knowledge_cutoff_at is None:
+            raw_knowledge_cutoff_at = getattr(
+                config,
+                'knowledge_cutoff_at',
+                None,
+            )
+            (
+                effective_knowledge_cutoff_at,
+                knowledge_cutoff_source,
+            ) = resolve_external_news_knowledge_cutoff_for_symbols(
+                market_date=config.market_date,
+                symbols=(
+                    requested_symbols
+                    if requested_symbols is not None
+                    else scoped_feedback_symbols
+                ),
+                knowledge_cutoff_at=raw_knowledge_cutoff_at,
+            )
+            requested_knowledge_cutoff_at = (
+                effective_knowledge_cutoff_at.isoformat()
+                if raw_knowledge_cutoff_at is not None
+                else None
+            )
+        knowledge_cutoff_at = effective_knowledge_cutoff_at.isoformat()
         if scoped_role_symbol_total <= 0:
             scoped_role_symbol_total = len(scoped_feedback_symbols) * max(1, len(roles))
         skipped_symbols = (
@@ -2496,6 +2617,11 @@ class AgentFeedbackRetryService:
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
             'knowledge_cutoff_at': knowledge_cutoff_at,
+            'admission_knowledge_cutoff_at': knowledge_cutoff_at,
+            'knowledge_cutoff_source': knowledge_cutoff_source,
+            'requested_knowledge_cutoff_at': (
+                requested_knowledge_cutoff_at
+            ),
             'parallel_subtasks': max(1, int(settings.openclaw_agent_parallel_subtasks)),
             'reuse_existing': config.reuse_existing,
             'force_recompute': effective_force_recompute,

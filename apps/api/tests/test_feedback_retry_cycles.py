@@ -268,6 +268,69 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(second['conflict_run']['run_id'], first_run_id)
         self.assertTrue(disjoint['acquired'])
 
+    def test_feedback_retry_admission_does_not_join_different_cutoff_or_scope_mode(self):
+        suffix = uuid4().hex[:10].upper()
+        market_date = date.fromisoformat('2040-01-05')
+        symbol = f'A{suffix}'
+        first_run_id = f'claim-identity-{suffix}'
+        equivalent_run_id = f'claim-equivalent-{suffix}'
+        cutoff_run_id = f'claim-cutoff-{suffix}'
+        mode_run_id = f'claim-mode-{suffix}'
+        run_ids = [
+            first_run_id,
+            equivalent_run_id,
+            cutoff_run_id,
+            mode_run_id,
+        ]
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+        common = {
+            'market_date': market_date,
+            'roles': ('signal-decider',),
+            'requested_symbols': (symbol,),
+            'started_at': datetime.now(timezone.utc),
+        }
+        first = _claim_feedback_retry_run(
+            **common,
+            feedback_scope_mode='decider_scope_fast_path',
+            admission_knowledge_cutoff_at='2026-01-02T09:00:00+09:00',
+            run_id=first_run_id,
+        )
+        equivalent = _claim_feedback_retry_run(
+            **common,
+            feedback_scope_mode='decider_scope_fast_path',
+            admission_knowledge_cutoff_at='2026-01-02T00:00:00+00:00',
+            run_id=equivalent_run_id,
+        )
+        different_cutoff = _claim_feedback_retry_run(
+            **common,
+            feedback_scope_mode='decider_scope_fast_path',
+            admission_knowledge_cutoff_at='2026-01-02T01:00:00+00:00',
+            run_id=cutoff_run_id,
+        )
+        different_mode = _claim_feedback_retry_run(
+            **common,
+            feedback_scope_mode='broad_feedback_universe',
+            admission_knowledge_cutoff_at='2026-01-02T00:00:00+00:00',
+            run_id=mode_run_id,
+        )
+
+        self.assertTrue(first['acquired'])
+        self.assertFalse(equivalent['acquired'])
+        self.assertTrue(equivalent['exact_scope'])
+        self.assertFalse(different_cutoff['acquired'])
+        self.assertFalse(different_cutoff['exact_scope'])
+        self.assertFalse(different_mode['acquired'])
+        self.assertFalse(different_mode['exact_scope'])
+
     def test_feedback_retry_admission_claim_recovers_stale_owner(self):
         suffix = uuid4().hex[:10].upper()
         stale_run_id = f'claim-stale-{suffix}'
@@ -2788,14 +2851,12 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                         ):
                             result = service.run_retry_cycles(
                                 config=SimpleNamespace(
-                                    market_date=date.fromisoformat('2026-04-16'),
+                                    market_date=date.fromisoformat('2040-04-16'),
                                     roles=roles,
                                     max_cycles=1,
                                     outer_batch_size=2,
                                     reuse_existing=True,
-                                    knowledge_cutoff_at=(
-                                        '2026-04-16T09:00:00+00:00'
-                                    ),
+                                    knowledge_cutoff_at=None,
                                 )
                             )
 
@@ -2833,10 +2894,14 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertTrue(
             all(call['parent_run_id'] == parent_run_id for call in dispatch_calls)
         )
+        effective_knowledge_cutoff_at = run_state_service.started[0][
+            'request_payload'
+        ]['knowledge_cutoff_at']
+        self.assertIsNotNone(effective_knowledge_cutoff_at)
         self.assertTrue(
             all(
                 call['knowledge_cutoff_at']
-                == '2026-04-16T09:00:00+00:00'
+                == effective_knowledge_cutoff_at
                 for call in dispatch_calls
             )
         )
