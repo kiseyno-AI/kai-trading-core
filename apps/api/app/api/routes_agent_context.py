@@ -783,7 +783,8 @@ async def dispatch_symbol_agent_feedback(
 ) -> dict:
     try:
         effective_knowledge_cutoff_at, _knowledge_cutoff_source = (
-            resolve_external_news_knowledge_cutoff_for_symbols(
+            await run_in_threadpool(
+                resolve_external_news_knowledge_cutoff_for_symbols,
                 market_date=payload.market_date,
                 symbols=payload.symbols,
                 knowledge_cutoff_at=payload.knowledge_cutoff_at,

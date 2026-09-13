@@ -1388,12 +1388,21 @@ class AgentContextRouteTests(unittest.TestCase):
                     self.assertEqual(response.json()['detail'], detail)
 
     def test_symbol_dispatch_route_returns_waiting_gate_when_prerequisites_are_not_ready(self):
+        threadpool_functions = []
+
+        async def fake_run_in_threadpool(function, *args, **kwargs):
+            threadpool_functions.append(function)
+            return function(*args, **kwargs)
+
         with patch(
             'app.api.routes_agent_context.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
             side_effect=lambda **_: _feedback_prerequisites(
                 status='waiting',
                 missing_stage_ids=['fundamentals_daily_refresh', 'quality_factors'],
             ),
+        ), patch(
+            'app.api.routes_agent_context.run_in_threadpool',
+            side_effect=fake_run_in_threadpool,
         ):
             client = TestClient(self.app)
             response = client.post(
@@ -1402,11 +1411,16 @@ class AgentContextRouteTests(unittest.TestCase):
                     'market_date': '2026-04-14',
                     'symbols': ['005930'],
                     'roles': ['technical-summarizer'],
+                    'knowledge_cutoff_at': '2026-04-14T06:30:00+00:00',
                     'wait_for_completion': False,
                 },
             )
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            threadpool_functions,
+            [routes_agent_context.resolve_external_news_knowledge_cutoff_for_symbols],
+        )
         payload = response.json()
         self.assertTrue(payload['summary']['gated'])
         self.assertEqual(payload['summary']['status'], 'waiting')

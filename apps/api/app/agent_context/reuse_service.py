@@ -45,6 +45,7 @@ FUNDAMENTAL_REUSE_STALE_REASONS = {
     'forced_recompute',
     'fundamental_input_fingerprint_changed',
     'fundamental_input_fingerprint_missing',
+    'knowledge_cutoff_mismatch',
     'stored_fundamental_input_fingerprint_missing',
     'source_updated',
     'stale_market_feedback',
@@ -143,6 +144,31 @@ def _normalized_evidence_datetime(value: Any) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _normalize_knowledge_cutoff_at(value: datetime | str) -> datetime:
+    parsed = value
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    if not isinstance(parsed, datetime):
+        raise ValueError('knowledge_cutoff_at must be an ISO-8601 datetime')
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError('knowledge_cutoff_at must include a timezone offset')
+    return parsed.astimezone(timezone.utc)
+
+
+def _request_payload_knowledge_cutoff_at(payload: Any) -> datetime | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ('admission_knowledge_cutoff_at', 'knowledge_cutoff_at'):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return _normalize_knowledge_cutoff_at(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _failure_supersedes_feedback(
     *,
     feedback: Any,
@@ -192,10 +218,16 @@ class AgentContextReuseService:
         symbols: Sequence[str],
         roles: Sequence[str],
         force_recompute: bool = False,
+        knowledge_cutoff_at: datetime | str | None = None,
     ) -> dict[str, dict[str, FeedbackReuseDecision]]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
         requested_roles = [role for role in roles if role in ROLE_TO_AGENT]
+        normalized_knowledge_cutoff_at = (
+            _normalize_knowledge_cutoff_at(knowledge_cutoff_at)
+            if knowledge_cutoff_at is not None
+            else None
+        )
 
         if not normalized_symbols:
             raise ValueError('symbols is required')
@@ -321,6 +353,7 @@ class AgentContextReuseService:
                 str,
                 tuple[datetime, int, datetime, int],
             ] = {}
+            run_knowledge_cutoff_by_id: dict[str, datetime | None] = {}
             if evidence_run_ids:
                 run_rows = session.execute(
                     select(
@@ -346,6 +379,11 @@ class AgentContextReuseService:
                             )
                             or ''
                         ).strip(),
+                        'knowledge_cutoff_at': (
+                            _request_payload_knowledge_cutoff_at(
+                                row.request_payload
+                            )
+                        ),
                     }
                     for row in run_rows
                     if str(row.run_id or '').strip()
@@ -380,11 +418,15 @@ class AgentContextReuseService:
                                 int(row.id),
                             ),
                             'parent_run_id': '',
+                            'knowledge_cutoff_at': None,
                         }
                 for run_id in evidence_run_ids:
                     metadata = run_metadata_by_id.get(run_id)
                     if metadata is None:
                         continue
+                    run_knowledge_cutoff_by_id[run_id] = metadata[
+                        'knowledge_cutoff_at'
+                    ]
                     direct_order = metadata['direct_order']
                     parent_run_id = metadata['parent_run_id']
                     if parent_run_id:
@@ -515,6 +557,13 @@ class AgentContextReuseService:
                         isinstance(flag, str) and flag in {'missing_batch_feedback', 'unstructured_response'}
                         for flag in latest_risk_flags
                     ) or has_newer_failure
+                    has_knowledge_cutoff_mismatch = (
+                        normalized_knowledge_cutoff_at is not None
+                        and run_knowledge_cutoff_by_id.get(
+                            str(latest_feedback.run_id or '').strip()
+                        )
+                        != normalized_knowledge_cutoff_at
+                    )
                     feedback_market_date = latest_feedback.market_date if latest_feedback is not None else None
                     is_stale_market_feedback = feedback_market_date is None or feedback_market_date != normalized_market_date
                     stored_input_fingerprint_payload = (
@@ -546,6 +595,13 @@ class AgentContextReuseService:
                                 )
                             )
                         )
+                    if (
+                        has_knowledge_cutoff_mismatch
+                        and not force_recompute
+                        and not has_newer_failure
+                    ):
+                        should_dispatch = True
+                        reason = 'knowledge_cutoff_mismatch'
                     decisions[symbol][role] = FeedbackReuseDecision(
                         symbol=symbol,
                         agent_name=agent_name,

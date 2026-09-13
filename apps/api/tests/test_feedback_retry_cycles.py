@@ -29,6 +29,7 @@ from app.agent_context.retry_service import (
     _FeedbackRetryClaimLease,
     _feedback_retry_admission_lock_key,
     _claim_feedback_retry_run,
+    _previous_run_matches_knowledge_cutoff,
 )
 from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundle
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
@@ -177,6 +178,34 @@ class RecordingRunStateService:
 
 
 class FeedbackRetryCycleTests(unittest.TestCase):
+    def test_prior_run_resume_requires_exact_normalized_cutoff(self):
+        previous_run = {
+            'request_payload': {
+                'admission_knowledge_cutoff_at': (
+                    '2026-04-16T15:30:00+09:00'
+                ),
+            },
+        }
+
+        self.assertTrue(
+            _previous_run_matches_knowledge_cutoff(
+                previous_run,
+                datetime(2026, 4, 16, 6, 30, tzinfo=timezone.utc),
+            )
+        )
+        self.assertFalse(
+            _previous_run_matches_knowledge_cutoff(
+                previous_run,
+                datetime(2026, 4, 16, 6, 29, tzinfo=timezone.utc),
+            )
+        )
+        self.assertFalse(
+            _previous_run_matches_knowledge_cutoff(
+                {'request_payload': {}},
+                datetime(2026, 4, 16, 6, 30, tzinfo=timezone.utc),
+            )
+        )
+
     def test_feedback_retry_admission_claim_atomically_rejects_overlapping_scope(self):
         suffix = uuid4().hex[:10].upper()
         run_ids = [f'claim-one-{suffix}', f'claim-two-{suffix}']
@@ -3423,6 +3452,11 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         run_state_service = RecordingRunStateService()
         previous_run = {
             'run_id': 'prior-retry-run',
+            'request_payload': {
+                'admission_knowledge_cutoff_at': (
+                    '2026-04-16T06:30:00+00:00'
+                ),
+            },
             'summary_payload': {
                 'progress_summary': {
                     'cycle_number': 1,
@@ -3567,6 +3601,9 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                                     roles=roles,
                                     max_cycles=3,
                                     outer_batch_size=20,
+                                    knowledge_cutoff_at=(
+                                        '2026-04-16T15:30:00+09:00'
+                                    ),
                                     reuse_existing=True,
                                 )
                             )

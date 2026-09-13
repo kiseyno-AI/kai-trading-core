@@ -74,6 +74,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     NextOpenAccountTarget,
+    _PlanRefreshRevisionConflict,
     _load_signal_decider_policy_authority,
     _next_open_policy_fingerprint,
     _short_term_entry_quality_blocks,
@@ -4126,14 +4127,113 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'activated',
             )
 
+    async def test_transient_post_activation_generation_contention_converges(
+        self,
+    ) -> None:
+        original_inspect = (
+            signal_decider_next_open_execution_service
+            .inspect_dispatch_authority_generation
+        )
+        inspect_call_count = 0
+
+        def inspect_with_one_post_activation_conflict(**kwargs):
+            nonlocal inspect_call_count
+            inspect_call_count += 1
+            if inspect_call_count == 4:
+                raise _PlanRefreshRevisionConflict(
+                    'transient post-activation generation contention'
+                )
+            return original_inspect(**kwargs)
+
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            'inspect_dispatch_authority_generation',
+            side_effect=inspect_with_one_post_activation_conflict,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_transient_post_activation_generation_contention',
+            )
+
+        self.assertEqual(inspect_call_count, 6)
+        self.assertEqual(self.client.revocation_calls, [])
+        self.assertEqual(
+            result['dispatch']['groups'][0]['activation_status'],
+            'activated',
+        )
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'activated',
+            )
+
+    async def test_transient_durable_activation_ack_contention_converges(
+        self,
+    ) -> None:
+        original_persist = self.service._persist_core_activation_ack
+        persist_call_count = 0
+
+        def persist_after_one_conflict(**kwargs) -> None:
+            nonlocal persist_call_count
+            persist_call_count += 1
+            if persist_call_count == 1:
+                raise _PlanRefreshRevisionConflict(
+                    'transient durable activation ACK contention'
+                )
+            original_persist(**kwargs)
+
+        with patch.object(
+            self.service,
+            '_persist_core_activation_ack',
+            side_effect=persist_after_one_conflict,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_transient_durable_activation_ack_contention',
+            )
+
+        self.assertEqual(persist_call_count, 2)
+        self.assertEqual(self.client.revocation_calls, [])
+        self.assertEqual(
+            result['dispatch']['groups'][0]['activation_status'],
+            'activated',
+        )
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'activated',
+            )
+
     async def test_durable_activation_fence_busy_after_remote_ack_revokes(
         self,
     ) -> None:
         with patch.object(
             self.service,
             '_persist_core_activation_ack',
-            side_effect=RuntimeError('_PlanRefreshRevisionConflict'),
-        ):
+            side_effect=_PlanRefreshRevisionConflict(
+                'persistent durable activation ACK contention'
+            ),
+        ) as persist_ack:
             result = await self.service.dispatch_next_open_plan(
                 target_trade_date=self.target_trade_date,
                 account_reference=self.account_reference,
@@ -4145,6 +4245,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(self.client.post_calls), 1)
         self.assertEqual(len(self.client.activation_calls), 1)
+        self.assertEqual(persist_ack.call_count, 3)
         self.assertEqual(len(self.client.revocation_calls), 1)
         self.assertEqual(
             result['dispatch']['groups'][0]['dispatch_status'],

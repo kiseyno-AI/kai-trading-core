@@ -2476,6 +2476,7 @@ class AgentFeedbackOrchestrator:
                         symbols=sorted(persisted_source_symbols),
                         roles=UPSTREAM_SUMMARY_ROLES,
                         force_recompute=False,
+                        knowledge_cutoff_at=source_knowledge_cutoff_at,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -2499,6 +2500,7 @@ class AgentFeedbackOrchestrator:
                         symbols=symbols,
                         roles=decision_roles,
                         force_recompute=False,
+                        knowledge_cutoff_at=source_knowledge_cutoff_at,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -4964,6 +4966,7 @@ class AgentFeedbackOrchestrator:
                         symbols=[symbol],
                         roles=[role],
                         force_recompute=True,
+                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     ).get(symbol, {}).get(role)
                     input_fingerprint_payload = getattr(fingerprint_decision, 'input_fingerprint_payload', None)
                 except Exception:  # noqa: BLE001
@@ -5299,6 +5302,7 @@ class AgentFeedbackOrchestrator:
                         symbols=scoped_dispatch_symbols,
                         roles=requested_role_names,
                         force_recompute=force_recompute,
+                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
                     reuse_decisions = {
                         symbol: {
@@ -5336,6 +5340,7 @@ class AgentFeedbackOrchestrator:
                         symbols=scoped_dispatch_symbols,
                         roles=UPSTREAM_SUMMARY_ROLES,
                         force_recompute=False,
+                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
                     upstream_reuse_decisions = {
                         symbol: {

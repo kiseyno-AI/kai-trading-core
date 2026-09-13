@@ -78,12 +78,99 @@ class _TimestampSession:
         return _TimestampResult(self.value)
 
 
+class _RowsResult:
+    def __init__(self, rows=()):
+        self._rows = list(rows)
+
+    def all(self):
+        return list(self._rows)
+
+    def scalars(self):
+        return _EmptyScalars()
+
+
+class _CutoffReuseSession:
+    def __init__(self):
+        feedback = SimpleNamespace(
+            id=7,
+            market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
+            symbol='CUTOFFTEST',
+            agent_name='eod-summarizer',
+            run_id='cutoff-reuse-run',
+            summary_payload={},
+            feedback_payload={'summary': 'reusable'},
+            context_payload={},
+            received_at=datetime(2026, 4, 16, 6, 32, tzinfo=timezone.utc),
+        )
+        run = SimpleNamespace(
+            id=11,
+            run_id='cutoff-reuse-run',
+            started_at=datetime(2026, 4, 16, 6, 31, tzinfo=timezone.utc),
+            request_payload={
+                'knowledge_cutoff_at': '2026-04-16T06:30:00+00:00',
+            },
+        )
+        self._results = iter(
+            (
+                _RowsResult(),
+                _RowsResult([feedback]),
+                _RowsResult(),
+                _RowsResult([run]),
+            )
+        )
+
+    def execute(self, _statement):
+        return next(self._results)
+
+
 @contextmanager
 def _reuse_session_scope():
     yield _ReuseSession()
 
 
+@contextmanager
+def _cutoff_reuse_session_scope():
+    yield _CutoffReuseSession()
+
+
 class FundamentalReuseServiceTests(unittest.TestCase):
+    def test_feedback_reuse_requires_exact_effective_cutoff_instant(self):
+        service = AgentContextReuseService()
+        symbol = 'CUTOFFTEST'
+        role = 'eod-summarizer'
+        market_date = __import__('datetime').date.fromisoformat('2026-04-16')
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _cutoff_reuse_session_scope,
+        ):
+            equivalent = service.build_latest_decisions(
+                market_date=market_date,
+                symbols=[symbol],
+                roles=[role],
+                knowledge_cutoff_at='2026-04-16T15:30:00+09:00',
+            )[symbol][role]
+        self.assertFalse(equivalent.should_dispatch)
+        self.assertEqual(equivalent.reason, 'reuse_latest_feedback')
+
+        for mismatched_cutoff in (
+            '2026-04-16T05:30:00+00:00',
+            '2026-04-16T07:30:00+00:00',
+        ):
+            with self.subTest(mismatched_cutoff=mismatched_cutoff):
+                with patch(
+                    'app.agent_context.reuse_service.session_scope',
+                    _cutoff_reuse_session_scope,
+                ):
+                    mismatch = service.build_latest_decisions(
+                        market_date=market_date,
+                        symbols=[symbol],
+                        roles=[role],
+                        knowledge_cutoff_at=mismatched_cutoff,
+                    )[symbol][role]
+                self.assertTrue(mismatch.should_dispatch)
+                self.assertEqual(mismatch.reason, 'knowledge_cutoff_mismatch')
+
     def test_newer_run_success_supersedes_late_failure_from_older_run(self):
         earlier = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
         later = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
@@ -267,13 +354,18 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             with patch(
                 'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
                 return_value=decisions,
-            ):
+            ) as build_latest_decisions:
                 snapshot = service._build_role_sequence_snapshot(
                     market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
                     roles=('fundamental-summarizer',),
                     eligible_symbols=('005930',),
+                    knowledge_cutoff_at='2026-04-16T15:30:00+09:00',
                 )
 
+        self.assertEqual(
+            build_latest_decisions.call_args.kwargs['knowledge_cutoff_at'],
+            '2026-04-16T15:30:00+09:00',
+        )
         role_state = snapshot.role_states['fundamental-summarizer']
         self.assertEqual(role_state.completed_symbols, ('005930',))
         self.assertEqual(role_state.reused_symbols, ('005930',))

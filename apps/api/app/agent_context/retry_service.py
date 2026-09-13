@@ -126,6 +126,28 @@ def _normalize_admission_knowledge_cutoff(
     return parsed.astimezone(timezone.utc).isoformat()
 
 
+def _previous_run_matches_knowledge_cutoff(
+    previous_run: dict[str, Any] | None,
+    effective_knowledge_cutoff_at: datetime | str,
+) -> bool:
+    if not isinstance(previous_run, dict):
+        return False
+    request_payload = previous_run.get('request_payload')
+    if not isinstance(request_payload, dict):
+        return False
+    prior_cutoff_at = request_payload.get('admission_knowledge_cutoff_at')
+    if prior_cutoff_at is None:
+        prior_cutoff_at = request_payload.get('knowledge_cutoff_at')
+    try:
+        return _normalize_admission_knowledge_cutoff(
+            prior_cutoff_at
+        ) == _normalize_admission_knowledge_cutoff(
+            effective_knowledge_cutoff_at
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _normalized_admission_scope(
     *,
     roles: Sequence[str],
@@ -896,18 +918,24 @@ class AgentFeedbackRetryService:
         eligible_symbols: Sequence[str] | None = None,
         force_recompute: bool = False,
         reuse_existing: bool = True,
+        knowledge_cutoff_at: datetime | str | None = None,
     ) -> list[str]:
         expected_roles = tuple(roles)
         symbols = list(eligible_symbols) if eligible_symbols is not None else self._load_eligible_symbols(market_date=market_date)
         if not symbols:
             return []
 
+        decision_kwargs: dict[str, Any] = {
+            'market_date': market_date,
+            'symbols': symbols,
+            'roles': expected_roles,
+            'force_recompute': force_recompute,
+        }
+        if knowledge_cutoff_at is not None:
+            decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
         decisions = (
             agent_context_reuse_service.build_latest_decisions(
-                market_date=market_date,
-                symbols=symbols,
-                roles=expected_roles,
-                force_recompute=force_recompute,
+                **decision_kwargs
             )
             if reuse_existing
             else {}
@@ -1475,16 +1503,22 @@ class AgentFeedbackRetryService:
         *,
         market_date: date,
         symbols: Sequence[str],
+        knowledge_cutoff_at: datetime | str | None = None,
     ) -> tuple[str, ...]:
         normalized_symbols = _normalize_optional_symbol_scope(symbols)
         if not normalized_symbols:
             return ()
 
+        decision_kwargs: dict[str, Any] = {
+            'market_date': market_date,
+            'symbols': normalized_symbols,
+            'roles': SUMMARIZER_AGENT_NAMES,
+            'force_recompute': False,
+        }
+        if knowledge_cutoff_at is not None:
+            decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
         upstream_decisions = agent_context_reuse_service.build_latest_decisions(
-            market_date=market_date,
-            symbols=normalized_symbols,
-            roles=SUMMARIZER_AGENT_NAMES,
-            force_recompute=False,
+            **decision_kwargs
         )
         ready_symbols: list[str] = []
         for symbol in normalized_symbols:
@@ -1534,6 +1568,7 @@ class AgentFeedbackRetryService:
         reuse_existing: bool = True,
         parent_run_id: str | None = None,
         parent_started_at: datetime | None = None,
+        knowledge_cutoff_at: datetime | str | None = None,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
@@ -1564,12 +1599,17 @@ class AgentFeedbackRetryService:
             )
         if parent_run_id or force_recompute or not reuse_existing:
             failed_by_role = current_failed_by_role
+        decision_kwargs: dict[str, Any] = {
+            'market_date': market_date,
+            'symbols': normalized_symbols,
+            'roles': normalized_roles,
+            'force_recompute': force_recompute,
+        }
+        if knowledge_cutoff_at is not None:
+            decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
         reuse_decisions = (
             agent_context_reuse_service.build_latest_decisions(
-                market_date=market_date,
-                symbols=normalized_symbols,
-                roles=normalized_roles,
-                force_recompute=force_recompute,
+                **decision_kwargs
             )
             if reuse_existing and normalized_symbols and normalized_roles
             else {}
@@ -1743,6 +1783,7 @@ class AgentFeedbackRetryService:
                     'forced_recompute',
                     'fundamental_input_fingerprint_changed',
                     'fundamental_input_fingerprint_missing',
+                    'knowledge_cutoff_mismatch',
                     'stored_fundamental_input_fingerprint_missing',
                     'source_updated',
                     'stale_market_feedback',
@@ -1757,6 +1798,7 @@ class AgentFeedbackRetryService:
                     eligible_symbols=role_symbols,
                     force_recompute=force_recompute,
                     reuse_existing=reuse_existing,
+                    knowledge_cutoff_at=knowledge_cutoff_at,
                 )
             )
             retry_pending_symbols = tuple(
@@ -1772,6 +1814,7 @@ class AgentFeedbackRetryService:
                 retry_pending_symbols = self._filter_decider_retry_ready_symbols(
                     market_date=market_date,
                     symbols=failed_symbols,
+                    knowledge_cutoff_at=knowledge_cutoff_at,
                 )
             role_states[role] = RoleSequenceRoleState(
                 role=role,
@@ -2336,6 +2379,11 @@ class AgentFeedbackRetryService:
                 request_modes=[DAILY_RETRY_CYCLE_MODE],
                 feedback_scope_mode=feedback_scope_mode,
             )
+            if not _previous_run_matches_knowledge_cutoff(
+                previous_run,
+                effective_knowledge_cutoff_at,
+            ):
+                previous_run = None
         request_run_id = (
             f"feedback-cycle-{config.market_date.isoformat()}-"
             f"{uuid4().hex[:10]}"
@@ -2593,6 +2641,7 @@ class AgentFeedbackRetryService:
             reuse_existing=config.reuse_existing,
             parent_run_id=request_run_id,
             parent_started_at=parent_started_at,
+            knowledge_cutoff_at=knowledge_cutoff_at,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -2780,6 +2829,7 @@ class AgentFeedbackRetryService:
                         reuse_existing=config.reuse_existing,
                         parent_run_id=request_run_id,
                         parent_started_at=parent_started_at,
+                        knowledge_cutoff_at=knowledge_cutoff_at,
                     )
                     completed_roles_before = tuple(
                         list(active_plan.completed_roles) + list(active_plan.plan_roles[:index])
@@ -2889,6 +2939,7 @@ class AgentFeedbackRetryService:
                                     reuse_existing=config.reuse_existing,
                                     parent_run_id=request_run_id,
                                     parent_started_at=parent_started_at,
+                                    knowledge_cutoff_at=knowledge_cutoff_at,
                                 )
                                 self._sync_runtime_state(
                                     market_date=config.market_date,
@@ -2971,6 +3022,7 @@ class AgentFeedbackRetryService:
                         reuse_existing=config.reuse_existing,
                         parent_run_id=request_run_id,
                         parent_started_at=parent_started_at,
+                        knowledge_cutoff_at=knowledge_cutoff_at,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
                     role_boundary_complete = len(role_state_after.boundary_pending_symbols) == 0
@@ -3043,6 +3095,7 @@ class AgentFeedbackRetryService:
                     reuse_existing=config.reuse_existing,
                     parent_run_id=request_run_id,
                     parent_started_at=parent_started_at,
+                    knowledge_cutoff_at=knowledge_cutoff_at,
                 )
                 cycle_state = runtime_feedback_state_store.get_run(
                     config.market_date,
@@ -3097,6 +3150,7 @@ class AgentFeedbackRetryService:
                 reuse_existing=config.reuse_existing,
                 parent_run_id=request_run_id,
                 parent_started_at=parent_started_at,
+                knowledge_cutoff_at=knowledge_cutoff_at,
             )
             final_state_before_finish = runtime_feedback_state_store.get_run(
                 config.market_date,
@@ -3192,6 +3246,7 @@ class AgentFeedbackRetryService:
                 reuse_existing=config.reuse_existing,
                 parent_run_id=request_run_id,
                 parent_started_at=parent_started_at,
+                knowledge_cutoff_at=knowledge_cutoff_at,
             ),
             retry_attempted_symbols_by_role=(
                 final_state.retry_attempted_symbols_by_role
