@@ -30,6 +30,7 @@ from app.agent_context.read_service import (
     _load_latest_symbol_day_block_history,
     _resolve_external_news_knowledge_cutoff_at,
     _resolve_symbol_market_session,
+    resolve_external_news_knowledge_cutoff_for_symbols,
 )
 from app.core.settings import settings
 
@@ -1238,6 +1239,30 @@ class DartEventContextTests(unittest.TestCase):
 
 
 class ExternalNewsKnowledgeCutoffTests(unittest.TestCase):
+    def test_symbol_scope_resolver_normalizes_case_before_market_lookup(self):
+        with patch(
+            'app.agent_context.read_service.load_symbols',
+            return_value=[
+                {'symbol': '005930', 'market': 'KOSPI'},
+                {'symbol': 'AAPL', 'market': 'NASDAQ'},
+            ],
+        ) as load_symbols_mock:
+            with self.assertRaisesRegex(
+                ValueError,
+                'required when a request mixes KRX and US symbols',
+            ):
+                resolve_external_news_knowledge_cutoff_for_symbols(
+                    market_date='2026-04-08',
+                    symbols=['005930', 'aapl'],
+                    knowledge_cutoff_at=None,
+                    now=datetime(2026, 4, 9, 12, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            load_symbols_mock.call_args.kwargs['symbols'],
+            ['005930', 'AAPL'],
+        )
+
     def test_cutoff_applies_only_to_historical_market_dates(self):
         now = datetime(2026, 4, 9, 12, tzinfo=timezone.utc)
 
