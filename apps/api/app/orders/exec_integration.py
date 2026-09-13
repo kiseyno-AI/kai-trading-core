@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -139,6 +139,8 @@ CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION = (
 )
 EXECUTION_ACTIVATION_SCHEMA_VERSION = 'execution_handoff_activation_v1'
 EXECUTION_ACTIVATION_CAPABILITY = 'core_confirmed_activation_v1'
+CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS = 3
+CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS = 0.01
 
 REMOTE_FETCH_STATUS_OK = 'ok'
 REMOTE_FETCH_STATUS_DISABLED = 'disabled'
@@ -322,6 +324,19 @@ class DashboardReadModelCacheRecord:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _retry_plan_refresh_revision_conflict(
+    operation: Callable[[], Any],
+) -> Any:
+    for attempt in range(CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(operation)
+        except _PlanRefreshRevisionConflict:
+            if attempt + 1 >= CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS)
+    raise AssertionError('unreachable plan refresh conflict retry state')
 
 
 def _normalize_optional_text(value: Any, *, lowercase: bool = False) -> str | None:
@@ -2661,16 +2676,24 @@ class SignalDeciderExecIntegrationService:
         target_trade_date: date,
         rows: Sequence[SignalDeciderExecutionPlanItem],
         revision_fingerprints: dict[int, str],
+        retry_plan_refresh_conflict: bool = False,
     ) -> dict[str, Any]:
-        try:
-            return await asyncio.to_thread(
-                signal_decider_next_open_execution_service.inspect_dispatch_authority_generation,
-                target_trade_date=target_trade_date,
-                expected_row_bindings=_dispatch_authority_row_bindings(
-                    rows,
-                    revision_fingerprints=revision_fingerprints,
-                ),
+        def inspect() -> dict[str, Any]:
+            return (
+                signal_decider_next_open_execution_service
+                .inspect_dispatch_authority_generation(
+                    target_trade_date=target_trade_date,
+                    expected_row_bindings=_dispatch_authority_row_bindings(
+                        rows,
+                        revision_fingerprints=revision_fingerprints,
+                    ),
+                )
             )
+
+        try:
+            if retry_plan_refresh_conflict:
+                return await _retry_plan_refresh_revision_conflict(inspect)
+            return await asyncio.to_thread(inspect)
         except Exception as exc:  # noqa: BLE001 - dispatch must fail closed
             return {
                 'status': 'invalid',
@@ -2961,6 +2984,7 @@ class SignalDeciderExecIntegrationService:
                     target_trade_date=target_trade_date,
                     rows=rows,
                     revision_fingerprints=revision_fingerprints,
+                    retry_plan_refresh_conflict=True,
                 )
             )
             if (
@@ -2973,11 +2997,13 @@ class SignalDeciderExecIntegrationService:
                 raise ValueError(
                     'Core activation authority changed during activation POST'
                 )
-            self._persist_core_activation_ack(
-                rows=rows,
-                revision_fingerprints=revision_fingerprints,
-                request_payload=activation_request,
-                response_payload=activation_response,
+            await _retry_plan_refresh_revision_conflict(
+                lambda: self._persist_core_activation_ack(
+                    rows=rows,
+                    revision_fingerprints=revision_fingerprints,
+                    request_payload=activation_request,
+                    response_payload=activation_response,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - activated BUY must be revoked on uncertainty
             error = (
@@ -3260,6 +3286,7 @@ class SignalDeciderExecIntegrationService:
                         target_trade_date=target_trade_date,
                         rows=group_rows,
                         revision_fingerprints=revision_fingerprints,
+                        retry_plan_refresh_conflict=True,
                     )
                 )
                 if (
@@ -3273,11 +3300,13 @@ class SignalDeciderExecIntegrationService:
                         reason_code='post_activation_authority_changed'
                     )
                     continue
-                self._persist_core_activation_ack(
-                    rows=group_rows,
-                    revision_fingerprints=revision_fingerprints,
-                    request_payload=activation_request,
-                    response_payload=activation_response,
+                await _retry_plan_refresh_revision_conflict(
+                    lambda: self._persist_core_activation_ack(
+                        rows=group_rows,
+                        revision_fingerprints=revision_fingerprints,
+                        request_payload=activation_request,
+                        response_payload=activation_response,
+                    )
                 )
             except Exception as exc:  # noqa: BLE001 - recovered BUY stays fail closed
                 error = (

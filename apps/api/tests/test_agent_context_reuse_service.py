@@ -90,7 +90,10 @@ class _RowsResult:
 
 
 class _CutoffReuseSession:
-    def __init__(self):
+    def __init__(
+        self,
+        knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+    ):
         feedback = SimpleNamespace(
             id=7,
             market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
@@ -106,9 +109,11 @@ class _CutoffReuseSession:
             id=11,
             run_id='cutoff-reuse-run',
             started_at=datetime(2026, 4, 16, 6, 31, tzinfo=timezone.utc),
-            request_payload={
-                'knowledge_cutoff_at': '2026-04-16T06:30:00+00:00',
-            },
+            request_payload=(
+                {'knowledge_cutoff_at': knowledge_cutoff_at}
+                if knowledge_cutoff_at is not None
+                else {}
+            ),
         )
         self._results = iter(
             (
@@ -131,6 +136,11 @@ def _reuse_session_scope():
 @contextmanager
 def _cutoff_reuse_session_scope():
     yield _CutoffReuseSession()
+
+
+@contextmanager
+def _missing_cutoff_reuse_session_scope():
+    yield _CutoffReuseSession(knowledge_cutoff_at=None)
 
 
 class FundamentalReuseServiceTests(unittest.TestCase):
@@ -170,6 +180,19 @@ class FundamentalReuseServiceTests(unittest.TestCase):
                     )[symbol][role]
                 self.assertTrue(mismatch.should_dispatch)
                 self.assertEqual(mismatch.reason, 'knowledge_cutoff_mismatch')
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _missing_cutoff_reuse_session_scope,
+        ):
+            missing = service.build_latest_decisions(
+                market_date=market_date,
+                symbols=[symbol],
+                roles=[role],
+                knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+            )[symbol][role]
+        self.assertTrue(missing.should_dispatch)
+        self.assertEqual(missing.reason, 'knowledge_cutoff_mismatch')
 
     def test_newer_run_success_supersedes_late_failure_from_older_run(self):
         earlier = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
