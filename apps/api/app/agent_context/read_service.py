@@ -1028,7 +1028,7 @@ def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
     seen: set[str] = set()
     for raw_symbol in symbols:
         for piece in (raw_symbol or '').split(','):
-            symbol = piece.strip()
+            symbol = piece.strip().upper()
             if not symbol or symbol in seen:
                 continue
             seen.add(symbol)
