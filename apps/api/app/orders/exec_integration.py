@@ -139,8 +139,8 @@ CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION = (
 )
 EXECUTION_ACTIVATION_SCHEMA_VERSION = 'execution_handoff_activation_v1'
 EXECUTION_ACTIVATION_CAPABILITY = 'core_confirmed_activation_v1'
-CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS = 3
-CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS = 0.01
+CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS = 6
+CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS = 0.025
 
 REMOTE_FETCH_STATUS_OK = 'ok'
 REMOTE_FETCH_STATUS_DISABLED = 'disabled'
@@ -329,13 +329,17 @@ def _utcnow() -> datetime:
 async def _retry_plan_refresh_revision_conflict(
     operation: Callable[[], Any],
 ) -> Any:
+    # Keep the remote-activation safety fence fail-closed, while allowing the
+    # peer transaction that accepted the same plan to release its date lock.
     for attempt in range(CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS):
         try:
             return await asyncio.to_thread(operation)
         except _PlanRefreshRevisionConflict:
             if attempt + 1 >= CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS:
                 raise
-            await asyncio.sleep(CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS)
+            await asyncio.sleep(
+                CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS * (2**attempt)
+            )
     raise AssertionError('unreachable plan refresh conflict retry state')
 
 

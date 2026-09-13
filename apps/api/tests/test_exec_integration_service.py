@@ -34,6 +34,7 @@ from app.market.session import (
     set_krx_calendar_provider,
 )
 from app.orders.exec_integration import (
+    CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS,
     EXEC_ENTRY_BUY_INTENTS,
     EXEC_INTENT_INTRADAY_WATCH_BUY,
     EXEC_INTENT_NEXT_OPEN_BUY,
@@ -4127,7 +4128,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'activated',
             )
 
-    async def test_transient_post_activation_generation_contention_converges(
+    async def test_pre_activation_generation_contention_stays_pending(
         self,
     ) -> None:
         original_inspect = (
@@ -4136,10 +4137,53 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         inspect_call_count = 0
 
-        def inspect_with_one_post_activation_conflict(**kwargs):
+        def inspect_with_pre_activation_conflict(**kwargs):
             nonlocal inspect_call_count
             inspect_call_count += 1
-            if inspect_call_count == 4:
+            if inspect_call_count == 3:
+                raise _PlanRefreshRevisionConflict(
+                    'transient pre-activation generation contention'
+                )
+            return original_inspect(**kwargs)
+
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            'inspect_dispatch_authority_generation',
+            side_effect=inspect_with_pre_activation_conflict,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_pre_activation_generation_contention',
+            )
+
+        self.assertEqual(inspect_call_count, 3)
+        self.assertEqual(self.client.activation_calls, [])
+        self.assertEqual(self.client.revocation_calls, [])
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'accepted')
+        self.assertEqual(group['activation_status'], 'pending')
+        self.assertEqual(
+            group['activation_error']['code'],
+            'execution_activation_fence_busy',
+        )
+
+    async def test_bounded_post_activation_generation_contention_converges(
+        self,
+    ) -> None:
+        original_inspect = (
+            signal_decider_next_open_execution_service
+            .inspect_dispatch_authority_generation
+        )
+        inspect_call_count = 0
+
+        def inspect_with_bounded_post_activation_conflicts(**kwargs):
+            nonlocal inspect_call_count
+            inspect_call_count += 1
+            if inspect_call_count in {4, 5, 6}:
                 raise _PlanRefreshRevisionConflict(
                     'transient post-activation generation contention'
                 )
@@ -4148,7 +4192,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             signal_decider_next_open_execution_service,
             'inspect_dispatch_authority_generation',
-            side_effect=inspect_with_one_post_activation_conflict,
+            side_effect=inspect_with_bounded_post_activation_conflicts,
         ):
             result = await self.service.dispatch_next_open_plan(
                 target_trade_date=self.target_trade_date,
@@ -4156,10 +4200,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 refresh_plan=False,
                 dry_run=False,
                 force=False,
-                trigger='test_transient_post_activation_generation_contention',
+                trigger='test_bounded_post_activation_generation_contention',
             )
 
-        self.assertEqual(inspect_call_count, 6)
+        self.assertEqual(inspect_call_count, 8)
         self.assertEqual(self.client.revocation_calls, [])
         self.assertEqual(
             result['dispatch']['groups'][0]['activation_status'],
@@ -4245,7 +4289,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(self.client.post_calls), 1)
         self.assertEqual(len(self.client.activation_calls), 1)
-        self.assertEqual(persist_ack.call_count, 3)
+        self.assertEqual(
+            persist_ack.call_count,
+            CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS,
+        )
         self.assertEqual(len(self.client.revocation_calls), 1)
         self.assertEqual(
             result['dispatch']['groups'][0]['dispatch_status'],
