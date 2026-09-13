@@ -24,6 +24,10 @@ serialize the effective instant in UTC, so an input such as
 `2026-04-15T15:30:00+09:00` is returned as
 `2026-04-15T06:30:00+00:00`.
 
+When `reuse_existing=true`, feedback reuse also requires the stored run's
+effective cutoff to be the same normalized UTC instant. Equivalent timezone
+offsets match; a missing, earlier, or later stored cutoff redispatches.
+
 ## Example request
 ```http
 POST /agent-context/feedback/dispatch/symbols

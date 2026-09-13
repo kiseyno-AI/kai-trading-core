@@ -1506,6 +1506,11 @@ explicitly future cutoff is rejected. Background runs persist one canonical
 UTC effective cutoff in their durable request payload, including when the
 value was derived from a default.
 
+With `reuse_existing=true`, persisted feedback is reusable only when its run
+records the same effective cutoff instant. Equivalent timezone offsets compare
+equal after UTC normalization; a missing, earlier, or later stored cutoff
+fails closed and redispatches the role.
+
 ### Example request
 ```http
 POST /agent-context/feedback/dispatch/symbols
@@ -1572,6 +1577,13 @@ historical US dates use the actual XNYS session close, and mixed-market scopes
 require an explicit cutoff. When the field is omitted, current or future dates
 use request time. Naive or explicitly future values fail with HTTP 400 rather
 than silently changing the evidence window.
+
+Reuse and durable cycle resume use the normalized effective cutoff as part of
+their identity. Equivalent timezone offsets match, while a missing, earlier,
+or later cutoff cannot be reused or resumed and therefore requires fresh work.
+Active retry runs join only when scope,
+scope mode, and effective cutoff all match. Separate current/future requests
+whose omitted cutoffs resolve to different request-time instants do not join.
 
 ### Example request
 ```http
@@ -1648,6 +1660,9 @@ whole follow-up. When omitted, current or future dates use request time. The
 same 15:30 KST historical default and HTTP 400 rejection rules apply;
 historical US dates use the actual XNYS close, mixed-market scopes require an
 explicit value, and invalid explicit values fail with HTTP 400.
+
+The same exact normalized-cutoff reuse, resume, and active-run join rules as
+`/feedback/retry-cycles` apply to follow-up requests.
 
 ### Example request
 ```http

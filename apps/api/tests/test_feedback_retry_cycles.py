@@ -206,6 +206,64 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             )
         )
 
+    def test_run_retry_cycles_discards_prior_resume_when_cutoff_differs(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        run_state_service.find_latest_run = lambda **_: {
+            'run_id': 'prior-retry-run',
+            'request_payload': {
+                'admission_knowledge_cutoff_at': '2026-04-16T06:29:00+00:00',
+            },
+        }
+
+        class LeaseContext:
+            def __enter__(self):
+                return SimpleNamespace()
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        effective_cutoff = datetime(2026, 4, 16, 6, 30, tzinfo=timezone.utc)
+        with patch(
+            'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            return_value=_feedback_prerequisites(),
+        ), patch.object(
+            service, '_load_eligible_symbols', return_value=['005930'],
+        ), patch(
+            'app.agent_context.retry_service.resolve_external_news_knowledge_cutoff_for_symbols',
+            return_value=(effective_cutoff, 'requested'),
+        ), patch(
+            'app.agent_context.retry_service.agent_context_feedback_run_state_service',
+            run_state_service,
+        ), patch(
+            'app.agent_context.retry_service._claim_feedback_retry_run',
+            return_value={'acquired': True, 'owner_token': 'owner-token'},
+        ), patch(
+            'app.agent_context.retry_service._feedback_retry_claim_lease',
+            return_value=LeaseContext(),
+        ), patch(
+            'app.agent_context.retry_service._finish_feedback_retry_claim_if_running',
+        ), patch.object(
+            service,
+            '_run_retry_cycles_admitted',
+            return_value={'status': 'completed'},
+        ) as run_admitted:
+            service.run_retry_cycles(
+                config=SimpleNamespace(
+                    market_date=date.fromisoformat('2026-04-16'),
+                    roles=('signal-decider',),
+                    symbols=('005930',),
+                    knowledge_cutoff_at='2026-04-16T15:30:00+09:00',
+                    force_recompute=False,
+                )
+            )
+
+        self.assertIsNone(run_admitted.call_args.kwargs['previous_run'])
+        self.assertEqual(
+            run_admitted.call_args.kwargs['effective_knowledge_cutoff_at'],
+            effective_cutoff,
+        )
+
     def test_feedback_retry_admission_claim_atomically_rejects_overlapping_scope(self):
         suffix = uuid4().hex[:10].upper()
         run_ids = [f'claim-one-{suffix}', f'claim-two-{suffix}']

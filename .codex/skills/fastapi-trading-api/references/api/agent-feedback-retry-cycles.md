@@ -25,6 +25,12 @@ values fail with HTTP 400. Core normalizes the effective instant to UTC in the
 durable run request; the endpoint's top-level response does not duplicate that
 field.
 
+The normalized effective cutoff is part of feedback reuse, prior-cycle resume,
+and active-run join identity. Equivalent timezone offsets match; a missing,
+earlier, or later cutoff requires fresh work instead of reuse or resume.
+Omitted current/future cutoffs are
+resolved at request time, so different resolved instants do not exact-join.
+
 ## Example request
 ```http
 POST /agent-context/feedback/retry-cycles

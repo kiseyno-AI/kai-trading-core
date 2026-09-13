@@ -18,6 +18,12 @@ future values fail with HTTP 400. Core normalizes the effective instant to UTC
 in the durable run request; the endpoint's top-level response does not
 duplicate that field.
 
+Feedback reuse, prior-cycle resume, and active-run joins require the same
+UTC-normalized effective cutoff. Equivalent timezone offsets match; a missing,
+earlier, or later cutoff requires fresh work instead of reuse or resume.
+Omitted current/future cutoffs that
+resolve to different request-time instants do not exact-join.
+
 ## Example request
 
 ```http
