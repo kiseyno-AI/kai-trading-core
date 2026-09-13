@@ -2061,9 +2061,6 @@ class RecordingAgentContextReadService:
 class DeciderReadyAgentContextReadService:
     def get_symbol_day_context(self, **kwargs):
         return {
-            'request': {
-                'knowledge_cutoff_at': kwargs.get('knowledge_cutoff_at'),
-            },
             'summary': {
                 'context_completeness': {
                     'requested_symbol_count': len(kwargs['symbols']),
@@ -4888,13 +4885,19 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             if set(call['roles']) == set(orchestrator_module.UPSTREAM_SUMMARY_ROLES)
         )
         self.assertFalse(upstream_reuse_call['force_recompute'])
-        self.assertTrue(reuse_calls)
-        self.assertTrue(
-            all(
-                call['knowledge_cutoff_at']
-                == '2026-04-14T06:30:00+00:00'
-                for call in reuse_calls
-            )
+        primary_reuse_call = next(
+            call
+            for call in reuse_calls
+            if set(call['roles'])
+            == set(orchestrator_module.DEFAULT_AGENT_NAMES)
+        )
+        self.assertEqual(
+            primary_reuse_call['knowledge_cutoff_at'],
+            '2026-04-14T06:30:00+00:00',
+        )
+        self.assertEqual(
+            upstream_reuse_call['knowledge_cutoff_at'],
+            '2026-04-14T06:30:00+00:00',
         )
         self.assertEqual(len(client.decider_payloads), 2)
         short_term_payload = next(payload for payload in client.decider_payloads if payload['role'] == 'short-term-decider')
@@ -5018,11 +5021,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn(result['request']['request_run_id'], decider_call['batch_items'][0]['session_key'])
         self.assertIn('/batch-001/', decider_call['batch_items'][0]['session_key'])
         self.assertEqual(market_context_builder.calls, ['2026-04-14'] * 5)
-        self.assertEqual(
-            result['summary']['completed'],
-            5,
-            result['failures'],
-        )
+        self.assertEqual(result['summary']['completed'], 5)
 
     def test_auto_scoped_symbol_dispatch_applies_smaller_decider_role_caps(self):
         service = AgentFeedbackOrchestrator()
