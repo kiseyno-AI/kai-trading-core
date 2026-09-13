@@ -5985,7 +5985,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_workers_converge_after_201_and_409(self) -> None:
         first_started = asyncio.Event()
         allow_first_to_finish = asyncio.Event()
-        first_worker_finished = asyncio.Event()
+        first_published = asyncio.Event()
         post_attempt_count = 0
         original_post = self.client.post_execution_plan
 
@@ -6005,9 +6005,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         }
                     ]
                 }
+                first_published.set()
                 return response
             allow_first_to_finish.set()
-            await first_worker_finished.wait()
+            await first_published.wait()
             raise SignalDeciderExecClientError(
                 'concurrent execution plan already accepted',
                 code='conflict',
@@ -6018,18 +6019,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         second_service = SignalDeciderExecIntegrationService(
             client=self.client
         )
-
-        async def dispatch_first_worker() -> dict:
-            try:
-                return await self.service.dispatch_next_open_plan(
-                    target_trade_date=self.target_trade_date,
-                    refresh_plan=False,
-                    force=True,
-                    trigger='concurrent_worker_one',
-                )
-            finally:
-                first_worker_finished.set()
-
         first_task: asyncio.Task | None = None
         second_task: asyncio.Task | None = None
         combined_future: asyncio.Future | None = None
@@ -6040,7 +6029,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=concurrent_post,
             ):
                 first_task = asyncio.create_task(
-                    dispatch_first_worker()
+                    self.service.dispatch_next_open_plan(
+                        target_trade_date=self.target_trade_date,
+                        refresh_plan=False,
+                        force=True,
+                        trigger='concurrent_worker_one',
+                    )
                 )
                 await asyncio.wait_for(first_started.wait(), timeout=2)
                 second_task = asyncio.create_task(
@@ -6061,7 +6055,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             # work continues beyond teardown. Release the controlled waits and
             # drain both tasks to their natural terminal state.
             allow_first_to_finish.set()
-            first_worker_finished.set()
+            first_published.set()
             tasks = [
                 task
                 for task in (first_task, second_task)
