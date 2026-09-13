@@ -2461,11 +2461,41 @@ class SignalDeciderLoopRepository:
                         ),
                         else_=excluded.status,
                     ),
-                    'parent_policy_version': excluded.parent_policy_version,
-                    'source_candidate_version': excluded.source_candidate_version,
-                    'change_summary': excluded.change_summary,
-                    'rule_bundle_payload': excluded.rule_bundle_payload,
-                    'metadata_payload': excluded.metadata_payload,
+                    'parent_policy_version': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.parent_policy_version,
+                        ),
+                        else_=excluded.parent_policy_version,
+                    ),
+                    'source_candidate_version': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.source_candidate_version,
+                        ),
+                        else_=excluded.source_candidate_version,
+                    ),
+                    'change_summary': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.change_summary,
+                        ),
+                        else_=excluded.change_summary,
+                    ),
+                    'rule_bundle_payload': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.rule_bundle_payload,
+                        ),
+                        else_=excluded.rule_bundle_payload,
+                    ),
+                    'metadata_payload': case(
+                        (
+                            SignalDeciderPolicyVersion.status.in_(('active', 'retired')),
+                            SignalDeciderPolicyVersion.metadata_payload,
+                        ),
+                        else_=excluded.metadata_payload,
+                    ),
                     'activated_by': case(
                         (
                             SignalDeciderPolicyVersion.status.in_(('active', 'retired')),

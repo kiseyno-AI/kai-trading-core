@@ -1,4 +1,6 @@
 import unittest
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sqlalchemy import delete
@@ -56,6 +58,43 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
             self.assertTrue(acquired)
 
         engine.connect.return_value.__exit__.assert_called_once_with(None, None, None)
+
+
+class CompleteEODCollectionRunUnitTests(unittest.TestCase):
+    def test_completion_timestamp_is_timezone_aware_utc(self):
+        expected_completed_at = datetime(2026, 9, 12, 16, 5, tzinfo=timezone.utc)
+        run = SimpleNamespace(
+            status='running',
+            symbols_succeeded=0,
+            symbols_failed=0,
+            error_message=None,
+            completed_at=None,
+            run_metadata=None,
+        )
+        session = MagicMock()
+        session.get.return_value = run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.repositories.eod_run_repository.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.repositories.eod_run_repository.datetime') as datetime_type,
+        ):
+            datetime_type.now.return_value = expected_completed_at
+            datetime_type.utcnow.return_value = expected_completed_at.replace(tzinfo=None)
+
+            complete_eod_collection_run(
+                521,
+                status='completed_with_errors',
+                symbols_succeeded=3_548,
+                symbols_failed=1,
+            )
+
+        self.assertEqual(run.completed_at, expected_completed_at)
+        datetime_type.now.assert_called_once_with(timezone.utc)
 
 
 class EODRunRepositoryTests(unittest.TestCase):
@@ -124,6 +163,37 @@ class EODRunRepositoryTests(unittest.TestCase):
         self.assertEqual(rows[0]['symbols_succeeded'], 4)
         self.assertEqual(rows[0]['run_metadata']['mode'], 'daily_auto')
         self.assertNotIn('_sa_instance_state', rows[0])
+
+    def test_list_eod_collection_runs_excludes_metadata_modes_before_limit(self):
+        daily_run_id = self._create_completed_run(
+            trade_date='2099-12-29',
+            trigger='test_repo_daily_before_limit',
+            status='completed',
+            symbols_total=5,
+            symbols_succeeded=5,
+            symbols_failed=0,
+            run_metadata={'mode': 'daily_auto'},
+        )
+        for index in range(11):
+            self._create_completed_run(
+                trade_date='2099-12-29',
+                trigger=f'test_repo_historical_{index}',
+                status='completed',
+                symbols_total=5,
+                symbols_succeeded=5,
+                symbols_failed=0,
+                run_metadata={'mode': 'historical_backfill'},
+            )
+
+        rows = list_eod_collection_runs(
+            market='KRX',
+            trade_date='2099-12-29',
+            source='pykrx',
+            excluded_run_metadata_modes=('historical_backfill',),
+            limit=1,
+        )
+
+        self.assertEqual([row['id'] for row in rows], [daily_run_id])
 
     def test_load_most_complete_eod_collection_run_prefers_highest_success_count(self):
         losing_run_id = self._create_completed_run(

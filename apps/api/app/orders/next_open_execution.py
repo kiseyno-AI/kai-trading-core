@@ -24,8 +24,11 @@ from app.agent_context.read_service import (
     _build_market_regime_context,
 )
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
-from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
+from app.agent_context.eligibility import AGENT_FEEDBACK_SCOPE_REQUESTED
+from app.agent_context.feedback_failure_taxonomy import build_failure_groups
+from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.orders.signal_decider_alignment_gate import (
     ALIGNMENT_GATE_ACTION_BLOCK,
@@ -43,10 +46,12 @@ from app.agent_context.signal_decider_loop_service import signal_decider_loop_se
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
+    AgentContextFeedbackFailure,
     AgentContextFeedbackRun,
     CurrentMarketSnapshotCache,
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
+    SignalDeciderPolicyVersion,
 )
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
@@ -107,6 +112,15 @@ ORDER_SOURCE = 'signal_decider_next_open'
 NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION = 'next_open_cost_evidence_v1'
 NEXT_OPEN_PREOPEN_POLICY_FINGERPRINT_VERSION = 'next_open_preopen_policy_v1'
 CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION = 'current_live_market_buy_authority_v1'
+AGENT_FEEDBACK_CHILD_RUN_LINEAGE_SCHEMA_VERSION = (
+    'agent_feedback_child_run_lineage_v1'
+)
+AGENT_FEEDBACK_REUSE_EVIDENCE_SCHEMA_VERSION = (
+    'agent_feedback_reuse_evidence_v1'
+)
+SIGNAL_DECIDER_POLICY_AUTHORITY_SCHEMA_VERSION = (
+    'signal_decider_policy_authority_v2'
+)
 KRX_NEXT_OPEN_MARKETS = frozenset({'KRX', 'KOSPI', 'KOSDAQ', 'KONEX'})
 SHORT_TERM_ACTIONABLE_ACTIONS = {'scalp_buy_candidate', 'watch_for_trigger'}
 SHORT_TERM_GENERIC_ACTION_BY_TACTICAL_ACTION = {
@@ -242,6 +256,16 @@ def _to_json_safe(value: Any) -> Any:
     return value
 
 
+def _canonical_payload_fingerprint(value: Any) -> str:
+    encoded = json.dumps(
+        _to_json_safe(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return 'sha256:' + hashlib.sha256(encoded).hexdigest()
+
+
 def _snapshot_cohort_fingerprint(
     snapshots: Sequence[SignalDeciderDecisionSnapshot],
 ) -> str:
@@ -296,6 +320,25 @@ def _plan_refresh_advisory_lock_key(target_trade_date: date) -> int:
     return int.from_bytes(digest[:8], byteorder='big', signed=False) & ((1 << 63) - 1)
 
 
+def _acquire_plan_refresh_advisory_lock(
+    session: Any,
+    *,
+    target_trade_date: date,
+) -> None:
+    """Acquire the date-scoped lock without pinning a waiting pool connection."""
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != 'postgresql':
+        return
+    acquired = session.execute(
+        text('SELECT pg_try_advisory_xact_lock(:lock_key)'),
+        {'lock_key': _plan_refresh_advisory_lock_key(target_trade_date)},
+    ).scalar_one()
+    if acquired is not True:
+        raise _PlanRefreshRevisionConflict(
+            f'next-open plan refresh already active for {target_trade_date.isoformat()}'
+        )
+
+
 def _lock_dispatch_authority_source_tables(session: Any) -> None:
     bind = session.get_bind()
     if bind is None or bind.dialect.name != 'postgresql':
@@ -303,11 +346,71 @@ def _lock_dispatch_authority_source_tables(session: Any) -> None:
     preparer = bind.dialect.identifier_preparer
     for table in (
         AgentContextFeedbackRun.__table__,
+        AgentContextFeedbackFailure.__table__,
         SignalDeciderDecisionSnapshot.__table__,
+        SignalDeciderPolicyVersion.__table__,
     ):
         session.execute(
             text(f'LOCK TABLE {preparer.format_table(table)} IN SHARE MODE')
         )
+
+
+def _load_signal_decider_policy_authority(
+    session: Any,
+    *,
+    policy_versions: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    normalized_versions = sorted(
+        {
+            str(policy_version or '').strip()
+            for policy_version in policy_versions
+            if str(policy_version or '').strip()
+        }
+    )
+    if not normalized_versions:
+        return {}
+    rows = session.execute(
+        select(SignalDeciderPolicyVersion).where(
+            SignalDeciderPolicyVersion.policy_version.in_(normalized_versions)
+        )
+    ).scalars().all()
+    by_version = {row.policy_version: row for row in rows}
+    return {
+        policy_version: {
+            'schema_version': SIGNAL_DECIDER_POLICY_AUTHORITY_SCHEMA_VERSION,
+            'policy_version': policy_version,
+            'status': (
+                str(by_version[policy_version].status or '').strip().lower()
+                if policy_version in by_version
+                else 'missing'
+            ),
+            'activated_at': (
+                by_version[policy_version].activated_at.isoformat()
+                if policy_version in by_version
+                and by_version[policy_version].activated_at is not None
+                else None
+            ),
+            'retired_at': (
+                by_version[policy_version].retired_at.isoformat()
+                if policy_version in by_version
+                and by_version[policy_version].retired_at is not None
+                else None
+            ),
+            'rule_bundle_fingerprint': (
+                _canonical_payload_fingerprint(
+                    by_version[policy_version].rule_bundle_payload
+                )
+                if policy_version in by_version
+                else None
+            ),
+            'rule_bundle': (
+                copy.deepcopy(by_version[policy_version].rule_bundle_payload)
+                if policy_version in by_version
+                else None
+            ),
+        }
+        for policy_version in normalized_versions
+    }
 
 
 def _execution_plan_row_authority_fingerprint(
@@ -776,6 +879,10 @@ def _stable_market_state_generation_material(
 
 def _dispatch_authority_issue_reason(reason_code: str) -> dict[str, str]:
     messages = {
+        'agent_context_authority_changed': (
+            'The latest decision-agent evidence is incomplete or no longer matches '
+            'the authority stored with this BUY; stale authority is blocked.'
+        ),
         'current_live_market_risk_off': (
             'Fresh authoritative live market breadth is severely weak; new BUY '
             'authority is blocked.'
@@ -796,6 +903,10 @@ def _dispatch_authority_issue_reason(reason_code: str) -> dict[str, str]:
             'The decision candidate bound to this BUY is no longer present; stale '
             'authority is blocked.'
         ),
+        'decision_input_generation_changed': (
+            'The source, policy, eligibility, prior-decision, or upstream evidence '
+            'bound to this decision changed; stale BUY authority is blocked.'
+        ),
         'policy_scope_changed': (
             'The execution policy, route, or dispatch material changed; stale BUY '
             'authority is blocked.'
@@ -807,6 +918,52 @@ def _dispatch_authority_issue_reason(reason_code: str) -> dict[str, str]:
             reason_code,
             'Dispatch authority changed; the stale BUY is blocked.',
         ),
+    )
+
+
+def _candidate_agent_context(
+    context: dict[str, Any] | None,
+    *,
+    symbol: str,
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    by_symbol = context.get('_candidate_contexts_by_symbol')
+    normalized_symbol = str(symbol or '').strip().upper()
+    if isinstance(by_symbol, dict):
+        candidate_context = by_symbol.get(normalized_symbol)
+        if isinstance(candidate_context, dict):
+            return candidate_context
+    return context
+
+
+def _public_agent_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    return {
+        key: value
+        for key, value in context.items()
+        if not str(key).startswith('_')
+    }
+
+
+def _agent_context_authority_matches(
+    *,
+    stored: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(stored, dict) or not isinstance(current, dict):
+        return False
+    if str(stored.get('status') or '').strip().lower() != 'complete':
+        return False
+    if str(current.get('status') or '').strip().lower() != 'complete':
+        return False
+    stored_fingerprint = str(stored.get('authority_fingerprint') or '').strip()
+    current_fingerprint = str(current.get('authority_fingerprint') or '').strip()
+    return bool(
+        stored_fingerprint
+        and current_fingerprint
+        and stored_fingerprint == current_fingerprint
     )
 
 
@@ -1599,6 +1756,8 @@ def _preopen_plan_covers_latest_snapshots(
     existing_rows: Sequence[SignalDeciderExecutionPlanItem],
     snapshots: Sequence[SignalDeciderDecisionSnapshot],
     account_targets: Sequence[NextOpenAccountTarget],
+    agent_context_authority_fingerprint: str | None = None,
+    agent_context_completeness: dict[str, Any] | None = None,
 ) -> bool:
     if any(
         not _is_dispatch_terminal_status(row.execution_status)
@@ -1634,6 +1793,28 @@ def _preopen_plan_covers_latest_snapshots(
             != _next_open_policy_fingerprint([target])
         ):
             return False
+        stored_agent_context = validation.get('agent_context_completeness')
+        if isinstance(agent_context_completeness, dict):
+            current_agent_context = _candidate_agent_context(
+                agent_context_completeness,
+                symbol=row.symbol,
+            )
+            if not _agent_context_authority_matches(
+                stored=(
+                    stored_agent_context
+                    if isinstance(stored_agent_context, dict)
+                    else None
+                ),
+                current=current_agent_context,
+            ):
+                return False
+        elif agent_context_authority_fingerprint:
+            if (
+                not isinstance(stored_agent_context, dict)
+                or stored_agent_context.get('authority_fingerprint')
+                != agent_context_authority_fingerprint
+            ):
+                return False
 
     expected_snapshots: dict[tuple[str, str, str], SignalDeciderDecisionSnapshot] = {}
     for snapshot in snapshots:
@@ -1725,9 +1906,9 @@ class SignalDeciderNextOpenExecutionService:
 
         session_context = session_scope() if _session is None else nullcontext(_session)
         with session_context as session:
-            session.execute(
-                text('SELECT pg_advisory_xact_lock(:lock_key)'),
-                {'lock_key': _plan_refresh_advisory_lock_key(resolved_target_date)},
+            _acquire_plan_refresh_advisory_lock(
+                session,
+                target_trade_date=resolved_target_date,
             )
             _lock_dispatch_authority_source_tables(session)
             market_state = self.market_state_getter()
@@ -1750,17 +1931,48 @@ class SignalDeciderNextOpenExecutionService:
                 .order_by(SignalDeciderExecutionPlanItem.id.asc())
                 .with_for_update(read=True)
             ).scalars().all()
-            latest_snapshots = self._load_latest_snapshots(
-                source_market_date=source_market_date
+            current_scope_state = self._load_latest_decider_scope_state(
+                source_market_date=source_market_date,
+                _session=session,
             )
-            run_generation = session.execute(
-                select(AgentContextFeedbackRun)
-                .where(AgentContextFeedbackRun.market_date == source_market_date)
-                .order_by(
-                    AgentContextFeedbackRun.started_at.asc(),
-                    AgentContextFeedbackRun.id.asc(),
+            raw_latest_snapshots = sorted(
+                (
+                    snapshot
+                    for snapshot in current_scope_state['selected_by_key'].values()
+                    if snapshot is not None
+                ),
+                key=lambda snapshot: (
+                    snapshot.symbol,
+                    _snapshot_agent_name(snapshot),
+                    snapshot.id,
+                ),
+            )
+            generation_validation = (
+                agent_feedback_orchestrator.revalidate_persisted_decider_snapshots(
+                    market_date=source_market_date,
+                    snapshots=raw_latest_snapshots,
                 )
-            ).scalars().all()
+            )
+            valid_snapshot_ids = {
+                int(snapshot_id)
+                for snapshot_id in generation_validation.get(
+                    'valid_snapshot_ids'
+                )
+                or []
+            }
+            invalid_snapshot_ids = {
+                int(snapshot_id)
+                for snapshot_id in generation_validation.get(
+                    'invalid_snapshot_ids'
+                )
+                or []
+            }
+            latest_snapshots = [
+                snapshot
+                for snapshot in raw_latest_snapshots
+                if int(snapshot.id) in valid_snapshot_ids
+            ]
+            current_source_run = current_scope_state.get('source_run')
 
             account_targets, account_target_errors = self._parse_account_targets()
             account_targets_by_reference = {
@@ -1770,7 +1982,22 @@ class SignalDeciderNextOpenExecutionService:
                 (snapshot.symbol.upper(), _snapshot_agent_name(snapshot)): snapshot
                 for snapshot in latest_snapshots
             }
+            raw_latest_by_scope = {
+                (snapshot.symbol.upper(), _snapshot_agent_name(snapshot)): snapshot
+                for snapshot in raw_latest_snapshots
+            }
             rows_by_id = {int(row.id): row for row in rows}
+            decision_policy_authority_by_version = (
+                _load_signal_decider_policy_authority(
+                    session,
+                    policy_versions=[
+                        row.policy_version
+                        for row in rows
+                        if _normalize_agent_name(row.decision_agent_name)
+                        == SIGNAL_DECIDER_AGENT_NAME
+                    ],
+                )
+            )
             issues: list[dict[str, Any]] = []
             row_generation: list[dict[str, Any]] = []
 
@@ -1791,6 +2018,7 @@ class SignalDeciderNextOpenExecutionService:
                 decision_agent_name = _normalize_agent_name(row.decision_agent_name)
                 scope = (str(row.symbol or '').strip().upper(), decision_agent_name)
                 latest = latest_by_scope.get(scope)
+                raw_latest = raw_latest_by_scope.get(scope)
                 latest_action = (
                     _short_term_tactical_action(latest)
                     if latest is not None
@@ -1806,6 +2034,36 @@ class SignalDeciderNextOpenExecutionService:
                 replacement_actionable = bool(
                     latest is not None and _is_actionable_snapshot(latest)
                 )
+                row_validation = _row_validation_payload(row)
+                stored_agent_context = row_validation.get(
+                    'agent_context_completeness'
+                )
+                stored_candidate_symbols = (
+                    stored_agent_context.get('candidate_symbols')
+                    if isinstance(stored_agent_context, dict)
+                    and isinstance(
+                        stored_agent_context.get('candidate_symbols'), list
+                    )
+                    else None
+                )
+                current_agent_context = (
+                    self._build_agent_context_completeness_from_state(
+                        source_market_date=source_market_date,
+                        candidate_symbols=(
+                            stored_candidate_symbols or [scope[0]]
+                        ),
+                        source_run=(
+                            current_source_run
+                            if isinstance(current_source_run, dict)
+                            else None
+                        ),
+                        scope_state=current_scope_state,
+                    )
+                )
+                current_agent_context = self._attach_snapshot_generation_validation(
+                    agent_context_completeness=current_agent_context,
+                    generation_validation=generation_validation,
+                )
 
                 if (
                     row.target_trade_date != resolved_target_date
@@ -1813,6 +2071,13 @@ class SignalDeciderNextOpenExecutionService:
                     or row.execution_window != EXECUTION_WINDOW_NEXT_OPEN
                 ):
                     reason_code = 'latest_snapshot_replaced'
+                elif (
+                    raw_latest is not None
+                    and int(raw_latest.id) in invalid_snapshot_ids
+                ):
+                    reason_code = 'decision_input_generation_changed'
+                    replacement_action = 'reject'
+                    replacement_actionable = False
                 elif latest is None:
                     reason_code = 'candidate_removed'
                     replacement_action = 'wait'
@@ -1830,6 +2095,17 @@ class SignalDeciderNextOpenExecutionService:
                     _execution_plan_row_authority_fingerprint(row)
                 ):
                     reason_code = 'policy_scope_changed'
+                elif not _agent_context_authority_matches(
+                    stored=(
+                        stored_agent_context
+                        if isinstance(stored_agent_context, dict)
+                        else None
+                    ),
+                    current=current_agent_context,
+                ):
+                    reason_code = 'agent_context_authority_changed'
+                    replacement_action = 'reject'
+                    replacement_actionable = False
 
                 target = account_targets_by_reference.get(row.account_reference)
                 if (
@@ -1850,12 +2126,54 @@ class SignalDeciderNextOpenExecutionService:
                 if reason_code is None and (
                     account_target_errors
                     or current_policy_fingerprint is None
-                    or _row_validation_payload(row).get(
-                        'preopen_policy_fingerprint'
-                    )
+                    or row_validation.get('preopen_policy_fingerprint')
                     != current_policy_fingerprint
                 ):
                     reason_code = 'policy_scope_changed'
+                current_decision_policy_authority = (
+                    decision_policy_authority_by_version.get(
+                        row.policy_version,
+                        {
+                            'schema_version': (
+                                SIGNAL_DECIDER_POLICY_AUTHORITY_SCHEMA_VERSION
+                            ),
+                            'policy_version': row.policy_version,
+                            'status': 'missing',
+                            'activated_at': None,
+                            'retired_at': None,
+                            'rule_bundle_fingerprint': None,
+                            'rule_bundle': None,
+                        },
+                    )
+                    if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                    else None
+                )
+                if (
+                    reason_code is None
+                    and decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                    and (
+                        (
+                            row_validation.get('policy_context') or {}
+                        ).get('authority')
+                        != current_decision_policy_authority
+                    )
+                ):
+                    reason_code = 'policy_scope_changed'
+                    replacement_action = 'reject'
+                    replacement_actionable = False
+                if (
+                    reason_code is None
+                    and decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                    and settings.signal_decider_next_open_require_active_policy
+                    and str(
+                        (current_decision_policy_authority or {}).get('status')
+                        or ''
+                    ).strip().lower()
+                    != 'active'
+                ):
+                    reason_code = 'policy_scope_changed'
+                    replacement_action = 'reject'
+                    replacement_actionable = False
 
                 live_authority: dict[str, Any] | None = None
                 if latest is not None and row.planned_side == 'buy':
@@ -1895,7 +2213,31 @@ class SignalDeciderNextOpenExecutionService:
                         'latest_decision_snapshot_id': (
                             int(latest.id) if latest is not None else None
                         ),
+                        'latest_decision_snapshot_fingerprint': (
+                            _snapshot_cohort_fingerprint([latest])
+                            if latest is not None
+                            else None
+                        ),
                         'current_policy_fingerprint': current_policy_fingerprint,
+                        'current_decision_policy_authority': (
+                            current_decision_policy_authority
+                        ),
+                        'agent_context_authority': {
+                            'stored_status': (
+                                stored_agent_context.get('status')
+                                if isinstance(stored_agent_context, dict)
+                                else None
+                            ),
+                            'stored_fingerprint': (
+                                stored_agent_context.get('authority_fingerprint')
+                                if isinstance(stored_agent_context, dict)
+                                else None
+                            ),
+                            'current_status': current_agent_context.get('status'),
+                            'current_fingerprint': current_agent_context.get(
+                                'authority_fingerprint'
+                            ),
+                        },
                         'live_authority': (
                             _stable_live_market_authority_generation_material(
                                 live_authority
@@ -1905,21 +2247,11 @@ class SignalDeciderNextOpenExecutionService:
                 )
 
             generation_material = {
-                'schema_version': 'dispatch_authority_generation_v1',
+                'schema_version': 'dispatch_authority_generation_v2',
                 'target_trade_date': resolved_target_date,
                 'source_market_date': source_market_date,
                 'row_bindings': normalized_bindings,
                 'rows': row_generation,
-                'latest_snapshot_cohort_fingerprint': (
-                    _snapshot_cohort_fingerprint(latest_snapshots)
-                ),
-                'run_generation': [
-                    {
-                        column.key: getattr(run, column.key, None)
-                        for column in AgentContextFeedbackRun.__table__.columns
-                    }
-                    for run in run_generation
-                ],
                 'market_state': _stable_market_state_generation_material(
                     market_state
                 ),
@@ -1928,6 +2260,9 @@ class SignalDeciderNextOpenExecutionService:
                         snapshot_context,
                         load_error=snapshot_load_error,
                     )
+                ),
+                'decision_input_generation_validation_fingerprint': (
+                    generation_validation.get('generation_fingerprint')
                 ),
                 'account_target_errors': account_target_errors,
                 'issues': issues,
@@ -2089,76 +2424,342 @@ class SignalDeciderNextOpenExecutionService:
                 if str(symbol or '').strip()
             }
         )
+        required_agents = [
+            SHORT_TERM_DECIDER_AGENT_NAME,
+            SIGNAL_DECIDER_AGENT_NAME,
+        ]
         try:
-            latest_run = agent_context_feedback_run_state_service.find_latest_run(
-                market_date=source_market_date,
-                requested_symbols=normalized_symbols or None,
+            scope_state = self._load_latest_decider_scope_state(
+                source_market_date=source_market_date
             )
-            run_id = str(latest_run.get('run_id')).strip() if isinstance(latest_run, dict) and latest_run.get('run_id') else None
-            if run_id:
-                failure_summary = agent_context_feedback_failure_service.get_grouped_summary(
-                    market_date=source_market_date,
-                    run_id=run_id,
-                    limit=20,
-                )
+            if 'source_run' in scope_state:
+                source_run = scope_state.get('source_run')
             else:
-                failure_summary = {'summary': {'failure_count': 0, 'group_count': 0}, 'groups': []}
+                # Preserve compatibility for callers/tests that provide a legacy
+                # preloaded scope shape without its source-run snapshot.
+                source_run = agent_context_feedback_run_state_service.find_latest_run(
+                    market_date=source_market_date,
+                    requested_symbols=None,
+                    requested_roles=required_agents,
+                    request_modes=[DAILY_RETRY_CYCLE_MODE],
+                )
         except Exception as exc:  # noqa: BLE001
             return {
                 'schema_version': 'agent_context_completeness_v1',
                 'source_market_date': source_market_date.isoformat(),
+                'candidate_symbols': normalized_symbols,
+                'candidate_set_basis': (
+                    'latest_signal_decider_snapshots'
+                    if normalized_symbols
+                    else 'source_decision_run'
+                ),
                 'status': 'unavailable',
                 'has_incomplete_agent_context': None,
                 'reason': 'agent_context_completeness_lookup_failed',
                 'error_type': type(exc).__name__,
             }
 
-        summary = failure_summary.get('summary') if isinstance(failure_summary, dict) else {}
-        groups = failure_summary.get('groups') if isinstance(failure_summary, dict) else []
-        failure_groups = [group for group in groups if isinstance(group, dict)][:20] if isinstance(groups, list) else []
-        failure_count = int(summary.get('failure_count') or 0) if isinstance(summary, dict) else 0
-        run_status = (
-            str(latest_run.get('status') or '').strip().lower()
-            if isinstance(latest_run, dict)
-            else None
+        return self._build_agent_context_completeness_from_state(
+            source_market_date=source_market_date,
+            candidate_symbols=normalized_symbols,
+            source_run=source_run if isinstance(source_run, dict) else None,
+            scope_state=scope_state,
         )
-        incomplete_run_statuses = {'running', 'failed', 'partial', 'abandoned'}
-        has_incomplete_agent_context = bool(failure_count > 0 or run_status in incomplete_run_statuses)
-        if has_incomplete_agent_context:
-            status = 'incomplete'
-        elif latest_run is None:
-            status = 'unknown'
-        else:
-            status = 'complete'
-        return {
-            'schema_version': 'agent_context_completeness_v1',
-            'source_market_date': source_market_date.isoformat(),
-            'candidate_symbols': normalized_symbols,
-            'candidate_set_basis': 'latest_signal_decider_snapshots',
-            'status': status,
-            'has_incomplete_agent_context': has_incomplete_agent_context if latest_run is not None or failure_count else None,
-            'latest_run': (
-                {
-                    'run_id': latest_run.get('run_id'),
-                    'status': latest_run.get('status'),
-                    'symbols_total': latest_run.get('symbols_total'),
-                    'completed_count': latest_run.get('completed_count'),
-                    'failed_count': latest_run.get('failed_count'),
-                    'started_at': latest_run.get('started_at').isoformat()
-                    if hasattr(latest_run.get('started_at'), 'isoformat')
-                    else latest_run.get('started_at'),
-                    'completed_at': latest_run.get('completed_at').isoformat()
-                    if hasattr(latest_run.get('completed_at'), 'isoformat')
-                    else latest_run.get('completed_at'),
-                }
-                if isinstance(latest_run, dict)
-                else None
-            ),
-            'failure_count': failure_count,
-            'failure_group_count': int(summary.get('group_count') or 0) if isinstance(summary, dict) else 0,
-            'by_failure_kind': summary.get('by_failure_kind') if isinstance(summary, dict) else {},
-            'failure_groups': failure_groups,
+
+    def _build_agent_context_completeness_from_state(
+        self,
+        *,
+        source_market_date: date,
+        candidate_symbols: Sequence[str] | None,
+        source_run: dict[str, Any] | None,
+        scope_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized_symbols = sorted(
+            {
+                str(symbol or '').strip().upper()
+                for symbol in (candidate_symbols or [])
+                if str(symbol or '').strip()
+            }
+        )
+        required_agents = [
+            SHORT_TERM_DECIDER_AGENT_NAME,
+            SIGNAL_DECIDER_AGENT_NAME,
+        ]
+
+        state_role_scopes = scope_state.get('source_role_symbol_scopes')
+        source_role_scopes = (
+            {
+                _normalize_agent_name(agent_name): list(symbols)
+                for agent_name, symbols in state_role_scopes.items()
+                if isinstance(symbols, list)
+            }
+            if isinstance(state_role_scopes, dict)
+            else self._decider_role_symbol_scopes(source_run)
+        )
+        source_scope_keys = {
+            (symbol, agent_name)
+            for agent_name, symbols in source_role_scopes.items()
+            for symbol in symbols
         }
+        source_cohort_symbols = sorted({symbol for symbol, _ in source_scope_keys})
+
+        selected_by_key = scope_state['selected_by_key']
+        authoritative_run_id_by_key = scope_state['authoritative_run_id_by_key']
+        failures_by_key = scope_state['failures_by_key']
+        raw_evidenced_scope_keys = scope_state.get('evidenced_scope_keys')
+        evidenced_scope_keys = (
+            set(raw_evidenced_scope_keys)
+            if raw_evidenced_scope_keys is not None
+            else {
+                key
+                for key, snapshot in selected_by_key.items()
+                if snapshot is not None
+            }
+        )
+        blocked_source_scope_keys = set(
+            scope_state.get('blocked_source_scope_keys') or ()
+        )
+
+        def assess_scope(
+            scope_keys: set[tuple[str, str]],
+            *,
+            invalid_scope_keys: set[tuple[str, str]] | None = None,
+        ) -> dict[str, Any]:
+            invalid_keys = invalid_scope_keys or set()
+            completed_keys = {
+                key
+                for key in scope_keys
+                if (
+                    key not in invalid_keys
+                    and key in evidenced_scope_keys
+                    and selected_by_key.get(key) is not None
+                )
+            }
+            failed_rows: list[dict[str, Any]] = []
+            failed_keys: set[tuple[str, str]] = set()
+            for key in scope_keys - completed_keys - invalid_keys:
+                failure = failures_by_key.get(key)
+                authoritative_run_id = authoritative_run_id_by_key.get(key)
+                if not isinstance(failure, dict) or not authoritative_run_id:
+                    continue
+                if str(failure.get('run_id') or '').strip() != authoritative_run_id:
+                    continue
+                failed_keys.add(key)
+                failed_rows.append(failure)
+            pending_keys = scope_keys - completed_keys - failed_keys - invalid_keys
+            return {
+                'completed_scope_keys': completed_keys,
+                'failed_scope_keys': failed_keys,
+                'pending_scope_keys': pending_keys,
+                'blocked_source_scope_keys': (
+                    scope_keys & blocked_source_scope_keys
+                ),
+                'invalid_scope_keys': invalid_keys,
+                'failed_rows': failed_rows,
+                'failure_group_map': build_failure_groups(failed_rows),
+            }
+
+        cohort_assessment = assess_scope(set(source_scope_keys))
+        source_parent_runs = [
+            run
+            for run in (scope_state.get('source_parent_runs') or [])
+            if isinstance(run, dict)
+        ]
+        source_parent_status_by_id = {
+            str(run.get('run_id') or '').strip(): str(
+                run.get('status') or ''
+            ).strip().lower()
+            for run in source_parent_runs
+            if str(run.get('run_id') or '').strip()
+        }
+        source_parent_run_id_by_key = scope_state.get(
+            'source_parent_run_id_by_key'
+        )
+        if not isinstance(source_parent_run_id_by_key, dict):
+            source_parent_run_id_by_key = {
+                key: str(source_run.get('run_id') or '').strip()
+                for key in source_scope_keys
+            } if isinstance(source_run, dict) else {}
+
+        def classify_assessment(assessment: dict[str, Any]) -> tuple[str, str | None]:
+            if source_run is None:
+                return 'unknown', 'source_decision_cohort_missing'
+            if not source_role_scopes:
+                return 'unknown', 'source_decision_cohort_scope_missing'
+            if assessment['invalid_scope_keys']:
+                return 'incomplete', 'candidate_symbols_outside_source_cohort'
+            blocked_keys = assessment['blocked_source_scope_keys']
+            if blocked_keys:
+                blocked_statuses = {
+                    source_parent_status_by_id.get(
+                        source_parent_run_id_by_key.get(key),
+                        '',
+                    )
+                    for key in blocked_keys
+                }
+                if 'running' in blocked_statuses:
+                    return 'incomplete', 'source_decision_cohort_running'
+                return 'incomplete', 'source_decision_cohort_not_terminal'
+            if assessment['failed_scope_keys'] or assessment['pending_scope_keys']:
+                return 'incomplete', 'agent_context_terminal_scope_incomplete'
+            return 'complete', None
+
+        cohort_status, cohort_reason = classify_assessment(cohort_assessment)
+
+        ordered_run_snapshots = [
+            run
+            for run in (scope_state.get('run_snapshots') or [])
+            if isinstance(run, dict)
+        ]
+
+        def serialize_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not isinstance(run, dict):
+                return None
+            return {
+                'run_id': run.get('run_id'),
+                'status': run.get('status'),
+                'symbols_total': run.get('symbols_total'),
+                'completed_count': run.get('completed_count'),
+                'failed_count': run.get('failed_count'),
+                'started_at': run.get('started_at').isoformat()
+                if hasattr(run.get('started_at'), 'isoformat')
+                else run.get('started_at'),
+                'completed_at': run.get('completed_at').isoformat()
+                if hasattr(run.get('completed_at'), 'isoformat')
+                else run.get('completed_at'),
+            }
+
+        def latest_run_for_scope(
+            scope_keys: set[tuple[str, str]],
+        ) -> dict[str, Any] | None:
+            parent_ids = {
+                source_parent_run_id_by_key.get(key)
+                for key in scope_keys
+                if source_parent_run_id_by_key.get(key)
+            }
+            for run in [*ordered_run_snapshots, *reversed(source_parent_runs)]:
+                if str(run.get('run_id') or '').strip() in parent_ids:
+                    return serialize_run(run)
+            return serialize_run(source_run)
+
+        def build_payload(
+            symbols: Sequence[str],
+            *,
+            include_full_cohort_details: bool,
+        ) -> dict[str, Any]:
+            payload_symbols = sorted(set(symbols))
+            payload_scope_keys = (
+                {
+                    (symbol, agent_name)
+                    for symbol in payload_symbols
+                    for agent_name in required_agents
+                }
+                if payload_symbols
+                else set(source_scope_keys)
+            )
+            payload_out_of_cohort = sorted(
+                payload_scope_keys - source_scope_keys
+            )
+            assessment = assess_scope(
+                payload_scope_keys,
+                invalid_scope_keys=set(payload_out_of_cohort),
+            )
+            latest_run_payload = latest_run_for_scope(payload_scope_keys)
+            status, reason = classify_assessment(assessment)
+            failed_rows = assessment['failed_rows']
+            grouped_failures = assessment['failure_group_map']
+            by_failure_kind = Counter(
+                str(row.get('failure_kind') or 'dispatch_failed')
+                for row in failed_rows
+            )
+            payload_symbol_set = set(payload_symbols)
+            payload_source_role_scopes = (
+                source_role_scopes
+                if include_full_cohort_details
+                else {
+                    agent_name: [
+                        symbol
+                        for symbol in role_symbols
+                        if symbol in payload_symbol_set
+                    ]
+                    for agent_name, role_symbols in source_role_scopes.items()
+                }
+            )
+            return {
+                'schema_version': 'agent_context_completeness_v1',
+                'source_market_date': source_market_date.isoformat(),
+                'candidate_symbols': payload_symbols,
+                'candidate_set_basis': (
+                    'latest_signal_decider_snapshots'
+                    if payload_symbols
+                    else 'source_decision_run'
+                ),
+                'status': status,
+                'has_incomplete_agent_context': (
+                    None
+                    if status in {'unknown', 'unavailable'}
+                    else status != 'complete'
+                ),
+                'reason': reason,
+                'cohort_status': cohort_status,
+                'cohort_reason': cohort_reason,
+                'candidate_set_definitive': cohort_status == 'complete',
+                'authority_fingerprint': self._agent_context_authority_fingerprint(
+                    source_run=source_run,
+                    scope_state=scope_state,
+                    candidate_symbols=payload_symbols,
+                ),
+                'source_role_symbol_scopes': payload_source_role_scopes,
+                'source_cohort_symbols': (
+                    source_cohort_symbols
+                    if include_full_cohort_details
+                    else [
+                        symbol
+                        for symbol in source_cohort_symbols
+                        if symbol in payload_symbol_set
+                    ]
+                ),
+                'source_cohort_symbol_count': len(source_cohort_symbols),
+                'evaluation_scope_count': len(payload_scope_keys),
+                'completed_scope_count': len(assessment['completed_scope_keys']),
+                'pending_scope_count': len(assessment['pending_scope_keys']),
+                'out_of_cohort_scopes': [
+                    {'symbol': symbol, 'agent_name': agent_name}
+                    for symbol, agent_name in payload_out_of_cohort
+                ],
+                'latest_run': latest_run_payload,
+                'failure_count': len(assessment['failed_scope_keys']),
+                'failure_group_count': len(grouped_failures),
+                'by_failure_kind': dict(sorted(by_failure_kind.items())),
+                'failure_groups': list(grouped_failures.values())[:20],
+                'cohort_completed_scope_count': len(
+                    cohort_assessment['completed_scope_keys']
+                ),
+                'cohort_pending_scope_count': len(
+                    cohort_assessment['pending_scope_keys']
+                ),
+                'cohort_failure_count': len(
+                    cohort_assessment['failed_scope_keys']
+                ),
+                'cohort_failure_groups': list(
+                    cohort_assessment['failure_group_map'].values()
+                )[:20]
+                if include_full_cohort_details
+                else [],
+            }
+
+        result = build_payload(
+            normalized_symbols,
+            include_full_cohort_details=True,
+        )
+        result['_candidate_contexts_by_symbol'] = {
+            symbol: build_payload(
+                [symbol],
+                include_full_cohort_details=False,
+            )
+            for symbol in normalized_symbols
+        }
+        return result
 
     def list_plan_items(
         self,
@@ -2242,73 +2843,56 @@ class SignalDeciderNextOpenExecutionService:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
         runtime = self.runtime_status()
-        current_market_state = self.market_state_getter()
-        live_market_authority_applies = _current_live_market_authority_applies(
-            market_state=current_market_state,
-            target_trade_date=resolved_target_date,
+        initial_market_state = self.market_state_getter()
+        initial_live_market_authority_applies = (
+            _current_live_market_authority_applies(
+                market_state=initial_market_state,
+                target_trade_date=resolved_target_date,
+            )
         )
         live_market_snapshot_context: dict[str, Any] | None = None
         live_market_snapshot_load_error = False
-        if live_market_authority_applies:
+        if initial_live_market_authority_applies:
             (
                 live_market_snapshot_context,
                 live_market_snapshot_load_error,
             ) = _load_live_market_snapshot_context()
-        live_market_snapshot_fingerprint = _live_market_snapshot_fingerprint(
-            live_market_snapshot_context,
-            load_error=live_market_snapshot_load_error,
+        initial_live_market_snapshot_fingerprint = (
+            _live_market_snapshot_fingerprint(
+                live_market_snapshot_context,
+                load_error=live_market_snapshot_load_error,
+            )
         )
-        existing_rows = self._load_plan_rows(
-            target_trade_date=resolved_target_date,
-            account_reference=None,
-            include_payloads=False,
-            include_validation_payload=True,
+        snapshot_generation_state = (
+            self._load_latest_snapshot_generation_state(
+                source_market_date=source_market_date
+            )
         )
-        agent_context_completeness = self._build_agent_context_completeness_context(
-            source_market_date=source_market_date,
-            candidate_symbols=[row.symbol for row in existing_rows],
-        )
-        snapshots = self._load_latest_snapshots(source_market_date=source_market_date)
+        snapshots = snapshot_generation_state['snapshots']
+        generation_validation = snapshot_generation_state[
+            'generation_validation'
+        ]
         account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(
             settings.signal_decider_next_open_account_targets.strip()
         )
         plan_policy_fingerprint = _next_open_policy_fingerprint(account_targets)
-        if (
-            existing_rows
-            and not force
-            and trigger == 'preopen_scheduler'
-            and not live_market_authority_applies
-            and not account_target_errors
-            and all(
-                _is_dispatch_terminal_status(row.execution_status)
-                for row in existing_rows
-            )
-            and _preopen_plan_covers_latest_snapshots(
-                existing_rows=existing_rows,
-                snapshots=snapshots,
-                account_targets=account_targets,
-            )
-        ):
-            return {
-                'request': {
-                    'target_trade_date': resolved_target_date.isoformat(),
-                    'trigger': trigger,
-                },
-                'runtime': runtime,
-                'summary': {
-                    **self._build_summary(
-                        rows=existing_rows,
-                        target_trade_date=resolved_target_date,
-                        runtime=runtime,
-                        source_market_date=source_market_date,
-                        agent_context_completeness=agent_context_completeness,
-                    ),
-                    'reason': 'existing_next_open_plan_reused',
-                },
-                'enrichment_preflight': None,
-                'items': [self._serialize_row(row) for row in existing_rows],
+        signal_policy_versions = sorted(
+            {
+                snapshot.policy_version
+                for snapshot in snapshots
+                if _snapshot_agent_name(snapshot)
+                == SIGNAL_DECIDER_AGENT_NAME
             }
+        )
+        policy_cache = {
+            policy_version: (
+                signal_decider_loop_service.get_policy_prompt_context(
+                    policy_version=policy_version
+                )
+            )
+            for policy_version in signal_policy_versions
+        }
         enrichment_preflight = (
             {
                 'market_date': source_market_date.isoformat(),
@@ -2326,7 +2910,17 @@ class SignalDeciderNextOpenExecutionService:
         enrichment_preflight_blocked = not force and not enrichment_preflight.get('allowed')
         agent_context_completeness = self._build_agent_context_completeness_context(
             source_market_date=source_market_date,
-            candidate_symbols=[snapshot.symbol for snapshot in snapshots],
+            candidate_symbols=[
+                snapshot.symbol
+                for snapshot in snapshot_generation_state['raw_snapshots']
+            ],
+        )
+        base_agent_context_authority = str(
+            agent_context_completeness.get('authority_fingerprint') or ''
+        ).strip()
+        agent_context_completeness = self._attach_snapshot_generation_validation(
+            agent_context_completeness=agent_context_completeness,
+            generation_validation=generation_validation,
         )
         signal_decider_action_by_symbol = _latest_signal_decider_action_by_symbol(snapshots)
         actionable_snapshot_scopes = {
@@ -2358,68 +2952,83 @@ class SignalDeciderNextOpenExecutionService:
             if inspect_candidate_pykrx
             else {}
         )
-        if enrichment_preflight_blocked and not actionable_short_term_symbols:
-            self._block_existing_plan_rows_for_enrichment_preflight(
-                target_trade_date=resolved_target_date,
-                source_market_date=source_market_date,
-                preflight=enrichment_preflight,
-            )
-            rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
-            return {
-                'request': {
-                    'target_trade_date': resolved_target_date.isoformat(),
-                    'trigger': trigger,
-                },
-                'runtime': runtime,
-                'summary': {
-                    **self._build_summary(
-                        rows=rows,
-                        target_trade_date=resolved_target_date,
-                        runtime=runtime,
-                        source_market_date=source_market_date,
-                        enrichment_preflight=enrichment_preflight,
-                        agent_context_completeness=agent_context_completeness,
-                    ),
-                    'reason': 'pykrx_enrichment_preflight_blocked',
-                    'enrichment_preflight_allowed': False,
-                    'enrichment_preflight_status': enrichment_preflight.get('status'),
-                    'enrichment_failed_categories': enrichment_preflight.get('failed_categories') or [],
-                },
-                'enrichment_preflight': enrichment_preflight,
-                'items': [self._serialize_row(row) for row in rows],
-            }
-        policy_cache: dict[str, dict[str, Any]] = {}
         price_cache: dict[str, int | None] = {}
         desired_keys: set[tuple[str, str, str]] = set()
         now = _utcnow()
 
         with session_scope() as session:
-            session.execute(
-                text('SELECT pg_advisory_xact_lock(:lock_key)'),
-                {'lock_key': _plan_refresh_advisory_lock_key(resolved_target_date)},
+            _acquire_plan_refresh_advisory_lock(
+                session,
+                target_trade_date=resolved_target_date,
             )
             _lock_dispatch_authority_source_tables(session)
-            if (
-                live_market_authority_applies
-                and live_market_snapshot_context is not None
-                and not live_market_snapshot_load_error
-            ):
+            policy_authority_by_version = (
+                _load_signal_decider_policy_authority(
+                    session,
+                    policy_versions=signal_policy_versions,
+                )
+            )
+            for policy_version in signal_policy_versions:
+                cached_context = copy.deepcopy(
+                    policy_cache.get(policy_version) or {}
+                )
+                policy_authority = policy_authority_by_version.get(
+                    policy_version,
+                    {
+                        'schema_version': (
+                            SIGNAL_DECIDER_POLICY_AUTHORITY_SCHEMA_VERSION
+                        ),
+                        'policy_version': policy_version,
+                        'status': 'missing',
+                        'activated_at': None,
+                        'retired_at': None,
+                        'rule_bundle_fingerprint': None,
+                        'rule_bundle': None,
+                    },
+                )
+                locked_status = str(
+                    policy_authority.get('status') or ''
+                ).strip().lower()
+                cached_context['current_version'] = policy_version
+                cached_context['status'] = locked_status
+                cached_context['rule_bundle'] = copy.deepcopy(
+                    policy_authority.get('rule_bundle') or {}
+                )
+                cached_context['policy_authority'] = policy_authority
+                policy_cache[policy_version] = cached_context
+            # Re-sample the clock and live evidence only after the authority
+            # lock is held. A PREOPEN -> OPEN transition between the initial
+            # planning read and this transaction must not preserve stale BUY
+            # authority.
+            current_market_state = self.market_state_getter()
+            live_market_authority_applies = (
+                _current_live_market_authority_applies(
+                    market_state=current_market_state,
+                    target_trade_date=resolved_target_date,
+                )
+            )
+            if live_market_authority_applies:
                 session.execute(
                     select(CurrentMarketSnapshotCache.id)
                     .where(CurrentMarketSnapshotCache.cache_key == 'dashboard')
                     .with_for_update(read=True)
                 ).scalar_one_or_none()
                 (
-                    current_live_market_snapshot_context,
-                    current_live_market_snapshot_load_error,
+                    live_market_snapshot_context,
+                    live_market_snapshot_load_error,
                 ) = _load_live_market_snapshot_context()
-                if _live_market_snapshot_fingerprint(
-                    current_live_market_snapshot_context,
-                    load_error=current_live_market_snapshot_load_error,
-                ) != live_market_snapshot_fingerprint:
+                if (
+                    initial_live_market_authority_applies
+                    and _live_market_snapshot_fingerprint(
+                        live_market_snapshot_context,
+                        load_error=live_market_snapshot_load_error,
+                    )
+                    != initial_live_market_snapshot_fingerprint
+                ):
                     raise _PlanRefreshRevisionConflict
-                live_market_snapshot_context = current_live_market_snapshot_context
-                live_market_snapshot_load_error = current_live_market_snapshot_load_error
+            else:
+                live_market_snapshot_context = None
+                live_market_snapshot_load_error = False
             locked_existing_rows = session.execute(
                 select(SignalDeciderExecutionPlanItem)
                 .where(
@@ -2431,13 +3040,89 @@ class SignalDeciderNextOpenExecutionService:
                 .order_by(SignalDeciderExecutionPlanItem.id.asc())
                 .with_for_update()
             ).scalars().all()
-            current_snapshots = self._load_latest_snapshots(
-                source_market_date=source_market_date
+            current_scope_state = self._load_latest_decider_scope_state(
+                source_market_date=source_market_date,
+                _session=session,
             )
+            current_raw_snapshots = sorted(
+                (
+                    snapshot
+                    for snapshot in current_scope_state['selected_by_key'].values()
+                    if snapshot is not None
+                ),
+                key=lambda snapshot: (
+                    snapshot.symbol,
+                    _snapshot_agent_name(snapshot),
+                    snapshot.id,
+                ),
+            )
+            if _snapshot_cohort_fingerprint(
+                current_raw_snapshots
+            ) != snapshot_generation_state[
+                'raw_snapshot_cohort_fingerprint'
+            ]:
+                raise _PlanRefreshRevisionConflict
+            locked_generation_validation = (
+                agent_feedback_orchestrator
+                .revalidate_persisted_decider_snapshots(
+                    market_date=source_market_date,
+                    snapshots=current_raw_snapshots,
+                )
+            )
+            if (
+                locked_generation_validation.get('generation_fingerprint')
+                != generation_validation.get('generation_fingerprint')
+            ):
+                raise _PlanRefreshRevisionConflict
+            generation_validation = locked_generation_validation
+            valid_snapshot_ids = {
+                int(snapshot_id)
+                for snapshot_id in generation_validation.get(
+                    'valid_snapshot_ids'
+                )
+                or []
+            }
+            current_snapshots = [
+                snapshot
+                for snapshot in current_raw_snapshots
+                if int(snapshot.id) in valid_snapshot_ids
+            ]
             if _snapshot_cohort_fingerprint(
                 current_snapshots
             ) != _snapshot_cohort_fingerprint(snapshots):
                 raise _PlanRefreshRevisionConflict
+            initial_agent_context_authority = str(
+                agent_context_completeness.get('authority_fingerprint') or ''
+            ).strip()
+            if base_agent_context_authority:
+                current_agent_context = (
+                    self._build_agent_context_completeness_from_state(
+                        source_market_date=source_market_date,
+                        candidate_symbols=[
+                            snapshot.symbol for snapshot in snapshots
+                        ],
+                        source_run=current_scope_state.get('source_run'),
+                        scope_state=current_scope_state,
+                    )
+                )
+                current_agent_context = (
+                    self._attach_snapshot_generation_validation(
+                        agent_context_completeness=current_agent_context,
+                        generation_validation=generation_validation,
+                    )
+                )
+                current_agent_context_authority = str(
+                    current_agent_context.get('authority_fingerprint') or ''
+                ).strip()
+                if (
+                    current_agent_context_authority
+                    != initial_agent_context_authority
+                    or str(current_agent_context.get('status') or '').strip().lower()
+                    != str(
+                        agent_context_completeness.get('status') or ''
+                    ).strip().lower()
+                ):
+                    raise _PlanRefreshRevisionConflict
             current_account_targets, current_account_target_errors = (
                 self._parse_account_targets()
             )
@@ -2459,6 +3144,15 @@ class SignalDeciderNextOpenExecutionService:
             }
             for snapshot in snapshots:
                 decision_agent_name = _snapshot_agent_name(snapshot)
+                policy_context = (
+                    policy_cache.get(snapshot.policy_version) or {}
+                    if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                    else None
+                )
+                candidate_agent_context = _candidate_agent_context(
+                    agent_context_completeness,
+                    symbol=snapshot.symbol,
+                )
                 current_live_market_authority = _current_live_market_buy_authority(
                     snapshot=snapshot,
                     target_trade_date=resolved_target_date,
@@ -2548,6 +3242,7 @@ class SignalDeciderNextOpenExecutionService:
                             snapshot=snapshot,
                             target=target,
                             current_live_market_authority=current_live_market_authority,
+                            current_agent_context=candidate_agent_context,
                             now=now,
                         ):
                             continue
@@ -2603,6 +3298,140 @@ class SignalDeciderNextOpenExecutionService:
                                 now=now,
                             )
                             continue
+                        current_policy_authority = (
+                            (policy_context or {}).get('policy_authority')
+                            if isinstance(
+                                (policy_context or {}).get('policy_authority'),
+                                dict,
+                            )
+                            else None
+                        )
+                        stored_policy_authority = (
+                            (
+                                _row_validation_payload(row).get(
+                                    'policy_context'
+                                )
+                                or {}
+                            ).get('authority')
+                        )
+                        if (
+                            decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                            and stored_policy_authority
+                            != current_policy_authority
+                        ):
+                            authority_fingerprint = (
+                                _canonical_payload_fingerprint(
+                                    current_policy_authority
+                                )
+                            )
+                            self._stage_terminal_revocation(
+                                row=row,
+                                replacement_snapshot=None,
+                                replacement_observation_id=(
+                                    'observation:policy_scope_changed:'
+                                    f'{authority_fingerprint[-20:]}'
+                                ),
+                                replacement_action='reject',
+                                reason=_dispatch_authority_issue_reason(
+                                    'policy_scope_changed'
+                                ),
+                                now=now,
+                            )
+                            continue
+                        if (
+                            decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                            and settings.signal_decider_next_open_require_active_policy
+                            and str(
+                                (policy_context or {}).get('status') or ''
+                            ).strip().lower()
+                            != 'active'
+                        ):
+                            policy_authority = (
+                                (policy_context or {}).get('policy_authority')
+                                if isinstance(
+                                    (policy_context or {}).get(
+                                        'policy_authority'
+                                    ),
+                                    dict,
+                                )
+                                else {}
+                            )
+                            observation_material = '|'.join(
+                                (
+                                    'policy_scope_changed',
+                                    snapshot.policy_version,
+                                    str(
+                                        (policy_context or {}).get('status')
+                                        or 'unknown'
+                                    ),
+                                    str(policy_authority.get('retired_at') or ''),
+                                )
+                            )
+                            self._stage_terminal_revocation(
+                                row=row,
+                                replacement_snapshot=None,
+                                replacement_observation_id=(
+                                    'observation:policy_scope_changed:'
+                                    f'{hashlib.sha256(observation_material.encode("utf-8")).hexdigest()[:20]}'
+                                ),
+                                replacement_action='reject',
+                                reason=_dispatch_authority_issue_reason(
+                                    'policy_scope_changed'
+                                ),
+                                now=now,
+                            )
+                            continue
+                        stored_agent_context = _row_validation_payload(row).get(
+                            'agent_context_completeness'
+                        )
+                        if not _agent_context_authority_matches(
+                            stored=(
+                                stored_agent_context
+                                if isinstance(stored_agent_context, dict)
+                                else None
+                            ),
+                            current=candidate_agent_context,
+                        ):
+                            current_parent = candidate_agent_context.get(
+                                'latest_run'
+                            )
+                            observation_material = '|'.join(
+                                (
+                                    'agent_context_authority_changed',
+                                    resolved_target_date.isoformat(),
+                                    row.account_reference,
+                                    row.symbol,
+                                    str(
+                                        candidate_agent_context.get(
+                                            'authority_fingerprint'
+                                        )
+                                        or ''
+                                    ),
+                                    str(
+                                        candidate_agent_context.get('status')
+                                        or ''
+                                    ),
+                                    str(
+                                        current_parent.get('run_id')
+                                        if isinstance(current_parent, dict)
+                                        else ''
+                                    ),
+                                )
+                            )
+                            self._stage_terminal_revocation(
+                                row=row,
+                                replacement_snapshot=None,
+                                replacement_observation_id=(
+                                    'observation:agent_context_authority_changed:'
+                                    f'{hashlib.sha256(observation_material.encode("utf-8")).hexdigest()[:20]}'
+                                ),
+                                replacement_action='reject',
+                                reason=_dispatch_authority_issue_reason(
+                                    'agent_context_authority_changed'
+                                ),
+                                now=now,
+                            )
+                            continue
                         authority_action = current_live_market_authority.get('action')
                         if (
                             planned_side == 'buy'
@@ -2646,13 +3475,6 @@ class SignalDeciderNextOpenExecutionService:
                             )
                             continue
                         continue
-                    policy_context = None
-                    if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and snapshot.policy_version not in policy_cache:
-                        policy_cache[snapshot.policy_version] = signal_decider_loop_service.get_policy_prompt_context(
-                            policy_version=snapshot.policy_version
-                        )
-                    if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
-                        policy_context = policy_cache[snapshot.policy_version]
                     validation, computed = self._build_validation_payload(
                         snapshot=snapshot,
                         target=target,
@@ -2665,7 +3487,7 @@ class SignalDeciderNextOpenExecutionService:
                             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
                             else None
                         ),
-                        agent_context_completeness=agent_context_completeness,
+                        agent_context_completeness=candidate_agent_context,
                     )
                     if current_live_market_authority.get('applies') is True:
                         validation['current_live_market_authority'] = copy.deepcopy(
@@ -3363,8 +4185,220 @@ class SignalDeciderNextOpenExecutionService:
             )
         return items, errors
 
-    def _load_latest_snapshots(self, *, source_market_date: date) -> list[SignalDeciderDecisionSnapshot]:
-        with session_scope() as session:
+    @staticmethod
+    def _decider_role_symbol_scopes(
+        run_snapshot: dict[str, Any] | None,
+    ) -> dict[str, list[str]]:
+        if not isinstance(run_snapshot, dict):
+            return {}
+        request_payload = (
+            run_snapshot.get('request_payload')
+            if isinstance(run_snapshot.get('request_payload'), dict)
+            else {}
+        )
+        relevant_agents = {
+            SIGNAL_DECIDER_AGENT_NAME,
+            SHORT_TERM_DECIDER_AGENT_NAME,
+        }
+        role_scopes: dict[str, list[str]] = {}
+        raw_role_scopes = request_payload.get('role_symbol_scopes')
+        if isinstance(raw_role_scopes, dict):
+            for raw_role, raw_symbols in raw_role_scopes.items():
+                agent_name = _normalize_agent_name(raw_role)
+                if agent_name not in relevant_agents or not isinstance(raw_symbols, list):
+                    continue
+                role_scopes[agent_name] = sorted(
+                    {
+                        str(symbol or '').strip().upper()
+                        for symbol in raw_symbols
+                        if str(symbol or '').strip()
+                    }
+                )
+        if role_scopes:
+            return role_scopes
+
+        requested_symbols = (
+            agent_context_feedback_run_state_service.resolve_run_requested_symbols(
+                run_snapshot=run_snapshot
+            )
+        )
+        raw_roles = request_payload.get('roles')
+        if requested_symbols is None or not isinstance(raw_roles, list):
+            return {}
+        for raw_role in raw_roles:
+            agent_name = _normalize_agent_name(raw_role)
+            if agent_name in relevant_agents:
+                role_scopes[agent_name] = list(requested_symbols)
+        return role_scopes
+
+    def _agent_context_authority_fingerprint(
+        self,
+        *,
+        source_run: dict[str, Any] | None,
+        scope_state: dict[str, Any],
+        candidate_symbols: Sequence[str],
+    ) -> str:
+        state_role_scopes = scope_state.get('source_role_symbol_scopes')
+        source_role_scopes = (
+            state_role_scopes
+            if isinstance(state_role_scopes, dict)
+            else self._decider_role_symbol_scopes(source_run)
+        )
+        source_scope_keys = {
+            (symbol, agent_name)
+            for agent_name, symbols in source_role_scopes.items()
+            for symbol in symbols
+        }
+        candidate_scope_keys = {
+            (str(symbol).strip().upper(), agent_name)
+            for symbol in candidate_symbols
+            if str(symbol).strip()
+            for agent_name in (
+                SHORT_TERM_DECIDER_AGENT_NAME,
+                SIGNAL_DECIDER_AGENT_NAME,
+            )
+        }
+        fingerprint_scope_keys = candidate_scope_keys or source_scope_keys
+        source_parent_run_id_by_key = scope_state.get(
+            'source_parent_run_id_by_key'
+        )
+        if not isinstance(source_parent_run_id_by_key, dict):
+            source_parent_run_id_by_key = {}
+        relevant_parent_ids = {
+            str(source_parent_run_id_by_key.get(key) or '').strip()
+            for key in fingerprint_scope_keys
+            if str(source_parent_run_id_by_key.get(key) or '').strip()
+        }
+        runs_by_id = {
+            str(run.get('run_id') or '').strip(): run
+            for run in [
+                *(scope_state.get('run_snapshots') or []),
+                *(scope_state.get('source_parent_runs') or []),
+            ]
+            if isinstance(run, dict) and str(run.get('run_id') or '').strip()
+        }
+        effective_source_run = source_run
+        if len(relevant_parent_ids) == 1:
+            effective_source_run = runs_by_id.get(
+                next(iter(relevant_parent_ids)),
+                source_run,
+            )
+        mixed_parent_material = (
+            [
+                {
+                    'run_id': parent_run_id,
+                    'child_run_lineage': (
+                        (runs_by_id.get(parent_run_id, {}).get(
+                            'request_payload'
+                        ) or {}).get('child_run_lineage')
+                        if isinstance(
+                            runs_by_id.get(parent_run_id, {}).get(
+                                'request_payload'
+                            ),
+                            dict,
+                        )
+                        else None
+                    ),
+                }
+                for parent_run_id in sorted(relevant_parent_ids)
+            ]
+            if len(relevant_parent_ids) > 1
+            else None
+        )
+        selected_by_key = scope_state.get('selected_by_key') or {}
+        authority_by_key = scope_state.get('authoritative_run_id_by_key') or {}
+        failures_by_key = scope_state.get('failures_by_key') or {}
+        evidenced_scope_keys = set(scope_state.get('evidenced_scope_keys') or ())
+        reused_scope_keys = set(scope_state.get('reused_scope_keys') or ())
+        scope_rows: list[dict[str, Any]] = []
+        for symbol, agent_name in sorted(fingerprint_scope_keys):
+            snapshot = selected_by_key.get((symbol, agent_name))
+            failure = failures_by_key.get((symbol, agent_name))
+            authoritative_run_id = authority_by_key.get(
+                (symbol, agent_name)
+            )
+            if (
+                not isinstance(failure, dict)
+                or str(failure.get('run_id') or '').strip()
+                != str(authoritative_run_id or '').strip()
+            ):
+                failure = None
+            scope_rows.append(
+                {
+                    'symbol': symbol,
+                    'agent_name': agent_name,
+                    'authoritative_run_id': authoritative_run_id,
+                    'snapshot_id': getattr(snapshot, 'id', None),
+                    'snapshot_run_id': getattr(snapshot, 'decision_run_id', None),
+                    'evidenced': (symbol, agent_name) in evidenced_scope_keys,
+                    'reused': (symbol, agent_name) in reused_scope_keys,
+                    'failure_run_id': (
+                        failure.get('run_id') if isinstance(failure, dict) else None
+                    ),
+                    'failure_kind': (
+                        failure.get('failure_kind')
+                        if isinstance(failure, dict)
+                        else None
+                    ),
+                    'failure_received_at': (
+                        failure.get('received_at')
+                        if isinstance(failure, dict)
+                        else None
+                    ),
+                }
+            )
+        material = {
+            'source_run_id': (
+                [item['run_id'] for item in mixed_parent_material]
+                if mixed_parent_material is not None
+                else effective_source_run.get('run_id')
+                if effective_source_run
+                else None
+            ),
+            'source_lineage': (
+                mixed_parent_material
+                if mixed_parent_material is not None
+                else (effective_source_run.get('request_payload') or {}).get(
+                    'child_run_lineage'
+                )
+                if effective_source_run
+                and isinstance(
+                    effective_source_run.get('request_payload'), dict
+                )
+                else None
+            ),
+            'source_role_symbol_scopes': {
+                agent_name: [
+                    symbol
+                    for symbol in symbols
+                    if not candidate_scope_keys
+                    or (symbol, agent_name) in candidate_scope_keys
+                ]
+                for agent_name, symbols in source_role_scopes.items()
+            },
+            'candidate_symbols': sorted(
+                {str(symbol).strip().upper() for symbol in candidate_symbols if str(symbol).strip()}
+            ),
+            'scope_rows': scope_rows,
+        }
+        canonical = json.dumps(
+            _to_json_safe(material),
+            default=str,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+    def _load_latest_decider_scope_state(
+        self,
+        *,
+        source_market_date: date,
+        _session: Any | None = None,
+    ) -> dict[str, Any]:
+        owns_session = _session is None
+        session_context = session_scope() if owns_session else nullcontext(_session)
+        with session_context as session:
             snapshots = session.execute(
                 select(SignalDeciderDecisionSnapshot)
                 .where(
@@ -3390,8 +4424,200 @@ class SignalDeciderNextOpenExecutionService:
                 agent_context_feedback_run_state_service._serialize_run(row)
                 for row in run_rows
             ]
-            for snapshot in snapshots:
-                session.expunge(snapshot)
+            failure_rows = session.execute(
+                select(
+                    AgentContextFeedbackFailure.symbol,
+                    AgentContextFeedbackFailure.agent_name,
+                    AgentContextFeedbackFailure.run_id,
+                    AgentContextFeedbackFailure.failure_kind,
+                    AgentContextFeedbackFailure.retryable,
+                    AgentContextFeedbackFailure.summary_payload,
+                    AgentContextFeedbackFailure.context_payload,
+                    AgentContextFeedbackFailure.received_at,
+                    AgentContextFeedbackFailure.id,
+                )
+                .where(
+                    AgentContextFeedbackFailure.market_date == source_market_date,
+                    AgentContextFeedbackFailure.agent_name.in_(
+                        [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
+                    ),
+                )
+                .order_by(
+                    AgentContextFeedbackFailure.received_at.desc(),
+                    AgentContextFeedbackFailure.id.desc(),
+                )
+            ).all()
+            if owns_session:
+                for snapshot in snapshots:
+                    session.expunge(snapshot)
+
+        required_agents = sorted(
+            [SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME]
+        )
+
+        def request_payload(run: dict[str, Any]) -> dict[str, Any]:
+            payload = run.get('request_payload')
+            return payload if isinstance(payload, dict) else {}
+
+        def normalized_run_status(run: dict[str, Any]) -> str:
+            return str(run.get('status') or '').strip().lower()
+
+        def is_usable_run(run: dict[str, Any]) -> bool:
+            return bool(
+                normalized_run_status(run) != 'abandoned'
+                and not agent_context_feedback_run_state_service._is_stale_running_row(
+                    run
+                )
+            )
+
+        def failed_scope_keys_for_run(
+            run: dict[str, Any],
+        ) -> set[tuple[str, str]]:
+            run_scopes = self._decider_role_symbol_scopes(run)
+            all_scope_keys = {
+                (symbol, agent_name)
+                for agent_name, symbols in run_scopes.items()
+                for symbol in symbols
+            }
+            summary_payload = run.get('summary_payload')
+            containers = (
+                [summary_payload]
+                if isinstance(summary_payload, dict)
+                else []
+            )
+            progress_summary = (
+                summary_payload.get('progress_summary')
+                if isinstance(summary_payload, dict)
+                else None
+            )
+            if isinstance(progress_summary, dict):
+                containers.append(progress_summary)
+            failed_keys: set[tuple[str, str]] = set()
+            has_exact_failure_scope = False
+            for container in containers:
+                raw_by_role = container.get('failed_symbols_by_role')
+                if not isinstance(raw_by_role, dict):
+                    continue
+                has_exact_failure_scope = True
+                for raw_role, raw_symbols in raw_by_role.items():
+                    agent_name = _normalize_agent_name(raw_role)
+                    if not isinstance(raw_symbols, list):
+                        continue
+                    failed_keys.update(
+                        (str(symbol or '').strip().upper(), agent_name)
+                        for symbol in raw_symbols
+                        if str(symbol or '').strip()
+                    )
+            try:
+                failed_count = max(0, int(run.get('failed_count') or 0))
+            except (TypeError, ValueError):
+                failed_count = 0
+            if normalized_run_status(run) == 'failed':
+                return all_scope_keys
+            if failed_count > len(failed_keys) and not has_exact_failure_scope:
+                # Legacy run rows only persisted aggregate failure counts.  A
+                # direct snapshot from such a mixed/failed run cannot prove
+                # which scope survived, so fail the whole run closed.
+                return all_scope_keys
+            if failed_count > len(failed_keys):
+                return all_scope_keys
+            return failed_keys & all_scope_keys
+
+        source_parent_runs: list[dict[str, Any]] = []
+        for run in run_snapshots:
+            payload = request_payload(run)
+            if str(payload.get('mode') or '').strip() != DAILY_RETRY_CYCLE_MODE:
+                continue
+            raw_roles = payload.get('roles')
+            if not isinstance(raw_roles, list):
+                continue
+            normalized_roles = sorted(
+                {
+                    _normalize_agent_name(role)
+                    for role in raw_roles
+                    if str(role or '').strip()
+                }
+            )
+            if set(required_agents).intersection(normalized_roles):
+                source_parent_runs.append(run)
+
+        # A requested-symbol retry is a patch over the most recent broad cohort,
+        # not a replacement for every symbol omitted from that request.  Build a
+        # per-scope parent map from the latest broad parent plus each newer
+        # targeted parent, oldest patch first so the newest patch wins.
+        latest_broad_parent_index = next(
+            (
+                index
+                for index, run in enumerate(source_parent_runs)
+                if str(request_payload(run).get('scope') or '').strip()
+                != AGENT_FEEDBACK_SCOPE_REQUESTED
+                and set(required_agents).issubset(
+                    {
+                        _normalize_agent_name(role)
+                        for role in request_payload(run).get('roles') or []
+                        if str(role or '').strip()
+                    }
+                )
+            ),
+            None,
+        )
+        if latest_broad_parent_index is None:
+            active_source_parents = list(reversed(source_parent_runs))
+        else:
+            active_source_parents = [
+                source_parent_runs[latest_broad_parent_index],
+                *reversed(source_parent_runs[:latest_broad_parent_index]),
+            ]
+        source_parent_by_key: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
+        for parent in active_source_parents:
+            for agent_name, symbols in self._decider_role_symbol_scopes(
+                parent
+            ).items():
+                for symbol in symbols:
+                    source_parent_by_key[(symbol, agent_name)] = parent
+
+        source_run = (
+            source_parent_runs[0]
+            if source_parent_runs
+            else None
+        )
+
+        source_role_scopes: dict[str, list[str]] = {
+            agent_name: sorted(
+                symbol
+                for symbol, scoped_agent_name in source_parent_by_key
+                if scoped_agent_name == agent_name
+            )
+            for agent_name in required_agents
+            if any(
+                scoped_agent_name == agent_name
+                for _, scoped_agent_name in source_parent_by_key
+            )
+        }
+        source_scope_keys = {
+            (symbol, agent_name)
+            for agent_name, symbols in source_role_scopes.items()
+            for symbol in symbols
+        }
+
+        def has_strict_child_lineage(run: dict[str, Any]) -> bool:
+            run_id = str(run.get('run_id') or '').strip()
+            lineage = request_payload(run).get('child_run_lineage')
+            return bool(
+                run_id
+                and isinstance(lineage, dict)
+                and str(lineage.get('schema_version') or '').strip()
+                == AGENT_FEEDBACK_CHILD_RUN_LINEAGE_SCHEMA_VERSION
+                and str(lineage.get('parent_run_id') or '').strip() == run_id
+                and str(lineage.get('child_link_field') or '').strip()
+                == 'parent_run_id'
+            )
+
+        strict_source_lineage = bool(
+            source_run is not None and has_strict_child_lineage(source_run)
+        )
 
         snapshots_by_run_key: dict[
             tuple[str, tuple[str, str]],
@@ -3403,57 +4629,463 @@ class SignalDeciderNextOpenExecutionService:
                 continue
             key = (snapshot.symbol.upper(), _snapshot_agent_name(snapshot))
             snapshots_by_run_key.setdefault((run_id, key), snapshot)
+        snapshots_by_key: dict[
+            tuple[str, str],
+            list[SignalDeciderDecisionSnapshot],
+        ] = {}
+        for snapshot in snapshots:
+            key = (snapshot.symbol.upper(), _snapshot_agent_name(snapshot))
+            snapshots_by_key.setdefault(key, []).append(snapshot)
+
+        run_by_id = {
+            str(run.get('run_id') or '').strip(): run
+            for run in run_snapshots
+            if str(run.get('run_id') or '').strip()
+        }
+
+        def comparable_datetime(value: Any) -> datetime | None:
+            if not isinstance(value, datetime):
+                return None
+            if value.tzinfo is None or value.utcoffset() is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        def reused_scope_keys_for_run(
+            run: dict[str, Any],
+        ) -> set[tuple[str, str]]:
+            summary_payload = run.get('summary_payload')
+            if not isinstance(summary_payload, dict):
+                return set()
+            containers = [summary_payload]
+            progress_summary = summary_payload.get('progress_summary')
+            if isinstance(progress_summary, dict):
+                containers.append(progress_summary)
+            reused: set[tuple[str, str]] = set()
+            for container in containers:
+                raw_by_role = container.get('reused_symbols_by_role')
+                if not isinstance(raw_by_role, dict):
+                    continue
+                for raw_role, raw_symbols in raw_by_role.items():
+                    agent_name = _normalize_agent_name(raw_role)
+                    if (
+                        agent_name not in required_agents
+                        or not isinstance(raw_symbols, list)
+                    ):
+                        continue
+                    reused.update(
+                        (str(symbol or '').strip().upper(), agent_name)
+                        for symbol in raw_symbols
+                        if str(symbol or '').strip()
+                    )
+            return reused
+
+        def reused_feedback_evidence_for_run(
+            run: dict[str, Any],
+        ) -> dict[tuple[str, str], dict[str, Any]]:
+            summary_payload = run.get('summary_payload')
+            if not isinstance(summary_payload, dict):
+                return {}
+            containers = [summary_payload]
+            progress_summary = summary_payload.get('progress_summary')
+            if isinstance(progress_summary, dict):
+                containers.append(progress_summary)
+            evidence_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+            for container in containers:
+                raw_by_role = container.get(
+                    'reused_feedback_evidence_by_role'
+                )
+                if not isinstance(raw_by_role, dict):
+                    continue
+                for raw_role, raw_by_symbol in raw_by_role.items():
+                    agent_name = _normalize_agent_name(raw_role)
+                    if (
+                        agent_name not in required_agents
+                        or not isinstance(raw_by_symbol, dict)
+                    ):
+                        continue
+                    for raw_symbol, raw_evidence in raw_by_symbol.items():
+                        symbol = str(raw_symbol or '').strip().upper()
+                        if (
+                            not symbol
+                            or not isinstance(raw_evidence, dict)
+                            or str(
+                                raw_evidence.get('schema_version') or ''
+                            ).strip()
+                            != AGENT_FEEDBACK_REUSE_EVIDENCE_SCHEMA_VERSION
+                        ):
+                            continue
+                        feedback_run_id = str(
+                            raw_evidence.get('feedback_run_id') or ''
+                        ).strip()
+                        feedback_received_at = str(
+                            raw_evidence.get('feedback_received_at') or ''
+                        ).strip()
+                        if not feedback_run_id or not feedback_received_at:
+                            continue
+                        evidence_by_key.setdefault(
+                            (symbol, agent_name),
+                            {
+                                'schema_version': (
+                                    AGENT_FEEDBACK_REUSE_EVIDENCE_SCHEMA_VERSION
+                                ),
+                                'feedback_id': raw_evidence.get('feedback_id'),
+                                'feedback_run_id': feedback_run_id,
+                                'feedback_received_at': feedback_received_at,
+                                'decision_snapshot_id': raw_evidence.get(
+                                    'decision_snapshot_id'
+                                ),
+                                'decision_snapshot_fingerprint': (
+                                    raw_evidence.get(
+                                        'decision_snapshot_fingerprint'
+                                    )
+                                ),
+                                'decision_snapshot_observed_at': (
+                                    raw_evidence.get(
+                                        'decision_snapshot_observed_at'
+                                    )
+                                ),
+                            },
+                        )
+            return evidence_by_key
+
+        def parse_evidence_datetime(value: Any) -> datetime | None:
+            try:
+                parsed = datetime.fromisoformat(
+                    str(value or '').strip().replace('Z', '+00:00')
+                )
+            except (TypeError, ValueError):
+                return None
+            return comparable_datetime(parsed)
+
+        def latest_prior_parent_for_key(
+            *,
+            current_parent: dict[str, Any],
+            key: tuple[str, str],
+        ) -> dict[str, Any] | None:
+            current_parent_id = str(current_parent.get('run_id') or '').strip()
+            current_parent_row_id = int(current_parent.get('id') or 0)
+            current_started_at = comparable_datetime(
+                current_parent.get('started_at')
+            )
+            if not current_parent_id or current_started_at is None:
+                return None
+            for candidate in source_parent_runs:
+                candidate_id = str(candidate.get('run_id') or '').strip()
+                if not candidate_id or candidate_id == current_parent_id:
+                    continue
+                candidate_started_at = comparable_datetime(
+                    candidate.get('started_at')
+                )
+                candidate_row_id = int(candidate.get('id') or 0)
+                if candidate_started_at is None or (
+                    candidate_started_at > current_started_at
+                ) or (
+                    candidate_started_at == current_started_at
+                    and candidate_row_id >= current_parent_row_id
+                ):
+                    continue
+                candidate_scopes = self._decider_role_symbol_scopes(candidate)
+                if key[0] in candidate_scopes.get(key[1], []):
+                    return candidate
+            return None
+
+        def snapshot_observed_at(
+            snapshot: SignalDeciderDecisionSnapshot,
+        ) -> datetime | None:
+            observed_at = comparable_datetime(snapshot.feedback_received_at)
+            if observed_at is None:
+                observed_at = comparable_datetime(snapshot.created_at)
+            return observed_at
+
+        def snapshot_from_reuse_evidence(
+            *,
+            key: tuple[str, str],
+            evidence: dict[str, Any],
+            not_after: datetime,
+        ) -> SignalDeciderDecisionSnapshot | None:
+            evidence_run_id = str(
+                evidence.get('feedback_run_id') or ''
+            ).strip()
+            evidence_snapshot_observed_at = parse_evidence_datetime(
+                evidence.get('decision_snapshot_observed_at')
+            )
+            raw_snapshot_id = evidence.get('decision_snapshot_id')
+            raw_feedback_id = evidence.get('feedback_id')
+            try:
+                evidence_snapshot_id = (
+                    int(raw_snapshot_id) if raw_snapshot_id is not None else None
+                )
+                evidence_feedback_id = (
+                    int(raw_feedback_id) if raw_feedback_id is not None else None
+                )
+            except (TypeError, ValueError):
+                return None
+            evidence_snapshot_fingerprint = str(
+                evidence.get('decision_snapshot_fingerprint') or ''
+            ).strip()
+            if (
+                not evidence_run_id
+                or (
+                    evidence_snapshot_id is None
+                    and not evidence_snapshot_fingerprint
+                )
+            ):
+                return None
+            for snapshot in snapshots_by_key.get(key, []):
+                observed_at = snapshot_observed_at(snapshot)
+                if observed_at is None or observed_at > not_after:
+                    continue
+                if str(snapshot.decision_run_id or '').strip() != evidence_run_id:
+                    continue
+                if (
+                    evidence_snapshot_id is not None
+                    and snapshot.id != evidence_snapshot_id
+                ):
+                    continue
+                if (
+                    evidence_snapshot_fingerprint
+                    and str(snapshot.content_fingerprint or '').strip()
+                    != evidence_snapshot_fingerprint
+                ):
+                    continue
+                if (
+                    evidence_snapshot_observed_at is not None
+                    and observed_at != evidence_snapshot_observed_at
+                ):
+                    continue
+                if (
+                    evidence_feedback_id is not None
+                    and snapshot.feedback_id != evidence_feedback_id
+                ):
+                    continue
+                return snapshot
+            return None
+
+        def strict_parent_selected_snapshot(
+            *,
+            parent: dict[str, Any],
+            key: tuple[str, str],
+            visited_parent_ids: frozenset[str] = frozenset(),
+        ) -> SignalDeciderDecisionSnapshot | None:
+            parent_run_id = str(parent.get('run_id') or '').strip()
+            parent_started_at = comparable_datetime(parent.get('started_at'))
+            if (
+                not parent_run_id
+                or parent_run_id in visited_parent_ids
+                or parent_started_at is None
+            ):
+                return None
+            next_visited = visited_parent_ids | {parent_run_id}
+            for run in run_snapshots:
+                run_id = str(run.get('run_id') or '').strip()
+                if not run_id:
+                    continue
+                payload = request_payload(run)
+                if (
+                    run_id != parent_run_id
+                    and str(payload.get('parent_run_id') or '').strip()
+                    != parent_run_id
+                ):
+                    continue
+                scopes = self._decider_role_symbol_scopes(run)
+                if key[0] not in scopes.get(key[1], []):
+                    continue
+                if not is_usable_run(run):
+                    return None
+                if key in failed_scope_keys_for_run(run):
+                    return None
+                direct_snapshot = snapshots_by_run_key.get((run_id, key))
+                if direct_snapshot is not None:
+                    return direct_snapshot
+                if key not in reused_scope_keys_for_run(run):
+                    return None
+                evidence = reused_feedback_evidence_for_run(run).get(key)
+                if evidence is None:
+                    return None
+                reused = snapshot_from_reuse_evidence(
+                    key=key,
+                    evidence=evidence,
+                    not_after=parent_started_at,
+                )
+                if reused is None:
+                    return None
+                prior_parent = latest_prior_parent_for_key(
+                    current_parent=parent,
+                    key=key,
+                )
+                if prior_parent is None:
+                    return reused
+                if normalized_run_status(prior_parent) not in {
+                    'completed',
+                    'completed_with_failures',
+                    'partial',
+                    'failed',
+                }:
+                    return None
+                prior_selected = strict_parent_selected_snapshot(
+                    parent=prior_parent,
+                    key=key,
+                    visited_parent_ids=next_visited,
+                )
+                if prior_selected is None or prior_selected.id != reused.id:
+                    return None
+                return reused
+            return None
+
+        def reused_snapshot(
+            *,
+            key: tuple[str, str],
+            current_run_id: str,
+            not_after: datetime | None = None,
+            evidence: dict[str, Any] | None = None,
+            strict_parent: dict[str, Any] | None = None,
+        ) -> SignalDeciderDecisionSnapshot | None:
+            current_run = run_by_id.get(current_run_id)
+            current_started = not_after or comparable_datetime(
+                current_run.get('started_at') if current_run else None
+            )
+            if current_started is None:
+                return None
+            if strict_parent is not None:
+                if evidence is None:
+                    return None
+                selected = snapshot_from_reuse_evidence(
+                    key=key,
+                    evidence=evidence,
+                    not_after=current_started,
+                )
+                if selected is None:
+                    return None
+                prior_parent = latest_prior_parent_for_key(
+                    current_parent=strict_parent,
+                    key=key,
+                )
+                if prior_parent is not None:
+                    if normalized_run_status(prior_parent) not in {
+                        'completed',
+                        'completed_with_failures',
+                        'partial',
+                        'failed',
+                    }:
+                        return None
+                    prior_selected = strict_parent_selected_snapshot(
+                        parent=prior_parent,
+                        key=key,
+                    )
+                    if prior_selected is None or prior_selected.id != selected.id:
+                        return None
+                return selected
+            for snapshot in snapshots_by_key.get(key, []):
+                snapshot_run_id = str(snapshot.decision_run_id or '').strip()
+                if snapshot_run_id == current_run_id:
+                    continue
+                observed_at = snapshot_observed_at(snapshot)
+                if observed_at is None or observed_at > current_started:
+                    continue
+                return snapshot
+            return None
 
         selected_by_key: dict[
             tuple[str, str],
             SignalDeciderDecisionSnapshot | None,
         ] = {}
+        authoritative_run_id_by_key: dict[tuple[str, str], str] = {}
         explicitly_scoped_run_ids: set[str] = set()
-        relevant_agents = {SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME}
+        reused_scope_keys: set[tuple[str, str]] = set()
+
+        def apply_run_scope(
+            *,
+            run: dict[str, Any],
+            destination: dict[
+                tuple[str, str],
+                SignalDeciderDecisionSnapshot | None,
+            ],
+            authority_destination: dict[tuple[str, str], str],
+            reused_destination: set[tuple[str, str]],
+            allowed_keys: set[tuple[str, str]] | None = None,
+            only_reused: bool = False,
+            reuse_cutoff_at: datetime | None = None,
+            require_exact_reuse_evidence: bool = False,
+            strict_parent: dict[str, Any] | None = None,
+        ) -> set[tuple[str, str]]:
+            run_id = str(run.get('run_id') or '').strip()
+            if not run_id:
+                return set()
+            run_reused_scope_keys = reused_scope_keys_for_run(run)
+            run_reused_evidence = reused_feedback_evidence_for_run(run)
+            run_failed_scope_keys = failed_scope_keys_for_run(run)
+            applied_with_evidence: set[tuple[str, str]] = set()
+            for agent_name, symbols in self._decider_role_symbol_scopes(run).items():
+                for symbol in symbols:
+                    key = (symbol, agent_name)
+                    if (
+                        key in destination
+                        or (allowed_keys is not None and key not in allowed_keys)
+                        or (only_reused and key not in run_reused_scope_keys)
+                    ):
+                        continue
+                    if key in run_failed_scope_keys:
+                        destination[key] = None
+                        authority_destination[key] = run_id
+                        reused_destination.discard(key)
+                        continue
+                    snapshot = snapshots_by_run_key.get((run_id, key))
+                    reused = snapshot is None and key in run_reused_scope_keys
+                    if reused:
+                        reuse_evidence = run_reused_evidence.get(key)
+                        snapshot = reused_snapshot(
+                            key=key,
+                            current_run_id=run_id,
+                            not_after=reuse_cutoff_at,
+                            evidence=reuse_evidence,
+                            strict_parent=(
+                                strict_parent
+                                if require_exact_reuse_evidence
+                                else None
+                            ),
+                        )
+                    destination[key] = snapshot
+                    authority_destination[key] = run_id
+                    if snapshot is not None:
+                        applied_with_evidence.add(key)
+                    if reused and snapshot is not None:
+                        reused_destination.add(key)
+            return applied_with_evidence
+
         for run in run_snapshots:
             run_id = str(run.get('run_id') or '').strip()
             if not run_id:
                 continue
-            status = str(run.get('status') or '').strip().lower()
-            if status == 'abandoned' or agent_context_feedback_run_state_service._is_stale_running_row(run):
-                explicitly_scoped_run_ids.add(run_id)
-                continue
-            request_payload = run.get('request_payload') if isinstance(run.get('request_payload'), dict) else {}
-            raw_role_scopes = request_payload.get('role_symbol_scopes')
-            role_scopes: dict[str, list[str]] = {}
-            if isinstance(raw_role_scopes, dict):
-                for raw_role, raw_symbols in raw_role_scopes.items():
-                    agent_name = _normalize_agent_name(raw_role)
-                    if agent_name not in relevant_agents or not isinstance(raw_symbols, list):
-                        continue
-                    role_scopes[agent_name] = sorted(
-                        {
-                            str(symbol or '').strip().upper()
-                            for symbol in raw_symbols
-                            if str(symbol or '').strip()
-                        }
-                    )
-            if not role_scopes:
-                requested_symbols = agent_context_feedback_run_state_service.resolve_run_requested_symbols(
-                    run_snapshot=run
-                )
-                raw_roles = request_payload.get('roles')
-                if requested_symbols is not None and isinstance(raw_roles, list):
-                    for raw_role in raw_roles:
-                        agent_name = _normalize_agent_name(raw_role)
-                        if agent_name in relevant_agents:
-                            role_scopes[agent_name] = requested_symbols
+            payload = request_payload(run)
+            is_retry_parent = (
+                str(payload.get('mode') or '').strip()
+                == DAILY_RETRY_CYCLE_MODE
+            )
+            reuse_existing = bool(payload.get('reuse_existing', True))
+            force_recompute = bool(payload.get('force_recompute', False))
+            role_scopes = self._decider_role_symbol_scopes(run)
             if not role_scopes:
                 continue
             explicitly_scoped_run_ids.add(run_id)
-            for agent_name, symbols in role_scopes.items():
-                for symbol in symbols:
-                    key = (symbol, agent_name)
-                    if key in selected_by_key:
-                        continue
-                    # A requested-but-missing result is a deliberate tombstone: never
-                    # mix an older BUY into this newer run's partial/failure cohort.
-                    selected_by_key[key] = snapshots_by_run_key.get((run_id, key))
+            if is_retry_parent and reuse_existing and not force_recompute:
+                # A logical retry parent is not itself an actual model response.
+                # Only exact persisted reuse attestations may bind an old result.
+                apply_run_scope(
+                    run=run,
+                    destination=selected_by_key,
+                    authority_destination=authoritative_run_id_by_key,
+                    reused_destination=reused_scope_keys,
+                    only_reused=True,
+                )
+                continue
+            if not is_usable_run(run):
+                continue
+            apply_run_scope(
+                run=run,
+                destination=selected_by_key,
+                authority_destination=authoritative_run_id_by_key,
+                reused_destination=reused_scope_keys,
+            )
 
         for snapshot in snapshots:
             key = (snapshot.symbol.upper(), _snapshot_agent_name(snapshot))
@@ -3463,11 +5095,411 @@ class SignalDeciderNextOpenExecutionService:
             if run_id and run_id in explicitly_scoped_run_ids:
                 continue
             selected_by_key[key] = snapshot
+            if run_id:
+                authoritative_run_id_by_key[key] = run_id
 
-        return sorted(
-            (snapshot for snapshot in selected_by_key.values() if snapshot is not None),
+        source_parent_run_id_by_key = {
+            key: str(parent.get('run_id') or '').strip()
+            for key, parent in source_parent_by_key.items()
+        }
+        source_parent_by_id = {
+            str(parent.get('run_id') or '').strip(): parent
+            for parent in active_source_parents
+            if str(parent.get('run_id') or '').strip()
+        }
+        terminal_parent_statuses = {
+            'completed',
+            'completed_with_failures',
+            'partial',
+            'failed',
+        }
+        blocked_source_scope_keys = {
+            key
+            for key, parent in source_parent_by_key.items()
+            if normalized_run_status(parent) not in terminal_parent_statuses
+        }
+        evidenced_scope_keys: set[tuple[str, str]] = {
+            key
+            for key, snapshot in selected_by_key.items()
+            if key not in source_scope_keys and snapshot is not None
+        }
+
+        for parent_run_id, parent in source_parent_by_id.items():
+            parent_scope_keys = {
+                key
+                for key, scoped_parent_run_id in source_parent_run_id_by_key.items()
+                if scoped_parent_run_id == parent_run_id
+            }
+            if not parent_scope_keys:
+                continue
+            parent_started = comparable_datetime(parent.get('started_at'))
+            if has_strict_child_lineage(parent):
+                strict_selected_by_key: dict[
+                    tuple[str, str],
+                    SignalDeciderDecisionSnapshot | None,
+                ] = {}
+                strict_authority_by_key: dict[tuple[str, str], str] = {}
+                strict_reused_scope_keys: set[tuple[str, str]] = set()
+                strict_evidenced_scope_keys: set[tuple[str, str]] = set()
+                terminal_child_statuses = {
+                    'completed',
+                    'completed_with_failures',
+                    'partial',
+                    'failed',
+                }
+                for run in run_snapshots:
+                    run_id = str(run.get('run_id') or '').strip()
+                    if not run_id:
+                        continue
+                    payload = request_payload(run)
+                    is_parent_or_child = bool(
+                        run_id == parent_run_id
+                        or str(payload.get('parent_run_id') or '').strip()
+                        == parent_run_id
+                    )
+                    if not is_parent_or_child:
+                        continue
+                    nonterminal_child = (
+                        run_id != parent_run_id
+                        and normalized_run_status(run)
+                        not in terminal_child_statuses
+                    )
+                    if nonterminal_child or not is_usable_run(run):
+                        for agent_name, symbols in (
+                            self._decider_role_symbol_scopes(run).items()
+                        ):
+                            for symbol in symbols:
+                                key = (symbol, agent_name)
+                                if (
+                                    key not in parent_scope_keys
+                                    or key in strict_selected_by_key
+                                ):
+                                    continue
+                                strict_selected_by_key[key] = None
+                                strict_authority_by_key[key] = run_id
+                        continue
+                    if run_id == parent_run_id:
+                        strict_evidenced_scope_keys.update(
+                            apply_run_scope(
+                                run=run,
+                                destination=strict_selected_by_key,
+                                authority_destination=strict_authority_by_key,
+                                reused_destination=strict_reused_scope_keys,
+                                allowed_keys=parent_scope_keys,
+                                only_reused=True,
+                                reuse_cutoff_at=parent_started,
+                                require_exact_reuse_evidence=True,
+                                strict_parent=parent,
+                            )
+                        )
+                        continue
+                    strict_evidenced_scope_keys.update(
+                        apply_run_scope(
+                            run=run,
+                            destination=strict_selected_by_key,
+                            authority_destination=strict_authority_by_key,
+                            reused_destination=strict_reused_scope_keys,
+                            allowed_keys=parent_scope_keys,
+                            reuse_cutoff_at=parent_started,
+                            require_exact_reuse_evidence=True,
+                            strict_parent=parent,
+                        )
+                    )
+                for key in parent_scope_keys:
+                    selected_by_key[key] = strict_selected_by_key.get(key)
+                    authoritative_run_id_by_key[key] = (
+                        strict_authority_by_key.get(key) or parent_run_id
+                    )
+                    reused_scope_keys.discard(key)
+                    evidenced_scope_keys.discard(key)
+                reused_scope_keys.update(strict_reused_scope_keys)
+                evidenced_scope_keys.update(strict_evidenced_scope_keys)
+                continue
+
+            for key in parent_scope_keys:
+                snapshot = selected_by_key.get(key)
+                if snapshot is None:
+                    continue
+                authority_run_id = authoritative_run_id_by_key.get(key)
+                authority_run = run_by_id.get(authority_run_id or '')
+                authority_started = comparable_datetime(
+                    authority_run.get('started_at') if authority_run else None
+                )
+                if key in reused_scope_keys and authority_run_id == parent_run_id:
+                    evidenced_scope_keys.add(key)
+                elif (
+                    parent_started is not None
+                    and authority_started is not None
+                    and authority_started >= parent_started
+                ):
+                    evidenced_scope_keys.add(key)
+
+        failures_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        failures_by_run_key: dict[
+            tuple[str, tuple[str, str]], dict[str, Any]
+        ] = {}
+        for row in failure_rows:
+            key = (str(row.symbol).upper(), _normalize_agent_name(row.agent_name))
+            failure = {
+                'symbol': str(row.symbol).upper(),
+                'agent_name': _normalize_agent_name(row.agent_name),
+                'run_id': str(row.run_id or '').strip() or None,
+                'failure_kind': str(row.failure_kind or 'dispatch_failed'),
+                'retryable': bool(row.retryable),
+                'summary_payload': row.summary_payload,
+                'context_payload': row.context_payload,
+                'received_at': row.received_at,
+            }
+            failures_by_key.setdefault(key, failure)
+            if failure['run_id']:
+                failures_by_run_key.setdefault(
+                    (str(failure['run_id']), key),
+                    failure,
+                )
+
+        # A run can persist a valid response and then discover that the inputs
+        # changed before finalization.  The later/equal failure is the terminal
+        # fact for that exact run; retaining the earlier snapshot would make the
+        # next-open cohort look complete even though the retry ledger does not.
+        for key, authority_run_id in authoritative_run_id_by_key.items():
+            failure = failures_by_run_key.get((authority_run_id, key))
+            if failure is None:
+                continue
+            failures_by_key[key] = failure
+            snapshot = selected_by_key.get(key)
+            if snapshot is None:
+                continue
+            failure_received_at = comparable_datetime(failure.get('received_at'))
+            snapshot_received_at = snapshot_observed_at(snapshot)
+            snapshot_run_id = str(snapshot.decision_run_id or '').strip()
+            failure_supersedes_snapshot = (
+                snapshot_run_id != authority_run_id
+                or failure_received_at is None
+                or snapshot_received_at is None
+                or failure_received_at >= snapshot_received_at
+            )
+            if not failure_supersedes_snapshot:
+                continue
+            selected_by_key[key] = None
+            evidenced_scope_keys.discard(key)
+            reused_scope_keys.discard(key)
+        return {
+            'selected_by_key': selected_by_key,
+            'authoritative_run_id_by_key': authoritative_run_id_by_key,
+            'evidenced_scope_keys': evidenced_scope_keys,
+            'reused_scope_keys': reused_scope_keys,
+            'failures_by_key': failures_by_key,
+            'run_snapshots': run_snapshots,
+            'source_run': source_run,
+            'source_parent_runs': active_source_parents,
+            'source_parent_run_id_by_key': source_parent_run_id_by_key,
+            'source_role_symbol_scopes': source_role_scopes,
+            'blocked_source_scope_keys': blocked_source_scope_keys,
+            'strict_source_lineage': strict_source_lineage,
+        }
+
+    def _load_latest_snapshots(
+        self,
+        *,
+        source_market_date: date,
+        _session: Any | None = None,
+    ) -> list[SignalDeciderDecisionSnapshot]:
+        return self._load_latest_snapshot_generation_state(
+            source_market_date=source_market_date,
+            _session=_session,
+        )['snapshots']
+
+    def _load_latest_snapshot_generation_state(
+        self,
+        *,
+        source_market_date: date,
+        _session: Any | None = None,
+    ) -> dict[str, Any]:
+        scope_state = self._load_latest_decider_scope_state(
+            source_market_date=source_market_date,
+            _session=_session,
+        )
+        raw_snapshots = sorted(
+            (
+                snapshot
+                for snapshot in scope_state['selected_by_key'].values()
+                if snapshot is not None
+            ),
             key=lambda snapshot: (snapshot.symbol, _snapshot_agent_name(snapshot), snapshot.id),
         )
+        generation_validation = (
+            agent_feedback_orchestrator.revalidate_persisted_decider_snapshots(
+                market_date=source_market_date,
+                snapshots=raw_snapshots,
+            )
+        )
+        valid_snapshot_ids = set(
+            generation_validation.get('valid_snapshot_ids') or []
+        )
+        return {
+            'snapshots': [
+                snapshot
+                for snapshot in raw_snapshots
+                if int(snapshot.id) in valid_snapshot_ids
+            ],
+            'raw_snapshots': raw_snapshots,
+            'raw_snapshot_cohort_fingerprint': _snapshot_cohort_fingerprint(
+                raw_snapshots
+            ),
+            'generation_validation': generation_validation,
+        }
+
+    @staticmethod
+    def _scope_snapshot_generation_validation(
+        *,
+        generation_validation: dict[str, Any],
+        candidate_symbols: Sequence[str],
+    ) -> dict[str, Any]:
+        normalized_symbols = {
+            str(symbol or '').strip().upper()
+            for symbol in candidate_symbols
+            if str(symbol or '').strip()
+        }
+        validations = [
+            copy.deepcopy(item)
+            for item in generation_validation.get('validations') or []
+            if isinstance(item, dict)
+        ]
+        has_symbol_identity = any(
+            str(item.get('symbol') or '').strip() for item in validations
+        )
+        if not normalized_symbols or not has_symbol_identity:
+            return copy.deepcopy(generation_validation)
+        scoped_validations = [
+            item
+            for item in validations
+            if str(item.get('symbol') or '').strip().upper()
+            in normalized_symbols
+        ]
+        valid_snapshot_ids = sorted(
+            int(item['snapshot_id'])
+            for item in scoped_validations
+            if item.get('snapshot_id') is not None
+            and item.get('status') in {'valid', 'legacy_unenforced'}
+        )
+        invalid_snapshot_ids = sorted(
+            int(item['snapshot_id'])
+            for item in scoped_validations
+            if item.get('snapshot_id') is not None
+            and item.get('status') not in {'valid', 'legacy_unenforced'}
+        )
+        scoped_material = {
+            'schema_version': generation_validation.get('schema_version'),
+            'market_date': generation_validation.get('market_date'),
+            'candidate_symbols': sorted(normalized_symbols),
+            'valid_snapshot_ids': valid_snapshot_ids,
+            'invalid_snapshot_ids': invalid_snapshot_ids,
+            'validations': scoped_validations,
+        }
+        encoded = json.dumps(
+            _to_json_safe(scoped_material),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        return {
+            **scoped_material,
+            'generation_fingerprint': (
+                'sha256:' + hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+            ),
+        }
+
+    @staticmethod
+    def _attach_snapshot_generation_validation(
+        *,
+        agent_context_completeness: dict[str, Any],
+        generation_validation: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = copy.deepcopy(agent_context_completeness)
+        candidate_symbols = (
+            payload.get('candidate_symbols')
+            if isinstance(payload.get('candidate_symbols'), list)
+            else []
+        )
+        scoped_validation = (
+            SignalDeciderNextOpenExecutionService
+            ._scope_snapshot_generation_validation(
+                generation_validation=generation_validation,
+                candidate_symbols=candidate_symbols,
+            )
+        )
+        invalid_snapshot_ids = list(
+            scoped_validation.get('invalid_snapshot_ids') or []
+        )
+        validation_summary = {
+            'schema_version': scoped_validation.get('schema_version'),
+            'generation_fingerprint': scoped_validation.get(
+                'generation_fingerprint'
+            ),
+            'invalid_snapshot_ids': invalid_snapshot_ids,
+            'valid_snapshot_ids': list(
+                scoped_validation.get('valid_snapshot_ids') or []
+            ),
+        }
+        payload['decision_input_generation_validation'] = validation_summary
+        authority_material = {
+            'agent_context_authority_fingerprint': payload.get(
+                'authority_fingerprint'
+            ),
+            'decision_input_generation_fingerprint': validation_summary.get(
+                'generation_fingerprint'
+            ),
+        }
+        canonical = json.dumps(
+            _to_json_safe(authority_material),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        payload['authority_fingerprint'] = (
+            'agent-context-generation:'
+            + hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        )
+        if invalid_snapshot_ids:
+            payload['status'] = 'incomplete'
+            payload['has_incomplete_agent_context'] = True
+            payload['reason'] = 'decision_input_generation_invalid'
+            payload['candidate_set_definitive'] = False
+            payload['invalid_decision_input_generation_count'] = len(
+                invalid_snapshot_ids
+            )
+        candidate_contexts = payload.get('_candidate_contexts_by_symbol')
+        if isinstance(candidate_contexts, dict):
+            payload['_candidate_contexts_by_symbol'] = {
+                symbol: (
+                    SignalDeciderNextOpenExecutionService
+                    ._attach_snapshot_generation_validation(
+                        agent_context_completeness=context,
+                        generation_validation=generation_validation,
+                    )
+                    if isinstance(context, dict)
+                    else context
+                )
+                for symbol, context in candidate_contexts.items()
+            }
+        elif len(candidate_symbols) > 1:
+            payload['_candidate_contexts_by_symbol'] = {
+                str(symbol).strip().upper(): (
+                    SignalDeciderNextOpenExecutionService
+                    ._attach_snapshot_generation_validation(
+                        agent_context_completeness={
+                            **copy.deepcopy(agent_context_completeness),
+                            'candidate_symbols': [
+                                str(symbol).strip().upper()
+                            ],
+                        },
+                        generation_validation=generation_validation,
+                    )
+                )
+                for symbol in candidate_symbols
+                if str(symbol).strip()
+            }
+        return payload
 
     def _load_plan_rows(
         self,
@@ -3572,27 +5604,47 @@ class SignalDeciderNextOpenExecutionService:
                     f'Missing upstream roles: {", ".join(missing_upstream_roles)}.',
                 )
             )
+        agent_context_completeness_provided = isinstance(
+            agent_context_completeness, dict
+        )
         agent_context_completeness_payload = (
             agent_context_completeness
-            if isinstance(agent_context_completeness, dict)
+            if agent_context_completeness_provided
             else {}
         )
-        if agent_context_completeness_payload.get('has_incomplete_agent_context') is True:
+        agent_context_status = str(
+            agent_context_completeness_payload.get('status') or ''
+        ).strip().lower()
+        if agent_context_completeness_provided and agent_context_status != 'complete':
             failure_count = int(agent_context_completeness_payload.get('failure_count') or 0)
             latest_run = (
                 agent_context_completeness_payload.get('latest_run')
                 if isinstance(agent_context_completeness_payload.get('latest_run'), dict)
                 else {}
             )
+            blocking_reasons.append(
+                _reason(
+                    (
+                        'agent_context_incomplete_candidate_set'
+                        if agent_context_status == 'incomplete'
+                        else 'agent_context_candidate_set_unverified'
+                    ),
+                    (
+                        'Candidate decision is not backed by complete agent context'
+                        f" from run {latest_run.get('run_id') or 'unknown'}"
+                        f" ({latest_run.get('status') or agent_context_status});"
+                        f' authoritative failure count: {failure_count}.'
+                    ),
+                )
+            )
+        elif (
+            agent_context_status == 'complete'
+            and agent_context_completeness_payload.get('candidate_set_definitive') is False
+        ):
             warnings.append(
                 _reason(
-                    'agent_context_incomplete_candidate_set',
-                    (
-                        'Candidate set is based on incomplete agent context'
-                        f" from run {latest_run.get('run_id') or 'unknown'}"
-                        f" ({latest_run.get('status') or agent_context_completeness_payload.get('status')});"
-                        f' grouped failure count: {failure_count}.'
-                    ),
+                    'agent_context_source_cohort_incomplete',
+                    'This candidate is complete, but failures elsewhere make the source candidate count non-definitive.',
                 )
             )
 
@@ -3708,6 +5760,42 @@ class SignalDeciderNextOpenExecutionService:
                     _reason(
                         'policy_not_active',
                         f'Policy {snapshot.policy_version} is {policy_context.get("status") or "unknown"}, not active.',
+                    )
+                )
+            snapshot_request_payload = (
+                snapshot.request_payload
+                if isinstance(snapshot.request_payload, dict)
+                else {}
+            )
+            snapshot_policy_context = snapshot_request_payload.get(
+                'signal_decider_policy'
+            )
+            snapshot_rule_bundle = (
+                snapshot_policy_context.get('rule_bundle')
+                if isinstance(snapshot_policy_context, dict)
+                else None
+            )
+            policy_authority = policy_context.get('policy_authority')
+            current_rule_bundle_fingerprint = (
+                policy_authority.get('rule_bundle_fingerprint')
+                if isinstance(policy_authority, dict)
+                else None
+            )
+            snapshot_rule_bundle_fingerprint = (
+                _canonical_payload_fingerprint(snapshot_rule_bundle)
+                if isinstance(snapshot_rule_bundle, dict)
+                else None
+            )
+            if (
+                current_rule_bundle_fingerprint is None
+                or snapshot_rule_bundle_fingerprint
+                != current_rule_bundle_fingerprint
+            ):
+                blocking_reasons.append(
+                    _reason(
+                        'policy_scope_changed',
+                        'The decision snapshot is not bound to the current '
+                        'authoritative policy rule bundle.',
                     )
                 )
             if snapshot.entry_price_basis != 'next_open':
@@ -4072,6 +6160,9 @@ class SignalDeciderNextOpenExecutionService:
                 'policy_version': snapshot.policy_version,
                 'status': (policy_context or {}).get('status'),
                 'activation_mode': (policy_context or {}).get('activation_mode'),
+                'authority': copy.deepcopy(
+                    (policy_context or {}).get('policy_authority')
+                ),
             },
             'gate_checks': {
                 'missing_upstream_roles': missing_upstream_roles,
@@ -4550,9 +6641,10 @@ class SignalDeciderNextOpenExecutionService:
         snapshot: SignalDeciderDecisionSnapshot,
         target: NextOpenAccountTarget,
         current_live_market_authority: dict[str, Any],
+        current_agent_context: dict[str, Any],
         now: datetime,
     ) -> bool:
-        """Retire an ACKed transient BUY authority only after exact live revalidation."""
+        """Retire an ACKed transient BUY authority only after exact revalidation."""
         submission = (
             copy.deepcopy(row.submission_payload)
             if isinstance(row.submission_payload, dict)
@@ -4651,18 +6743,46 @@ class SignalDeciderNextOpenExecutionService:
             if isinstance(link, dict)
             and str(link.get('side') or '').strip().lower() == 'buy'
         }
+        reason_code = str(revocation.get('reason_code') or '').strip()
+        market_evidence_recovered = bool(
+            reason_code == 'current_live_market_evidence_unavailable'
+            and current_live_market_authority.get('schema_version')
+            == CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION
+            and current_live_market_authority.get('applies') is True
+            and current_live_market_authority.get('authoritative') is True
+            and current_live_market_authority.get('status') == 'available'
+            and current_live_market_authority.get('action') == 'allow'
+            and current_live_market_authority.get('market_date')
+            == row.target_trade_date.isoformat()
+        )
+        agent_context_recovered = bool(
+            reason_code == 'agent_context_authority_changed'
+            and str(current_agent_context.get('status') or '').strip().lower()
+            == 'complete'
+            and str(
+                current_agent_context.get('authority_fingerprint') or ''
+            ).strip()
+            and _is_actionable_snapshot(snapshot)
+            and (
+                current_live_market_authority.get('applies') is not True
+                or (
+                    current_live_market_authority.get('authoritative') is True
+                    and current_live_market_authority.get('status') == 'available'
+                    and current_live_market_authority.get('action') == 'allow'
+                )
+            )
+        )
 
         if (
             revocation.get('schema_version') != 'core_execution_revocation_state_v1'
             or revocation.get('status') != 'acknowledged'
             or revocation.get('ack_status') != 'revoked'
-            or revocation.get('reason_code')
-            != 'current_live_market_evidence_unavailable'
+            or not (market_evidence_recovered or agent_context_recovered)
             or revocation.get('replacement_action') != 'reject'
             or revocation.get('replacement_actionable') is not False
             or not replacement_revision_id
             or not replacement_revision_id.startswith(
-                'observation:current_live_market_evidence_unavailable:'
+                f'observation:{reason_code}:'
             )
             or str(revocation.get('prior_decision_snapshot_id') or '')
             != str(row.decision_snapshot_id)
@@ -4700,14 +6820,6 @@ class SignalDeciderNextOpenExecutionService:
             )
             or str(response_contract_ack.get('status') or '').strip().lower()
             != 'revoked'
-            or current_live_market_authority.get('schema_version')
-            != CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION
-            or current_live_market_authority.get('applies') is not True
-            or current_live_market_authority.get('authoritative') is not True
-            or current_live_market_authority.get('status') != 'available'
-            or current_live_market_authority.get('action') != 'allow'
-            or current_live_market_authority.get('market_date')
-            != row.target_trade_date.isoformat()
         ):
             return False
 
@@ -4716,10 +6828,14 @@ class SignalDeciderNextOpenExecutionService:
                 'row_id': row.id,
                 'plan_id': revocation.get('plan_id'),
                 'replacement_revision_id': replacement_revision_id,
+                'reason_code': reason_code,
                 'revoked_row_authority_fingerprint': (
                     revoked_row_authority_fingerprint
                 ),
                 'live_market_authority': current_live_market_authority,
+                'agent_context_authority_fingerprint': (
+                    current_agent_context.get('authority_fingerprint')
+                ),
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -4733,7 +6849,7 @@ class SignalDeciderNextOpenExecutionService:
             archived_dispatch_evidence.update(
                 {
                     'retired_at': now.isoformat(),
-                    'retirement_reason': 'transient_market_evidence_recovered',
+                    'retirement_reason': 'transient_buy_authority_recovered',
                     'recovery_generation': recovery_generation,
                 }
             )
@@ -4785,6 +6901,7 @@ class SignalDeciderNextOpenExecutionService:
         *,
         target_trade_date: date,
         account_reference: str | None,
+        row_ids: Sequence[int] | None = None,
         reason_code: str,
         reason_message: str,
         observation_scope: str,
@@ -4806,6 +6923,16 @@ class SignalDeciderNextOpenExecutionService:
             if account_reference:
                 stmt = stmt.where(
                     SignalDeciderExecutionPlanItem.account_reference == account_reference
+                )
+            if row_ids is not None:
+                normalized_row_ids = sorted({int(row_id) for row_id in row_ids})
+                if not normalized_row_ids:
+                    return {
+                        'staged_count': 0,
+                        'pending_count': 0,
+                    }
+                stmt = stmt.where(
+                    SignalDeciderExecutionPlanItem.id.in_(normalized_row_ids)
                 )
             rows = session.execute(stmt).scalars().all()
             for row in rows:
@@ -4927,12 +7054,14 @@ class SignalDeciderNextOpenExecutionService:
         *,
         target_trade_date: date,
         account_reference: str | None = None,
+        row_ids: Sequence[int] | None = None,
         failure_source: str,
     ) -> dict[str, int]:
         """Freeze delegated BUY authority when the critical live-decision chain fails."""
         return self._stage_delegated_buy_revocations(
             target_trade_date=target_trade_date,
             account_reference=account_reference,
+            row_ids=row_ids,
             reason_code='current_live_market_evidence_unavailable',
             reason_message=(
                 'The critical market evidence or decision-plan refresh failed; '
@@ -5056,18 +7185,35 @@ class SignalDeciderNextOpenExecutionService:
         reason: str | None = None,
     ) -> dict[str, Any]:
         source_market_date = source_market_date or _previous_trading_day(target_trade_date)
-        agent_context_payload = (
+        agent_context_payload = _public_agent_context(
             agent_context_completeness
-            if isinstance(agent_context_completeness, dict)
-            else {}
         )
+        symbols: set[str] = set()
+        eligible_symbols: set[str] = set()
+        monitor_candidate_symbols: set[str] = set()
+        blocked_symbols: set[str] = set()
+        for row in rows:
+            symbol = str(row.symbol).strip().upper()
+            if not symbol:
+                continue
+            symbols.add(symbol)
+            if row.eligibility_status == ELIGIBILITY_ELIGIBLE:
+                eligible_symbols.add(symbol)
+            elif row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
+                monitor_candidate_symbols.add(symbol)
+            elif row.eligibility_status == ELIGIBILITY_BLOCKED:
+                blocked_symbols.add(symbol)
         counts = {
             'items_total': len(rows),
+            'symbol_count': len(symbols),
             'eligible_count': sum(1 for row in rows if row.eligibility_status == ELIGIBILITY_ELIGIBLE),
+            'eligible_symbol_count': len(eligible_symbols),
             'blocked_count': sum(1 for row in rows if row.eligibility_status == ELIGIBILITY_BLOCKED),
+            'blocked_symbol_count': len(blocked_symbols),
             'monitor_candidate_count': sum(
                 1 for row in rows if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE
             ),
+            'monitor_candidate_symbol_count': len(monitor_candidate_symbols),
             'planned_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_PLANNED),
             'awaiting_trigger_count': sum(
                 1 for row in rows if row.execution_status == EXECUTION_STATUS_AWAITING_TRIGGER

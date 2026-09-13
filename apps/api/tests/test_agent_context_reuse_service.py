@@ -9,6 +9,7 @@ from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARY_REUSE_REASON,
     AgentContextReuseService,
     _extract_fingerprint_payload,
+    _failure_supersedes_feedback,
 )
 from app.agent_context.retry_service import AgentFeedbackRetryService
 
@@ -59,12 +60,120 @@ class _ReuseSession:
         return _ReuseExecuteResult()
 
 
+class _TimestampResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+
+class _TimestampSession:
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def execute(self, _statement):
+        self.calls += 1
+        return _TimestampResult(self.value)
+
+
 @contextmanager
 def _reuse_session_scope():
     yield _ReuseSession()
 
 
 class FundamentalReuseServiceTests(unittest.TestCase):
+    def test_newer_run_success_supersedes_late_failure_from_older_run(self):
+        earlier = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
+        later = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+        feedback = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='newer-success-run',
+            received_at=later,
+        )
+        failure = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='older-failure-run',
+            received_at=later.replace(minute=30),
+        )
+
+        self.assertFalse(
+            _failure_supersedes_feedback(
+                feedback=feedback,
+                failure=failure,
+                run_order_by_id={
+                    'older-failure-run': (earlier, 10),
+                    'newer-success-run': (later, 20),
+                },
+            )
+        )
+
+    def test_newer_run_failure_supersedes_earlier_success(self):
+        earlier = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
+        later = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+        feedback = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='older-success-run',
+            received_at=later.replace(minute=30),
+        )
+        failure = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='newer-failure-run',
+            received_at=later,
+        )
+
+        self.assertTrue(
+            _failure_supersedes_feedback(
+                feedback=feedback,
+                failure=failure,
+                run_order_by_id={
+                    'older-success-run': (earlier, 10),
+                    'newer-failure-run': (later, 20),
+                },
+            )
+        )
+
+    def test_missing_run_lineage_keeps_equal_time_failure_fail_closed(self):
+        observed_at = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
+        feedback = SimpleNamespace(
+            market_date=observed_at.date(),
+            run_id='unknown-success-run',
+            received_at=observed_at,
+        )
+        failure = SimpleNamespace(
+            market_date=observed_at.date(),
+            run_id='unknown-failure-run',
+            received_at=observed_at,
+        )
+
+        self.assertTrue(
+            _failure_supersedes_feedback(
+                feedback=feedback,
+                failure=failure,
+                run_order_by_id={},
+            )
+        )
+
+    def test_both_deciders_track_newer_upstream_feedback(self):
+        service = AgentContextReuseService()
+        updated_at = datetime(2026, 4, 16, 5, 30, tzinfo=timezone.utc)
+
+        for role in ('short-term-decider', 'signal-decider'):
+            session = _TimestampSession(updated_at)
+            result = service._get_latest_source_updated_at(
+                session=session,
+                role=role,
+                market_date=__import__('datetime').date.fromisoformat(
+                    '2026-04-16'
+                ),
+                symbol='005930',
+                symbol_id=101,
+            )
+
+            self.assertEqual(result, updated_at)
+            self.assertEqual(session.calls, 1)
+
     def test_fundamental_reuse_decision_accepts_matching_fingerprint_across_dates(self):
         should_dispatch, reason = AgentContextReuseService._decide_fundamental_reuse(
             force_recompute=False,
@@ -198,7 +307,7 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         )
         self.assertIn('technical-summarizer', missing_roles)
 
-    def test_decider_upstream_bundle_uses_same_day_feedback_pending_refresh(self):
+    def test_decider_upstream_bundle_blocks_same_day_feedback_pending_refresh(self):
         decision = _decision(
             should_dispatch=True,
             reason='fundamental_input_fingerprint_changed',
@@ -217,10 +326,9 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             upstream_summary_roles=('fundamental-summarizer',),
         )
 
-        self.assertEqual(missing_roles, [])
-        self.assertEqual(upstream_summaries['fundamental-summarizer']['summary'], 'reusable fundamentals')
-        self.assertTrue(upstream_traceability['fundamental-summarizer']['refresh_pending'])
-        self.assertEqual(upstream_traceability['fundamental-summarizer']['source'], 'persisted_feedback')
+        self.assertEqual(missing_roles, ['fundamental-summarizer'])
+        self.assertNotIn('fundamental-summarizer', upstream_summaries)
+        self.assertNotIn('fundamental-summarizer', upstream_traceability)
 
 
 if __name__ == '__main__':

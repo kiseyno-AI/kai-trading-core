@@ -15,6 +15,7 @@ from unittest.mock import patch
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import (
+    build_durable_decider_input_generation,
     build_response_storage_payload,
     build_signal_decider_payload,
     coerce_decoded_batch_response,
@@ -144,6 +145,516 @@ def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[st
         ],
         'stages': {},
     }
+
+
+class DurableDeciderInputGenerationTests(unittest.TestCase):
+    @staticmethod
+    def _source_context() -> dict:
+        return {
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+            'company': {
+                'name': 'Samsung Electronics',
+                'market': 'KOSPI',
+                'is_active': True,
+                'source': 'pykrx',
+                'last_refreshed_at': '2026-04-23T07:00:00Z',
+            },
+            'market_session': {'current_calendar_date': '2026-04-23'},
+            'market_data_phase_contract': {'current_market_state': 'closed'},
+            'quote_context': {'price': 85700, 'captured_at': '2026-04-23T06:20:00Z'},
+            'intraday_execution_context': {
+                'quote': {'price': 85700},
+                'orderbook': {'best_bid_price': 85600, 'best_ask_price': 85700},
+            },
+            'liquidity_context': {
+                'status': 'available',
+                'turnover': {'turnover_krw': 8800000000, 'trade_date': '2026-04-23'},
+                'ranking': {'liquidity_percentile': 0.91},
+                'intraday': {'quote_spread_points': 100, 'quote_balance_rank': 5},
+            },
+            'pre_decider_enrichment_context': {
+                'quote_orderbook_snapshot': {'current_price': 85700},
+            },
+            'market_regime_context': {
+                'open_drive': {'index_change_percent': 0.7},
+            },
+            'decider_data_quality_context': {'status': 'available'},
+            'decision_input_quality_context': {'status': 'available'},
+            'context_completeness': {'quote_context': {'status': 'available'}},
+            'availability': {
+                'quote_context': True,
+                'intraday_execution_context': True,
+                'technical_snapshot': True,
+            },
+            'context_provenance': {
+                'quote_context': {'as_of_timestamp': '2026-04-23T06:20:00Z'},
+                'intraday_execution_context': {'as_of_timestamp': '2026-04-23T06:20:00Z'},
+                'technical_snapshot': {'as_of_market_date': '2026-04-23'},
+                'recent_external_news': {
+                    'provider_status': {
+                        'enabled': True,
+                        'collection_enabled': True,
+                        'status': 'ready',
+                        'reason': None,
+                    },
+                },
+            },
+            'price_context': {'close_price': 85700, 'trade_date': '2026-04-23'},
+            'technical_snapshot': {'trend_state': 'uptrend'},
+            'action_summary': {'action_label': 'watch_long'},
+            'macro_context': {
+                'status': 'available',
+                'generated_at': '2026-04-23T07:00:00Z',
+                'series': [
+                    {
+                        'series_id': 'DEXKOUS',
+                        'latest_value': 1380.5,
+                        'freshness': {
+                            'status': 'fresh',
+                            'age_hours': 1.0,
+                            'fetched_at': '2026-04-23T06:00:00Z',
+                        },
+                    }
+                ],
+            },
+            'market_breadth_context': {
+                'status': 'available',
+                'source': 'pykrx_derived',
+                'up_count': 470,
+                'down_count': 260,
+            },
+            'agent_feedback_eligibility': {
+                'eligible': True,
+                'candidate_rank': 2,
+            },
+            'recent_external_news': {
+                'status': 'available',
+                'reason': None,
+                'provider': {
+                    'provider': 'naver_news',
+                    'context_enabled': True,
+                    'storage_read_enabled': True,
+                    'enabled': True,
+                    'collection_enabled': True,
+                    'status': 'ready',
+                    'reason': None,
+                },
+                'knowledge_cutoff_source': 'request_time',
+                'item_count': 1,
+                'items': [
+                    {
+                        'item_id': 77,
+                        'title': 'Existing material filing coverage',
+                        'materiality': 'material',
+                    }
+                ],
+                'freshness_provenance': {
+                    'provider_status': {
+                        'enabled': True,
+                        'collection_enabled': True,
+                        'status': 'ready',
+                        'reason': None,
+                    },
+                },
+            },
+        }
+
+    def test_live_session_changes_do_not_revoke_durable_eod_generation(self):
+        friday = self._source_context()
+        monday = deepcopy(friday)
+        monday['market_session'] = {'current_calendar_date': '2026-04-27'}
+        monday['market_data_phase_contract'] = {'current_market_state': 'open'}
+        monday['quote_context'] = {
+            'price': 90100,
+            'captured_at': '2026-04-27T00:01:00Z',
+        }
+        monday['intraday_execution_context'] = {
+            'quote': {'price': 90100},
+            'orderbook': {'best_bid_price': 90000, 'best_ask_price': 90100},
+        }
+        monday['liquidity_context']['intraday'] = {
+            'quote_spread_points': 100,
+            'quote_balance_rank': 1,
+        }
+        monday['pre_decider_enrichment_context'] = {
+            'quote_orderbook_snapshot': {'current_price': 90100},
+        }
+        monday['market_regime_context'] = {
+            'open_drive': {'index_change_percent': -1.3},
+        }
+        monday['decider_data_quality_context'] = {'status': 'partial'}
+        monday['decision_input_quality_context'] = {'status': 'partial'}
+        monday['context_completeness']['quote_context'] = {'status': 'fresh'}
+        monday['availability']['quote_context'] = False
+        monday['availability']['intraday_execution_context'] = False
+        monday['context_provenance']['quote_context'] = {
+            'as_of_timestamp': '2026-04-27T00:01:00Z',
+        }
+        monday['context_provenance']['intraday_execution_context'] = {
+            'as_of_timestamp': '2026-04-27T00:01:00Z',
+        }
+        monday['company']['last_refreshed_at'] = '2026-04-27T00:00:00Z'
+        monday['company']['source'] = 'kis_master'
+        monday['macro_context']['generated_at'] = '2026-04-27T00:01:00Z'
+        monday['macro_context']['series'][0]['freshness']['age_hours'] = 97.0
+        monday['recent_external_news']['knowledge_cutoff_source'] = 'explicit'
+        for provider_status in (
+            monday['recent_external_news']['provider'],
+            monday['recent_external_news']['freshness_provenance'][
+                'provider_status'
+            ],
+            monday['context_provenance']['recent_external_news'][
+                'provider_status'
+            ],
+        ):
+            provider_status.update(
+                {
+                    'enabled': False,
+                    'collection_enabled': False,
+                    'status': 'disabled',
+                    'reason': 'credentials_missing',
+                }
+            )
+
+        self.assertEqual(
+            build_durable_decider_input_generation(source_context=friday),
+            build_durable_decider_input_generation(source_context=monday),
+        )
+
+    def test_eod_or_eligibility_changes_revoke_durable_generation(self):
+        original = self._source_context()
+        changed_eod = deepcopy(original)
+        changed_eod['technical_snapshot']['trend_state'] = 'downtrend'
+        changed_eligibility = deepcopy(original)
+        changed_eligibility['agent_feedback_eligibility']['candidate_rank'] = 9
+        changed_company = deepcopy(original)
+        changed_company['company']['market'] = 'KOSDAQ'
+        changed_news = deepcopy(original)
+        changed_news['recent_external_news']['items'].append(
+            {
+                'item_id': 78,
+                'title': 'New material event',
+                'materiality': 'material',
+            }
+        )
+        changed_news['recent_external_news']['item_count'] = 2
+
+        expected = build_durable_decider_input_generation(
+            source_context=original
+        )
+        self.assertNotEqual(
+            expected,
+            build_durable_decider_input_generation(source_context=changed_eod),
+        )
+        self.assertNotEqual(
+            expected,
+            build_durable_decider_input_generation(
+                source_context=changed_eligibility
+            ),
+        )
+        self.assertNotEqual(
+            expected,
+            build_durable_decider_input_generation(source_context=changed_company),
+        )
+        self.assertNotEqual(
+            expected,
+            build_durable_decider_input_generation(source_context=changed_news),
+        )
+
+    def test_live_open_drive_breadth_cannot_claim_durable_reuse(self):
+        source = self._source_context()
+        source['market_breadth_context'] = {
+            'status': 'available',
+            'source': 'kis_market_snapshot_v1',
+            'up_count': 510,
+            'down_count': 220,
+            'freshness_provenance': {
+                'source_provider': 'kis_market_snapshot_v1',
+                'source_tables': ['current_market_snapshot_cache'],
+            },
+        }
+
+        generation = build_durable_decider_input_generation(
+            source_context=source
+        )
+
+        self.assertFalse(generation['durable_reuse_eligible'])
+        self.assertEqual(
+            generation['non_durable_reasons'],
+            ['live_market_breadth_context'],
+        )
+
+    def test_scalar_live_breadth_source_table_cannot_claim_durable_reuse(self):
+        source = self._source_context()
+        source['market_breadth_context'] = {
+            'status': 'available',
+            'source': 'persisted_snapshot',
+            'freshness_provenance': {
+                'source_tables': 'current_market_snapshot_cache',
+            },
+        }
+
+        generation = build_durable_decider_input_generation(
+            source_context=source
+        )
+
+        self.assertFalse(generation['durable_reuse_eligible'])
+        self.assertEqual(
+            generation['non_durable_reasons'],
+            ['live_market_breadth_context'],
+        )
+
+    def test_durable_generation_binds_the_original_news_cutoff(self):
+        source = self._source_context()
+
+        friday_close = build_durable_decider_input_generation(
+            source_context=source,
+            source_knowledge_cutoff_at='2026-04-23T06:30:00+00:00',
+        )
+        later_cutoff = build_durable_decider_input_generation(
+            source_context=source,
+            source_knowledge_cutoff_at='2026-04-26T23:00:00+00:00',
+        )
+
+        self.assertNotEqual(friday_close, later_cutoff)
+
+    def test_actionable_legacy_snapshot_is_not_execution_valid(self):
+        snapshot = SimpleNamespace(
+            id=101,
+            request_payload={},
+            response_payload={'preferred_action': 'buy'},
+            decision_run_id='legacy-run',
+            agent_name='signal-decider',
+            symbol='005930',
+            decision_action='buy',
+            next_day_open_action='buy',
+        )
+
+        result = AgentFeedbackOrchestrator().revalidate_persisted_decider_snapshots(
+            market_date='2026-04-23',
+            snapshots=[snapshot],
+        )
+
+        self.assertEqual(result['valid_snapshot_ids'], [])
+        self.assertEqual(result['invalid_snapshot_ids'], [101])
+        self.assertEqual(
+            result['validations'][0]['reason'],
+            'actionable_snapshot_missing_durable_generation_fence',
+        )
+
+    def test_json_string_snapshot_payloads_are_normalized_before_fence_validation(self):
+        legacy_snapshot = SimpleNamespace(
+            id=103,
+            request_payload=json.dumps({}),
+            response_payload=json.dumps(
+                {'tactical_action': 'watch_for_trigger'}
+            ),
+            decision_run_id='legacy-short-term-run',
+            agent_name='short-term-decider',
+            symbol='005930',
+            decision_action='wait',
+            preferred_action='wait',
+            next_day_open_action='wait',
+        )
+        service = AgentFeedbackOrchestrator()
+
+        legacy_result = service.revalidate_persisted_decider_snapshots(
+            market_date='2026-04-23',
+            snapshots=[legacy_snapshot],
+        )
+
+        self.assertEqual(legacy_result['valid_snapshot_ids'], [])
+        self.assertEqual(legacy_result['invalid_snapshot_ids'], [103])
+        self.assertEqual(
+            legacy_result['validations'][0]['reason'],
+            'actionable_snapshot_missing_durable_generation_fence',
+        )
+
+        fenced_snapshot = SimpleNamespace(
+            id=104,
+            request_payload=json.dumps(
+                {
+                    'durable_decision_input_generation': {
+                        'schema_version': 'durable_decider_input_generation_v1',
+                        'durable_reuse_eligible': True,
+                        'non_durable_reasons': [],
+                    },
+                    'decision_input_generation_fence': {
+                        'enforcement': 'required'
+                    },
+                    'source_revalidation_request': {
+                        'source_context_scope_symbols': ['005930'],
+                        'eligibility_scope_symbols': ['005930'],
+                        'fs_div': 'CFS',
+                        'disclosures_limit': 5,
+                        'knowledge_cutoff_at': '2026-04-23T06:30:00+00:00',
+                    },
+                }
+            ),
+            response_payload=json.dumps({'preferred_action': 'wait'}),
+            decision_run_id='fenced-string-run',
+            agent_name='signal-decider',
+            symbol='005930',
+            decision_action='wait',
+            preferred_action='wait',
+            next_day_open_action='wait',
+        )
+
+        with patch.object(
+            service,
+            '_revalidate_decider_dispatch_inputs',
+            return_value={},
+        ) as revalidate:
+            fenced_result = service.revalidate_persisted_decider_snapshots(
+                market_date='2026-04-23',
+                snapshots=[fenced_snapshot],
+            )
+
+        revalidate.assert_called_once()
+        self.assertEqual(fenced_result['valid_snapshot_ids'], [104])
+        self.assertEqual(
+            fenced_result['validations'][0]['reason'],
+            'durable_decider_inputs_unchanged',
+        )
+
+    def test_invalid_json_string_snapshot_payloads_fail_closed(self):
+        cases = (
+            (
+                105,
+                json.dumps({}),
+                '{"tactical_action":',
+                {'response_payload': 'json_decode_error'},
+            ),
+            (
+                106,
+                json.dumps({}),
+                json.dumps(['watch_for_trigger']),
+                {'response_payload': 'json_shape_not_object'},
+            ),
+            (
+                107,
+                '{"decision_input_generation_fence":',
+                json.dumps({'tactical_action': 'watch_for_trigger'}),
+                {'request_payload': 'json_decode_error'},
+            ),
+        )
+        service = AgentFeedbackOrchestrator()
+
+        for snapshot_id, request_payload, response_payload, payload_errors in cases:
+            with self.subTest(snapshot_id=snapshot_id):
+                snapshot = SimpleNamespace(
+                    id=snapshot_id,
+                    request_payload=request_payload,
+                    response_payload=response_payload,
+                    decision_run_id=f'invalid-payload-{snapshot_id}',
+                    agent_name='short-term-decider',
+                    symbol='005930',
+                    decision_action='wait',
+                    preferred_action='wait',
+                    next_day_open_action='wait',
+                )
+
+                result = service.revalidate_persisted_decider_snapshots(
+                    market_date='2026-04-23',
+                    snapshots=[snapshot],
+                )
+
+                self.assertEqual(result['valid_snapshot_ids'], [])
+                self.assertEqual(result['invalid_snapshot_ids'], [snapshot_id])
+                self.assertEqual(
+                    result['validations'][0]['reason'],
+                    'persisted_snapshot_payload_invalid',
+                )
+                self.assertEqual(
+                    result['validations'][0]['payload_errors'],
+                    payload_errors,
+                )
+
+    def test_oversized_json_string_snapshot_payload_fails_closed(self):
+        snapshot = SimpleNamespace(
+            id=108,
+            request_payload=json.dumps({}),
+            response_payload=json.dumps(
+                {
+                    'tactical_action': 'watch_for_trigger',
+                    'padding': 'x' * (1024 * 1024),
+                }
+            ),
+            decision_run_id='oversized-payload',
+            agent_name='short-term-decider',
+            symbol='005930',
+            decision_action='wait',
+            preferred_action='wait',
+            next_day_open_action='wait',
+        )
+
+        result = AgentFeedbackOrchestrator().revalidate_persisted_decider_snapshots(
+            market_date='2026-04-23',
+            snapshots=[snapshot],
+        )
+
+        self.assertEqual(result['valid_snapshot_ids'], [])
+        self.assertEqual(result['invalid_snapshot_ids'], [108])
+        self.assertEqual(
+            result['validations'][0]['reason'],
+            'persisted_snapshot_payload_invalid',
+        )
+        self.assertEqual(
+            result['validations'][0]['payload_errors'],
+            {'response_payload': 'json_payload_too_large'},
+        )
+
+    def test_persisted_snapshot_revalidation_uses_durable_generation(self):
+        snapshot = SimpleNamespace(
+            id=102,
+            request_payload={
+                'decision_input_generation': {'schema_version': 'decider_input_generation_v1'},
+                'durable_decision_input_generation': {
+                    'schema_version': 'durable_decider_input_generation_v1',
+                    'durable_reuse_eligible': True,
+                    'non_durable_reasons': [],
+                },
+                'decision_input_generation_fence': {'enforcement': 'required'},
+                'source_revalidation_request': {
+                    'source_context_scope_symbols': ['005930'],
+                    'eligibility_scope_symbols': ['005930'],
+                    'fs_div': 'CFS',
+                    'disclosures_limit': 5,
+                    'knowledge_cutoff_at': '2026-04-23T06:30:00+00:00',
+                },
+            },
+            response_payload={'preferred_action': 'buy'},
+            decision_run_id='fenced-run',
+            agent_name='signal-decider',
+            symbol='005930',
+            decision_action='buy',
+            next_day_open_action='buy',
+        )
+        service = AgentFeedbackOrchestrator()
+
+        with patch.object(
+            service,
+            '_revalidate_decider_dispatch_inputs',
+            return_value={},
+        ) as revalidate:
+            result = service.revalidate_persisted_decider_snapshots(
+                market_date='2026-04-23',
+                snapshots=[snapshot],
+            )
+
+        self.assertEqual(result['valid_snapshot_ids'], [102])
+        self.assertTrue(revalidate.call_args.kwargs['durable_source_generation'])
+        self.assertFalse(revalidate.call_args.kwargs['revalidate_market_context'])
+        self.assertTrue(
+            revalidate.call_args.kwargs[
+                'revalidate_post_decision_material_context'
+            ]
+        )
+        self.assertEqual(
+            revalidate.call_args.kwargs['source_knowledge_cutoff_at'],
+            '2026-04-23T06:30:00+00:00',
+        )
 
 
 class ResponseIntegrityGuardTests(unittest.TestCase):
@@ -1739,6 +2250,28 @@ class DeciderReadyAgentContextReadService:
         }
 
 
+class MutatingDeciderInputReadService:
+    def __init__(self, *, stable_calls: int = 1):
+        self.calls = 0
+        self.stable_calls = stable_calls
+        self.delegate = DeciderReadyAgentContextReadService()
+
+    def get_symbol_day_context(self, **kwargs):
+        self.calls += 1
+        payload = self.delegate.get_symbol_day_context(**kwargs)
+        generation = (
+            'generation-1'
+            if self.calls <= self.stable_calls
+            else 'generation-2'
+        )
+        for item in payload['items']:
+            item['technical_snapshot'] = {
+                **(item.get('technical_snapshot') or {}),
+                'source_generation': generation,
+            }
+        return payload
+
+
 class FakeMarketContextBuilder:
     def __init__(self, payload: dict):
         self.payload = payload
@@ -2272,7 +2805,16 @@ class DetailedFailingBatchClient:
 
 
 def _reuse_decision(should_dispatch: bool):
-    return SimpleNamespace(should_dispatch=should_dispatch)
+    return SimpleNamespace(
+        should_dispatch=should_dispatch,
+        latest_feedback_id=41,
+        latest_feedback_received_at='2026-04-14T05:00:00+00:00',
+        latest_feedback={
+            'id': 41,
+            'run_id': 'reusable-feedback-source',
+            'received_at': '2026-04-14T05:00:00+00:00',
+        },
+    )
 
 
 def _patched_eligibility_split(*allowed_symbols: str):
@@ -2294,6 +2836,12 @@ def _patched_eligibility_split(*allowed_symbols: str):
                 'hard_block_reasons': [] if symbol in allowed else [{'code': 'test_hard_block'}],
                 'soft_penalties': [],
                 'filter_signals': {},
+                'candidate_rank': list(requested_symbols).index(symbol) + 1,
+                'candidate_cap': {
+                    'pre_cap_eligible_count': len(requested_symbols),
+                    'post_cap_dispatched_count': len(eligible),
+                    'applied': False,
+                },
             }
             for symbol in requested_symbols
         }
@@ -2319,20 +2867,36 @@ def _patched_eligibility_split(*allowed_symbols: str):
 
 @contextmanager
 def _patch_feedback_eligibility(*symbols: str):
+    split = _patched_eligibility_split(*symbols)
+
+    def load_records(*, market_date, requested_symbols=None, **_):
+        scope = list(requested_symbols) if requested_symbols is not None else list(symbols)
+        return list(
+            split(
+                market_date=market_date,
+                requested_symbols=scope,
+            )[2]['records_by_symbol'].values()
+        )
+
     with patch.object(
         orchestrator_module,
         '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics',
-        side_effect=_patched_eligibility_split(*symbols),
+        side_effect=split,
     ):
         with patch.object(
             orchestrator_module,
-            '_split_requested_symbols_by_agent_feedback_eligibility',
-            side_effect=lambda market_date, requested_symbols: (
-                [symbol for symbol in requested_symbols if symbol in set(symbols)],
-                [symbol for symbol in requested_symbols if symbol not in set(symbols)],
-            ),
+            'load_agent_feedback_eligibility_records',
+            side_effect=load_records,
         ):
-            yield
+            with patch.object(
+                orchestrator_module,
+                '_split_requested_symbols_by_agent_feedback_eligibility',
+                side_effect=lambda market_date, requested_symbols: (
+                    [symbol for symbol in requested_symbols if symbol in set(symbols)],
+                    [symbol for symbol in requested_symbols if symbol not in set(symbols)],
+                ),
+            ):
+                yield
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
@@ -3184,6 +3748,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                                                 symbols=['005930', '000660'],
                                                 roles=['eod-summarizer'],
                                                 reuse_existing=True,
+                                                parent_run_id='feedback-parent-reuse-test',
+                                                knowledge_cutoff_at=(
+                                                    '2026-04-14T08:15:00+00:00'
+                                                ),
                                             )
 
         dispatched_symbols = [
@@ -3192,10 +3760,27 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             for item in call['batch_items']
         ]
         self.assertEqual(read_service.calls[0]['symbols'], ['000660'])
+        self.assertEqual(
+            read_service.calls[0]['knowledge_cutoff_at'],
+            '2026-04-14T08:15:00+00:00',
+        )
         self.assertEqual(dispatched_symbols, ['000660'])
         self.assertEqual([item['symbol'] for item in feedback_service.bulk_items], ['000660'])
         self.assertEqual(failure_service.recorded, [])
         self.assertEqual(run_state_service.finished[0]['status'], 'completed')
+        self.assertEqual(
+            run_state_service.started[0]['request_payload']['parent_run_id'],
+            'feedback-parent-reuse-test',
+        )
+        self.assertEqual(
+            run_state_service.finished[0]['summary_payload']['request']['parent_run_id'],
+            'feedback-parent-reuse-test',
+        )
+        self.assertEqual(
+            run_state_service.finished[0]['summary_payload']['reused_symbols_by_role'],
+            {'eod-summarizer': ['005930']},
+        )
+        self.assertEqual(result['request']['parent_run_id'], 'feedback-parent-reuse-test')
         self.assertEqual([target.symbol for target in cleanup_service.targets], ['000660'])
 
     def test_reuse_existing_cached_only_skips_openclaw_auth_preflight(self):
@@ -3442,12 +4027,17 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 market_date='2026-04-14',
                 symbols=['005930'],
                 roles=['technical-summarizer'],
+                parent_run_id='feedback-parent-prerequisite-gate',
             )
 
         self.assertTrue(result['summary']['gated'])
         self.assertEqual(result['summary']['status'], 'blocked')
         self.assertEqual(result['items'], [])
         self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(
+            result['request']['parent_run_id'],
+            'feedback-parent-prerequisite-gate',
+        )
 
     def test_buffered_symbol_dispatch_cleans_each_batch_session_once(self):
         service = AgentFeedbackOrchestrator()
@@ -4138,6 +4728,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 symbols=requested_symbols,
                 roles=['signal-decider'],
                 reuse_existing=False,
+                parent_run_id='feedback-parent-eligibility-gate',
             )
 
         self.assertEqual(result['summary']['status'], 'blocked')
@@ -4150,6 +4741,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(
             result['prerequisites']['eligibility_scope_gate']['dispatch_symbol_count'],
             1,
+        )
+        self.assertEqual(
+            result['request']['parent_run_id'],
+            'feedback-parent-eligibility-gate',
         )
         self.assertEqual(client.calls, [])
 
@@ -4408,7 +5003,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertTrue(decider_call['batch_items'][0]['session_key'].startswith('agent:signal-decider:feedback-fresh/signal-decider/'))
         self.assertIn(result['request']['request_run_id'], decider_call['batch_items'][0]['session_key'])
         self.assertIn('/batch-001/', decider_call['batch_items'][0]['session_key'])
-        self.assertEqual(market_context_builder.calls, ['2026-04-14', '2026-04-14'])
+        self.assertEqual(market_context_builder.calls, ['2026-04-14'] * 5)
         self.assertEqual(result['summary']['completed'], 5)
 
     def test_auto_scoped_symbol_dispatch_applies_smaller_decider_role_caps(self):
@@ -4491,6 +5086,165 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(result['summary']['completed'], 14)
 
+    def test_chunked_decider_revalidation_preserves_original_source_and_eligibility_scope(self):
+        service = AgentFeedbackOrchestrator()
+        client = SignalDeciderBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        symbols = ['005930', '000660']
+        roles = [
+            'eod-summarizer',
+            'technical-summarizer',
+            'fundamental-summarizer',
+            'short-term-decider',
+        ]
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'agent_context_read_service',
+                DeciderReadyAgentContextReadService(),
+            ):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_reuse_service',
+                    SimpleNamespace(build_latest_decisions=lambda **kwargs: {}),
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_feedback_service',
+                        feedback_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_feedback_session_cleanup_service',
+                            FakeSessionCleanupService(),
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'signal_decider_market_context_builder',
+                                market_context_builder,
+                            ):
+                                with _patch_feedback_eligibility(*symbols):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=symbols,
+                                        roles=roles,
+                                        reuse_existing=False,
+                                    )
+
+        decider_calls = [
+            call
+            for call in client.calls
+            if call['spec'].role == 'short-term-decider'
+        ]
+        self.assertEqual(result['summary']['status'], 'completed')
+        self.assertEqual(result['summary']['completed'], 8)
+        self.assertEqual(result['failures'], [])
+        self.assertEqual(
+            [[item['symbol'] for item in call['batch_items']] for call in decider_calls],
+            [['005930'], ['000660']],
+        )
+
+    def test_precomputed_auto_scope_revalidation_preserves_missing_eligibility_context(self):
+        service = AgentFeedbackOrchestrator()
+        client = SignalDeciderBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        symbols = ['005930', '000660']
+        roles = [
+            'eod-summarizer',
+            'technical-summarizer',
+            'fundamental-summarizer',
+            'short-term-decider',
+        ]
+        role_symbol_scopes = {
+            role: list(symbols)
+            for role in roles[:-1]
+        }
+        role_symbol_scopes['short-term-decider'] = ['005930']
+        funnel_diagnostics = {
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'broad_symbols': list(symbols),
+            'role_symbols': role_symbol_scopes,
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'agent_context_read_service',
+                DeciderReadyAgentContextReadService(),
+            ):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_reuse_service',
+                    SimpleNamespace(build_latest_decisions=lambda **kwargs: {}),
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_feedback_service',
+                        feedback_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_feedback_session_cleanup_service',
+                            FakeSessionCleanupService(),
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'signal_decider_market_context_builder',
+                                market_context_builder,
+                            ):
+                                with _patch_feedback_eligibility(*symbols):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=symbols,
+                                        roles=roles,
+                                        reuse_existing=False,
+                                        auto_scope=True,
+                                        role_symbol_scopes=role_symbol_scopes,
+                                        funnel_diagnostics=funnel_diagnostics,
+                                    )
+
+        decider_payload = next(
+            payload
+            for payload in client.decider_payloads
+            if payload['role'] == 'short-term-decider'
+        )
+        self.assertEqual(result['summary']['status'], 'completed')
+        self.assertEqual(result['summary']['completed'], 7)
+        self.assertEqual(result['failures'], [])
+        self.assertNotIn(
+            'agent_feedback_eligibility',
+            decider_payload['symbol_day_context'],
+        )
+
     def test_requested_short_term_decider_builds_tactical_payload_from_upstream_summaries(self):
         service = AgentFeedbackOrchestrator()
         client = SignalDeciderBatchClient()
@@ -4544,8 +5298,362 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(short_term_row['feedback']['preferred_action'], 'watch_for_trigger')
         self.assertEqual(short_term_row['feedback']['trigger_price'], 87200.0)
         self.assertEqual(short_term_row['context']['market_context']['summary']['market_bias'], 'risk_on')
-        self.assertEqual(market_context_builder.calls, ['2026-04-14'])
+        self.assertEqual(market_context_builder.calls, ['2026-04-14'] * 3)
         self.assertEqual(result['summary']['completed'], 4)
+
+    def test_decider_response_is_rejected_when_source_context_changes_during_dispatch(self):
+        service = AgentFeedbackOrchestrator()
+        client = SignalDeciderBatchClient()
+        service.client = client
+        read_service = MutatingDeciderInputReadService()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_reuse_service',
+                    SimpleNamespace(build_latest_decisions=lambda **kwargs: {}),
+                ):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_context_feedback_failure_service',
+                            failure_service,
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'agent_feedback_session_cleanup_service',
+                                cleanup_service,
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'signal_decider_market_context_builder',
+                                    market_context_builder,
+                                ):
+                                    with _patch_feedback_eligibility('005930'):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            reuse_existing=False,
+                                        )
+
+        persisted_roles = {
+            item['agent_name']
+            for call in feedback_service.bulk_calls
+            for item in call
+        }
+        self.assertEqual(
+            persisted_roles,
+            {
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+            },
+        )
+        self.assertEqual(
+            {failure['agent_name'] for failure in failure_service.recorded},
+            {'short-term-decider', 'signal-decider'},
+        )
+        self.assertEqual(
+            {failure['failure_kind'] for failure in failure_service.recorded},
+            {'dependency_upstream_changed_during_dispatch'},
+        )
+        self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(result['summary']['completed'], 3)
+        self.assertEqual(result['summary']['failed'], 2)
+        self.assertGreaterEqual(read_service.calls, 3)
+
+    def test_decider_response_is_rejected_when_eligibility_context_changes(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = SignalDeciderBatchClient()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+        eligibility_calls = 0
+
+        def changing_eligibility(*, market_date, requested_symbols):
+            nonlocal eligibility_calls
+            eligibility_calls += 1
+            penalty_code = (
+                'initial_penalty'
+                if eligibility_calls == 1
+                else 'updated_penalty'
+            )
+            records = {
+                symbol: {
+                    'symbol': symbol,
+                    'market_date': market_date.isoformat(),
+                    'rule_version': 'strategy_aware_prefilter_scoring_v1',
+                    'strategy_scope': 'short_term_momentum_breakout',
+                    'candidate_path': 'short_term_momentum_breakout',
+                    'eligible': True,
+                    'hard_blocked': False,
+                    'status': 'soft_penalized_dispatched',
+                    'hard_block_reasons': [],
+                    'soft_penalties': [{'code': penalty_code}],
+                    'filter_signals': {'rank': eligibility_calls},
+                }
+                for symbol in requested_symbols
+            }
+            return list(requested_symbols), [], {
+                'records_by_symbol': records,
+                'soft_penalized_symbols': list(requested_symbols),
+                'hard_blocked_symbols': [],
+            }
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'agent_context_read_service',
+                DeciderReadyAgentContextReadService(),
+            ):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_reuse_service',
+                    SimpleNamespace(build_latest_decisions=lambda **kwargs: {}),
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_feedback_service',
+                        feedback_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_context_feedback_failure_service',
+                            failure_service,
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'agent_feedback_session_cleanup_service',
+                                cleanup_service,
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'signal_decider_market_context_builder',
+                                    market_context_builder,
+                                ):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics',
+                                        side_effect=changing_eligibility,
+                                    ):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            reuse_existing=False,
+                                        )
+
+        persisted_roles = {
+            item['agent_name']
+            for call in feedback_service.bulk_calls
+            for item in call
+        }
+        self.assertEqual(
+            persisted_roles,
+            {
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+            },
+        )
+        self.assertEqual(
+            {failure['agent_name'] for failure in failure_service.recorded},
+            {'short-term-decider', 'signal-decider'},
+        )
+        revalidation_codes = {
+            reason['code']
+            for failure in failure_service.recorded
+            for reason in failure['context'][
+                'input_generation_revalidation'
+            ]['reasons']
+        }
+        self.assertIn('source_context_changed', revalidation_codes)
+        self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(result['summary']['completed'], 3)
+        self.assertEqual(result['summary']['failed'], 2)
+
+    def test_finalization_invalidates_decider_success_when_source_changes_after_acceptance(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = SignalDeciderBatchClient()
+        read_service = MutatingDeciderInputReadService(stable_calls=3)
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_reuse_service',
+                    SimpleNamespace(build_latest_decisions=lambda **kwargs: {}),
+                ):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_context_feedback_failure_service',
+                            failure_service,
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'agent_feedback_session_cleanup_service',
+                                cleanup_service,
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'signal_decider_market_context_builder',
+                                    market_context_builder,
+                                ):
+                                    with _patch_feedback_eligibility('005930'):
+                                        result = service.dispatch_for_symbols(
+                                            market_date='2026-04-14',
+                                            symbols=['005930'],
+                                            reuse_existing=False,
+                                        )
+
+        persisted_roles = {
+            item['agent_name']
+            for call in feedback_service.bulk_calls
+            for item in call
+        }
+        self.assertIn('short-term-decider', persisted_roles)
+        self.assertIn('signal-decider', persisted_roles)
+        self.assertEqual(
+            {failure['failure_kind'] for failure in failure_service.recorded},
+            {'dependency_upstream_changed_during_dispatch'},
+        )
+        self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(result['summary']['completed'], 3)
+        self.assertEqual(result['summary']['failed'], 2)
+        self.assertGreaterEqual(read_service.calls, 4)
+
+    def test_finalization_failure_write_outage_keeps_invalidated_scope_in_run_summary(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = SignalDeciderBatchClient()
+        read_service = MutatingDeciderInputReadService(stable_calls=3)
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+
+        class FailingFailureService:
+            @staticmethod
+            def record_failure(**_kwargs):
+                raise RuntimeError('failure table unavailable')
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_reuse_service',
+                    SimpleNamespace(build_latest_decisions=lambda **kwargs: {}),
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_feedback_service',
+                        feedback_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_context_feedback_failure_service',
+                            FailingFailureService(),
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'agent_context_feedback_run_state_service',
+                                run_state_service,
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'agent_feedback_session_cleanup_service',
+                                    cleanup_service,
+                                ):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'signal_decider_market_context_builder',
+                                        market_context_builder,
+                                    ):
+                                        with _patch_feedback_eligibility('005930'):
+                                            with self.assertRaisesRegex(
+                                                RuntimeError,
+                                                'failure table unavailable',
+                                            ):
+                                                service.dispatch_for_symbols(
+                                                    market_date='2026-04-14',
+                                                    symbols=['005930'],
+                                                    reuse_existing=False,
+                                                )
+
+        persisted_roles = {
+            item['agent_name']
+            for call in feedback_service.bulk_calls
+            for item in call
+        }
+        self.assertIn('short-term-decider', persisted_roles)
+        self.assertIn('signal-decider', persisted_roles)
+        finished = run_state_service.finished[-1]
+        self.assertEqual(finished['status'], 'partial')
+        self.assertEqual(finished['failed_count'], 2)
+        self.assertEqual(
+            finished['summary_payload']['failed_symbols_by_role'],
+            {
+                'short-term-decider': ['005930'],
+                'signal-decider': ['005930'],
+            },
+        )
 
     def test_failed_fresh_signal_decider_batch_still_cleans_session(self):
         service = AgentFeedbackOrchestrator()
@@ -4611,7 +5719,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn(result['request']['request_run_id'], cleanup_target.session_key)
         self.assertIn('feedback-fresh/signal-decider/', cleanup_target.session_key)
 
-    def test_build_upstream_feedback_bundle_reuses_same_day_persisted_summary_when_role_requires_redispatch(self):
+    def test_build_upstream_feedback_bundle_blocks_same_day_summary_pending_redispatch(self):
         upstream_summaries, upstream_traceability, missing_roles = AgentFeedbackOrchestrator._build_upstream_feedback_bundle(
             symbol='005930',
             market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
@@ -4644,12 +5752,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(
             set(upstream_summaries.keys()),
-            {'eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'},
+            {'eod-summarizer', 'fundamental-summarizer'},
         )
-        self.assertEqual(upstream_summaries['technical-summarizer']['summary'], 'stale technical')
-        self.assertEqual(missing_roles, [])
+        self.assertEqual(missing_roles, ['technical-summarizer'])
         self.assertEqual(upstream_traceability['eod-summarizer']['source'], 'current_run_buffer')
-        self.assertTrue(upstream_traceability['technical-summarizer']['refresh_pending'])
+        self.assertNotIn('technical-summarizer', upstream_traceability)
 
     def test_signal_decider_missing_upstream_records_dependency_context_without_dispatch(self):
         service = AgentFeedbackOrchestrator()

@@ -1494,17 +1494,20 @@ def _build_role_scope_selection(
         if cap_limit <= 0:
             selected_symbols = {str(record.get('symbol') or '').strip().upper() for record in ranked}
 
-    role_cap_selected_symbols = set(selected_symbols)
     decider_scope_applied = decider_scope_symbols is not None
     normalized_decider_scope = _normalize_symbol_scope(decider_scope_symbols) or []
+    role_cap_selected_symbols = set(selected_symbols)
+    ranked_symbol_set = {
+        str(record.get('symbol') or '').strip().upper()
+        for record in ranked
+    }
     if decider_scope_applied:
-        selected_symbols = set(normalized_decider_scope).intersection(role_cap_selected_symbols)
+        # The fast path is already bounded by the smallest requested upstream
+        # role cap. Preserve that decision scope exactly so a role-specific
+        # ranking cannot silently remove a prerequisite for a decider symbol.
+        selected_symbols = set(normalized_decider_scope).intersection(ranked_symbol_set)
 
     if decider_scope_applied:
-        ranked_symbol_set = {
-            str(record.get('symbol') or '').strip().upper()
-            for record in ranked
-        }
         ordered_selected = [
             symbol
             for symbol in normalized_decider_scope
@@ -1538,6 +1541,8 @@ def _build_role_scope_selection(
             selection_reasons_by_symbol[symbol].append('summarizer_gate_advance_to_decider')
         if decider_scope_applied:
             selection_reasons_by_symbol[symbol].append(FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
+            if symbol not in role_cap_selected_symbols:
+                selection_reasons_by_symbol[symbol].append('decider_scope_prerequisite')
         for reason in forced_reasons_by_symbol.get(symbol, []):
             selection_reasons_by_symbol[symbol].append(f"forced:{reason.get('code')}")
 
@@ -1611,12 +1616,21 @@ def _build_decider_scope_fast_path(
             'symbol_count': 0,
             'symbols': [],
             'candidate_role_symbol_counts': {},
+            'prerequisite_role_cap_limits': {},
         }
 
     reference_role, reference_symbols, _ = min(
         candidate_scopes,
         key=lambda item: (len(item[1]), source_roles.index(item[0])),
     )
+    prerequisite_role_cap_limits = {
+        role: _role_cap_limit(role, len(records))
+        for role in roles
+        if role in SUMMARIZER_AGENT_NAMES
+    }
+    if prerequisite_role_cap_limits and not requested_scope_bypass:
+        scope_limit = min(prerequisite_role_cap_limits.values())
+        reference_symbols = reference_symbols[:scope_limit]
     return {
         'mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         'applied': True,
@@ -1628,6 +1642,7 @@ def _build_decider_scope_fast_path(
             role: len(symbols)
             for role, symbols, _ in candidate_scopes
         },
+        'prerequisite_role_cap_limits': prerequisite_role_cap_limits,
     }
 
 

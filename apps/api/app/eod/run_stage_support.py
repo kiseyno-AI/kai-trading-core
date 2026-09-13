@@ -84,6 +84,37 @@ def build_stage_counts(
     )
 
 
+def extract_next_open_plan_stage_counts(
+    result: Mapping[str, Any],
+) -> StageCounts:
+    """Count every plan-row outcome without treating a safe block as failure."""
+
+    def _as_nonnegative_int(value: Any) -> int:
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    summary = result.get('summary')
+    if not isinstance(summary, Mapping):
+        summary = {}
+    outcome_count = sum(
+        _as_nonnegative_int(summary.get(key))
+        for key in (
+            'eligible_count',
+            'monitor_candidate_count',
+            'blocked_count',
+        )
+    )
+    reported_total = _as_nonnegative_int(summary.get('items_total'))
+    total = max(reported_total, outcome_count)
+    return build_stage_counts(
+        total=total,
+        succeeded=outcome_count,
+        failed=max(total - outcome_count, 0),
+    )
+
+
 def extract_run_stage_counts(
     run: Mapping[str, Any],
     *,

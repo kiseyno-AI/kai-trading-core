@@ -467,6 +467,103 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
         self.assertEqual(funnel['role_symbols']['short-term-decider'], ['005930', '000660'])
         self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930', '000660'])
 
+    def test_role_funnel_fast_path_keeps_decider_prerequisites_across_role_rankings(self) -> None:
+        records = [
+            {
+                'symbol': '005930',
+                'candidate_rank': 1,
+                'candidate_score': 90,
+                'candidate_score_payload': {'source_values': {'composite_percentile': 0.0}},
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '000660',
+                'candidate_rank': 2,
+                'candidate_score': 80,
+                'candidate_score_payload': {'source_values': {'composite_percentile': 0.0}},
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '035420',
+                'candidate_rank': 3,
+                'candidate_score': 78,
+                'candidate_score_payload': {'source_values': {'composite_percentile': 1.0}},
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+        ]
+
+        with (
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_eod_summarizer', 2),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_technical_summarizer', 2),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_fundamental_summarizer', 2),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 2),
+        ):
+            funnel = build_agent_feedback_role_funnel(
+                records=records,
+                roles=[
+                    'eod-summarizer',
+                    'technical-summarizer',
+                    'fundamental-summarizer',
+                    'signal-decider',
+                ],
+                feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            )
+
+        self.assertEqual(funnel['decider_scope']['symbols'], ['005930', '000660'])
+        for role in ('eod-summarizer', 'technical-summarizer', 'fundamental-summarizer'):
+            self.assertEqual(funnel['role_symbols'][role], ['005930', '000660'])
+            self.assertLessEqual(funnel['role_symbol_counts'][role], 2)
+
+    def test_role_funnel_fast_path_respects_smallest_prerequisite_cap(self) -> None:
+        records = [
+            {
+                'symbol': symbol,
+                'candidate_rank': index,
+                'candidate_score': 100 - index,
+                'candidate_score_payload': {'source_values': {'composite_percentile': 0.0}},
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            }
+            for index, symbol in enumerate(('005930', '000660'), start=1)
+        ]
+
+        with (
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_eod_summarizer', 2),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_technical_summarizer', 2),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_fundamental_summarizer', 1),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 2),
+        ):
+            funnel = build_agent_feedback_role_funnel(
+                records=records,
+                roles=[
+                    'eod-summarizer',
+                    'technical-summarizer',
+                    'fundamental-summarizer',
+                    'signal-decider',
+                ],
+                feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            )
+
+        self.assertEqual(funnel['decider_scope']['symbols'], ['005930'])
+        self.assertEqual(
+            funnel['decider_scope']['prerequisite_role_cap_limits']['fundamental-summarizer'],
+            1,
+        )
+        for role in (
+            'eod-summarizer',
+            'technical-summarizer',
+            'fundamental-summarizer',
+            'signal-decider',
+        ):
+            self.assertEqual(funnel['role_symbols'][role], ['005930'])
+
     def test_role_funnel_broad_mode_preserves_wider_summarizer_scope(self) -> None:
         records = [
             {

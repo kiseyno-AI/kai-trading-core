@@ -4,6 +4,7 @@ import json
 import hashlib
 import re
 import uuid
+from copy import deepcopy
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
@@ -32,6 +33,89 @@ def is_abortlike_error(error: Any) -> bool:
 
 FEEDBACK_SESSION_KEY_PREFIX = 'feedback'
 FRESH_FEEDBACK_SESSION_KEY_PREFIX = 'feedback-fresh'
+DECIDER_SOURCE_CONTEXT_GENERATION_SCHEMA_VERSION = (
+    'decider_source_context_generation_v1'
+)
+DECIDER_INPUT_GENERATION_SCHEMA_VERSION = 'decider_input_generation_v1'
+DURABLE_DECIDER_INPUT_GENERATION_SCHEMA_VERSION = (
+    'durable_decider_input_generation_v1'
+)
+DECIDER_SOURCE_CONTEXT_VOLATILE_KEYS = frozenset(
+    {
+        'age_seconds',
+        'decision_time',
+        'knowledge_cutoff_at',
+        'requested_at',
+    }
+)
+DURABLE_DECIDER_SOURCE_CONTEXT_KEYS = (
+    'symbol',
+    'market_date',
+    'company',
+    'price_context',
+    'price_context_history',
+    'technical_snapshot',
+    'action_summary',
+    'signal_features',
+    'market_relative_context',
+    'sector_peer_context',
+    'market_breadth_context',
+    'macro_context',
+    'investor_flow_context',
+    'short_selling_context',
+    'valuation_context',
+    'scores',
+    'factor_summary',
+    'persisted_factor_rows',
+    'fundamentals',
+    'recent_disclosures',
+    'recent_dart_events',
+    'recent_external_news',
+    'agent_feedback_eligibility',
+    'signal_envelopes',
+)
+DURABLE_DECIDER_CONTEXT_PROVENANCE_KEYS = frozenset(
+    {
+        'price_context',
+        'market_relative_context',
+        'signal_features',
+        'sector_peer_context',
+        'market_breadth_context',
+        'macro_context',
+        'investor_flow_context',
+        'short_selling_context',
+        'valuation_context',
+        'fundamentals',
+        'recent_disclosures',
+        'recent_dart_events',
+        'recent_external_news',
+        'factor_rows',
+    }
+)
+DURABLE_DECIDER_AVAILABILITY_KEYS = frozenset(
+    {
+        'company',
+        'price_context',
+        'technical_snapshot',
+        'action_summary',
+        'signal_features',
+        'market_relative_context',
+        'sector_peer_context',
+        'market_breadth_context',
+        'investor_flow_context',
+        'short_selling_context',
+        'valuation_context',
+        'persisted_factor_rows',
+        'fundamentals',
+        'recent_disclosures',
+        'recent_dart_events',
+        'recent_external_news',
+        'macro_context',
+    }
+)
+EXTERNAL_NEWS_PROVIDER_RUNTIME_KEYS = frozenset(
+    {'enabled', 'collection_enabled', 'status', 'reason'}
+)
 
 
 def feedback_session_key(*, agent_name: str, slot: int) -> str:
@@ -76,6 +160,290 @@ def strip_runtime_session_fields(item: dict[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in item.items()
         if key not in {'session_slot', 'session_key'}
+    }
+
+
+def _canonical_decider_source_context(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_decider_source_context(item)
+            for key, item in value.items()
+            if str(key) not in DECIDER_SOURCE_CONTEXT_VOLATILE_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_decider_source_context(item) for item in value]
+    return value
+
+
+def build_decider_source_context_generation(
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    canonical_context = _canonical_decider_source_context(
+        strip_runtime_session_fields(item)
+    )
+    encoded = json.dumps(
+        jsonable_encoder(canonical_context),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+    return {
+        'schema_version': DECIDER_SOURCE_CONTEXT_GENERATION_SCHEMA_VERSION,
+        'fingerprint': (
+            'sha256:' + hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+        ),
+    }
+
+
+def _stable_macro_context(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    result = deepcopy(value)
+    result.pop('generated_at', None)
+    series = result.get('series')
+    if isinstance(series, list):
+        for row in series:
+            if not isinstance(row, dict):
+                continue
+            freshness = row.get('freshness')
+            if isinstance(freshness, dict):
+                freshness.pop('age_hours', None)
+    return result
+
+
+def _source_names(value: Any) -> tuple[Any, ...]:
+    """Normalize provenance source fields without treating text as characters."""
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(value)
+    return (value,)
+
+
+def _durable_decider_source_context(item: dict[str, Any]) -> dict[str, Any]:
+    """Project a decider input onto data that remains authoritative overnight.
+
+    Current quote, order-book, session, and open-drive derivatives are enforced
+    independently by the next-open live-market gate. Keeping them in the durable
+    fingerprint would revoke a valid completed-EOD decision merely because the
+    next trading session opened. The projection intentionally keeps the source-day
+    EOD facts and their provenance, including the complete eligibility record.
+    """
+
+    projected = {
+        key: item[key]
+        for key in DURABLE_DECIDER_SOURCE_CONTEXT_KEYS
+        if key in item
+    }
+
+    if 'macro_context' in projected:
+        projected['macro_context'] = _stable_macro_context(
+            projected['macro_context']
+        )
+    company = item.get('company')
+    if isinstance(company, dict):
+        projected['company'] = {
+            key: value
+            for key, value in company.items()
+            if key not in {'last_refreshed_at', 'source'}
+        }
+
+    def stable_external_news(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        result = deepcopy(value)
+        result.pop('knowledge_cutoff_source', None)
+
+        def strip_provider_runtime_fields(provider: Any) -> None:
+            if not isinstance(provider, dict):
+                return
+            for key in EXTERNAL_NEWS_PROVIDER_RUNTIME_KEYS:
+                provider.pop(key, None)
+
+        strip_provider_runtime_fields(result.get('provider'))
+        strip_provider_runtime_fields(result.get('provider_status'))
+        root_requested_coverage = result.get('requested_symbol_coverage')
+        if isinstance(root_requested_coverage, dict):
+            strip_provider_runtime_fields(
+                root_requested_coverage.get('provider_status')
+            )
+        freshness = result.get('freshness_provenance')
+        if isinstance(freshness, dict):
+            strip_provider_runtime_fields(freshness.get('provider_status'))
+            requested_coverage = freshness.get('requested_symbol_coverage')
+            if isinstance(requested_coverage, dict):
+                strip_provider_runtime_fields(
+                    requested_coverage.get('provider_status')
+                )
+        return result
+
+    if 'recent_external_news' in projected:
+        projected['recent_external_news'] = stable_external_news(
+            projected['recent_external_news']
+        )
+    liquidity_context = item.get('liquidity_context')
+    if isinstance(liquidity_context, dict):
+        projected['liquidity_context'] = {
+            key: liquidity_context[key]
+            for key in ('status', 'reason', 'turnover', 'ranking')
+            if key in liquidity_context
+        }
+    context_provenance = item.get('context_provenance')
+    if isinstance(context_provenance, dict):
+        projected['context_provenance'] = {
+            key: (
+                stable_external_news(value)
+                if key == 'recent_external_news'
+                else value
+            )
+            for key, value in context_provenance.items()
+            if key in DURABLE_DECIDER_CONTEXT_PROVENANCE_KEYS
+        }
+    availability = item.get('availability')
+    if isinstance(availability, dict):
+        projected['availability'] = {
+            key: value
+            for key, value in availability.items()
+            if key in DURABLE_DECIDER_AVAILABILITY_KEYS
+        }
+    return projected
+
+
+def build_durable_decider_input_generation(
+    *,
+    source_context: dict[str, Any],
+    source_knowledge_cutoff_at: str | None = None,
+    policy_context: dict[str, Any] | None = None,
+    previous_decision_context: dict[str, Any] | None = None,
+    upstream_summaries: dict[str, Any] | None = None,
+    upstream_traceability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    market_breadth = source_context.get('market_breadth_context')
+    market_breadth = market_breadth if isinstance(market_breadth, dict) else {}
+    breadth_provenance = market_breadth.get('freshness_provenance')
+    breadth_provenance = (
+        breadth_provenance if isinstance(breadth_provenance, dict) else {}
+    )
+    context_provenance = source_context.get('context_provenance')
+    context_provenance = (
+        context_provenance if isinstance(context_provenance, dict) else {}
+    )
+    context_breadth_provenance = context_provenance.get(
+        'market_breadth_context'
+    )
+    context_breadth_provenance = (
+        context_breadth_provenance
+        if isinstance(context_breadth_provenance, dict)
+        else {}
+    )
+    breadth_sources = {
+        str(value or '').strip().lower()
+        for value in (
+            market_breadth.get('source'),
+            breadth_provenance.get('source_provider'),
+            context_breadth_provenance.get('source_provider'),
+        )
+    }
+    breadth_source_tables = {
+        str(value or '').strip().lower()
+        for value in (
+            _source_names(breadth_provenance.get('source_tables'))
+            + _source_names(context_breadth_provenance.get('source_tables'))
+        )
+    }
+    non_durable_reasons: list[str] = []
+    if (
+        'kis_market_snapshot_v1' in breadth_sources
+        or 'current_market_snapshot_cache' in breadth_source_tables
+    ):
+        non_durable_reasons.append('live_market_breadth_context')
+    components = {
+        'source_context_fingerprint': build_decider_source_context_generation(
+            _durable_decider_source_context(source_context)
+        )['fingerprint'],
+        'policy_context_fingerprint': build_decider_source_context_generation(
+            policy_context or {}
+        )['fingerprint'],
+        'previous_decision_context_fingerprint': (
+            build_decider_source_context_generation(
+                previous_decision_context or {}
+            )['fingerprint']
+        ),
+        'upstream_bundle_fingerprint': build_decider_source_context_generation(
+            {
+                'summaries': upstream_summaries or {},
+                'traceability': upstream_traceability or {},
+            }
+        )['fingerprint'],
+        'source_knowledge_cutoff_fingerprint': (
+            build_decider_source_context_generation(
+                {'source_knowledge_boundary': source_knowledge_cutoff_at}
+            )['fingerprint']
+        ),
+    }
+    return {
+        'schema_version': DURABLE_DECIDER_INPUT_GENERATION_SCHEMA_VERSION,
+        'durable_reuse_eligible': not non_durable_reasons,
+        'non_durable_reasons': non_durable_reasons,
+        **components,
+        'fingerprint': build_decider_source_context_generation(
+            {
+                'durable_reuse_eligible': not non_durable_reasons,
+                'non_durable_reasons': non_durable_reasons,
+                **components,
+            }
+        )['fingerprint'],
+    }
+
+
+def build_decider_input_generation(
+    *,
+    source_context: dict[str, Any],
+    market_context: dict[str, Any],
+    policy_context: dict[str, Any],
+    previous_decision_context: dict[str, Any],
+    upstream_summaries: dict[str, Any],
+    upstream_traceability: dict[str, Any],
+) -> dict[str, Any]:
+    components = {
+        'source_context_fingerprint': build_decider_source_context_generation(
+            {
+                **source_context,
+                **(
+                    {
+                        'macro_context': _stable_macro_context(
+                            source_context['macro_context']
+                        )
+                    }
+                    if 'macro_context' in source_context
+                    else {}
+                ),
+            }
+        )['fingerprint'],
+        'market_context_fingerprint': build_decider_source_context_generation(
+            market_context
+        )['fingerprint'],
+        'policy_context_fingerprint': build_decider_source_context_generation(
+            policy_context
+        )['fingerprint'],
+        'previous_decision_context_fingerprint': (
+            build_decider_source_context_generation(previous_decision_context)[
+                'fingerprint'
+            ]
+        ),
+        'upstream_bundle_fingerprint': build_decider_source_context_generation(
+            {
+                'summaries': upstream_summaries,
+                'traceability': upstream_traceability,
+            }
+        )['fingerprint'],
+    }
+    return {
+        'schema_version': DECIDER_INPUT_GENERATION_SCHEMA_VERSION,
+        **components,
+        'fingerprint': build_decider_source_context_generation(components)[
+            'fingerprint'
+        ],
     }
 
 
@@ -1070,7 +1438,12 @@ def build_upstream_feedback_bundle(
         feedback_payload = latest_feedback.get('feedback_payload') if isinstance(latest_feedback, dict) else None
         feedback_market_date = latest_feedback.get('market_date') if isinstance(latest_feedback, dict) else None
         reuse_reason = str(getattr(decision, 'reason', '') or '')
-        if isinstance(feedback_payload, dict) and feedback_market_date == market_date.isoformat():
+        if (
+            isinstance(feedback_payload, dict)
+            and feedback_market_date == market_date.isoformat()
+            and decision is not None
+            and not bool(decision.should_dispatch)
+        ):
             upstream_summaries[role] = feedback_payload
             upstream_traceability[role] = {
                 'agent_name': role,
@@ -1080,7 +1453,7 @@ def build_upstream_feedback_bundle(
                 'feedback_id': latest_feedback.get('id'),
                 'source': 'persisted_feedback',
                 'reuse_reason': reuse_reason or None,
-                'refresh_pending': bool(decision.should_dispatch) if decision is not None else None,
+                'refresh_pending': False,
             }
             continue
         if decision is not None and bool(decision.should_dispatch):

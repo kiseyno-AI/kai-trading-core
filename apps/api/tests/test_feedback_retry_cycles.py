@@ -1,26 +1,67 @@
 import importlib.util
 import os
 import sys
+import threading
 import types
 import unittest
-from datetime import date, datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
+from uuid import uuid4
 
+from sqlalchemy import delete, select
+
+from app.db import session_scope
+from app.db_models import (
+    AgentContextFeedback,
+    AgentContextFeedbackFailure,
+    AgentContextFeedbackRun,
+)
 from app.agent_context.retry_service import (
     AgentFeedbackRetryService,
     EXPECTED_ROLES,
+    FeedbackRetryLeaseLostError,
     RetryCyclePlan,
     RoleSequenceRoleState,
     RoleSequenceSnapshot,
+    _FeedbackRetryClaimLease,
+    _feedback_retry_admission_lock_key,
+    _claim_feedback_retry_run,
 )
+from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundle
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+from app.agent_context.reuse_service import AgentContextReuseService
+from app.agent_context.runtime_state import RuntimeFeedbackRunState
 from scripts import run_feedback_retry_cycles
 
 
-def _decision(*, should_dispatch, latest_feedback=None):
-    return SimpleNamespace(should_dispatch=should_dispatch, latest_feedback=latest_feedback)
+def _decision(
+    *,
+    should_dispatch,
+    latest_feedback=None,
+    latest_feedback_id=None,
+    latest_feedback_received_at=None,
+    latest_decision_snapshot_id=None,
+    latest_decision_snapshot_fingerprint=None,
+    latest_decision_snapshot_observed_at=None,
+    reason=None,
+):
+    return SimpleNamespace(
+        should_dispatch=should_dispatch,
+        latest_feedback=latest_feedback,
+        latest_feedback_id=latest_feedback_id,
+        latest_feedback_received_at=latest_feedback_received_at,
+        latest_decision_snapshot_id=latest_decision_snapshot_id,
+        latest_decision_snapshot_fingerprint=(
+            latest_decision_snapshot_fingerprint
+        ),
+        latest_decision_snapshot_observed_at=(
+            latest_decision_snapshot_observed_at
+        ),
+        reason=reason,
+    )
 
 
 def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
@@ -56,6 +97,7 @@ def _role_state(
     symbols: tuple[str, ...],
     completed: tuple[str, ...] = (),
     failed: tuple[str, ...] = (),
+    reused: tuple[str, ...] = (),
     boundary_pending: tuple[str, ...] = (),
     retry_pending: tuple[str, ...] = (),
     boundary_status: str | None = None,
@@ -77,6 +119,7 @@ def _role_state(
         total_symbols=len(symbols),
         completed_symbols=completed,
         failed_symbols=failed,
+        reused_symbols=reused,
         terminal_symbols=tuple(symbol for symbol in symbols if symbol in set(completed) | set(failed)),
         boundary_pending_symbols=boundary_pending,
         retry_pending_symbols=retry_pending,
@@ -134,6 +177,2091 @@ class RecordingRunStateService:
 
 
 class FeedbackRetryCycleTests(unittest.TestCase):
+    def test_feedback_retry_admission_claim_atomically_rejects_overlapping_scope(self):
+        suffix = uuid4().hex[:10].upper()
+        run_ids = [f'claim-one-{suffix}', f'claim-two-{suffix}']
+        market_date = date.fromisoformat('2040-01-02')
+        started_at = datetime.now(timezone.utc)
+        barrier = threading.Barrier(2)
+
+        def claim(run_id):
+            barrier.wait(timeout=5)
+            return _claim_feedback_retry_run(
+                market_date=market_date,
+                roles=('signal-decider',),
+                requested_symbols=(f'A{suffix}', f'B{suffix}'),
+                feedback_scope_mode='decider_scope_fast_path',
+                run_id=run_id,
+                started_at=started_at,
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, run_ids))
+
+        acquired = [result for result in results if result['acquired']]
+        blocked = [result for result in results if not result['acquired']]
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(
+            blocked[0]['conflict_run']['run_id'],
+            acquired[0]['run_id'],
+        )
+        self.assertTrue(blocked[0]['exact_scope'])
+
+    def test_feedback_retry_admission_claim_blocks_partially_overlapping_scope(self):
+        suffix = uuid4().hex[:10].upper()
+        first_run_id = f'claim-multi-{suffix}'
+        second_run_id = f'claim-overlap-{suffix}'
+        disjoint_run_id = f'claim-disjoint-{suffix}'
+        run_ids = [first_run_id, second_run_id, disjoint_run_id]
+        market_date = date.fromisoformat('2040-01-03')
+        started_at = datetime.now(timezone.utc)
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        first = _claim_feedback_retry_run(
+            market_date=market_date,
+            roles=('signal-decider',),
+            requested_symbols=(f'A{suffix}', f'B{suffix}'),
+            feedback_scope_mode='decider_scope_fast_path',
+            run_id=first_run_id,
+            started_at=started_at,
+        )
+        second = _claim_feedback_retry_run(
+            market_date=market_date,
+            roles=('signal-decider',),
+            requested_symbols=(f'A{suffix}',),
+            feedback_scope_mode='decider_scope_fast_path',
+            run_id=second_run_id,
+            started_at=started_at,
+        )
+        disjoint = _claim_feedback_retry_run(
+            market_date=market_date,
+            roles=('signal-decider',),
+            requested_symbols=(f'C{suffix}',),
+            feedback_scope_mode='decider_scope_fast_path',
+            run_id=disjoint_run_id,
+            started_at=started_at,
+        )
+
+        self.assertTrue(first['acquired'])
+        self.assertFalse(second['acquired'])
+        self.assertFalse(second['exact_scope'])
+        self.assertEqual(second['conflict_run']['run_id'], first_run_id)
+        self.assertTrue(disjoint['acquired'])
+
+    def test_feedback_retry_admission_claim_recovers_stale_owner(self):
+        suffix = uuid4().hex[:10].upper()
+        stale_run_id = f'claim-stale-{suffix}'
+        replacement_run_id = f'claim-replacement-{suffix}'
+        run_ids = [stale_run_id, replacement_run_id]
+        market_date = date.fromisoformat('2040-01-04')
+        stale_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        symbol = f'A{suffix}'
+        request_payload = {
+            'mode': 'daily_retry_cycle_role_sequenced',
+            'roles': ['signal-decider'],
+            'requested_symbols': [symbol],
+            'admission_scope_by_role': {'signal-decider': [symbol]},
+        }
+
+        with session_scope() as session:
+            session.add(
+                AgentContextFeedbackRun(
+                    run_id=stale_run_id,
+                    market_date=market_date,
+                    status='running',
+                    symbols_total=1,
+                    completed_count=0,
+                    failed_count=0,
+                    request_payload=request_payload,
+                    summary_payload={},
+                    started_at=stale_at,
+                    updated_at=stale_at,
+                )
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        replacement = _claim_feedback_retry_run(
+            market_date=market_date,
+            roles=('signal-decider',),
+            requested_symbols=(symbol,),
+            feedback_scope_mode='decider_scope_fast_path',
+            run_id=replacement_run_id,
+            started_at=datetime.now(timezone.utc),
+        )
+
+        with session_scope() as session:
+            stale_status = session.execute(
+                select(AgentContextFeedbackRun.status).where(
+                    AgentContextFeedbackRun.run_id == stale_run_id
+                )
+            ).scalar_one()
+        self.assertTrue(replacement['acquired'])
+        self.assertEqual(stale_status, 'abandoned')
+
+    def test_retry_owner_losing_lease_before_child_dispatch_fails_closed(self):
+        suffix = uuid4().hex[:10].upper()
+        market_date = date.fromisoformat('2040-01-06')
+        symbol = f'A{suffix}'
+        replacement_run_id = f'claim-takeover-{suffix}'
+        created_run_ids = [replacement_run_id]
+        roles = ('eod-summarizer',)
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        snapshots = SnapshotSequence(
+            [
+                _snapshot(
+                    market_date=market_date.isoformat(),
+                    symbols=(symbol,),
+                    role_states={
+                        roles[0]: _role_state(
+                            role=roles[0],
+                            symbols=(symbol,),
+                            boundary_pending=(symbol,),
+                            retry_pending=(symbol,),
+                        )
+                    },
+                ),
+                _snapshot(
+                    market_date=market_date.isoformat(),
+                    symbols=(symbol,),
+                    role_states={
+                        roles[0]: _role_state(
+                            role=roles[0],
+                            symbols=(symbol,),
+                            boundary_pending=(symbol,),
+                            retry_pending=(symbol,),
+                        )
+                    },
+                ),
+                _snapshot(
+                    market_date=market_date.isoformat(),
+                    symbols=(symbol,),
+                    role_states={
+                        roles[0]: _role_state(
+                            role=roles[0],
+                            symbols=(symbol,),
+                            completed=(symbol,),
+                        )
+                    },
+                ),
+            ]
+        )
+        original_checkpoint = service._checkpoint_run_state
+        takeover_result: dict[str, object] = {}
+
+        def checkpoint_with_takeover(**kwargs):
+            result = original_checkpoint(**kwargs)
+            if (
+                kwargs['lifecycle_stage'] == 'role_started'
+                and not takeover_result
+            ):
+                owner_run_id = kwargs['request_run_id']
+                created_run_ids.append(owner_run_id)
+                stale_at = datetime.now(timezone.utc) - timedelta(hours=2)
+                with session_scope() as session:
+                    owner = session.execute(
+                        select(AgentContextFeedbackRun).where(
+                            AgentContextFeedbackRun.run_id == owner_run_id
+                        )
+                    ).scalar_one()
+                    owner.updated_at = stale_at
+                takeover_result.update(
+                    _claim_feedback_retry_run(
+                        market_date=market_date,
+                        roles=roles,
+                        requested_symbols=(symbol,),
+                        feedback_scope_mode='decider_scope_fast_path',
+                        run_id=replacement_run_id,
+                        started_at=datetime.now(timezone.utc),
+                    )
+                )
+            return result
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(created_run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        with (
+            patch.object(service, '_load_eligible_symbols', return_value=[symbol]),
+            patch.object(
+                service,
+                '_build_role_sequence_snapshot',
+                side_effect=snapshots,
+            ),
+            patch.object(
+                service,
+                '_checkpoint_run_state',
+                side_effect=checkpoint_with_takeover,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
+            patch(
+                'app.agent_context.retry_service.build_agent_feedback_role_funnel',
+                return_value={
+                    'role_symbols': {roles[0]: [symbol]},
+                    'role_symbol_counts': {roles[0]: 1},
+                    'role_diagnostics': {roles[0]: {}},
+                },
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_feedback_run_state_service',
+                run_state_service,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_orchestrator.dispatch_for_symbols'
+            ) as dispatch,
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_progress_service.get_feedback_progress',
+                return_value={'summary': {'pending_symbols': 1}},
+            ),
+            self.assertRaisesRegex(RuntimeError, 'lease ownership lost'),
+        ):
+            service.run_retry_cycles(
+                config=SimpleNamespace(
+                    market_date=market_date,
+                    roles=roles,
+                    symbols=(symbol,),
+                    feedback_scope_mode='decider_scope_fast_path',
+                    max_cycles=1,
+                    outer_batch_size=1,
+                    reuse_existing=True,
+                    force_recompute=False,
+                    progress_callback=None,
+                )
+            )
+
+        self.assertTrue(takeover_result['acquired'])
+        dispatch.assert_not_called()
+        with session_scope() as session:
+            owner = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == created_run_ids[-1]
+                )
+            ).scalar_one()
+            self.assertEqual(owner.status, 'abandoned')
+            retry_admission = owner.request_payload['retry_admission']
+            self.assertNotIn('owner_token', retry_admission)
+            self.assertRegex(
+                retry_admission['owner_token_hash'],
+                r'^[0-9a-f]{64}$',
+            )
+            self.assertEqual(
+                owner.summary_payload['admission_lease_loss']['stage'],
+                'before_child_dispatch',
+            )
+
+    def test_retry_heartbeat_errors_exhaust_bounded_grace(self):
+        lease = _FeedbackRetryClaimLease(
+            run_id='heartbeat-grace-owner',
+            owner_token='heartbeat-grace-token',
+            heartbeat_grace_seconds=10,
+        )
+        lease._last_confirmed_monotonic = 100.0
+
+        with (
+            patch(
+                'app.agent_context.retry_service.time.monotonic',
+                return_value=109.9,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                '_record_feedback_retry_lease_loss',
+                return_value=True,
+            ) as record_loss,
+        ):
+            lease.note_heartbeat_exception(TimeoutError('temporary'))
+
+        self.assertFalse(lease.is_lost)
+        record_loss.assert_not_called()
+
+        with (
+            patch(
+                'app.agent_context.retry_service.time.monotonic',
+                return_value=110.0,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                '_record_feedback_retry_lease_loss',
+                return_value=True,
+            ) as record_loss,
+        ):
+            lease.note_heartbeat_exception(TimeoutError('expired'))
+
+        self.assertTrue(lease.is_lost)
+        record_loss.assert_called_once_with(
+            run_id='heartbeat-grace-owner',
+            owner_token='heartbeat-grace-token',
+            stage='heartbeat',
+            reason='heartbeat_refresh_grace_exceeded',
+            error_type='TimeoutError',
+        )
+        with self.assertRaisesRegex(
+            FeedbackRetryLeaseLostError,
+            'lease ownership lost',
+        ):
+            lease.assert_owned(stage='before_child_dispatch')
+
+    def test_retry_lease_ignores_late_heartbeat_after_finalization_begins(self):
+        lease = _FeedbackRetryClaimLease(
+            run_id='finalizing-owner',
+            owner_token='finalizing-token',
+            heartbeat_grace_seconds=10,
+        )
+        lease.begin_finalization()
+
+        with patch(
+            'app.agent_context.retry_service.'
+            '_record_feedback_retry_lease_loss',
+            return_value=True,
+        ) as record_loss:
+            lease.mark_lost(
+                reason='durable_claim_not_owned',
+                stage='heartbeat',
+            )
+
+        self.assertTrue(lease.is_finalizing)
+        self.assertFalse(lease.is_lost)
+        record_loss.assert_not_called()
+
+    def test_run_retry_cycles_finalizes_durable_claim_when_owner_raises(self):
+        suffix = uuid4().hex[:10].upper()
+        market_date = date.fromisoformat('2040-01-05')
+        symbol = f'A{suffix}'
+        created_run_ids: list[str] = []
+        service = AgentFeedbackRetryService()
+        config = SimpleNamespace(
+            market_date=market_date,
+            roles=('signal-decider',),
+            symbols=(symbol,),
+            feedback_scope_mode='decider_scope_fast_path',
+            max_cycles=3,
+            outer_batch_size=20,
+            reuse_existing=True,
+            force_recompute=False,
+            progress_callback=None,
+        )
+
+        def fail_after_claim(**kwargs):
+            created_run_ids.append(kwargs['request_run_id'])
+            raise RuntimeError('simulated owner failure')
+
+        def cleanup():
+            if not created_run_ids:
+                return
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(created_run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        with (
+            patch.object(
+                service,
+                '_run_retry_cycles_admitted',
+                side_effect=fail_after_claim,
+            ),
+            self.assertRaisesRegex(RuntimeError, 'simulated owner failure'),
+        ):
+            service.run_retry_cycles(config=config)
+
+        self.assertEqual(len(created_run_ids), 1)
+        with session_scope() as session:
+            persisted = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == created_run_ids[0]
+                )
+            ).scalar_one()
+            self.assertEqual(persisted.status, 'failed')
+            self.assertIsNotNone(persisted.completed_at)
+            self.assertEqual(
+                persisted.summary_payload['admission_owner_error']['type'],
+                'RuntimeError',
+            )
+
+    def test_feedback_retry_admission_lock_key_is_market_date_scoped(self):
+        lock_key = _feedback_retry_admission_lock_key(
+            market_date=date.fromisoformat('2026-04-16'),
+            roles=('signal-decider', 'short-term-overlay'),
+            symbols=('005930', '000660'),
+        )
+        reordered_lock_key = _feedback_retry_admission_lock_key(
+            market_date=date.fromisoformat('2026-04-16'),
+            roles=('short-term-overlay', 'signal-decider'),
+            symbols=('000660', '005930'),
+        )
+        self.assertEqual(lock_key, reordered_lock_key)
+        self.assertEqual(
+            lock_key,
+            _feedback_retry_admission_lock_key(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=('eod-summarizer',),
+                symbols=None,
+            ),
+        )
+
+    def test_equal_time_failure_prevents_feedback_reuse(self):
+        service = AgentContextReuseService()
+        suffix = uuid4().hex[:10]
+        symbol = f'E{suffix.upper()}'
+        role = 'eod-summarizer'
+        market_date = date.fromisoformat('2026-04-16')
+        observed_at = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedback(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=f'equal-success-{suffix}',
+                        summary_payload={},
+                        feedback_payload={'summary': 'ambiguous success'},
+                        context_payload={},
+                        received_at=observed_at,
+                    ),
+                    AgentContextFeedbackFailure(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=f'equal-failure-{suffix}',
+                        failure_kind='dispatch_failed',
+                        retryable=True,
+                        summary_payload={'error': 'ambiguous failure'},
+                        context_payload={},
+                        received_at=observed_at,
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedback).where(
+                        AgentContextFeedback.market_date == market_date,
+                        AgentContextFeedback.symbol == symbol,
+                        AgentContextFeedback.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.market_date == market_date,
+                        AgentContextFeedbackFailure.symbol == symbol,
+                        AgentContextFeedbackFailure.agent_name == role,
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        decision = service.build_latest_decisions(
+            market_date=market_date,
+            symbols=[symbol],
+            roles=[role],
+        )[symbol][role]
+
+        self.assertTrue(decision.should_dispatch)
+        self.assertEqual(decision.reason, 'latest_failure_pending_retry')
+
+    def test_newer_parent_success_outweighs_late_old_lineage_failure(self):
+        service = AgentContextReuseService()
+        suffix = uuid4().hex[:10].upper()
+        symbol = f'L{suffix}'
+        role = 'signal-decider'
+        market_date = date.fromisoformat('2026-04-16')
+        old_parent = f'old-parent-{suffix}'
+        old_child = f'old-child-{suffix}'
+        new_parent = f'new-parent-{suffix}'
+        new_child = f'new-child-{suffix}'
+        run_ids = [old_parent, old_child, new_parent, new_child]
+
+        def run_payload(*, parent_run_id=None, mode=None):
+            payload = {
+                'mode': mode or 'role_sequential_runtime_buffered',
+                'roles': [role],
+                'symbols': [symbol],
+                'requested_symbols': [symbol],
+                'role_symbol_scopes': {role: [symbol]},
+            }
+            if parent_run_id is not None:
+                payload['parent_run_id'] = parent_run_id
+            return payload
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedbackRun(
+                        run_id=old_parent,
+                        market_date=market_date,
+                        status='failed',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=1,
+                        request_payload=run_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 5, 0, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=old_child,
+                        market_date=market_date,
+                        status='failed',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=1,
+                        request_payload=run_payload(
+                            parent_run_id=old_parent
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 5, 1, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=new_parent,
+                        market_date=market_date,
+                        status='completed',
+                        symbols_total=1,
+                        completed_count=1,
+                        failed_count=0,
+                        request_payload=run_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 6, 0, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=new_child,
+                        market_date=market_date,
+                        status='completed',
+                        symbols_total=1,
+                        completed_count=1,
+                        failed_count=0,
+                        request_payload=run_payload(
+                            parent_run_id=new_parent
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 6, 1, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedback(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=new_child,
+                        summary_payload={},
+                        feedback_payload={'decision': 'WAIT'},
+                        context_payload={},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 2, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackFailure(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=old_child,
+                        failure_kind='agent_error',
+                        retryable=True,
+                        summary_payload={'error': 'late persisted old failure'},
+                        context_payload={},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 3, tzinfo=timezone.utc
+                        ),
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedback).where(
+                        AgentContextFeedback.market_date == market_date,
+                        AgentContextFeedback.symbol == symbol,
+                        AgentContextFeedback.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.market_date == market_date,
+                        AgentContextFeedbackFailure.symbol == symbol,
+                        AgentContextFeedbackFailure.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        decision = service.build_latest_decisions(
+            market_date=market_date,
+            symbols=[symbol],
+            roles=[role],
+        )[symbol][role]
+
+        self.assertFalse(decision.should_dispatch)
+        self.assertEqual(decision.reason, 'reuse_latest_feedback')
+        self.assertEqual(decision.latest_feedback['run_id'], new_child)
+
+    def test_newer_parent_failure_outweighs_later_old_lineage_child_success(self):
+        service = AgentContextReuseService()
+        suffix = uuid4().hex[:10].upper()
+        symbol = f'I{suffix}'
+        role = 'eod-summarizer'
+        market_date = date.fromisoformat('2026-04-16')
+        old_parent = f'inverse-old-parent-{suffix}'
+        old_success_child = f'inverse-old-success-{suffix}'
+        new_parent = f'inverse-new-parent-{suffix}'
+        new_failure_child = f'inverse-new-failure-{suffix}'
+        run_ids = [
+            old_parent,
+            old_success_child,
+            new_parent,
+            new_failure_child,
+        ]
+
+        def run_payload(*, parent_run_id=None, mode=None):
+            payload = {
+                'mode': mode or 'role_sequential_runtime_buffered',
+                'roles': [role],
+                'symbols': [symbol],
+                'requested_symbols': [symbol],
+                'role_symbol_scopes': {role: [symbol]},
+            }
+            if parent_run_id is not None:
+                payload['parent_run_id'] = parent_run_id
+            return payload
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedbackRun(
+                        run_id=old_parent,
+                        market_date=market_date,
+                        status='completed',
+                        symbols_total=1,
+                        completed_count=1,
+                        failed_count=0,
+                        request_payload=run_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 5, 0, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=new_parent,
+                        market_date=market_date,
+                        status='failed',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=1,
+                        request_payload=run_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 6, 0, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=new_failure_child,
+                        market_date=market_date,
+                        status='failed',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=1,
+                        request_payload=run_payload(
+                            parent_run_id=new_parent
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 6, 10, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=old_success_child,
+                        market_date=market_date,
+                        status='completed',
+                        symbols_total=1,
+                        completed_count=1,
+                        failed_count=0,
+                        request_payload=run_payload(
+                            parent_run_id=old_parent
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 7, 0, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackFailure(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=new_failure_child,
+                        failure_kind='agent_error',
+                        retryable=True,
+                        summary_payload={'error': 'newer parent failed'},
+                        context_payload={},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 11, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedback(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=old_success_child,
+                        summary_payload={},
+                        feedback_payload={'summary': 'late old child success'},
+                        context_payload={},
+                        received_at=datetime(
+                            2026, 4, 16, 7, 1, tzinfo=timezone.utc
+                        ),
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedback).where(
+                        AgentContextFeedback.market_date == market_date,
+                        AgentContextFeedback.symbol == symbol,
+                        AgentContextFeedback.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.market_date == market_date,
+                        AgentContextFeedbackFailure.symbol == symbol,
+                        AgentContextFeedbackFailure.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        decisions = service.build_latest_decisions(
+            market_date=market_date,
+            symbols=[symbol],
+            roles=[role],
+        )
+        decision = decisions[symbol][role]
+
+        self.assertTrue(decision.should_dispatch)
+        self.assertEqual(decision.reason, 'latest_failure_pending_retry')
+        upstream, traceability, missing = build_upstream_feedback_bundle(
+            symbol=symbol,
+            market_date=market_date,
+            buffered_lookup={},
+            upstream_reuse_decisions=decisions,
+            upstream_summary_roles=(role,),
+        )
+        self.assertEqual(upstream, {})
+        self.assertEqual(traceability, {})
+        self.assertEqual(missing, [role])
+
+    def test_same_run_failure_remains_authoritative_over_feedback(self):
+        service = AgentContextReuseService()
+        suffix = uuid4().hex[:10].upper()
+        symbol = f'S{suffix}'
+        role = 'signal-decider'
+        run_id = f'same-child-{suffix}'
+        market_date = date.fromisoformat('2026-04-16')
+        feedback_at = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedback(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=run_id,
+                        summary_payload={},
+                        feedback_payload={'decision': 'WAIT'},
+                        context_payload={},
+                        received_at=feedback_at,
+                    ),
+                    AgentContextFeedbackFailure(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=run_id,
+                        failure_kind='agent_error',
+                        retryable=True,
+                        summary_payload={'error': 'same dispatch failed'},
+                        context_payload={},
+                        received_at=feedback_at + timedelta(seconds=1),
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedback).where(
+                        AgentContextFeedback.market_date == market_date,
+                        AgentContextFeedback.symbol == symbol,
+                        AgentContextFeedback.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.market_date == market_date,
+                        AgentContextFeedbackFailure.symbol == symbol,
+                        AgentContextFeedbackFailure.agent_name == role,
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        decision = service.build_latest_decisions(
+            market_date=market_date,
+            symbols=[symbol],
+            roles=[role],
+        )[symbol][role]
+
+        self.assertTrue(decision.should_dispatch)
+        self.assertEqual(decision.reason, 'latest_failure_pending_retry')
+
+    def test_reuse_lineage_detaches_rows_and_breaks_equal_time_ties_by_id(self):
+        service = AgentFeedbackRetryService()
+        suffix = uuid4().hex[:10]
+        symbol = f'R{suffix.upper()}'
+        role = 'signal-decider'
+        prior_parent = f'prior-parent-{suffix}'
+        current_parent = f'current-parent-{suffix}'
+        older_child = f'older-child-{suffix}'
+        newer_child = f'newer-child-{suffix}'
+        run_ids = [prior_parent, current_parent, older_child, newer_child]
+        market_date = date.fromisoformat('2026-04-16')
+        parent_started_at = datetime(
+            2026, 4, 16, 6, 0, tzinfo=timezone.utc
+        )
+        child_started_at = datetime(
+            2026, 4, 16, 6, 1, tzinfo=timezone.utc
+        )
+
+        def request_payload(*, parent_run_id=None, mode=None):
+            payload = {
+                'mode': mode or 'role_sequential_runtime_buffered',
+                'roles': [role],
+                'symbols': [symbol],
+                'requested_symbols': [symbol],
+                'role_symbol_scopes': {role: [symbol]},
+            }
+            if parent_run_id is not None:
+                payload['parent_run_id'] = parent_run_id
+            return payload
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedbackRun(
+                        run_id=prior_parent,
+                        market_date=market_date,
+                        status='failed',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=1,
+                        request_payload=request_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={},
+                        started_at=parent_started_at,
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=current_parent,
+                        market_date=market_date,
+                        status='running',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=0,
+                        request_payload=request_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={},
+                        started_at=parent_started_at,
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=older_child,
+                        market_date=market_date,
+                        status='completed',
+                        symbols_total=1,
+                        completed_count=1,
+                        failed_count=0,
+                        request_payload=request_payload(
+                            parent_run_id=current_parent
+                        ),
+                        summary_payload={},
+                        started_at=child_started_at,
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=newer_child,
+                        market_date=market_date,
+                        status='abandoned',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=1,
+                        request_payload=request_payload(
+                            parent_run_id=current_parent
+                        ),
+                        summary_payload={},
+                        started_at=child_started_at,
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        (
+            latest_parent_by_key,
+            parent_by_child_run_id,
+            latest_child_by_parent_key,
+        ) = service._load_reuse_lineage_context(
+            market_date=market_date,
+            roles=(role,),
+            symbols=(symbol,),
+            current_parent_run_id=current_parent,
+            current_parent_started_at=parent_started_at,
+        )
+
+        self.assertEqual(
+            latest_parent_by_key[(symbol, role)],
+            (prior_parent, 'failed'),
+        )
+        self.assertEqual(
+            parent_by_child_run_id[newer_child],
+            current_parent,
+        )
+        self.assertEqual(
+            latest_child_by_parent_key[(current_parent, symbol, role)],
+            (newer_child, 'abandoned'),
+        )
+
+    def test_reuse_lineage_marks_only_failed_scope_of_partial_child_unusable(self):
+        service = AgentFeedbackRetryService()
+        suffix = uuid4().hex[:10].upper()
+        success_symbol = f'S{suffix}'
+        failed_symbol = f'F{suffix}'
+        role = 'signal-decider'
+        prior_parent = f'prior-partial-parent-{suffix}'
+        prior_child = f'prior-partial-child-{suffix}'
+        current_parent = f'current-parent-{suffix}'
+        run_ids = [prior_parent, prior_child, current_parent]
+        market_date = date.fromisoformat('2026-04-16')
+        parent_started_at = datetime(
+            2026, 4, 16, 6, 0, tzinfo=timezone.utc
+        )
+        symbols = [success_symbol, failed_symbol]
+
+        def request_payload(*, parent_run_id=None, mode=None):
+            payload = {
+                'mode': mode or 'role_sequential_runtime_buffered',
+                'roles': [role],
+                'symbols': symbols,
+                'requested_symbols': symbols,
+                'role_symbol_scopes': {role: symbols},
+            }
+            if parent_run_id is not None:
+                payload['parent_run_id'] = parent_run_id
+            return payload
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedbackRun(
+                        run_id=prior_parent,
+                        market_date=market_date,
+                        status='partial',
+                        symbols_total=2,
+                        completed_count=1,
+                        failed_count=1,
+                        request_payload=request_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={
+                            'failed_symbols_by_role': {
+                                role: [failed_symbol]
+                            }
+                        },
+                        started_at=datetime(
+                            2026, 4, 16, 5, 0, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=prior_child,
+                        market_date=market_date,
+                        status='completed_with_failures',
+                        symbols_total=2,
+                        completed_count=1,
+                        failed_count=1,
+                        request_payload=request_payload(
+                            parent_run_id=prior_parent
+                        ),
+                        summary_payload={
+                            'failed_symbols_by_role': {
+                                role: [failed_symbol]
+                            }
+                        },
+                        started_at=datetime(
+                            2026, 4, 16, 5, 1, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=current_parent,
+                        market_date=market_date,
+                        status='running',
+                        symbols_total=2,
+                        completed_count=0,
+                        failed_count=0,
+                        request_payload=request_payload(
+                            mode='daily_retry_cycle_role_sequenced'
+                        ),
+                        summary_payload={},
+                        started_at=parent_started_at,
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        (
+            latest_parent_by_key,
+            _,
+            latest_child_by_parent_key,
+        ) = service._load_reuse_lineage_context(
+            market_date=market_date,
+            roles=(role,),
+            symbols=symbols,
+            current_parent_run_id=current_parent,
+            current_parent_started_at=parent_started_at,
+        )
+
+        self.assertEqual(
+            latest_parent_by_key[(success_symbol, role)],
+            (prior_parent, 'partial'),
+        )
+        self.assertEqual(
+            latest_parent_by_key[(failed_symbol, role)],
+            (prior_parent, 'failed'),
+        )
+        self.assertEqual(
+            latest_child_by_parent_key[
+                (prior_parent, success_symbol, role)
+            ],
+            (prior_child, 'completed_with_failures'),
+        )
+        self.assertEqual(
+            latest_child_by_parent_key[
+                (prior_parent, failed_symbol, role)
+            ],
+            (prior_child, 'failed'),
+        )
+
+    def test_newer_failed_child_overrides_older_sibling_success(self):
+        service = AgentFeedbackRetryService()
+        suffix = uuid4().hex[:10]
+        symbol = f'F{suffix.upper()}'
+        role = 'eod-summarizer'
+        parent_run = f'failure-parent-{suffix}'
+        successful_child = f'success-child-{suffix}'
+        failed_child = f'failed-child-{suffix}'
+        run_ids = [parent_run, successful_child, failed_child]
+        market_date = date.fromisoformat('2026-04-16')
+        parent_started_at = datetime(
+            2026, 4, 16, 6, 0, tzinfo=timezone.utc
+        )
+
+        def request_payload(*, parent_run_id=None):
+            payload = {
+                'mode': 'role_sequential_runtime_buffered',
+                'roles': [role],
+                'symbols': [symbol],
+                'requested_symbols': [symbol],
+                'role_symbol_scopes': {role: [symbol]},
+            }
+            if parent_run_id is not None:
+                payload['parent_run_id'] = parent_run_id
+            return payload
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedbackRun(
+                        run_id=parent_run,
+                        market_date=market_date,
+                        status='running',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=0,
+                        request_payload={
+                            **request_payload(),
+                            'mode': 'daily_retry_cycle_role_sequenced',
+                        },
+                        summary_payload={},
+                        started_at=parent_started_at,
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=successful_child,
+                        market_date=market_date,
+                        status='completed',
+                        symbols_total=1,
+                        completed_count=1,
+                        failed_count=0,
+                        request_payload=request_payload(
+                            parent_run_id=parent_run
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 6, 1, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=failed_child,
+                        market_date=market_date,
+                        status='failed',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=1,
+                        request_payload=request_payload(
+                            parent_run_id=parent_run
+                        ),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 6, 2, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedback(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=successful_child,
+                        summary_payload={},
+                        feedback_payload={'summary': 'older success'},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 1, 30, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackFailure(
+                        market_date=market_date,
+                        symbol=symbol,
+                        agent_name=role,
+                        run_id=failed_child,
+                        failure_kind='agent_error',
+                        retryable=True,
+                        summary_payload={'error': 'newer failure'},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 2, 30, tzinfo=timezone.utc
+                        ),
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedback).where(
+                        AgentContextFeedback.market_date == market_date,
+                        AgentContextFeedback.symbol == symbol,
+                        AgentContextFeedback.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.market_date == market_date,
+                        AgentContextFeedbackFailure.symbol == symbol,
+                        AgentContextFeedbackFailure.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        with patch(
+            'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+            return_value={
+                symbol: {
+                    role: _decision(
+                        should_dispatch=True,
+                        reason='latest_failure_pending_retry',
+                    )
+                }
+            },
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=market_date,
+                roles=(role,),
+                eligible_symbols=(symbol,),
+                parent_run_id=parent_run,
+                parent_started_at=parent_started_at,
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ())
+        self.assertEqual(role_state.failed_symbols, (symbol,))
+        self.assertEqual(role_state.retry_pending_symbols, (symbol,))
+        self.assertEqual(role_state.boundary_status, 'failed')
+
+    def test_partial_child_summary_keeps_failed_scope_after_failure_row_overwrite(
+        self,
+    ):
+        service = AgentFeedbackRetryService()
+        suffix = uuid4().hex[:10].upper()
+        success_symbol = f'A{suffix}'
+        failed_symbol = f'B{suffix}'
+        role = 'signal-decider'
+        parent_run = f'partial-parent-{suffix}'
+        current_child = f'partial-child-{suffix}'
+        old_child = f'old-child-{suffix}'
+        run_ids = [parent_run, current_child, old_child]
+        market_date = date.fromisoformat('2026-04-16')
+        parent_started_at = datetime(
+            2026, 4, 16, 6, 0, tzinfo=timezone.utc
+        )
+        symbols = [success_symbol, failed_symbol]
+
+        def child_request(run_parent: str | None = None):
+            payload = {
+                'roles': [role],
+                'symbols': symbols,
+                'requested_symbols': symbols,
+                'role_symbol_scopes': {role: symbols},
+            }
+            if run_parent is not None:
+                payload['parent_run_id'] = run_parent
+            return payload
+
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedbackRun(
+                        run_id=parent_run,
+                        market_date=market_date,
+                        status='running',
+                        symbols_total=2,
+                        completed_count=0,
+                        failed_count=0,
+                        request_payload={
+                            **child_request(),
+                            'mode': 'daily_retry_cycle_role_sequenced',
+                        },
+                        summary_payload={},
+                        started_at=parent_started_at,
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=old_child,
+                        market_date=market_date,
+                        status='failed',
+                        symbols_total=2,
+                        completed_count=0,
+                        failed_count=2,
+                        request_payload=child_request('older-parent'),
+                        summary_payload={},
+                        started_at=datetime(
+                            2026, 4, 16, 5, 0, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=current_child,
+                        market_date=market_date,
+                        status='completed_with_failures',
+                        symbols_total=2,
+                        completed_count=1,
+                        failed_count=1,
+                        request_payload=child_request(parent_run),
+                        summary_payload={
+                            'failed_symbols_by_role': {
+                                role: [failed_symbol]
+                            }
+                        },
+                        started_at=datetime(
+                            2026, 4, 16, 6, 1, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedback(
+                        market_date=market_date,
+                        symbol=success_symbol,
+                        agent_name=role,
+                        run_id=current_child,
+                        summary_payload={},
+                        feedback_payload={'summary': 'current success'},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 2, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedback(
+                        market_date=market_date,
+                        symbol=failed_symbol,
+                        agent_name=role,
+                        run_id=current_child,
+                        summary_payload={},
+                        feedback_payload={'summary': 'stale response'},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 2, tzinfo=timezone.utc
+                        ),
+                    ),
+                    AgentContextFeedbackFailure(
+                        market_date=market_date,
+                        symbol=failed_symbol,
+                        agent_name=role,
+                        run_id=old_child,
+                        failure_kind='agent_error',
+                        retryable=True,
+                        summary_payload={'error': 'late old failure'},
+                        received_at=datetime(
+                            2026, 4, 16, 6, 3, tzinfo=timezone.utc
+                        ),
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedback).where(
+                        AgentContextFeedback.market_date == market_date,
+                        AgentContextFeedback.symbol.in_(symbols),
+                        AgentContextFeedback.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.market_date == market_date,
+                        AgentContextFeedbackFailure.symbol.in_(symbols),
+                        AgentContextFeedbackFailure.agent_name == role,
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        completed, failed = service._load_same_day_terminal_symbols(
+            market_date=market_date,
+            roles=(role,),
+            symbols=symbols,
+            required_parent_run_id=parent_run,
+        )
+
+        self.assertEqual(completed[role], {success_symbol})
+        self.assertEqual(failed[role], {failed_symbol})
+
+    def test_retry_parent_summary_preserves_exact_reused_symbols_by_role(self):
+        market_date = date.fromisoformat('2026-04-16')
+        state = RuntimeFeedbackRunState(
+            run_id='feedback-parent-reuse-summary',
+            market_date=market_date,
+            requested_symbols=['005930', '000660'],
+            requested_roles=['eod-summarizer'],
+            role_sequence=['eod-summarizer'],
+            parallel_per_role=1,
+            batch_size=20,
+            started_at=datetime.now(timezone.utc),
+            reused_symbols_by_role={'eod-summarizer': {'000660', '005930'}},
+            reused_feedback_evidence_by_role={
+                'eod-summarizer': {
+                    '000660': {
+                        'schema_version': 'agent_feedback_reuse_evidence_v1',
+                        'feedback_id': 10,
+                        'feedback_run_id': 'reuse-source-000660',
+                        'feedback_received_at': '2026-04-16T05:00:00+00:00',
+                    },
+                    '005930': {
+                        'schema_version': 'agent_feedback_reuse_evidence_v1',
+                        'feedback_id': 11,
+                        'feedback_run_id': 'reuse-source-005930',
+                        'feedback_received_at': '2026-04-16T05:01:00+00:00',
+                    },
+                }
+            },
+        )
+
+        summary = AgentFeedbackRetryService()._build_run_summary_payload(
+            market_date=market_date,
+            request_payload={'request_run_id': state.run_id},
+            state=state,
+            lifecycle_stage='finished',
+        )
+
+        self.assertEqual(
+            summary['reused_symbols_by_role'],
+            {'eod-summarizer': ['000660', '005930']},
+        )
+        self.assertEqual(
+            summary['reused_feedback_evidence_by_role']['eod-summarizer'][
+                '005930'
+            ]['feedback_run_id'],
+            'reuse-source-005930',
+        )
+
+    def test_role_snapshot_attests_same_day_terminal_feedback_as_reused(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+        parent_started_at = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+
+        def load_terminal_symbols(**kwargs):
+            if kwargs.get('required_parent_run_id'):
+                return ({}, {})
+            return ({role: {'005930'}}, {})
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=load_terminal_symbols,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=False,
+                            latest_feedback_id=17,
+                            latest_feedback={
+                                'id': 17,
+                                'run_id': 'feedback-source-reuse',
+                                'received_at': '2026-04-16T05:59:00+00:00',
+                            },
+                            latest_feedback_received_at='2026-04-16T05:59:00+00:00',
+                            latest_decision_snapshot_id=117,
+                            latest_decision_snapshot_fingerprint='snapshot-117',
+                            latest_decision_snapshot_observed_at='2026-04-16T05:58:00+00:00',
+                            reason='reuse_latest_feedback',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id='feedback-parent-reuse',
+                parent_started_at=parent_started_at,
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ('005930',))
+        self.assertEqual(role_state.reused_symbols, ('005930',))
+        self.assertEqual(
+            role_state.reused_feedback_evidence['005930']['feedback_run_id'],
+            'feedback-source-reuse',
+        )
+        self.assertEqual(role_state.boundary_pending_symbols, ())
+
+    def test_role_snapshot_does_not_reuse_stale_same_day_feedback(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+
+        def load_terminal_symbols(**kwargs):
+            if kwargs.get('required_parent_run_id'):
+                return ({}, {})
+            return ({role: {'005930'}}, {})
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=load_terminal_symbols,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=True,
+                            latest_feedback_received_at='2026-04-16T05:00:00+00:00',
+                            reason='source_updated',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id='feedback-parent-stale',
+                parent_started_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ())
+        self.assertEqual(role_state.reused_symbols, ())
+        self.assertEqual(role_state.boundary_pending_symbols, ('005930',))
+
+    def test_role_snapshot_rejects_reuse_from_parent_older_than_latest_authority(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+        key = ('005930', role)
+
+        def load_terminal_symbols(**kwargs):
+            if kwargs.get('required_parent_run_id'):
+                return ({}, {})
+            return ({role: {'005930'}}, {})
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=load_terminal_symbols,
+            ),
+            patch.object(
+                service,
+                '_load_reuse_lineage_context',
+                return_value=(
+                    {key: ('parent-two', 'failed')},
+                    {'late-child-one': 'parent-one'},
+                    {
+                        ('parent-two', '005930', role): (
+                            'failed-child-two',
+                            'failed',
+                        )
+                    },
+                ),
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=False,
+                            latest_feedback_id=19,
+                            latest_feedback={
+                                'id': 19,
+                                'run_id': 'late-child-one',
+                                'received_at': '2026-04-16T05:59:00+00:00',
+                            },
+                            latest_feedback_received_at='2026-04-16T05:59:00+00:00',
+                            latest_decision_snapshot_id=119,
+                            latest_decision_snapshot_fingerprint='snapshot-119',
+                            latest_decision_snapshot_observed_at='2026-04-16T05:58:00+00:00',
+                            reason='reuse_latest_feedback',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id='parent-three',
+                parent_started_at=datetime(
+                    2026, 4, 16, 6, 0, tzinfo=timezone.utc
+                ),
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ())
+        self.assertEqual(role_state.reused_symbols, ())
+        self.assertEqual(role_state.boundary_pending_symbols, ('005930',))
+
+    def test_role_snapshot_rejects_older_sibling_from_latest_parent(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+        key = ('005930', role)
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=lambda **kwargs: (
+                    ({}, {})
+                    if kwargs.get('required_parent_run_id')
+                    else ({role: {'005930'}}, {})
+                ),
+            ),
+            patch.object(
+                service,
+                '_load_reuse_lineage_context',
+                return_value=(
+                    {key: ('parent-two', 'completed')},
+                    {
+                        'child-a': 'parent-two',
+                        'child-b': 'parent-two',
+                    },
+                    {
+                        ('parent-two', '005930', role): (
+                            'child-b',
+                            'completed',
+                        )
+                    },
+                ),
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=False,
+                            latest_feedback_id=20,
+                            latest_feedback={
+                                'id': 20,
+                                'run_id': 'child-a',
+                                'received_at': '2026-04-16T05:59:00+00:00',
+                            },
+                            latest_feedback_received_at='2026-04-16T05:59:00+00:00',
+                            latest_decision_snapshot_id=120,
+                            latest_decision_snapshot_fingerprint='snapshot-120',
+                            latest_decision_snapshot_observed_at='2026-04-16T05:58:00+00:00',
+                            reason='reuse_latest_feedback',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id='parent-three',
+                parent_started_at=datetime(
+                    2026, 4, 16, 6, 0, tzinfo=timezone.utc
+                ),
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ())
+        self.assertEqual(role_state.reused_symbols, ())
+        self.assertEqual(role_state.boundary_pending_symbols, ('005930',))
+
+    def test_role_snapshot_reuses_latest_lineage_success_over_older_global_failure(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+        key = ('005930', role)
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=lambda **kwargs: (
+                    ({}, {})
+                    if kwargs.get('required_parent_run_id')
+                    else ({}, {role: {'005930'}})
+                ),
+            ),
+            patch.object(
+                service,
+                '_load_reuse_lineage_context',
+                return_value=(
+                    {key: ('latest-parent', 'completed')},
+                    {'latest-child': 'latest-parent'},
+                    {
+                        ('latest-parent', '005930', role): (
+                            'latest-child',
+                            'completed',
+                        )
+                    },
+                ),
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=True,
+                            latest_feedback_id=22,
+                            latest_feedback={
+                                'id': 22,
+                                'run_id': 'latest-child',
+                                'received_at': '2026-04-16T05:59:00+00:00',
+                            },
+                            latest_feedback_received_at=(
+                                '2026-04-16T05:59:00+00:00'
+                            ),
+                            latest_decision_snapshot_id=122,
+                            latest_decision_snapshot_fingerprint=(
+                                'snapshot-122'
+                            ),
+                            latest_decision_snapshot_observed_at=(
+                                '2026-04-16T05:58:00+00:00'
+                            ),
+                            reason='latest_failure_pending_retry',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id='current-parent',
+                parent_started_at=datetime(
+                    2026, 4, 16, 6, 0, tzinfo=timezone.utc
+                ),
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ('005930',))
+        self.assertEqual(role_state.reused_symbols, ('005930',))
+        self.assertEqual(role_state.failed_symbols, ())
+        self.assertEqual(role_state.boundary_pending_symbols, ())
+
+    def test_role_snapshot_never_reuses_feedback_from_failed_child(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+        key = ('005930', role)
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=lambda **kwargs: (
+                    ({}, {})
+                    if kwargs.get('required_parent_run_id')
+                    else ({role: {'005930'}}, {})
+                ),
+            ),
+            patch.object(
+                service,
+                '_load_reuse_lineage_context',
+                return_value=(
+                    {key: ('prior-parent', 'failed')},
+                    {'failed-child': 'prior-parent'},
+                    {
+                        ('prior-parent', '005930', role): (
+                            'failed-child',
+                            'failed',
+                        )
+                    },
+                ),
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=False,
+                            latest_feedback_id=21,
+                            latest_feedback={
+                                'id': 21,
+                                'run_id': 'failed-child',
+                                'received_at': (
+                                    '2026-04-16T05:59:00+00:00'
+                                ),
+                            },
+                            latest_feedback_received_at=(
+                                '2026-04-16T05:59:00+00:00'
+                            ),
+                            latest_decision_snapshot_id=121,
+                            latest_decision_snapshot_fingerprint=(
+                                'snapshot-121'
+                            ),
+                            latest_decision_snapshot_observed_at=(
+                                '2026-04-16T05:58:00+00:00'
+                            ),
+                            reason='reuse_latest_feedback',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id='current-parent',
+                parent_started_at=datetime(
+                    2026, 4, 16, 6, 0, tzinfo=timezone.utc
+                ),
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ())
+        self.assertEqual(role_state.reused_symbols, ())
+        self.assertEqual(role_state.boundary_pending_symbols, ('005930',))
+
+    def test_role_snapshot_does_not_reuse_feedback_received_after_parent_started(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+
+        def load_terminal_symbols(**kwargs):
+            if kwargs.get('required_parent_run_id'):
+                return ({}, {})
+            return ({role: {'005930'}}, {})
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=load_terminal_symbols,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=False,
+                            latest_feedback_id=18,
+                            latest_feedback={
+                                'id': 18,
+                                'run_id': 'feedback-source-after-cutoff',
+                                'received_at': '2026-04-16T06:01:00+00:00',
+                            },
+                            latest_feedback_received_at='2026-04-16T06:01:00+00:00',
+                            latest_decision_snapshot_id=118,
+                            latest_decision_snapshot_fingerprint='snapshot-118',
+                            latest_decision_snapshot_observed_at='2026-04-16T05:58:00+00:00',
+                            reason='reuse_latest_feedback',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id='feedback-parent-cutoff',
+                parent_started_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ())
+        self.assertEqual(role_state.reused_symbols, ())
+        self.assertEqual(role_state.boundary_pending_symbols, ('005930',))
+
+    def test_role_snapshot_keeps_current_parent_failure_retryable_over_late_older_success(self):
+        service = AgentFeedbackRetryService()
+        role = 'eod-summarizer'
+        parent_run_id = 'feedback-parent-current-failure'
+        parent_started_at = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+
+        def load_terminal_symbols(**kwargs):
+            if kwargs.get('required_parent_run_id') == parent_run_id:
+                return ({}, {role: {'005930'}})
+            return ({role: {'005930'}}, {})
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=load_terminal_symbols,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={
+                    '005930': {
+                        role: _decision(
+                            should_dispatch=False,
+                            latest_feedback_received_at='2026-04-16T06:01:00+00:00',
+                            reason='reuse_latest_feedback',
+                        )
+                    }
+                },
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930',),
+                reuse_existing=True,
+                parent_run_id=parent_run_id,
+                parent_started_at=parent_started_at,
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ())
+        self.assertEqual(role_state.reused_symbols, ())
+        self.assertEqual(role_state.failed_symbols, ('005930',))
+        self.assertEqual(role_state.terminal_symbols, ('005930',))
+        self.assertEqual(role_state.boundary_pending_symbols, ())
+        self.assertEqual(role_state.retry_pending_symbols, ('005930',))
+        self.assertEqual(role_state.boundary_status, 'failed')
+
+    def test_role_snapshot_force_recompute_counts_only_current_parent_feedback(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+        parent_run_id = 'feedback-parent-force-recompute'
+
+        def load_terminal_symbols(**kwargs):
+            if kwargs.get('required_parent_run_id') == parent_run_id:
+                return ({role: {'005930'}}, {})
+            return ({role: {'005930', '000660'}}, {})
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                side_effect=load_terminal_symbols,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={},
+            ),
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=('005930', '000660'),
+                force_recompute=True,
+                reuse_existing=True,
+                parent_run_id=parent_run_id,
+                parent_started_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.completed_symbols, ('005930',))
+        self.assertEqual(role_state.reused_symbols, ())
+        self.assertEqual(role_state.boundary_pending_symbols, ('000660',))
+
+    def test_final_status_keeps_exhausted_terminal_failures_visible(self):
+        symbols = ('005930', '000660')
+        snapshot = _snapshot(
+            symbols=symbols,
+            role_states={
+                'signal-decider': _role_state(
+                    role='signal-decider',
+                    symbols=symbols,
+                    completed=('005930',),
+                    failed=('000660',),
+                )
+            },
+        )
+
+        status = AgentFeedbackRetryService._resolve_final_status(
+            eligible_symbols=symbols,
+            snapshot=snapshot,
+            retry_pending_symbols=(),
+            boundary_pending_roles=(),
+        )
+
+        self.assertEqual(status, 'partial')
+
+    def test_final_status_is_failed_when_every_terminal_item_failed(self):
+        symbols = ('005930', '000660')
+        snapshot = _snapshot(
+            symbols=symbols,
+            role_states={
+                'signal-decider': _role_state(
+                    role='signal-decider',
+                    symbols=symbols,
+                    failed=symbols,
+                )
+            },
+        )
+
+        status = AgentFeedbackRetryService._resolve_final_status(
+            eligible_symbols=symbols,
+            snapshot=snapshot,
+            retry_pending_symbols=(),
+            boundary_pending_roles=(),
+        )
+
+        self.assertEqual(status, 'failed')
     def setUp(self):
         self.prerequisite_patcher = patch(
             'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
@@ -218,7 +2346,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 symbols=('005930', '000660'),
             )
 
-        self.assertEqual(result, ('005930',))
+        self.assertEqual(result, ())
 
     def test_load_incomplete_symbols_uses_feedback_eligible_universe(self):
         service = AgentFeedbackRetryService()
@@ -420,6 +2548,66 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(result['progress']['summary']['completed_feedback_per_minute'], 0.6)
         self.assertEqual(result['progress']['summary']['estimated_completion_at'], '2026-04-16T01:05:00+00:00')
 
+    def test_run_retry_cycles_joins_identical_active_scope_when_admission_is_busy(self):
+        service = AgentFeedbackRetryService()
+        config = SimpleNamespace(
+            market_date=date.fromisoformat('2026-04-16'),
+            roles=('signal-decider',),
+            symbols=('005930',),
+            feedback_scope_mode='decider_scope_fast_path',
+            max_cycles=3,
+            outer_batch_size=20,
+            reuse_existing=True,
+            force_recompute=False,
+            progress_callback=None,
+        )
+        active_run = {
+            'run_id': 'feedback-cycle-active',
+            'status': 'running',
+            'request_payload': {
+                'requested_symbols': ['005930'],
+                'symbols': ['005930'],
+                'roles': ['signal-decider'],
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+            },
+        }
+        run_state_service = RecordingRunStateService()
+        run_state_service.find_latest_run = lambda **_: active_run
+
+        with (
+            patch(
+                'app.agent_context.retry_service._claim_feedback_retry_run',
+                return_value={
+                    'acquired': False,
+                    'run_id': None,
+                    'conflict_run': active_run,
+                    'exact_scope': True,
+                },
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_feedback_run_state_service',
+                run_state_service,
+            ),
+            patch.object(
+                service,
+                '_run_retry_cycles_admitted',
+                create=True,
+            ) as admitted_run,
+            patch.object(
+                service,
+                '_get_retry_progress',
+                return_value={'summary': {'pending_symbols': 1}},
+            ),
+        ):
+            result = service.run_retry_cycles(config=config)
+
+        admitted_run.assert_not_called()
+        self.assertEqual(result['run_id'], 'feedback-cycle-active')
+        self.assertEqual(result['status'], 'running')
+        self.assertTrue(result['joined_existing_run'])
+        self.assertEqual(result['admission_status'], 'active_scope_joined')
+
     def test_run_retry_cycles_scopes_progress_to_requested_roles(self):
         service = AgentFeedbackRetryService()
         run_state_service = RecordingRunStateService()
@@ -471,6 +2659,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                     role=role,
                     symbols=('005930',),
                     completed=('005930',),
+                    reused=('005930',) if role == 'eod-summarizer' else (),
                 )
                 for role in EXPECTED_ROLES
             },
@@ -524,6 +2713,10 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(
             run_state_service.finished[0]['summary_payload']['feedback_scope_mode'],
             'decider_scope_fast_path',
+        )
+        self.assertEqual(
+            run_state_service.finished[0]['summary_payload']['reused_symbols_by_role'],
+            {'eod-summarizer': ['005930']},
         )
         self.assertEqual(result['feedback_scope_mode'], 'decider_scope_fast_path')
         self.assertEqual(result['requested_symbols'], ['005930'])
@@ -600,6 +2793,9 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                                     max_cycles=1,
                                     outer_batch_size=2,
                                     reuse_existing=True,
+                                    knowledge_cutoff_at=(
+                                        '2026-04-16T09:00:00+00:00'
+                                    ),
                                 )
                             )
 
@@ -618,6 +2814,31 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 {'index': 2, 'total': 3, 'outer_batch_size': 2},
                 {'index': 3, 'total': 3, 'outer_batch_size': 2},
             ],
+        )
+        parent_run_id = run_state_service.started[0]['run_id']
+        self.assertEqual(
+            run_state_service.started[0]['request_payload']['child_run_lineage'],
+            {
+                'schema_version': 'agent_feedback_child_run_lineage_v1',
+                'parent_run_id': parent_run_id,
+                'child_link_field': 'parent_run_id',
+            },
+        )
+        self.assertEqual(
+            run_state_service.finished[0]['summary_payload']['request'][
+                'child_run_lineage'
+            ],
+            run_state_service.started[0]['request_payload']['child_run_lineage'],
+        )
+        self.assertTrue(
+            all(call['parent_run_id'] == parent_run_id for call in dispatch_calls)
+        )
+        self.assertTrue(
+            all(
+                call['knowledge_cutoff_at']
+                == '2026-04-16T09:00:00+00:00'
+                for call in dispatch_calls
+            )
         )
         self.assertTrue(result['completed'])
         self.assertEqual(result['cycles'][0]['role_batches'][0]['summary']['chunks'], 3)
@@ -1014,7 +3235,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 ('signal-decider', ['000660']),
             ],
         )
-        self.assertTrue(all(call['reuse_existing'] is True for call in dispatch_calls))
+        self.assertTrue(all(call['reuse_existing'] is False for call in dispatch_calls))
         self.assertTrue(result['completed'])
         self.assertEqual(result['final_pending'], 0)
         self.assertEqual(result['cycles'][0]['mode'], 'boundary_resume')
@@ -1290,7 +3511,8 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             [('fundamental-summarizer', ['000660']), ('signal-decider', ['005930', '000660'])],
         )
         self.assertEqual(run_state_service.started[0]['request_payload']['resumed_from_run_id'], 'prior-retry-run')
-        self.assertEqual(run_state_service.finished[-1]['status'], 'completed')
+        self.assertEqual(run_state_service.finished[-1]['status'], 'partial')
+        self.assertEqual(result['status'], 'partial')
         role_started_checkpoints = [
             checkpoint['summary_payload']
             for checkpoint in run_state_service.checkpoints

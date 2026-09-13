@@ -7,6 +7,9 @@ from typing import Any, Iterable, Mapping
 
 class FeedbackFailureKind(str, Enum):
     DEPENDENCY_MISSING_UPSTREAM = 'dependency_missing_upstream'
+    DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH = (
+        'dependency_upstream_changed_during_dispatch'
+    )
     OPENCLAW_AUTH_MISSING = 'openclaw_auth_missing'
     OPENCLAW_AUTH_REJECTED = 'openclaw_auth_rejected'
     OPENCLAW_TRANSPORT_TIMEOUT = 'openclaw_transport_timeout'
@@ -20,6 +23,9 @@ class FeedbackFailureKind(str, Enum):
 
 class FeedbackFailureStatus(str, Enum):
     DEPENDENCY_MISSING_UPSTREAM = 'dependency/missing-upstream'
+    DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH = (
+        'dependency/upstream-changed-during-dispatch'
+    )
     AUTH_MISSING = 'auth/missing'
     AUTH_REJECTED = 'auth/rejected'
     TRANSPORT_TIMEOUT = 'transport/timeout'
@@ -119,6 +125,26 @@ def classify_feedback_failure(
     context_payload = context if isinstance(context, Mapping) else {}
     summary_payload = summary if isinstance(summary, Mapping) else {}
     status_codes = set(_status_code_values(summary_payload, context_payload))
+
+    if (
+        'dependency_upstream_changed_during_dispatch' in haystack
+        or failure_kind
+        == FeedbackFailureKind.DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH.value
+        or failure_kind
+        == FeedbackFailureStatus.DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH.value
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=(
+                FeedbackFailureKind.DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH.value
+            ),
+            failure_status=(
+                FeedbackFailureStatus.DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH.value
+            ),
+            failure_category='dependency',
+            reason=(
+                'decision inputs changed while the decider response was in flight'
+            ),
+        )
 
     missing_roles = context_payload.get('missing_roles')
     if (

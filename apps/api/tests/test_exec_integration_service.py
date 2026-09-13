@@ -16,6 +16,7 @@ from app.core.settings import settings
 from app.db import engine, session_scope
 from app.db_models import (
     AgentContextFeedback,
+    AgentContextFeedbackFailure,
     AgentContextFeedbackRun,
     BrokerOrder,
     CurrentMarketSnapshotCache,
@@ -23,6 +24,7 @@ from app.db_models import (
     SignalDeciderActualExecutionOutcome,
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
+    SignalDeciderPolicyVersion,
     Symbol,
 )
 from app.market.clock import MarketState
@@ -72,6 +74,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     NextOpenAccountTarget,
+    _load_signal_decider_policy_authority,
     _next_open_policy_fingerprint,
     _short_term_entry_quality_blocks,
     signal_decider_next_open_execution_service,
@@ -96,6 +99,7 @@ class FakeExecClient:
             else bearer_token
         )
         self.post_calls: list[dict] = []
+        self.activation_calls: list[dict] = []
         self.revocation_calls: list[dict] = []
         self.dispatch_events: list[str] = []
         self.runtime_calls = 0
@@ -173,6 +177,37 @@ class FakeExecClient:
             'accepted_item_count': len(items),
             'rejected_item_count': 0,
             'item_acks': items,
+        }
+
+    async def post_execution_plan_activation(self, payload: dict) -> dict:
+        self.dispatch_events.append('activation')
+        self.activation_calls.append(payload)
+        return {
+            'plan_id': payload['plan_id'],
+            'execution_plan_id': payload['execution_plan_id'],
+            'contract_ack': {
+                'schema_version': 'execution_handoff_activation_v1',
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': 'core_confirmed_activation_v1',
+                'plan_id': payload['plan_id'],
+                'status': 'activated',
+                'dispatch_material_fingerprint': payload[
+                    'dispatch_material_fingerprint'
+                ],
+                'authority_generation_fingerprint': payload[
+                    'authority_generation_fingerprint'
+                ],
+            },
+            'item_acks': [
+                {
+                    **item,
+                    'status': 'activated',
+                    'execution_plan_id': payload['execution_plan_id'],
+                }
+                for item in payload['items']
+            ],
+            'activated_item_count': len(payload['items']),
+            'idempotent_replay': False,
         }
 
     async def post_execution_plan_revocation(self, payload: dict) -> dict:
@@ -1306,11 +1341,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         AgentContextFeedback.__table__.create(bind=engine, checkfirst=True)
+        AgentContextFeedbackFailure.__table__.create(bind=engine, checkfirst=True)
         AgentContextFeedbackRun.__table__.create(bind=engine, checkfirst=True)
         OrderRequest.__table__.create(bind=engine, checkfirst=True)
         BrokerOrder.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderDecisionSnapshot.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderExecutionPlanItem.__table__.create(bind=engine, checkfirst=True)
+        SignalDeciderPolicyVersion.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderActualExecutionOutcome.__table__.create(bind=engine, checkfirst=True)
         CurrentMarketSnapshotCache.__table__.create(bind=engine, checkfirst=True)
         Symbol.__table__.create(bind=engine, checkfirst=True)
@@ -1325,6 +1362,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.short_term_client_order_id = f'STDE-20260430-{self.symbol}'
         self.market_date = date(2026, 4, 29)
         self.target_trade_date = date(2026, 4, 30)
+        self._previous_active_policy_states: list[
+            tuple[str, datetime | None]
+        ] = []
         self.original_settings = {
             'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
             'signal_decider_exec_base_url': settings.signal_decider_exec_base_url,
@@ -1377,6 +1417,50 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.enrichment_preflight_mock = self.enrichment_preflight_patcher.start()
         self.addCleanup(self.enrichment_preflight_patcher.stop)
+
+        def complete_agent_context(
+            *,
+            source_market_date,
+            candidate_symbols=None,
+            **_kwargs,
+        ):
+            return {
+                'schema_version': 'agent_context_completeness_v1',
+                'source_market_date': source_market_date.isoformat(),
+                'candidate_symbols': sorted(set(candidate_symbols or [])),
+                'candidate_set_basis': 'latest_signal_decider_snapshots',
+                'status': 'complete',
+                'cohort_status': 'complete',
+                'has_incomplete_agent_context': False,
+                'candidate_set_definitive': True,
+                'authority_fingerprint': 'exec-integration-agent-context-authority',
+                'latest_run': None,
+                'failure_count': 0,
+                'failure_groups': [],
+            }
+
+        self.agent_context_builder_patcher = patch(
+            'app.orders.next_open_execution.SignalDeciderNextOpenExecutionService.'
+            '_build_agent_context_completeness_context',
+            side_effect=complete_agent_context,
+        )
+        self.agent_context_builder_patcher.start()
+        self.addCleanup(self.agent_context_builder_patcher.stop)
+        self.agent_context_from_state_patcher = patch(
+            'app.orders.next_open_execution.SignalDeciderNextOpenExecutionService.'
+            '_build_agent_context_completeness_from_state',
+            side_effect=complete_agent_context,
+        )
+        self.agent_context_from_state_patcher.start()
+        self.addCleanup(self.agent_context_from_state_patcher.stop)
+
+        self.snapshot_generation_patcher = patch(
+            'app.orders.next_open_execution.agent_feedback_orchestrator.'
+            'revalidate_persisted_decider_snapshots',
+            side_effect=self._valid_snapshot_generation_fixture,
+        )
+        self.snapshot_generation_mock = self.snapshot_generation_patcher.start()
+        self.addCleanup(self.snapshot_generation_patcher.stop)
         self.calendar_client = FakeCalendarClient(
             [
                 {'bass_dt': '20260429', 'opnd_yn': 'Y'},
@@ -1385,6 +1469,39 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         set_krx_calendar_provider(KisKrxTradingCalendarProvider(client=self.calendar_client))
         self.addCleanup(reset_krx_calendar_provider)
+        with session_scope() as session:
+            active_policies = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.status == 'active'
+                )
+            ).scalars().all()
+            for active_policy in active_policies:
+                self._previous_active_policy_states.append(
+                    (active_policy.policy_version, active_policy.retired_at)
+                )
+                active_policy.status = 'retired'
+                active_policy.retired_at = datetime.now(timezone.utc)
+            session.flush()
+            session.add(
+                SignalDeciderPolicyVersion(
+                    policy_version=self.policy_version,
+                    status='active',
+                    change_summary='Exec integration test active policy.',
+                    rule_bundle_payload={
+                        'schema_version': 'signal_decider_policy_bundle_v1'
+                    },
+                    metadata_payload={
+                        'schema_version': 'signal_decider_policy_metadata_v1',
+                        'activation_mode': 'manual_only',
+                        'candidate_activation_required': True,
+                    },
+                    created_by='test',
+                    activated_by='test',
+                    activated_at=datetime(
+                        2026, 4, 29, 0, 0, tzinfo=timezone.utc
+                    ),
+                )
+            )
         self._seed_symbol()
         self.snapshot_id = self._seed_snapshot()
         self.plan_item_id = self._seed_plan_item()
@@ -1409,6 +1526,23 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     SignalDeciderDecisionSnapshot.policy_version == self.policy_version
                 )
             )
+            session.execute(
+                delete(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+            )
+            session.flush()
+            for policy_version, retired_at in self._previous_active_policy_states:
+                previous_policy = session.execute(
+                    select(SignalDeciderPolicyVersion).where(
+                        SignalDeciderPolicyVersion.policy_version
+                        == policy_version
+                    )
+                ).scalar_one_or_none()
+                if previous_policy is not None:
+                    previous_policy.status = 'active'
+                    previous_policy.retired_at = retired_at
             session.execute(
                 delete(SignalDeciderDecisionSnapshot).where(
                     SignalDeciderDecisionSnapshot.agent_name == 'short-term-decider',
@@ -1626,7 +1760,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 traceability_payload={'gate_checks': {'missing_upstream_roles': []}},
                 input_feature_snapshot_payload={'technical': {'trend_state': 'uptrend'}},
                 request_payload={
-                    'signal_decider_policy': {'current_version': self.policy_version},
+                    'signal_decider_policy': (
+                        self._signal_decider_policy_request_fixture()
+                    ),
                     'market_regime_context': self._market_regime_context(),
                     'symbol_day_context': {
                         'company': {'market': 'KOSPI'},
@@ -1638,6 +1774,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             session.add(row)
             session.flush()
             return row.id
+
+    def _signal_decider_policy_request_fixture(self) -> dict:
+        return {
+            'current_version': self.policy_version,
+            'rule_bundle': {
+                'schema_version': 'signal_decider_policy_bundle_v1'
+            },
+        }
 
     def _market_regime_context(
         self,
@@ -1702,9 +1846,90 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'missing_fields': [],
         }
 
-    def _signal_dispatch_validation(self) -> dict:
+    @staticmethod
+    def _valid_snapshot_generation_fixture(*, market_date, snapshots) -> dict:
+        snapshot_ids = sorted(int(snapshot.id) for snapshot in snapshots)
+        identity_by_id = {
+            int(snapshot.id): {
+                'symbol': str(snapshot.symbol).strip().upper(),
+                'agent_name': str(snapshot.agent_name).strip(),
+            }
+            for snapshot in snapshots
+        }
+        return {
+            'schema_version': 'persisted_decider_generation_validation_v1',
+            'market_date': str(market_date),
+            'valid_snapshot_ids': snapshot_ids,
+            'invalid_snapshot_ids': [],
+            'validations': [
+                {
+                    'snapshot_id': snapshot_id,
+                    **identity_by_id[snapshot_id],
+                    'status': 'valid',
+                    'reason': 'test_generation_unchanged',
+                }
+                for snapshot_id in snapshot_ids
+            ],
+            'generation_fingerprint': (
+                'test-snapshot-generation:'
+                + ','.join(str(snapshot_id) for snapshot_id in snapshot_ids)
+            ),
+        }
+
+    def _stored_agent_context_fixture(
+        self,
+        *,
+        snapshots: list[tuple[int, str, str]],
+        candidate_symbols: list[str],
+    ) -> dict:
+        base = {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': self.market_date.isoformat(),
+            'candidate_symbols': sorted(set(candidate_symbols)),
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': 'complete',
+            'cohort_status': 'complete',
+            'has_incomplete_agent_context': False,
+            'candidate_set_definitive': True,
+            'authority_fingerprint': 'exec-integration-agent-context-authority',
+            'latest_run': None,
+            'failure_count': 0,
+            'failure_groups': [],
+        }
+        generation = self._valid_snapshot_generation_fixture(
+            market_date=self.market_date,
+            snapshots=[
+                SimpleNamespace(
+                    id=snapshot_id,
+                    agent_name=agent_name,
+                    symbol=symbol,
+                )
+                for snapshot_id, agent_name, symbol in snapshots
+            ],
+        )
+        return (
+            signal_decider_next_open_execution_service
+            ._attach_snapshot_generation_validation(
+                agent_context_completeness=base,
+                generation_validation=generation,
+            )
+        )
+
+    def _signal_dispatch_validation(
+        self,
+        *,
+        snapshot_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict:
         market_date = self.market_date.isoformat()
         observed_at = f'{market_date}T09:57:00+09:00'
+        resolved_snapshot_id = snapshot_id or self.snapshot_id
+        resolved_symbol = symbol or self.symbol
+        with session_scope() as session:
+            policy_authority = _load_signal_decider_policy_authority(
+                session,
+                policy_versions=[self.policy_version],
+            )[self.policy_version]
         return {
             'execution_cost_evidence_policy_version': 'next_open_cost_evidence_v1',
             'preopen_policy_fingerprint': _next_open_policy_fingerprint(
@@ -1716,6 +1941,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ]
             ),
+            'agent_context_completeness': self._stored_agent_context_fixture(
+                snapshots=[
+                    (resolved_snapshot_id, 'signal-decider', resolved_symbol)
+                ],
+                candidate_symbols=[resolved_symbol],
+            ),
+            'policy_context': {
+                'policy_version': self.policy_version,
+                'status': 'active',
+                'activation_mode': 'manual_only',
+                'authority': policy_authority,
+            },
             'blocking_reasons': [],
             'warnings': [],
             'pre_decider_enrichment_context': {
@@ -1920,7 +2157,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self._seed_symbol(symbol=symbol, name_ko=name_ko)
         resolved_request_payload = copy.deepcopy(
             request_payload
-            or {'signal_decider_policy': {'current_version': self.policy_version}}
+            or {
+                'signal_decider_policy': (
+                    self._signal_decider_policy_request_fixture()
+                )
+            }
         )
         symbol_day_context = resolved_request_payload.setdefault(
             'symbol_day_context',
@@ -1991,7 +2232,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 eligibility_status='eligible',
                 execution_status='planned',
                 client_order_id=client_order_id,
-                validation_payload=self._signal_dispatch_validation(),
+                validation_payload=self._signal_dispatch_validation(
+                    snapshot_id=int(snapshot.id),
+                    symbol=symbol,
+                ),
                 traceability_payload={
                     'decision_snapshot_id': snapshot.id,
                     'decision_run_id': decision_run_id,
@@ -2074,6 +2318,33 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         stop_loss_price: int | None = 49200,
     ) -> int:
         with session_scope() as session:
+            shared_agent_context = self._stored_agent_context_fixture(
+                snapshots=[
+                    (
+                        self.snapshot_id,
+                        'signal-decider',
+                        self.symbol,
+                    ),
+                    (
+                        snapshot_id,
+                        'short-term-decider',
+                        self.symbol,
+                    ),
+                ],
+                candidate_symbols=[self.symbol],
+            )
+            signal_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            if signal_row is not None:
+                signal_validation = copy.deepcopy(
+                    signal_row.validation_payload or {}
+                )
+                signal_validation['agent_context_completeness'] = copy.deepcopy(
+                    shared_agent_context
+                )
+                signal_row.validation_payload = signal_validation
             row = SignalDeciderExecutionPlanItem(
                 execution_window='next_open',
                 decision_agent_name='short-term-decider',
@@ -2107,6 +2378,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                             )
                         ]
                     ),
+                    'agent_context_completeness': shared_agent_context,
                     'blocking_reasons': [],
                     'warnings': [],
                     'decision_agent_name': 'short-term-decider',
@@ -2660,7 +2932,43 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['translated_item_count'], 3)
         self.assertTrue(result['summary']['delegated_to_exec'])
         self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 1)
+        self.assertEqual(self.client.dispatch_events, ['plan', 'activation'])
         payload = self.client.post_calls[0]
+        activation = self.client.activation_calls[0]
+        activation_bindings = {
+            item['risk_context']['_core_activation'][
+                'authority_generation_fingerprint'
+            ]
+            for item in payload['items']
+        }
+        self.assertEqual(len(activation_bindings), 1)
+        authority_generation_fingerprint = activation_bindings.pop()
+        self.assertRegex(authority_generation_fingerprint, r'^[0-9a-f]{64}$')
+        self.assertEqual(
+            activation['authority_generation_fingerprint'],
+            authority_generation_fingerprint,
+        )
+        self.assertEqual(
+            activation['dispatch_material_fingerprint'],
+            payload['metadata']['dispatch_material_fingerprint'],
+        )
+        self.assertEqual(
+            {
+                (
+                    item['core_item_key'],
+                    item['decision_snapshot_id'],
+                )
+                for item in activation['items']
+            },
+            {
+                (
+                    item['core_item_key'],
+                    item['decision_snapshot_id'],
+                )
+                for item in payload['items']
+            },
+        )
         self.assertEqual(payload['market_date'], '2026-04-30')
         intents = [item['intent'] for item in payload['items']]
         self.assertEqual(
@@ -3194,6 +3502,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.activation_calls, [])
         self.assertEqual(len(self.client.revocation_calls), 1)
         self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'revocation_pending')
         self.assertEqual(result['summary']['revoked_group_count'], 1)
@@ -3207,8 +3516,109 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 row.submission_payload['revocation']['reason_code'],
                 'policy_scope_changed',
             )
+
+    async def test_dispatch_ack_revokes_remote_authority_when_policy_retires_during_post(
+        self,
+    ) -> None:
+        original_post_execution_plan = self.client.post_execution_plan
+
+        async def retire_policy_before_ack(payload: dict) -> dict:
+            with session_scope() as session:
+                policy = session.execute(
+                    select(SignalDeciderPolicyVersion).where(
+                        SignalDeciderPolicyVersion.policy_version
+                        == self.policy_version
+                    )
+                ).scalar_one()
+                policy.status = 'retired'
+                policy.retired_at = datetime(
+                    2026, 4, 30, 0, 0, 1, tzinfo=timezone.utc
+                )
+            return await original_post_execution_plan(payload)
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=retire_policy_before_ack,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_policy_retirement_race',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.activation_calls, [])
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            result['dispatch']['groups'][0]['dispatch_status'],
+            'revocation_pending',
+        )
+        self.assertEqual(result['summary']['revoked_group_count'], 1)
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'policy_scope_changed',
+            )
             self.assertEqual(row.submission_payload['revocation']['status'], 'acknowledged')
             self.assertEqual(len(row.submission_payload['revocation_history']), 1)
+
+    async def test_activation_fence_rejects_policy_change_after_plan_ack(
+        self,
+    ) -> None:
+        original_activate = self.service._activate_core_confirmed_dispatch
+
+        async def retire_policy_before_activation(**kwargs):
+            with session_scope() as session:
+                policy = session.execute(
+                    select(SignalDeciderPolicyVersion).where(
+                        SignalDeciderPolicyVersion.policy_version
+                        == self.policy_version
+                    )
+                ).scalar_one()
+                policy.status = 'retired'
+                policy.retired_at = datetime(
+                    2026, 4, 30, 0, 0, 2, tzinfo=timezone.utc
+                )
+            return await original_activate(**kwargs)
+
+        with patch.object(
+            self.service,
+            '_activate_core_confirmed_dispatch',
+            side_effect=retire_policy_before_activation,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_post_plan_ack_policy_retirement',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.activation_calls, [])
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            result['dispatch']['groups'][0]['dispatch_status'],
+            'revocation_pending',
+        )
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.eligibility_status, 'blocked')
 
     async def test_predispatch_generation_fence_blocks_new_wait_without_post(self) -> None:
         with session_scope() as session:
@@ -3484,6 +3894,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.activation_calls, [])
         self.assertEqual(len(self.client.revocation_calls), 1)
         self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'revocation_pending')
         with session_scope() as session:
@@ -3493,6 +3904,368 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 row.submission_payload['revocation']['reason_code'],
                 'latest_snapshot_not_actionable',
             )
+
+    async def test_activation_transport_failure_revokes_ambiguous_remote_authority(
+        self,
+    ) -> None:
+        async def fail_after_activation_request(payload: dict) -> dict:
+            self.client.dispatch_events.append('activation')
+            self.client.activation_calls.append(copy.deepcopy(payload))
+            raise SignalDeciderExecClientError(
+                'activation response was lost',
+                code='unavailable',
+                retryable=True,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_activation',
+            side_effect=fail_after_activation_request,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_activation_transport_failure',
+            )
+
+        self.assertEqual(self.client.dispatch_events, ['plan', 'activation', 'revocation'])
+        self.assertEqual(len(self.client.activation_calls), 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            result['dispatch']['groups'][0]['dispatch_status'],
+            'revocation_pending',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'current_live_market_evidence_unavailable',
+            )
+
+    async def test_activation_failure_revokes_only_the_failed_plan_cohort(
+        self,
+    ) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        short_plan_item_id = self._seed_short_term_plan_item(
+            snapshot_id=short_snapshot_id
+        )
+        original_activation = self.client.post_execution_plan_activation
+
+        async def fail_signal_plan(payload: dict) -> dict:
+            if any(
+                str(item['decision_snapshot_id']) == str(self.snapshot_id)
+                for item in payload['items']
+            ):
+                self.client.dispatch_events.append('activation')
+                self.client.activation_calls.append(copy.deepcopy(payload))
+                raise SignalDeciderExecClientError(
+                    'signal plan activation failed',
+                    code='unavailable',
+                    retryable=True,
+                )
+            return await original_activation(payload)
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_activation',
+            side_effect=fail_signal_plan,
+        ):
+            await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_activation_plan_isolation',
+            )
+
+        with session_scope() as session:
+            failed_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            unrelated_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            self.assertEqual(failed_row.execution_status, 'revoked')
+            self.assertNotEqual(unrelated_row.execution_status, 'revoked')
+            self.assertEqual(
+                unrelated_row.submission_payload['exec_dispatch'][
+                    'contract_proof'
+                ]['core_activation']['status'],
+                'activated',
+            )
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            {
+                item['decision_snapshot_id']
+                for item in self.client.revocation_calls[0]['items']
+            },
+            {str(self.snapshot_id)},
+        )
+
+    async def test_restart_activates_exact_quarantined_plan_without_reposting(
+        self,
+    ) -> None:
+        with patch.object(
+            self.service,
+            '_activate_core_confirmed_dispatch',
+            side_effect=SystemExit('simulated crash before activation request'),
+        ):
+            with self.assertRaisesRegex(SystemExit, 'before activation request'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                    refresh_plan=False,
+                    dry_run=False,
+                    force=False,
+                    trigger='test_crash_before_activation',
+                )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.activation_calls, [])
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'pending',
+            )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test_restart_pending_activation',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 1)
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'activated',
+            )
+
+    async def test_restart_replays_activation_after_remote_ack_before_local_proof(
+        self,
+    ) -> None:
+        with patch.object(
+            self.service,
+            '_persist_core_activation_ack',
+            side_effect=SystemExit('simulated crash after activation ACK'),
+        ):
+            with self.assertRaisesRegex(SystemExit, 'after activation ACK'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                    refresh_plan=False,
+                    dry_run=False,
+                    force=False,
+                    trigger='test_crash_after_activation_ack',
+                )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 1)
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'pending',
+            )
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test_restart_after_activation_ack',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 2)
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'activated',
+            )
+
+    async def test_durable_activation_fence_busy_after_remote_ack_revokes(
+        self,
+    ) -> None:
+        with patch.object(
+            self.service,
+            '_persist_core_activation_ack',
+            side_effect=RuntimeError('_PlanRefreshRevisionConflict'),
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_durable_activation_fence_busy',
+            )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 1)
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(
+            result['dispatch']['groups'][0]['dispatch_status'],
+            'revocation_pending',
+        )
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.eligibility_status, 'blocked')
+
+    async def test_restart_revokes_quarantined_plan_when_core_revision_changed(
+        self,
+    ) -> None:
+        with patch.object(
+            self.service,
+            '_activate_core_confirmed_dispatch',
+            side_effect=SystemExit('simulated crash before activation request'),
+        ):
+            with self.assertRaisesRegex(SystemExit, 'before activation request'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                    refresh_plan=False,
+                    dry_run=False,
+                    force=False,
+                    trigger='test_crash_before_stale_activation',
+                )
+
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            row.planned_quantity = Decimal(row.planned_quantity) + Decimal('1')
+
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+        await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test_restart_stale_pending_activation',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.activation_calls, [])
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.eligibility_status, 'blocked')
+
+    async def test_dispatch_ack_ignores_unrelated_summarizer_run_checkpoint(self) -> None:
+        original_post_execution_plan = self.client.post_execution_plan
+        unrelated_run_id = f'unrelated-summary-{uuid4().hex[:10]}'
+
+        async def checkpoint_unrelated_run(payload: dict) -> dict:
+            with session_scope() as session:
+                session.add(
+                    AgentContextFeedbackRun(
+                        run_id=unrelated_run_id,
+                        market_date=self.market_date,
+                        status='running',
+                        symbols_total=1,
+                        completed_count=0,
+                        failed_count=0,
+                        request_payload={
+                            'mode': 'role_sequential_runtime_buffered',
+                            'roles': ['eod-summarizer'],
+                            'symbols': ['999999'],
+                        },
+                        summary_payload={'checkpoint': 1},
+                        started_at=datetime(
+                            2026,
+                            4,
+                            29,
+                            6,
+                            30,
+                            tzinfo=timezone.utc,
+                        ),
+                    )
+                )
+            return await original_post_execution_plan(payload)
+
+        try:
+            with patch.object(
+                self.client,
+                'post_execution_plan',
+                side_effect=checkpoint_unrelated_run,
+            ):
+                result = await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                    refresh_plan=False,
+                    dry_run=False,
+                    force=True,
+                    trigger='test_unrelated_summarizer_generation',
+                )
+        finally:
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id == unrelated_run_id
+                    )
+                )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.revocation_calls, [])
+        self.assertEqual(
+            result['dispatch']['groups'][0]['dispatch_status'],
+            'accepted',
+        )
 
     async def test_dispatch_ack_uses_wait_when_concurrent_refresh_blocks_candidate(self) -> None:
         with session_scope() as session:
@@ -4077,7 +4850,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         with session_scope() as session:
             snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
             snapshot.request_payload = {
-                'signal_decider_policy': {'current_version': self.policy_version},
+                'signal_decider_policy': (
+                    self._signal_decider_policy_request_fixture()
+                ),
                 **bulky_decider_context,
             }
             snapshot.input_feature_snapshot_payload = {'raw_feature_blob': 'z' * 12000}
@@ -4088,7 +4863,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             decision_run_id='exec-run-2',
             client_order_id='SDNO-20260430-000660',
             request_payload={
-                'signal_decider_policy': {'current_version': self.policy_version},
+                'signal_decider_policy': (
+                    self._signal_decider_policy_request_fixture()
+                ),
                 **bulky_decider_context,
             },
             input_feature_snapshot_payload={'raw_feature_blob': 'q' * 12000},
@@ -4267,7 +5044,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot.request_payload = {
                 'role': 'signal-decider',
                 'agent_name': 'signal-decider',
-                'signal_decider_policy': {'current_version': self.policy_version},
+                'signal_decider_policy': (
+                    self._signal_decider_policy_request_fixture()
+                ),
                 'symbol_day_context': {
                     'company': {'market': 'KOSPI'},
                 },
@@ -4314,7 +5093,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         with session_scope() as session:
             snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
             snapshot.request_payload = {
-                'signal_decider_policy': {'current_version': self.policy_version},
+                'signal_decider_policy': (
+                    self._signal_decider_policy_request_fixture()
+                ),
                 'symbol_day_context': {
                     'company': {'market': 'KOSPI'},
                     'pre_decider_enrichment_context': self._closed_market_pre_decider_context(),

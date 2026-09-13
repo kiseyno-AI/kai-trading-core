@@ -363,6 +363,7 @@ class DailyPipelineRunStateService:
         details: Mapping[str, Any] | None = None,
         completed_at: datetime | None = None,
         mark_started: bool = False,
+        recompute_remaining: bool = False,
     ) -> dict[str, Any]:
         now = _utcnow()
         normalized_market_date = _normalize_market_date(market_date)
@@ -396,12 +397,15 @@ class DailyPipelineRunStateService:
                 session.add(row)
             elif mark_started and row.started_at is None:
                 row.started_at = now
+            resolved_remaining = remaining
+            if remaining is None and not recompute_remaining and not terminal:
+                resolved_remaining = row.remaining
             counts = _build_counts(
                 processed=row.processed if processed is None else processed,
                 total=row.total if total is None else total,
                 succeeded=row.succeeded if succeeded is None else succeeded,
                 failed=row.failed if failed is None else failed,
-                remaining=row.remaining if remaining is None else remaining,
+                remaining=resolved_remaining,
             )
 
             row.status = normalized_status
@@ -470,6 +474,7 @@ class DailyPipelineRunStateService:
             source_run_ids=source_run_ids,
             details=details,
             completed_at=_utcnow(),
+            recompute_remaining=True,
         )
 
     def finish_run(

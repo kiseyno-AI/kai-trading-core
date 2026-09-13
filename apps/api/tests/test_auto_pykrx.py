@@ -10,6 +10,7 @@ from unittest.mock import ANY, AsyncMock, patch
 
 import pandas as pd
 
+from app.core.settings import Settings
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import (
     AUTO_FOLLOWUP_RECOVERY_TRIGGER,
@@ -25,6 +26,7 @@ from app.eod.pykrx_pipeline_runner import (
     _OfficialDailyPipelineTracker,
     _extract_result_counts,
     _normalize_stage_status,
+    _resolve_result_status,
     _run_daily_external_news_enrichment_followup,
     _run_daily_feedback_followup,
     _run_daily_macro_context_followup,
@@ -33,6 +35,17 @@ from app.eod.pykrx_pipeline_runner import (
     _run_daily_signal_decider_followup,
 )
 from app.market.clock import KST, MarketState
+
+
+class PykrxPipelineResultStatusTests(TestCase):
+    def test_completed_payload_with_failed_items_is_partial(self) -> None:
+        result = {
+            'status': 'completed',
+            'completed_count': 60,
+            'failed_count': 100,
+        }
+
+        self.assertEqual(_resolve_result_status(result), 'partial')
 
 
 @contextmanager
@@ -249,6 +262,29 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
 
+    def test_extract_result_counts_includes_every_next_open_plan_outcome(self) -> None:
+        counts = _extract_result_counts(
+            {
+                'status': 'completed',
+                'summary': {
+                    'items_total': 18,
+                    'eligible_count': 4,
+                    'monitor_candidate_count': 10,
+                    'blocked_count': 4,
+                },
+            }
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 18,
+                'total': 18,
+                'succeeded': 18,
+                'failed': 0,
+            },
+        )
+
     def test_auto_tracker_normalizes_warning_followup_status_to_terminal_partial(self) -> None:
         fake_run_state_service = _FakeDailyPipelineRunStateService()
         log_events: list[dict] = []
@@ -326,6 +362,13 @@ class PykrxBackfillServiceTests(TestCase):
                 FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
             ],
         )
+        for config in configs:
+            self.assertIsInstance(config.knowledge_cutoff_at, datetime)
+            self.assertIsNotNone(config.knowledge_cutoff_at.utcoffset())
+            self.assertLessEqual(
+                config.knowledge_cutoff_at,
+                datetime.now(timezone.utc),
+            )
 
     def test_auto_followup_order_matches_canonical_news_macro_feedback_dependencies(self) -> None:
         collect_index = AUTO_DAILY_FOLLOWUP_STAGE_ORDER.index('external_news_collect')
@@ -3274,6 +3317,11 @@ class PykrxBackfillServiceTests(TestCase):
 
 
 class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
+    def test_automatic_market_default_excludes_unreliable_konex_feed(self) -> None:
+        field = Settings.model_fields['eod_auto_pykrx_markets']
+
+        self.assertEqual(field.default, 'KOSPI,KOSDAQ')
+
     async def test_schedule_daily_pipeline_if_due_waits_for_close_buffer(self) -> None:
         scheduler = AutoPykrxEODScheduler()
         now = datetime.now(KST)
@@ -3320,3 +3368,91 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
 
         snapshot = scheduler.snapshot()
         self.assertEqual(snapshot['last_status'], 'running')
+
+    async def test_triggered_failed_pipeline_remains_failed_in_scheduler_status(self) -> None:
+        scheduler = AutoPykrxEODScheduler()
+
+        with patch(
+            'app.eod.auto_pykrx.PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+            return_value={
+                'triggered': True,
+                'status': 'failed',
+                'reason': 'price_collection_failed',
+            },
+        ):
+            await scheduler._run_scheduled_daily_pipeline(
+                '2026-09-11',
+                markets=('KOSPI', 'KOSDAQ'),
+            )
+
+        self.assertEqual(scheduler.snapshot()['last_status'], 'failed')
+
+    async def test_triggered_completed_with_errors_pipeline_is_partial(self) -> None:
+        scheduler = AutoPykrxEODScheduler()
+
+        with patch(
+            'app.eod.auto_pykrx.PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+            return_value={
+                'triggered': True,
+                'status': 'completed_with_errors',
+            },
+        ):
+            await scheduler._run_scheduled_daily_pipeline(
+                '2026-09-11',
+                markets=('KOSPI', 'KOSDAQ'),
+            )
+
+        self.assertEqual(scheduler.snapshot()['last_status'], 'partial')
+
+    async def test_incomplete_universe_preflight_uses_backoff_then_retries(self) -> None:
+        scheduler = AutoPykrxEODScheduler()
+        now = datetime.now(KST)
+        close_at = (now - timedelta(minutes=30)).replace(second=0, microsecond=0)
+        market = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time=now.isoformat(),
+            session_open_at=(close_at - timedelta(hours=6, minutes=30)).isoformat(),
+            session_close_at=close_at.isoformat(),
+        )
+        incomplete_error = RuntimeError(
+            'PyKRX universe snapshot is incomplete for requested markets: KONEX.'
+        )
+
+        with (
+            patch('app.eod.auto_pykrx.async_get_market_state', return_value=market),
+            patch(
+                'app.eod.auto_pykrx.PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+                side_effect=[
+                    incomplete_error,
+                    {'triggered': False, 'reason': 'already_completed'},
+                ],
+            ) as run_daily,
+            patch(
+                'app.eod.auto_pykrx.settings.eod_auto_pykrx_markets',
+                'KOSPI,KOSDAQ,KONEX',
+            ),
+        ):
+            await scheduler.schedule_daily_pipeline_if_due()
+            self.assertIsNotNone(scheduler._task)
+            await scheduler._task
+
+            await scheduler.schedule_daily_pipeline_if_due()
+
+            self.assertEqual(run_daily.call_count, 1)
+            self.assertEqual(scheduler.snapshot()['last_status'], 'blocked')
+            self.assertEqual(
+                scheduler.snapshot()['last_reason'],
+                'incomplete_universe_preflight_backoff',
+            )
+
+            scheduler._state.preflight_retry_not_before = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            )
+            await scheduler.schedule_daily_pipeline_if_due()
+            self.assertIsNotNone(scheduler._task)
+            await scheduler._task
+
+        self.assertEqual(run_daily.call_count, 2)

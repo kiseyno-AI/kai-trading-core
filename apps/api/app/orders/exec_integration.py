@@ -133,6 +133,11 @@ LIVE_EXEC_ACCOUNT_TARGET_REQUIRED = 'live_exec_account_target_required'
 EXEC_DESTINATION_BINDING_SCHEMA_VERSION = 'core_exec_destination_binding_v1'
 EXEC_DISPATCH_PROOF_SCHEMA_VERSION = 'core_exec_dispatch_proof_v2'
 EXEC_POSITION_SCOPE_PROOF_SCHEMA_VERSION = 'execution_position_plan_scope_v1'
+CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION = (
+    'core_execution_activation_binding_v1'
+)
+EXECUTION_ACTIVATION_SCHEMA_VERSION = 'execution_handoff_activation_v1'
+EXECUTION_ACTIVATION_CAPABILITY = 'core_confirmed_activation_v1'
 
 REMOTE_FETCH_STATUS_OK = 'ok'
 REMOTE_FETCH_STATUS_DISABLED = 'disabled'
@@ -916,6 +921,498 @@ def _fingerprint_exec_plan(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validated_sha256_hex(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if (
+        normalized != value
+        or normalized.lower() != normalized
+        or len(normalized) != 64
+        or any(character not in '0123456789abcdef' for character in normalized)
+    ):
+        return None
+    return normalized
+
+
+def _bind_core_confirmed_activation(
+    payload: dict[str, Any],
+    *,
+    authority_generation: dict[str, Any],
+) -> dict[str, Any]:
+    authority_generation_fingerprint = _validated_sha256_hex(
+        authority_generation.get('generation_fingerprint')
+    )
+    if (
+        authority_generation.get('status') != 'valid'
+        or authority_generation_fingerprint is None
+    ):
+        raise SignalDeciderExecPayloadContractError(
+            'valid dispatch authority generation is required before Exec activation binding'
+        )
+    candidate = copy.deepcopy(payload)
+    items = candidate.get('items')
+    if not isinstance(items, list) or not items:
+        raise SignalDeciderExecPayloadContractError(
+            'core-confirmed activation requires non-empty execution plan items'
+        )
+    binding = {
+        'schema_version': CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION,
+        'mode': 'core_confirmed',
+        'authority_generation_fingerprint': authority_generation_fingerprint,
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            raise SignalDeciderExecPayloadContractError(
+                'core-confirmed activation requires object execution plan items'
+            )
+        risk_context = item.get('risk_context')
+        item['risk_context'] = {
+            **(risk_context if isinstance(risk_context, dict) else {}),
+            '_core_activation': copy.deepcopy(binding),
+        }
+    return serialize_execution_plan_dispatch_payload(candidate)
+
+
+def _core_activation_binding_from_plan(
+    payload: dict[str, Any],
+) -> dict[str, str] | None:
+    items = payload.get('items')
+    if not isinstance(items, list) or not items:
+        return None
+    bindings: list[dict[str, Any]] = []
+    for item in items:
+        risk_context = (
+            item.get('risk_context') if isinstance(item, dict) else None
+        )
+        binding = (
+            risk_context.get('_core_activation')
+            if isinstance(risk_context, dict)
+            else None
+        )
+        if not isinstance(binding, dict):
+            return None
+        bindings.append(binding)
+    first = bindings[0]
+    authority_generation_fingerprint = _validated_sha256_hex(
+        first.get('authority_generation_fingerprint')
+    )
+    expected = {
+        'schema_version': CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION,
+        'mode': 'core_confirmed',
+        'authority_generation_fingerprint': authority_generation_fingerprint,
+    }
+    if authority_generation_fingerprint is None or any(
+        binding != expected for binding in bindings
+    ):
+        return None
+    return expected
+
+
+def _build_execution_activation_payload(
+    *,
+    plan_payload: dict[str, Any],
+    response_payload: dict[str, Any],
+) -> dict[str, Any]:
+    plan_id = _normalize_optional_text(plan_payload.get('plan_id'))
+    metadata = (
+        plan_payload.get('metadata')
+        if isinstance(plan_payload.get('metadata'), dict)
+        else {}
+    )
+    dispatch_material_fingerprint = _validated_sha256_hex(
+        metadata.get('dispatch_material_fingerprint')
+    )
+    binding = _core_activation_binding_from_plan(plan_payload)
+    plan_items = (
+        plan_payload.get('items')
+        if isinstance(plan_payload.get('items'), list)
+        else []
+    )
+    if not plan_id or dispatch_material_fingerprint is None or binding is None:
+        raise ValueError('execution plan is missing an exact Core activation binding')
+    submitted_core_item_keys = [
+        str(item.get('core_item_key') or '')
+        for item in plan_items
+        if isinstance(item, dict)
+    ]
+    if (
+        len(submitted_core_item_keys) != len(plan_items)
+        or not submitted_core_item_keys
+        or any(not key for key in submitted_core_item_keys)
+    ):
+        raise ValueError('execution activation items require exact Core item keys')
+    response_by_key = validate_execution_plan_dispatch_ack(
+        response_payload,
+        plan_id=plan_id,
+        submitted_core_item_keys=submitted_core_item_keys,
+        expected_dispatch_material_fingerprint=dispatch_material_fingerprint,
+    )
+    execution_plan_id = _normalize_optional_text(
+        response_payload.get('execution_plan_id')
+    )
+    if not execution_plan_id:
+        raise ValueError('execution activation requires an accepted Exec plan id')
+    return {
+        'schema_version': EXECUTION_ACTIVATION_SCHEMA_VERSION,
+        'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+        'required_capability': EXECUTION_ACTIVATION_CAPABILITY,
+        'plan_id': plan_id,
+        'execution_plan_id': execution_plan_id,
+        'dispatch_material_fingerprint': dispatch_material_fingerprint,
+        'authority_generation_fingerprint': binding[
+            'authority_generation_fingerprint'
+        ],
+        'requested_at': _utcnow().isoformat(),
+        'items': [
+            {
+                'core_item_key': str(item['core_item_key']),
+                'execution_plan_item_id': str(
+                    response_by_key[str(item['core_item_key'])][
+                        'execution_plan_item_id'
+                    ]
+                ),
+                'decision_snapshot_id': str(item['decision_snapshot_id']),
+            }
+            for item in plan_items
+        ],
+    }
+
+
+def _validate_execution_activation_ack(
+    payload: dict[str, Any],
+    *,
+    request_payload: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise ValueError('execution activation ACK must be an object')
+    plan_id = str(request_payload['plan_id'])
+    execution_plan_id = str(request_payload['execution_plan_id'])
+    contract_ack = (
+        payload.get('contract_ack')
+        if isinstance(payload.get('contract_ack'), dict)
+        else {}
+    )
+    expected_contract_ack = {
+        'schema_version': EXECUTION_ACTIVATION_SCHEMA_VERSION,
+        'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+        'capability': EXECUTION_ACTIVATION_CAPABILITY,
+        'plan_id': plan_id,
+        'status': 'activated',
+        'dispatch_material_fingerprint': request_payload[
+            'dispatch_material_fingerprint'
+        ],
+        'authority_generation_fingerprint': request_payload[
+            'authority_generation_fingerprint'
+        ],
+    }
+    if (
+        payload.get('plan_id') != plan_id
+        or payload.get('execution_plan_id') != execution_plan_id
+        or contract_ack != expected_contract_ack
+    ):
+        raise ValueError('execution activation ACK header does not match the request')
+    expected_by_key = {
+        str(item['core_item_key']): {
+            'core_item_key': str(item['core_item_key']),
+            'execution_plan_item_id': str(item['execution_plan_item_id']),
+            'decision_snapshot_id': str(item['decision_snapshot_id']),
+            'execution_plan_id': execution_plan_id,
+            'status': 'activated',
+        }
+        for item in request_payload['items']
+    }
+    raw_item_acks = payload.get('item_acks')
+    if not isinstance(raw_item_acks, list):
+        raise ValueError('execution activation ACK items are missing')
+    actual_by_key = {
+        str(item.get('core_item_key') or ''): item
+        for item in raw_item_acks
+        if isinstance(item, dict)
+    }
+    if (
+        len(actual_by_key) != len(raw_item_acks)
+        or actual_by_key != expected_by_key
+        or payload.get('activated_item_count') != len(expected_by_key)
+    ):
+        raise ValueError('execution activation ACK item identities do not match')
+    return actual_by_key
+
+
+def _build_pending_core_activation_request(
+    rows: Sequence[SignalDeciderExecutionPlanItem],
+) -> tuple[dict[str, Any], dict[int, str], dict[str, Any]]:
+    """Rebuild only the exact activation contract durably attested by Core."""
+    ordered_rows = sorted(rows, key=lambda row: int(row.id))
+    if not ordered_rows or len({int(row.id) for row in ordered_rows}) != len(
+        ordered_rows
+    ):
+        raise ValueError('pending Core activation rows are missing or duplicated')
+
+    exec_states: list[dict[str, Any]] = []
+    contract_proofs: list[dict[str, Any]] = []
+    request_summaries: list[dict[str, Any]] = []
+    response_summaries: list[dict[str, Any]] = []
+    destinations: list[dict[str, Any]] = []
+    revision_fingerprints: dict[int, str] = {}
+    for row in ordered_rows:
+        if (
+            str(row.planned_side or '').strip().lower() != 'buy'
+            or row.execution_status
+            not in {
+                EXECUTION_STATUS_SUBMITTED,
+                EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+            }
+            or not _row_has_accepted_exec_dispatch(row)
+        ):
+            raise ValueError(
+                'pending Core activation no longer has exact accepted BUY authority'
+            )
+        submission = (
+            row.submission_payload
+            if isinstance(row.submission_payload, dict)
+            else {}
+        )
+        exec_dispatch = (
+            submission.get('exec_dispatch')
+            if isinstance(submission.get('exec_dispatch'), dict)
+            else {}
+        )
+        proof = (
+            exec_dispatch.get('contract_proof')
+            if isinstance(exec_dispatch.get('contract_proof'), dict)
+            else {}
+        )
+        request_summary = (
+            exec_dispatch.get('last_request_summary')
+            if isinstance(exec_dispatch.get('last_request_summary'), dict)
+            else {}
+        )
+        response_summary = (
+            exec_dispatch.get('last_response_summary')
+            if isinstance(exec_dispatch.get('last_response_summary'), dict)
+            else {}
+        )
+        destination = _exec_dispatch_destination_binding(exec_dispatch)
+        revision_fingerprint = _validated_sha256_hex(
+            exec_dispatch.get('dispatch_revision_fingerprint')
+        )
+        if destination is None or revision_fingerprint is None:
+            raise ValueError(
+                'pending Core activation lost its destination or revision binding'
+            )
+        exec_states.append(exec_dispatch)
+        contract_proofs.append(proof)
+        request_summaries.append(request_summary)
+        response_summaries.append(response_summary)
+        destinations.append(destination)
+        revision_fingerprints[int(row.id)] = revision_fingerprint
+
+    account_references = {
+        _normalize_optional_text(row.account_reference) for row in ordered_rows
+    }
+    target_trade_dates = {row.target_trade_date for row in ordered_rows}
+    plan_ids = {
+        _normalize_optional_text(state.get('plan_id')) for state in exec_states
+    }
+    execution_plan_ids = {
+        _normalize_optional_text(proof.get('execution_plan_id'))
+        for proof in contract_proofs
+    }
+    material_fingerprints = {
+        _validated_sha256_hex(proof.get('dispatch_material_fingerprint'))
+        for proof in contract_proofs
+    }
+    plan_fingerprints = {
+        _validated_sha256_hex(state.get('plan_fingerprint'))
+        for state in exec_states
+    }
+    activation_proofs = [
+        proof.get('core_activation')
+        if isinstance(proof.get('core_activation'), dict)
+        else {}
+        for proof in contract_proofs
+    ]
+    authority_generation_fingerprints = {
+        _validated_sha256_hex(
+            activation.get('authority_generation_fingerprint')
+        )
+        for activation in activation_proofs
+    }
+    if (
+        None in account_references
+        or len(account_references) != 1
+        or len(target_trade_dates) != 1
+        or None in plan_ids
+        or len(plan_ids) != 1
+        or None in execution_plan_ids
+        or len(execution_plan_ids) != 1
+        or None in material_fingerprints
+        or len(material_fingerprints) != 1
+        or None in plan_fingerprints
+        or len(plan_fingerprints) != 1
+        or None in authority_generation_fingerprints
+        or len(authority_generation_fingerprints) != 1
+        or len(
+            {
+                json.dumps(destination, sort_keys=True, separators=(',', ':'))
+                for destination in destinations
+            }
+        )
+        != 1
+    ):
+        raise ValueError('pending Core activation group authority is inconsistent')
+
+    plan_id = str(next(iter(plan_ids)))
+    execution_plan_id = str(next(iter(execution_plan_ids)))
+    dispatch_material_fingerprint = str(next(iter(material_fingerprints)))
+    authority_generation_fingerprint = str(
+        next(iter(authority_generation_fingerprints))
+    )
+    expected_activation_proof = {
+        'schema_version': CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION,
+        'mode': 'core_confirmed',
+        'authority_generation_fingerprint': authority_generation_fingerprint,
+        'status': 'pending',
+        'dispatch_material_fingerprint': dispatch_material_fingerprint,
+    }
+    if any(
+        activation != expected_activation_proof
+        for activation in activation_proofs
+    ):
+        raise ValueError('pending Core activation proof is not exact')
+
+    request_total_counts = {
+        summary.get('total_item_count') for summary in request_summaries
+    }
+    response_total_counts = {
+        summary.get('total_item_count') for summary in response_summaries
+    }
+    accepted_item_counts = {
+        summary.get('accepted_item_count') for summary in response_summaries
+    }
+    rejected_item_counts = {
+        summary.get('rejected_item_count') for summary in response_summaries
+    }
+    if (
+        len(request_total_counts) != 1
+        or len(response_total_counts) != 1
+        or len(accepted_item_counts) != 1
+        or rejected_item_counts != {0}
+    ):
+        raise ValueError('pending Core activation item totals are inconsistent')
+    total_item_count = next(iter(request_total_counts))
+    if (
+        not isinstance(total_item_count, int)
+        or isinstance(total_item_count, bool)
+        or total_item_count <= 0
+        or response_total_counts != {total_item_count}
+        or accepted_item_counts != {total_item_count}
+    ):
+        raise ValueError('pending Core activation item totals are invalid')
+
+    activation_items: list[dict[str, str]] = []
+    for row, state, request_summary, response_summary in zip(
+        ordered_rows,
+        exec_states,
+        request_summaries,
+        response_summaries,
+        strict=True,
+    ):
+        if (
+            request_summary.get('plan_id') != plan_id
+            or request_summary.get('row_item_count')
+            != len(state.get('item_links') or [])
+            or response_summary.get('execution_plan_id') != execution_plan_id
+            or response_summary.get('row_item_count')
+            != len(state.get('item_links') or [])
+        ):
+            raise ValueError(
+                'pending Core activation row summaries are incomplete'
+            )
+        request_items = request_summary.get('row_items')
+        if not isinstance(request_items, list):
+            raise ValueError('pending Core activation request items are missing')
+        request_by_key = {
+            str(item.get('core_item_key') or ''): item
+            for item in request_items
+            if isinstance(item, dict)
+        }
+        links = state.get('item_links')
+        if not isinstance(links, list) or not links:
+            raise ValueError('pending Core activation item links are missing')
+        link_keys = {
+            str(link.get('core_item_key') or '')
+            for link in links
+            if isinstance(link, dict)
+        }
+        if (
+            len(request_by_key) != len(request_items)
+            or set(request_by_key) != link_keys
+            or len(link_keys) != len(links)
+            or '' in link_keys
+            or any(
+                str(request_by_key[key].get('decision_snapshot_id') or '')
+                != str(row.decision_snapshot_id)
+                for key in link_keys
+            )
+        ):
+            raise ValueError(
+                'pending Core activation item-to-snapshot binding changed'
+            )
+        for link in links:
+            core_item_key = str(link['core_item_key'])
+            linked_execution_plan_id = _normalize_optional_text(
+                link.get('exec_plan_id')
+            )
+            execution_plan_item_id = _normalize_optional_text(
+                link.get('exec_plan_item_id')
+            )
+            if (
+                linked_execution_plan_id != execution_plan_id
+                or execution_plan_item_id is None
+            ):
+                raise ValueError(
+                    'pending Core activation remote item binding changed'
+                )
+            activation_items.append(
+                {
+                    'core_item_key': core_item_key,
+                    'execution_plan_item_id': execution_plan_item_id,
+                    'decision_snapshot_id': str(row.decision_snapshot_id),
+                }
+            )
+
+    if (
+        len(activation_items) != total_item_count
+        or len({item['core_item_key'] for item in activation_items})
+        != total_item_count
+        or len(
+            {item['execution_plan_item_id'] for item in activation_items}
+        )
+        != total_item_count
+    ):
+        raise ValueError('pending Core activation does not cover the whole plan')
+
+    return (
+        {
+            'schema_version': EXECUTION_ACTIVATION_SCHEMA_VERSION,
+            'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+            'required_capability': EXECUTION_ACTIVATION_CAPABILITY,
+            'plan_id': plan_id,
+            'execution_plan_id': execution_plan_id,
+            'dispatch_material_fingerprint': dispatch_material_fingerprint,
+            'authority_generation_fingerprint': (
+                authority_generation_fingerprint
+            ),
+            'requested_at': _utcnow().isoformat(),
+            'items': activation_items,
+        },
+        revision_fingerprints,
+        destinations[0],
+    )
+
+
 def _row_dispatch_revision_fingerprint(
     row: SignalDeciderExecutionPlanItem,
 ) -> str:
@@ -1496,6 +1993,16 @@ class SignalDeciderExecClient:
 
     async def post_execution_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request_json('POST', '/v4/execution-plans', json_body=payload)
+
+    async def post_execution_plan_activation(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._request_json(
+            'POST',
+            '/v4/execution-plans/activations',
+            json_body=payload,
+        )
 
     async def post_buy_authority_observation(
         self,
@@ -2173,6 +2680,634 @@ class SignalDeciderExecIntegrationService:
                 'error_type': type(exc).__name__,
             }
 
+    @staticmethod
+    def _persist_core_activation_ack(
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        revision_fingerprints: dict[int, str],
+        request_payload: dict[str, Any],
+        response_payload: dict[str, Any],
+    ) -> None:
+        row_ids = [int(row.id) for row in rows]
+        if not row_ids or set(revision_fingerprints) != set(row_ids):
+            raise ValueError(
+                'Core activation revision fingerprints must bind every row'
+            )
+        request_by_key = {
+            str(item['core_item_key']): item
+            for item in request_payload['items']
+        }
+        with session_scope() as session:
+            durable_generation = (
+                signal_decider_next_open_execution_service
+                .inspect_dispatch_authority_generation(
+                    target_trade_date=rows[0].target_trade_date,
+                    expected_row_bindings=_dispatch_authority_row_bindings(
+                        rows,
+                        revision_fingerprints=revision_fingerprints,
+                    ),
+                    _session=session,
+                )
+            )
+            if (
+                _dispatch_authority_generation_conflict(
+                    before={
+                        'status': 'valid',
+                        'generation_fingerprint': request_payload[
+                            'authority_generation_fingerprint'
+                        ],
+                    },
+                    after=durable_generation,
+                )
+                is not None
+            ):
+                raise ValueError(
+                    'Core activation authority changed before durable ACK'
+                )
+            persisted_rows = session.execute(
+                select(SignalDeciderExecutionPlanItem)
+                .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
+            ).scalars().all()
+            if len(persisted_rows) != len(row_ids):
+                raise ValueError('Core activation rows changed before ACK persistence')
+
+            prepared: list[
+                tuple[
+                    SignalDeciderExecutionPlanItem,
+                    dict[str, Any],
+                    dict[str, Any],
+                ]
+            ] = []
+            for row in persisted_rows:
+                if row.execution_status in {
+                    'revocation_pending',
+                    'revocation_manual_review',
+                    'revoked',
+                }:
+                    raise ValueError('Core activation row was revoked before ACK persistence')
+                submission = (
+                    copy.deepcopy(row.submission_payload)
+                    if isinstance(row.submission_payload, dict)
+                    else {}
+                )
+                exec_dispatch = (
+                    copy.deepcopy(submission.get('exec_dispatch'))
+                    if isinstance(submission.get('exec_dispatch'), dict)
+                    else {}
+                )
+                proof = (
+                    copy.deepcopy(exec_dispatch.get('contract_proof'))
+                    if isinstance(exec_dispatch.get('contract_proof'), dict)
+                    else {}
+                )
+                links = [
+                    link
+                    for link in (exec_dispatch.get('item_links') or [])
+                    if isinstance(link, dict)
+                ]
+                linked_by_key = {
+                    str(link.get('core_item_key') or ''): link
+                    for link in links
+                }
+                submitted_keys = proof.get('submitted_core_item_keys')
+                expected_keys = (
+                    {str(key) for key in submitted_keys}
+                    if isinstance(submitted_keys, list)
+                    else set()
+                )
+                core_activation = (
+                    proof.get('core_activation')
+                    if isinstance(proof.get('core_activation'), dict)
+                    else {}
+                )
+                activation_status = _normalize_status(
+                    core_activation.get('status')
+                )
+                pending_activation = {
+                    'schema_version': (
+                        CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION
+                    ),
+                    'mode': 'core_confirmed',
+                    'authority_generation_fingerprint': request_payload[
+                        'authority_generation_fingerprint'
+                    ],
+                    'status': 'pending',
+                    'dispatch_material_fingerprint': request_payload[
+                        'dispatch_material_fingerprint'
+                    ],
+                }
+                if (
+                    exec_dispatch.get('plan_id') != request_payload['plan_id']
+                    or proof.get('execution_plan_id')
+                    != request_payload['execution_plan_id']
+                    or proof.get('dispatch_material_fingerprint')
+                    != request_payload['dispatch_material_fingerprint']
+                    or _validated_sha256_hex(
+                        exec_dispatch.get('dispatch_revision_fingerprint')
+                    )
+                    != _row_dispatch_revision_fingerprint(row)
+                    or (
+                        core_activation != pending_activation
+                        and not (
+                            activation_status == 'activated'
+                            and core_activation.get('schema_version')
+                            == EXECUTION_ACTIVATION_SCHEMA_VERSION
+                            and core_activation.get(
+                                'dispatch_material_fingerprint'
+                            )
+                            == request_payload[
+                                'dispatch_material_fingerprint'
+                            ]
+                            and core_activation.get(
+                                'authority_generation_fingerprint'
+                            )
+                            == request_payload[
+                                'authority_generation_fingerprint'
+                            ]
+                        )
+                    )
+                    or not expected_keys
+                    or not expected_keys.issubset(request_by_key)
+                    or set(linked_by_key) != expected_keys
+                    or any(
+                        str(request_by_key[key]['decision_snapshot_id'])
+                        != str(row.decision_snapshot_id)
+                        for key in expected_keys
+                    )
+                    or any(
+                        str(linked_by_key[key].get('exec_plan_item_id') or '')
+                        != str(request_by_key[key]['execution_plan_item_id'])
+                        for key in expected_keys
+                    )
+                ):
+                    raise ValueError(
+                        'Core activation ACK no longer matches persisted dispatch authority'
+                    )
+                prepared.append((row, submission, exec_dispatch))
+
+            activated_at = _utcnow().isoformat()
+            for row, submission, exec_dispatch in prepared:
+                proof = copy.deepcopy(exec_dispatch['contract_proof'])
+                proof['core_activation'] = {
+                    'schema_version': EXECUTION_ACTIVATION_SCHEMA_VERSION,
+                    'status': 'activated',
+                    'activated_at': activated_at,
+                    'dispatch_material_fingerprint': request_payload[
+                        'dispatch_material_fingerprint'
+                    ],
+                    'authority_generation_fingerprint': request_payload[
+                        'authority_generation_fingerprint'
+                    ],
+                    'contract_ack': copy.deepcopy(
+                        response_payload.get('contract_ack')
+                    ),
+                }
+                exec_dispatch['contract_proof'] = proof
+                submission['exec_dispatch'] = exec_dispatch
+                row.submission_payload = slim_signal_decider_exec_submission_payload(
+                    submission
+                ).payload
+            session.flush()
+
+    async def _activate_core_confirmed_dispatch(
+        self,
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        plan_payload: dict[str, Any],
+        response_payload: dict[str, Any],
+        persisted_group_result: dict[str, Any],
+        target_trade_date: date,
+        account_reference: str,
+        trigger: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if (
+            persisted_group_result.get('dispatch_status')
+            != EXEC_DISPATCH_STATUS_ACCEPTED
+            or _core_activation_binding_from_plan(plan_payload) is None
+        ):
+            return persisted_group_result, []
+
+        activation_request: dict[str, Any] | None = None
+        try:
+            binding = _core_activation_binding_from_plan(plan_payload)
+            if binding is None:
+                raise ValueError(
+                    'execution plan is missing a Core activation binding'
+                )
+            revision_fingerprints = {
+                int(row.id): _row_dispatch_revision_fingerprint(row)
+                for row in rows
+            }
+            expected_generation = {
+                'status': 'valid',
+                'generation_fingerprint': binding[
+                    'authority_generation_fingerprint'
+                ],
+            }
+            generation_before = (
+                await self._inspect_dispatch_authority_generation(
+                    target_trade_date=target_trade_date,
+                    rows=rows,
+                    revision_fingerprints=revision_fingerprints,
+                )
+            )
+            if (
+                _dispatch_authority_generation_conflict(
+                    before=expected_generation,
+                    after=generation_before,
+                )
+                is not None
+            ):
+                if (
+                    generation_before.get('error_type')
+                    == '_PlanRefreshRevisionConflict'
+                ):
+                    return (
+                        {
+                            **persisted_group_result,
+                            'activation_status': 'pending',
+                            'activation_error': _serialize_error(
+                                code='execution_activation_fence_busy',
+                                message=(
+                                    'Core activation fence is busy; the Exec '
+                                    'plan remains quarantined for retry.'
+                                ),
+                                retryable=True,
+                            ),
+                        },
+                        [],
+                    )
+                raise ValueError(
+                    'Core activation authority changed before activation POST'
+                )
+            activation_request = _build_execution_activation_payload(
+                plan_payload=plan_payload,
+                response_payload=response_payload,
+            )
+            activation_response = (
+                await self.client.post_execution_plan_activation(
+                    activation_request
+                )
+            )
+            _validate_execution_activation_ack(
+                activation_response,
+                request_payload=activation_request,
+            )
+            generation_after = (
+                await self._inspect_dispatch_authority_generation(
+                    target_trade_date=target_trade_date,
+                    rows=rows,
+                    revision_fingerprints=revision_fingerprints,
+                )
+            )
+            if (
+                _dispatch_authority_generation_conflict(
+                    before=expected_generation,
+                    after=generation_after,
+                )
+                is not None
+            ):
+                raise ValueError(
+                    'Core activation authority changed during activation POST'
+                )
+            self._persist_core_activation_ack(
+                rows=rows,
+                revision_fingerprints=revision_fingerprints,
+                request_payload=activation_request,
+                response_payload=activation_response,
+            )
+        except Exception as exc:  # noqa: BLE001 - activated BUY must be revoked on uncertainty
+            error = (
+                _serialize_error(
+                    code=exc.code,
+                    message=str(exc),
+                    retryable=exc.retryable,
+                    status_code=exc.status_code,
+                )
+                if isinstance(exc, SignalDeciderExecClientError)
+                else _serialize_error(
+                    code='execution_activation_ack_invalid',
+                    message=str(exc),
+                    retryable=isinstance(exc, AttributeError),
+                )
+            )
+            await asyncio.to_thread(
+                signal_decider_next_open_execution_service
+                .stage_market_evidence_unavailable_revocations,
+                target_trade_date=target_trade_date,
+                account_reference=account_reference,
+                row_ids=[int(row.id) for row in rows],
+                failure_source=f'{trigger}_core_activation_failed',
+            )
+            return (
+                {
+                    **persisted_group_result,
+                    'dispatch_status': 'revocation_pending',
+                    'activation_status': 'failed_closed',
+                    'activation_error': error,
+                    'activation_request_created': activation_request is not None,
+                },
+                [],
+            )
+
+        return (
+            {
+                **persisted_group_result,
+                'activation_status': 'activated',
+                'activation': {
+                    'schema_version': EXECUTION_ACTIVATION_SCHEMA_VERSION,
+                    'authority_generation_fingerprint': activation_request[
+                        'authority_generation_fingerprint'
+                    ],
+                    'dispatch_material_fingerprint': activation_request[
+                        'dispatch_material_fingerprint'
+                    ],
+                },
+            },
+            [],
+        )
+
+    async def _reconcile_pending_core_activations(
+        self,
+        *,
+        target_trade_date: date,
+        account_reference: str | None,
+        integration: dict[str, Any],
+        buy_authority_sync: dict[str, Any],
+        trigger: str,
+    ) -> list[dict[str, Any]]:
+        """Retry exact quarantined plans after Core lost the activation window."""
+        rows = self._load_next_open_rows(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            include_payloads=True,
+        )
+        pending_rows: list[SignalDeciderExecutionPlanItem] = []
+        for row in rows:
+            submission = (
+                row.submission_payload
+                if isinstance(row.submission_payload, dict)
+                else {}
+            )
+            exec_dispatch = (
+                submission.get('exec_dispatch')
+                if isinstance(submission.get('exec_dispatch'), dict)
+                else {}
+            )
+            proof = (
+                exec_dispatch.get('contract_proof')
+                if isinstance(exec_dispatch.get('contract_proof'), dict)
+                else {}
+            )
+            activation = (
+                proof.get('core_activation')
+                if isinstance(proof.get('core_activation'), dict)
+                else None
+            )
+            if (
+                _normalize_status(exec_dispatch.get('dispatch_status'))
+                == EXEC_DISPATCH_STATUS_ACCEPTED
+                and isinstance(activation, dict)
+                and _normalize_status(activation.get('status')) == 'pending'
+                and row.execution_status
+                not in {'revocation_pending', 'revocation_manual_review', 'revoked'}
+            ):
+                pending_rows.append(row)
+
+        results: list[dict[str, Any]] = []
+        for plan_id, group_rows in self._group_rows_by_plan_id(
+            pending_rows
+        ).items():
+            group_accounts = sorted(
+                {
+                    str(row.account_reference)
+                    for row in group_rows
+                    if _normalize_optional_text(row.account_reference)
+                }
+            )
+
+            async def fail_closed(
+                *,
+                reason_code: str,
+                error: dict[str, Any] | None = None,
+            ) -> list[dict[str, Any]]:
+                revocations: list[dict[str, Any]] = []
+                for group_account in group_accounts:
+                    await asyncio.to_thread(
+                        signal_decider_next_open_execution_service
+                        .stage_market_evidence_unavailable_revocations,
+                        target_trade_date=target_trade_date,
+                        account_reference=group_account,
+                        row_ids=[int(row.id) for row in group_rows],
+                        failure_source=(
+                            f'{trigger}_pending_core_activation_{reason_code}'
+                        ),
+                    )
+                    revocations.extend(
+                        await self._flush_pending_exec_revocations(
+                            target_trade_date=target_trade_date,
+                            account_reference=group_account,
+                            integration=integration,
+                            trigger=(
+                                f'{trigger}_pending_core_activation_'
+                                f'{reason_code}'
+                            ),
+                        )
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'revocation_pending',
+                        'reason_code': reason_code,
+                        'error': error,
+                        'revocations': revocations,
+                    }
+                )
+                return revocations
+
+            try:
+                (
+                    activation_request,
+                    revision_fingerprints,
+                    expected_destination,
+                ) = _build_pending_core_activation_request(group_rows)
+            except ValueError as exc:
+                await fail_closed(
+                    reason_code='persisted_contract_invalid',
+                    error=_serialize_error(
+                        code='execution_activation_persisted_contract_invalid',
+                        message=str(exc),
+                        retryable=False,
+                    ),
+                )
+                continue
+
+            group_account = group_accounts[0]
+            try:
+                active_destination = self._active_destination_binding(
+                    account_reference=group_account,
+                    integration=integration,
+                )
+            except ValueError:
+                active_destination = None
+            if active_destination != expected_destination:
+                reason_code = (
+                    'exec_destination_binding_missing'
+                    if active_destination is None
+                    else 'exec_destination_mismatch'
+                )
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code=reason_code,
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': reason_code,
+                    }
+                )
+                continue
+
+            requires_buy_authority = any(
+                _dispatch_group_requires_core_krx_buy_authority(
+                    route_family=route_family,
+                    rows=scoped_rows,
+                )
+                for (
+                    _scoped_account,
+                    _decision_agent_name,
+                    route_family,
+                ), scoped_rows in self._group_rows_by_dispatch_scope(
+                    group_rows
+                ).items()
+            )
+            if requires_buy_authority and buy_authority_sync.get('applies') is True:
+                synchronized_accounts = buy_authority_sync.get('accounts')
+                account_authority = (
+                    synchronized_accounts.get(group_account)
+                    if isinstance(synchronized_accounts, dict)
+                    else None
+                )
+                if not isinstance(account_authority, dict) or not account_authority.get(
+                    'dispatch_allowed'
+                ):
+                    results.append(
+                        {
+                            'plan_id': plan_id,
+                            'status': 'activation_pending',
+                            'reason_code': (
+                                'core_exec_buy_authority_not_acknowledged'
+                            ),
+                        }
+                    )
+                    continue
+
+            expected_generation = {
+                'status': 'valid',
+                'generation_fingerprint': activation_request[
+                    'authority_generation_fingerprint'
+                ],
+            }
+            generation_before = (
+                await self._inspect_dispatch_authority_generation(
+                    target_trade_date=target_trade_date,
+                    rows=group_rows,
+                    revision_fingerprints=revision_fingerprints,
+                )
+            )
+            if (
+                _dispatch_authority_generation_conflict(
+                    before=expected_generation,
+                    after=generation_before,
+                )
+                is not None
+            ):
+                if (
+                    generation_before.get('error_type')
+                    == '_PlanRefreshRevisionConflict'
+                ):
+                    results.append(
+                        {
+                            'plan_id': plan_id,
+                            'status': 'activation_pending',
+                            'reason_code': 'activation_fence_busy',
+                        }
+                    )
+                    continue
+                await fail_closed(reason_code='authority_generation_changed')
+                continue
+
+            try:
+                activation_response = (
+                    await self.client.post_execution_plan_activation(
+                        activation_request
+                    )
+                )
+                _validate_execution_activation_ack(
+                    activation_response,
+                    request_payload=activation_request,
+                )
+                generation_after = (
+                    await self._inspect_dispatch_authority_generation(
+                        target_trade_date=target_trade_date,
+                        rows=group_rows,
+                        revision_fingerprints=revision_fingerprints,
+                    )
+                )
+                if (
+                    _dispatch_authority_generation_conflict(
+                        before=expected_generation,
+                        after=generation_after,
+                    )
+                    is not None
+                ):
+                    await fail_closed(
+                        reason_code='post_activation_authority_changed'
+                    )
+                    continue
+                self._persist_core_activation_ack(
+                    rows=group_rows,
+                    revision_fingerprints=revision_fingerprints,
+                    request_payload=activation_request,
+                    response_payload=activation_response,
+                )
+            except Exception as exc:  # noqa: BLE001 - recovered BUY stays fail closed
+                error = (
+                    _serialize_error(
+                        code=exc.code,
+                        message=str(exc),
+                        retryable=exc.retryable,
+                        status_code=exc.status_code,
+                    )
+                    if isinstance(exc, SignalDeciderExecClientError)
+                    else _serialize_error(
+                        code='execution_activation_recovery_failed',
+                        message=str(exc),
+                        retryable=isinstance(exc, AttributeError),
+                    )
+                )
+                await fail_closed(
+                    reason_code='activation_recovery_failed',
+                    error=error,
+                )
+                continue
+
+            results.append(
+                {
+                    'plan_id': plan_id,
+                    'status': 'activated',
+                    'activated_item_count': len(activation_request['items']),
+                }
+            )
+        return results
+
     async def _reconcile_pending_dispatch_write_ahead(
         self,
         *,
@@ -2341,6 +3476,57 @@ class SignalDeciderExecIntegrationService:
             except SignalDeciderExecPayloadContractError:
                 payload = {}
                 row_links = {}
+            stored_authority_generations = [
+                state.get('authority_generation_before')
+                for state in exec_states
+                if isinstance(state.get('authority_generation_before'), dict)
+            ]
+            stored_activation_bindings = [
+                generation.get('core_activation')
+                for generation in stored_authority_generations
+                if isinstance(generation.get('core_activation'), dict)
+            ]
+            if payload and stored_activation_bindings:
+                generation_fingerprints = {
+                    _validated_sha256_hex(
+                        generation.get('generation_fingerprint')
+                    )
+                    for generation in stored_authority_generations
+                    if generation.get('status') == 'valid'
+                }
+                if (
+                    len(stored_authority_generations) != len(exec_states)
+                    or len(stored_activation_bindings) != len(exec_states)
+                    or len(
+                        {
+                            json.dumps(
+                                binding,
+                                sort_keys=True,
+                                separators=(',', ':'),
+                            )
+                            for binding in stored_activation_bindings
+                        }
+                    )
+                    != 1
+                    or None in generation_fingerprints
+                    or len(generation_fingerprints) != 1
+                ):
+                    payload = {}
+                    row_links = {}
+                else:
+                    try:
+                        payload = _bind_core_confirmed_activation(
+                            payload,
+                            authority_generation={
+                                'status': 'valid',
+                                'generation_fingerprint': next(
+                                    iter(generation_fingerprints)
+                                ),
+                            },
+                        )
+                    except SignalDeciderExecPayloadContractError:
+                        payload = {}
+                        row_links = {}
             expected_material_fingerprint = next(
                 iter(dispatch_material_fingerprints)
             )
@@ -2610,6 +3796,15 @@ class SignalDeciderExecIntegrationService:
                     trigger=f'{trigger}_write_ahead_retry',
                     authority_generation_before=authority_generation_before,
                 )
+                persisted, _ = await self._activate_core_confirmed_dispatch(
+                    rows=group_rows,
+                    plan_payload=payload,
+                    response_payload=candidate_response,
+                    persisted_group_result=persisted,
+                    target_trade_date=target_trade_date,
+                    account_reference=str(group_rows[0].account_reference),
+                    trigger=f'{trigger}_write_ahead_retry',
+                )
                 results.append({'plan_id': plan_id, **persisted})
                 if persisted.get('dispatch_status') == 'revocation_pending':
                     await self._flush_pending_exec_revocations(
@@ -2650,6 +3845,21 @@ class SignalDeciderExecIntegrationService:
                 trigger=f'{trigger}_write_ahead_recovery',
                 authority_generation_before=authority_generation_before,
             )
+            activation_allowed = bool(
+                integration.get('delegate_execution')
+                and integration.get('config_status') == 'ready'
+                and settings.signal_decider_next_open_enabled
+            )
+            if activation_allowed:
+                persisted, _ = await self._activate_core_confirmed_dispatch(
+                    rows=group_rows,
+                    plan_payload=payload,
+                    response_payload=candidate_response,
+                    persisted_group_result=persisted,
+                    target_trade_date=target_trade_date,
+                    account_reference=str(group_rows[0].account_reference),
+                    trigger=f'{trigger}_write_ahead_recovery',
+                )
             results.append({'plan_id': plan_id, **persisted})
             if persisted.get('dispatch_status') == 'revocation_pending':
                 await self._flush_pending_exec_revocations(
@@ -2708,7 +3918,6 @@ class SignalDeciderExecIntegrationService:
             buy_authority_sync=buy_authority_sync,
             trigger=trigger,
         )
-
         managed_delegated_authority = bool(
             execution_control_disabled
             and self.should_manage_delegated_authority(
@@ -2983,6 +4192,15 @@ class SignalDeciderExecIntegrationService:
                     'items': plan_view.get('items') or [],
                 }
 
+        if not resolved_dry_run:
+            await self._reconcile_pending_core_activations(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                integration=integration,
+                buy_authority_sync=buy_authority_sync,
+                trigger=trigger,
+            )
+
         rows = self._load_next_open_rows(
             target_trade_date=resolved_target_date,
             account_reference=resolved_account_reference,
@@ -3214,6 +4432,34 @@ class SignalDeciderExecIntegrationService:
                     )
                     continue
 
+                try:
+                    plan_payload = _bind_core_confirmed_activation(
+                        plan_payload,
+                        authority_generation=authority_generation_before,
+                    )
+                except SignalDeciderExecPayloadContractError as exc:
+                    failed_group_count += 1
+                    group_results.append(
+                        {
+                            'account_reference': account_key,
+                            'decision_agent_name': decision_agent_name,
+                            'plan_id': plan_id,
+                            'dispatch_status': EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
+                            'eligible_count': len(eligible_rows),
+                            'already_dispatched_count': len(
+                                already_dispatched_rows
+                            ),
+                            'dispatch_candidate_count': len(dispatch_rows),
+                            'translated_item_count': len(plan_payload['items']),
+                            'error': _serialize_error(
+                                code='execution_activation_binding_invalid',
+                                message=str(exc),
+                            ),
+                        }
+                    )
+                    continue
+                fingerprint = _fingerprint_exec_plan(plan_payload)
+
             if not force and self._rows_match_existing_dispatch(dispatch_rows, plan_id=plan_id, fingerprint=fingerprint):
                 skipped_group_count += 1
                 group_results.append(
@@ -3366,6 +4612,19 @@ class SignalDeciderExecIntegrationService:
                                 authority_generation_before
                             ),
                         )
+                        (
+                            persisted_group_result,
+                            activation_revocations,
+                        ) = await self._activate_core_confirmed_dispatch(
+                            rows=dispatch_rows,
+                            plan_payload=plan_payload,
+                            response_payload=response_payload,
+                            persisted_group_result=persisted_group_result,
+                            target_trade_date=resolved_target_date,
+                            account_reference=account_key,
+                            trigger=trigger,
+                        )
+                        revocation_results.extend(activation_revocations)
                         if persisted_group_result['dispatch_status'] == 'revocation_pending':
                             post_ack_revocations = await self._flush_pending_exec_revocations(
                                 target_trade_date=resolved_target_date,
@@ -3449,6 +4708,19 @@ class SignalDeciderExecIntegrationService:
                 trigger=trigger,
                 authority_generation_before=authority_generation_before,
             )
+            (
+                persisted_group_result,
+                activation_revocations,
+            ) = await self._activate_core_confirmed_dispatch(
+                rows=dispatch_rows,
+                plan_payload=plan_payload,
+                response_payload=response_payload,
+                persisted_group_result=persisted_group_result,
+                target_trade_date=resolved_target_date,
+                account_reference=account_key,
+                trigger=trigger,
+            )
+            revocation_results.extend(activation_revocations)
             if persisted_group_result['dispatch_status'] == 'revocation_pending':
                 post_ack_revocations = await self._flush_pending_exec_revocations(
                     target_trade_date=resolved_target_date,
@@ -6478,6 +7750,7 @@ class SignalDeciderExecIntegrationService:
         authority_generation_before: dict[str, Any] | None,
     ) -> None:
         now = _utcnow()
+        core_activation_binding = _core_activation_binding_from_plan(payload)
         row_ids = [int(row.id) for row in rows]
         submitted_by_id = {int(row.id): row for row in rows}
         if set(submitted_revision_fingerprints) != set(row_ids):
@@ -6564,6 +7837,15 @@ class SignalDeciderExecIntegrationService:
                             'generation_fingerprint': authority_generation_before.get(
                                 'generation_fingerprint'
                             ),
+                            **(
+                                {
+                                    'core_activation': copy.deepcopy(
+                                        core_activation_binding
+                                    )
+                                }
+                                if core_activation_binding is not None
+                                else {}
+                            ),
                         }
                         if isinstance(authority_generation_before, dict)
                         else None
@@ -6645,6 +7927,7 @@ class SignalDeciderExecIntegrationService:
         authority_generation_before: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         destination_binding = self._destination_binding_for_payload(payload)
+        core_activation_binding = _core_activation_binding_from_plan(payload)
         submitted_core_item_keys = [
             str(link['core_item_key'])
             for row in rows
@@ -7130,6 +8413,19 @@ class SignalDeciderExecIntegrationService:
                         ],
                         'accepted_item_count': len(row_links.get(row.id, [])),
                         'rejected_item_count': 0,
+                        **(
+                            {
+                                'core_activation': {
+                                    **core_activation_binding,
+                                    'status': 'pending',
+                                    'dispatch_material_fingerprint': payload[
+                                        'metadata'
+                                    ]['dispatch_material_fingerprint'],
+                                }
+                            }
+                            if core_activation_binding is not None
+                            else {}
+                        ),
                     },
                     'attempts': _append_limited(existing_exec.get('attempts') or [], attempt),
                     'last_request_summary': compact_exec_request_summary(

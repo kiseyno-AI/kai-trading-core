@@ -318,6 +318,126 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     status='completed',
                 )
 
+    def test_finish_stage_recomputes_stale_remaining_from_terminal_counts(self) -> None:
+        now = datetime(2026, 9, 12, 16, 5, tzinfo=timezone.utc)
+        run = SimpleNamespace(
+            id=386,
+            status='running',
+            current_stage='price_collection',
+            updated_at=now,
+        )
+        stage = SimpleNamespace(
+            id=901,
+            pipeline_run_id=386,
+            market_date=date(2026, 9, 11),
+            stage_id='price_collection',
+            status='running',
+            processed=3_548,
+            total=3_549,
+            succeeded=3_548,
+            failed=0,
+            remaining=3_549,
+            current_step='collecting',
+            current_activity='Collecting prices',
+            current_symbol='472220',
+            current_period=None,
+            started_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=1),
+            completed_at=None,
+            error_message=None,
+            source_run_ids={},
+            details={},
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stage_result = MagicMock()
+        stage_result.scalar_one_or_none.return_value = stage
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stage_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+        ):
+            result = DailyPipelineRunStateService().finish_stage(
+                pipeline_run_id=386,
+                stage_id='price_collection',
+                market_date='2026-09-11',
+                status='partial',
+                processed=3_549,
+                total=3_549,
+                succeeded=3_548,
+                failed=1,
+            )
+
+        self.assertEqual(result['remaining'], 0)
+        self.assertEqual(stage.remaining, 0)
+
+    def test_direct_terminal_update_recomputes_stale_remaining(self) -> None:
+        now = datetime(2026, 9, 12, 16, 5, tzinfo=timezone.utc)
+        run = SimpleNamespace(
+            id=386,
+            status='running',
+            current_stage='price_collection',
+            updated_at=now,
+        )
+        stage = SimpleNamespace(
+            id=901,
+            pipeline_run_id=386,
+            market_date=date(2026, 9, 11),
+            stage_id='price_collection',
+            status='running',
+            processed=3_548,
+            total=3_549,
+            succeeded=3_548,
+            failed=0,
+            remaining=3_549,
+            current_step='collecting',
+            current_activity='Collecting prices',
+            current_symbol='472220',
+            current_period=None,
+            started_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=1),
+            completed_at=None,
+            error_message=None,
+            source_run_ids={},
+            details={},
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stage_result = MagicMock()
+        stage_result.scalar_one_or_none.return_value = stage
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stage_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+        ):
+            result = DailyPipelineRunStateService().update_stage(
+                pipeline_run_id=386,
+                stage_id='price_collection',
+                market_date='2026-09-11',
+                status='partial',
+                processed=3_549,
+                total=3_549,
+                succeeded=3_548,
+                failed=1,
+            )
+
+        self.assertEqual(result['remaining'], 0)
+        self.assertEqual(stage.remaining, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

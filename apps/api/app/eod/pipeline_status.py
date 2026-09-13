@@ -35,7 +35,12 @@ from app.db_models import (
     Symbol,
 )
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
-from app.eod.daily_pipeline_stages import DAILY_STAGE_ORDER, FACTOR_STAGE_ORDER, STAGE_DEFINITIONS
+from app.eod.daily_pipeline_stages import (
+    DAILY_STAGE_ORDER,
+    FACTOR_STAGE_ORDER,
+    STAGE_DEFINITIONS,
+    DailyPipelineStageService,
+)
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES, pykrx_enrichment_service
@@ -133,11 +138,20 @@ def _utcnow_iso() -> str:
 
 
 def _load_pipeline_pykrx_run_rows(*, trade_date: str) -> list[dict[str, Any]]:
+    daily_rows = list_eod_collection_runs(
+        market='KRX',
+        trade_date=trade_date,
+        source='pykrx',
+        excluded_run_metadata_modes=('historical_backfill',),
+        limit=10,
+    )
+    if daily_rows:
+        return daily_rows
     return list_eod_collection_runs(
         market='KRX',
         trade_date=trade_date,
         source='pykrx',
-        limit=10,
+        limit=1,
     )
 
 
@@ -1035,6 +1049,25 @@ class EODPipelineStatusService:
                 'default_selected': definition.default_selected,
                 'details': details,
             }
+        signal_decider_status = str(
+            normalized.get('signal_decider', {}).get('status') or ''
+        ).strip().lower()
+        next_open_stage = normalized.get('next_open_execution_plan')
+        if (
+            next_open_stage is not None
+            and str(next_open_stage.get('status') or '').strip().lower() == 'completed'
+            and signal_decider_status != 'completed'
+        ):
+            repaired_details = dict(next_open_stage.get('details') or {})
+            repaired_details['status_repaired_from'] = 'completed'
+            repaired_details['status_repair_reason'] = 'signal_decider_incomplete'
+            repaired_details['upstream_status'] = signal_decider_status or 'unknown'
+            normalized['next_open_execution_plan'] = {
+                **next_open_stage,
+                'status': 'blocked',
+                'current_activity': 'Blocked because the signal decider cohort is incomplete.',
+                'details': repaired_details,
+            }
         return normalized
 
     @staticmethod
@@ -1468,17 +1501,13 @@ class EODPipelineStatusService:
         fallback_stage: dict[str, Any],
     ) -> bool:
         details = fallback_stage.get('details') if isinstance(fallback_stage.get('details'), dict) else {}
-        if stage_id != 'pykrx_enrichment':
-            if stage_id not in FACTOR_STAGE_MODELS and stage_id not in {'composite_factors'}:
-                return False
-            return (
-                str(fallback_stage.get('status') or '').strip().lower() == 'completed'
-                and int(details.get('rows_persisted') or fallback_stage.get('succeeded') or 0) > 0
-            )
+        if stage_id == 'pykrx_enrichment':
+            return False
+        if stage_id not in FACTOR_STAGE_MODELS and stage_id not in {'composite_factors'}:
+            return False
         return (
             str(fallback_stage.get('status') or '').strip().lower() == 'completed'
-            and str(fallback_stage.get('gate_status') or details.get('decider_category_gate_status') or '').strip().lower() == 'ready'
-            and bool(details.get('categories'))
+            and int(details.get('rows_persisted') or fallback_stage.get('succeeded') or 0) > 0
         )
 
     @staticmethod
@@ -1522,7 +1551,63 @@ class EODPipelineStatusService:
             failed=progress_source.get('failed'),
             processed=progress_source.get('processed'),
         )
-        details = dict(official_stage.get('details') or {})
+        official_details = dict(official_stage.get('details') or {})
+        result_summary = (
+            official_details.get('result_summary')
+            if isinstance(official_details.get('result_summary'), dict)
+            else {}
+        )
+        should_repair_legacy_counts = (
+            counts.processed == 0
+            and counts.succeeded == 0
+            and counts.failed == 0
+        )
+        if (
+            stage_id in {'external_news_collect', 'external_news_enrich'}
+            and result_summary
+            and should_repair_legacy_counts
+        ):
+            result_counts = DailyPipelineStageService._extract_stage_counts(
+                stage_id=stage_id,
+                result=result_summary,
+            )
+            if (
+                result_counts['total'] > 0
+                or result_counts['processed'] > 0
+                or DailyPipelineStageService._has_explicit_zero_stage_scope(
+                    stage_id=stage_id,
+                    result=result_summary,
+                )
+            ):
+                counts = build_stage_counts(**result_counts)
+        status_repaired_for_incomplete_counts = (
+            status == 'completed'
+            and (counts.failed > 0 or counts.remaining > 0)
+        )
+        if status_repaired_for_incomplete_counts:
+            status = 'partial'
+        fallback_details = dict(fallback_stage.get('details') or {})
+        uses_fallback_coverage_diagnostics = (
+            stage_id == 'pykrx_enrichment'
+            and bool(fallback_details.get('categories'))
+        )
+        details = (
+            {**fallback_details, **official_details}
+            if uses_fallback_coverage_diagnostics
+            else official_details
+        )
+        count_semantics = DailyPipelineStageService._extract_stage_count_semantics(
+            stage_id=stage_id,
+            result=result_summary,
+        )
+        if count_semantics:
+            details['count_semantics'] = count_semantics
+        if uses_fallback_coverage_diagnostics:
+            details['coverage_diagnostics_source'] = 'stage_specific_fallback'
+            details['coverage_diagnostics_updated_at'] = fallback_stage.get('updated_at')
+        if status_repaired_for_incomplete_counts:
+            details['status_repaired_from'] = 'completed'
+            details['status_repair_reason'] = 'incomplete_terminal_counts'
         details['mode'] = 'official_daily_pipeline_run_state'
         details['pipeline_run_id'] = official_run.get('id')
         details['pipeline_trigger'] = official_run.get('trigger')
@@ -1533,9 +1618,15 @@ class EODPipelineStatusService:
         current_activity = official_stage.get('current_activity')
         if use_fallback_progress:
             current_activity = fallback_stage.get('current_activity') or current_activity
+        if status_repaired_for_incomplete_counts:
+            current_activity = (
+                f'Completed with {counts.failed} failed items.'
+                if counts.failed > 0
+                else f'Incomplete with {counts.remaining} items remaining.'
+            )
         if status in {'failed', 'interrupted', 'abandoned'} and official_stage.get('error_message'):
             current_activity = official_stage.get('error_message')
-        return {
+        stage_payload = {
             'task': stage_id,
             'label': definition.label,
             'status': status,
@@ -1560,6 +1651,11 @@ class EODPipelineStatusService:
             ),
             'details': details,
         }
+        if stage_id == 'pykrx_enrichment':
+            for field_name in ('gate_status', 'severity', 'blocking_status'):
+                if fallback_stage.get(field_name) is not None:
+                    stage_payload[field_name] = fallback_stage[field_name]
+        return stage_payload
 
     def _build_agent_feedback_stage(
         self,

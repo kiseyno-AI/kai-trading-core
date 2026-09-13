@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import func, select, text
@@ -91,6 +91,7 @@ def list_eod_collection_runs(
     trade_date: str,
     source: str | None = None,
     statuses: Sequence[str] | None = None,
+    excluded_run_metadata_modes: Sequence[str] | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     with session_scope() as session:
@@ -102,6 +103,12 @@ def list_eod_collection_runs(
             stmt = stmt.where(EODCollectionRun.source == source)
         if statuses:
             stmt = stmt.where(EODCollectionRun.status.in_(statuses))
+        if excluded_run_metadata_modes:
+            metadata_mode = func.coalesce(
+                EODCollectionRun.run_metadata['mode'].as_string(),
+                '',
+            )
+            stmt = stmt.where(metadata_mode.not_in(excluded_run_metadata_modes))
         rows = session.execute(
             stmt.order_by(EODCollectionRun.started_at.desc(), EODCollectionRun.id.desc()).limit(limit)
         ).scalars()
@@ -178,7 +185,7 @@ def complete_eod_collection_run(
         run.symbols_succeeded = symbols_succeeded
         run.symbols_failed = symbols_failed
         run.error_message = error_message
-        run.completed_at = datetime.utcnow()
+        run.completed_at = datetime.now(timezone.utc)
         if run_metadata is not None:
             run.run_metadata = run_metadata
 

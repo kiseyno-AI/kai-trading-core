@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.core.settings import Settings, settings
 from app.core.test_database_safety import (
@@ -19,6 +19,7 @@ assert_safe_test_database_settings(settings)
 from app.db import engine, session_scope
 from app.db_models import (
     AgentContextFeedback,
+    AgentContextFeedbackFailure,
     AgentContextFeedbackRun,
     BrokerOrder,
     CurrentMarketSnapshotCache,
@@ -28,12 +29,17 @@ from app.db_models import (
     SignalDeciderPolicyVersion,
 )
 from app.market.clock import MarketState
+from app.agent_context.signal_decider_loop_service import (
+    SignalDeciderLoopRepository,
+)
 from app.market.session import (
     KisKrxTradingCalendarProvider,
     reset_krx_calendar_provider,
     set_krx_calendar_provider,
 )
 from app.orders.exec_integration import (
+    EXECUTION_ACTIVATION_CAPABILITY,
+    EXECUTION_ACTIVATION_SCHEMA_VERSION,
     EXEC_INTENT_INTRADAY_WATCH_BUY,
     SignalDeciderExecIntegrationService,
     _delta_dispatch_batch_key,
@@ -45,6 +51,7 @@ from app.orders.execution_handoff_contract import (
     EXECUTION_HANDOFF_CONTRACT_VERSION,
 )
 from app.orders.next_open_execution import (
+    EXECUTION_STATUS_AWAITING_TRIGGER,
     EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
     EXECUTION_STATUS_DRY_RUN,
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
@@ -58,7 +65,10 @@ from app.orders.next_open_execution import (
     ELIGIBILITY_MONITOR_CANDIDATE,
     SignalDeciderNextOpenExecutionService,
     NextOpenAccountTarget,
+    _PlanRefreshRevisionConflict,
+    _acquire_plan_refresh_advisory_lock,
     _delegate_short_term_watch_entry_quality_blocks_to_warnings,
+    _execution_plan_row_authority_fingerprint,
     _is_canonical_closed_market_cost_absence,
     _lock_dispatch_authority_source_tables,
     _next_open_performance_cost_evidence,
@@ -101,8 +111,108 @@ def test_dispatch_authority_source_locks_use_one_deadlock_safe_order() -> None:
     statements = [str(call.args[0]) for call in session.execute.call_args_list]
     assert statements == [
         'LOCK TABLE agent_context_feedback_runs IN SHARE MODE',
+        'LOCK TABLE agent_context_feedback_failures IN SHARE MODE',
         'LOCK TABLE signal_decider_decision_snapshots IN SHARE MODE',
+        'LOCK TABLE signal_decider_policy_versions IN SHARE MODE',
     ]
+
+
+def test_plan_refresh_lock_fails_fast_instead_of_holding_a_pool_waiter() -> None:
+    session = MagicMock()
+    bind = MagicMock()
+    bind.dialect.name = 'postgresql'
+    session.get_bind.return_value = bind
+    session.execute.return_value.scalar_one.return_value = False
+
+    try:
+        _acquire_plan_refresh_advisory_lock(
+            session,
+            target_trade_date=date(2026, 9, 14),
+        )
+    except _PlanRefreshRevisionConflict:
+        pass
+    else:
+        raise AssertionError('a busy plan refresh lock must fail fast')
+
+    statement = str(session.execute.call_args.args[0])
+    assert 'pg_try_advisory_xact_lock' in statement
+
+
+def test_next_open_summary_reports_distinct_symbols_beside_account_rows() -> None:
+    def row(
+        *,
+        account_reference: str,
+        symbol: str,
+        eligibility_status: str,
+        execution_status: str,
+        decision_agent_name: str = 'signal-decider',
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            account_reference=account_reference,
+            symbol=symbol,
+            eligibility_status=eligibility_status,
+            execution_status=execution_status,
+            decision_agent_name=decision_agent_name,
+            validation_payload={},
+        )
+
+    rows = [
+        row(
+            account_reference=account_reference,
+            symbol=symbol,
+            eligibility_status=eligibility_status,
+            execution_status=execution_status,
+            decision_agent_name=decision_agent_name,
+        )
+        for account_reference in ('KIS:12345678-01', 'KIS:87654321-01')
+        for symbol, eligibility_status, execution_status, decision_agent_name in (
+            ('005930', ELIGIBILITY_ELIGIBLE, EXECUTION_STATUS_PLANNED, 'signal-decider'),
+            (
+                '000660',
+                ELIGIBILITY_MONITOR_CANDIDATE,
+                EXECUTION_STATUS_AWAITING_TRIGGER,
+                'short-term-decider',
+            ),
+            ('035420', ELIGIBILITY_BLOCKED, EXECUTION_STATUS_PLANNED, 'signal-decider'),
+        )
+    ]
+
+    summary = SignalDeciderNextOpenExecutionService.__new__(
+        SignalDeciderNextOpenExecutionService
+    )._build_summary(
+        rows=rows,
+        target_trade_date=date(2026, 4, 30),
+        runtime={
+            'execution_enabled': True,
+            'dry_run': False,
+            'account_targets_configured': True,
+            'account_targets_valid': True,
+            'account_target_errors': [],
+        },
+    )
+
+    assert {
+        key: summary[key]
+        for key in (
+            'items_total',
+            'symbol_count',
+            'eligible_count',
+            'eligible_symbol_count',
+            'monitor_candidate_count',
+            'monitor_candidate_symbol_count',
+            'blocked_count',
+            'blocked_symbol_count',
+        )
+    } == {
+        'items_total': 6,
+        'symbol_count': 3,
+        'eligible_count': 2,
+        'eligible_symbol_count': 1,
+        'monitor_candidate_count': 2,
+        'monitor_candidate_symbol_count': 1,
+        'blocked_count': 2,
+        'blocked_symbol_count': 1,
+    }
 
 
 def _preopen_snapshot(
@@ -681,10 +791,187 @@ class FakeCalendarClient:
         return {'output': list(self.rows)}
 
 
+class AgentContextCompletenessUnitTests(unittest.TestCase):
+    def test_empty_candidate_scope_uses_source_decision_cohort(self) -> None:
+        source_market_date = date(2026, 9, 11)
+        latest_run = {
+            'run_id': 'feedback-cycle-2026-09-11-decision',
+            'status': 'partial',
+            'symbols_total': 160,
+            'completed_count': 60,
+            'failed_count': 100,
+            'started_at': datetime(2026, 9, 12, 13, 36, tzinfo=timezone.utc),
+            'completed_at': datetime(2026, 9, 12, 14, 57, tzinfo=timezone.utc),
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'roles': ['short-term-decider', 'signal-decider'],
+                'symbols': ['005930', '000660'],
+                'requested_symbols': ['005930', '000660'],
+                'role_symbol_scopes': {
+                    'short-term-decider': ['005930', '000660'],
+                    'signal-decider': ['005930', '000660'],
+                },
+            },
+        }
+        failure = {
+            'symbol': '000660',
+            'agent_name': 'short-term-decider',
+            'run_id': 'repair-short-term',
+            'failure_kind': 'response_contract_invalid',
+            'retryable': True,
+            'summary_payload': {},
+            'context_payload': {},
+        }
+        scope_state = {
+            'selected_by_key': {
+                ('005930', 'short-term-decider'): object(),
+                ('005930', 'signal-decider'): object(),
+                ('000660', 'short-term-decider'): None,
+                ('000660', 'signal-decider'): object(),
+            },
+            'authoritative_run_id_by_key': {
+                ('005930', 'short-term-decider'): 'initial-short-term',
+                ('005930', 'signal-decider'): 'initial-signal',
+                ('000660', 'short-term-decider'): 'repair-short-term',
+                ('000660', 'signal-decider'): 'initial-signal',
+            },
+            'failures_by_key': {
+                ('000660', 'short-term-decider'): failure,
+            },
+            'run_snapshots': [],
+        }
+        service = SignalDeciderNextOpenExecutionService()
+
+        with (
+            patch(
+                'app.orders.next_open_execution.agent_context_feedback_run_state_service.find_latest_run',
+                return_value=latest_run,
+            ) as find_latest_run,
+            patch.object(
+                service,
+                '_load_latest_decider_scope_state',
+                return_value=scope_state,
+            ),
+        ):
+            result = service._build_agent_context_completeness_context(
+                source_market_date=source_market_date,
+                candidate_symbols=[],
+            )
+
+        find_latest_run.assert_called_once_with(
+            market_date=source_market_date,
+            requested_symbols=None,
+            requested_roles=['short-term-decider', 'signal-decider'],
+            request_modes=['daily_retry_cycle_role_sequenced'],
+        )
+        self.assertEqual(result['candidate_set_basis'], 'source_decision_run')
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['cohort_status'], 'incomplete')
+        self.assertTrue(result['has_incomplete_agent_context'])
+        self.assertEqual(result['evaluation_scope_count'], 4)
+        self.assertEqual(result['completed_scope_count'], 3)
+        self.assertEqual(result['failure_count'], 1)
+        self.assertEqual(result['pending_scope_count'], 0)
+        self.assertEqual(result['latest_run']['completed_count'], 60)
+        self.assertEqual(result['latest_run']['failed_count'], 100)
+
+    def test_complete_candidate_scope_reports_incomplete_source_cohort(self) -> None:
+        source_market_date = date(2026, 9, 11)
+        source_run = {
+            'run_id': 'feedback-cycle-source',
+            'status': 'partial',
+            'symbols_total': 4,
+            'completed_count': 3,
+            'failed_count': 1,
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'roles': ['short-term-decider', 'signal-decider'],
+                'role_symbol_scopes': {
+                    'short-term-decider': ['005930', '000660'],
+                    'signal-decider': ['005930', '000660'],
+                },
+            },
+        }
+        failed_scope = ('000660', 'short-term-decider')
+        service = SignalDeciderNextOpenExecutionService()
+        scope_state = {
+            'selected_by_key': {
+                ('005930', 'short-term-decider'): object(),
+                ('005930', 'signal-decider'): object(),
+                failed_scope: None,
+                ('000660', 'signal-decider'): object(),
+            },
+            'authoritative_run_id_by_key': {failed_scope: 'failed-child'},
+            'failures_by_key': {
+                failed_scope: {
+                    'symbol': '000660',
+                    'agent_name': 'short-term-decider',
+                    'run_id': 'failed-child',
+                    'failure_kind': 'response_contract_invalid',
+                    'retryable': True,
+                    'summary_payload': {},
+                    'context_payload': {},
+                }
+            },
+            'run_snapshots': [],
+        }
+
+        with (
+            patch(
+                'app.orders.next_open_execution.agent_context_feedback_run_state_service.find_latest_run',
+                return_value=source_run,
+            ),
+            patch.object(
+                service,
+                '_load_latest_decider_scope_state',
+                return_value=scope_state,
+            ),
+        ):
+            result = service._build_agent_context_completeness_context(
+                source_market_date=source_market_date,
+                candidate_symbols=['005930'],
+            )
+
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['cohort_status'], 'incomplete')
+        self.assertFalse(result['candidate_set_definitive'])
+        self.assertFalse(result['has_incomplete_agent_context'])
+        self.assertEqual(result['failure_count'], 0)
+        self.assertEqual(result['cohort_failure_count'], 1)
+
+    def test_candidate_without_source_cohort_is_unknown(self) -> None:
+        service = SignalDeciderNextOpenExecutionService()
+        with (
+            patch(
+                'app.orders.next_open_execution.agent_context_feedback_run_state_service.find_latest_run',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_load_latest_decider_scope_state',
+                return_value={
+                    'selected_by_key': {},
+                    'authoritative_run_id_by_key': {},
+                    'failures_by_key': {},
+                    'run_snapshots': [],
+                },
+            ),
+        ):
+            result = service._build_agent_context_completeness_context(
+                source_market_date=date(2026, 9, 11),
+                candidate_symbols=['005930'],
+            )
+
+        self.assertEqual(result['status'], 'unknown')
+        self.assertIsNone(result['has_incomplete_agent_context'])
+        self.assertEqual(result['reason'], 'source_decision_cohort_missing')
+
+
 class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         AgentContextFeedback.__table__.create(bind=engine, checkfirst=True)
+        AgentContextFeedbackFailure.__table__.create(bind=engine, checkfirst=True)
         AgentContextFeedbackRun.__table__.create(bind=engine, checkfirst=True)
         OrderRequest.__table__.create(bind=engine, checkfirst=True)
         BrokerOrder.__table__.create(bind=engine, checkfirst=True)
@@ -700,6 +987,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.market_date = date(2026, 4, 29)
         self.target_trade_date = date(2026, 4, 30)
         self.feedback_run_ids: list[str] = []
+        self.feedback_failure_symbols: list[str] = []
         self.original_settings = {
             'signal_decider_next_open_account_targets': settings.signal_decider_next_open_account_targets,
             'signal_decider_next_open_enabled': settings.signal_decider_next_open_enabled,
@@ -756,6 +1044,80 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.enrichment_preflight_mock = self.enrichment_preflight_patcher.start()
         self.addCleanup(self.enrichment_preflight_patcher.stop)
+        def complete_agent_context(
+            *,
+            source_market_date,
+            candidate_symbols=None,
+            **_kwargs,
+        ):
+            return {
+                'schema_version': 'agent_context_completeness_v1',
+                'source_market_date': source_market_date.isoformat(),
+                'candidate_symbols': sorted(set(candidate_symbols or [])),
+                'candidate_set_basis': (
+                    'latest_signal_decider_snapshots'
+                    if candidate_symbols
+                    else 'source_decision_run'
+                ),
+                'status': 'complete',
+                'cohort_status': 'complete',
+                'has_incomplete_agent_context': False,
+                'candidate_set_definitive': True,
+                'authority_fingerprint': 'test-agent-context-authority',
+                'latest_run': None,
+                'failure_count': 0,
+                'failure_groups': [],
+            }
+
+        self.agent_context_completeness_patcher = patch.object(
+            SignalDeciderNextOpenExecutionService,
+            '_build_agent_context_completeness_context',
+            side_effect=complete_agent_context,
+        )
+        self.agent_context_completeness_patcher.start()
+        self.addCleanup(self.agent_context_completeness_patcher.stop)
+        self.agent_context_from_state_patcher = patch.object(
+            SignalDeciderNextOpenExecutionService,
+            '_build_agent_context_completeness_from_state',
+            side_effect=complete_agent_context,
+        )
+        self.agent_context_from_state_patcher.start()
+        self.addCleanup(self.agent_context_from_state_patcher.stop)
+        def valid_snapshot_generations(*, market_date, snapshots):
+            snapshot_ids = sorted(int(snapshot.id) for snapshot in snapshots)
+            identity_by_id = {
+                int(snapshot.id): {
+                    'symbol': str(snapshot.symbol).strip().upper(),
+                    'agent_name': str(snapshot.agent_name).strip(),
+                }
+                for snapshot in snapshots
+            }
+            return {
+                'schema_version': 'persisted_decider_generation_validation_v1',
+                'market_date': str(market_date),
+                'valid_snapshot_ids': snapshot_ids,
+                'invalid_snapshot_ids': [],
+                'validations': [
+                    {
+                        'snapshot_id': snapshot_id,
+                        **identity_by_id[snapshot_id],
+                        'status': 'valid',
+                        'reason': 'test_generation_unchanged',
+                    }
+                    for snapshot_id in snapshot_ids
+                ],
+                'generation_fingerprint': (
+                    'test-snapshot-generation:'
+                    + ','.join(str(snapshot_id) for snapshot_id in snapshot_ids)
+                ),
+            }
+
+        self.snapshot_generation_patcher = patch(
+            'app.orders.next_open_execution.agent_feedback_orchestrator.revalidate_persisted_decider_snapshots',
+            side_effect=valid_snapshot_generations,
+        )
+        self.snapshot_generation_mock = self.snapshot_generation_patcher.start()
+        self.addCleanup(self.snapshot_generation_patcher.stop)
         self.calendar_client = FakeCalendarClient(
             [
                 {'bass_dt': '20260429', 'opnd_yn': 'Y'},
@@ -776,6 +1138,15 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     AgentContextFeedbackRun.run_id.in_(self.feedback_run_ids)
                 )
             )
+            if self.feedback_failure_symbols:
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.market_date == self.market_date,
+                        AgentContextFeedbackFailure.symbol.in_(
+                            self.feedback_failure_symbols
+                        ),
+                    )
+                )
             session.execute(
                 delete(SignalDeciderExecutionPlanItem).where(
                     SignalDeciderExecutionPlanItem.account_reference == self.account_reference
@@ -858,6 +1229,104 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(generation['status'], 'valid')
         self.assertEqual(market_state_call_count, 2)
+
+    def test_refresh_retries_when_source_parent_scope_changes_without_snapshot_change(
+        self,
+    ) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date
+        )
+
+        def parent_run(*, run_id: str, symbols: list[str], updated_minute: int):
+            return {
+                'run_id': run_id,
+                'status': 'completed',
+                'updated_at': datetime(
+                    2026, 4, 29, 5, updated_minute, tzinfo=timezone.utc
+                ),
+                'request_payload': {
+                    'mode': 'daily_retry_cycle_role_sequenced',
+                    'roles': ['short-term-decider', 'signal-decider'],
+                    'role_symbol_scopes': {
+                        'short-term-decider': symbols,
+                        'signal-decider': symbols,
+                    },
+                },
+            }
+
+        initial_parent = parent_run(
+            run_id='source-parent-before',
+            symbols=['005930'],
+            updated_minute=0,
+        )
+        changed_parent = parent_run(
+            run_id='source-parent-after',
+            symbols=['005930', '000660'],
+            updated_minute=1,
+        )
+        initial_fingerprint = service._agent_context_authority_fingerprint(
+            source_run=initial_parent,
+            scope_state=scope_state,
+            candidate_symbols=['005930'],
+        )
+        initial_context = {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': self.market_date.isoformat(),
+            'candidate_symbols': ['005930'],
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': 'complete',
+            'cohort_status': 'complete',
+            'has_incomplete_agent_context': False,
+            'candidate_set_definitive': True,
+            'authority_fingerprint': initial_fingerprint,
+            'latest_run': {'run_id': initial_parent['run_id'], 'status': 'completed'},
+            'failure_count': 0,
+            'failure_groups': [],
+        }
+        changed_context = {
+            **initial_context,
+            'authority_fingerprint': service._agent_context_authority_fingerprint(
+                source_run=changed_parent,
+                scope_state=scope_state,
+                candidate_symbols=['005930'],
+            ),
+            'latest_run': {
+                'run_id': changed_parent['run_id'],
+                'status': 'completed',
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_build_agent_context_completeness_context',
+                return_value=initial_context,
+            ),
+            patch.object(
+                service,
+                '_build_agent_context_completeness_from_state',
+                return_value=changed_context,
+            ) as build_current_context,
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'could not bind stable decision inputs',
+            ):
+                service.refresh_plan_items(
+                    target_trade_date=self.target_trade_date,
+                    trigger='test',
+                )
+
+        self.assertEqual(build_current_context.call_count, 2)
 
     def _seed_policy_version(self) -> None:
         with session_scope() as session:
@@ -1117,6 +1586,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         stop_loss_price: int = 47000,
         pre_decider_enrichment_context: dict[str, object] | None = None,
         decision_run_id: str | None = None,
+        feedback_received_at: datetime | None = None,
     ) -> int:
         symbol_day_context = {
             'decider_data_quality_context': self._quality_context(),
@@ -1137,7 +1607,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 agent_name='signal-decider',
                 agent_version='test-agent',
                 decision_run_id=decision_run_id or f'run-{symbol}',
-                feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+                feedback_received_at=feedback_received_at
+                or datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
                 policy_version=self.policy_version,
                 decision_action=next_day_open_action,
                 preferred_action=next_day_open_action,
@@ -1168,7 +1639,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     'meta': {'supporting_evidence_count': 1},
                 },
                 request_payload={
-                    'signal_decider_policy': {'current_version': self.policy_version},
+                    'signal_decider_policy': {
+                        'current_version': self.policy_version,
+                        'rule_bundle': {
+                            'schema_version': (
+                                'signal_decider_policy_bundle_v1'
+                            ),
+                        },
+                    },
                     'symbol_day_context': symbol_day_context,
                 },
                 response_payload={'next_day_open_action': next_day_open_action},
@@ -1177,6 +1655,36 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             session.add(row)
             session.flush()
             return row.id
+
+    @staticmethod
+    def _reuse_evidence(
+        *,
+        symbol: str,
+        feedback_run_id: str,
+        feedback_received_at: datetime,
+        decision_snapshot_id: int,
+        feedback_id: int | None = None,
+        decision_snapshot_fingerprint: str | None = None,
+        decision_snapshot_observed_at: datetime | None = None,
+        role: str = 'signal-decider',
+    ) -> dict[str, dict[str, dict[str, object]]]:
+        return {
+            role: {
+                symbol: {
+                    'schema_version': 'agent_feedback_reuse_evidence_v1',
+                    'feedback_id': feedback_id,
+                    'feedback_run_id': feedback_run_id,
+                    'feedback_received_at': feedback_received_at.isoformat(),
+                    'decision_snapshot_id': decision_snapshot_id,
+                    'decision_snapshot_fingerprint': (
+                        decision_snapshot_fingerprint
+                    ),
+                    'decision_snapshot_observed_at': (
+                        decision_snapshot_observed_at or feedback_received_at
+                    ).isoformat(),
+                }
+            }
+        }
 
     def _seed_feedback_run(
         self,
@@ -1189,8 +1697,38 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         status: str = 'completed',
         completed_count: int | None = None,
         failed_count: int = 0,
+        mode: str = 'role_sequential_runtime_buffered',
+        reuse_existing: bool = True,
+        force_recompute: bool = False,
+        parent_run_id: str | None = None,
+        child_run_lineage: bool = False,
+        reused_symbols_by_role: dict[str, list[str]] | None = None,
+        reused_feedback_evidence_by_role: (
+            dict[str, dict[str, dict[str, object]]] | None
+        ) = None,
+        scope: str | None = None,
     ) -> None:
         self.feedback_run_ids.append(run_id)
+        request_payload = {
+            'symbols': symbols,
+            'requested_symbols': symbols,
+            'roles': roles,
+            'mode': mode,
+            'reuse_existing': reuse_existing,
+            'force_recompute': force_recompute,
+            'role_symbol_scopes': role_symbol_scopes
+            or {role: symbols for role in roles},
+        }
+        if scope is not None:
+            request_payload['scope'] = scope
+        if parent_run_id is not None:
+            request_payload['parent_run_id'] = parent_run_id
+        if child_run_lineage:
+            request_payload['child_run_lineage'] = {
+                'schema_version': 'agent_feedback_child_run_lineage_v1',
+                'parent_run_id': run_id,
+                'child_link_field': 'parent_run_id',
+            }
         with session_scope() as session:
             session.add(
                 AgentContextFeedbackRun(
@@ -1200,14 +1738,13 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     symbols_total=len(symbols),
                     completed_count=(len(symbols) if completed_count is None else completed_count),
                     failed_count=failed_count,
-                    request_payload={
-                        'symbols': symbols,
-                        'requested_symbols': symbols,
-                        'roles': roles,
-                        'role_symbol_scopes': role_symbol_scopes
-                        or {role: symbols for role in roles},
+                    request_payload=request_payload,
+                    summary_payload={
+                        'reused_symbols_by_role': reused_symbols_by_role or {},
+                        'reused_feedback_evidence_by_role': (
+                            reused_feedback_evidence_by_role or {}
+                        ),
                     },
-                    summary_payload={},
                     started_at=started_at,
                     completed_at=started_at,
                 )
@@ -1230,6 +1767,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         confidence_score_10: float = 7.1,
         input_feature_snapshot_payload: dict[str, object] | None = None,
         objective_technical_snapshot: dict[str, object] | None = None,
+        decision_run_id: str | None = None,
+        feedback_received_at: datetime | None = None,
     ) -> int:
         generic_action = 'buy' if tactical_action in {'scalp_buy_candidate', 'watch_for_trigger'} else tactical_action
         if generic_action not in {'buy', 'wait', 'reject'}:
@@ -1262,8 +1801,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 symbol=symbol,
                 agent_name='short-term-decider',
                 agent_version='test-agent',
-                decision_run_id=f'short-run-{symbol}',
-                feedback_received_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+                decision_run_id=decision_run_id or f'short-run-{symbol}',
+                feedback_received_at=feedback_received_at
+                or datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
                 policy_version='short_term_decider_contract_v1',
                 decision_action=generic_action,
                 preferred_action=generic_action,
@@ -1592,13 +2132,22 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'started_at': datetime(2026, 4, 29, 5, 45, tzinfo=timezone.utc),
             'completed_at': datetime(2026, 4, 29, 5, 46, tzinfo=timezone.utc),
         }
-        failure_summary = {
-            'summary': {
-                'failure_count': 1,
-                'group_count': 1,
-                'by_failure_kind': {'openclaw_auth_rejected': 1},
+        incomplete_context = {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': self.market_date.isoformat(),
+            'candidate_symbols': ['005930'],
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': 'incomplete',
+            'cohort_status': 'incomplete',
+            'has_incomplete_agent_context': True,
+            'candidate_set_definitive': False,
+            'latest_run': {
+                **latest_run,
+                'started_at': latest_run['started_at'].isoformat(),
+                'completed_at': latest_run['completed_at'].isoformat(),
             },
-            'groups': [
+            'failure_count': 1,
+            'failure_groups': [
                 {
                     'market_date': '2026-08-03',
                     'run_id': run_id,
@@ -1611,20 +2160,12 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
 
-        def fake_find_latest_run(*, market_date: date, requested_symbols: list[str] | None = None):
-            if requested_symbols == ['005930']:
-                return latest_run
-            return None
-
         with (
-            patch(
-                'app.orders.next_open_execution.agent_context_feedback_run_state_service.find_latest_run',
-                side_effect=fake_find_latest_run,
-            ) as find_latest_run,
-            patch(
-                'app.orders.next_open_execution.agent_context_feedback_failure_service.get_grouped_summary',
-                return_value=failure_summary,
-            ) as get_grouped_summary,
+            patch.object(
+                service,
+                '_build_agent_context_completeness_context',
+                return_value=incomplete_context,
+            ),
             patch(
                 'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
                 return_value=[{'trade_date': '2026-08-03', 'close_price': 50000}],
@@ -1632,15 +2173,6 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
-        find_latest_run.assert_any_call(
-            market_date=self.market_date,
-            requested_symbols=['005930'],
-        )
-        get_grouped_summary.assert_called_once_with(
-            market_date=self.market_date,
-            run_id=run_id,
-            limit=20,
-        )
         self.assertEqual(result['summary']['agent_context_completeness_status'], 'incomplete')
         self.assertTrue(result['summary']['agent_context_incomplete'])
         self.assertEqual(result['summary']['agent_context_failure_count'], 1)
@@ -1650,9 +2182,53 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(completeness['has_incomplete_agent_context'])
         self.assertEqual(completeness['latest_run']['run_id'], run_id)
         self.assertEqual(completeness['failure_groups'][0]['failure_kind'], 'openclaw_auth_rejected')
-        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
-        self.assertIn('agent_context_incomplete_candidate_set', warning_codes)
+        blocking_codes = {
+            reason['code'] for reason in item['validation']['blocking_reasons']
+        }
+        self.assertIn('agent_context_incomplete_candidate_set', blocking_codes)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
         self.assertEqual(item['traceability']['agent_context_completeness']['status'], 'incomplete')
+
+    def test_refresh_plan_items_blocks_unverified_agent_context_candidate(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        for status in ('unknown', 'unavailable', None):
+            with (
+                self.subTest(status=status),
+                patch.object(
+                    service,
+                    '_build_agent_context_completeness_context',
+                    return_value={
+                        'schema_version': 'agent_context_completeness_v1',
+                        'source_market_date': self.market_date.isoformat(),
+                        'candidate_symbols': ['005930'],
+                        'candidate_set_basis': 'latest_signal_decider_snapshots',
+                        'status': status,
+                        'has_incomplete_agent_context': None,
+                        'reason': 'source_decision_cohort_missing',
+                        'latest_run': None,
+                        'failure_count': 0,
+                    },
+                ),
+                patch(
+                    'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                    return_value=[
+                        {'trade_date': '2026-04-29', 'close_price': 50000}
+                    ],
+                ),
+            ):
+                result = service.refresh_plan_items(
+                    target_trade_date=self.target_trade_date,
+                    trigger='test',
+                    force=True,
+                )
+
+            block_codes = {
+                reason['code']
+                for reason in result['items'][0]['validation']['blocking_reasons']
+            }
+            self.assertIn('agent_context_candidate_set_unverified', block_codes)
 
     def test_refresh_plan_items_blocks_existing_rows_when_pykrx_enrichment_missing(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
@@ -2235,6 +2811,95 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         get_policy_prompt_context.assert_called_once_with(policy_version=self.policy_version)
 
+    def test_locked_active_policy_status_overrides_stale_draft_cache(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.signal_decider_loop_service.get_policy_prompt_context',
+            return_value={
+                'status': 'draft',
+                'rule_bundle': {
+                    'schema_version': 'signal_decider_policy_bundle_v1'
+                },
+            },
+        ), patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='stale_policy_cache',
+            )
+
+        self.assertEqual(
+            result['items'][0]['validation']['policy_context']['status'],
+            'active',
+        )
+        self.assertNotIn(
+            'policy_not_active',
+            {
+                reason['code']
+                for reason in result['items'][0]['validation'][
+                    'blocking_reasons'
+                ]
+            },
+        )
+
+    def test_active_policy_rule_bundle_is_immutable_during_upsert(self) -> None:
+        replacement_bundle = {
+            'schema_version': 'signal_decider_policy_bundle_v1',
+            'change_set': [{'rule': 'minimum_confidence', 'value': 9}],
+        }
+
+        SignalDeciderLoopRepository().bulk_upsert_policy_versions(
+            items=[
+                {
+                    'policy_version': self.policy_version,
+                    'status': 'candidate',
+                    'parent_policy_version': 'unexpected-parent',
+                    'source_candidate_version': 'unexpected-candidate',
+                    'change_summary': 'Unexpected regenerated policy.',
+                    'rule_bundle_payload': replacement_bundle,
+                    'metadata_payload': {
+                        'schema_version': 'signal_decider_policy_metadata_v1'
+                    },
+                    'created_by': 'test-regenerator',
+                    'activated_by': None,
+                    'activated_at': None,
+                    'retired_at': None,
+                    'created_at': datetime(
+                        2026, 4, 29, 7, 0, tzinfo=timezone.utc
+                    ),
+                    'updated_at': datetime(
+                        2026, 4, 29, 7, 0, tzinfo=timezone.utc
+                    ),
+                }
+            ]
+        )
+
+        with session_scope() as session:
+            policy = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+            ).scalar_one()
+            self.assertEqual(policy.status, 'active')
+            self.assertEqual(
+                policy.change_summary,
+                'Test active policy.',
+            )
+            self.assertEqual(
+                policy.rule_bundle_payload,
+                {'schema_version': 'signal_decider_policy_bundle_v1'},
+            )
+
     def test_preopen_scheduler_revalidates_policy_status_before_reusing_plan(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         self._seed_snapshot(symbol='005930')
@@ -2254,12 +2919,24 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first['items'][0]['eligibility_status'], ELIGIBILITY_ELIGIBLE)
 
+        with session_scope() as session:
+            policy = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+            ).scalar_one()
+            policy.status = 'retired'
+            policy.retired_at = datetime(
+                2026, 4, 29, 7, 0, tzinfo=timezone.utc
+            )
+
         with patch(
             'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
             return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
         ), patch(
             'app.orders.next_open_execution.signal_decider_loop_service.get_policy_prompt_context',
-            return_value={'status': 'retired'},
+            return_value={'status': 'active'},
         ) as get_policy_prompt_context:
             refreshed = service.refresh_plan_items(
                 target_trade_date=self.target_trade_date,
@@ -2328,6 +3005,12 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         self.assertEqual(result['summary']['items_total'], 2)
+        self.assertEqual(result['summary']['symbol_count'], 1)
+        self.assertEqual(result['summary']['eligible_symbol_count'], 0)
+        self.assertEqual(result['summary']['monitor_candidate_symbol_count'], 1)
+        self.assertEqual(result['summary']['blocked_symbol_count'], 1)
+        self.assertEqual(result['summary']['monitor_candidate_count'], 1)
+        self.assertEqual(result['summary']['blocked_count'], 1)
         self.assertEqual(result['summary']['decision_agent_counts']['short-term-decider'], 1)
         self.assertEqual(result['summary']['decision_agent_counts']['signal-decider'], 1)
         items = [item for item in result['items'] if item['symbol'] == '005930']
@@ -2779,6 +3462,39 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         exec_client = AsyncMock()
         exec_client.post_execution_plan.side_effect = capture_dispatch
+
+        async def activate_dispatch(payload):
+            return {
+                'plan_id': payload['plan_id'],
+                'execution_plan_id': payload['execution_plan_id'],
+                'contract_ack': {
+                    'schema_version': EXECUTION_ACTIVATION_SCHEMA_VERSION,
+                    'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                    'capability': EXECUTION_ACTIVATION_CAPABILITY,
+                    'plan_id': payload['plan_id'],
+                    'status': 'activated',
+                    'dispatch_material_fingerprint': payload[
+                        'dispatch_material_fingerprint'
+                    ],
+                    'authority_generation_fingerprint': payload[
+                        'authority_generation_fingerprint'
+                    ],
+                },
+                'activated_item_count': len(payload['items']),
+                'idempotent_replay': False,
+                'item_acks': [
+                    {
+                        **item,
+                        'execution_plan_id': payload['execution_plan_id'],
+                        'status': 'activated',
+                    }
+                    for item in payload['items']
+                ],
+            }
+
+        exec_client.post_execution_plan_activation.side_effect = (
+            activate_dispatch
+        )
         dispatch_result = await SignalDeciderExecIntegrationService(client=exec_client).dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
             account_reference='KIS:00000000-00',
@@ -2900,6 +3616,2024 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual([snapshot.id for snapshot in matching], [wait_id])
         self.assertEqual(matching[0].decision_action, 'wait')
+
+    def test_latest_snapshot_selection_ignores_reuse_only_retry_parent_scope(self) -> None:
+        child_run = f'child-success-{uuid4().hex[:10]}'
+        parent_run = f'retry-parent-{uuid4().hex[:10]}'
+        self._seed_feedback_run(
+            run_id=child_run,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+        )
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=child_run,
+        )
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+        )
+
+        selected = self._service()._load_latest_snapshots(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(
+            [
+                snapshot.id
+                for snapshot in selected
+                if snapshot.symbol == '005930'
+                and snapshot.agent_name == 'signal-decider'
+            ],
+            [snapshot_id],
+        )
+
+    def test_latest_snapshot_selection_tombstones_forced_retry_parent_scope(self) -> None:
+        child_run = f'child-success-{uuid4().hex[:10]}'
+        parent_run = f'forced-retry-parent-{uuid4().hex[:10]}'
+        self._seed_feedback_run(
+            run_id=child_run,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=child_run,
+        )
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            force_recompute=True,
+        )
+
+        selected = self._service()._load_latest_snapshots(
+            source_market_date=self.market_date,
+        )
+
+        self.assertFalse(
+            any(
+                snapshot.symbol == '005930'
+                and snapshot.agent_name == 'signal-decider'
+                for snapshot in selected
+            )
+        )
+
+    def test_latest_snapshot_selection_uses_only_latest_parent_lineage(self) -> None:
+        parent_a = f'parent-a-{uuid4().hex[:10]}'
+        parent_b = f'parent-b-{uuid4().hex[:10]}'
+        child_a = f'child-a-{uuid4().hex[:10]}'
+        child_b = f'child-b-{uuid4().hex[:10]}'
+        late_child_a = f'late-child-a-{uuid4().hex[:10]}'
+        self._seed_feedback_run(
+            run_id=parent_a,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=child_a,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_a,
+        )
+        self._seed_snapshot(symbol='005930', decision_run_id=child_a)
+        self._seed_feedback_run(
+            run_id=parent_b,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=child_b,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_b,
+        )
+        expected_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=child_b,
+        )
+        self._seed_feedback_run(
+            run_id=late_child_a,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            parent_run_id=parent_a,
+        )
+        self._seed_snapshot(symbol='005930', decision_run_id=late_child_a)
+
+        selected = self._service()._load_latest_snapshots(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(
+            [
+                snapshot.id
+                for snapshot in selected
+                if snapshot.symbol == '005930'
+                and snapshot.agent_name == 'signal-decider'
+            ],
+            [expected_snapshot_id],
+        )
+
+    def test_latest_full_workflow_parent_supersedes_older_decider_only_parent(self) -> None:
+        old_parent = f'old-decider-parent-{uuid4().hex[:8]}'
+        old_child = f'old-decider-child-{uuid4().hex[:8]}'
+        new_parent = f'new-full-parent-{uuid4().hex[:8]}'
+        new_child = f'new-full-child-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_parent,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=old_child,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=old_parent,
+        )
+        self._seed_snapshot(symbol='005930', decision_run_id=old_child)
+        full_roles = [
+            'eod-summarizer',
+            'technical-summarizer',
+            'fundamental-summarizer',
+            'short-term-decider',
+            'signal-decider',
+        ]
+        self._seed_feedback_run(
+            run_id=new_parent,
+            symbols=['005930'],
+            roles=full_roles,
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=new_child,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=new_parent,
+        )
+        expected_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=new_child,
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(state['source_run']['run_id'], new_parent)
+        self.assertEqual(
+            state['selected_by_key'][('005930', 'signal-decider')].id,
+            expected_snapshot_id,
+        )
+
+    def test_targeted_parent_overlays_only_its_symbols_on_latest_full_cohort(self) -> None:
+        base_parent = f'base-parent-{uuid4().hex[:8]}'
+        base_short = f'base-short-{uuid4().hex[:8]}'
+        base_signal = f'base-signal-{uuid4().hex[:8]}'
+        targeted_parent = f'targeted-parent-{uuid4().hex[:8]}'
+        targeted_short = f'targeted-short-{uuid4().hex[:8]}'
+        targeted_signal = f'targeted-signal-{uuid4().hex[:8]}'
+        symbols = ['005930', '000660']
+        self._seed_feedback_run(
+            run_id=base_parent,
+            symbols=symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='active_strategy_aware_prefilter_scoring',
+        )
+        self._seed_feedback_run(
+            run_id=base_short,
+            symbols=symbols,
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        self._seed_feedback_run(
+            run_id=base_signal,
+            symbols=symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 11, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        base_short_b = self._seed_short_term_snapshot(
+            symbol='000660', decision_run_id=base_short
+        )
+        base_signal_b = self._seed_snapshot(
+            symbol='000660', decision_run_id=base_signal
+        )
+        self._seed_short_term_snapshot(symbol='005930', decision_run_id=base_short)
+        self._seed_snapshot(symbol='005930', decision_run_id=base_signal)
+        self._seed_feedback_run(
+            run_id=targeted_parent,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+        )
+        self._seed_feedback_run(
+            run_id=targeted_short,
+            symbols=['005930'],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=targeted_parent,
+        )
+        self._seed_feedback_run(
+            run_id=targeted_signal,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            parent_run_id=targeted_parent,
+        )
+        targeted_short_a = self._seed_short_term_snapshot(
+            symbol='005930', decision_run_id=targeted_short
+        )
+        targeted_signal_a = self._seed_snapshot(
+            symbol='005930', decision_run_id=targeted_signal
+        )
+
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        result = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=symbols,
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+
+        self.assertEqual(scope_state['source_run']['run_id'], targeted_parent)
+        self.assertEqual(
+            scope_state['source_parent_run_id_by_key'][
+                ('005930', 'signal-decider')
+            ],
+            targeted_parent,
+        )
+        self.assertEqual(
+            scope_state['source_parent_run_id_by_key'][
+                ('000660', 'signal-decider')
+            ],
+            base_parent,
+        )
+        self.assertEqual(
+            scope_state['selected_by_key'][('005930', 'short-term-decider')].id,
+            targeted_short_a,
+        )
+        self.assertEqual(
+            scope_state['selected_by_key'][('005930', 'signal-decider')].id,
+            targeted_signal_a,
+        )
+        self.assertEqual(
+            scope_state['selected_by_key'][('000660', 'short-term-decider')].id,
+            base_short_b,
+        )
+        self.assertEqual(
+            scope_state['selected_by_key'][('000660', 'signal-decider')].id,
+            base_signal_b,
+        )
+        self.assertEqual(
+            result['_candidate_contexts_by_symbol']['005930']['status'],
+            'complete',
+        )
+        self.assertEqual(
+            result['_candidate_contexts_by_symbol']['000660']['status'],
+            'complete',
+        )
+
+    def test_abandoned_targeted_parent_blocks_only_its_overlay_symbols(self) -> None:
+        base_parent = f'base-parent-{uuid4().hex[:8]}'
+        base_short = f'base-short-{uuid4().hex[:8]}'
+        base_signal = f'base-signal-{uuid4().hex[:8]}'
+        targeted_parent = f'abandoned-targeted-{uuid4().hex[:8]}'
+        symbols = ['005930', '000660']
+        self._seed_feedback_run(
+            run_id=base_parent,
+            symbols=symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='active_strategy_aware_prefilter_scoring',
+        )
+        self._seed_feedback_run(
+            run_id=base_short,
+            symbols=symbols,
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        self._seed_feedback_run(
+            run_id=base_signal,
+            symbols=symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 11, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        for symbol in symbols:
+            self._seed_short_term_snapshot(symbol=symbol, decision_run_id=base_short)
+            self._seed_snapshot(symbol=symbol, decision_run_id=base_signal)
+        self._seed_feedback_run(
+            run_id=targeted_parent,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            status='abandoned',
+            completed_count=0,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+        )
+
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        result = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=symbols,
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+
+        self.assertIsNone(
+            scope_state['selected_by_key'][('005930', 'signal-decider')]
+        )
+        self.assertIsNotNone(
+            scope_state['selected_by_key'][('000660', 'signal-decider')]
+        )
+        self.assertEqual(
+            result['_candidate_contexts_by_symbol']['005930']['status'],
+            'incomplete',
+        )
+        self.assertEqual(
+            result['_candidate_contexts_by_symbol']['000660']['status'],
+            'complete',
+        )
+
+    def test_single_role_retry_parent_overlays_only_that_decider_role(self) -> None:
+        base_parent = f'base-parent-{uuid4().hex[:8]}'
+        base_short = f'base-short-{uuid4().hex[:8]}'
+        base_signal = f'base-signal-{uuid4().hex[:8]}'
+        signal_parent = f'signal-parent-{uuid4().hex[:8]}'
+        signal_child = f'signal-child-{uuid4().hex[:8]}'
+        symbol = '005930'
+        base_symbols = [symbol, '000660']
+        self._seed_feedback_run(
+            run_id=base_parent,
+            symbols=base_symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='active_strategy_aware_prefilter_scoring',
+        )
+        self._seed_feedback_run(
+            run_id=base_short,
+            symbols=base_symbols,
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        self._seed_feedback_run(
+            run_id=base_signal,
+            symbols=base_symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 11, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        base_short_snapshot = self._seed_short_term_snapshot(
+            symbol=symbol,
+            decision_run_id=base_short,
+        )
+        self._seed_snapshot(symbol=symbol, decision_run_id=base_signal)
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            decision_run_id=base_short,
+        )
+        self._seed_snapshot(symbol='000660', decision_run_id=base_signal)
+        self._seed_feedback_run(
+            run_id=signal_parent,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+        )
+        self._seed_feedback_run(
+            run_id=signal_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=signal_parent,
+        )
+        new_signal_snapshot = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=signal_child,
+        )
+
+        service = self._service()
+        state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        result = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=state['source_run'],
+            scope_state=state,
+        )
+
+        self.assertEqual(
+            state['source_parent_run_id_by_key'][
+                (symbol, 'signal-decider')
+            ],
+            signal_parent,
+        )
+        self.assertEqual(
+            state['source_parent_run_id_by_key'][
+                (symbol, 'short-term-decider')
+            ],
+            base_parent,
+        )
+        self.assertEqual(
+            state['selected_by_key'][(symbol, 'signal-decider')].id,
+            new_signal_snapshot,
+        )
+        self.assertEqual(
+            state['selected_by_key'][(symbol, 'short-term-decider')].id,
+            base_short_snapshot,
+        )
+        self.assertEqual(result['status'], 'complete')
+        mixed_parent_fingerprint = result['authority_fingerprint']
+
+        unrelated_parent = f'unrelated-parent-{uuid4().hex[:8]}'
+        unrelated_short = f'unrelated-short-{uuid4().hex[:8]}'
+        unrelated_signal = f'unrelated-signal-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=unrelated_parent,
+            symbols=['000660'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+        )
+        self._seed_feedback_run(
+            run_id=unrelated_short,
+            symbols=['000660'],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 6, 10, tzinfo=timezone.utc),
+            parent_run_id=unrelated_parent,
+        )
+        self._seed_feedback_run(
+            run_id=unrelated_signal,
+            symbols=['000660'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 11, tzinfo=timezone.utc),
+            parent_run_id=unrelated_parent,
+        )
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            decision_run_id=unrelated_short,
+        )
+        self._seed_snapshot(
+            symbol='000660',
+            decision_run_id=unrelated_signal,
+        )
+        after_unrelated_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        after_unrelated = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=after_unrelated_state['source_run'],
+            scope_state=after_unrelated_state,
+        )
+        self.assertEqual(
+            after_unrelated['authority_fingerprint'],
+            mixed_parent_fingerprint,
+        )
+
+    def test_targeted_retry_preserves_unrelated_terminal_buy_authority(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        base_parent = f'base-parent-{uuid4().hex[:8]}'
+        base_short = f'base-short-{uuid4().hex[:8]}'
+        base_signal = f'base-signal-{uuid4().hex[:8]}'
+        symbols = ['005930', '000660']
+        self._seed_feedback_run(
+            run_id=base_parent,
+            symbols=symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='active_strategy_aware_prefilter_scoring',
+        )
+        self._seed_feedback_run(
+            run_id=base_short,
+            symbols=symbols,
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        self._seed_feedback_run(
+            run_id=base_signal,
+            symbols=symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 11, tzinfo=timezone.utc),
+            parent_run_id=base_parent,
+        )
+        for symbol in symbols:
+            self._seed_short_term_snapshot(
+                symbol=symbol,
+                tactical_action='wait',
+                decision_run_id=base_short,
+            )
+            self._seed_snapshot(symbol=symbol, decision_run_id=base_signal)
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        before_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        before_context = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=['005930'],
+            source_run=before_state['source_run'],
+            scope_state=before_state,
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='base_cohort',
+            )
+        self._mark_row_as_handed_off(symbol='005930')
+
+        targeted_parent = f'targeted-parent-{uuid4().hex[:8]}'
+        targeted_short = f'targeted-short-{uuid4().hex[:8]}'
+        targeted_signal = f'targeted-signal-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=targeted_parent,
+            symbols=['000660'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+        )
+        self._seed_feedback_run(
+            run_id=targeted_short,
+            symbols=['000660'],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=targeted_parent,
+        )
+        self._seed_feedback_run(
+            run_id=targeted_signal,
+            symbols=['000660'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            parent_run_id=targeted_parent,
+        )
+        self._seed_short_term_snapshot(
+            symbol='000660',
+            tactical_action='wait',
+            decision_run_id=targeted_short,
+        )
+        self._seed_snapshot(symbol='000660', decision_run_id=targeted_signal)
+        after_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        after_context = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=['005930'],
+            source_run=after_state['source_run'],
+            scope_state=after_state,
+        )
+
+        self.assertEqual(
+            after_context['authority_fingerprint'],
+            before_context['authority_fingerprint'],
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='targeted_other_symbol',
+            )
+        unrelated = next(
+            item
+            for item in refreshed['items']
+            if item['symbol'] == '005930'
+            and item['decision_agent_name'] == 'signal-decider'
+        )
+        self.assertEqual(unrelated['execution_status'], EXECUTION_STATUS_SUBMITTED)
+        self.assertNotIn('revocation', unrelated['submission'])
+
+    def test_abandoned_newer_parent_blocks_older_buy_authority(self) -> None:
+        old_parent = f'old-buy-parent-{uuid4().hex[:8]}'
+        old_child = f'old-buy-child-{uuid4().hex[:8]}'
+        abandoned_parent = f'abandoned-parent-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_parent,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=old_child,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=old_parent,
+        )
+        self._seed_snapshot(symbol='005930', decision_run_id=old_child)
+        self._seed_feedback_run(
+            run_id=abandoned_parent,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            status='abandoned',
+            completed_count=0,
+            failed_count=0,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(state['source_run']['run_id'], abandoned_parent)
+        self.assertIsNone(
+            state['selected_by_key'][('005930', 'signal-decider')],
+        )
+        self.assertNotIn(
+            ('005930', 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_latest_snapshot_selection_preserves_explicit_child_reuse(self) -> None:
+        old_run = f'old-child-{uuid4().hex[:10]}'
+        parent_run = f'parent-{uuid4().hex[:10]}'
+        reuse_child = f'reuse-child-{uuid4().hex[:10]}'
+        self._seed_feedback_run(
+            run_id=old_run,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+        )
+        expected_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=old_run,
+            feedback_received_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=reuse_child,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+            reused_symbols_by_role={'signal-decider': ['005930']},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol='005930',
+                feedback_run_id=old_run,
+                feedback_received_at=datetime(
+                    2026, 4, 29, 4, 10, tzinfo=timezone.utc
+                ),
+                decision_snapshot_id=expected_snapshot_id,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(
+            state['selected_by_key'][('005930', 'signal-decider')].id,
+            expected_snapshot_id,
+        )
+        self.assertEqual(
+            state['authoritative_run_id_by_key'][('005930', 'signal-decider')],
+            reuse_child,
+        )
+        self.assertIn(
+            ('005930', 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_latest_snapshot_selection_reuses_prior_parent_child_snapshot(self) -> None:
+        parent_a = f'parent-a-{uuid4().hex[:10]}'
+        child_a = f'child-a-{uuid4().hex[:10]}'
+        parent_b = f'parent-b-{uuid4().hex[:10]}'
+        child_b = f'child-b-{uuid4().hex[:10]}'
+        self._seed_feedback_run(
+            run_id=parent_a,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=child_a,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_a,
+        )
+        expected_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=child_a,
+            feedback_received_at=datetime(2026, 4, 29, 4, 20, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=parent_b,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=child_b,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_b,
+            reused_symbols_by_role={'signal-decider': ['005930']},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol='005930',
+                feedback_run_id=child_a,
+                feedback_received_at=datetime(
+                    2026, 4, 29, 4, 20, tzinfo=timezone.utc
+                ),
+                decision_snapshot_id=expected_snapshot_id,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(
+            state['selected_by_key'][('005930', 'signal-decider')].id,
+            expected_snapshot_id,
+        )
+        self.assertEqual(
+            state['authoritative_run_id_by_key'][('005930', 'signal-decider')],
+            child_b,
+        )
+        self.assertIn(
+            ('005930', 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_exact_reuse_survives_identical_duplicate_feedback_receipt_update(self) -> None:
+        symbol = f'D{uuid4().hex[:10].upper()}'
+        source_run = f'duplicate-source-{uuid4().hex[:8]}'
+        parent_run = f'duplicate-parent-{uuid4().hex[:8]}'
+        snapshot_observed_at = datetime(
+            2026, 4, 29, 4, 10, tzinfo=timezone.utc
+        )
+        self._seed_feedback_run(
+            run_id=source_run,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+        )
+        expected_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=source_run,
+            feedback_received_at=snapshot_observed_at,
+        )
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            reused_symbols_by_role={'signal-decider': [symbol]},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol=symbol,
+                feedback_run_id=source_run,
+                feedback_received_at=datetime(
+                    2026, 4, 29, 4, 30, tzinfo=timezone.utc
+                ),
+                decision_snapshot_id=expected_snapshot_id,
+                decision_snapshot_observed_at=snapshot_observed_at,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(
+            state['selected_by_key'][(symbol, 'signal-decider')].id,
+            expected_snapshot_id,
+        )
+        self.assertIn(
+            (symbol, 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_reuse_does_not_admit_slow_old_lineage_result_received_after_parent(self) -> None:
+        parent_a = f'slow-parent-a-{uuid4().hex[:8]}'
+        slow_child_a = f'slow-child-a-{uuid4().hex[:8]}'
+        parent_b = f'slow-parent-b-{uuid4().hex[:8]}'
+        reuse_child_b = f'reuse-child-b-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_a,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=slow_child_a,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 50, tzinfo=timezone.utc),
+            parent_run_id=parent_a,
+        )
+        slow_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=slow_child_a,
+            feedback_received_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=parent_b,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=reuse_child_b,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 20, tzinfo=timezone.utc),
+            parent_run_id=parent_b,
+            reused_symbols_by_role={'signal-decider': ['005930']},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol='005930',
+                feedback_run_id=slow_child_a,
+                feedback_received_at=datetime(
+                    2026, 4, 29, 5, 10, tzinfo=timezone.utc
+                ),
+                decision_snapshot_id=slow_snapshot_id,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertIsNone(
+            state['selected_by_key'][('005930', 'signal-decider')],
+        )
+        self.assertNotIn(
+            ('005930', 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_third_parent_reuse_keeps_exact_second_parent_authority_after_late_first_child(
+        self,
+    ) -> None:
+        symbol = f'P{uuid4().hex[:10].upper()}'
+        parent_one = f'parent-one-{uuid4().hex[:8]}'
+        child_one = f'child-one-{uuid4().hex[:8]}'
+        parent_two = f'parent-two-{uuid4().hex[:8]}'
+        child_two = f'child-two-{uuid4().hex[:8]}'
+        late_child_one = f'late-child-one-{uuid4().hex[:8]}'
+        parent_three = f'parent-three-{uuid4().hex[:8]}'
+
+        for run_id, started_at in (
+            (parent_one, datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc)),
+            (parent_two, datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc)),
+        ):
+            self._seed_feedback_run(
+                run_id=run_id,
+                symbols=[symbol],
+                roles=['short-term-decider', 'signal-decider'],
+                started_at=started_at,
+                mode='daily_retry_cycle_role_sequenced',
+                child_run_lineage=True,
+            )
+        self._seed_feedback_run(
+            run_id=child_one,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_one,
+        )
+        child_one_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=child_one,
+            feedback_received_at=datetime(2026, 4, 29, 4, 20, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=child_two,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_two,
+        )
+        expected_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=child_two,
+            feedback_received_at=datetime(2026, 4, 29, 5, 20, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=late_child_one,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            parent_run_id=parent_one,
+        )
+        late_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=late_child_one,
+            feedback_received_at=datetime(2026, 4, 29, 6, 10, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=parent_three,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 7, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            reused_symbols_by_role={'signal-decider': [symbol]},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol=symbol,
+                feedback_run_id=child_two,
+                feedback_received_at=datetime(
+                    2026, 4, 29, 5, 20, tzinfo=timezone.utc
+                ),
+                decision_snapshot_id=expected_snapshot_id,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        selected = state['selected_by_key'][(symbol, 'signal-decider')]
+
+        self.assertEqual(selected.id, expected_snapshot_id)
+        self.assertNotEqual(selected.id, late_snapshot_id)
+        self.assertEqual(
+            state['authoritative_run_id_by_key'][(symbol, 'signal-decider')],
+            parent_three,
+        )
+
+    def test_third_parent_reuse_rejects_evidence_from_older_parent_lineage(
+        self,
+    ) -> None:
+        symbol = f'Q{uuid4().hex[:10].upper()}'
+        parent_one = f'parent-one-{uuid4().hex[:8]}'
+        child_one = f'child-one-{uuid4().hex[:8]}'
+        parent_two = f'parent-two-{uuid4().hex[:8]}'
+        parent_three = f'parent-three-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_one,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=child_one,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_one,
+        )
+        child_one_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=child_one,
+            feedback_received_at=datetime(2026, 4, 29, 4, 20, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=parent_two,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=parent_three,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 7, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            reused_symbols_by_role={'signal-decider': [symbol]},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol=symbol,
+                feedback_run_id=child_one,
+                feedback_received_at=datetime(
+                    2026, 4, 29, 4, 20, tzinfo=timezone.utc
+                ),
+                decision_snapshot_id=child_one_snapshot_id,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertIsNone(
+            state['selected_by_key'][(symbol, 'signal-decider')]
+        )
+        self.assertNotIn(
+            (symbol, 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_reuse_rejects_late_older_sibling_from_immediate_parent(self) -> None:
+        symbol = f'S{uuid4().hex[:10].upper()}'
+        parent_two = f'parent-two-{uuid4().hex[:8]}'
+        child_a = f'child-a-{uuid4().hex[:8]}'
+        child_b = f'child-b-{uuid4().hex[:8]}'
+        parent_three = f'parent-three-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_two,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=child_a,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_two,
+        )
+        self._seed_feedback_run(
+            run_id=child_b,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 20, tzinfo=timezone.utc),
+            parent_run_id=parent_two,
+        )
+        self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=child_b,
+            feedback_received_at=datetime(2026, 4, 29, 5, 25, tzinfo=timezone.utc),
+        )
+        child_a_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=child_a,
+            feedback_received_at=datetime(2026, 4, 29, 5, 30, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=parent_three,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 7, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            reused_symbols_by_role={'signal-decider': [symbol]},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol=symbol,
+                feedback_run_id=child_a,
+                feedback_received_at=datetime(
+                    2026, 4, 29, 5, 30, tzinfo=timezone.utc
+                ),
+                decision_snapshot_id=child_a_snapshot_id,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertIsNone(
+            state['selected_by_key'][(symbol, 'signal-decider')]
+        )
+        self.assertNotIn(
+            (symbol, 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_newer_abandoned_sibling_blocks_older_success_from_same_parent(
+        self,
+    ) -> None:
+        symbol = f'A{uuid4().hex[:10].upper()}'
+        parent_run = f'parent-{uuid4().hex[:8]}'
+        older_child = f'older-child-{uuid4().hex[:8]}'
+        abandoned_child = f'abandoned-child-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=older_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+        )
+        self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=older_child,
+            feedback_received_at=datetime(
+                2026, 4, 29, 5, 11, tzinfo=timezone.utc
+            ),
+        )
+        self._seed_feedback_run(
+            run_id=abandoned_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 20, tzinfo=timezone.utc),
+            status='abandoned',
+            completed_count=0,
+            parent_run_id=parent_run,
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        key = (symbol, 'signal-decider')
+        self.assertIsNone(state['selected_by_key'][key])
+        self.assertEqual(
+            state['authoritative_run_id_by_key'][key],
+            abandoned_child,
+        )
+        self.assertNotIn(key, state['evidenced_scope_keys'])
+
+    def test_newer_running_child_with_snapshot_blocks_older_terminal_authority(
+        self,
+    ) -> None:
+        symbol = f'R{uuid4().hex[:10].upper()}'
+        parent_run = f'parent-{uuid4().hex[:8]}'
+        older_child = f'older-child-{uuid4().hex[:8]}'
+        running_child = f'running-child-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=older_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+        )
+        self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=older_child,
+            feedback_received_at=datetime(
+                2026, 4, 29, 5, 11, tzinfo=timezone.utc
+            ),
+        )
+        self._seed_feedback_run(
+            run_id=running_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 20, tzinfo=timezone.utc),
+            status='running',
+            completed_count=0,
+            parent_run_id=parent_run,
+        )
+        self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=running_child,
+            feedback_received_at=datetime(
+                2026, 4, 29, 5, 21, tzinfo=timezone.utc
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        key = (symbol, 'signal-decider')
+        self.assertIsNone(state['selected_by_key'][key])
+        self.assertEqual(
+            state['authoritative_run_id_by_key'][key],
+            running_child,
+        )
+        self.assertNotIn(key, state['evidenced_scope_keys'])
+
+    def test_equal_parent_start_time_uses_row_id_to_find_running_barrier(
+        self,
+    ) -> None:
+        symbol = f'T{uuid4().hex[:10].upper()}'
+        older_parent = f'equal-parent-a-{uuid4().hex[:8]}'
+        newer_parent = f'equal-parent-b-{uuid4().hex[:8]}'
+        shared_started_at = datetime(
+            2026, 4, 29, 5, 0, tzinfo=timezone.utc
+        )
+        self._seed_feedback_run(
+            run_id=older_parent,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=shared_started_at,
+            status='running',
+            completed_count=0,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        snapshot_observed_at = datetime(
+            2026, 4, 29, 4, 59, tzinfo=timezone.utc
+        )
+        older_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=older_parent,
+            feedback_received_at=snapshot_observed_at,
+        )
+        self._seed_feedback_run(
+            run_id=newer_parent,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=shared_started_at,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            reused_symbols_by_role={'signal-decider': [symbol]},
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol=symbol,
+                feedback_run_id=older_parent,
+                feedback_received_at=snapshot_observed_at,
+                decision_snapshot_id=older_snapshot_id,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        key = (symbol, 'signal-decider')
+        self.assertEqual(state['source_run']['run_id'], newer_parent)
+        self.assertIsNone(state['selected_by_key'][key])
+        self.assertNotIn(key, state['evidenced_scope_keys'])
+
+    def test_reuse_uses_snapshot_created_at_when_feedback_receipt_is_missing(self) -> None:
+        symbol = f'N{uuid4().hex[:10].upper()}'
+        old_parent = f'null-receipt-parent-a-{uuid4().hex[:8]}'
+        slow_child = f'null-receipt-child-a-{uuid4().hex[:8]}'
+        new_parent = f'null-receipt-parent-b-{uuid4().hex[:8]}'
+        reuse_child = f'null-receipt-child-b-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_parent,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=slow_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 50, tzinfo=timezone.utc),
+            parent_run_id=old_parent,
+        )
+        snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=slow_child,
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            snapshot.feedback_received_at = None
+            snapshot.created_at = datetime(
+                2026, 4, 29, 5, 10, tzinfo=timezone.utc
+            )
+        self._seed_feedback_run(
+            run_id=new_parent,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=reuse_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 20, tzinfo=timezone.utc),
+            parent_run_id=new_parent,
+            reused_symbols_by_role={'signal-decider': [symbol]},
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertIsNone(
+            state['selected_by_key'][(symbol, 'signal-decider')]
+        )
+        self.assertNotIn(
+            (symbol, 'signal-decider'),
+            state['evidenced_scope_keys'],
+        )
+
+    def test_late_old_failure_does_not_change_current_parent_authority(self) -> None:
+        symbol = f'F{uuid4().hex[:10].upper()}'
+        parent_run = f'current-parent-{uuid4().hex[:8]}'
+        short_child = f'current-short-{uuid4().hex[:8]}'
+        signal_child = f'current-signal-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=short_child,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+        )
+        self._seed_feedback_run(
+            run_id=signal_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+        )
+        self._seed_short_term_snapshot(symbol=symbol, decision_run_id=short_child)
+        self._seed_snapshot(symbol=symbol, decision_run_id=signal_child)
+        service = self._service()
+        before_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        before = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=before_state['source_run'],
+            scope_state=before_state,
+        )
+        self.feedback_failure_symbols.append(symbol)
+        with session_scope() as session:
+            session.add(
+                AgentContextFeedbackFailure(
+                    market_date=self.market_date,
+                    symbol=symbol,
+                    agent_name='signal-decider',
+                    run_id=f'older-lineage-{uuid4().hex[:8]}',
+                    failure_kind='dispatch_failed',
+                    retryable=True,
+                    summary_payload={},
+                    context_payload={},
+                    received_at=datetime(
+                        2026, 4, 29, 7, 0, tzinfo=timezone.utc
+                    ),
+                )
+            )
+        after_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        after = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=after_state['source_run'],
+            scope_state=after_state,
+        )
+
+        self.assertEqual(after['status'], 'complete')
+        self.assertEqual(after['failure_count'], 0)
+        self.assertEqual(
+            after['authority_fingerprint'],
+            before['authority_fingerprint'],
+        )
+
+    def test_later_failure_in_same_child_run_invalidates_snapshot(self) -> None:
+        symbol = f'F{uuid4().hex[:10].upper()}'
+        parent_run = f'failure-parent-{uuid4().hex[:8]}'
+        short_child = f'failure-short-{uuid4().hex[:8]}'
+        signal_child = f'failure-signal-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=short_child,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+        )
+        self._seed_feedback_run(
+            run_id=signal_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+        )
+        self._seed_short_term_snapshot(
+            symbol=symbol,
+            decision_run_id=short_child,
+            feedback_received_at=datetime(
+                2026, 4, 29, 6, 0, tzinfo=timezone.utc
+            ),
+        )
+        self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=signal_child,
+            feedback_received_at=datetime(
+                2026, 4, 29, 6, 0, tzinfo=timezone.utc
+            ),
+        )
+        self.feedback_failure_symbols.append(symbol)
+        with session_scope() as session:
+            session.add(
+                AgentContextFeedbackFailure(
+                    market_date=self.market_date,
+                    symbol=symbol,
+                    agent_name='signal-decider',
+                    run_id=signal_child,
+                    failure_kind='upstream_changed_during_dispatch',
+                    retryable=True,
+                    summary_payload={},
+                    context_payload={},
+                    received_at=datetime(
+                        2026, 4, 29, 6, 1, tzinfo=timezone.utc
+                    ),
+                )
+            )
+
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        completeness = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+
+        key = (symbol, 'signal-decider')
+        self.assertIsNone(scope_state['selected_by_key'][key])
+        self.assertNotIn(key, scope_state['evidenced_scope_keys'])
+        self.assertEqual(completeness['status'], 'incomplete')
+        self.assertEqual(completeness['failure_count'], 1)
+
+    def test_failed_child_run_prevents_snapshot_resurrection_after_late_old_failure(
+        self,
+    ) -> None:
+        symbol = f'F{uuid4().hex[:10].upper()}'
+        old_parent = f'old-parent-{uuid4().hex[:8]}'
+        old_child = f'old-child-{uuid4().hex[:8]}'
+        current_parent = f'current-parent-{uuid4().hex[:8]}'
+        current_child = f'current-child-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_parent,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=old_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+            status='failed',
+            completed_count=0,
+            failed_count=1,
+            parent_run_id=old_parent,
+        )
+        self._seed_feedback_run(
+            run_id=current_parent,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_feedback_run(
+            run_id=current_child,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            status='completed_with_failures',
+            completed_count=0,
+            failed_count=1,
+            parent_run_id=current_parent,
+        )
+        self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=current_child,
+            feedback_received_at=datetime(
+                2026, 4, 29, 6, 0, tzinfo=timezone.utc
+            ),
+        )
+        self.feedback_failure_symbols.append(symbol)
+        with session_scope() as session:
+            session.add(
+                AgentContextFeedbackFailure(
+                    market_date=self.market_date,
+                    symbol=symbol,
+                    agent_name='signal-decider',
+                    run_id=current_child,
+                    failure_kind='upstream_changed_during_dispatch',
+                    retryable=True,
+                    summary_payload={},
+                    context_payload={},
+                    received_at=datetime(
+                        2026, 4, 29, 6, 1, tzinfo=timezone.utc
+                    ),
+                )
+            )
+
+        service = self._service()
+        key = (symbol, 'signal-decider')
+        before = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        self.assertIsNone(before['selected_by_key'][key])
+
+        with session_scope() as session:
+            failure = session.execute(
+                select(AgentContextFeedbackFailure).where(
+                    AgentContextFeedbackFailure.market_date
+                    == self.market_date,
+                    AgentContextFeedbackFailure.symbol == symbol,
+                    AgentContextFeedbackFailure.agent_name
+                    == 'signal-decider',
+                )
+            ).scalar_one()
+            failure.run_id = old_child
+            failure.received_at = datetime(
+                2026, 4, 29, 6, 2, tzinfo=timezone.utc
+            )
+
+        after = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertIsNone(after['selected_by_key'][key])
+        self.assertNotIn(key, after['evidenced_scope_keys'])
+
+    def test_partial_lineage_parent_does_not_accept_unattested_old_snapshots(self) -> None:
+        symbol = f'P{uuid4().hex[:10].upper()}'
+        old_short = f'old-short-{uuid4().hex[:8]}'
+        old_signal = f'old-signal-{uuid4().hex[:8]}'
+        parent_run = f'partial-parent-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_short,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+        )
+        self._seed_short_term_snapshot(symbol=symbol, decision_run_id=old_short)
+        self._seed_feedback_run(
+            run_id=old_signal,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 1, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(symbol=symbol, decision_run_id=old_signal)
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            status='partial',
+            completed_count=0,
+            failed_count=2,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        real_builder = self.agent_context_from_state_patcher.temp_original
+        result = real_builder(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['completed_scope_count'], 0)
+        self.assertEqual(result['pending_scope_count'], 2)
+
+    def test_legacy_partial_parent_does_not_accept_unattested_old_snapshots(self) -> None:
+        symbol = f'L{uuid4().hex[:10].upper()}'
+        old_short = f'legacy-short-{uuid4().hex[:8]}'
+        old_signal = f'legacy-signal-{uuid4().hex[:8]}'
+        parent_run = f'legacy-partial-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_short,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+        )
+        self._seed_short_term_snapshot(symbol=symbol, decision_run_id=old_short)
+        self._seed_feedback_run(
+            run_id=old_signal,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 1, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(symbol=symbol, decision_run_id=old_signal)
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            status='partial',
+            completed_count=0,
+            failed_count=2,
+            mode='daily_retry_cycle_role_sequenced',
+        )
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        result = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+
+        self.assertFalse(scope_state['strict_source_lineage'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['completed_scope_count'], 0)
+        self.assertEqual(result['pending_scope_count'], 2)
+
+    def test_legacy_completed_parent_does_not_accept_unattested_old_snapshots(self) -> None:
+        symbol = f'C{uuid4().hex[:10].upper()}'
+        old_short = f'legacy-complete-short-{uuid4().hex[:8]}'
+        old_signal = f'legacy-complete-signal-{uuid4().hex[:8]}'
+        parent_run = f'legacy-complete-parent-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_short,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+        )
+        self._seed_short_term_snapshot(symbol=symbol, decision_run_id=old_short)
+        self._seed_feedback_run(
+            run_id=old_signal,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 1, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(symbol=symbol, decision_run_id=old_signal)
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            status='completed',
+            completed_count=1,
+            failed_count=0,
+            mode='daily_retry_cycle_role_sequenced',
+        )
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        result = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+
+        self.assertFalse(scope_state['strict_source_lineage'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['completed_scope_count'], 0)
+        self.assertEqual(result['pending_scope_count'], 2)
+
+    def test_lineage_parent_exact_reuse_attestation_is_complete(self) -> None:
+        symbol = f'R{uuid4().hex[:10].upper()}'
+        old_short = f'reused-short-{uuid4().hex[:8]}'
+        old_signal = f'reused-signal-{uuid4().hex[:8]}'
+        parent_run = f'reuse-parent-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=old_short,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+        )
+        old_short_snapshot_id = self._seed_short_term_snapshot(
+            symbol=symbol,
+            decision_run_id=old_short,
+            feedback_received_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=old_signal,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 1, tzinfo=timezone.utc),
+        )
+        old_signal_snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            decision_run_id=old_signal,
+            feedback_received_at=datetime(2026, 4, 29, 4, 10, tzinfo=timezone.utc),
+        )
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            reused_symbols_by_role={
+                'short-term-decider': [symbol],
+                'signal-decider': [symbol],
+            },
+            reused_feedback_evidence_by_role={
+                **self._reuse_evidence(
+                    symbol=symbol,
+                    role='short-term-decider',
+                    feedback_run_id=old_short,
+                    feedback_received_at=datetime(
+                        2026, 4, 29, 4, 10, tzinfo=timezone.utc
+                    ),
+                    decision_snapshot_id=old_short_snapshot_id,
+                ),
+                **self._reuse_evidence(
+                    symbol=symbol,
+                    feedback_run_id=old_signal,
+                    feedback_received_at=datetime(
+                        2026, 4, 29, 4, 10, tzinfo=timezone.utc
+                    ),
+                    decision_snapshot_id=old_signal_snapshot_id,
+                ),
+            },
+        )
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        result = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['completed_scope_count'], 2)
+        self.assertEqual(
+            {
+                scope_state['selected_by_key'][(symbol, agent_name)].id
+                for agent_name in ('short-term-decider', 'signal-decider')
+            },
+            {old_short_snapshot_id, old_signal_snapshot_id},
+        )
+        self.assertEqual(
+            scope_state['reused_scope_keys'],
+            {
+                (symbol, 'short-term-decider'),
+                (symbol, 'signal-decider'),
+            },
+        )
+
+    def test_agent_context_completeness_is_assessed_per_candidate_symbol(self) -> None:
+        source_run = {
+            'run_id': 'per-symbol-source',
+            'status': 'partial',
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'roles': ['short-term-decider', 'signal-decider'],
+                'role_symbol_scopes': {
+                    'short-term-decider': ['005930', '000660'],
+                    'signal-decider': ['005930', '000660'],
+                },
+            },
+        }
+        failed_key = ('000660', 'short-term-decider')
+        scope_state = {
+            'source_run': source_run,
+            'selected_by_key': {
+                ('005930', 'short-term-decider'): object(),
+                ('005930', 'signal-decider'): object(),
+                failed_key: None,
+                ('000660', 'signal-decider'): object(),
+            },
+            'authoritative_run_id_by_key': {
+                ('005930', 'short-term-decider'): 'short-a',
+                ('005930', 'signal-decider'): 'signal-a',
+                failed_key: 'short-b-failed',
+                ('000660', 'signal-decider'): 'signal-b',
+            },
+            'evidenced_scope_keys': {
+                ('005930', 'short-term-decider'),
+                ('005930', 'signal-decider'),
+                ('000660', 'signal-decider'),
+            },
+            'failures_by_key': {
+                failed_key: {
+                    'symbol': '000660',
+                    'agent_name': 'short-term-decider',
+                    'run_id': 'short-b-failed',
+                    'failure_kind': 'response_contract_invalid',
+                    'retryable': True,
+                },
+            },
+            'run_snapshots': [],
+        }
+        real_builder = self.agent_context_from_state_patcher.temp_original
+        service = self._service()
+        result = real_builder(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=['005930', '000660'],
+            source_run=source_run,
+            scope_state=scope_state,
+        )
+
+        by_symbol = result['_candidate_contexts_by_symbol']
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(by_symbol['005930']['status'], 'complete')
+        self.assertFalse(by_symbol['005930']['candidate_set_definitive'])
+        self.assertEqual(by_symbol['000660']['status'], 'incomplete')
+        self.assertEqual(by_symbol['000660']['failure_count'], 1)
+
+    def test_completeness_uses_latest_actual_child_and_ignores_stale_failure(self) -> None:
+        symbol = f'T{uuid4().hex[:10].upper()}'
+        source_parent = f'source-parent-{uuid4().hex[:8]}'
+        short_success = f'short-success-{uuid4().hex[:8]}'
+        signal_success = f'signal-success-{uuid4().hex[:8]}'
+        signal_failure = f'signal-failure-{uuid4().hex[:8]}'
+        signal_repair = f'signal-repair-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=source_parent,
+            symbols=[symbol],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+        )
+        self._seed_feedback_run(
+            run_id=short_success,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+        )
+        self._seed_short_term_snapshot(
+            symbol=symbol,
+            decision_run_id=short_success,
+        )
+        self._seed_feedback_run(
+            run_id=signal_success,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 1, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(symbol=symbol, decision_run_id=signal_success)
+        self._seed_feedback_run(
+            run_id=signal_failure,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            status='completed_with_failures',
+            completed_count=0,
+            failed_count=1,
+        )
+        self.feedback_failure_symbols.append(symbol)
+        with session_scope() as session:
+            session.add(
+                AgentContextFeedbackFailure(
+                    market_date=self.market_date,
+                    symbol=symbol,
+                    agent_name='signal-decider',
+                    run_id=signal_failure,
+                    failure_kind='response_contract_invalid',
+                    retryable=True,
+                    summary_payload={},
+                    context_payload={},
+                    received_at=datetime(2026, 4, 29, 6, 1, tzinfo=timezone.utc),
+                )
+            )
+
+        real_builder = self.agent_context_from_state_patcher.temp_original
+        service = self._service()
+        failed_scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        failed_result = real_builder(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=failed_scope_state['source_run'],
+            scope_state=failed_scope_state,
+        )
+
+        self.assertEqual(failed_result['status'], 'incomplete')
+        self.assertEqual(failed_result['completed_scope_count'], 1)
+        self.assertEqual(failed_result['failure_count'], 1)
+        self.assertEqual(failed_result['pending_scope_count'], 0)
+        self.assertEqual(
+            failed_result['by_failure_kind'],
+            {'response_contract_invalid': 1},
+        )
+
+        self._seed_feedback_run(
+            run_id=signal_repair,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 7, 0, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(symbol=symbol, decision_run_id=signal_repair)
+        repaired_scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+        repaired_result = real_builder(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=repaired_scope_state['source_run'],
+            scope_state=repaired_scope_state,
+        )
+
+        self.assertEqual(repaired_result['status'], 'complete')
+        self.assertEqual(repaired_result['completed_scope_count'], 2)
+        self.assertEqual(repaired_result['failure_count'], 0)
+        self.assertEqual(repaired_result['pending_scope_count'], 0)
 
     def test_latest_run_cohort_missing_symbol_revokes_prior_delegated_buy(self) -> None:
         run_a = f'cohort-a-{uuid4().hex[:10]}'
@@ -3577,10 +6311,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 target_trade_date=self.target_trade_date,
                 trigger='seed_buy_plan',
             )
-            stale_snapshot_cohort = stale_service._load_latest_snapshots(
-                source_market_date=self.market_date
+            stale_snapshot_generation_state = (
+                stale_service._load_latest_snapshot_generation_state(
+                    source_market_date=self.market_date
+                )
             )
-            load_latest = stale_service._load_latest_snapshots
+            load_latest_generation_state = (
+                stale_service._load_latest_snapshot_generation_state
+            )
             load_count = 0
 
             def expose_newer_wait_after_stale_read(*, source_market_date: date):
@@ -3595,12 +6333,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                         target_trade_date=self.target_trade_date,
                         trigger='newer_wait_refresh',
                     )
-                    return stale_snapshot_cohort
-                return load_latest(source_market_date=source_market_date)
+                    return stale_snapshot_generation_state
+                return load_latest_generation_state(
+                    source_market_date=source_market_date
+                )
 
             with patch.object(
                 stale_service,
-                '_load_latest_snapshots',
+                '_load_latest_snapshot_generation_state',
                 side_effect=expose_newer_wait_after_stale_read,
             ):
                 stale_result = stale_service.refresh_plan_items(
@@ -3765,6 +6505,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             target_trade_date=self.target_trade_date,
         )['items'][0]
         self.assertEqual(acknowledged['execution_status'], EXECUTION_STATUS_PLANNED)
+
         self.assertNotIn('exec_dispatch', acknowledged['submission'])
 
         with (
@@ -3825,6 +6566,83 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'allow',
         )
         self.assertNotIn('exec_dispatch', recovered['submission'])
+
+    def test_refresh_resamples_preopen_to_open_transition_under_plan_lock(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        preopen_service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            preopen_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_scheduler',
+            )
+        self._mark_row_as_handed_off()
+
+        preopen_state = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-04-30T08:59:59+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        open_state = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T09:00:01+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        state_reads = 0
+
+        def transitioning_market_state() -> MarketState:
+            nonlocal state_reads
+            state_reads += 1
+            return preopen_state if state_reads == 1 else open_state
+
+        transition_service = SignalDeciderNextOpenExecutionService(
+            market_state_getter=transitioning_market_state,
+        )
+        severe_snapshot = self._live_market_snapshot_context(
+            observed_at=datetime(
+                2026,
+                4,
+                30,
+                9,
+                0,
+                tzinfo=timezone(timedelta(hours=9)),
+            )
+        )
+        with (
+            patch(
+                'app.orders.next_open_execution.load_current_market_snapshot_context',
+                return_value=severe_snapshot,
+            ) as load_snapshot,
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            item = transition_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_open_transition',
+            )['items'][0]
+
+        self.assertGreaterEqual(state_reads, 2)
+        self.assertGreaterEqual(load_snapshot.call_count, 1)
+        self.assertEqual(item['execution_status'], EXECUTION_STATUS_REVOCATION_PENDING)
+        self.assertEqual(
+            item['submission']['revocation']['reason_code'],
+            'current_live_market_risk_off',
+        )
 
     def test_healthy_live_refresh_retires_acked_transient_revocation_authority(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
@@ -4381,7 +7199,19 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
         self._mark_row_as_handed_off()
 
-        with patch.object(service, '_load_latest_snapshots', return_value=[]):
+        with (
+            patch.object(service, '_load_latest_snapshots', return_value=[]),
+            patch.object(
+                service,
+                '_load_latest_decider_scope_state',
+                return_value={
+                    'selected_by_key': {},
+                    'authoritative_run_id_by_key': {},
+                    'failures_by_key': {},
+                    'run_snapshots': [],
+                },
+            ),
+        ):
             refreshed = service.refresh_plan_items(
                 target_trade_date=self.target_trade_date,
                 trigger='candidate_removed',
@@ -4484,6 +7314,587 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             )['items'][0]
         self.assertEqual(Decimal(rebound['allocation_budget_krw']), Decimal('900000'))
         self.assertNotIn('exec_dispatch', rebound['submission'])
+
+    def test_dispatch_rejects_regressed_agent_context_authority(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        stored_context = {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': self.market_date.isoformat(),
+            'candidate_symbols': ['005930'],
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': 'complete',
+            'cohort_status': 'complete',
+            'has_incomplete_agent_context': False,
+            'candidate_set_definitive': True,
+            'authority_fingerprint': 'stored-complete-authority',
+            'latest_run': {'run_id': 'stored-parent', 'status': 'completed'},
+            'failure_count': 0,
+            'failure_groups': [],
+        }
+        with (
+            patch.object(
+                service,
+                '_build_agent_context_completeness_context',
+                return_value=stored_context,
+            ),
+            patch.object(
+                service,
+                '_build_agent_context_completeness_from_state',
+                return_value=stored_context,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_complete_agent_context',
+            )
+        self._mark_row_as_handed_off()
+
+        with session_scope() as session:
+            row = (
+                session.query(SignalDeciderExecutionPlanItem)
+                .filter(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+                .one()
+            )
+            expected_row_bindings = {
+                int(row.id): {
+                    'decision_snapshot_id': int(row.decision_snapshot_id),
+                    'row_revision_fingerprint': (
+                        _execution_plan_row_authority_fingerprint(row)
+                    ),
+                }
+            }
+
+        current_contexts = [
+            {
+                **stored_context,
+                'authority_fingerprint': 'new-complete-authority',
+                'latest_run': {'run_id': 'new-parent', 'status': 'completed'},
+            },
+            {
+                **stored_context,
+                'status': 'incomplete',
+                'cohort_status': 'incomplete',
+                'has_incomplete_agent_context': True,
+                'candidate_set_definitive': False,
+                'authority_fingerprint': 'new-running-authority',
+                'latest_run': {'run_id': 'new-parent', 'status': 'running'},
+            },
+        ]
+        for current_context in current_contexts:
+            with self.subTest(
+                status=current_context['status'],
+                authority_fingerprint=current_context['authority_fingerprint'],
+            ):
+                with (
+                    patch.object(
+                        service,
+                        '_build_agent_context_completeness_context',
+                        return_value=current_context,
+                    ),
+                    patch.object(
+                        service,
+                        '_build_agent_context_completeness_from_state',
+                        return_value=current_context,
+                    ),
+                ):
+                    generation = service.inspect_dispatch_authority_generation(
+                        target_trade_date=self.target_trade_date,
+                        expected_row_bindings=expected_row_bindings,
+                    )
+
+                self.assertEqual(generation['status'], 'invalid')
+                self.assertTrue(generation['issues'])
+                self.assertEqual(
+                    generation['issues'][0]['reason_code'],
+                    'agent_context_authority_changed',
+                )
+                self.assertEqual(
+                    generation['issues'][0]['replacement_action'],
+                    'reject',
+                )
+
+    def test_terminal_buy_revokes_when_agent_context_authority_regresses(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        stored_context = {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': self.market_date.isoformat(),
+            'candidate_symbols': ['005930'],
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': 'complete',
+            'cohort_status': 'complete',
+            'has_incomplete_agent_context': False,
+            'candidate_set_definitive': True,
+            'authority_fingerprint': 'stored-complete-authority',
+            'latest_run': {'run_id': 'stored-parent', 'status': 'completed'},
+            'failure_count': 0,
+            'failure_groups': [],
+        }
+        with (
+            patch.object(
+                service,
+                '_build_agent_context_completeness_context',
+                return_value=stored_context,
+            ),
+            patch.object(
+                service,
+                '_build_agent_context_completeness_from_state',
+                return_value=stored_context,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_complete_agent_context',
+            )
+        self._mark_row_as_handed_off()
+
+        regressed_context = {
+            **stored_context,
+            'status': 'incomplete',
+            'cohort_status': 'incomplete',
+            'has_incomplete_agent_context': True,
+            'candidate_set_definitive': False,
+            'authority_fingerprint': 'new-running-authority',
+            'latest_run': {'run_id': 'new-parent', 'status': 'running'},
+        }
+        with (
+            patch.object(
+                service,
+                '_build_agent_context_completeness_context',
+                return_value=regressed_context,
+            ),
+            patch.object(
+                service,
+                '_build_agent_context_completeness_from_state',
+                return_value=regressed_context,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='agent_context_regressed',
+            )
+
+        item = next(
+            row
+            for row in refreshed['items']
+            if row['account_reference'] == self.account_reference
+            and row['symbol'] == '005930'
+        )
+        self.assertEqual(
+            item['execution_status'],
+            EXECUTION_STATUS_REVOCATION_PENDING,
+        )
+        self.assertEqual(
+            item['submission']['revocation']['reason_code'],
+            'agent_context_authority_changed',
+        )
+
+    def test_terminal_buy_revokes_when_bound_decision_policy_is_retired(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_active_policy_authority',
+            )
+        self._mark_row_as_handed_off()
+        with session_scope() as session:
+            policy = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+            ).scalar_one()
+            policy.status = 'retired'
+            policy.retired_at = datetime(
+                2026, 4, 29, 7, 0, tzinfo=timezone.utc
+            )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='policy_retired_after_handoff',
+            )
+
+        item = refreshed['items'][0]
+        self.assertEqual(
+            item['execution_status'],
+            EXECUTION_STATUS_REVOCATION_PENDING,
+        )
+        self.assertEqual(
+            item['submission']['revocation']['reason_code'],
+            'policy_scope_changed',
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+
+    def test_terminal_buy_revokes_when_active_policy_bundle_changes(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_policy_bundle_authority',
+            )
+        self._mark_row_as_handed_off()
+
+        with session_scope() as session:
+            policy = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+            ).scalar_one()
+            policy.rule_bundle_payload = {
+                'schema_version': 'signal_decider_policy_bundle_v1',
+                'change_set': [{'rule': 'minimum_confidence', 'value': 8}],
+            }
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='policy_bundle_changed_after_handoff',
+            )
+
+        item = refreshed['items'][0]
+        self.assertEqual(
+            item['execution_status'],
+            EXECUTION_STATUS_REVOCATION_PENDING,
+        )
+        self.assertEqual(
+            item['submission']['revocation']['reason_code'],
+            'policy_scope_changed',
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+
+    def test_dispatch_generation_rejects_retired_decision_policy(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_active_policy_generation',
+            )
+        with session_scope() as session:
+            row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+            ).scalar_one()
+            expected_row_bindings = {
+                int(row.id): {
+                    'decision_snapshot_id': int(row.decision_snapshot_id),
+                    'row_revision_fingerprint': (
+                        _execution_plan_row_authority_fingerprint(row)
+                    ),
+                }
+            }
+            policy = session.execute(
+                select(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+            ).scalar_one()
+            policy.status = 'retired'
+            policy.retired_at = datetime(
+                2026, 4, 29, 7, 0, tzinfo=timezone.utc
+            )
+
+        generation = service.inspect_dispatch_authority_generation(
+            target_trade_date=self.target_trade_date,
+            expected_row_bindings=expected_row_bindings,
+        )
+
+        self.assertEqual(generation['status'], 'invalid')
+        self.assertEqual(generation['reason_code'], 'policy_scope_changed')
+        self.assertEqual(
+            generation['issues'][0]['reason_code'],
+            'policy_scope_changed',
+        )
+
+    def test_dispatch_generation_rejects_changed_durable_decision_inputs(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_durable_generation',
+            )
+        with session_scope() as session:
+            row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+            ).scalar_one()
+            expected_row_bindings = {
+                int(row.id): {
+                    'decision_snapshot_id': int(row.decision_snapshot_id),
+                    'row_revision_fingerprint': (
+                        _execution_plan_row_authority_fingerprint(row)
+                    ),
+                }
+            }
+
+        self.snapshot_generation_mock.side_effect = None
+        self.snapshot_generation_mock.return_value = {
+            'schema_version': 'persisted_decider_generation_validation_v1',
+            'market_date': self.market_date.isoformat(),
+            'valid_snapshot_ids': [],
+            'invalid_snapshot_ids': [snapshot_id],
+            'validations': [
+                {
+                    'snapshot_id': snapshot_id,
+                    'symbol': '005930',
+                    'agent_name': 'signal-decider',
+                    'status': 'invalid',
+                    'reason': 'durable_decider_inputs_changed',
+                }
+            ],
+            'generation_fingerprint': 'test-snapshot-generation:changed',
+        }
+
+        generation = service.inspect_dispatch_authority_generation(
+            target_trade_date=self.target_trade_date,
+            expected_row_bindings=expected_row_bindings,
+        )
+
+        self.assertEqual(generation['status'], 'invalid')
+        self.assertEqual(
+            generation['reason_code'],
+            'decision_input_generation_changed',
+        )
+        self.assertFalse(generation['replacement_actionable'])
+
+    def test_revoked_buy_recovers_after_agent_context_becomes_complete_again(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        initial_context = {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': self.market_date.isoformat(),
+            'candidate_symbols': ['005930'],
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': 'complete',
+            'cohort_status': 'complete',
+            'has_incomplete_agent_context': False,
+            'candidate_set_definitive': True,
+            'authority_fingerprint': 'initial-complete-authority',
+            'latest_run': {'run_id': 'initial-parent', 'status': 'completed'},
+            'failure_count': 0,
+            'failure_groups': [],
+        }
+
+        def refresh_with_context(context: dict, trigger: str) -> dict:
+            with (
+                patch.object(
+                    service,
+                    '_build_agent_context_completeness_context',
+                    return_value=context,
+                ),
+                patch.object(
+                    service,
+                    '_build_agent_context_completeness_from_state',
+                    return_value=context,
+                ),
+                patch(
+                    'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                    return_value=[
+                        {'trade_date': '2026-04-29', 'close_price': 50000}
+                    ],
+                ),
+            ):
+                return service.refresh_plan_items(
+                    target_trade_date=self.target_trade_date,
+                    trigger=trigger,
+                )['items'][0]
+
+        refresh_with_context(initial_context, 'store_initial_context')
+        self._mark_row_as_handed_off()
+        regressed_context = {
+            **initial_context,
+            'status': 'incomplete',
+            'cohort_status': 'incomplete',
+            'has_incomplete_agent_context': True,
+            'candidate_set_definitive': False,
+            'authority_fingerprint': 'running-authority',
+            'latest_run': {'run_id': 'running-parent', 'status': 'running'},
+        }
+        pending = refresh_with_context(
+            regressed_context,
+            'agent_context_temporarily_incomplete',
+        )
+        self.assertEqual(
+            pending['execution_status'],
+            EXECUTION_STATUS_REVOCATION_PENDING,
+        )
+        self._ack_pending_revocation(service=service, item=pending)
+        revoked = service.list_plan_items(
+            target_trade_date=self.target_trade_date,
+        )['items'][0]
+        self.assertEqual(revoked['execution_status'], EXECUTION_STATUS_REVOKED)
+
+        recovered_context = {
+            **initial_context,
+            'authority_fingerprint': 'recovered-complete-authority',
+            'latest_run': {'run_id': 'recovered-parent', 'status': 'completed'},
+        }
+        recovered = refresh_with_context(
+            recovered_context,
+            'agent_context_recovered',
+        )
+
+        self.assertEqual(recovered['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(recovered['execution_status'], EXECUTION_STATUS_PLANNED)
+        self.assertNotIn('exec_dispatch', recovered['submission'])
+        self.assertEqual(
+            recovered['submission']['revocation']['recovery']['status'],
+            'authority_revalidated',
+        )
+
+    def test_blocked_pykrx_still_revokes_terminal_buy_removed_by_child_tombstone(
+        self,
+    ) -> None:
+        initial_run = f'pykrx-candidate-{uuid4().hex[:10]}'
+        tombstone_run = f'pykrx-tombstone-{uuid4().hex[:10]}'
+        self._seed_feedback_run(
+            run_id=initial_run,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(symbol='005930', decision_run_id=initial_run)
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='seed_terminal_buy',
+            )
+        self._mark_row_as_handed_off()
+        self._seed_feedback_run(
+            run_id=tombstone_run,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            force_recompute=True,
+        )
+        blocked_preflight = {
+            'market_date': self.market_date.isoformat(),
+            'status': 'blocked',
+            'allowed': False,
+            'required_categories': [
+                'sector_classification',
+                'investor_flow_symbol',
+                'short_selling',
+            ],
+            'failed_categories': ['investor_flow_symbol'],
+            'zero_coverage_categories': ['investor_flow_symbol'],
+            'category_row_counts': {
+                'sector_classification': 1,
+                'investor_flow_symbol': 0,
+                'short_selling': 1,
+            },
+        }
+
+        with patch(
+            'app.orders.next_open_execution.inspect_pykrx_enrichment_preflight',
+            return_value=blocked_preflight,
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='blocked_pykrx_after_tombstone',
+            )
+
+        item = next(
+            row
+            for row in refreshed['items']
+            if row['account_reference'] == self.account_reference
+            and row['symbol'] == '005930'
+        )
+        self.assertEqual(
+            item['execution_status'],
+            EXECUTION_STATUS_REVOCATION_PENDING,
+        )
+        self.assertEqual(
+            item['submission']['revocation']['reason_code'],
+            'candidate_removed',
+        )
+        self.assertEqual(
+            refreshed['summary']['reason'],
+            'pykrx_enrichment_preflight_blocked',
+        )
 
 
 class CandidateEnrichmentRepairTests(unittest.TestCase):

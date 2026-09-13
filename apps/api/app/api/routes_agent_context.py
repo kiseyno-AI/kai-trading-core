@@ -124,6 +124,7 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
     roles: list[str] | None = None
     fs_div: str | None = None
     disclosures_limit: int = Field(default=5, ge=0, le=20)
+    knowledge_cutoff_at: datetime | None = None
     reuse_existing: bool = True
     wait_for_completion: bool = True
     force: bool = False
@@ -136,6 +137,7 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
+    knowledge_cutoff_at: datetime | None = None
     feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=200)
@@ -159,6 +161,7 @@ class AgentFeedbackFollowupRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
+    knowledge_cutoff_at: datetime | None = None
     feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=500)
@@ -768,6 +771,7 @@ async def dispatch_symbol_agent_feedback(
                 roles=payload.roles,
                 fs_div=payload.fs_div,
                 disclosures_limit=payload.disclosures_limit,
+                knowledge_cutoff_at=payload.knowledge_cutoff_at,
                 reuse_existing=payload.reuse_existing,
                 force=payload.force,
                 force_recompute=payload.force_recompute,
@@ -788,6 +792,11 @@ async def dispatch_symbol_agent_feedback(
             'roles': requested_roles,
             'fs_div': payload.fs_div,
             'disclosures_limit': payload.disclosures_limit,
+            'knowledge_cutoff_at': (
+                payload.knowledge_cutoff_at.isoformat()
+                if payload.knowledge_cutoff_at is not None
+                else None
+            ),
             'reuse_existing': payload.reuse_existing,
             'force_recompute': payload.force_recompute,
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
@@ -899,6 +908,7 @@ async def dispatch_symbol_agent_feedback(
                     roles=requested_roles,
                     fs_div=payload.fs_div,
                     disclosures_limit=payload.disclosures_limit,
+                    knowledge_cutoff_at=payload.knowledge_cutoff_at,
                     reuse_existing=payload.reuse_existing,
                     request_run_id=request_run_id,
                     force=payload.force,
@@ -940,6 +950,11 @@ async def dispatch_symbol_agent_feedback(
                 'roles': requested_roles,
                 'fs_div': payload.fs_div,
                 'disclosures_limit': payload.disclosures_limit,
+                'knowledge_cutoff_at': (
+                    payload.knowledge_cutoff_at.isoformat()
+                    if payload.knowledge_cutoff_at is not None
+                    else None
+                ),
                 'reuse_existing': payload.reuse_existing,
                 'force_recompute': payload.force_recompute,
                 'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
@@ -966,6 +981,7 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
+            knowledge_cutoff_at=payload.knowledge_cutoff_at,
             feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
@@ -990,6 +1006,7 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
+            knowledge_cutoff_at=payload.knowledge_cutoff_at,
             feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
