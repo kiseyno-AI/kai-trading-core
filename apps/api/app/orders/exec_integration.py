@@ -3879,7 +3879,7 @@ class SignalDeciderExecIntegrationService:
                             }
                         )
                         continue
-                persisted = self._persist_dispatch_success(
+                persisted = await self._persist_dispatch_success_with_revision_retry(
                     rows=group_rows,
                     submitted_revision_fingerprints={
                         row_id: str(value)
@@ -3928,7 +3928,7 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(exec_states[0].get('authority_generation_before'), dict)
                 else None
             )
-            persisted = self._persist_dispatch_success(
+            persisted = await self._persist_dispatch_success_with_revision_retry(
                 rows=group_rows,
                 submitted_revision_fingerprints={
                     row_id: str(value)
@@ -4695,20 +4695,22 @@ class SignalDeciderExecIntegrationService:
                                 ),
                             )
                         )
-                        persisted_group_result = self._persist_dispatch_success(
-                            rows=dispatch_rows,
-                            submitted_revision_fingerprints=(
-                                recovered_revision_fingerprints
-                            ),
-                            row_links=row_links,
-                            plan_id=plan_id,
-                            fingerprint=fingerprint,
-                            payload=plan_payload,
-                            response_payload=response_payload,
-                            trigger=trigger,
-                            authority_generation_before=(
-                                authority_generation_before
-                            ),
+                        persisted_group_result = (
+                            await self._persist_dispatch_success_with_revision_retry(
+                                rows=dispatch_rows,
+                                submitted_revision_fingerprints=(
+                                    recovered_revision_fingerprints
+                                ),
+                                row_links=row_links,
+                                plan_id=plan_id,
+                                fingerprint=fingerprint,
+                                payload=plan_payload,
+                                response_payload=response_payload,
+                                trigger=trigger,
+                                authority_generation_before=(
+                                    authority_generation_before
+                                ),
+                            )
                         )
                         (
                             persisted_group_result,
@@ -4798,16 +4800,18 @@ class SignalDeciderExecIntegrationService:
                 )
                 continue
 
-            persisted_group_result = self._persist_dispatch_success(
-                rows=dispatch_rows,
-                submitted_revision_fingerprints=dispatch_revision_fingerprints,
-                row_links=row_links,
-                plan_id=plan_id,
-                fingerprint=fingerprint,
-                payload=plan_payload,
-                response_payload=response_payload,
-                trigger=trigger,
-                authority_generation_before=authority_generation_before,
+            persisted_group_result = (
+                await self._persist_dispatch_success_with_revision_retry(
+                    rows=dispatch_rows,
+                    submitted_revision_fingerprints=dispatch_revision_fingerprints,
+                    row_links=row_links,
+                    plan_id=plan_id,
+                    fingerprint=fingerprint,
+                    payload=plan_payload,
+                    response_payload=response_payload,
+                    trigger=trigger,
+                    authority_generation_before=authority_generation_before,
+                )
             )
             (
                 persisted_group_result,
@@ -9101,6 +9105,35 @@ class SignalDeciderExecIntegrationService:
                     existing_submission
                 ).payload
             session.flush()
+
+    async def _persist_dispatch_success_with_revision_retry(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        last_pending_result: dict[str, Any] | None = None
+
+        def persist() -> dict[str, Any]:
+            nonlocal last_pending_result
+            result = self._persist_dispatch_success(**kwargs)
+            error = result.get('error')
+            if (
+                result.get('dispatch_status')
+                == EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+                and isinstance(error, dict)
+                and error.get('code') == 'dispatch_ack_authority_fence_busy'
+            ):
+                last_pending_result = result
+                raise _PlanRefreshRevisionConflict(
+                    'post-ACK dispatch authority persistence is busy'
+                )
+            return result
+
+        try:
+            return await _retry_plan_refresh_revision_conflict(persist)
+        except _PlanRefreshRevisionConflict:
+            if last_pending_result is None:
+                raise
+            return last_pending_result
 
     def _persist_dispatch_success(
         self,

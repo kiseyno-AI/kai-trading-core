@@ -4841,6 +4841,99 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'execution_activation_fence_busy',
         )
 
+    async def test_transient_dispatch_ack_persistence_contention_converges(
+        self,
+    ) -> None:
+        original_persist = self.service._persist_dispatch_success
+        persist_call_count = 0
+
+        def persist_after_one_busy_fence(**kwargs) -> dict:
+            nonlocal persist_call_count
+            persist_call_count += 1
+            if persist_call_count == 1:
+                translated_item_count = sum(
+                    len(kwargs['row_links'].get(row.id, []))
+                    for row in kwargs['rows']
+                )
+                return {
+                    'dispatch_status': 'pending_remote_ack',
+                    'eligible_count': len(kwargs['rows']),
+                    'translated_item_count': translated_item_count,
+                    'accepted_item_count': 0,
+                    'rejected_item_count': 0,
+                    'pending_item_count': translated_item_count,
+                    'error': {
+                        'code': 'dispatch_ack_authority_fence_busy',
+                        'message': 'transient post-ACK authority contention',
+                        'retryable': True,
+                    },
+                }
+            return original_persist(**kwargs)
+
+        with patch.object(
+            self.service,
+            '_persist_dispatch_success',
+            side_effect=persist_after_one_busy_fence,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_transient_dispatch_ack_persistence_contention',
+            )
+
+        self.assertEqual(persist_call_count, 2)
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 1)
+        self.assertEqual(self.client.revocation_calls, [])
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'accepted')
+        self.assertEqual(group['activation_status'], 'activated')
+
+    async def test_persistent_dispatch_ack_persistence_contention_stays_quarantined(
+        self,
+    ) -> None:
+        pending_result = {
+            'dispatch_status': 'pending_remote_ack',
+            'eligible_count': 1,
+            'translated_item_count': 1,
+            'accepted_item_count': 0,
+            'rejected_item_count': 0,
+            'pending_item_count': 1,
+            'error': {
+                'code': 'dispatch_ack_authority_fence_busy',
+                'message': 'persistent post-ACK authority contention',
+                'retryable': True,
+            },
+        }
+
+        with (
+            patch.object(
+                self.service,
+                '_persist_dispatch_success',
+                return_value=pending_result,
+            ) as persist_success,
+            patch(
+                'app.orders.exec_integration.asyncio.sleep',
+                new_callable=AsyncMock,
+            ) as sleep,
+        ):
+            result = (
+                await self.service._persist_dispatch_success_with_revision_retry()
+            )
+
+        self.assertEqual(result, pending_result)
+        self.assertEqual(
+            persist_success.call_count,
+            CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS,
+        )
+        self.assertEqual(
+            sleep.await_count,
+            CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS - 1,
+        )
+
     async def test_transient_predispatch_generation_contention_converges(
         self,
     ) -> None:
