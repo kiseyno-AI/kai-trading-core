@@ -24,6 +24,7 @@ from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_TRACKED_STAGE_ORDER,
     HISTORICAL_BACKFILL_STAGE_ORDER,
     _OfficialDailyPipelineTracker,
+    _classify_pykrx_enrichment_categories,
     _extract_result_counts,
     _normalize_stage_status,
     _resolve_result_status,
@@ -46,6 +47,24 @@ class PykrxPipelineResultStatusTests(TestCase):
         }
 
         self.assertEqual(_resolve_result_status(result), 'partial')
+
+    def test_enrichment_provider_error_is_recovered_only_when_final_coverage_is_complete(self) -> None:
+        classification = _classify_pykrx_enrichment_categories(
+            category_results={
+                'sector_classification': {'errors': [{'error': 'provider timeout'}]},
+                'foreign_ownership': {'errors': []},
+            },
+            coverage_categories={
+                'sector_classification': {'expected_rows': 2, 'present_rows': 2},
+                'foreign_ownership': {'expected_rows': 2, 'present_rows': 1},
+            },
+            preflight_failed_categories=[],
+        )
+
+        self.assertEqual(classification['provider_error_categories'], ['sector_classification'])
+        self.assertEqual(classification['recovered_categories'], ['sector_classification'])
+        self.assertEqual(classification['coverage_gap_categories'], ['foreign_ownership'])
+        self.assertEqual(classification['unresolved_categories'], ['foreign_ownership'])
 
 
 @contextmanager
@@ -2988,11 +3007,11 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['price_retry_symbols_count'], 0)
         self.assertEqual(result['downstream_retry_symbols_count'], 60)
 
-    def test_run_market_data_pipeline_does_not_hide_global_downstream_partial_failures(self) -> None:
+    def test_run_market_data_pipeline_separates_recovered_enrichment_from_unresolved_failures(self) -> None:
         service = PykrxBackfillService()
         symbol = PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')
         enrichment_result = _ready_pykrx_enrichment_result()
-        enrichment_result['status'] = 'partial'
+        enrichment_result['status'] = 'recovered'
         enrichment_result['categories']['market_breadth']['errors'] = [
             {'market': 'KOSPI', 'error': 'provider timeout'}
         ]
@@ -3067,12 +3086,13 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['status'], 'completed_with_errors')
         self.assertEqual(result['retry_symbols'], ['005930'])
+        self.assertEqual(result['pykrx_enrichment']['recovered_categories'], ['market_breadth'])
+        self.assertEqual(result['pykrx_enrichment']['unresolved_categories'], [])
         self.assertNotIn('_retry_metadata', result['pykrx_enrichment'])
         self.assertNotIn('_retry_metadata', result['trending_ranks'])
         self.assertNotIn('_retry_metadata', result['signal_features'])
         self.assertEqual(
             complete_run.call_args.kwargs['error_message'],
-            'PyKRX enrichment incomplete for categories: market_breadth | '
             'Trending rank persistence incomplete: 1 period(s) failed | '
             'Daily signal feature sources incomplete: volume-power',
         )
