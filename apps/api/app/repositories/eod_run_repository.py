@@ -70,6 +70,12 @@ class _EODRecoveryCandidate:
     run_metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class AutoEODRecoveryTarget:
+    trade_date: str
+    eod_run_id: int
+
+
 @dataclass
 class _PipelineRecoveryCandidate:
     id: int
@@ -442,6 +448,49 @@ def _load_eod_recovery_modes(
         candidate_by_id[int(row.id)].run_metadata['mode'] = row.metadata_mode
 
 
+def load_exact_automatic_daily_eod_collection_run(
+    *,
+    eod_run_id: int,
+    trade_date: str | date,
+) -> dict[str, Any] | None:
+    """Reload one still-current automatic daily EOD lineage exactly."""
+
+    normalized_trade_date = _normalize_trade_date(trade_date)
+    normalized_run_id = int(eod_run_id)
+    with session_scope() as session:
+        candidates = [
+            _build_eod_recovery_candidate(row)
+            for row in session.execute(
+                _eod_recovery_candidate_statement(
+                    lower_bound=normalized_trade_date,
+                    cutoff=normalized_trade_date,
+                )
+            )
+        ]
+        _load_eod_recovery_modes(session, candidates=candidates)
+        latest_automatic = next(
+            (row for row in candidates if _is_automatic_daily_eod_run(row)),
+            None,
+        )
+        if (
+            latest_automatic is None
+            or latest_automatic.id != normalized_run_id
+        ):
+            return None
+
+        row = session.execute(
+            select(EODCollectionRun).where(
+                EODCollectionRun.id == normalized_run_id,
+                EODCollectionRun.market == 'KRX',
+                EODCollectionRun.source == 'pykrx',
+                EODCollectionRun.trade_date == normalized_trade_date,
+            )
+        ).scalar_one_or_none()
+        if row is None or not _is_automatic_daily_eod_run(row):
+            return None
+        return _serialize_eod_collection_run(row)
+
+
 def _load_eod_recovery_metadata(
     session: Any,
     *,
@@ -745,12 +794,12 @@ def _followup_recovery_is_satisfied_for_convergence(
     )
 
 
-def load_oldest_outstanding_auto_eod_recovery_date(
+def load_oldest_outstanding_auto_eod_recovery_target(
     *,
     on_or_after: str | date,
     on_or_before: str | date,
-) -> str | None:
-    """Return one oldest recent automatic EOD date with durable retry evidence.
+) -> AutoEODRecoveryTarget | None:
+    """Return the oldest recent automatic EOD lineage with retry evidence.
 
     Only the newest automatic-daily KRX/PyKRX EOD row for each date is
     considered, so unrelated manual or historical work cannot hide a recovery
@@ -818,22 +867,43 @@ def load_oldest_outstanding_auto_eod_recovery_date(
                     session,
                     candidates=[eod_row],
                 )
+            # Retry caps prevent new collection attempts; they must not hide a
+            # running lineage that still needs lock-protected reconciliation.
+            if str(eod_row.status or '').strip().lower() == 'running':
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
             eod_has_price_recovery_scope = _eod_has_price_recovery_scope(
                 eod_row
             )
+            auto_price_attempts = auto_attempt_counts.get(
+                eod_row.trade_date, 0
+            )
+            price_recovery_exhausted = bool(
+                eod_has_price_recovery_scope
+                and auto_price_attempts
+                >= _MAX_AUTO_PRICE_RECOVERY_RUNS_PER_TRADE_DATE
+            )
             if (
                 eod_has_price_recovery_scope
-                and auto_attempt_counts.get(eod_row.trade_date, 0)
+                and auto_price_attempts
                 < _MAX_AUTO_PRICE_RECOVERY_RUNS_PER_TRADE_DATE
             ):
-                return eod_row.trade_date.isoformat()
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
             if _eod_has_followup_recovery_scope(eod_row):
                 followup_attempts = _count_auto_followup_recovery_attempts(
                     session,
                     eod_run=eod_row,
                 )
                 if followup_attempts < _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD:
-                    return eod_row.trade_date.isoformat()
+                    return AutoEODRecoveryTarget(
+                        trade_date=eod_row.trade_date.isoformat(),
+                        eod_run_id=eod_row.id,
+                    )
                 pipeline_candidates = _load_pipeline_recovery_candidates(
                     session,
                     market_dates=[eod_row.trade_date],
@@ -849,7 +919,18 @@ def load_oldest_outstanding_auto_eod_recovery_date(
                         pipeline_run=latest_recovery,
                     )
                 ):
-                    return eod_row.trade_date.isoformat()
+                    return AutoEODRecoveryTarget(
+                        trade_date=eod_row.trade_date.isoformat(),
+                        eod_run_id=eod_row.id,
+                    )
+                continue
+
+            # The runtime cannot resume a primary pipeline from generic stage
+            # rows once its only durable EOD authority is price retry scope and
+            # that budget is exhausted. Treating those rows as fresh recovery
+            # authority would repeatedly select this date while the runtime
+            # returns ``auto_retry_limit_reached``, starving newer dates.
+            if price_recovery_exhausted:
                 continue
 
             linked_pipeline = next(
@@ -914,8 +995,25 @@ def load_oldest_outstanding_auto_eod_recovery_date(
                 )
                 < _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
             ):
-                return eod_row.trade_date.isoformat()
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
     return None
+
+
+def load_oldest_outstanding_auto_eod_recovery_date(
+    *,
+    on_or_after: str | date,
+    on_or_before: str | date,
+) -> str | None:
+    """Backward-compatible date-only view of the automatic recovery target."""
+
+    target = load_oldest_outstanding_auto_eod_recovery_target(
+        on_or_after=on_or_after,
+        on_or_before=on_or_before,
+    )
+    return target.trade_date if target is not None else None
 
 
 def count_eod_collection_runs(

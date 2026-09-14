@@ -4,11 +4,15 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.core.settings import settings
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.market.clock import KST, async_get_market_state
+from app.market.session import async_previous_krx_trading_date
+from app.repositories.eod_run_repository import (
+    load_oldest_outstanding_auto_eod_recovery_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +21,7 @@ _INCOMPLETE_UNIVERSE_ERROR_PREFIX = (
 )
 _INCOMPLETE_UNIVERSE_RETRY_BASE_MINUTES = 30
 _INCOMPLETE_UNIVERSE_RETRY_MAX_MINUTES = 240
+_RECOVERY_WINDOW_SESSION_COUNT = 5
 
 
 def _utcnow() -> str:
@@ -41,6 +46,14 @@ def _scheduled_pipeline_result_status(result: dict) -> str:
         'abandoned',
     }:
         return normalized_status
+    existing_run = result.get('existing_run')
+    if (
+        result.get('reason') == 'already_completed'
+        and isinstance(existing_run, dict)
+        and str(existing_run.get('status') or '').strip().lower()
+        == 'completed'
+    ):
+        return 'completed'
     return 'completed' if result.get('triggered') else 'skipped'
 
 
@@ -49,6 +62,19 @@ def _parse_markets(raw: str | None) -> tuple[str, ...]:
         return DEFAULT_MARKETS
     markets = tuple(item.strip().upper() for item in raw.split(',') if item.strip())
     return markets or DEFAULT_MARKETS
+
+
+async def _oldest_recovery_window_date(latest_session_date: str) -> str:
+    oldest_session_date = date.fromisoformat(latest_session_date)
+    for _ in range(_RECOVERY_WINDOW_SESSION_COUNT - 1):
+        previous_session_date = await async_previous_krx_trading_date(
+            oldest_session_date,
+            allow_fallback=True,
+        )
+        if previous_session_date is None:
+            break
+        oldest_session_date = previous_session_date
+    return oldest_session_date.isoformat()
 
 
 @dataclass
@@ -117,14 +143,8 @@ class AutoPykrxEODScheduler:
         market = await async_get_market_state()
         self._state.last_checked_at = _utcnow()
         self._state.last_market_state = market.state
-
-        if market.state == 'CLOSED':
-            target_market_date = market.server_time[:10]
-        elif market.state in {'WEEKEND', 'HOLIDAY'}:
-            target_market_date = market.latest_valid_trading_date
-        else:
-            target_market_date = None
-        self._state.last_market_date = target_market_date or market.server_time[:10]
+        current_market_date = market.server_time[:10]
+        self._state.last_market_date = current_market_date
 
         if not settings.eod_auto_pykrx_enabled:
             self._state.last_status = 'disabled'
@@ -146,6 +166,41 @@ class AutoPykrxEODScheduler:
             self._task = None
             self._state.active_task = False
 
+        try:
+            recovery_window_latest_date = (
+                current_market_date
+                if market.is_trading_day
+                else market.latest_valid_trading_date or current_market_date
+            )
+            recovery_window_start_date = await _oldest_recovery_window_date(
+                recovery_window_latest_date
+            )
+            recovery_target = await asyncio.to_thread(
+                load_oldest_outstanding_auto_eod_recovery_target,
+                on_or_after=recovery_window_start_date,
+                on_or_before=current_market_date,
+            )
+        except Exception as exc:
+            logger.exception('Could not inspect automatic EOD recovery state: %s', exc)
+            self._state.last_status = 'blocked'
+            self._state.last_reason = 'recovery_state_unavailable'
+            return
+
+        recovery_market_date = (
+            recovery_target.trade_date
+            if recovery_target is not None
+            else None
+        )
+        if recovery_market_date is not None:
+            target_market_date = recovery_market_date
+        elif market.state == 'CLOSED':
+            target_market_date = current_market_date
+        elif market.state in {'WEEKEND', 'HOLIDAY'}:
+            target_market_date = market.latest_valid_trading_date
+        else:
+            target_market_date = None
+        self._state.last_market_date = target_market_date or current_market_date
+
         configured_markets = _parse_markets(settings.eod_auto_pykrx_markets)
         same_preflight_failure = (
             self._state.preflight_failure_market_date == target_market_date
@@ -162,7 +217,7 @@ class AutoPykrxEODScheduler:
         if self._state.preflight_failure_market_date is not None and not same_preflight_failure:
             self._clear_preflight_backoff()
 
-        if market.state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
+        if recovery_market_date is None and market.state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
             self._state.last_status = 'idle'
             self._state.last_reason = f'market_not_closed:{market.state}'
             return
@@ -172,12 +227,12 @@ class AutoPykrxEODScheduler:
             self._state.last_reason = 'missing_latest_valid_trading_date'
             return
 
-        if market.state == 'CLOSED' and not market.session_close_at:
+        if recovery_market_date is None and market.state == 'CLOSED' and not market.session_close_at:
             self._state.last_status = 'idle'
             self._state.last_reason = 'missing_session_close'
             return
 
-        if market.state == 'CLOSED':
+        if recovery_market_date is None and market.state == 'CLOSED':
             close_at = datetime.fromisoformat(market.session_close_at)
             eligible_at = close_at + timedelta(
                 minutes=settings.eod_auto_pykrx_after_close_minutes
@@ -190,11 +245,25 @@ class AutoPykrxEODScheduler:
         self._state.active_task = True
         self._state.last_started_at = _utcnow()
         self._state.last_status = 'running'
-        self._state.last_reason = 'scheduled'
+        self._state.last_reason = (
+            'scheduled_recovery' if recovery_market_date is not None else 'scheduled'
+        )
         self._task = asyncio.create_task(
             self._run_scheduled_daily_pipeline(
                 target_market_date,
                 markets=configured_markets,
+                **(
+                    {'point_in_time_recovery': True}
+                    if recovery_market_date is not None
+                    and date.fromisoformat(target_market_date)
+                    < date.fromisoformat(current_market_date)
+                    else {}
+                ),
+                **(
+                    {'recovery_eod_run_id': recovery_target.eod_run_id}
+                    if recovery_target is not None
+                    else {}
+                ),
             ),
             name='auto-pykrx-eod',
         )
@@ -204,15 +273,24 @@ class AutoPykrxEODScheduler:
         market_date: str,
         *,
         markets: tuple[str, ...] | None = None,
+        point_in_time_recovery: bool = False,
+        recovery_eod_run_id: int | None = None,
     ) -> None:
         resolved_markets = markets or _parse_markets(settings.eod_auto_pykrx_markets)
         try:
+            run_kwargs = {
+                'market_date': market_date,
+                'markets': resolved_markets,
+                'trigger': 'auto_close_scheduler',
+                'refresh_universe': settings.eod_auto_pykrx_refresh_universe,
+            }
+            if point_in_time_recovery:
+                run_kwargs['point_in_time_recovery'] = True
+            if recovery_eod_run_id is not None:
+                run_kwargs['recovery_eod_run_id'] = recovery_eod_run_id
             result = await asyncio.to_thread(
                 PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due,
-                market_date=market_date,
-                markets=resolved_markets,
-                trigger='auto_close_scheduler',
-                refresh_universe=settings.eod_auto_pykrx_refresh_universe,
+                **run_kwargs,
             )
             self._clear_preflight_backoff()
             self._state.last_result = result

@@ -10,14 +10,17 @@ from sqlalchemy.orm import sessionmaker
 from app.db import engine, session_scope
 from app.db_models import DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun
 from app.repositories.eod_run_repository import (
+    AutoEODRecoveryTarget,
     advisory_eod_collection_lock,
     complete_eod_collection_run,
     count_eod_run_persisted_symbols,
     create_eod_collection_run,
     eod_collection_advisory_lock_keys,
     list_eod_collection_runs,
+    load_exact_automatic_daily_eod_collection_run,
     load_most_complete_eod_collection_run,
     load_oldest_outstanding_auto_eod_recovery_date,
+    load_oldest_outstanding_auto_eod_recovery_target,
 )
 
 
@@ -372,6 +375,166 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
         self.assertEqual(historical_result, '2026-09-09')
         self.assertEqual(legacy_result, '2026-09-10')
 
+    def test_recovery_target_preserves_selected_automatic_eod_run_id(
+        self,
+    ) -> None:
+        started_at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+        with self.session_factory.begin() as session:
+            automatic_run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 9, 11),
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed_with_errors',
+                symbols_total=2,
+                symbols_succeeded=1,
+                symbols_failed=1,
+                started_at=started_at,
+                run_metadata={'mode': 'daily_auto'},
+            )
+            session.add(automatic_run)
+            session.flush()
+            automatic_run_id = automatic_run.id
+            session.add(
+                EODCollectionRun(
+                    market='KRX',
+                    trade_date=date(2026, 9, 11),
+                    source='pykrx',
+                    trigger='manual_api',
+                    status='completed',
+                    symbols_total=2,
+                    symbols_succeeded=2,
+                    symbols_failed=0,
+                    started_at=started_at + timedelta(minutes=1),
+                    run_metadata={'mode': 'manual'},
+                )
+            )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after='2026-09-11',
+                on_or_before='2026-09-14',
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date='2026-09-11',
+                eod_run_id=automatic_run_id,
+            ),
+        )
+
+    def test_exact_automatic_loader_ignores_newer_manual_and_historical_rows(
+        self,
+    ) -> None:
+        started_at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+        with self.session_factory.begin() as session:
+            automatic_run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 9, 11),
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed_with_errors',
+                symbols_total=2,
+                symbols_succeeded=1,
+                symbols_failed=1,
+                started_at=started_at,
+                run_metadata={'mode': 'daily_auto'},
+            )
+            session.add(automatic_run)
+            session.flush()
+            automatic_run_id = automatic_run.id
+            session.add_all(
+                [
+                    EODCollectionRun(
+                        market='KRX',
+                        trade_date=date(2026, 9, 11),
+                        source='pykrx',
+                        trigger='manual_api',
+                        status='completed',
+                        symbols_total=2,
+                        symbols_succeeded=2,
+                        symbols_failed=0,
+                        started_at=started_at + timedelta(minutes=1),
+                        run_metadata={'mode': 'manual'},
+                    ),
+                    EODCollectionRun(
+                        market='KRX',
+                        trade_date=date(2026, 9, 11),
+                        source='pykrx',
+                        trigger='auto_close_scheduler',
+                        status='completed',
+                        symbols_total=2,
+                        symbols_succeeded=2,
+                        symbols_failed=0,
+                        started_at=started_at + timedelta(minutes=2),
+                        run_metadata={'mode': 'historical_backfill'},
+                    ),
+                ]
+            )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            loaded = load_exact_automatic_daily_eod_collection_run(
+                eod_run_id=automatic_run_id,
+                trade_date='2026-09-11',
+            )
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded['id'], automatic_run_id)
+        self.assertEqual(loaded['status'], 'completed_with_errors')
+
+    def test_exact_automatic_loader_rejects_superseded_automatic_target(
+        self,
+    ) -> None:
+        started_at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+        with self.session_factory.begin() as session:
+            selected_run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 9, 11),
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed_with_errors',
+                symbols_total=2,
+                symbols_succeeded=1,
+                symbols_failed=1,
+                started_at=started_at,
+                run_metadata={'mode': 'daily_auto'},
+            )
+            session.add(selected_run)
+            session.flush()
+            selected_run_id = selected_run.id
+            session.add(
+                EODCollectionRun(
+                    market='KRX',
+                    trade_date=date(2026, 9, 11),
+                    source='pykrx',
+                    trigger='auto_close_scheduler',
+                    status='completed',
+                    symbols_total=2,
+                    symbols_succeeded=2,
+                    symbols_failed=0,
+                    started_at=started_at + timedelta(minutes=1),
+                    run_metadata={'mode': 'daily_auto'},
+                )
+            )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            loaded = load_exact_automatic_daily_eod_collection_run(
+                eod_run_id=selected_run_id,
+                trade_date='2026-09-11',
+            )
+
+        self.assertIsNone(loaded)
+
     def test_bounded_candidate_lookup_avoids_json_materialization(self) -> None:
         with self.session_factory.begin() as session:
             session.add(
@@ -681,6 +844,70 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             )
 
         self.assertEqual(result, '2026-09-11')
+
+    def test_selects_running_fifth_auto_attempt_for_stale_reconciliation(
+        self,
+    ) -> None:
+        started_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+        with self.session_factory.begin() as session:
+            running_attempt = None
+            for attempt in range(5):
+                running_attempt = EODCollectionRun(
+                    market='KRX',
+                    trade_date=date(2026, 9, 10),
+                    source='pykrx',
+                    trigger='auto_close_scheduler',
+                    status='running' if attempt == 4 else 'failed',
+                    symbols_total=2,
+                    symbols_succeeded=1,
+                    symbols_failed=0 if attempt == 4 else 1,
+                    started_at=started_at + timedelta(minutes=attempt),
+                    run_metadata={
+                        'mode': 'daily_auto',
+                        'requested_symbols': ['005930', '000660'],
+                        'failed_symbols': (
+                            [] if attempt == 4 else ['000660']
+                        ),
+                    },
+                )
+                session.add(running_attempt)
+            session.flush()
+            running_attempt_id = running_attempt.id
+            session.add(
+                EODCollectionRun(
+                    market='KRX',
+                    trade_date=date(2026, 9, 11),
+                    source='pykrx',
+                    trigger='auto_close_scheduler',
+                    status='failed',
+                    symbols_total=2,
+                    symbols_succeeded=1,
+                    symbols_failed=1,
+                    started_at=started_at,
+                    run_metadata={
+                        'mode': 'daily_auto',
+                        'requested_symbols': ['005930', '000660'],
+                        'failed_symbols': ['000660'],
+                    },
+                )
+            )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after='2026-09-01',
+                on_or_before='2026-09-14',
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date='2026-09-10',
+                eod_run_id=running_attempt_id,
+            ),
+        )
 
     def test_skips_exhausted_followup_lineages_without_using_price_budget(
         self,
@@ -1110,7 +1337,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
         self.assertEqual(running_result, '2026-09-09')
         self.assertEqual(rejected_parent_result, '2026-09-14')
 
-    def test_exhausted_price_date_remains_eligible_for_incomplete_pipeline(
+    def test_exhausted_price_date_with_incomplete_primary_pipeline_does_not_starve_newer_date(
         self,
     ) -> None:
         started_at = datetime(2026, 9, 14, tzinfo=timezone.utc)
@@ -1160,6 +1387,24 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                     started_at=started_at + timedelta(minutes=5),
                 )
             )
+            session.add(
+                EODCollectionRun(
+                    market='KRX',
+                    trade_date=date(2026, 9, 12),
+                    source='pykrx',
+                    trigger='auto_close_scheduler',
+                    status='failed',
+                    symbols_total=2,
+                    symbols_succeeded=1,
+                    symbols_failed=1,
+                    started_at=started_at + timedelta(minutes=6),
+                    run_metadata={
+                        'mode': 'daily_auto',
+                        'requested_symbols': ['005930', '000660'],
+                        'failed_symbols': ['000660'],
+                    },
+                )
+            )
 
         with patch(
             'app.repositories.eod_run_repository.session_scope',
@@ -1170,9 +1415,9 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 on_or_before='2026-09-14',
             )
 
-        self.assertEqual(result, '2026-09-11')
+        self.assertEqual(result, '2026-09-12')
 
-    def test_exhausted_price_date_remains_eligible_with_non_price_metadata_checkpoint(
+    def test_exhausted_price_date_ignores_primary_non_price_metadata_checkpoint(
         self,
     ) -> None:
         started_at = datetime(2026, 9, 14, tzinfo=timezone.utc)
@@ -1227,7 +1472,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 on_or_before='2026-09-14',
             )
 
-        self.assertEqual(result, '2026-09-11')
+        self.assertIsNone(result)
 
 
 class AdvisoryEODCollectionLockTests(unittest.TestCase):

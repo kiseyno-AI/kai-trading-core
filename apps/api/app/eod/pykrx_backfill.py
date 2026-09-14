@@ -3,18 +3,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
+from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.master import get_master_symbols
+from app.eod.market_membership import (
+    build_market_membership_snapshot,
+    validate_market_membership_snapshot,
+)
 from app.eod.pykrx_pipeline_support import (
     build_daily_retry_context,
     build_daily_skip_result,
@@ -28,7 +34,9 @@ from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
     AUTO_DAILY_TRACKED_STAGE_ORDER,
     HISTORICAL_BACKFILL_STAGE_ORDER,
+    POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS,
     PykrxPipelineDependencies,
+    resolve_point_in_time_recovery,
     run_market_data_pipeline,
 )
 from app.market.session import latest_krx_trading_date
@@ -51,6 +59,9 @@ from app.market_data_store import (
     update_daily_price_bar_fundamentals,
     update_eod_collection_run_progress,
     upsert_symbol_universe,
+)
+from app.repositories.eod_run_repository import (
+    load_exact_automatic_daily_eod_collection_run,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,6 +91,7 @@ _PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
 MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
+AUTO_PYKRX_DAILY_RETRY_MIN_INTERVAL_SECONDS = 5 * 60
 MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE = 5
 AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
 AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
@@ -106,6 +118,37 @@ class PykrxSymbol:
     market: str
     name_ko: str
     standard_code: str | None = None
+
+
+class PointInTimeRetrySymbols(list[PykrxSymbol]):
+    """Retry subset carrying the full exact-date membership proof."""
+
+    def __init__(
+        self,
+        symbols: Sequence[PykrxSymbol],
+        *,
+        universe_snapshot: dict[str, Any],
+    ) -> None:
+        super().__init__(symbols)
+        self.universe_snapshot = universe_snapshot
+
+
+class PointInTimeRetryCodes(list[str]):
+    """Missing-symbol codes carrying the full exact-date membership proof."""
+
+    def __init__(
+        self,
+        symbols: Sequence[str],
+        *,
+        universe_snapshot: dict[str, Any],
+        unexpected_persisted_symbols: Sequence[str] = (),
+    ) -> None:
+        super().__init__(symbols)
+        self.universe_snapshot = universe_snapshot
+        self.unexpected_persisted_symbols = _dedupe_symbol_codes(
+            unexpected_persisted_symbols
+        )
+        self.coverage_mismatch = bool(self.unexpected_persisted_symbols)
 
 
 def _normalize_yyyymmdd(value: str | None, *, default: str | None = None) -> str:
@@ -223,6 +266,180 @@ def _dedupe_symbol_codes(symbols: Sequence[object]) -> list[str]:
             normalized = normalized.zfill(6)
         deduped.setdefault(normalized, None)
     return list(deduped.keys())
+
+
+def _point_in_time_source_markets(
+    metadata: Mapping[str, Any],
+    *,
+    fallback: Sequence[str],
+) -> tuple[str, ...]:
+    raw_markets = metadata.get('markets')
+    universe_snapshot = (
+        metadata.get('universe_snapshot')
+        if isinstance(metadata.get('universe_snapshot'), Mapping)
+        else {}
+    )
+    if not isinstance(raw_markets, (list, tuple)):
+        raw_markets = universe_snapshot.get('markets')
+    if not isinstance(raw_markets, (list, tuple)):
+        membership = universe_snapshot.get('market_membership')
+        membership_markets = (
+            membership.get('markets')
+            if isinstance(membership, Mapping)
+            and isinstance(membership.get('markets'), Mapping)
+            else {}
+        )
+        raw_markets = list(membership_markets)
+    normalized = tuple(
+        dict.fromkeys(
+            str(item).strip().upper()
+            for item in raw_markets or []
+            if str(item).strip()
+        )
+    )
+    return normalized or tuple(fallback)
+
+
+def _validated_point_in_time_membership_symbols(
+    metadata: Mapping[str, Any],
+    *,
+    markets: Sequence[str],
+    expected_market_date: str,
+) -> set[str] | None:
+    source_markets = _point_in_time_source_markets(
+        metadata,
+        fallback=markets,
+    )
+    universe_snapshot = (
+        metadata.get('universe_snapshot')
+        if isinstance(metadata.get('universe_snapshot'), Mapping)
+        else {}
+    )
+    validated = _validate_point_in_time_universe_snapshot(
+        universe_snapshot,
+        markets=source_markets,
+        expected_market_date=expected_market_date,
+    )
+    if validated is None:
+        return None
+    membership_symbols = {
+        symbol
+        for market_symbols in validated.values()
+        for symbol in market_symbols
+    }
+    admitted_scope = _dedupe_symbol_codes(
+        [
+            *(metadata.get('requested_symbols') or []),
+            *(metadata.get('failed_symbols') or []),
+            *(metadata.get('unattempted_symbols') or []),
+            *(metadata.get('downstream_retry_symbols') or []),
+            *(metadata.get('inherited_downstream_retry_symbols') or []),
+        ]
+    )
+    if admitted_scope and not set(admitted_scope).issubset(
+        membership_symbols
+    ):
+        return None
+    return membership_symbols
+
+
+def _validate_point_in_time_universe_snapshot(
+    universe_snapshot: Mapping[str, Any],
+    *,
+    markets: Sequence[str],
+    expected_market_date: str,
+) -> dict[str, list[str]] | None:
+    try:
+        expected_date = _normalize_yyyymmdd(expected_market_date)
+        snapshot_date = _normalize_yyyymmdd(
+            str(universe_snapshot.get('latest_trade_date') or '')
+        )
+    except ValueError:
+        return None
+    if (
+        snapshot_date != expected_date
+        or universe_snapshot.get('point_in_time') is not True
+        or str(universe_snapshot.get('source') or '').strip().lower()
+        != 'pykrx'
+        or str(
+            universe_snapshot.get('membership_basis') or ''
+        ).strip()
+        != 'end_date_snapshot'
+    ):
+        return None
+    membership = universe_snapshot.get('market_membership')
+    raw_membership_markets = (
+        membership.get('markets')
+        if isinstance(membership, Mapping)
+        and isinstance(membership.get('markets'), Mapping)
+        else {}
+    )
+    membership_symbols = _dedupe_symbol_codes(
+        [
+            symbol
+            for entry in raw_membership_markets.values()
+            if isinstance(entry, Mapping)
+            for symbol in (entry.get('symbols') or [])
+        ]
+    )
+    return validate_market_membership_snapshot(
+        membership,
+        requested_symbols=membership_symbols,
+        markets=markets,
+    )
+
+
+def _build_point_in_time_universe_snapshot(
+    provider_snapshot: Mapping[str, Any],
+    *,
+    markets: Sequence[str],
+    expected_market_date: str,
+) -> dict[str, Any] | None:
+    try:
+        snapshot_date = _normalize_yyyymmdd(
+            str(provider_snapshot.get('latest_trade_date') or '')
+        )
+        expected_date = _normalize_yyyymmdd(expected_market_date)
+    except ValueError:
+        return None
+    if (
+        not provider_snapshot.get('complete', True)
+        or snapshot_date != expected_date
+    ):
+        return None
+    symbols = list(provider_snapshot.get('symbols') or [])
+    try:
+        membership = build_market_membership_snapshot(
+            symbols=symbols,
+            markets=markets,
+        )
+    except ValueError:
+        return None
+    membership['symbol_metadata'] = [
+        {
+            'symbol': item.symbol,
+            'market': item.market,
+            'name_ko': item.name_ko,
+            'standard_code': item.standard_code,
+        }
+        for item in symbols
+    ]
+    return {
+        'source': 'pykrx',
+        'markets': list(markets),
+        'symbol_count': len(symbols),
+        'persisted_count': 0,
+        'latest_trade_date': _normalize_iso_date(expected_date),
+        'universe_source': provider_snapshot.get(
+            'universe_source', 'pykrx_market_ohlcv'
+        ),
+        'membership_basis': 'end_date_snapshot',
+        'complete': True,
+        'deactivate_missing': False,
+        'point_in_time': True,
+        'current_universe_mutated': False,
+        'market_membership': membership,
+    }
 
 
 def _utcnow_iso() -> str:
@@ -781,6 +998,581 @@ class PykrxBackfillService:
             chain_fundamentals_followup=False,
         )
 
+    @staticmethod
+    def _pipeline_run_matches_eod_run(
+        *,
+        pipeline_run: Mapping[str, Any],
+        eod_run: Mapping[str, Any],
+    ) -> bool:
+        try:
+            eod_run_id = int(eod_run['id'])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        pipeline_metadata = (
+            pipeline_run.get('run_metadata')
+            if isinstance(pipeline_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        explicit_eod_ids: list[int] = []
+        for key in (
+            'eod_collection_run_id',
+            'reused_eod_collection_run_id',
+        ):
+            raw_value = pipeline_metadata.get(key)
+            if raw_value is None:
+                continue
+            try:
+                explicit_eod_ids.append(int(raw_value))
+            except (TypeError, ValueError):
+                return False
+
+        stages = (
+            pipeline_run.get('stages')
+            if isinstance(pipeline_run.get('stages'), Mapping)
+            else {}
+        )
+        for raw_stage in stages.values():
+            if not isinstance(raw_stage, Mapping):
+                continue
+            source_run_ids = raw_stage.get('source_run_ids')
+            if not isinstance(source_run_ids, Mapping):
+                continue
+            raw_value = source_run_ids.get('eod_run_id')
+            if raw_value is None:
+                continue
+            try:
+                explicit_eod_ids.append(int(raw_value))
+            except (TypeError, ValueError):
+                return False
+
+        if explicit_eod_ids:
+            return set(explicit_eod_ids) == {eod_run_id}
+
+        eod_metadata = (
+            eod_run.get('run_metadata')
+            if isinstance(eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        raw_pipeline_run_id = eod_metadata.get('daily_pipeline_run_id')
+        if raw_pipeline_run_id is None:
+            return False
+        try:
+            return int(raw_pipeline_run_id) == int(pipeline_run['id'])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _build_untracked_followup_recovery_parent(
+        *,
+        latest_eod_run: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata = (
+            latest_eod_run.get('run_metadata')
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        stage_progress = (
+            metadata.get('stage_progress')
+            if isinstance(metadata.get('stage_progress'), Mapping)
+            else {}
+        )
+        all_resumable_stages = tuple(
+            stage_id
+            for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+            if stage_id != 'price_collection'
+        )
+        expected_stage_ids = {
+            str(raw_stage_id).strip()
+            for raw_stage_id in (
+                metadata.get('expected_daily_pipeline_stages') or []
+            )
+        }
+        expected_stages = tuple(
+            stage_id
+            for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+            if stage_id != 'price_collection'
+            and stage_id in expected_stage_ids
+        )
+        resumable_stage_order = expected_stages or all_resumable_stages
+        has_downstream_scope = bool(
+            _dedupe_symbol_codes(
+                metadata.get('downstream_retry_symbols') or []
+            )
+        )
+        incomplete_indexes = [
+            index
+            for index, stage_id in enumerate(resumable_stage_order)
+            if (
+                expected_stages
+                or isinstance(stage_progress.get(stage_id), Mapping)
+            )
+            and not daily_pipeline_outcome_is_satisfied(
+                stage_progress.get(stage_id)
+                if isinstance(stage_progress.get(stage_id), Mapping)
+                else {}
+            )
+        ]
+        if has_downstream_scope:
+            durable_resume_stage = str(
+                metadata.get('downstream_retry_resume_from_stage') or ''
+            ).strip()
+            if durable_resume_stage not in resumable_stage_order:
+                durable_resume_stage = next(
+                    (
+                        stage_id
+                        for stage_id in (
+                            'pykrx_enrichment',
+                            'technical_snapshots',
+                        )
+                        if stage_id in resumable_stage_order
+                    ),
+                    resumable_stage_order[0],
+                )
+            resume_index = resumable_stage_order.index(
+                durable_resume_stage
+            )
+        elif not incomplete_indexes:
+            resume_index = (
+                resumable_stage_order.index('technical_snapshots')
+                if 'technical_snapshots' in resumable_stage_order
+                else 0
+            )
+        else:
+            resume_index = min(incomplete_indexes)
+        resolved_stages = list(resumable_stage_order[resume_index:])
+        resume_stage = resolved_stages[0]
+        stages: dict[str, dict[str, Any]] = {}
+        for stage_id in resolved_stages:
+            raw_progress = stage_progress.get(stage_id)
+            stage_status = (
+                str(raw_progress.get('status') or '').strip().lower()
+                if isinstance(raw_progress, Mapping)
+                else 'pending'
+            )
+            stages[stage_id] = {
+                'status': (
+                    'interrupted'
+                    if stage_id == resume_stage
+                    else stage_status or 'pending'
+                )
+            }
+        return {
+            'id': None,
+            'trigger': str(
+                latest_eod_run.get('trigger') or 'auto_close_scheduler'
+            ),
+            'status': 'interrupted',
+            'run_metadata': {
+                'resolved_stages': resolved_stages,
+                'synthetic_recovery_parent': True,
+                'reused_eod_collection_run_id': latest_eod_run.get('id'),
+            },
+            'stages': stages,
+        }
+
+    def _resolve_point_in_time_followup_membership(
+        self,
+        *,
+        market_date: str,
+        metadata: Mapping[str, Any],
+        markets: Sequence[str],
+    ) -> tuple[set[str] | None, tuple[str, ...]]:
+        """Return exact-date membership, refetching only from PyKRX if needed."""
+
+        source_markets = _point_in_time_source_markets(
+            metadata,
+            fallback=markets,
+        )
+        membership_symbols = _validated_point_in_time_membership_symbols(
+            metadata,
+            markets=source_markets,
+            expected_market_date=market_date,
+        )
+        if membership_symbols:
+            return membership_symbols, source_markets
+
+        try:
+            provider_snapshot = self.fetch_recent_universe_snapshot(
+                markets=source_markets,
+                limit=None,
+                end_date=market_date.replace('-', ''),
+                allow_master_fallback=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Unable to refetch exact-date PyKRX membership for %s: %s',
+                market_date,
+                exc,
+            )
+            return None, source_markets
+
+        universe_snapshot = _build_point_in_time_universe_snapshot(
+            provider_snapshot,
+            markets=source_markets,
+            expected_market_date=market_date,
+        )
+        if universe_snapshot is None:
+            return None, source_markets
+        refetched_metadata = {
+            **dict(metadata),
+            'markets': list(source_markets),
+            'universe_snapshot': universe_snapshot,
+        }
+        return (
+            _validated_point_in_time_membership_symbols(
+                refetched_metadata,
+                markets=source_markets,
+                expected_market_date=market_date,
+            ),
+            source_markets,
+        )
+
+    @staticmethod
+    def _record_failed_followup_scope_attempt(
+        *,
+        market_date: str,
+        latest_available_trade_date: str,
+        latest_eod_run: Mapping[str, Any],
+        markets: Sequence[str],
+        recovery_stages: Sequence[str],
+        resume_from_stage: str,
+        recovery_attempts: int,
+        requested_symbols: Sequence[str],
+        point_in_time_recovery: bool,
+        failure_reason: str,
+    ) -> dict[str, Any]:
+        """Persist a bounded attempt when follow-up scope is unprovable."""
+
+        error_message = (
+            'Exact-date PyKRX membership could not prove the follow-up '
+            'symbol scope.'
+        )
+        started_run = daily_pipeline_run_state_service.start_run(
+            market_date=market_date,
+            trigger=AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            requested_stages=list(recovery_stages),
+            resolved_stages=list(recovery_stages),
+            run_metadata={
+                'entrypoint': AUTO_EOD_PIPELINE_ENTRYPOINT,
+                'reused_eod_collection_run_id': int(latest_eod_run['id']),
+                'point_in_time_recovery': point_in_time_recovery,
+                'resume_from_stage': resume_from_stage,
+                'markets': list(markets),
+                'requested_symbols': _dedupe_symbol_codes(
+                    requested_symbols
+                ),
+                'failure_reason': failure_reason,
+            },
+        )
+        if started_run.get('deduplicated'):
+            result = build_daily_skip_result(
+                reason='followup_recovery_already_running',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'pipeline_run_id': started_run.get('id'),
+                'resume_from_stage': resume_from_stage,
+                'deduplicated': True,
+            }
+            return result
+
+        pipeline_run_id = int(started_run['id'])
+        daily_pipeline_run_state_service.finish_run(
+            pipeline_run_id=pipeline_run_id,
+            status='failed',
+            error_message=error_message,
+            run_metadata={'failure_reason': failure_reason},
+        )
+        result = build_daily_skip_result(
+            reason=failure_reason,
+            market_date=market_date,
+            latest_available_trade_date=latest_available_trade_date,
+            existing_run=latest_eod_run,
+        )
+        result.update(
+            {
+                'triggered': True,
+                'status': 'failed',
+                'reason': failure_reason,
+            }
+        )
+        result['followup_recovery'] = {
+            'status': 'failed',
+            'reason': 'invalid_or_missing_price_scope',
+            'attempt': recovery_attempts + 1,
+            'max_attempts': MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE,
+            'pipeline_run_id': pipeline_run_id,
+            'reused_eod_collection_run_id': latest_eod_run.get('id'),
+            'resume_from_stage': resume_from_stage,
+            'stages': list(recovery_stages),
+            'requested_symbols': _dedupe_symbol_codes(requested_symbols),
+        }
+        return result
+
+    @staticmethod
+    def _converge_point_in_time_price_complete_run(
+        *,
+        latest_eod_run: Mapping[str, Any],
+        market_date: str,
+        markets: Sequence[str],
+        universe_snapshot: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Finalize a legacy failed row whose exact admitted prices all exist."""
+
+        metadata = (
+            dict(latest_eod_run.get('run_metadata') or {})
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        evidence_metadata = {
+            **metadata,
+            'universe_snapshot': dict(universe_snapshot),
+        }
+        source_markets = _point_in_time_source_markets(
+            evidence_metadata,
+            fallback=markets,
+        )
+        validated = _validate_point_in_time_universe_snapshot(
+            universe_snapshot,
+            markets=source_markets,
+            expected_market_date=market_date,
+        )
+        if validated is None:
+            return None
+        membership_symbols = {
+            symbol
+            for market_symbols in validated.values()
+            for symbol in market_symbols
+        }
+        persisted_symbols = set(
+            load_eod_run_persisted_symbols(
+                int(latest_eod_run['id']),
+                trade_date=market_date,
+            )
+        )
+        if not membership_symbols or persisted_symbols != membership_symbols:
+            return None
+
+        completed_at = _utcnow_iso()
+        metadata.update(
+            {
+                'markets': list(source_markets),
+                'requested_symbols': sorted(membership_symbols),
+                'failed_symbols': [],
+                'failed_symbols_count': 0,
+                'unattempted_symbols': [],
+                'unattempted_symbols_count': 0,
+                'universe_snapshot': dict(universe_snapshot),
+                'point_in_time_recovery': True,
+                'collection_coverage_checked_at': completed_at,
+                'collection_persisted_symbols_count': len(
+                    persisted_symbols
+                ),
+                'collection_expected_symbols_count': len(
+                    membership_symbols
+                ),
+                'collection_coverage_inconsistent': False,
+                'unexpected_persisted_symbols': [],
+                'unexpected_persisted_symbols_count': 0,
+                'resumable': False,
+            }
+        )
+        complete_eod_collection_run(
+            int(latest_eod_run['id']),
+            status='completed',
+            symbols_succeeded=len(membership_symbols),
+            symbols_failed=0,
+            error_message=None,
+            run_metadata=metadata,
+        )
+        return {
+            **dict(latest_eod_run),
+            'status': 'completed',
+            'symbols_total': len(membership_symbols),
+            'symbols_succeeded': len(membership_symbols),
+            'symbols_failed': 0,
+            'error_message': None,
+            'run_metadata': metadata,
+        }
+
+    def _preflight_untracked_followup_price_scope(
+        self,
+        *,
+        market_date: str,
+        latest_available_trade_date: str,
+        latest_eod_run: Mapping[str, Any],
+        markets: Sequence[str],
+    ) -> dict[str, Any]:
+        """Fence orphan downstream recovery behind exact EOD price identity."""
+
+        metadata = (
+            dict(latest_eod_run.get('run_metadata') or {})
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        requested_symbols = _dedupe_symbol_codes(
+            metadata.get('requested_symbols') or []
+        )
+        run_id = int(latest_eod_run['id'])
+        persisted_count = count_eod_run_persisted_symbols(
+            run_id,
+            trade_date=market_date,
+        )
+        persisted_symbols = set(
+            load_eod_run_persisted_symbols(
+                run_id,
+                trade_date=market_date,
+            )
+        )
+        source_markets = _point_in_time_source_markets(
+            metadata,
+            fallback=markets,
+        )
+        if not requested_symbols:
+            membership_symbols, source_markets = (
+                self._resolve_point_in_time_followup_membership(
+                    market_date=market_date,
+                    metadata=metadata,
+                    markets=source_markets,
+                )
+            )
+            if not membership_symbols:
+                return {
+                    'verified': False,
+                    'symbols': [],
+                    'scope_unavailable': True,
+                    'markets': source_markets,
+                }
+            requested_symbols = sorted(membership_symbols)
+        requested_set = set(requested_symbols)
+        missing_symbols = [
+            symbol
+            for symbol in requested_symbols
+            if symbol not in persisted_symbols
+        ]
+        unexpected_symbols = sorted(persisted_symbols - requested_set)
+        symbols_total = max(
+            int(latest_eod_run.get('symbols_total') or 0),
+            0,
+        )
+        if (
+            persisted_count >= symbols_total == len(requested_symbols)
+            and not missing_symbols
+        ):
+            downstream_symbols = _dedupe_symbol_codes(
+                metadata.get('downstream_retry_symbols') or []
+            )
+            inherited_only_symbols = set(downstream_symbols) - requested_set
+            if inherited_only_symbols:
+                membership_symbols, source_markets = (
+                    self._resolve_point_in_time_followup_membership(
+                        market_date=market_date,
+                        metadata=metadata,
+                        markets=source_markets,
+                    )
+                )
+                try:
+                    exact_price_symbols = set(
+                        list_symbols_with_daily_bars_in_range(
+                            start_date=market_date,
+                            end_date=market_date,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        'Unable to verify exact-date price scope for %s: %s',
+                        market_date,
+                        exc,
+                    )
+                    exact_price_symbols = set()
+                downstream_set = set(downstream_symbols)
+                if (
+                    not membership_symbols
+                    or not downstream_set.issubset(membership_symbols)
+                    or not downstream_set.issubset(exact_price_symbols)
+                ):
+                    return {
+                        'verified': False,
+                        'symbols': [],
+                        'scope_unavailable': True,
+                        'markets': source_markets,
+                        'requested_symbols': downstream_symbols,
+                    }
+            # Extra rows are a collection-integrity defect, but they cannot
+            # leak into recovery when every admitted symbol is present and
+            # the downstream run is explicitly bound to that admitted set.
+            return {
+                'verified': True,
+                'symbols': requested_symbols,
+                'downstream_symbols': downstream_symbols,
+                'unexpected_symbols': unexpected_symbols,
+            }
+
+        covered_count = min(
+            len(requested_set & persisted_symbols),
+            symbols_total,
+        )
+        failed_count = max(symbols_total - covered_count, 0)
+        checked_at = _utcnow_iso()
+        metadata.update(
+            {
+                'failed_symbols': missing_symbols,
+                'failed_symbols_count': len(missing_symbols),
+                'unexpected_persisted_symbols': unexpected_symbols,
+                'unexpected_persisted_symbols_count': len(
+                    unexpected_symbols
+                ),
+                'collection_coverage_inconsistent': True,
+                'collection_coverage_checked_at': checked_at,
+                'collection_persisted_symbols_count': persisted_count,
+                'collection_expected_symbols_count': symbols_total,
+                'resumable': bool(failed_count or missing_symbols),
+            }
+        )
+        error_message = (
+            'Persisted price identity does not match the admitted EOD scope '
+            'before follow-up recovery.'
+        )
+        complete_eod_collection_run(
+            run_id,
+            status='completed_with_errors',
+            symbols_succeeded=covered_count,
+            symbols_failed=failed_count,
+            error_message=error_message,
+            run_metadata=metadata,
+        )
+        result = build_daily_skip_result(
+            reason='followup_recovery_price_scope_inconsistent',
+            market_date=market_date,
+            latest_available_trade_date=latest_available_trade_date,
+            existing_run=latest_eod_run,
+        )
+        result.update(
+            {
+                'triggered': True,
+                'status': 'completed_with_errors',
+            }
+        )
+        result['followup_recovery'] = {
+            'status': 'blocked',
+            'reason': 'price_scope_inconsistent',
+            'symbols': [],
+            'state_convergence': {
+                'updated': True,
+                'status': 'completed_with_errors',
+                'price_retry_pending': bool(
+                    failed_count or missing_symbols
+                ),
+                'persisted_symbol_count': persisted_count,
+                'coverage_gap_count': failed_count,
+                'unexpected_symbol_count': len(unexpected_symbols),
+            },
+        }
+        return {'verified': False, 'symbols': [], 'result': result}
+
     def _resume_auto_daily_followups_if_due(
         self,
         *,
@@ -788,8 +1580,43 @@ class PykrxBackfillService:
         latest_available_trade_date: str,
         latest_eod_run: dict,
         markets: Sequence[str],
+        allow_safe_downstream_scope_with_price_failures: bool = False,
+        point_in_time_recovery: bool = False,
     ) -> dict | None:
         """Resume failed post-collection stages without downloading prices again."""
+
+        latest_eod_metadata = (
+            latest_eod_run.get('run_metadata')
+            if isinstance(latest_eod_run.get('run_metadata'), dict)
+            else {}
+        )
+        recovery_markets = (
+            _point_in_time_source_markets(
+                latest_eod_metadata,
+                fallback=markets,
+            )
+            if point_in_time_recovery
+            else tuple(markets)
+        )
+        point_in_time_membership_symbols = (
+            _validated_point_in_time_membership_symbols(
+                latest_eod_metadata,
+                markets=recovery_markets,
+                expected_market_date=market_date,
+            )
+            if point_in_time_recovery
+            else None
+        )
+        price_retry_symbols = set(
+            self._metadata_retry_symbol_codes(latest_eod_run)
+        )
+        downstream_retry_symbols = [
+            symbol
+            for symbol in _dedupe_symbol_codes(
+                latest_eod_metadata.get('downstream_retry_symbols') or []
+            )
+            if symbol not in price_retry_symbols
+        ]
 
         try:
             pipeline_run = daily_pipeline_run_state_service.get_latest_run_for_context(
@@ -811,8 +1638,23 @@ class PykrxBackfillService:
             }
             return result
 
+        if pipeline_run is not None and not self._pipeline_run_matches_eod_run(
+            pipeline_run=pipeline_run,
+            eod_run=latest_eod_run,
+        ):
+            logger.warning(
+                'Ignoring daily pipeline run %s as recovery evidence for '
+                'unrelated EOD run %s.',
+                pipeline_run.get('id'),
+                latest_eod_run.get('id'),
+            )
+            pipeline_run = None
+
+        untracked_followup_parent = pipeline_run is None
         if pipeline_run is None:
-            return None
+            pipeline_run = self._build_untracked_followup_recovery_parent(
+                latest_eod_run=latest_eod_run,
+            )
 
         run_metadata = (
             pipeline_run.get('run_metadata')
@@ -844,17 +1686,121 @@ class PykrxBackfillService:
         incomplete_stages = [
             stage_id
             for stage_id in recovery_scope
-            if str((stage_rows.get(stage_id) or {}).get('status') or '').strip().lower()
-            not in {'completed', 'skipped'}
+            if not daily_pipeline_outcome_is_satisfied(
+                stage_rows.get(stage_id)
+                if isinstance(stage_rows.get(stage_id), Mapping)
+                else {}
+            )
         ]
+        pipeline_status = str(pipeline_run.get('status') or '').strip().lower()
+        downstream_resume_from_stage = str(
+            latest_eod_metadata.get('downstream_retry_resume_from_stage') or ''
+        ).strip()
+        if downstream_resume_from_stage not in recovery_scope:
+            downstream_resume_from_stage = next(
+                (
+                    stage_id
+                    for stage_id in (
+                        'pykrx_enrichment',
+                        'technical_snapshots',
+                    )
+                    if stage_id in recovery_scope
+                ),
+                '',
+            )
+        if (
+            pipeline_run.get('trigger') != AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            and downstream_retry_symbols
+            and downstream_resume_from_stage in recovery_scope
+            and (
+                not incomplete_stages
+                or recovery_scope.index(downstream_resume_from_stage)
+                < recovery_scope.index(incomplete_stages[0])
+            )
+        ):
+            incomplete_stages.insert(0, downstream_resume_from_stage)
         if not incomplete_stages:
-            return None
+            eod_convergence: dict[str, Any] | None = None
+            if pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER:
+                eod_convergence = self._persist_successful_followup_recovery(
+                    latest_eod_run=latest_eod_run,
+                    recovery_result={
+                        # Every resolved recovery stage is terminally
+                        # completed/skipped. That persisted stage evidence is
+                        # stronger than a parent left interrupted between its
+                        # last finish_stage and finish_run commits.
+                        'status': 'completed',
+                        'pipeline_run_id': pipeline_run.get('id'),
+                        'pipeline_status': pipeline_status,
+                    },
+                )
+            elif downstream_retry_symbols:
+                # A primary parent is not terminal proof while an implicit
+                # downstream artifact scope remains durable. The technical
+                # resume branch above normally handles this; fail closed if
+                # that stage was not part of this run's resolved scope.
+                return None
+
+            pipeline_convergence = (
+                daily_pipeline_run_state_service.converge_terminal_stages_run(
+                    pipeline_run_id=int(pipeline_run['id']),
+                )
+            )
+            if not (
+                pipeline_convergence.get('updated')
+                or (
+                    eod_convergence is not None
+                    and eod_convergence.get('updated')
+                )
+            ):
+                return None
+
+            convergence = (
+                dict(eod_convergence)
+                if eod_convergence is not None
+                else {'updated': False, 'reason': 'not_applicable'}
+            )
+            convergence['pipeline_run'] = pipeline_convergence
+            result = build_daily_skip_result(
+                reason=(
+                    'followup_recovery_state_converged'
+                    if pipeline_run.get('trigger')
+                    == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+                    else 'daily_pipeline_state_converged'
+                ),
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'pipeline_run_id': pipeline_run.get('id'),
+                'state_convergence': convergence,
+            }
+            return result
+
+        resume_from_stage = incomplete_stages[0]
+        resume_index = recovery_scope.index(resume_from_stage)
+        recovery_stages = recovery_scope[resume_index:]
+        recovery_reaches_followup_stage = any(
+            stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
+            for stage_id in recovery_stages
+        )
+        recovering_safe_downstream_scope = bool(
+            allow_safe_downstream_scope_with_price_failures
+            and price_retry_symbols
+            and downstream_retry_symbols
+        )
+        if recovery_reaches_followup_stage and price_retry_symbols:
+            if not recovering_safe_downstream_scope:
+                return None
+
+        verified_orphan_symbols: list[str] = []
+        verified_downstream_symbols: list[str] = []
 
         now = datetime.now(timezone.utc)
         latest_activity_at = _parse_activity_datetime(
             pipeline_run.get('updated_at') or pipeline_run.get('started_at')
         )
-        pipeline_status = str(pipeline_run.get('status') or '').strip().lower()
         if pipeline_status == 'running':
             stale_after_seconds = max(
                 60,
@@ -877,6 +1823,7 @@ class PykrxBackfillService:
             recovery_attempts = daily_pipeline_run_state_service.count_runs(
                 market_date=market_date,
                 trigger=AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+                reused_eod_collection_run_id=int(latest_eod_run['id']),
             )
         except Exception as exc:  # pragma: no cover - defensive production guard
             logger.exception('Unable to count daily follow-up recovery attempts for %s', market_date)
@@ -935,9 +1882,87 @@ class PykrxBackfillService:
                 }
                 return result
 
-        resume_from_stage = incomplete_stages[0]
-        resume_index = recovery_scope.index(resume_from_stage)
-        recovery_stages = recovery_scope[resume_index:]
+        current_price_scope_preflight_required = bool(
+            not point_in_time_recovery
+            and not price_retry_symbols
+            and (
+                untracked_followup_parent
+                or pipeline_run.get('trigger')
+                == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            )
+        )
+        if current_price_scope_preflight_required:
+            price_scope_preflight = (
+                self._preflight_untracked_followup_price_scope(
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    latest_eod_run=latest_eod_run,
+                    markets=recovery_markets,
+                )
+            )
+            if price_scope_preflight.get('result') is not None:
+                return dict(price_scope_preflight['result'])
+            verified_orphan_symbols = list(
+                price_scope_preflight.get('symbols') or []
+            )
+            verified_downstream_symbols = list(
+                price_scope_preflight.get('downstream_symbols') or []
+            )
+            if price_scope_preflight.get('scope_unavailable'):
+                return self._record_failed_followup_scope_attempt(
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    latest_eod_run=latest_eod_run,
+                    markets=recovery_markets,
+                    recovery_stages=recovery_stages,
+                    resume_from_stage=resume_from_stage,
+                    recovery_attempts=recovery_attempts,
+                    requested_symbols=(
+                        price_scope_preflight.get('requested_symbols')
+                        or downstream_retry_symbols
+                    ),
+                    point_in_time_recovery=False,
+                    failure_reason=(
+                        'followup_recovery_price_scope_unavailable'
+                    ),
+                )
+
+        if point_in_time_recovery and not point_in_time_membership_symbols:
+            (
+                point_in_time_membership_symbols,
+                recovery_markets,
+            ) = self._resolve_point_in_time_followup_membership(
+                market_date=market_date,
+                metadata=latest_eod_metadata,
+                markets=recovery_markets,
+            )
+            if not point_in_time_membership_symbols:
+                requested_recovery_symbols = _dedupe_symbol_codes(
+                    [
+                        *(latest_eod_metadata.get('requested_symbols') or []),
+                        *downstream_retry_symbols,
+                    ]
+                )
+                return self._record_failed_followup_scope_attempt(
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    latest_eod_run=latest_eod_run,
+                    markets=recovery_markets,
+                    recovery_stages=recovery_stages,
+                    resume_from_stage=resume_from_stage,
+                    recovery_attempts=recovery_attempts,
+                    requested_symbols=requested_recovery_symbols,
+                    point_in_time_recovery=True,
+                    failure_reason=(
+                        'point_in_time_recovery_scope_unavailable'
+                    ),
+                )
 
         # Imported lazily because the stage orchestrator depends on this service.
         from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
@@ -945,29 +1970,15 @@ class PykrxBackfillService:
         recovery_kwargs: dict[str, Any] = {
             'market_date': market_date,
             'stages': recovery_stages,
-            'markets': markets,
+            'markets': recovery_markets,
             'force': False,
             'reuse_existing_feedback': True,
             'resume_from_stage': resume_from_stage,
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'reused_eod_collection_run_id': int(latest_eod_run['id']),
         }
-        price_retry_symbols = set(
-            self._metadata_retry_symbol_codes(latest_eod_run)
-        )
-        downstream_retry_symbols = [
-            symbol
-            for symbol in _dedupe_symbol_codes(
-                (
-                    (latest_eod_run.get('run_metadata') or {}).get(
-                        'downstream_retry_symbols'
-                    )
-                    or []
-                )
-                if isinstance(latest_eod_run.get('run_metadata'), dict)
-                else []
-            )
-            if symbol not in price_retry_symbols
-        ]
+        if point_in_time_recovery:
+            recovery_kwargs['point_in_time_recovery'] = True
         # A later follow-up can fail independently of the immediate PyKRX
         # stages, so a healthy collection resumes the full universe. When a
         # price failure coexists, however, an unscoped resume would include a
@@ -976,7 +1987,27 @@ class PykrxBackfillService:
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in incomplete_stages
         )
-        if has_incomplete_followup_stage:
+        if point_in_time_recovery and downstream_retry_symbols:
+            recovery_symbols = downstream_retry_symbols
+        elif recovering_safe_downstream_scope:
+            recovery_symbols = downstream_retry_symbols
+        elif point_in_time_recovery:
+            requested_recovery_symbols = _dedupe_symbol_codes(
+                latest_eod_metadata.get('requested_symbols') or []
+            )
+            recovery_symbols = (
+                requested_recovery_symbols
+                or sorted(point_in_time_membership_symbols)
+            )
+        elif verified_downstream_symbols:
+            recovery_symbols = verified_downstream_symbols
+        elif verified_orphan_symbols:
+            recovery_symbols = verified_orphan_symbols
+        elif recovery_reaches_followup_stage and not price_retry_symbols:
+            recovery_symbols = []
+        elif run_metadata.get('synthetic_recovery_parent'):
+            recovery_symbols = downstream_retry_symbols
+        elif has_incomplete_followup_stage:
             recovery_symbols = (
                 downstream_retry_symbols if price_retry_symbols else []
             )
@@ -985,6 +2016,10 @@ class PykrxBackfillService:
         if recovery_symbols:
             recovery_kwargs['symbols'] = recovery_symbols
         recovery_result = dict(daily_pipeline_stage_service.run(**recovery_kwargs))
+        convergence = self._persist_successful_followup_recovery(
+            latest_eod_run=latest_eod_run,
+            recovery_result=recovery_result,
+        )
         recovery_result.setdefault('triggered', True)
         recovery_result.setdefault('reason', 'incomplete_followups_resumed')
         recovery_result.setdefault('market_date', market_date)
@@ -998,8 +2033,260 @@ class PykrxBackfillService:
             'resume_from_stage': resume_from_stage,
             'stages': recovery_stages,
             'symbols': recovery_symbols,
+            'state_convergence': convergence,
         }
         return recovery_result
+
+    def _persist_successful_followup_recovery(
+        self,
+        *,
+        latest_eod_run: Mapping[str, Any],
+        recovery_result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not daily_pipeline_outcome_is_satisfied(recovery_result):
+            return {'updated': False, 'reason': 'recovery_not_completed'}
+
+        metadata = (
+            dict(latest_eod_run.get('run_metadata') or {})
+            if isinstance(latest_eod_run.get('run_metadata'), dict)
+            else {}
+        )
+        downstream_retry_symbols = _dedupe_symbol_codes(
+            metadata.get('downstream_retry_symbols') or []
+        )
+        if (
+            latest_eod_run.get('symbols_total') is None
+            or latest_eod_run.get('symbols_succeeded') is None
+        ):
+            return {'updated': False, 'reason': 'collection_counts_unavailable'}
+
+        price_retry_symbols = self._metadata_retry_symbol_codes(
+            dict(latest_eod_run)
+        )
+        completed_at = _utcnow_iso()
+        metadata.pop('downstream_retry_resume_from_stage', None)
+        metadata.pop(
+            'inherited_downstream_retry_resume_from_stage',
+            None,
+        )
+        metadata.update(
+            {
+                'downstream_retry_symbols': [],
+                'downstream_retry_symbols_count': 0,
+                'inherited_downstream_retry_symbols': [],
+                'inherited_downstream_retry_symbols_count': 0,
+                'downstream_recovery_symbols_count': len(
+                    downstream_retry_symbols
+                ),
+                'downstream_recovery_completed_at': completed_at,
+                'downstream_recovery_pipeline_run_id': recovery_result.get(
+                    'pipeline_run_id'
+                ),
+                'followup_recovery_required': False,
+            }
+        )
+        run_id = int(latest_eod_run['id'])
+        symbols_total = max(int(latest_eod_run.get('symbols_total') or 0), 0)
+        symbols_succeeded = max(
+            int(latest_eod_run.get('symbols_succeeded') or 0),
+            0,
+        )
+        symbols_failed = max(
+            int(latest_eod_run.get('symbols_failed') or 0),
+            0,
+        )
+        trade_date = latest_eod_run.get('trade_date')
+        persisted_symbol_count = (
+            count_eod_run_persisted_symbols(
+                run_id,
+                trade_date=trade_date,
+            )
+            if symbols_total > 0
+            and not price_retry_symbols
+            else None
+        )
+        requested_symbols = _dedupe_symbol_codes(
+            metadata.get('requested_symbols') or []
+        )
+        persisted_symbol_codes: set[str] | None = None
+        missing_symbols: list[str] = []
+        unexpected_symbols: list[str] = []
+        if persisted_symbol_count is not None and requested_symbols:
+            persisted_symbol_codes = set(
+                load_eod_run_persisted_symbols(
+                    run_id,
+                    trade_date=trade_date,
+                )
+            )
+            requested_symbol_set = set(requested_symbols)
+            missing_symbols = [
+                symbol
+                for symbol in requested_symbols
+                if symbol not in persisted_symbol_codes
+            ]
+            unexpected_symbols = sorted(
+                persisted_symbol_codes - requested_symbol_set
+            )
+        identity_mismatch = bool(missing_symbols or unexpected_symbols)
+        coverage_gap_count = max(
+            symbols_total - int(persisted_symbol_count or 0),
+            0,
+        ) if persisted_symbol_count is not None else 0
+        if coverage_gap_count or identity_mismatch:
+            if persisted_symbol_codes is None:
+                persisted_symbol_codes = set(
+                    load_eod_run_persisted_symbols(
+                        run_id,
+                        trade_date=trade_date,
+                    )
+                )
+            if not requested_symbols:
+                covered_requested_count = min(
+                    int(persisted_symbol_count or 0),
+                    symbols_total,
+                )
+            else:
+                covered_requested_count = min(
+                    len(set(requested_symbols) & persisted_symbol_codes),
+                    symbols_total,
+                )
+            reconciled_failed_count = max(
+                symbols_total - covered_requested_count,
+                0,
+            )
+            if not missing_symbols and requested_symbols:
+                missing_symbols = [
+                    symbol
+                    for symbol in requested_symbols
+                    if symbol not in persisted_symbol_codes
+                ]
+            metadata.update(
+                {
+                    'failed_symbols': missing_symbols,
+                    'failed_symbols_count': len(missing_symbols),
+                    'unexpected_persisted_symbols': unexpected_symbols,
+                    'unexpected_persisted_symbols_count': len(
+                        unexpected_symbols
+                    ),
+                    'collection_coverage_inconsistent': True,
+                    'collection_coverage_checked_at': completed_at,
+                    'collection_persisted_symbols_count': int(
+                        persisted_symbol_count or 0
+                    ),
+                    'collection_expected_symbols_count': symbols_total,
+                    'resumable': bool(
+                        reconciled_failed_count or missing_symbols
+                    ),
+                }
+            )
+            coverage_error = (
+                'Persisted price coverage is incomplete or does not match '
+                'the admitted symbols after follow-up recovery: '
+                f'{persisted_symbol_count}/{symbols_total} symbols, '
+                f'{len(missing_symbols)} missing, '
+                f'{len(unexpected_symbols)} unexpected.'
+            )
+            complete_eod_collection_run(
+                run_id,
+                status='completed_with_errors',
+                symbols_succeeded=covered_requested_count,
+                symbols_failed=reconciled_failed_count,
+                error_message=coverage_error,
+                run_metadata=metadata,
+            )
+            return {
+                'updated': True,
+                'status': 'completed_with_errors',
+                'price_retry_pending': bool(
+                    reconciled_failed_count or missing_symbols
+                ),
+                'persisted_symbol_count': persisted_symbol_count,
+                'coverage_gap_count': reconciled_failed_count,
+                'unexpected_symbol_count': len(unexpected_symbols),
+            }
+        if (
+            persisted_symbol_count is not None
+            and persisted_symbol_count > symbols_total
+        ):
+            metadata.update(
+                {
+                    'failed_symbols': [],
+                    'failed_symbols_count': 0,
+                    'unattempted_symbols': [],
+                    'unattempted_symbols_count': 0,
+                    'collection_coverage_inconsistent': True,
+                    'collection_coverage_checked_at': completed_at,
+                    'collection_persisted_symbols_count': (
+                        persisted_symbol_count
+                    ),
+                    'collection_expected_symbols_count': symbols_total,
+                    'resumable': False,
+                }
+            )
+            coverage_error = (
+                'Persisted price coverage exceeds the admitted collection '
+                f'scope after follow-up recovery: '
+                f'{persisted_symbol_count}/{symbols_total} symbols.'
+            )
+            complete_eod_collection_run(
+                run_id,
+                status='completed_with_errors',
+                symbols_succeeded=symbols_total,
+                symbols_failed=0,
+                error_message=coverage_error,
+                run_metadata=metadata,
+            )
+            return {
+                'updated': True,
+                'status': 'completed_with_errors',
+                'price_retry_pending': False,
+                'persisted_symbol_count': persisted_symbol_count,
+                'coverage_excess_count': (
+                    persisted_symbol_count - symbols_total
+                ),
+            }
+        prices_complete = bool(
+            symbols_total > 0
+            and not price_retry_symbols
+            and persisted_symbol_count == symbols_total
+        )
+        if prices_complete:
+            metadata.update(
+                {
+                    'failed_symbols': [],
+                    'failed_symbols_count': 0,
+                    'unattempted_symbols': [],
+                    'unattempted_symbols_count': 0,
+                    'resumable': False,
+                }
+            )
+            complete_eod_collection_run(
+                run_id,
+                status='completed',
+                symbols_succeeded=symbols_total,
+                symbols_failed=0,
+                error_message=None,
+                run_metadata=metadata,
+            )
+            return {
+                'updated': True,
+                'status': 'completed',
+                'price_retry_pending': False,
+                'persisted_symbol_count': persisted_symbol_count,
+            }
+
+        update_eod_collection_run_progress(
+            run_id,
+            symbols_succeeded=symbols_succeeded,
+            symbols_failed=symbols_failed,
+            run_metadata=metadata,
+        )
+        return {
+            'updated': True,
+            'status': latest_eod_run.get('status'),
+            'price_retry_pending': bool(price_retry_symbols),
+            'persisted_symbol_count': persisted_symbol_count,
+        }
 
     def run_daily_pipeline_if_due(
         self,
@@ -1009,6 +2296,8 @@ class PykrxBackfillService:
         trigger: str = 'auto_close',
         refresh_universe: bool = True,
         force: bool = False,
+        point_in_time_recovery: bool = False,
+        recovery_eod_run_id: int | None = None,
     ) -> dict:
         if market_date is None:
             latest_trade_date = self.resolve_latest_trade_date()
@@ -1018,6 +2307,15 @@ class PykrxBackfillService:
             normalized_market_date = _normalize_yyyymmdd(market_date)
             market_date_iso = _normalize_iso_date(normalized_market_date)
             latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
+
+        point_in_time_recovery = resolve_point_in_time_recovery(
+            market_date=market_date_iso,
+            requested=point_in_time_recovery,
+            recovery_context=(
+                trigger in POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS
+            ),
+            current_market_date=_current_krx_calendar_date(),
+        )
 
         if latest_trade_date != market_date_iso:
             result = build_daily_skip_result(
@@ -1038,16 +2336,39 @@ class PykrxBackfillService:
                 _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                 return result
 
-            latest_run = load_latest_eod_collection_run(
-                market='KRX',
-                trade_date=market_date_iso,
-                source='pykrx',
-            )
+            if recovery_eod_run_id is not None:
+                latest_run = load_exact_automatic_daily_eod_collection_run(
+                    eod_run_id=recovery_eod_run_id,
+                    trade_date=market_date_iso,
+                )
+            else:
+                latest_run = load_latest_eod_collection_run(
+                    market='KRX',
+                    trade_date=market_date_iso,
+                    source='pykrx',
+                )
             if latest_run and not force:
                 latest_run = self.reconcile_latest_daily_run_status(
                     trade_date=market_date_iso,
                     latest_run=latest_run,
+                    recovery_eod_run_id=recovery_eod_run_id,
                 )
+            if recovery_eod_run_id is not None and latest_run is None:
+                result = build_daily_skip_result(
+                    reason='recovery_target_invalid_or_superseded',
+                    market_date=market_date_iso,
+                    latest_available_trade_date=latest_trade_date,
+                )
+                result['recovery_target'] = {
+                    'trade_date': market_date_iso,
+                    'eod_run_id': recovery_eod_run_id,
+                }
+                _log_pykrx_fetch(
+                    'run_daily_pipeline_if_due',
+                    'skipped',
+                    **result,
+                )
+                return result
             if latest_run and latest_run['status'] == 'running' and not force:
                 result = build_daily_skip_result(
                     reason='already_running',
@@ -1068,6 +2389,11 @@ class PykrxBackfillService:
                     if isinstance(latest_run.get('run_metadata'), dict)
                     else {}
                 )
+                if point_in_time_recovery:
+                    markets = _point_in_time_source_markets(
+                        latest_metadata,
+                        fallback=markets,
+                    )
                 collection_is_terminal = bool(
                     (
                         latest_status == 'completed'
@@ -1078,10 +2404,32 @@ class PykrxBackfillService:
                         and latest_failed == 0
                         and not metadata_retry_symbols
                     )
+                    or self._failed_run_has_exact_complete_price_scope(
+                        latest_run
+                    )
                 )
                 has_downstream_retry_scope = bool(
                     latest_metadata.get('downstream_retry_symbols')
                 )
+                price_retry_pending = bool(
+                    latest_failed > 0 or metadata_retry_symbols
+                )
+                is_automatic_retryable_run = bool(
+                    _is_auto_daily_trigger(trigger)
+                    and self._is_retryable_daily_run(latest_run)
+                )
+                automatic_run_count: int | None = None
+                if (
+                    is_automatic_retryable_run
+                    and price_retry_pending
+                    and has_downstream_retry_scope
+                ):
+                    automatic_run_count = count_eod_collection_runs(
+                        market='KRX',
+                        trade_date=market_date_iso,
+                        source='pykrx',
+                        trigger_prefix='auto_',
+                    )
                 if _is_auto_daily_trigger(trigger) and (
                     collection_is_terminal or has_downstream_retry_scope
                 ):
@@ -1090,14 +2438,17 @@ class PykrxBackfillService:
                         latest_available_trade_date=latest_trade_date,
                         latest_eod_run=latest_run,
                         markets=markets,
+                        allow_safe_downstream_scope_with_price_failures=bool(
+                            automatic_run_count is not None
+                            and automatic_run_count
+                            >= MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE
+                        ),
+                        point_in_time_recovery=point_in_time_recovery,
                     )
                     recovery_exhausted = bool(
                         recovery_result is not None
                         and recovery_result.get('reason')
                         == 'followup_recovery_limit_reached'
-                    )
-                    price_retry_pending = bool(
-                        latest_failed > 0 or metadata_retry_symbols
                     )
                     if recovery_result is not None and not (
                         recovery_exhausted and price_retry_pending
@@ -1134,13 +2485,14 @@ class PykrxBackfillService:
                     )
                     _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                     return result
-                if _is_auto_daily_trigger(trigger) and self._is_retryable_daily_run(latest_run):
-                    automatic_run_count = count_eod_collection_runs(
-                        market='KRX',
-                        trade_date=market_date_iso,
-                        source='pykrx',
-                        trigger_prefix='auto_',
-                    )
+                if is_automatic_retryable_run:
+                    if automatic_run_count is None:
+                        automatic_run_count = count_eod_collection_runs(
+                            market='KRX',
+                            trade_date=market_date_iso,
+                            source='pykrx',
+                            trigger_prefix='auto_',
+                        )
                     if automatic_run_count >= MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE:
                         result = build_daily_skip_result(
                             reason='auto_retry_limit_reached',
@@ -1154,7 +2506,299 @@ class PykrxBackfillService:
                         )
                         _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
                         return result
-                    symbols_override = self._load_retry_symbols_for_run(latest_run, markets=markets)
+                    latest_run_completed_at = _parse_activity_datetime(
+                        latest_run.get('completed_at')
+                    )
+                    latest_run_activity_at = (
+                        latest_run_completed_at
+                        or _parse_activity_datetime(latest_run.get('started_at'))
+                    )
+                    if latest_run_activity_at is not None:
+                        retry_elapsed_seconds = (
+                            datetime.now(timezone.utc) - latest_run_activity_at
+                        ).total_seconds()
+                        if (
+                            retry_elapsed_seconds
+                            < AUTO_PYKRX_DAILY_RETRY_MIN_INTERVAL_SECONDS
+                        ):
+                            retry_after_seconds = max(
+                                1,
+                                math.ceil(
+                                    AUTO_PYKRX_DAILY_RETRY_MIN_INTERVAL_SECONDS
+                                    - retry_elapsed_seconds
+                                ),
+                            )
+                            result = build_daily_skip_result(
+                                reason='auto_retry_backoff',
+                                market_date=market_date_iso,
+                                latest_available_trade_date=latest_trade_date,
+                                existing_run=latest_run,
+                                auto_retry={
+                                    'attempts': automatic_run_count,
+                                    'max_attempts': (
+                                        MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE
+                                    ),
+                                    'retry_after_seconds': retry_after_seconds,
+                                },
+                            )
+                            result['retry_after_seconds'] = (
+                                retry_after_seconds
+                            )
+                            _log_pykrx_fetch(
+                                'run_daily_pipeline_if_due',
+                                'skipped',
+                                **result,
+                            )
+                            return result
+                    failed_symbol_kwargs: dict[str, Any] = {
+                        'markets': markets,
+                    }
+                    if point_in_time_recovery:
+                        failed_symbol_kwargs['point_in_time_recovery'] = True
+                    retry_symbol_codes = self._failed_symbol_codes_for_run(
+                        latest_run,
+                        **failed_symbol_kwargs,
+                    )
+                    retry_scope_snapshot = getattr(
+                        retry_symbol_codes,
+                        'universe_snapshot',
+                        None,
+                    )
+                    retry_scope_coverage_mismatch = bool(
+                        getattr(
+                            retry_symbol_codes,
+                            'coverage_mismatch',
+                            False,
+                        )
+                    )
+                    membership_scope_proven = bool(
+                        point_in_time_recovery
+                        and isinstance(retry_scope_snapshot, Mapping)
+                        and not retry_scope_coverage_mismatch
+                    )
+                    retry_symbol_kwargs: dict[str, Any] = {
+                        'markets': markets,
+                        'symbol_codes': retry_symbol_codes,
+                    }
+                    if point_in_time_recovery:
+                        retry_symbol_kwargs['point_in_time_recovery'] = True
+                    symbols_override = self._load_retry_symbols_for_run(
+                        latest_run,
+                        **retry_symbol_kwargs,
+                    )
+                    resolved_retry_symbol_codes = {
+                        item.symbol for item in symbols_override
+                    }
+                    unresolved_retry_symbol_codes = [
+                        symbol_code
+                        for symbol_code in retry_symbol_codes
+                        if symbol_code not in resolved_retry_symbol_codes
+                    ]
+                    membership_scope_unresolved = bool(
+                        point_in_time_recovery
+                        and not retry_symbol_codes
+                        and not membership_scope_proven
+                    )
+                    retry_scope_failure_reason = (
+                        'point_in_time_retry_lineage_mismatch'
+                        if retry_scope_coverage_mismatch
+                        else 'point_in_time_retry_membership_unavailable'
+                    )
+                    if unresolved_retry_symbol_codes or membership_scope_unresolved:
+                        if point_in_time_recovery:
+                            attempt = automatic_run_count + 1
+                            unresolved_count = max(
+                                len(unresolved_retry_symbol_codes),
+                                int(latest_run.get('symbols_failed') or 0),
+                                int(latest_run.get('symbols_total') or 0)
+                                - int(latest_run.get('symbols_succeeded') or 0),
+                                1,
+                            )
+                            auto_retry = {
+                                'attempt': attempt,
+                                'attempts': attempt,
+                                'max_attempts': (
+                                    MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE
+                                ),
+                                'requested_symbol_count': len(
+                                    retry_symbol_codes
+                                ),
+                                'resolved_symbol_count': len(
+                                    resolved_retry_symbol_codes
+                                ),
+                                'unresolved_symbol_count': unresolved_count,
+                                'unresolved_symbols': (
+                                    unresolved_retry_symbol_codes[:50]
+                                ),
+                            }
+                            retry_metadata = build_daily_retry_context(
+                                latest_run,
+                                attempt=attempt,
+                                max_attempts=(
+                                    MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE
+                                ),
+                                symbol_count=len(retry_symbol_codes),
+                            )
+                            attempt_metadata = {
+                                'mode': 'daily_auto',
+                                'point_in_time_recovery': True,
+                                'requested_start_date': normalized_market_date,
+                                'requested_end_date': normalized_market_date,
+                                'latest_available_trade_date': (
+                                    latest_trade_date
+                                ),
+                                'markets': list(markets),
+                                'requested_symbols': retry_symbol_codes,
+                                'failed_symbols': (
+                                    unresolved_retry_symbol_codes
+                                ),
+                                'failed_symbols_count': len(
+                                    unresolved_retry_symbol_codes
+                                ),
+                                'unattempted_symbols': sorted(
+                                    resolved_retry_symbol_codes
+                                ),
+                                'unattempted_symbols_count': len(
+                                    resolved_retry_symbol_codes
+                                ),
+                                'retry': retry_metadata,
+                                'auto_retry': auto_retry,
+                                'resumable': True,
+                                'failure_reason': (
+                                    retry_scope_failure_reason
+                                ),
+                            }
+                            attempt_run_id = create_eod_collection_run(
+                                market='KRX',
+                                trade_date=market_date_iso,
+                                symbols_total=unresolved_count,
+                                trigger=trigger,
+                                source='pykrx',
+                                run_metadata=attempt_metadata,
+                            )
+                            error_message = (
+                                'Point-in-time membership evidence cannot '
+                                'authorize the retry scope: '
+                                + ', '.join(
+                                    (
+                                        getattr(
+                                            retry_symbol_codes,
+                                            'unexpected_persisted_symbols',
+                                            [],
+                                        )
+                                        or unresolved_retry_symbol_codes
+                                    )[:50]
+                                )
+                            )
+                            complete_eod_collection_run(
+                                attempt_run_id,
+                                status='failed',
+                                symbols_succeeded=0,
+                                symbols_failed=unresolved_count,
+                                error_message=error_message,
+                                run_metadata=attempt_metadata,
+                            )
+                            result = {
+                                'triggered': True,
+                                'run_id': attempt_run_id,
+                                'source': 'pykrx',
+                                'status': 'failed',
+                                'reason': (
+                                    retry_scope_failure_reason
+                                ),
+                                'market_date': market_date_iso,
+                                'latest_available_trade_date': (
+                                    latest_trade_date
+                                ),
+                                'symbols_total': unresolved_count,
+                                'symbols_succeeded': 0,
+                                'symbols_failed': unresolved_count,
+                                'failed_symbols': (
+                                    unresolved_retry_symbol_codes[:50]
+                                ),
+                                'auto_retry': auto_retry,
+                            }
+                            _log_pykrx_fetch(
+                                'run_daily_pipeline_if_due',
+                                'failed',
+                                **{
+                                    key: value
+                                    for key, value in result.items()
+                                    if key != 'status'
+                                },
+                            )
+                            return result
+                        result = build_daily_skip_result(
+                            reason='retry_symbol_resolution_incomplete',
+                            market_date=market_date_iso,
+                            latest_available_trade_date=latest_trade_date,
+                            existing_run=latest_run,
+                            auto_retry={
+                                'attempts': automatic_run_count,
+                                'max_attempts': MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
+                                'requested_symbol_count': len(
+                                    retry_symbol_codes
+                                ),
+                                'resolved_symbol_count': len(
+                                    resolved_retry_symbol_codes
+                                ),
+                                'unresolved_symbol_count': len(
+                                    unresolved_retry_symbol_codes
+                                ),
+                                'unresolved_symbols': (
+                                    unresolved_retry_symbol_codes[:50]
+                                ),
+                            },
+                        )
+                        _log_pykrx_fetch(
+                            'run_daily_pipeline_if_due',
+                            'skipped',
+                            **result,
+                        )
+                        return result
+                    if (
+                        point_in_time_recovery
+                        and membership_scope_proven
+                        and not retry_symbol_codes
+                    ):
+                        converged_run = (
+                            self._converge_point_in_time_price_complete_run(
+                                latest_eod_run=latest_run,
+                                market_date=market_date_iso,
+                                markets=markets,
+                                universe_snapshot=retry_scope_snapshot,
+                            )
+                        )
+                        if converged_run is not None:
+                            recovery_result = (
+                                self._resume_auto_daily_followups_if_due(
+                                    market_date=market_date_iso,
+                                    latest_available_trade_date=(
+                                        latest_trade_date
+                                    ),
+                                    latest_eod_run=converged_run,
+                                    markets=markets,
+                                    point_in_time_recovery=True,
+                                )
+                            )
+                            if recovery_result is not None:
+                                return recovery_result
+                            result = build_daily_skip_result(
+                                reason=(
+                                    'point_in_time_price_scope_reconciled'
+                                ),
+                                market_date=market_date_iso,
+                                latest_available_trade_date=(
+                                    latest_trade_date
+                                ),
+                                existing_run=converged_run,
+                            )
+                            result.update(
+                                {'triggered': True, 'status': 'completed'}
+                            )
+                            return result
+                        membership_scope_unresolved = True
+
                     if not symbols_override:
                         result = build_daily_skip_result(
                             reason='no_failed_symbols_to_retry',
@@ -1174,6 +2818,123 @@ class PykrxBackfillService:
                         max_attempts=MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE,
                         symbol_count=len(symbols_override),
                     )
+                    if point_in_time_recovery:
+                        resolved_retry_snapshot = getattr(
+                            symbols_override,
+                            'universe_snapshot',
+                            None,
+                        )
+                        source_universe_snapshot = (
+                            dict(resolved_retry_snapshot)
+                            if isinstance(resolved_retry_snapshot, dict)
+                            else latest_metadata.get('universe_snapshot')
+                            if isinstance(
+                                latest_metadata.get('universe_snapshot'), dict
+                            )
+                            else None
+                        )
+                        if source_universe_snapshot is not None:
+                            if (
+                                _validate_point_in_time_universe_snapshot(
+                                    source_universe_snapshot,
+                                    markets=markets,
+                                    expected_market_date=market_date_iso,
+                                )
+                                is None
+                            ):
+                                source_universe_snapshot = None
+                        if source_universe_snapshot is None:
+                            retry_membership = build_market_membership_snapshot(
+                                symbols=symbols_override,
+                                markets=markets,
+                            )
+                            retry_membership['symbol_metadata'] = [
+                                {
+                                    'symbol': item.symbol,
+                                    'market': item.market,
+                                    'name_ko': item.name_ko,
+                                    'standard_code': item.standard_code,
+                                }
+                                for item in symbols_override
+                            ]
+                            source_universe_snapshot = {
+                                'source': 'pykrx',
+                                'markets': list(markets),
+                                'symbol_count': len(symbols_override),
+                                'persisted_count': 0,
+                                'latest_trade_date': market_date_iso,
+                                'universe_source': 'point_in_time_retry_scope',
+                                'membership_basis': 'end_date_snapshot',
+                                'complete': True,
+                                'deactivate_missing': False,
+                                'point_in_time': True,
+                                'current_universe_mutated': False,
+                                'market_membership': retry_membership,
+                            }
+                        retry_context[
+                            'point_in_time_universe_snapshot'
+                        ] = source_universe_snapshot
+                        validated_retry_membership = (
+                            _validate_point_in_time_universe_snapshot(
+                                source_universe_snapshot,
+                                markets=markets,
+                                expected_market_date=market_date_iso,
+                            )
+                        )
+                        if validated_retry_membership is not None:
+                            exact_membership_symbols = {
+                                symbol
+                                for market_symbols in (
+                                    validated_retry_membership.values()
+                                )
+                                for symbol in market_symbols
+                            }
+                            persisted_parent_symbols = set(
+                                load_eod_run_persisted_symbols(
+                                    int(latest_run['id']),
+                                    trade_date=market_date_iso,
+                                )
+                            )
+                            inherited_symbols = _dedupe_symbol_codes(
+                                [
+                                    *(
+                                        retry_context.get(
+                                            'inherited_downstream_retry_symbols'
+                                        )
+                                        or []
+                                    ),
+                                    *sorted(
+                                        (
+                                            persisted_parent_symbols
+                                            & exact_membership_symbols
+                                        )
+                                        - set(retry_symbol_codes)
+                                    ),
+                                ]
+                            )
+                            if inherited_symbols:
+                                retry_context[
+                                    'inherited_downstream_retry_symbols'
+                                ] = inherited_symbols
+                                retry_context.setdefault(
+                                    'inherited_downstream_retry_resume_from_stage',
+                                    'pykrx_enrichment',
+                                )
+                    inherited_resume_from_stage = str(
+                        latest_metadata.get(
+                            'downstream_retry_resume_from_stage'
+                        )
+                        or ''
+                    ).strip()
+                    if (
+                        retry_context.get(
+                            'inherited_downstream_retry_symbols'
+                        )
+                        and inherited_resume_from_stage
+                    ):
+                        retry_context[
+                            'inherited_downstream_retry_resume_from_stage'
+                        ] = inherited_resume_from_stage
 
             result = self._run_market_data_pipeline(
                 start_date=normalized_market_date,
@@ -1187,6 +2948,7 @@ class PykrxBackfillService:
                 selected_stages=PYKRX_STAGE_SEQUENCE,
                 chain_fundamentals_followup=True,
                 track_daily_pipeline=True,
+                point_in_time_recovery=point_in_time_recovery,
             )
             result.setdefault('triggered', True)
             _log_pykrx_fetch(
@@ -1201,6 +2963,7 @@ class PykrxBackfillService:
         *,
         trade_date: str | None = None,
         latest_run: dict | None = None,
+        recovery_eod_run_id: int | None = None,
     ) -> dict | None:
         resolved_run = latest_run
         resolved_trade_date = trade_date or (
@@ -1210,18 +2973,30 @@ class PykrxBackfillService:
             raise ValueError('trade_date is required to reconcile pykrx daily run status')
 
         if resolved_run is None:
-            resolved_run = load_latest_eod_collection_run(
-                market='KRX',
-                trade_date=resolved_trade_date,
-                source='pykrx',
-            )
+            if recovery_eod_run_id is not None:
+                resolved_run = load_exact_automatic_daily_eod_collection_run(
+                    eod_run_id=recovery_eod_run_id,
+                    trade_date=resolved_trade_date,
+                )
+            else:
+                resolved_run = load_latest_eod_collection_run(
+                    market='KRX',
+                    trade_date=resolved_trade_date,
+                    source='pykrx',
+                )
         if resolved_run and resolved_run.get('status') == 'running' and self._is_stale_running_run(resolved_run):
             self._fail_stale_running_run(resolved_run)
-            resolved_run = load_latest_eod_collection_run(
-                market='KRX',
-                trade_date=resolved_trade_date,
-                source='pykrx',
-            )
+            if recovery_eod_run_id is not None:
+                resolved_run = load_exact_automatic_daily_eod_collection_run(
+                    eod_run_id=recovery_eod_run_id,
+                    trade_date=resolved_trade_date,
+                )
+            else:
+                resolved_run = load_latest_eod_collection_run(
+                    market='KRX',
+                    trade_date=resolved_trade_date,
+                    source='pykrx',
+                )
         return resolved_run
 
     def run_daily_pipeline_stages(
@@ -1234,6 +3009,7 @@ class PykrxBackfillService:
         refresh_universe: bool = True,
         force: bool = False,
         symbols: Sequence[str] | None = None,
+        point_in_time_recovery: bool = False,
     ) -> dict:
         requested_stages = [stage for stage in PYKRX_STAGE_SEQUENCE if stage in set(stages)]
         if not requested_stages:
@@ -1243,6 +3019,14 @@ class PykrxBackfillService:
 
         normalized_market_date = _normalize_yyyymmdd(market_date)
         market_date_iso = _normalize_iso_date(normalized_market_date)
+        point_in_time_recovery = resolve_point_in_time_recovery(
+            market_date=market_date_iso,
+            requested=point_in_time_recovery,
+            recovery_context=(
+                trigger in POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS
+            ),
+            current_market_date=_current_krx_calendar_date(),
+        )
         latest_trade_date = self.resolve_latest_trade_date(end_date=normalized_market_date)
         if latest_trade_date != market_date_iso:
             return build_daily_skip_result(
@@ -1254,11 +3038,43 @@ class PykrxBackfillService:
         symbols_override = None
         if symbols:
             requested_symbols = {str(item).strip().zfill(6) for item in symbols if str(item).strip()}
-            symbols_override = [
-                item
-                for item in self.load_active_universe(markets=markets)
-                if item.symbol in requested_symbols
-            ]
+            if point_in_time_recovery:
+                snapshot = self.fetch_recent_universe_snapshot(
+                    markets=markets,
+                    limit=None,
+                    end_date=normalized_market_date,
+                    allow_master_fallback=False,
+                )
+                if not snapshot.get('complete', True):
+                    unavailable_markets = ','.join(
+                        snapshot.get('unavailable_markets') or []
+                    )
+                    raise RuntimeError(
+                        'PyKRX universe snapshot is incomplete for requested '
+                        f'markets: {unavailable_markets or "unknown"}.'
+                    )
+                symbols_override = [
+                    item
+                    for item in snapshot['symbols']
+                    if item.symbol in requested_symbols
+                ]
+                admitted_symbols = {
+                    item.symbol for item in symbols_override
+                }
+                missing_requested_symbols = sorted(
+                    requested_symbols - admitted_symbols
+                )
+                if missing_requested_symbols:
+                    raise RuntimeError(
+                        'Point-in-time universe is missing requested symbols: '
+                        + ', '.join(missing_requested_symbols[:50])
+                    )
+            else:
+                symbols_override = [
+                    item
+                    for item in self.load_active_universe(markets=markets)
+                    if item.symbol in requested_symbols
+                ]
             if not symbols_override:
                 raise RuntimeError('No active pykrx symbols matched the requested stage scope.')
 
@@ -1282,6 +3098,7 @@ class PykrxBackfillService:
                 symbols_override=symbols_override,
                 selected_stages=requested_stages,
                 chain_fundamentals_followup=False,
+                point_in_time_recovery=point_in_time_recovery,
             )
             result['triggered'] = True
             result['forced'] = force
@@ -1303,6 +3120,54 @@ class PykrxBackfillService:
         )
 
     @staticmethod
+    def _failed_run_has_exact_complete_price_scope(run: Mapping[str, Any]) -> bool:
+        if str(run.get('status') or '').strip().lower() != 'failed':
+            return False
+        metadata = (
+            run.get('run_metadata')
+            if isinstance(run.get('run_metadata'), Mapping)
+            else {}
+        )
+        requested_symbols = _dedupe_symbol_codes(
+            metadata.get('requested_symbols') or []
+        )
+        try:
+            symbols_total = max(int(run.get('symbols_total') or 0), 0)
+            symbols_succeeded = max(
+                int(run.get('symbols_succeeded') or 0),
+                0,
+            )
+            symbols_failed = max(
+                int(run.get('symbols_failed') or 0),
+                0,
+            )
+            persisted_count = int(
+                metadata.get('collection_persisted_symbols_count')
+            )
+            expected_count = int(
+                metadata.get('collection_expected_symbols_count')
+            )
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            symbols_total > 0
+            and len(requested_symbols) == symbols_total
+            and symbols_succeeded == symbols_total
+            and symbols_failed == 0
+            and persisted_count == symbols_total
+            and expected_count == symbols_total
+            and metadata.get('collection_coverage_checked_at')
+            and metadata.get('collection_coverage_inconsistent') is False
+            and not metadata.get('unexpected_persisted_symbols')
+            and not _dedupe_symbol_codes(
+                [
+                    *(metadata.get('failed_symbols') or []),
+                    *(metadata.get('unattempted_symbols') or []),
+                ]
+            )
+        )
+
+    @staticmethod
     def _metadata_retry_symbol_codes(run: dict) -> list[str]:
         metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
         return _dedupe_symbol_codes(
@@ -1312,16 +3177,159 @@ class PykrxBackfillService:
             ]
         )
 
-    def _load_retry_symbols_for_run(self, run: dict, *, markets: Sequence[str]) -> list[PykrxSymbol]:
-        symbol_codes = self._failed_symbol_codes_for_run(run, markets=markets)
-        if not symbol_codes:
+    def _load_retry_symbols_for_run(
+        self,
+        run: dict,
+        *,
+        markets: Sequence[str],
+        symbol_codes: Sequence[str] | None = None,
+        point_in_time_recovery: bool = False,
+    ) -> list[PykrxSymbol]:
+        retry_code_universe_snapshot = getattr(
+            symbol_codes,
+            'universe_snapshot',
+            None,
+        )
+        resolved_symbol_codes = (
+            _dedupe_symbol_codes(symbol_codes)
+            if symbol_codes is not None
+            else self._failed_symbol_codes_for_run(run, markets=markets)
+        )
+        if not resolved_symbol_codes:
             return []
+
+        if point_in_time_recovery:
+            metadata = (
+                run.get('run_metadata')
+                if isinstance(run.get('run_metadata'), dict)
+                else {}
+            )
+            universe_snapshot = (
+                retry_code_universe_snapshot
+                if isinstance(retry_code_universe_snapshot, dict)
+                else metadata.get('universe_snapshot')
+                if isinstance(metadata.get('universe_snapshot'), dict)
+                else {}
+            )
+            evidence_metadata = {
+                **metadata,
+                'universe_snapshot': universe_snapshot,
+            }
+            membership = universe_snapshot.get('market_membership')
+            membership_markets = _point_in_time_source_markets(
+                evidence_metadata,
+                fallback=markets,
+            )
+            validated = _validate_point_in_time_universe_snapshot(
+                universe_snapshot,
+                markets=membership_markets,
+                expected_market_date=str(run.get('trade_date') or ''),
+            )
+            if (
+                validated is not None
+                and _validated_point_in_time_membership_symbols(
+                    evidence_metadata,
+                    markets=membership_markets,
+                    expected_market_date=str(run.get('trade_date') or ''),
+                )
+                is None
+            ):
+                validated = None
+            if validated is not None:
+                stored_members = {
+                    symbol
+                    for market_symbols in validated.values()
+                    for symbol in market_symbols
+                }
+                if not set(resolved_symbol_codes).issubset(stored_members):
+                    validated = None
+            if validated is None:
+                try:
+                    point_in_time_snapshot = self.fetch_recent_universe_snapshot(
+                        markets=membership_markets,
+                        limit=None,
+                        end_date=str(run.get('trade_date') or '').replace('-', ''),
+                        allow_master_fallback=False,
+                    )
+                except Exception:
+                    return []
+                full_snapshot_symbols = list(
+                    point_in_time_snapshot.get('symbols') or []
+                )
+                exact_date_universe_snapshot = (
+                    _build_point_in_time_universe_snapshot(
+                        point_in_time_snapshot,
+                        markets=membership_markets,
+                        expected_market_date=str(
+                            run.get('trade_date') or ''
+                        ),
+                    )
+                )
+                if exact_date_universe_snapshot is None:
+                    return []
+                refetched_members = {
+                    item.symbol for item in full_snapshot_symbols
+                }
+                if not set(resolved_symbol_codes).issubset(
+                    refetched_members
+                ):
+                    return []
+                requested_symbol_set = set(resolved_symbol_codes)
+                retry_symbols = [
+                    item
+                    for item in full_snapshot_symbols
+                    if item.symbol in requested_symbol_set
+                ]
+                return PointInTimeRetrySymbols(
+                    retry_symbols,
+                    universe_snapshot=exact_date_universe_snapshot,
+                )
+            market_by_symbol = {
+                symbol: market
+                for market, market_symbols in validated.items()
+                for symbol in market_symbols
+            }
+            raw_symbol_metadata = (
+                membership.get('symbol_metadata')
+                if isinstance(membership, dict)
+                and isinstance(membership.get('symbol_metadata'), list)
+                else []
+            )
+            symbol_metadata = {
+                str(item.get('symbol') or '').strip().upper(): item
+                for item in raw_symbol_metadata
+                if isinstance(item, dict)
+            }
+            historical_items: list[PykrxSymbol] = []
+            for symbol_code in resolved_symbol_codes:
+                market = market_by_symbol.get(symbol_code)
+                if market is None:
+                    continue
+                identity = symbol_metadata.get(symbol_code) or {}
+                if str(identity.get('market') or market).strip().upper() != market:
+                    identity = {}
+                historical_items.append(
+                    PykrxSymbol(
+                        symbol=symbol_code,
+                        market=market,
+                        name_ko=str(identity.get('name_ko') or symbol_code),
+                        standard_code=(
+                            str(identity['standard_code'])
+                            if identity.get('standard_code')
+                            else None
+                        ),
+                    )
+                )
+            return PointInTimeRetrySymbols(
+                historical_items,
+                universe_snapshot=dict(universe_snapshot),
+            )
 
         rows = load_symbols(
             is_active=True,
             source='pykrx',
             markets=list(markets),
-            symbols=symbol_codes,
+            symbols=resolved_symbol_codes,
         )
         by_symbol = {
             row['symbol']: PykrxSymbol(
@@ -1334,7 +3342,7 @@ class PykrxBackfillService:
         }
 
         items: list[PykrxSymbol] = []
-        for symbol_code in symbol_codes:
+        for symbol_code in resolved_symbol_codes:
             item = by_symbol.get(symbol_code)
             if item is None:
                 item = self.find_symbol(symbol_code, markets=markets)
@@ -1342,13 +3350,20 @@ class PykrxBackfillService:
                 items.append(item)
         return items
 
-    def _failed_symbol_codes_for_run(self, run: dict, *, markets: Sequence[str]) -> list[str]:
+    def _failed_symbol_codes_for_run(
+        self,
+        run: dict,
+        *,
+        markets: Sequence[str],
+        point_in_time_recovery: bool = False,
+    ) -> list[str]:
         metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
-        metadata_retry_symbols = self._metadata_retry_symbol_codes(run)
-        if metadata_retry_symbols:
-            return metadata_retry_symbols
-
-        persisted_symbols = set(load_eod_run_persisted_symbols(run['id']))
+        persisted_symbols = set(
+            load_eod_run_persisted_symbols(
+                run['id'],
+                trade_date=run.get('trade_date'),
+            )
+        )
         requested_symbols = metadata.get('requested_symbols') if metadata else None
         if requested_symbols:
             return [
@@ -1356,6 +3371,81 @@ class PykrxBackfillService:
                 for symbol in _dedupe_symbol_codes(requested_symbols)
                 if symbol not in persisted_symbols
             ]
+
+        metadata_retry_symbols = self._metadata_retry_symbol_codes(run)
+        if metadata_retry_symbols:
+            return [
+                symbol
+                for symbol in metadata_retry_symbols
+                if symbol not in persisted_symbols
+            ]
+
+        membership_symbols = _validated_point_in_time_membership_symbols(
+            metadata,
+            markets=markets,
+            expected_market_date=str(run.get('trade_date') or ''),
+        )
+        if membership_symbols is not None:
+            universe_snapshot = metadata.get('universe_snapshot')
+            missing_symbols = sorted(membership_symbols - persisted_symbols)
+            if (
+                (point_in_time_recovery or metadata.get('point_in_time_recovery'))
+                and isinstance(universe_snapshot, dict)
+            ):
+                return PointInTimeRetryCodes(
+                    missing_symbols,
+                    universe_snapshot=dict(universe_snapshot),
+                    unexpected_persisted_symbols=sorted(
+                        persisted_symbols - membership_symbols
+                    ),
+                )
+            return missing_symbols
+
+        if point_in_time_recovery or metadata.get('point_in_time_recovery'):
+            membership_markets = _point_in_time_source_markets(
+                metadata,
+                fallback=markets,
+            )
+            try:
+                provider_snapshot = self.fetch_recent_universe_snapshot(
+                    markets=membership_markets,
+                    limit=None,
+                    end_date=str(run.get('trade_date') or '').replace('-', ''),
+                    allow_master_fallback=False,
+                )
+            except Exception:
+                # A prior-date retry must never infer missing membership from
+                # the current active table. The caller records a bounded,
+                # durable failed attempt when exact-date evidence is unavailable.
+                return []
+            universe_snapshot = _build_point_in_time_universe_snapshot(
+                provider_snapshot,
+                markets=membership_markets,
+                expected_market_date=str(run.get('trade_date') or ''),
+            )
+            if universe_snapshot is None:
+                return []
+            refetched_metadata = {
+                **metadata,
+                'markets': list(membership_markets),
+                'universe_snapshot': universe_snapshot,
+            }
+            membership_symbols = (
+                _validated_point_in_time_membership_symbols(
+                    refetched_metadata,
+                    markets=membership_markets,
+                    expected_market_date=str(run.get('trade_date') or ''),
+                )
+            )
+            if not membership_symbols:
+                return []
+            return PointInTimeRetryCodes(
+                sorted(membership_symbols - persisted_symbols),
+                universe_snapshot=universe_snapshot,
+                unexpected_persisted_symbols=sorted(
+                    persisted_symbols - membership_symbols
+                ),
+            )
 
         active_universe = self.load_active_universe(markets=markets)
         return [item.symbol for item in active_universe if item.symbol not in persisted_symbols]
@@ -1445,15 +3535,44 @@ class PykrxBackfillService:
         return updated
 
     def _fail_stale_running_run(self, run: dict) -> None:
-        persisted_symbols = count_eod_run_persisted_symbols(run['id'])
-        symbols_total = int(run.get('symbols_total') or 0)
-        symbols_succeeded = max(int(run.get('symbols_succeeded') or 0), persisted_symbols)
-        symbols_failed = max(int(run.get('symbols_failed') or 0), max(symbols_total - symbols_succeeded, 0))
+        persisted_symbol_count = count_eod_run_persisted_symbols(
+            run['id'],
+            trade_date=run.get('trade_date'),
+        )
+        symbols_total = max(int(run.get('symbols_total') or 0), 0)
         metadata = run.get('run_metadata') if isinstance(run.get('run_metadata'), dict) else {}
         markets = tuple(metadata.get('markets') or DEFAULT_MARKETS)
-        failed_symbols = self._failed_symbol_codes_for_run(run, markets=markets)
-        if failed_symbols:
-            symbols_failed = max(symbols_failed, len(failed_symbols))
+        requested_symbols = _dedupe_symbol_codes(
+            metadata.get('requested_symbols') or []
+        )
+        unexpected_persisted_symbols: list[str] = []
+        if requested_symbols:
+            persisted_symbol_codes = set(
+                load_eod_run_persisted_symbols(
+                    run['id'],
+                    trade_date=run.get('trade_date'),
+                )
+            )
+            requested_symbol_set = set(requested_symbols)
+            symbols_succeeded = min(
+                len(requested_symbol_set & persisted_symbol_codes),
+                symbols_total,
+            )
+            failed_symbols = [
+                symbol
+                for symbol in requested_symbols
+                if symbol not in persisted_symbol_codes
+            ]
+            unexpected_persisted_symbols = sorted(
+                persisted_symbol_codes - requested_symbol_set
+            )
+        else:
+            symbols_succeeded = min(persisted_symbol_count, symbols_total)
+            failed_symbols = self._failed_symbol_codes_for_run(
+                run,
+                markets=markets,
+            )
+        symbols_failed = max(symbols_total - symbols_succeeded, 0)
         error_message = (
             f"Marked stale after {settings.eod_auto_pykrx_stale_run_minutes} minutes without completion."
         )
@@ -1469,8 +3588,23 @@ class PykrxBackfillService:
             symbols_failed=symbols_failed,
             error_message=error_message,
         )
-        if failed_symbols:
-            metadata = self._run_metadata_with_failed_symbols(metadata, failed_symbols)
+        metadata = self._run_metadata_with_failed_symbols(metadata, failed_symbols)
+        metadata['unattempted_symbols'] = []
+        metadata['unattempted_symbols_count'] = 0
+        metadata['collection_coverage_checked_at'] = _utcnow_iso()
+        metadata['collection_persisted_symbols_count'] = persisted_symbol_count
+        metadata['collection_expected_symbols_count'] = symbols_total
+        metadata['unexpected_persisted_symbols'] = (
+            unexpected_persisted_symbols
+        )
+        metadata['unexpected_persisted_symbols_count'] = len(
+            unexpected_persisted_symbols
+        )
+        metadata['collection_coverage_inconsistent'] = (
+            persisted_symbol_count != symbols_succeeded
+            or len(failed_symbols) != symbols_failed
+            or bool(unexpected_persisted_symbols)
+        )
         complete_eod_collection_run(
             run['id'],
             status='failed',
@@ -1496,6 +3630,7 @@ class PykrxBackfillService:
         selected_stages: Sequence[str] | None = None,
         chain_fundamentals_followup: bool = True,
         track_daily_pipeline: bool = False,
+        point_in_time_recovery: bool = False,
     ) -> dict:
         self._symbol_fundamentals_disabled_for_run = False
         self._symbol_fundamentals_failure_count_for_run = 0
@@ -1535,6 +3670,7 @@ class PykrxBackfillService:
             selected_stages=selected_stages,
             chain_fundamentals_followup=chain_fundamentals_followup,
             track_daily_pipeline=track_daily_pipeline,
+            point_in_time_recovery=point_in_time_recovery,
         )
 
     def _load_symbol_fundamentals(self, *, symbol: str, start_date: str, end_date: str):
