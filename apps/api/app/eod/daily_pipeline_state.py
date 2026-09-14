@@ -14,9 +14,18 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
+from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.repositories.eod_run_repository import (
+    eod_collection_advisory_lock_keys,
+)
 
 
 ACTIVE_DAILY_PIPELINE_STATUSES = {'running'}
+STARTUP_RECOVERABLE_EOD_STATUSES = {
+    'running',
+    'completed',
+    'completed_with_errors',
+}
 TERMINAL_DAILY_PIPELINE_STATUSES = {
     'completed',
     'partial',
@@ -87,6 +96,25 @@ def _build_counts(
         'succeeded': succeeded_value,
         'failed': failed_value,
         'remaining': remaining_value,
+    }
+
+
+def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
+    stage_id = str(getattr(stage_row, 'stage_id', '') or '').strip()
+    return {
+        'stage': stage_id,
+        'stage_id': stage_id,
+        'status': str(getattr(stage_row, 'status', '') or '').strip().lower(),
+        'processed': _as_int(getattr(stage_row, 'processed', 0)),
+        'total': _as_int(getattr(stage_row, 'total', 0)),
+        'succeeded': _as_int(getattr(stage_row, 'succeeded', 0)),
+        'failed': _as_int(getattr(stage_row, 'failed', 0)),
+        'error_message': getattr(stage_row, 'error_message', None),
+        'details': (
+            getattr(stage_row, 'details', {})
+            if isinstance(getattr(stage_row, 'details', {}), Mapping)
+            else {}
+        ),
     }
 
 
@@ -619,19 +647,228 @@ class DailyPipelineRunStateService:
         *,
         market_date: str | date,
         trigger: str,
+        reused_eod_collection_run_id: int | None = None,
     ) -> int:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_trigger = str(trigger or '').strip()
         if not normalized_trigger:
             raise ValueError('trigger is required when counting daily pipeline runs')
+        filters = [
+            DailyPipelineRun.market_date == normalized_market_date,
+            DailyPipelineRun.trigger == normalized_trigger,
+        ]
+        if reused_eod_collection_run_id is not None:
+            normalized_eod_run_id = int(reused_eod_collection_run_id)
+            if normalized_eod_run_id <= 0:
+                raise ValueError(
+                    'reused_eod_collection_run_id must be greater than zero'
+                )
+            # Recovery budgets belong to one exact provider-run lineage.
+            # Rows without this explicit link are intentionally excluded;
+            # inferring legacy ownership by date could exhaust a newer run.
+            filters.append(
+                DailyPipelineRun.run_metadata[
+                    'reused_eod_collection_run_id'
+                ].as_integer()
+                == normalized_eod_run_id
+            )
         with session_scope() as session:
             run_ids = session.execute(
-                select(DailyPipelineRun.id).where(
-                    DailyPipelineRun.market_date == normalized_market_date,
-                    DailyPipelineRun.trigger == normalized_trigger,
-                )
+                select(DailyPipelineRun.id).where(*filters)
             ).scalars()
             return sum(1 for _ in run_ids)
+
+    def converge_terminal_stages_run(
+        self,
+        *,
+        pipeline_run_id: int,
+    ) -> dict[str, Any]:
+        """Finalize an orphaned parent from complete persisted stage evidence.
+
+        The caller must own the provider admission fence before asking a
+        still-running parent to converge. This closes the checkpoint window
+        where every stage commit succeeded but the final parent commit did
+        not.
+        """
+        normalized_pipeline_run_id = int(pipeline_run_id)
+        now = _utcnow()
+        with session_scope() as session:
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == normalized_pipeline_run_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if run_row is None:
+                return {
+                    'updated': False,
+                    'pipeline_run_id': normalized_pipeline_run_id,
+                    'status': None,
+                    'reason': 'run_not_found',
+                }
+
+            current_status = str(run_row.status or '').strip().lower()
+            if current_status not in {'interrupted', 'running'}:
+                return {
+                    'updated': False,
+                    'pipeline_run_id': normalized_pipeline_run_id,
+                    'status': current_status,
+                    'reason': 'run_not_convergeable',
+                }
+
+            metadata = (
+                dict(run_row.run_metadata)
+                if isinstance(run_row.run_metadata, Mapping)
+                else {}
+            )
+            raw_resolved_stages = metadata.get('resolved_stages')
+            if (
+                not isinstance(raw_resolved_stages, list)
+                or not raw_resolved_stages
+                or any(
+                    not isinstance(stage_id, str) or not stage_id.strip()
+                    for stage_id in raw_resolved_stages
+                )
+            ):
+                return {
+                    'updated': False,
+                    'pipeline_run_id': normalized_pipeline_run_id,
+                    'status': current_status,
+                    'reason': 'resolved_stages_unavailable',
+                }
+            resolved_stages = list(
+                dict.fromkeys(
+                    str(stage_id).strip()
+                    for stage_id in raw_resolved_stages
+                )
+            )
+
+            stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == normalized_pipeline_run_id,
+                        DailyPipelineStageRun.stage_id.in_(resolved_stages),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            persisted_stage_outcomes = {
+                str(stage_row.stage_id).strip(): _stage_row_outcome(stage_row)
+                for stage_row in stage_rows
+            }
+            missing_stages = [
+                stage_id
+                for stage_id in resolved_stages
+                if stage_id not in persisted_stage_outcomes
+            ]
+            if missing_stages:
+                return {
+                    'updated': False,
+                    'pipeline_run_id': normalized_pipeline_run_id,
+                    'status': current_status,
+                    'reason': 'resolved_stage_rows_missing',
+                    'missing_stages': missing_stages,
+                }
+
+            stage_statuses = {
+                stage_id: str(persisted_stage_outcomes[stage_id]['status'])
+                for stage_id in resolved_stages
+            }
+            incomplete_stages = {
+                stage_id: status
+                for stage_id, status in stage_statuses.items()
+                if not daily_pipeline_outcome_is_satisfied(
+                    persisted_stage_outcomes[stage_id]
+                )
+            }
+            if incomplete_stages:
+                return {
+                    'updated': False,
+                    'pipeline_run_id': normalized_pipeline_run_id,
+                    'status': current_status,
+                    'reason': 'resolved_stages_incomplete',
+                    'incomplete_stages': incomplete_stages,
+                }
+
+            if any(
+                status == 'partial'
+                for status in stage_statuses.values()
+            ):
+                terminal_status = 'partial'
+            elif all(
+                status == 'skipped'
+                for status in stage_statuses.values()
+            ):
+                terminal_status = 'skipped'
+            else:
+                terminal_status = 'completed'
+            metadata.update(
+                {
+                    'resumable': False,
+                    'converged_at': now.isoformat(),
+                    'converged_from_status': current_status,
+                    'stage_statuses': stage_statuses,
+                }
+            )
+            run_row.status = terminal_status
+            run_row.error_message = None
+            run_row.completed_at = now
+            run_row.updated_at = now
+            run_row.run_metadata = metadata
+
+            return {
+                'updated': True,
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'status': terminal_status,
+                'resolved_stages': resolved_stages,
+                'stage_statuses': stage_statuses,
+            }
+
+    def link_eod_run(
+        self,
+        *,
+        pipeline_run_id: int,
+        eod_run_id: int,
+    ) -> dict[str, int]:
+        now = _utcnow()
+        with session_scope() as session:
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == int(pipeline_run_id))
+                .with_for_update()
+            ).scalar_one_or_none()
+            if run_row is None:
+                raise ValueError(f'daily pipeline run not found: {pipeline_run_id}')
+            if run_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                raise ValueError(
+                    f'daily pipeline run is not active: '
+                    f'{pipeline_run_id} ({run_row.status})'
+                )
+            eod_run = session.get(EODCollectionRun, int(eod_run_id))
+            if eod_run is None:
+                raise ValueError(f'EOD collection run not found: {eod_run_id}')
+            if eod_run.trade_date != run_row.market_date:
+                raise ValueError(
+                    'daily pipeline and EOD collection market dates do not match'
+                )
+            if (
+                eod_run.market != 'KRX'
+                or eod_run.source != 'pykrx'
+                or eod_run.trigger != run_row.trigger
+            ):
+                raise ValueError(
+                    'daily pipeline and EOD collection contexts do not match'
+                )
+
+            metadata = dict(run_row.run_metadata or {})
+            metadata['eod_collection_run_id'] = int(eod_run_id)
+            run_row.run_metadata = metadata
+            run_row.updated_at = now
+        return {
+            'pipeline_run_id': int(pipeline_run_id),
+            'eod_run_id': int(eod_run_id),
+        }
 
     def mark_active_runs_interrupted(
         self,
@@ -640,14 +877,205 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         interrupted_run_ids: list[int] = []
-        linked_eod_market_dates: dict[int, date] = {}
+        interrupted_eod_run_ids: list[int] = []
+        augmented_eod_run_ids: list[int] = []
+        provider_lock_owned_run_ids: list[int] = []
+        ambiguous_eod_link_run_ids: list[int] = []
         with session_scope() as session:
             run_rows = list(
                 session.execute(
-                    select(DailyPipelineRun).where(DailyPipelineRun.status.in_(ACTIVE_DAILY_PIPELINE_STATUSES))
+                    select(DailyPipelineRun).where(
+                        DailyPipelineRun.status.in_(
+                            ACTIVE_DAILY_PIPELINE_STATUSES
+                        )
+                    )
                 ).scalars()
             )
             for run_row in run_rows:
+                expected_market_date = _normalize_market_date(run_row.market_date)
+                stage_rows = list(
+                    session.execute(
+                        select(DailyPipelineStageRun).where(
+                            DailyPipelineStageRun.pipeline_run_id == run_row.id
+                        )
+                    ).scalars()
+                )
+                run_metadata = (
+                    run_row.run_metadata
+                    if isinstance(run_row.run_metadata, dict)
+                    else {}
+                )
+                has_eod_reference = _as_int(
+                    run_metadata.get('eod_collection_run_id')
+                ) > 0 or any(
+                    _as_int(
+                        (stage_row.source_run_ids or {}).get('eod_run_id')
+                        if isinstance(stage_row.source_run_ids, dict)
+                        else None
+                    )
+                    > 0
+                    for stage_row in stage_rows
+                )
+                is_auto_pykrx_parent = bool(
+                    run_metadata.get('mode') == 'daily_auto'
+                    or run_metadata.get('entrypoint')
+                    == 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+                    or run_row.trigger == 'auto_eod_followup_resume'
+                )
+                if has_eod_reference or is_auto_pykrx_parent:
+                    source_key, trade_key = eod_collection_advisory_lock_keys(
+                        market='KRX',
+                        trade_date=expected_market_date,
+                        source='pykrx',
+                    )
+                    lock_acquired = bool(
+                        session.execute(
+                            text(
+                                'SELECT pg_try_advisory_xact_lock('
+                                ':source_key, :trade_key)'
+                            ),
+                            {
+                                'source_key': source_key,
+                                'trade_key': trade_key,
+                            },
+                        ).scalar()
+                    )
+                    if not lock_acquired:
+                        provider_lock_owned_run_ids.append(int(run_row.id))
+                        continue
+                    session.refresh(run_row, with_for_update=True)
+                    for stage_row in stage_rows:
+                        session.refresh(stage_row, with_for_update=True)
+                    if run_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                        continue
+
+                linked_eod_ids: list[int] = []
+                metadata_eod_run_id = _as_int(
+                    (run_row.run_metadata or {}).get('eod_collection_run_id')
+                    if isinstance(run_row.run_metadata, dict)
+                    else None
+                )
+                if metadata_eod_run_id > 0:
+                    linked_eod_ids.append(metadata_eod_run_id)
+                for stage_row in stage_rows:
+                    source_run_ids = (
+                        stage_row.source_run_ids
+                        if isinstance(stage_row.source_run_ids, dict)
+                        else {}
+                    )
+                    eod_run_id = _as_int(source_run_ids.get('eod_run_id'))
+                    if eod_run_id > 0 and eod_run_id not in linked_eod_ids:
+                        linked_eod_ids.append(eod_run_id)
+
+                linked_eod_runs: list[EODCollectionRun] = []
+                for eod_run_id in linked_eod_ids:
+                    eod_run = session.get(EODCollectionRun, eod_run_id)
+                    if eod_run is not None:
+                        session.refresh(eod_run, with_for_update=True)
+                    if (
+                        eod_run is not None
+                        and eod_run.status in STARTUP_RECOVERABLE_EOD_STATUSES
+                        and eod_run.market == 'KRX'
+                        and eod_run.source == 'pykrx'
+                        and eod_run.trade_date == expected_market_date
+                        and eod_run.trigger == run_row.trigger
+                    ):
+                        linked_eod_runs.append(eod_run)
+
+                # Older runs may have crashed after creating the provider row
+                # but before their first stage checkpoint persisted its ID.
+                if not linked_eod_ids and is_auto_pykrx_parent:
+                    fallback_eod_runs = list(
+                        session.execute(
+                            select(EODCollectionRun)
+                            .where(
+                                EODCollectionRun.market == 'KRX',
+                                EODCollectionRun.source == 'pykrx',
+                                EODCollectionRun.trade_date
+                                == expected_market_date,
+                                EODCollectionRun.trigger == run_row.trigger,
+                                EODCollectionRun.status.in_(
+                                    STARTUP_RECOVERABLE_EOD_STATUSES
+                                ),
+                                EODCollectionRun.run_metadata[
+                                    'daily_pipeline_run_id'
+                                ].as_integer()
+                                == int(run_row.id),
+                            )
+                            .order_by(
+                                EODCollectionRun.started_at.desc(),
+                                EODCollectionRun.id.desc(),
+                            )
+                            .limit(2)
+                        ).scalars()
+                    )
+                    if not fallback_eod_runs:
+                        fallback_eod_runs = list(
+                            session.execute(
+                                select(EODCollectionRun)
+                                .where(
+                                    EODCollectionRun.market == 'KRX',
+                                    EODCollectionRun.source == 'pykrx',
+                                    EODCollectionRun.trade_date
+                                    == expected_market_date,
+                                    EODCollectionRun.trigger == run_row.trigger,
+                                    EODCollectionRun.status == 'running',
+                                )
+                                .order_by(
+                                    EODCollectionRun.started_at.desc(),
+                                    EODCollectionRun.id.desc(),
+                                )
+                                .limit(2)
+                            ).scalars()
+                    )
+                    if len(fallback_eod_runs) > 1:
+                        ambiguous_eod_link_run_ids.append(int(run_row.id))
+                        linked_eod_runs = []
+                    else:
+                        for eod_run in fallback_eod_runs:
+                            session.refresh(eod_run, with_for_update=True)
+                        linked_eod_runs = [
+                            eod_run
+                            for eod_run in fallback_eod_runs
+                            if eod_run.status in STARTUP_RECOVERABLE_EOD_STATUSES
+                            and eod_run.market == 'KRX'
+                            and eod_run.source == 'pykrx'
+                            and eod_run.trade_date == expected_market_date
+                            and eod_run.trigger == run_row.trigger
+                        ]
+
+                if len({int(row.id) for row in linked_eod_runs}) > 1:
+                    ambiguous_eod_link_run_ids.append(int(run_row.id))
+                    linked_eod_runs = []
+
+                resolved_stage_ids = {
+                    str(stage_id).strip()
+                    for stage_id in (
+                        (run_row.run_metadata or {}).get('resolved_stages') or []
+                    )
+                    if str(stage_id).strip()
+                }
+                if not resolved_stage_ids:
+                    resolved_stage_ids = {
+                        str(stage_row.stage_id).strip()
+                        for stage_row in stage_rows
+                        if str(getattr(stage_row, 'stage_id', '')).strip()
+                    }
+                stage_outcomes = {
+                    str(stage_row.stage_id).strip(): _stage_row_outcome(
+                        stage_row
+                    )
+                    for stage_row in stage_rows
+                    if str(getattr(stage_row, 'stage_id', '')).strip()
+                }
+                has_incomplete_downstream = any(
+                    stage_id != 'price_collection'
+                    and not daily_pipeline_outcome_is_satisfied(
+                        stage_outcomes.get(stage_id)
+                    )
+                    for stage_id in resolved_stage_ids
+                )
+
                 interrupted_run_ids.append(int(run_row.id))
                 metadata = dict(run_row.run_metadata or {})
                 metadata['interrupted_reason'] = reason
@@ -659,15 +1087,9 @@ class DailyPipelineRunStateService:
                 run_row.updated_at = now
                 run_row.run_metadata = metadata
 
-                stage_rows = list(
-                    session.execute(
-                        select(DailyPipelineStageRun).where(
-                            DailyPipelineStageRun.pipeline_run_id == run_row.id,
-                            DailyPipelineStageRun.status.in_(ACTIVE_DAILY_PIPELINE_STATUSES),
-                        )
-                    ).scalars()
-                )
                 for stage_row in stage_rows:
+                    if stage_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                        continue
                     details = dict(stage_row.details or {})
                     details['interrupted_reason'] = reason
                     details['resumable'] = True
@@ -682,81 +1104,209 @@ class DailyPipelineRunStateService:
                     stage_row.completed_at = now
                     stage_row.updated_at = now
                     stage_row.details = details
-                    source_run_ids = (
-                        stage_row.source_run_ids
-                        if isinstance(stage_row.source_run_ids, dict)
-                        else {}
-                    )
-                    eod_run_id = _as_int(source_run_ids.get('eod_run_id'))
-                    if eod_run_id > 0:
-                        linked_eod_market_dates.setdefault(
-                            eod_run_id,
-                            _normalize_market_date(stage_row.market_date),
-                        )
-
-            # The scheduler starts only after this transaction. Closing the
-            # linked provider run now lets its normal scoped retry run on the
-            # first poll instead of waiting for the stale-running threshold.
-            interrupted_eod_run_ids: list[int] = []
-            for eod_run_id, expected_market_date in sorted(
-                linked_eod_market_dates.items()
-            ):
-                eod_run = session.get(EODCollectionRun, eod_run_id)
-                if (
-                    eod_run is None
-                    or eod_run.status != 'running'
-                    or eod_run.market != 'KRX'
-                    or eod_run.source != 'pykrx'
-                    or eod_run.trade_date != expected_market_date
-                ):
+                if not linked_eod_runs:
                     continue
-
-                interrupted_eod_run_ids.append(eod_run_id)
+                eod_run = linked_eod_runs[0]
+                eod_run_id = int(eod_run.id)
                 metadata = dict(eod_run.run_metadata or {})
+                symbols_total = max(_as_int(eod_run.symbols_total), 0)
                 persisted_symbols = [
                     str(symbol).strip()
                     for symbol in session.execute(
                         select(Symbol.symbol)
                         .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-                        .where(DailyPriceBar.eod_run_id == eod_run_id)
+                        .where(
+                            DailyPriceBar.eod_run_id == eod_run_id,
+                            DailyPriceBar.trade_date == expected_market_date,
+                        )
+                        .distinct()
                         .order_by(Symbol.symbol.asc())
                     ).scalars()
                     if str(symbol).strip()
                 ]
-                price_retry_symbols = {
-                    str(symbol).strip()
-                    for key in ('failed_symbols', 'unattempted_symbols')
-                    for symbol in (metadata.get(key) or [])
-                    if str(symbol).strip()
-                }
-                requested_success_symbols = [
-                    str(symbol).strip()
-                    for symbol in (metadata.get('requested_symbols') or [])
-                    if str(symbol).strip()
-                    and str(symbol).strip() not in price_retry_symbols
+                persisted_symbol_set = set(persisted_symbols)
+                requested_symbols = list(
+                    dict.fromkeys(
+                        str(symbol).strip()
+                        for symbol in (
+                            metadata.get('requested_symbols') or []
+                        )
+                        if str(symbol).strip()
+                    )
+                )
+                requested_symbol_set = set(requested_symbols)
+                has_exact_requested_scope = bool(
+                    requested_symbols
+                    and len(requested_symbol_set) == symbols_total
+                )
+                unexpected_persisted_symbols = (
+                    sorted(persisted_symbol_set - requested_symbol_set)
+                    if has_exact_requested_scope
+                    else []
+                )
+                metadata['unexpected_persisted_symbols'] = (
+                    unexpected_persisted_symbols
+                )
+                metadata['unexpected_persisted_symbols_count'] = len(
+                    unexpected_persisted_symbols
+                )
+                inherited_downstream_symbols = list(
+                    dict.fromkeys(
+                        str(symbol).strip()
+                        for symbol in (
+                            metadata.get(
+                                'inherited_downstream_retry_symbols'
+                            )
+                            or []
+                        )
+                        if str(symbol).strip()
+                    )
+                )
+                inherited_day_symbol_set: set[str] = set()
+                if inherited_downstream_symbols:
+                    inherited_day_symbol_set = {
+                        str(symbol).strip()
+                        for symbol in session.execute(
+                            select(Symbol.symbol)
+                            .join(
+                                DailyPriceBar,
+                                DailyPriceBar.symbol_id == Symbol.id,
+                            )
+                            .where(
+                                DailyPriceBar.trade_date
+                                == expected_market_date,
+                                Symbol.symbol.in_(
+                                    inherited_downstream_symbols
+                                ),
+                            )
+                            .distinct()
+                            .order_by(Symbol.symbol.asc())
+                        ).scalars()
+                        if str(symbol).strip()
+                    }
+                reconciled_inherited_downstream_symbols = [
+                    symbol
+                    for symbol in inherited_downstream_symbols
+                    if symbol in inherited_day_symbol_set
                 ]
+                inherited_day_symbol_set = set(
+                    reconciled_inherited_downstream_symbols
+                )
+                metadata['inherited_downstream_retry_symbols'] = (
+                    reconciled_inherited_downstream_symbols
+                )
+                metadata['inherited_downstream_retry_symbols_count'] = len(
+                    reconciled_inherited_downstream_symbols
+                )
+                reconciled_failed_symbols = [
+                    str(symbol).strip()
+                    for symbol in (metadata.get('failed_symbols') or [])
+                    if str(symbol).strip()
+                    and str(symbol).strip() not in persisted_symbol_set
+                ]
+                reconciled_unattempted_symbols = [
+                    str(symbol).strip()
+                    for symbol in (metadata.get('unattempted_symbols') or [])
+                    if str(symbol).strip()
+                    and str(symbol).strip() not in persisted_symbol_set
+                ]
+                known_retry_symbols = set(
+                    [
+                        *reconciled_failed_symbols,
+                        *reconciled_unattempted_symbols,
+                    ]
+                )
+                for symbol in requested_symbols:
+                    if (
+                        not symbol
+                        or symbol in persisted_symbol_set
+                        or symbol in known_retry_symbols
+                    ):
+                        continue
+                    reconciled_unattempted_symbols.append(symbol)
+                    known_retry_symbols.add(symbol)
+                metadata['failed_symbols'] = reconciled_failed_symbols
+                metadata['unattempted_symbols'] = (
+                    reconciled_unattempted_symbols
+                )
+                price_retry_symbols = known_retry_symbols
+                exact_symbols_succeeded = len(
+                    requested_symbol_set & persisted_symbol_set
+                )
+                reconciled_symbols_succeeded = (
+                    exact_symbols_succeeded
+                    if has_exact_requested_scope
+                    else min(
+                        max(
+                            _as_int(eod_run.symbols_succeeded),
+                            len(persisted_symbols),
+                        ),
+                        symbols_total,
+                    )
+                )
+                reconciled_symbols_failed = max(
+                    symbols_total - reconciled_symbols_succeeded,
+                    0,
+                )
+                requested_success_symbols = [
+                    symbol
+                    for symbol in requested_symbols
+                    if symbol not in price_retry_symbols
+                    and symbol in persisted_symbol_set
+                ]
+                existing_downstream_retry_symbols = list(
+                    dict.fromkeys(
+                        str(symbol).strip()
+                        for symbol in (
+                            metadata.get('downstream_retry_symbols') or []
+                        )
+                        if str(symbol).strip()
+                    )
+                )
                 downstream_retry_symbols: list[str] = []
                 seen_downstream_symbols: set[str] = set()
                 for raw_symbol in [
                     *requested_success_symbols,
-                    *(metadata.get('downstream_retry_symbols') or []),
+                    *existing_downstream_retry_symbols,
                     *persisted_symbols,
                 ]:
                     symbol = str(raw_symbol).strip()
                     if (
                         not symbol
                         or symbol in price_retry_symbols
+                        or (
+                            symbol not in persisted_symbol_set
+                            and symbol not in inherited_day_symbol_set
+                        )
+                        or (
+                            has_exact_requested_scope
+                            and symbol not in requested_symbol_set
+                            and symbol not in inherited_day_symbol_set
+                        )
                         or symbol in seen_downstream_symbols
                     ):
                         continue
                     seen_downstream_symbols.add(symbol)
                     downstream_retry_symbols.append(symbol)
+                if not has_incomplete_downstream:
+                    existing_downstream_retry_symbol_set = set(
+                        existing_downstream_retry_symbols
+                    )
+                    downstream_retry_symbols = [
+                        symbol
+                        for symbol in downstream_retry_symbols
+                        if symbol in existing_downstream_retry_symbol_set
+                    ]
+
                 stage_progress = dict(metadata.get('stage_progress') or {})
                 for stage_id, raw_progress in list(stage_progress.items()):
                     if not isinstance(raw_progress, dict):
                         continue
                     progress = dict(raw_progress)
-                    if str(progress.get('status') or '').strip().lower() != 'running':
+                    if (
+                        str(progress.get('status') or '').strip().lower()
+                        != 'running'
+                    ):
                         continue
                     progress.update(
                         {
@@ -768,19 +1318,27 @@ class DailyPipelineRunStateService:
                         }
                     )
                     stage_progress[stage_id] = progress
-
                 metadata.update(
                     {
                         'stage_progress': stage_progress,
-                        'current_step': 'core_restart_interrupted',
-                        'current_activity': reason,
-                        'last_progress_at': now.isoformat(),
                         'interrupted_reason': reason,
                         'interrupted_at': now.isoformat(),
                         'resumable': True,
                         'downstream_retry_symbols': downstream_retry_symbols,
                         'downstream_retry_symbols_count': len(
                             downstream_retry_symbols
+                        ),
+                        'collection_coverage_checked_at': now.isoformat(),
+                        'collection_persisted_symbols_count': len(
+                            persisted_symbols
+                        ),
+                        'collection_expected_symbols_count': symbols_total,
+                        'collection_coverage_inconsistent': bool(
+                            has_exact_requested_scope
+                            and (
+                                reconciled_symbols_failed
+                                or unexpected_persisted_symbols
+                            )
                         ),
                     }
                 )
@@ -793,27 +1351,60 @@ class DailyPipelineRunStateService:
                         metadata['unattempted_symbols']
                     )
 
-                eod_run.status = 'failed'
-                eod_run.symbols_succeeded = max(
-                    _as_int(eod_run.symbols_succeeded),
-                    len(persisted_symbols),
-                )
-                eod_run.symbols_failed = max(
-                    _as_int(eod_run.symbols_failed),
-                    max(
-                        _as_int(eod_run.symbols_total)
-                        - eod_run.symbols_succeeded,
-                        0,
-                    ),
-                )
-                eod_run.error_message = reason
-                eod_run.completed_at = now
+                if eod_run.status == 'running':
+                    interrupted_eod_run_ids.append(eod_run_id)
+                    metadata.update(
+                        {
+                            'current_step': 'core_restart_interrupted',
+                            'current_activity': reason,
+                            'last_progress_at': now.isoformat(),
+                        }
+                    )
+                    eod_run.symbols_succeeded = reconciled_symbols_succeeded
+                    eod_run.symbols_failed = reconciled_symbols_failed
+                    prices_complete = bool(
+                        symbols_total > 0
+                        and eod_run.symbols_succeeded == symbols_total
+                        and not price_retry_symbols
+                    )
+                    eod_run.status = (
+                        'completed_with_errors' if prices_complete else 'failed'
+                    )
+                    eod_run.error_message = reason
+                    eod_run.completed_at = now
+                else:
+                    augmented_eod_run_ids.append(eod_run_id)
+                    if has_exact_requested_scope:
+                        eod_run.symbols_succeeded = (
+                            reconciled_symbols_succeeded
+                        )
+                        eod_run.symbols_failed = reconciled_symbols_failed
+                        if reconciled_symbols_failed:
+                            eod_run.status = 'completed_with_errors'
+                            if not eod_run.error_message:
+                                eod_run.error_message = (
+                                    'Persisted price coverage is incomplete '
+                                    'for the admitted symbol scope after '
+                                    'restart reconciliation.'
+                                )
+                    metadata.update(
+                        {
+                            'followup_interrupted_reason': reason,
+                            'followup_interrupted_at': now.isoformat(),
+                            'followup_recovery_required': bool(
+                                downstream_retry_symbols
+                            ),
+                        }
+                    )
                 eod_run.run_metadata = metadata
         return {
             'interrupted_runs': len(interrupted_run_ids),
             'run_ids': interrupted_run_ids,
             'interrupted_eod_runs': len(interrupted_eod_run_ids),
             'interrupted_eod_run_ids': interrupted_eod_run_ids,
+            'augmented_eod_run_ids': augmented_eod_run_ids,
+            'provider_lock_owned_run_ids': provider_lock_owned_run_ids,
+            'ambiguous_eod_link_run_ids': ambiguous_eod_link_run_ids,
             'reason': reason,
         }
 
