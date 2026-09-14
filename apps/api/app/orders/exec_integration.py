@@ -43,6 +43,7 @@ from app.orders.execution_handoff_contract import (
     EXECUTION_REVOCATION_SCHEMA_VERSION,
     EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
     EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION,
+    PORTFOLIO_SUMMARY_READ_MODEL_SOURCE,
     serialize_exec_agent_decider_handoff_payload,
     serialize_execution_daily_board_payload,
     serialize_execution_dashboard_freshness_payload,
@@ -134,6 +135,26 @@ LIVE_EXEC_ACCOUNT_TARGET_REQUIRED = 'live_exec_account_target_required'
 EXEC_DESTINATION_BINDING_SCHEMA_VERSION = 'core_exec_destination_binding_v1'
 EXEC_DISPATCH_PROOF_SCHEMA_VERSION = 'core_exec_dispatch_proof_v2'
 EXEC_POSITION_SCOPE_PROOF_SCHEMA_VERSION = 'execution_position_plan_scope_v1'
+EXEC_RUNTIME_MONITORED_SYMBOL_MEMBERSHIP_SCHEMA_VERSION = (
+    'runtime_monitored_symbol_membership_v1'
+)
+EXEC_RUNTIME_KRX_MEMBERSHIP_EXCHANGES = (
+    'KOSDAQ',
+    'KOSPI',
+    'KRX',
+    'NXT',
+    'SOR',
+)
+EXEC_RUNTIME_KIS_EXECUTION_SCOPE_EXCHANGES = (
+    'AMEX',
+    'KOSDAQ',
+    'KOSPI',
+    'KRX',
+    'NASD',
+    'NXT',
+    'NYSE',
+    'SOR',
+)
 CORE_EXEC_ACTIVATION_BINDING_SCHEMA_VERSION = (
     'core_execution_activation_binding_v1'
 )
@@ -290,6 +311,8 @@ DASHBOARD_FRESHNESS_STATUS_REFRESHING = 'refreshing'
 DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE = 'unavailable'
 DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION = EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION
 DASHBOARD_TODAY_ACTIVITY_BROKER_ORDER_ID_LIMIT = 5
+EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_AGE = timedelta(seconds=60)
+EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_FUTURE_SKEW = timedelta(seconds=30)
 
 MARKET_TIME_ZONE = ZoneInfo('Asia/Seoul')
 DELEGATED_GATE_POLICY_VERSION = 'core_delegated_gate_policy_v1'
@@ -320,6 +343,20 @@ CALENDAR_FALLBACK_STATUSES = {
 class DashboardReadModelCacheRecord:
     payload: dict[str, Any]
     cached_at: datetime
+
+
+@dataclass(frozen=True)
+class ExecRuntimeMonitoredSymbolMembership:
+    symbols: frozenset[str]
+    membership_complete: bool
+    source_version: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioHoldingSymbolMembership:
+    symbols: frozenset[str]
+    membership_complete: bool
+    source_version: datetime | None = None
 
 
 def _utcnow() -> datetime:
@@ -2011,6 +2048,12 @@ class SignalDeciderExecClient:
     async def get_runtime_status(self) -> dict[str, Any]:
         return await self._request_json('GET', '/runtime/status')
 
+    async def get_runtime_monitored_symbol_membership(self) -> dict[str, Any]:
+        return await self._request_json(
+            'GET',
+            '/runtime/monitored-symbol-membership',
+        )
+
     async def post_execution_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request_json('POST', '/v4/execution-plans', json_body=payload)
 
@@ -2166,6 +2209,14 @@ class SignalDeciderExecIntegrationService:
         self._dashboard_build_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
         self._dashboard_refresh_tasks: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
         self._dashboard_refresh_state: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
+        self._latest_exec_monitoring_membership: tuple[
+            date,
+            ExecRuntimeMonitoredSymbolMembership,
+        ] | None = None
+        self._latest_portfolio_holding_membership: tuple[
+            date,
+            PortfolioHoldingSymbolMembership,
+        ] | None = None
 
     async def _synchronize_open_buy_authority(
         self,
@@ -5248,8 +5299,19 @@ class SignalDeciderExecIntegrationService:
         market_date: str | date | None = None,
         refresh: bool = True,
         trigger: str = 'manual',
+        publish_realtime_observation: bool = True,
     ) -> dict[str, Any]:
         resolved_market_date = _normalize_date(market_date)
+        should_publish_realtime_observation = bool(
+            publish_realtime_observation
+            and resolved_market_date
+            == _utcnow().astimezone(MARKET_TIME_ZONE).date()
+        )
+        observation_revision = (
+            kis_realtime_price_service.observation_revision()
+            if should_publish_realtime_observation
+            else None
+        )
         refresh_state = self._ensure_dashboard_background_refresh(
             target_trade_date=resolved_market_date,
             account_reference=None,
@@ -5265,104 +5327,412 @@ class SignalDeciderExecIntegrationService:
             allow_stale=True,
         )
         if cached is not None:
-            self._observe_runtime_symbols_for_realtime_prices(
-                (item.get('symbol') for item in cached.get('items') or []),
-                trigger=trigger,
-            )
-            return cached
-
-        payload = await self._build_dashboard_payload_singleflight(
-            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
-            market_date=resolved_market_date,
-            symbol=None,
-            refresh_state=refresh_state,
-            build=lambda: self._build_and_cache_runtime_monitored_symbols(
+            payload = cached
+        else:
+            payload = await self._build_dashboard_payload_singleflight(
+                endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
                 market_date=resolved_market_date,
-                refresh=refresh,
+                symbol=None,
                 refresh_state=refresh_state,
-                trigger=trigger,
-            ),
-        )
-        self._observe_runtime_symbols_for_realtime_prices(
-            (item.get('symbol') for item in payload['items']),
-            trigger=trigger,
-        )
+                build=lambda: self._build_and_cache_runtime_monitored_symbols(
+                    market_date=resolved_market_date,
+                    refresh=refresh,
+                    refresh_state=refresh_state,
+                    trigger=trigger,
+                ),
+            )
+        if should_publish_realtime_observation:
+            try:
+                kis_realtime_price_service.observe_runtime_monitored_payload(
+                    payload,
+                    trigger=trigger,
+                    expected_observation_revision=observation_revision,
+                )
+            except Exception:
+                pass
         return payload
 
-    async def _load_live_exec_monitoring_symbols(self, *, market_date: date, trigger: str) -> set[str] | None:
+    async def _load_live_exec_monitoring_symbols(
+        self,
+        *,
+        market_date: date,
+        trigger: str,
+    ) -> ExecRuntimeMonitoredSymbolMembership | None:
+        now = _utcnow().astimezone(timezone.utc)
         integration = self.integration_status()
         if integration['config_status'] in {REMOTE_FETCH_STATUS_DISABLED, REMOTE_FETCH_STATUS_NOT_CONFIGURED}:
             return None
-        try:
-            payload = await self.client.get_runtime_status()
-        except SignalDeciderExecClientError:
+        if market_date != now.astimezone(MARKET_TIME_ZONE).date():
             return None
-        return self._extract_live_exec_monitoring_symbols(payload=payload, market_date=market_date)
+        try:
+            payload = await self.client.get_runtime_monitored_symbol_membership()
+        except SignalDeciderExecClientError:
+            return self._degraded_cached_exec_monitoring_membership(market_date)
 
-    @classmethod
-    def _extract_live_exec_monitoring_symbols(cls, *, payload: dict[str, Any], market_date: date) -> set[str]:
-        monitoring = _extract_field(payload, 'liveness', 'autonomous', 'monitoring')
-        if not isinstance(monitoring, dict):
-            return set()
-        last_cycle = monitoring.get('last_cycle') if isinstance(monitoring.get('last_cycle'), dict) else {}
-        monitored_symbols = last_cycle.get('monitored_symbols')
-        if isinstance(monitored_symbols, list):
-            symbols = {
-                symbol
-                for raw_symbol in monitored_symbols
-                for symbol in [_normalize_optional_text(raw_symbol)]
-                if symbol
-            }
-            if symbols:
-                return symbols
-        items = last_cycle.get('items') if isinstance(last_cycle.get('items'), list) else []
-        symbols: set[str] = set()
-        market_date_text = market_date.isoformat()
-        compact_market_date = market_date.strftime('%Y%m%d')
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if _normalize_optional_text(item.get('intent'), lowercase=True) not in EXEC_ENTRY_BUY_INTENTS:
-                continue
-            status = _normalize_status(item.get('status'))
-            if status != 'watch_monitoring_active':
-                continue
-            source_identity = item.get('source_identity') if isinstance(item.get('source_identity'), dict) else {}
-            source_plan_id = _normalize_optional_text(source_identity.get('source_plan_id')) or ''
-            core_plan_id = _normalize_optional_text(source_identity.get('core_plan_id')) or ''
-            strategy_run_id = _normalize_optional_text(source_identity.get('strategy_run_id')) or ''
+        if (
+            payload.get('schema_version')
+            != EXEC_RUNTIME_MONITORED_SYMBOL_MEMBERSHIP_SCHEMA_VERSION
+            or payload.get('market_date') != market_date.isoformat()
+            or not isinstance(payload.get('membership_complete'), bool)
+        ):
+            return self._degraded_cached_exec_monitoring_membership(market_date)
+
+        generated_at_text = payload.get('generated_at')
+        if not isinstance(generated_at_text, str):
+            return self._degraded_cached_exec_monitoring_membership(market_date)
+        try:
+            generated_at = datetime.fromisoformat(
+                generated_at_text.strip().replace('Z', '+00:00')
+            )
+        except ValueError:
+            return self._degraded_cached_exec_monitoring_membership(market_date)
+        if (
+            generated_at.tzinfo is None
+            or generated_at.utcoffset() != timedelta(0)
+            or generated_at.astimezone(MARKET_TIME_ZONE).date() != market_date
+            or generated_at > (
+                now + EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_FUTURE_SKEW
+            )
+            or generated_at < (
+                now - EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_AGE
+            )
+        ):
+            return self._degraded_cached_exec_monitoring_membership(market_date)
+
+        membership_complete = payload['membership_complete']
+        membership_scope = payload.get('membership_scope')
+        membership_exchanges = (
+            membership_scope.get('exchanges')
+            if isinstance(membership_scope, dict)
+            else None
+        )
+        coverage = payload.get('coverage')
+        execution_scope = (
+            coverage.get('execution_scope')
+            if isinstance(coverage, dict)
+            else None
+        )
+        exchanges = (
+            execution_scope.get('exchanges')
+            if isinstance(execution_scope, dict)
+            else None
+        )
+        valid_execution_scope_sources = {
+            'configured_broker_account',
+            'configured_account_scope',
+        }
+        if integration['runtime_mode'] != 'live':
+            valid_execution_scope_sources.add('simulated_provider_route')
+        if (
+            not isinstance(coverage, dict)
+            or not isinstance(membership_scope, dict)
+            or membership_scope.get('market') != 'KRX'
+            or membership_exchanges
+            != list(EXEC_RUNTIME_KRX_MEMBERSHIP_EXCHANGES)
+            or coverage.get('status')
+            != ('complete' if membership_complete else 'unavailable')
+            or coverage.get('provider') != 'kis'
+            or coverage.get('runtime_mode') != integration['runtime_mode']
+            or not isinstance(execution_scope, dict)
+            or execution_scope.get('provider') != 'kis'
+            or not isinstance(exchanges, list)
+            or any(not isinstance(exchange, str) for exchange in exchanges)
+            or 'KRX' not in exchanges
+            or (
+                membership_complete
+                and (
+                    coverage.get('reason') is not None
+                    or execution_scope.get('status') != 'available'
+                    or execution_scope.get('source')
+                    not in valid_execution_scope_sources
+                    or execution_scope.get('reason') is not None
+                    or exchanges
+                    != list(EXEC_RUNTIME_KIS_EXECUTION_SCOPE_EXCHANGES)
+                )
+            )
+            or (
+                not membership_complete
+                and not _normalize_optional_text(coverage.get('reason'))
+            )
+        ):
+            return self._degraded_cached_exec_monitoring_membership(market_date)
+
+        raw_symbols = payload.get('symbols')
+        if not isinstance(raw_symbols, list):
+            return self._degraded_cached_exec_monitoring_membership(market_date)
+        normalized_symbols: list[str] = []
+        for item in raw_symbols:
+            if not isinstance(item, str):
+                return self._degraded_cached_exec_monitoring_membership(
+                    market_date
+                )
+            symbol = item.strip().upper()
             if (
-                compact_market_date not in source_plan_id
-                and compact_market_date not in core_plan_id
-                and f':{market_date_text}:' not in strategy_run_id
+                not symbol
+                or symbol != item
+                or re.fullmatch(r'[0-9]{6}', symbol) is None
             ):
-                continue
-            symbol = _normalize_optional_text(item.get('symbol'))
-            if symbol:
-                symbols.add(symbol)
-        return symbols
+                return self._degraded_cached_exec_monitoring_membership(
+                    market_date
+                )
+            normalized_symbols.append(symbol)
+        if normalized_symbols != sorted(set(normalized_symbols)):
+            return self._degraded_cached_exec_monitoring_membership(market_date)
 
-    async def _load_live_portfolio_holding_symbols(self, *, trigger: str) -> set[str] | None:
+        membership = ExecRuntimeMonitoredSymbolMembership(
+            symbols=frozenset(normalized_symbols),
+            membership_complete=membership_complete,
+            source_version=generated_at.astimezone(timezone.utc),
+        )
+        latest = self._latest_exec_monitoring_membership
+        if (
+            latest is not None
+            and latest[0] == market_date
+            and latest[1].source_version is not None
+            and membership.source_version is not None
+        ):
+            if membership.source_version < latest[1].source_version:
+                return latest[1]
+            if (
+                membership.source_version == latest[1].source_version
+                and (
+                    membership.symbols != latest[1].symbols
+                    or membership.membership_complete
+                    != latest[1].membership_complete
+                )
+            ):
+                membership = ExecRuntimeMonitoredSymbolMembership(
+                    symbols=frozenset(
+                        membership.symbols | latest[1].symbols
+                    ),
+                    membership_complete=False,
+                    source_version=membership.source_version,
+                )
+            elif not membership.membership_complete:
+                membership = ExecRuntimeMonitoredSymbolMembership(
+                    symbols=frozenset(
+                        membership.symbols | latest[1].symbols
+                    ),
+                    membership_complete=False,
+                    source_version=membership.source_version,
+                )
+        self._latest_exec_monitoring_membership = (market_date, membership)
+        return membership
+
+    def _degraded_cached_exec_monitoring_membership(
+        self,
+        market_date: date,
+    ) -> ExecRuntimeMonitoredSymbolMembership | None:
+        latest = self._latest_exec_monitoring_membership
+        if latest is None or latest[0] != market_date:
+            return None
+        return ExecRuntimeMonitoredSymbolMembership(
+            symbols=latest[1].symbols,
+            membership_complete=False,
+            source_version=latest[1].source_version,
+        )
+
+    async def _load_live_portfolio_holding_membership(
+        self,
+        *,
+        market_date: date,
+        trigger: str,
+    ) -> PortfolioHoldingSymbolMembership | None:
+        now = _utcnow().astimezone(timezone.utc)
+        if market_date != now.astimezone(MARKET_TIME_ZONE).date():
+            return None
         try:
             payload = await portfolio_summary_service.get_portfolio_summary(
                 refresh=False,
                 trigger=f'{trigger}:runtime_monitored_holdings',
             )
         except Exception:
-            return None
+            return self._degraded_cached_portfolio_holding_membership(
+                market_date
+            )
+
+        freshness = (
+            payload.get('freshness')
+            if isinstance(payload.get('freshness'), dict)
+            else {}
+        )
+        accounts = payload.get('accounts')
+        account_coverage = payload.get('accountCoverage')
+        source_version_text = payload.get('asOf') or freshness.get(
+            'lastRefreshSucceededAt'
+        )
+        source_version: datetime | None = None
+        if isinstance(source_version_text, str):
+            try:
+                parsed_source_version = datetime.fromisoformat(
+                    source_version_text.strip().replace('Z', '+00:00')
+                )
+            except ValueError:
+                parsed_source_version = None
+            if (
+                parsed_source_version is not None
+                and parsed_source_version.tzinfo is not None
+                and parsed_source_version.utcoffset() == timedelta(0)
+            ):
+                source_version = parsed_source_version.astimezone(timezone.utc)
+
+        if (
+            source_version is not None
+            and source_version
+            > now + EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_FUTURE_SKEW
+        ):
+            return self._degraded_cached_portfolio_holding_membership(
+                market_date
+            )
 
         symbols: set[str] = set()
-        for account in payload.get('accounts') or []:
+        source_is_structurally_valid = bool(
+            payload.get('source') == PORTFOLIO_SUMMARY_READ_MODEL_SOURCE
+            and isinstance(accounts, list)
+            and accounts
+            and isinstance(account_coverage, dict)
+            and account_coverage.get('status') == 'complete'
+            and account_coverage.get('configuredCount') == len(accounts)
+            and account_coverage.get('returnedCount') == len(accounts)
+        )
+        account_memberships_complete = source_is_structurally_valid
+        account_ids: set[str] = set()
+        for account in accounts if isinstance(accounts, list) else []:
             if not isinstance(account, dict):
+                source_is_structurally_valid = False
+                account_memberships_complete = False
                 continue
-            for holding in account.get('holdings') or []:
+            account_id = _normalize_optional_text(account.get('id'))
+            if not account_id or account_id in account_ids:
+                source_is_structurally_valid = False
+            elif account_id:
+                account_ids.add(account_id)
+            if account.get('broker') != 'kis':
+                source_is_structurally_valid = False
+            completeness = account.get('holdingsCompleteness')
+            holdings_complete = bool(
+                isinstance(completeness, dict)
+                and completeness.get('status') == 'complete'
+            )
+            account_memberships_complete = bool(
+                account_memberships_complete and holdings_complete
+            )
+            holdings = account.get('holdings')
+            observed_holdings = account.get('observedHoldings')
+            if not isinstance(holdings, list):
+                holdings = []
+                if holdings_complete:
+                    source_is_structurally_valid = False
+            if not isinstance(observed_holdings, list):
+                observed_holdings = []
+            if not holdings and not observed_holdings and not holdings_complete:
+                source_is_structurally_valid = False
+            for holding in [*holdings, *observed_holdings]:
                 if not isinstance(holding, dict):
+                    source_is_structurally_valid = False
                     continue
-                symbol = _normalize_optional_text(holding.get('symbol'))
-                quantity = _safe_decimal(holding.get('quantity')) or Decimal('0')
-                if symbol and quantity > Decimal('0'):
+                raw_symbol = holding.get('symbol')
+                symbol = (
+                    raw_symbol.strip()
+                    if isinstance(raw_symbol, str)
+                    else None
+                )
+                quantity = _safe_decimal(holding.get('quantity'))
+                if (
+                    symbol is None
+                    or re.fullmatch(r'[0-9]{6}', symbol) is None
+                    or quantity is None
+                    or quantity < Decimal('0')
+                ):
+                    source_is_structurally_valid = False
+                    continue
+                if quantity > Decimal('0'):
                     symbols.add(symbol)
-        return symbols
+
+        source_is_current = bool(
+            source_version is not None
+            and source_version.astimezone(MARKET_TIME_ZONE).date()
+            == market_date
+            and source_version
+            >= now - EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_AGE
+        )
+        membership = PortfolioHoldingSymbolMembership(
+            symbols=frozenset(symbols),
+            membership_complete=bool(
+                source_is_structurally_valid
+                and account_memberships_complete
+                and source_is_current
+                and freshness.get('isStale') is False
+                and freshness.get('refreshInFlight') is False
+            ),
+            source_version=source_version,
+        )
+        latest = self._latest_portfolio_holding_membership
+        if latest is not None and latest[0] == market_date:
+            latest_membership = latest[1]
+            if (
+                membership.source_version is not None
+                and latest_membership.source_version is not None
+                and membership.source_version
+                < latest_membership.source_version
+            ):
+                return self._degraded_cached_portfolio_holding_membership(
+                    market_date
+                )
+            if (
+                not membership.membership_complete
+                or (
+                    membership.source_version is not None
+                    and membership.source_version
+                    == latest_membership.source_version
+                    and (
+                        membership.symbols != latest_membership.symbols
+                        or membership.membership_complete
+                        != latest_membership.membership_complete
+                    )
+                )
+            ):
+                membership = PortfolioHoldingSymbolMembership(
+                    symbols=frozenset(
+                        membership.symbols | latest_membership.symbols
+                    ),
+                    membership_complete=False,
+                    source_version=(
+                        membership.source_version
+                        or latest_membership.source_version
+                    ),
+                )
+        self._latest_portfolio_holding_membership = (
+            market_date,
+            membership,
+        )
+        return membership
+
+    def _degraded_cached_portfolio_holding_membership(
+        self,
+        market_date: date,
+    ) -> PortfolioHoldingSymbolMembership | None:
+        latest = self._latest_portfolio_holding_membership
+        if latest is None or latest[0] != market_date:
+            return None
+        return PortfolioHoldingSymbolMembership(
+            symbols=latest[1].symbols,
+            membership_complete=False,
+            source_version=latest[1].source_version,
+        )
+
+    async def _load_live_portfolio_holding_symbols(
+        self,
+        *,
+        trigger: str,
+    ) -> set[str] | None:
+        membership = await self._load_live_portfolio_holding_membership(
+            market_date=_utcnow().astimezone(MARKET_TIME_ZONE).date(),
+            trigger=trigger,
+        )
+        if membership is None or not membership.membership_complete:
+            return None
+        return set(membership.symbols)
 
     @staticmethod
     def _collect_runtime_plan_item_ids(items: Sequence[dict[str, Any]]) -> set[int]:
@@ -5393,6 +5763,7 @@ class SignalDeciderExecIntegrationService:
         existing_plan_item_ids: set[int],
         existing_held_scopes: set[tuple[str, str]],
         live_holding_symbols: set[str] | None,
+        live_holding_membership_complete: bool = False,
     ) -> list[dict[str, Any]]:
         lookback_start = market_date - timedelta(days=365)
         with session_scope() as session:
@@ -5418,7 +5789,13 @@ class SignalDeciderExecIntegrationService:
             for item in candidate_items
             if self._overview_item_has_held_position(item)
             and self._overview_item_has_recent_readback(item, market_date=market_date)
-            and self._historical_held_symbol_is_live(item, live_holding_symbols=live_holding_symbols)
+            and self._historical_held_symbol_is_live(
+                item,
+                live_holding_symbols=live_holding_symbols,
+                live_holding_membership_complete=(
+                    live_holding_membership_complete
+                ),
+            )
             and _safe_decimal(item.get('plan_item_id')) is not None
             and int(_safe_decimal(item.get('plan_item_id'))) not in existing_plan_item_ids
         ]
@@ -5434,7 +5811,13 @@ class SignalDeciderExecIntegrationService:
                 continue
             if not self._overview_item_has_recent_readback(item, market_date=market_date):
                 continue
-            if not self._historical_held_symbol_is_live(item, live_holding_symbols=live_holding_symbols):
+            if not self._historical_held_symbol_is_live(
+                item,
+                live_holding_symbols=live_holding_symbols,
+                live_holding_membership_complete=(
+                    live_holding_membership_complete
+                ),
+            ):
                 continue
             account_reference = _normalize_optional_text(item.get('account_reference'))
             symbol = _normalize_optional_text(item.get('symbol'))
@@ -5459,8 +5842,12 @@ class SignalDeciderExecIntegrationService:
         item: dict[str, Any],
         *,
         live_holding_symbols: set[str] | None,
+        live_holding_membership_complete: bool = False,
     ) -> bool:
-        if live_holding_symbols is None:
+        if (
+            live_holding_symbols is None
+            or not live_holding_membership_complete
+        ):
             return True
         symbol = _normalize_optional_text(item.get('symbol'))
         return bool(symbol and symbol in live_holding_symbols)
@@ -5607,8 +5994,18 @@ class SignalDeciderExecIntegrationService:
             refresh=False,
             trigger=trigger,
         )
-        live_holding_symbols = await self._load_live_portfolio_holding_symbols(trigger=trigger)
-        live_exec_monitoring_symbols = await self._load_live_exec_monitoring_symbols(
+        live_portfolio_holding_membership = (
+            await self._load_live_portfolio_holding_membership(
+                market_date=market_date,
+                trigger=trigger,
+            )
+        )
+        live_holding_symbols = (
+            set(live_portfolio_holding_membership.symbols)
+            if live_portfolio_holding_membership is not None
+            else None
+        )
+        live_exec_monitoring_membership = await self._load_live_exec_monitoring_symbols(
             market_date=market_date,
             trigger=trigger,
         )
@@ -5619,7 +6016,10 @@ class SignalDeciderExecIntegrationService:
             refresh_state=refresh_state,
             served_from_cache=False,
             live_holding_symbols=live_holding_symbols,
-            live_exec_monitoring_symbols=live_exec_monitoring_symbols,
+            live_portfolio_holding_membership=(
+                live_portfolio_holding_membership
+            ),
+            live_exec_monitoring_membership=live_exec_monitoring_membership,
         )
         self._store_dashboard_cached_payload(
             endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
@@ -5730,11 +6130,35 @@ class SignalDeciderExecIntegrationService:
         refresh_state: dict[str, Any],
         served_from_cache: bool,
         live_holding_symbols: set[str] | None = None,
-        live_exec_monitoring_symbols: set[str] | None = None,
+        live_portfolio_holding_membership: (
+            PortfolioHoldingSymbolMembership | None
+        ) = None,
+        live_exec_monitoring_membership: ExecRuntimeMonitoredSymbolMembership | None = None,
     ) -> dict[str, Any]:
         resolved_market_date = date.fromisoformat(str(board['market_date']))
+        if live_portfolio_holding_membership is not None:
+            live_holding_symbols = set(
+                live_portfolio_holding_membership.symbols
+            )
+            holdings_membership_complete = (
+                live_portfolio_holding_membership.membership_complete
+            )
+            holdings_membership_status = (
+                'complete' if holdings_membership_complete else 'partial'
+            )
+        else:
+            holdings_membership_complete = live_holding_symbols is not None
+            holdings_membership_status = (
+                'complete'
+                if holdings_membership_complete
+                else 'unknown'
+            )
         board_items = list(board.get('items') or [])
-        if board_items or live_holding_symbols is None or live_holding_symbols:
+        if (
+            board_items
+            or not holdings_membership_complete
+            or bool(live_holding_symbols)
+        ):
             board_items.extend(
                 self._load_historical_held_runtime_board_items(
                     market_date=resolved_market_date,
@@ -5742,33 +6166,45 @@ class SignalDeciderExecIntegrationService:
                     existing_plan_item_ids=self._collect_runtime_plan_item_ids(board_items),
                     existing_held_scopes=self._collect_runtime_held_scopes(board_items),
                     live_holding_symbols=live_holding_symbols,
+                    live_holding_membership_complete=(
+                        holdings_membership_complete
+                    ),
                 )
             )
+        live_exec_monitoring_symbols = (
+            set(live_exec_monitoring_membership.symbols)
+            if live_exec_monitoring_membership is not None
+            else set()
+        )
+        live_exec_membership_complete = bool(
+            live_exec_monitoring_membership is not None
+            and live_exec_monitoring_membership.membership_complete
+        )
+        board_items = [
+            self._apply_direct_runtime_membership_truth(
+                item=item,
+                holdings_membership_complete=holdings_membership_complete,
+                held_position=bool(
+                    live_holding_symbols is not None
+                    and _normalize_optional_text(item.get('symbol'))
+                    in live_holding_symbols
+                ),
+                exec_membership_complete=live_exec_membership_complete,
+                exec_monitoring_active=(
+                    _normalize_optional_text(item.get('symbol'))
+                    in live_exec_monitoring_symbols
+                ),
+            )
+            for item in board_items
+        ]
+        direct_membership_symbols = {
+            *(live_holding_symbols or set()),
+            *live_exec_monitoring_symbols,
+        }
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        live_exec_monitoring_symbols = live_exec_monitoring_symbols or set()
         for item in board_items:
             symbol = _normalize_optional_text(item.get('symbol'))
             if symbol:
-                live_exec_watch = symbol in live_exec_monitoring_symbols and _normalize_optional_text(
-                    item.get('intent'), lowercase=True
-                ) in EXEC_ENTRY_BUY_INTENTS
-                if live_exec_watch:
-                    item = {
-                        **item,
-                        'approval_state': 'approved',
-                        'exec_agent_approved': True,
-                        'exec_agent_action': item.get('exec_agent_action') or 'approve',
-                        'exec_monitoring_active': True,
-                        'exec_runtime_showable': True,
-                        'exec_runtime_state': 'exec_approved_watch',
-                        'exec_runtime_exclusion_reason': None,
-                        'monitoring_statuses': sorted(
-                            {
-                                *(item.get('monitoring_statuses') or []),
-                                'watch_monitoring_active',
-                            }
-                        ),
-                    }
                 grouped[symbol].append(item)
 
         included_groups = {
@@ -5777,10 +6213,6 @@ class SignalDeciderExecIntegrationService:
             if self._should_include_monitored_symbol_group(grouped_items)
         }
         realtime_symbols = self._prioritized_runtime_symbols_for_realtime(included_groups)
-        self._observe_runtime_symbols_for_realtime_prices(
-            realtime_symbols,
-            trigger='dashboard_read_model',
-        )
         items = [
             self._build_runtime_monitored_symbol_item(
                 symbol=symbol,
@@ -5790,7 +6222,49 @@ class SignalDeciderExecIntegrationService:
             )
             for symbol in realtime_symbols
         ]
+        included_symbols = {item['symbol'] for item in items}
+        missing_symbols = sorted(direct_membership_symbols - included_symbols)
+        if missing_symbols:
+            symbol_metadata_map = self._load_symbol_metadata_map(missing_symbols)
+            items.extend(
+                self._build_direct_runtime_membership_item(
+                    symbol=symbol,
+                    market_date=resolved_market_date,
+                    metadata=symbol_metadata_map.get(symbol),
+                    held_position=bool(
+                        live_holding_symbols is not None
+                        and symbol in live_holding_symbols
+                    ),
+                    exec_monitoring_active=(
+                        symbol in live_exec_monitoring_symbols
+                    ),
+                )
+                for symbol in missing_symbols
+            )
+        item_by_symbol = {item['symbol']: item for item in items}
+        ranking_groups = dict(included_groups)
+        ranking_groups.update(
+            {
+                symbol: [item_by_symbol[symbol]]
+                for symbol in missing_symbols
+            }
+        )
+        realtime_symbols = self._prioritized_runtime_symbols_for_realtime(
+            ranking_groups
+        )
+        items = [item_by_symbol[symbol] for symbol in realtime_symbols]
         generated_at = _utcnow()
+        freshness = self._build_runtime_monitored_freshness(
+            source_freshness=board.get('freshness'),
+            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+            market_date=resolved_market_date,
+            generated_at=generated_at,
+            served_from_cache=served_from_cache,
+            runtime_status=board['runtime']['status'],
+            overview_items=board_items,
+            output_item_count=len(items),
+            refresh_state=refresh_state,
+        )
         payload = {
             'request': {
                 'market_date': board['market_date'],
@@ -5804,20 +6278,188 @@ class SignalDeciderExecIntegrationService:
                 'desired_symbol_count': len(realtime_symbols),
                 'max_subscriptions': settings.kis_realtime_price_max_subscriptions,
             },
-            'freshness': self._build_dashboard_freshness(
-                endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
-                market_date=resolved_market_date,
-                generated_at=generated_at,
-                served_from_cache=served_from_cache,
-                runtime_status=board['runtime']['status'],
-                overview_items=board_items,
-                output_item_count=len(items),
-                refresh_state=refresh_state,
-            ),
+            'source_coverage': {
+                'membership_complete': bool(
+                    holdings_membership_complete
+                    and live_exec_membership_complete
+                ),
+                'live_holdings': (
+                    holdings_membership_status
+                ),
+                'live_exec_monitoring': (
+                    'complete'
+                    if live_exec_membership_complete
+                    else 'unknown'
+                ),
+            },
+            'freshness': freshness,
             'refresh': refresh_state,
             'items': items,
         }
         return serialize_execution_monitored_symbols_payload(payload)
+
+    @staticmethod
+    def _apply_direct_runtime_membership_truth(
+        *,
+        item: dict[str, Any],
+        holdings_membership_complete: bool,
+        held_position: bool,
+        exec_membership_complete: bool,
+        exec_monitoring_active: bool,
+    ) -> dict[str, Any]:
+        result = dict(item)
+        original_exec_showable = bool(item.get('exec_runtime_showable'))
+        monitoring_state = _normalize_optional_text(
+            item.get('monitoring_state'),
+            lowercase=True,
+        )
+
+        if holdings_membership_complete:
+            result['held_position'] = held_position
+            if held_position:
+                if (
+                    _safe_decimal(item.get('position_quantity'))
+                    or Decimal('0')
+                ) <= Decimal('0'):
+                    result['position_quantity'] = None
+                result['position_side'] = 'long'
+            else:
+                result['position_quantity'] = 0
+                result['position_average_price'] = None
+                result['position_side'] = None
+                result['open_quantity'] = 0
+        elif held_position:
+            result['held_position'] = True
+            result['position_side'] = 'long'
+
+        if exec_monitoring_active:
+            result['exec_monitoring_active'] = True
+            result['exec_runtime_showable'] = True
+            result['exec_runtime_state'] = (
+                item.get('exec_runtime_state')
+                if original_exec_showable
+                or item.get('exec_agent_approved') is True
+                else 'runtime_membership_confirmed'
+            )
+            result['exec_runtime_exclusion_reason'] = None
+            result['exec_runtime_exclusion_reasons'] = []
+        elif exec_membership_complete:
+            result['exec_monitoring_active'] = False
+            result['exec_runtime_showable'] = False
+            result['exec_runtime_state'] = 'no_runtime_membership'
+            result['exec_runtime_exclusion_reason'] = (
+                'no_exec_runtime_membership'
+            )
+            result['exec_runtime_exclusion_reasons'] = [
+                'no_exec_runtime_membership'
+            ]
+
+        if held_position or exec_monitoring_active:
+            if monitoring_state in {None, UI_MONITORING_STATE_IDLE}:
+                result['monitoring_state'] = UI_MONITORING_STATE_RECONCILING
+        elif (
+            holdings_membership_complete
+            and exec_membership_complete
+            and monitoring_state
+            in {
+                UI_MONITORING_STATE_WATCHING_TARGET_STOP,
+                UI_MONITORING_STATE_RECONCILING,
+            }
+        ):
+            result['monitoring_state'] = UI_MONITORING_STATE_IDLE
+
+        monitoring_statuses = {
+            status
+            for status in (item.get('monitoring_statuses') or [])
+            if _normalize_optional_text(status)
+        }
+        if holdings_membership_complete:
+            monitoring_statuses.discard('portfolio_holding_active')
+            if held_position:
+                monitoring_statuses.add('portfolio_holding_active')
+        if exec_membership_complete or exec_monitoring_active:
+            monitoring_statuses.discard('runtime_membership_active')
+            if exec_monitoring_active:
+                monitoring_statuses.add('runtime_membership_active')
+        result['monitoring_statuses'] = sorted(monitoring_statuses)
+
+        if exec_monitoring_active and not result.get('exec_agent_approved'):
+            result.update(
+                {
+                    'exec_agent_action': None,
+                    'exec_agent_reason_code': None,
+                    'exec_agent_target_profile': None,
+                    'exec_agent_target_tag': None,
+                    'exec_agent_special_tactical_scalp': None,
+                }
+            )
+        return result
+
+    def _build_direct_runtime_membership_item(
+        self,
+        *,
+        symbol: str,
+        market_date: date,
+        metadata: dict[str, Any] | None,
+        held_position: bool,
+        exec_monitoring_active: bool,
+    ) -> dict[str, Any]:
+        resolved_metadata = metadata or {'name': symbol, 'market': None}
+        monitoring_statuses = []
+        if held_position:
+            monitoring_statuses.append('portfolio_holding_active')
+        if exec_monitoring_active:
+            monitoring_statuses.append('runtime_membership_active')
+        exclusion_reason = (
+            None
+            if exec_monitoring_active
+            else 'no_exec_runtime_membership'
+        )
+        return {
+            'symbol': symbol,
+            'name': resolved_metadata['name'],
+            'market': resolved_metadata['market'],
+            **self._price_fields_for_symbol(symbol, market_date=market_date),
+            'monitoring_state': UI_MONITORING_STATE_RECONCILING,
+            'exec_monitoring_active': exec_monitoring_active,
+            'exec_runtime_showable': exec_monitoring_active,
+            'exec_runtime_state': (
+                'runtime_membership_only'
+                if exec_monitoring_active
+                else 'portfolio_membership_only'
+            ),
+            'exec_runtime_exclusion_reason': exclusion_reason,
+            'exec_runtime_exclusion_reasons': (
+                [] if exclusion_reason is None else [exclusion_reason]
+            ),
+            'core_state_divergence_count': 0,
+            'core_state_divergence_warnings': [],
+            'exec_agent_approved': False,
+            'exec_agent_action': None,
+            'exec_agent_reason_code': None,
+            'exec_agent_target_profile': None,
+            'exec_agent_target_tag': None,
+            'exec_agent_special_tactical_scalp': None,
+            'held_position': held_position,
+            'position_quantity': None,
+            'position_average_price': None,
+            'approved_quantity': None,
+            'approved_notional': None,
+            'monitoring_statuses': monitoring_statuses,
+            'position_side': 'long' if held_position else None,
+            'planned_intents': [],
+            'tactical_actions': [],
+            'handoff_intents': [],
+            'target_price': None,
+            'stop_loss_price': None,
+            'trigger_price': None,
+            'chase_limit_price': None,
+            'expected_holding_period': None,
+            'decision_agent_names': [],
+            'last_event_at': None,
+            'account_references': [],
+            'status_counts': {},
+        }
 
     def _build_runtime_symbol_detail_payload(
         self,
@@ -6137,23 +6779,35 @@ class SignalDeciderExecIntegrationService:
             status=DASHBOARD_REFRESH_STATUS_SUCCEEDED,
         )
         live_holding_symbols = None
-        live_exec_monitoring_symbols = None
+        live_portfolio_holding_membership = None
+        live_exec_monitoring_membership = None
         if symbol is None:
             background_trigger = f'{trigger}:dashboard_background_refresh'
-            live_holding_symbols = await self._load_live_portfolio_holding_symbols(
-                trigger=background_trigger,
+            live_portfolio_holding_membership = (
+                await self._load_live_portfolio_holding_membership(
+                    market_date=target_trade_date,
+                    trigger=background_trigger,
+                )
             )
-            live_exec_monitoring_symbols = await self._load_live_exec_monitoring_symbols(
+            live_holding_symbols = (
+                set(live_portfolio_holding_membership.symbols)
+                if live_portfolio_holding_membership is not None
+                else None
+            )
+            live_exec_monitoring_membership = await self._load_live_exec_monitoring_symbols(
                 market_date=target_trade_date,
                 trigger=background_trigger,
             )
-        self._store_dashboard_caches_from_overview(
+        await self._store_dashboard_caches_from_overview(
             market_date=target_trade_date,
             symbol=symbol,
             overview=overview,
             refresh_state=refresh_state,
             live_holding_symbols=live_holding_symbols,
-            live_exec_monitoring_symbols=live_exec_monitoring_symbols,
+            live_portfolio_holding_membership=(
+                live_portfolio_holding_membership
+            ),
+            live_exec_monitoring_membership=live_exec_monitoring_membership,
         )
 
     def _finalize_dashboard_refresh_task(
@@ -6161,8 +6815,11 @@ class SignalDeciderExecIntegrationService:
         key: tuple[str, str | None, str | None],
         task: asyncio.Task,
     ) -> None:
-        if self._dashboard_refresh_tasks.get(key) is task:
-            self._dashboard_refresh_tasks.pop(key, None)
+        if self._dashboard_refresh_tasks.get(key) is not task:
+            if not task.cancelled():
+                task.exception()
+            return
+        self._dashboard_refresh_tasks.pop(key, None)
         if task.cancelled():
             return
         exc = task.exception()
@@ -6178,7 +6835,7 @@ class SignalDeciderExecIntegrationService:
                 ),
             }
 
-    def _store_dashboard_caches_from_overview(
+    async def _store_dashboard_caches_from_overview(
         self,
         *,
         market_date: date,
@@ -6186,52 +6843,95 @@ class SignalDeciderExecIntegrationService:
         overview: dict[str, Any],
         refresh_state: dict[str, Any],
         live_holding_symbols: set[str] | None = None,
-        live_exec_monitoring_symbols: set[str] | None = None,
+        live_portfolio_holding_membership: (
+            PortfolioHoldingSymbolMembership | None
+        ) = None,
+        live_exec_monitoring_membership: ExecRuntimeMonitoredSymbolMembership | None = None,
     ) -> None:
         if symbol:
-            detail = self._build_runtime_symbol_detail_payload(
+            detail_cache_key = self._dashboard_cache_key(
+                DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+                market_date,
+                symbol,
+            )
+            detail_lock = self._dashboard_build_locks.get(detail_cache_key)
+            if detail_lock is None:
+                detail_lock = asyncio.Lock()
+                self._dashboard_build_locks[detail_cache_key] = detail_lock
+            async with detail_lock:
+                detail = self._build_runtime_symbol_detail_payload(
+                    market_date=market_date,
+                    symbol=symbol,
+                    refresh=True,
+                    overview=overview,
+                    refresh_state=refresh_state,
+                    served_from_cache=False,
+                )
+                self._store_dashboard_cached_payload(
+                    endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+                    market_date=market_date,
+                    symbol=symbol,
+                    payload=detail,
+                )
+            return
+
+        board_cache_key = self._dashboard_cache_key(
+            DASHBOARD_ENDPOINT_DAILY_BOARD,
+            market_date,
+            None,
+        )
+        board_lock = self._dashboard_build_locks.get(board_cache_key)
+        if board_lock is None:
+            board_lock = asyncio.Lock()
+            self._dashboard_build_locks[board_cache_key] = board_lock
+        async with board_lock:
+            board = self._build_runtime_daily_board_payload(
                 market_date=market_date,
-                symbol=symbol,
                 refresh=True,
                 overview=overview,
                 refresh_state=refresh_state,
                 served_from_cache=False,
             )
             self._store_dashboard_cached_payload(
-                endpoint=DASHBOARD_ENDPOINT_SYMBOL_DETAIL,
+                endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
                 market_date=market_date,
-                symbol=symbol,
-                payload=detail,
+                symbol=None,
+                payload=board,
             )
-            return
 
-        board = self._build_runtime_daily_board_payload(
-            market_date=market_date,
-            refresh=True,
-            overview=overview,
-            refresh_state=refresh_state,
-            served_from_cache=False,
+        monitored_cache_key = self._dashboard_cache_key(
+            DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+            market_date,
+            None,
         )
-        self._store_dashboard_cached_payload(
-            endpoint=DASHBOARD_ENDPOINT_DAILY_BOARD,
-            market_date=market_date,
-            symbol=None,
-            payload=board,
+        monitored_lock = self._dashboard_build_locks.get(
+            monitored_cache_key
         )
-        monitored = self._build_runtime_monitored_symbols_payload(
-            board=board,
-            refresh=True,
-            refresh_state=refresh_state,
-            served_from_cache=False,
-            live_holding_symbols=live_holding_symbols,
-            live_exec_monitoring_symbols=live_exec_monitoring_symbols,
-        )
-        self._store_dashboard_cached_payload(
-            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
-            market_date=market_date,
-            symbol=None,
-            payload=monitored,
-        )
+        if monitored_lock is None:
+            monitored_lock = asyncio.Lock()
+            self._dashboard_build_locks[monitored_cache_key] = (
+                monitored_lock
+            )
+        async with monitored_lock:
+            monitored = self._build_runtime_monitored_symbols_payload(
+                board=board,
+                refresh=True,
+                refresh_state=refresh_state,
+                served_from_cache=False,
+                live_holding_symbols=live_holding_symbols,
+                live_portfolio_holding_membership=(
+                    live_portfolio_holding_membership
+                ),
+                live_exec_monitoring_membership=(
+                    live_exec_monitoring_membership
+                ),
+            )
+            self._store_dashboard_cached_payload(
+                endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+                market_date=market_date,
+                symbol=None,
+                payload=monitored,
+            )
 
     def _load_dashboard_cached_payload(
         self,
@@ -6303,13 +7003,17 @@ class SignalDeciderExecIntegrationService:
         freshness = payload.get('freshness') if isinstance(payload.get('freshness'), dict) else {}
         stale_by_cache = self._dashboard_cache_is_due(record)
         refreshing = self._dashboard_refresh_in_flight(refresh_state)
+        refresh_failed = refresh_state.get('status') in {
+            DASHBOARD_REFRESH_STATUS_FAILED,
+            DASHBOARD_REFRESH_STATUS_TIMEOUT,
+        }
         if refreshing:
             status = DASHBOARD_FRESHNESS_STATUS_REFRESHING
         elif freshness.get('status') == DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE:
             status = DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE
         elif stale_by_cache or freshness.get('is_stale'):
             status = DASHBOARD_FRESHNESS_STATUS_STALE
-        elif freshness.get('is_partial'):
+        elif refresh_failed or freshness.get('is_partial'):
             status = DASHBOARD_FRESHNESS_STATUS_PARTIAL
         else:
             status = DASHBOARD_FRESHNESS_STATUS_FRESH
@@ -6322,6 +7026,9 @@ class SignalDeciderExecIntegrationService:
             'cache_age_seconds': self._dashboard_cache_age_seconds(record),
             'cache_ttl_seconds': self.dashboard_cache_ttl_seconds,
             'is_stale': bool(stale_by_cache or freshness.get('is_stale')),
+            'is_partial': bool(
+                refresh_failed or freshness.get('is_partial')
+            ),
             'refreshing': refreshing,
         }
         payload['freshness'] = freshness
@@ -6389,6 +7096,143 @@ class SignalDeciderExecIntegrationService:
             'readback_synced_count': readback_synced_count,
             'readback_missing_count': readback_missing_count,
             'overview_item_count': len(overview_items),
+            'output_item_count': output_item_count,
+        })
+
+    def _build_runtime_monitored_freshness(
+        self,
+        *,
+        source_freshness: object,
+        endpoint: str,
+        market_date: date,
+        generated_at: datetime,
+        served_from_cache: bool,
+        runtime_status: str,
+        overview_items: Sequence[dict[str, Any]],
+        output_item_count: int,
+        refresh_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(source_freshness, dict)
+            or source_freshness.get('schema_version')
+            != DASHBOARD_READ_MODEL_SCHEMA_VERSION
+            or source_freshness.get('endpoint')
+            != DASHBOARD_ENDPOINT_DAILY_BOARD
+            or source_freshness.get('market_date') != market_date.isoformat()
+            or source_freshness.get('status')
+            not in {
+                DASHBOARD_FRESHNESS_STATUS_FRESH,
+                DASHBOARD_FRESHNESS_STATUS_STALE,
+                DASHBOARD_FRESHNESS_STATUS_PARTIAL,
+                DASHBOARD_FRESHNESS_STATUS_REFRESHING,
+                DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE,
+            }
+            or _parse_iso_datetime(source_freshness.get('generated_at')) is None
+        ):
+            fallback = self._build_dashboard_freshness(
+                endpoint=endpoint,
+                market_date=market_date,
+                generated_at=generated_at,
+                served_from_cache=served_from_cache,
+                runtime_status=runtime_status,
+                overview_items=overview_items,
+                output_item_count=output_item_count,
+                refresh_state=refresh_state,
+            )
+            return serialize_execution_dashboard_freshness_payload({
+                **fallback,
+                'status': DASHBOARD_FRESHNESS_STATUS_PARTIAL,
+                'is_partial': True,
+            })
+
+        source_status = source_freshness['status']
+        source_refreshing = bool(
+            source_status == DASHBOARD_FRESHNESS_STATUS_REFRESHING
+            or source_freshness.get('refreshing')
+        )
+        source_unavailable = source_status == DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE
+        source_stale = bool(
+            source_status == DASHBOARD_FRESHNESS_STATUS_STALE
+            or source_freshness.get('is_stale')
+        )
+        source_partial = bool(
+            source_status == DASHBOARD_FRESHNESS_STATUS_PARTIAL
+            or source_freshness.get('is_partial')
+            or refresh_state.get('status')
+            in {
+                DASHBOARD_REFRESH_STATUS_FAILED,
+                DASHBOARD_REFRESH_STATUS_TIMEOUT,
+            }
+        )
+        refreshing = bool(
+            self._dashboard_refresh_in_flight(refresh_state)
+            or source_refreshing
+        )
+        if refreshing:
+            status = DASHBOARD_FRESHNESS_STATUS_REFRESHING
+        elif source_unavailable:
+            status = DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE
+        elif source_stale:
+            status = DASHBOARD_FRESHNESS_STATUS_STALE
+        elif source_partial:
+            status = DASHBOARD_FRESHNESS_STATUS_PARTIAL
+        else:
+            status = DASHBOARD_FRESHNESS_STATUS_FRESH
+
+        effective_served_from_cache = bool(
+            served_from_cache or source_freshness.get('served_from_cache')
+        )
+
+        def nonnegative_int(field: str, default: int = 0) -> int:
+            value = source_freshness.get(field)
+            return value if isinstance(value, int) and value >= 0 else default
+
+        readback_age_seconds = source_freshness.get('readback_age_seconds')
+        if not isinstance(readback_age_seconds, int) or readback_age_seconds < 0:
+            readback_age_seconds = None
+        last_readback_synced_at = source_freshness.get(
+            'last_readback_synced_at'
+        )
+        if not isinstance(last_readback_synced_at, str):
+            last_readback_synced_at = None
+
+        return serialize_execution_dashboard_freshness_payload({
+            'schema_version': DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+            'endpoint': endpoint,
+            'market_date': market_date.isoformat(),
+            'status': status,
+            'served_from_cache': effective_served_from_cache,
+            'read_model_source': (
+                'in_process_cache'
+                if effective_served_from_cache
+                else source_freshness.get('read_model_source')
+                or 'persisted_exec_read_model'
+            ),
+            'generated_at': generated_at.isoformat(),
+            'cached_at': generated_at.isoformat(),
+            'cache_age_seconds': nonnegative_int('cache_age_seconds'),
+            'cache_ttl_seconds': self.dashboard_cache_ttl_seconds,
+            'is_stale': bool(
+                source_stale
+                or status
+                in {
+                    DASHBOARD_FRESHNESS_STATUS_STALE,
+                    DASHBOARD_FRESHNESS_STATUS_UNAVAILABLE,
+                }
+            ),
+            'is_partial': bool(
+                source_partial
+                or status == DASHBOARD_FRESHNESS_STATUS_PARTIAL
+            ),
+            'refreshing': refreshing,
+            'last_readback_synced_at': last_readback_synced_at,
+            'readback_age_seconds': readback_age_seconds,
+            'readback_synced_count': nonnegative_int('readback_synced_count'),
+            'readback_missing_count': nonnegative_int('readback_missing_count'),
+            'overview_item_count': nonnegative_int(
+                'overview_item_count',
+                len(overview_items),
+            ),
             'output_item_count': output_item_count,
         })
 
@@ -6489,7 +7333,23 @@ class SignalDeciderExecIntegrationService:
 
     @staticmethod
     def _dashboard_cache_age_seconds(record: DashboardReadModelCacheRecord) -> int:
-        return max(int((_utcnow() - record.cached_at).total_seconds()), 0)
+        own_cache_age_seconds = max(
+            int((_utcnow() - record.cached_at).total_seconds()),
+            0,
+        )
+        freshness = (
+            record.payload.get('freshness')
+            if isinstance(record.payload.get('freshness'), dict)
+            else {}
+        )
+        inherited_cache_age_seconds = freshness.get('cache_age_seconds')
+        if (
+            not isinstance(inherited_cache_age_seconds, int)
+            or isinstance(inherited_cache_age_seconds, bool)
+            or inherited_cache_age_seconds < 0
+        ):
+            inherited_cache_age_seconds = 0
+        return inherited_cache_age_seconds + own_cache_age_seconds
 
     @staticmethod
     def _seconds_since(value: Any) -> int | None:
@@ -11210,6 +12070,10 @@ class SignalDeciderExecIntegrationService:
         ]
         exec_runtime_showable = any(bool(item.get('exec_runtime_showable')) for item in items)
         exec_monitoring_active = any(bool(item.get('exec_monitoring_active')) for item in items)
+        held_position = bool(
+            position_quantity > Decimal('0')
+            or any(bool(item.get('held_position')) for item in items)
+        )
         return {
             'symbol': symbol,
             'name': first.get('name') or symbol,
@@ -11231,8 +12095,14 @@ class SignalDeciderExecIntegrationService:
             'exec_agent_target_profile': first_value('exec_agent_target_profile'),
             'exec_agent_target_tag': first_value('exec_agent_target_tag'),
             'exec_agent_special_tactical_scalp': first_value('exec_agent_special_tactical_scalp'),
-            'held_position': position_quantity > Decimal('0') or any(bool(item.get('held_position')) for item in items),
-            'position_quantity': _to_json_number(position_quantity),
+            'held_position': held_position,
+            'position_quantity': (
+                _to_json_number(position_quantity)
+                if position_quantity > Decimal('0')
+                else None
+                if held_position
+                else 0
+            ),
             'position_average_price': _to_json_number(position_average_price),
             'approved_quantity': _to_json_number(approved_quantity if approved_quantity > Decimal('0') else None),
             'approved_notional': _decimal_to_text(approved_notional if approved_notional > Decimal('0') else None),
@@ -11336,6 +12206,12 @@ class SignalDeciderExecIntegrationService:
             monitoring_state = _normalize_optional_text(item.get('monitoring_state'), lowercase=True)
             intent = _normalize_optional_text(item.get('intent'), lowercase=True)
             open_quantity = _safe_decimal(item.get('open_quantity')) or Decimal('0')
+            if item.get('held_position'):
+                priority = max(priority, 500)
+                continue
+            if monitoring_state == UI_MONITORING_STATE_RECONCILING:
+                priority = max(priority, 400)
+                continue
             has_target_stop = bool(
                 set(item.get('planned_intents') or []) & {EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL}
             ) or any(
@@ -11376,17 +12252,6 @@ class SignalDeciderExecIntegrationService:
             if item.get('planned_intents') or cls._has_target_stop_watch_facts(item):
                 priority = max(priority, 100)
         return priority
-
-    @staticmethod
-    def _observe_runtime_symbols_for_realtime_prices(symbols: Iterable[Any], *, trigger: str) -> None:
-        try:
-            kis_realtime_price_service.observe_monitored_symbols(
-                symbols,
-                trigger=trigger,
-                preserve_order=True,
-            )
-        except Exception:
-            pass
 
     @staticmethod
     def _price_fields_for_symbol(symbol: Any, *, market_date: date) -> dict[str, Any]:

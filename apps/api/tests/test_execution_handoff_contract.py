@@ -820,11 +820,17 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                 'market_date': '2026-04-30',
                 'summary': {'items_total': 1, 'watching_target_stop': 1},
                 'realtime_subscription': {'desired_symbols': ['005930'], 'desired_symbol_count': 1, 'max_subscriptions': 40},
+                'source_coverage': {
+                    'membership_complete': True,
+                    'live_holdings': 'complete',
+                    'live_exec_monitoring': 'complete',
+                },
                 'freshness': self._freshness(endpoint='monitored_symbols', status='partial'),
                 'refresh': self._refresh(status='scheduled'),
                 'items': [self._monitored_symbol_item()],
             }
         )
+        self.assertTrue(monitored['source_coverage']['membership_complete'])
         detail = serialize_execution_symbol_detail_payload(
             {
                 'request': {'market_date': '2026-04-30', 'symbol': '005930', 'refresh': False},

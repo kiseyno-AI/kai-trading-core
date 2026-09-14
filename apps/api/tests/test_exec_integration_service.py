@@ -40,6 +40,8 @@ from app.orders.exec_integration import (
     EXEC_INTENT_NEXT_OPEN_BUY,
     EXEC_INTENT_STOP_SELL,
     EXEC_INTENT_TARGET_SELL,
+    ExecRuntimeMonitoredSymbolMembership,
+    PortfolioHoldingSymbolMembership,
     SignalDeciderExecClientError,
     SignalDeciderExecIntegrationService,
     SignalDeciderExecPayloadContractError,
@@ -60,6 +62,7 @@ from app.orders.execution_handoff_contract import (
     EXECUTION_HANDOFF_CAPABILITY,
     EXECUTION_HANDOFF_CONTRACT_VERSION,
     EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION,
+    EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
     EXECUTION_REVOCATION_CAPABILITY,
     EXECUTION_REVOCATION_SCHEMA_VERSION,
     serialize_execution_plan_dispatch_payload,
@@ -81,6 +84,49 @@ from app.orders.next_open_execution import (
     _short_term_entry_quality_blocks,
     signal_decider_next_open_execution_service,
 )
+from app.quotes.kis_realtime_prices import KISRealtimePriceService
+
+
+def _runtime_monitored_membership_payload(
+    symbols: list[str],
+    *,
+    market_date: str = '2026-04-30',
+    generated_at: str = '2026-04-30T00:00:00+00:00',
+    membership_complete: bool = True,
+) -> dict:
+    return {
+        'schema_version': 'runtime_monitored_symbol_membership_v1',
+        'market_date': market_date,
+        'generated_at': generated_at,
+        'membership_complete': membership_complete,
+        'symbols': symbols,
+        'membership_scope': {
+            'market': 'KRX',
+            'exchanges': ['KOSDAQ', 'KOSPI', 'KRX', 'NXT', 'SOR'],
+        },
+        'coverage': {
+            'status': 'complete' if membership_complete else 'unavailable',
+            'reason': None if membership_complete else 'test_coverage_unavailable',
+            'provider': 'kis',
+            'runtime_mode': 'mock',
+            'execution_scope': {
+                'provider': 'kis',
+                'status': 'available' if membership_complete else 'unavailable',
+                'source': 'configured_broker_account' if membership_complete else None,
+                'reason': None if membership_complete else 'test_scope_unavailable',
+                'exchanges': [
+                    'AMEX',
+                    'KOSDAQ',
+                    'KOSPI',
+                    'KRX',
+                    'NASD',
+                    'NXT',
+                    'NYSE',
+                    'SOR',
+                ],
+            },
+        },
+    }
 
 
 class FakeExecClient:
@@ -105,11 +151,13 @@ class FakeExecClient:
         self.revocation_calls: list[dict] = []
         self.dispatch_events: list[str] = []
         self.runtime_calls = 0
+        self.runtime_membership_calls = 0
         self.plan_calls: list[dict] = []
         self.order_calls: list[dict] = []
         self.execution_calls: list[dict] = []
         self.position_calls: list[dict] = []
         self.runtime_response: dict = {'ready': True, 'mode': 'mock'}
+        self.runtime_membership_response = _runtime_monitored_membership_payload([])
         self.plan_response: dict = {'items': []}
         self.order_response: dict = {'items': []}
         self.execution_response: dict = {'items': []}
@@ -124,6 +172,10 @@ class FakeExecClient:
     async def get_runtime_status(self) -> dict:
         self.runtime_calls += 1
         return self.runtime_response
+
+    async def get_runtime_monitored_symbol_membership(self) -> dict:
+        self.runtime_membership_calls += 1
+        return self.runtime_membership_response
 
     async def post_execution_plan(self, payload: dict) -> dict:
         self.dispatch_events.append('plan')
@@ -8256,7 +8308,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
-            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+            patch.object(self.service, '_load_live_portfolio_holding_membership', new=AsyncMock(return_value=None)),
+            patch.object(
+                self.service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(
+                    return_value=ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({self.symbol}),
+                        membership_complete=True,
+                    )
+                ),
+            ),
         ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
@@ -8353,7 +8415,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
-            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+            patch.object(self.service, '_load_live_portfolio_holding_membership', new=AsyncMock(return_value=None)),
+            patch.object(
+                self.service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(
+                    return_value=ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({self.symbol}),
+                        membership_complete=True,
+                    )
+                ),
+            ),
         ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
@@ -8611,7 +8683,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_symbol['RNO']['exec_runtime_state'], 'exec_agent_rejected')
         self.assertEqual(by_symbol['RNO']['exec_runtime_exclusion_reason'], 'exec_agent_rejected')
 
-    async def test_runtime_monitored_symbols_overlay_live_exec_watch_from_runtime_snapshot(self) -> None:
+    async def test_runtime_membership_does_not_infer_plan_approval(self) -> None:
         core_only = self.service._build_runtime_board_item(
             item={
                 'plan_item_id': 9003,
@@ -8659,43 +8731,867 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 refresh=False,
                 refresh_state={'requested': False, 'status': 'not_requested'},
                 served_from_cache=False,
-                live_exec_monitoring_symbols={self.symbol},
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({self.symbol}),
+                        membership_complete=True,
+                    )
+                ),
             )
 
         item = payload['items'][0]
-        self.assertTrue(item['exec_agent_approved'])
+        self.assertFalse(item['exec_agent_approved'])
         self.assertTrue(item['exec_monitoring_active'])
         self.assertTrue(item['exec_runtime_showable'])
-        self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
+        self.assertEqual(item['exec_runtime_state'], 'runtime_membership_confirmed')
         self.assertIsNone(item['exec_runtime_exclusion_reason'])
-        self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
+        self.assertIsNone(item['exec_agent_action'])
+        self.assertIn('runtime_membership_active', item['monitoring_statuses'])
 
-    async def test_runtime_monitored_symbols_extracts_exec_monitored_symbol_list(self) -> None:
-        payload = {
-            'liveness': {
-                'autonomous': {
-                    'monitoring': {
-                        'last_cycle': {
-                            'monitored_symbols': ['005930', '000660', '005930'],
-                            'items': [
-                                {
-                                    'symbol': 'SHOULD_NOT_LIMIT_TO_ITEMS',
-                                    'intent': 'intraday_watch_buy',
-                                    'status': 'watch_monitoring_active',
-                                }
+    async def test_runtime_membership_does_not_relabel_same_symbol_rejection(
+        self,
+    ) -> None:
+        rejected = {
+            'symbol': '005930',
+            'name': 'Samsung',
+            'market': 'KOSPI',
+            'status': 'failed',
+            'monitoring_state': 'idle',
+            'planned_intents': ['target_sell'],
+            'exec_monitoring_active': False,
+            'exec_runtime_showable': False,
+            'exec_runtime_state': 'exec_agent_rejected',
+            'exec_runtime_exclusion_reason': 'exec_agent_rejected',
+            'exec_agent_approved': False,
+            'exec_agent_action': 'reject',
+            'exec_agent_reason_code': 'expired_setup',
+            'held_position': False,
+            'position_quantity': 0,
+            'monitoring_statuses': ['rejected'],
+        }
+        with patch(
+            'app.orders.exec_integration.kis_realtime_price_service'
+        ) as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {'status': 'ready', 'mode': 'mock'},
+                    'items': [rejected],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({'005930'}),
+                        membership_complete=True,
+                    )
+                ),
+            )
+
+        item = payload['items'][0]
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertEqual(item['exec_runtime_state'], 'runtime_membership_confirmed')
+        self.assertIsNone(item['exec_agent_action'])
+        self.assertIsNone(item['exec_agent_reason_code'])
+
+    async def test_live_portfolio_holding_symbols_require_fresh_complete_positions(
+        self,
+    ) -> None:
+        cases = [
+            (
+                'missing_holdings',
+                {
+                    'sync': {'status': 'stale'},
+                    'freshness': {'isStale': False},
+                    'accounts': [{'id': self.account_reference}],
+                },
+                None,
+            ),
+            (
+                'stale_empty',
+                {
+                    'sync': {'status': 'synced'},
+                    'freshness': {'isStale': True},
+                    'accounts': [
+                        {'id': self.account_reference, 'holdings': []}
+                    ],
+                },
+                None,
+            ),
+            (
+                'missing_freshness_proof',
+                {
+                    'sync': {'status': 'synced'},
+                    'freshness': {},
+                    'accounts': [
+                        {'id': self.account_reference, 'holdings': []}
+                    ],
+                },
+                None,
+            ),
+            (
+                'malformed_holding',
+                {
+                    'sync': {'status': 'synced'},
+                    'freshness': {'isStale': False},
+                    'accounts': [
+                        {'id': self.account_reference, 'holdings': ['bad-row']}
+                    ],
+                },
+                None,
+            ),
+            (
+                'invalid_holding_quantity',
+                {
+                    'sync': {'status': 'synced'},
+                    'freshness': {'isStale': False},
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'holdings': [
+                                {'symbol': self.symbol, 'quantity': 'invalid'}
                             ],
                         }
-                    }
-                }
+                    ],
+                },
+                None,
+            ),
+            (
+                'negative_holding_quantity',
+                {
+                    'sync': {'status': 'synced'},
+                    'freshness': {'isStale': False},
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'holdings': [
+                                {'symbol': self.symbol, 'quantity': '-1'}
+                            ],
+                        }
+                    ],
+                },
+                None,
+            ),
+            (
+                'non_krx_holding_symbol',
+                {
+                    'sync': {'status': 'synced'},
+                    'freshness': {'isStale': False},
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'holdings': [
+                                {'symbol': 'AAPL', 'quantity': '1'}
+                            ],
+                        }
+                    ],
+                },
+                None,
+            ),
+            (
+                'unicode_digit_holding_symbol',
+                {
+                    'sync': {'status': 'synced'},
+                    'freshness': {
+                        'isStale': False,
+                        'refreshInFlight': False,
+                    },
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'holdings': [
+                                {'symbol': '００５９３０', 'quantity': '1'}
+                            ],
+                        }
+                    ],
+                },
+                None,
+            ),
+            (
+                'refresh_in_flight',
+                {
+                    'asOf': '2026-04-30T00:00:00+00:00',
+                    'source': 'kis_portfolio_summary_v1',
+                    'accountCoverage': {
+                        'status': 'complete',
+                        'configuredCount': 1,
+                        'returnedCount': 1,
+                    },
+                    'sync': {'status': 'synced'},
+                    'freshness': {
+                        'isStale': False,
+                        'refreshInFlight': True,
+                    },
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'broker': 'kis',
+                            'holdings': [],
+                            'holdingsCompleteness': {'status': 'complete'},
+                        }
+                    ],
+                },
+                None,
+            ),
+            (
+                'fresh_explicit_empty',
+                {
+                    'asOf': '2026-04-30T00:00:00+00:00',
+                    'source': 'kis_portfolio_summary_v1',
+                    'accountCoverage': {
+                        'status': 'complete',
+                        'configuredCount': 1,
+                        'returnedCount': 1,
+                    },
+                    'sync': {'status': 'synced'},
+                    'freshness': {
+                        'isStale': False,
+                        'refreshInFlight': False,
+                    },
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'broker': 'kis',
+                            'holdings': [],
+                            'holdingsCompleteness': {'status': 'complete'},
+                        }
+                    ],
+                },
+                set(),
+            ),
+            (
+                'summary_degraded_positions_complete',
+                {
+                    'asOf': '2026-04-30T00:00:00+00:00',
+                    'source': 'kis_portfolio_summary_v1',
+                    'accountCoverage': {
+                        'status': 'complete',
+                        'configuredCount': 1,
+                        'returnedCount': 1,
+                    },
+                    'sync': {'status': 'stale'},
+                    'freshness': {
+                        'isStale': False,
+                        'refreshInFlight': False,
+                    },
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'broker': 'kis',
+                            'holdingsCompleteness': {'status': 'complete'},
+                            'holdings': [
+                                {'symbol': '005930', 'quantity': 5}
+                            ],
+                        }
+                    ],
+                },
+                {'005930'},
+            ),
+        ]
+
+        for label, payload, expected in cases:
+            with self.subTest(case=label), patch(
+                'app.orders.exec_integration.portfolio_summary_service.'
+                'get_portfolio_summary',
+                new=AsyncMock(return_value=payload),
+            ):
+                service = SignalDeciderExecIntegrationService(
+                    client=FakeExecClient()
+                )
+                actual = await service._load_live_portfolio_holding_symbols(
+                    trigger='test'
+                )
+            self.assertEqual(actual, expected)
+
+    async def test_portfolio_membership_preserves_positive_facts_until_exact_empty(
+        self,
+    ) -> None:
+        def portfolio_payload(
+            symbols: list[str],
+            *,
+            generated_at: str,
+            complete: bool,
+        ) -> dict:
+            account = {
+                'id': self.account_reference,
+                'broker': 'kis',
+                'holdingsCompleteness': {
+                    'status': 'complete' if complete else 'incomplete',
+                },
             }
+            rows = [
+                {'symbol': symbol, 'quantity': 1}
+                for symbol in symbols
+            ]
+            if complete:
+                account['holdings'] = rows
+            else:
+                account['observedHoldings'] = rows
+            return {
+                'asOf': generated_at,
+                'source': 'kis_portfolio_summary_v1',
+                'accountCoverage': {
+                    'status': 'complete',
+                    'configuredCount': 1,
+                    'returnedCount': 1,
+                },
+                'sync': {'status': 'synced' if complete else 'stale'},
+                'freshness': {
+                    'isStale': not complete,
+                    'refreshInFlight': False,
+                },
+                'accounts': [account],
+            }
+
+        with patch(
+            'app.orders.exec_integration.portfolio_summary_service.'
+            'get_portfolio_summary',
+            new=AsyncMock(
+                return_value=portfolio_payload(
+                    ['005930'],
+                    generated_at='2026-04-30T00:00:00+00:00',
+                    complete=True,
+                )
+            ),
+        ):
+            complete = (
+                await self.service._load_live_portfolio_holding_membership(
+                    market_date=self.target_trade_date,
+                    trigger='complete',
+                )
+            )
+
+        with patch(
+            'app.orders.exec_integration.portfolio_summary_service.'
+            'get_portfolio_summary',
+            new=AsyncMock(side_effect=RuntimeError('transport failed')),
+        ):
+            failed = (
+                await self.service._load_live_portfolio_holding_membership(
+                    market_date=self.target_trade_date,
+                    trigger='failed',
+                )
+            )
+
+        with patch(
+            'app.orders.exec_integration.portfolio_summary_service.'
+            'get_portfolio_summary',
+            new=AsyncMock(
+                return_value=portfolio_payload(
+                    ['027710'],
+                    generated_at='2026-04-30T00:00:01+00:00',
+                    complete=False,
+                )
+            ),
+        ):
+            partial = (
+                await self.service._load_live_portfolio_holding_membership(
+                    market_date=self.target_trade_date,
+                    trigger='partial',
+                )
+            )
+
+        with patch(
+            'app.orders.exec_integration.portfolio_summary_service.'
+            'get_portfolio_summary',
+            new=AsyncMock(
+                return_value=portfolio_payload(
+                    [],
+                    generated_at='2026-04-30T00:00:02+00:00',
+                    complete=True,
+                )
+            ),
+        ):
+            empty = (
+                await self.service._load_live_portfolio_holding_membership(
+                    market_date=self.target_trade_date,
+                    trigger='empty',
+                )
+            )
+
+        self.assertEqual(
+            complete,
+            PortfolioHoldingSymbolMembership(
+                symbols=frozenset({'005930'}),
+                membership_complete=True,
+                source_version=datetime(
+                    2026, 4, 30, 0, 0, tzinfo=timezone.utc
+                ),
+            ),
+        )
+        self.assertEqual(failed.symbols, frozenset({'005930'}))
+        self.assertFalse(failed.membership_complete)
+        self.assertEqual(
+            partial.symbols,
+            frozenset({'005930', '027710'}),
+        )
+        self.assertFalse(partial.membership_complete)
+        self.assertEqual(empty.symbols, frozenset())
+        self.assertTrue(empty.membership_complete)
+
+    async def test_portfolio_membership_does_not_cross_market_dates(self) -> None:
+        load = AsyncMock()
+        with patch(
+            'app.orders.exec_integration.portfolio_summary_service.'
+            'get_portfolio_summary',
+            load,
+        ):
+            membership = (
+                await self.service._load_live_portfolio_holding_membership(
+                    market_date=self.market_date,
+                    trigger='historical',
+                )
+            )
+
+        self.assertIsNone(membership)
+        load.assert_not_awaited()
+
+    async def test_equal_version_portfolio_coverage_conflict_stays_partial(
+        self,
+    ) -> None:
+        partial_payload = {
+            'asOf': '2026-04-30T00:00:00+00:00',
+            'source': 'kis_portfolio_summary_v1',
+            'accountCoverage': {
+                'status': 'complete',
+                'configuredCount': 1,
+                'returnedCount': 1,
+            },
+            'freshness': {
+                'isStale': True,
+                'refreshInFlight': False,
+            },
+            'accounts': [
+                {
+                    'id': self.account_reference,
+                    'broker': 'kis',
+                    'holdingsCompleteness': {'status': 'incomplete'},
+                    'observedHoldings': [],
+                }
+            ],
+        }
+        complete_payload = copy.deepcopy(partial_payload)
+        complete_payload['freshness']['isStale'] = False
+        complete_payload['accounts'][0].pop('observedHoldings')
+        complete_payload['accounts'][0]['holdings'] = []
+        complete_payload['accounts'][0]['holdingsCompleteness'] = {
+            'status': 'complete'
         }
 
-        symbols = self.service._extract_live_exec_monitoring_symbols(
-            payload=payload,
-            market_date=self.target_trade_date,
+        with patch(
+            'app.orders.exec_integration.portfolio_summary_service.'
+            'get_portfolio_summary',
+            new=AsyncMock(side_effect=[partial_payload, complete_payload]),
+        ):
+            partial = (
+                await self.service._load_live_portfolio_holding_membership(
+                    market_date=self.target_trade_date,
+                    trigger='partial',
+                )
+            )
+            conflicting_complete = (
+                await self.service._load_live_portfolio_holding_membership(
+                    market_date=self.target_trade_date,
+                    trigger='conflicting-complete',
+                )
+            )
+
+        self.assertFalse(partial.membership_complete)
+        self.assertFalse(conflicting_complete.membership_complete)
+
+    async def test_live_exec_monitoring_symbols_require_complete_current_snapshot(
+        self,
+    ) -> None:
+        cases = [
+            ('missing_contract', {}, None),
+            (
+                'incomplete',
+                _runtime_monitored_membership_payload(
+                    [],
+                    membership_complete=False,
+                ),
+                (frozenset(), False),
+            ),
+            (
+                'incomplete_known_domestic_symbol',
+                {
+                    **_runtime_monitored_membership_payload(
+                        ['027710'],
+                        membership_complete=False,
+                    ),
+                    'coverage': {
+                        **_runtime_monitored_membership_payload(
+                            [],
+                            membership_complete=False,
+                        )['coverage'],
+                        'execution_scope': {
+                            **_runtime_monitored_membership_payload(
+                                [],
+                                membership_complete=False,
+                            )['coverage']['execution_scope'],
+                            'status': 'available',
+                            'reason': None,
+                        },
+                    },
+                },
+                (frozenset({'027710'}), False),
+            ),
+            (
+                'wrong_market_date',
+                _runtime_monitored_membership_payload(
+                    [],
+                    market_date=self.market_date.isoformat(),
+                ),
+                None,
+            ),
+            (
+                'naive_generated_at',
+                _runtime_monitored_membership_payload(
+                    [],
+                    generated_at='2026-04-30T00:00:00',
+                ),
+                None,
+            ),
+            (
+                'future_generated_at',
+                _runtime_monitored_membership_payload(
+                    [],
+                    generated_at='2026-04-30T00:02:00+00:00',
+                ),
+                None,
+            ),
+            (
+                'stale_same_market_date_generated_at',
+                _runtime_monitored_membership_payload(
+                    [],
+                    generated_at='2026-04-29T15:00:00+00:00',
+                ),
+                None,
+            ),
+            (
+                'unavailable_coverage',
+                {
+                    **_runtime_monitored_membership_payload([]),
+                    'coverage': {
+                        **_runtime_monitored_membership_payload([])['coverage'],
+                        'status': 'unavailable',
+                    },
+                },
+                None,
+            ),
+            (
+                'wrong_provider',
+                {
+                    **_runtime_monitored_membership_payload([]),
+                    'coverage': {
+                        **_runtime_monitored_membership_payload([])['coverage'],
+                        'provider': 'mock',
+                    },
+                },
+                None,
+            ),
+            (
+                'scope_without_krx',
+                {
+                    **_runtime_monitored_membership_payload([]),
+                    'coverage': {
+                        **_runtime_monitored_membership_payload([])['coverage'],
+                        'execution_scope': {
+                            **_runtime_monitored_membership_payload([])['coverage']['execution_scope'],
+                            'exchanges': ['NYSE'],
+                        },
+                    },
+                },
+                None,
+            ),
+            (
+                'complete_scope_without_broker_proof',
+                {
+                    **_runtime_monitored_membership_payload([]),
+                    'coverage': {
+                        **_runtime_monitored_membership_payload([])['coverage'],
+                        'execution_scope': {
+                            **_runtime_monitored_membership_payload([])['coverage']['execution_scope'],
+                            'source': None,
+                            'reason': 'broker_scope_unknown',
+                            'exchanges': ['KRX', 'NYSE'],
+                        },
+                    },
+                },
+                None,
+            ),
+            (
+                'unsorted_or_duplicate_symbols',
+                _runtime_monitored_membership_payload(
+                    [self.symbol, '000660', self.symbol],
+                ),
+                None,
+            ),
+            (
+                'complete_empty',
+                _runtime_monitored_membership_payload([]),
+                (frozenset(), True),
+            ),
+            (
+                'complete_rejects_non_domestic_symbols',
+                _runtime_monitored_membership_payload(
+                    ['005930', 'AAPL'],
+                ),
+                None,
+            ),
+            (
+                'complete_rejects_unicode_digit_symbols',
+                _runtime_monitored_membership_payload(
+                    ['005930', '００５９３０'],
+                ),
+                None,
+            ),
+        ]
+
+        for label, payload, expected in cases:
+            with self.subTest(case=label):
+                client = FakeExecClient()
+                client.runtime_membership_response = payload
+                service = SignalDeciderExecIntegrationService(client=client)
+                actual = await service._load_live_exec_monitoring_symbols(
+                    market_date=self.target_trade_date,
+                    trigger='test',
+                )
+            if expected is None:
+                self.assertIsNone(actual)
+            else:
+                self.assertIsNotNone(actual)
+                self.assertEqual(actual.symbols, expected[0])
+                self.assertEqual(actual.membership_complete, expected[1])
+                self.assertEqual(
+                    actual.source_version,
+                    datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc),
+                )
+
+        calls_before_historical_read = self.client.runtime_membership_calls
+        historical = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.market_date,
+            trigger='test-historical',
+        )
+        self.assertIsNone(historical)
+        self.assertEqual(
+            self.client.runtime_membership_calls,
+            calls_before_historical_read,
         )
 
-        self.assertEqual(symbols, {'005930', '000660'})
+    async def test_delayed_older_exec_membership_cannot_replace_newer_snapshot(
+        self,
+    ) -> None:
+        older_started = asyncio.Event()
+        release_older = asyncio.Event()
+        request_count = 0
+
+        async def load_membership() -> dict:
+            nonlocal request_count
+            request_count += 1
+            if request_count == 1:
+                older_started.set()
+                await release_older.wait()
+                return _runtime_monitored_membership_payload(
+                    ['005930'],
+                    generated_at='2026-04-30T00:00:01+00:00',
+                )
+            return _runtime_monitored_membership_payload(
+                ['027710'],
+                generated_at='2026-04-30T00:00:02+00:00',
+            )
+
+        self.client.get_runtime_monitored_symbol_membership = load_membership
+        older_task = asyncio.create_task(
+            self.service._load_live_exec_monitoring_symbols(
+                market_date=self.target_trade_date,
+                trigger='older-request',
+            )
+        )
+        await asyncio.wait_for(older_started.wait(), timeout=1)
+        newer = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='newer-request',
+        )
+        release_older.set()
+        older = await asyncio.wait_for(older_task, timeout=1)
+
+        self.assertIsNotNone(newer)
+        self.assertEqual(newer.symbols, frozenset({'027710'}))
+        self.assertIsNotNone(older)
+        self.assertEqual(older, newer)
+
+    async def test_future_exec_membership_cannot_poison_source_watermark(
+        self,
+    ) -> None:
+        self.client.runtime_membership_response = (
+            _runtime_monitored_membership_payload(
+                ['005930'],
+                generated_at='2026-04-30T01:00:00+00:00',
+            )
+        )
+        rejected = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='future',
+        )
+        self.client.runtime_membership_response = (
+            _runtime_monitored_membership_payload(
+                ['027710'],
+                generated_at='2026-04-30T00:00:01+00:00',
+            )
+        )
+        current = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='current',
+        )
+
+        self.assertIsNone(rejected)
+        self.assertIsNotNone(current)
+        self.assertEqual(current.symbols, frozenset({'027710'}))
+        self.assertTrue(current.membership_complete)
+
+    async def test_equal_version_exec_membership_conflict_fails_closed(
+        self,
+    ) -> None:
+        self.client.runtime_membership_response = (
+            _runtime_monitored_membership_payload(['005930'])
+        )
+        first = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='first',
+        )
+        self.client.runtime_membership_response = (
+            _runtime_monitored_membership_payload(['027710'])
+        )
+        conflict = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='conflict',
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(conflict)
+        self.assertEqual(
+            conflict.symbols,
+            frozenset({'005930', '027710'}),
+        )
+        self.assertFalse(conflict.membership_complete)
+
+    async def test_newer_incomplete_exec_membership_preserves_known_symbols(
+        self,
+    ) -> None:
+        self.client.runtime_membership_response = (
+            _runtime_monitored_membership_payload(
+                ['005930'],
+                generated_at='2026-04-30T00:00:01+00:00',
+            )
+        )
+        complete = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='complete',
+        )
+        incomplete_payload = _runtime_monitored_membership_payload(
+            ['027710'],
+            generated_at='2026-04-30T00:00:02+00:00',
+            membership_complete=False,
+        )
+        incomplete_payload['coverage']['execution_scope'] = {
+            **incomplete_payload['coverage']['execution_scope'],
+            'status': 'available',
+            'source': 'configured_broker_account',
+            'reason': None,
+        }
+        self.client.runtime_membership_response = incomplete_payload
+        incomplete = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='incomplete',
+        )
+
+        self.assertIsNotNone(complete)
+        self.assertEqual(complete.symbols, frozenset({'005930'}))
+        self.assertTrue(complete.membership_complete)
+        self.assertIsNotNone(incomplete)
+        self.assertEqual(
+            incomplete.symbols,
+            frozenset({'005930', '027710'}),
+        )
+        self.assertFalse(incomplete.membership_complete)
+
+    async def test_exec_membership_failure_retains_symbols_without_clear_authority(
+        self,
+    ) -> None:
+        self.client.runtime_membership_response = (
+            _runtime_monitored_membership_payload(['027710'])
+        )
+        current = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='current',
+        )
+        self.client.runtime_membership_response = {}
+        degraded = await self.service._load_live_exec_monitoring_symbols(
+            market_date=self.target_trade_date,
+            trigger='degraded',
+        )
+
+        self.assertIsNotNone(current)
+        self.assertTrue(current.membership_complete)
+        self.assertIsNotNone(degraded)
+        self.assertEqual(degraded.symbols, current.symbols)
+        self.assertFalse(degraded.membership_complete)
+
+    async def test_runtime_monitored_publication_is_current_date_and_opt_in(self) -> None:
+        payload = {
+            'market_date': self.target_trade_date.isoformat(),
+            'items': [],
+        }
+        with (
+            patch.object(
+                self.service,
+                '_load_dashboard_cached_payload',
+                return_value=payload,
+            ),
+            patch(
+                'app.orders.exec_integration.kis_realtime_price_service'
+            ) as price_service,
+        ):
+            price_service.observation_revision.return_value = 42
+            await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='current-date',
+            )
+            price_service.observe_runtime_monitored_payload.assert_called_once_with(
+                payload,
+                trigger='current-date',
+                expected_observation_revision=42,
+            )
+
+            price_service.reset_mock()
+            await self.service.list_runtime_monitored_symbols(
+                market_date=self.market_date,
+                refresh=False,
+                trigger='historical-date',
+            )
+            price_service.observe_runtime_monitored_payload.assert_not_called()
+
+            await self.service.list_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                trigger='source-read',
+                publish_realtime_observation=False,
+            )
+            price_service.observe_runtime_monitored_payload.assert_not_called()
 
     async def test_runtime_monitored_symbols_include_historical_held_position(self) -> None:
         with session_scope() as session:
@@ -8783,7 +9679,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
-            patch.object(self.service, '_load_live_portfolio_holding_symbols', new=AsyncMock(return_value=None)),
+            patch.object(self.service, '_load_live_portfolio_holding_membership', new=AsyncMock(return_value=None)),
+            patch.object(
+                self.service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(
+                    return_value=ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({self.symbol}),
+                        membership_complete=True,
+                    )
+                ),
+            ),
         ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
@@ -8965,7 +9871,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['items'][0]['price_status'], 'stale')
         load_daily_bars.assert_not_called()
 
-    async def test_runtime_monitored_symbols_observe_high_priority_symbols_first(self) -> None:
+    async def test_runtime_monitored_payload_is_pure_and_prioritizes_symbols(self) -> None:
         board = {
             'market_date': self.target_trade_date.isoformat(),
             'runtime': {'status': 'ready', 'mode': 'mock'},
@@ -9019,12 +9925,584 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 refresh=False,
                 refresh_state={'requested': False, 'status': 'not_requested'},
                 served_from_cache=False,
+                live_holding_symbols={'HIGH'},
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=True,
+                    )
+                ),
             )
 
-        observed_symbols = list(price_service.observe_monitored_symbols.call_args.args[0])
-        self.assertEqual(observed_symbols, ['HIGH', 'MID', 'LOW'])
-        self.assertTrue(price_service.observe_monitored_symbols.call_args.kwargs['preserve_order'])
+        price_service.observe_monitored_symbols.assert_not_called()
+        price_service.observe_runtime_monitored_payload.assert_not_called()
         self.assertEqual(payload['realtime_subscription']['desired_symbols'], ['HIGH', 'MID', 'LOW'])
+        self.assertTrue(payload['source_coverage']['membership_complete'])
+        self.assertEqual(
+            payload['source_coverage']['live_exec_monitoring'],
+            'complete',
+        )
+
+        incomplete_payload = self.service._build_runtime_monitored_symbols_payload(
+            board={**board, 'items': []},
+            refresh=False,
+            refresh_state={'requested': False, 'status': 'not_requested'},
+            served_from_cache=False,
+            live_holding_symbols=set(),
+            live_exec_monitoring_membership=None,
+        )
+        self.assertFalse(
+            incomplete_payload['source_coverage']['membership_complete']
+        )
+        self.assertEqual(
+            incomplete_payload['source_coverage']['live_exec_monitoring'],
+            'unknown',
+        )
+
+    async def test_runtime_monitored_payload_preserves_fresh_board_coverage(self) -> None:
+        generated_at = datetime(2026, 4, 30, 0, 10, tzinfo=timezone.utc)
+        board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {'status': 'ready', 'mode': 'mock'},
+            'freshness': {
+                'schema_version': EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+                'endpoint': 'daily_board',
+                'market_date': self.target_trade_date.isoformat(),
+                'status': 'fresh',
+                'served_from_cache': False,
+                'read_model_source': 'persisted_exec_read_model',
+                'generated_at': generated_at.isoformat(),
+                'cached_at': generated_at.isoformat(),
+                'cache_age_seconds': 0,
+                'cache_ttl_seconds': 5,
+                'is_stale': False,
+                'is_partial': False,
+                'refreshing': False,
+                'last_readback_synced_at': generated_at.isoformat(),
+                'readback_age_seconds': 0,
+                'readback_synced_count': 1,
+                'readback_missing_count': 0,
+                'overview_item_count': 1,
+                'output_item_count': 1,
+            },
+            'items': [
+                {
+                    'symbol': '005930',
+                    'name': 'Samsung Electronics',
+                    'market': 'KOSPI',
+                    'intent': 'intraday_watch_buy',
+                    'status': 'accepted',
+                    'monitoring_state': 'watching_fill',
+                    'trigger_price': 70000,
+                    'planned_intents': [],
+                }
+            ],
+        }
+
+        payload = self.service._build_runtime_monitored_symbols_payload(
+            board=board,
+            refresh=False,
+            refresh_state={'requested': False, 'status': 'not_requested'},
+            served_from_cache=False,
+            live_holding_symbols=set(),
+            live_exec_monitoring_membership=ExecRuntimeMonitoredSymbolMembership(
+                symbols=frozenset(),
+                membership_complete=True,
+            ),
+        )
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+        self.assertEqual(payload['freshness']['status'], 'fresh')
+        self.assertEqual(payload['freshness']['readback_missing_count'], 0)
+        self.assertTrue(source.membership_complete)
+
+    async def test_failed_fresh_build_refresh_is_partial(self) -> None:
+        generated_at = datetime(2026, 4, 30, 0, 10, tzinfo=timezone.utc)
+        freshness = self.service._build_runtime_monitored_freshness(
+            source_freshness={
+                'schema_version': EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+                'endpoint': 'daily_board',
+                'market_date': self.target_trade_date.isoformat(),
+                'status': 'fresh',
+                'served_from_cache': False,
+                'read_model_source': 'persisted_exec_read_model',
+                'generated_at': generated_at.isoformat(),
+                'cached_at': generated_at.isoformat(),
+                'cache_age_seconds': 0,
+                'cache_ttl_seconds': 5,
+                'is_stale': False,
+                'is_partial': False,
+                'refreshing': False,
+                'readback_synced_count': 1,
+                'readback_missing_count': 0,
+                'overview_item_count': 1,
+                'output_item_count': 1,
+            },
+            endpoint='monitored_symbols',
+            market_date=self.target_trade_date,
+            generated_at=generated_at,
+            served_from_cache=False,
+            runtime_status='ready',
+            overview_items=[{'symbol': '005930'}],
+            output_item_count=1,
+            refresh_state={
+                'requested': True,
+                'status': 'failed',
+                'in_flight': False,
+            },
+        )
+
+        self.assertEqual(freshness['status'], 'partial')
+        self.assertTrue(freshness['is_partial'])
+
+    async def test_missing_upstream_freshness_cannot_authorize_exact_empty(
+        self,
+    ) -> None:
+        payload = self.service._build_runtime_monitored_symbols_payload(
+            board={
+                'market_date': self.target_trade_date.isoformat(),
+                'runtime': {'status': 'ready', 'mode': 'mock'},
+                'items': [],
+            },
+            refresh=False,
+            refresh_state={'requested': False, 'status': 'not_requested'},
+            served_from_cache=False,
+            live_portfolio_holding_membership=(
+                PortfolioHoldingSymbolMembership(
+                    symbols=frozenset(),
+                    membership_complete=True,
+                )
+            ),
+            live_exec_monitoring_membership=(
+                ExecRuntimeMonitoredSymbolMembership(
+                    symbols=frozenset(),
+                    membership_complete=True,
+                )
+            ),
+        )
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+        self.assertEqual(payload['freshness']['status'], 'partial')
+        self.assertTrue(payload['freshness']['is_partial'])
+        self.assertFalse(source.membership_complete)
+
+    async def test_partial_holdings_membership_is_merge_only_and_loads_history(
+        self,
+    ) -> None:
+        generated_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+        with patch.object(
+            self.service,
+            '_load_historical_held_runtime_board_items',
+            return_value=[],
+        ) as load_history:
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {'status': 'ready', 'mode': 'mock'},
+                    'freshness': {
+                        'schema_version': EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+                        'endpoint': 'daily_board',
+                        'market_date': self.target_trade_date.isoformat(),
+                        'status': 'fresh',
+                        'served_from_cache': False,
+                        'read_model_source': 'persisted_exec_read_model',
+                        'generated_at': generated_at.isoformat(),
+                        'cached_at': generated_at.isoformat(),
+                        'cache_age_seconds': 0,
+                        'cache_ttl_seconds': 5,
+                        'is_stale': False,
+                        'is_partial': False,
+                        'refreshing': False,
+                        'readback_synced_count': 0,
+                        'readback_missing_count': 0,
+                        'overview_item_count': 0,
+                        'output_item_count': 0,
+                    },
+                    'items': [],
+                },
+                refresh=False,
+                refresh_state={
+                    'requested': False,
+                    'status': 'not_requested',
+                },
+                served_from_cache=False,
+                live_portfolio_holding_membership=(
+                    PortfolioHoldingSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=False,
+                    )
+                ),
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=True,
+                    )
+                ),
+            )
+
+        self.assertEqual(payload['source_coverage']['live_holdings'], 'partial')
+        self.assertFalse(payload['source_coverage']['membership_complete'])
+        self.assertFalse(
+            KISRealtimePriceService._runtime_monitored_source_from_payload(
+                payload
+            ).membership_complete
+        )
+        load_history.assert_called_once()
+        self.assertFalse(
+            load_history.call_args.kwargs[
+                'live_holding_membership_complete'
+            ]
+        )
+
+    async def test_monitored_cache_inherits_upstream_board_age(self) -> None:
+        generated_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+        self.service.dashboard_cache_ttl_seconds = 5
+        freshness = self.service._build_runtime_monitored_freshness(
+            source_freshness={
+                'schema_version': EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+                'endpoint': 'daily_board',
+                'market_date': self.target_trade_date.isoformat(),
+                'status': 'fresh',
+                'served_from_cache': True,
+                'read_model_source': 'in_process_cache',
+                'generated_at': generated_at.isoformat(),
+                'cached_at': generated_at.isoformat(),
+                'cache_age_seconds': 4,
+                'cache_ttl_seconds': 5,
+                'is_stale': False,
+                'is_partial': False,
+                'refreshing': False,
+                'last_readback_synced_at': generated_at.isoformat(),
+                'readback_age_seconds': 4,
+                'readback_synced_count': 1,
+                'readback_missing_count': 0,
+                'overview_item_count': 1,
+                'output_item_count': 1,
+            },
+            endpoint='monitored_symbols',
+            market_date=self.target_trade_date,
+            generated_at=generated_at,
+            served_from_cache=False,
+            runtime_status='ready',
+            overview_items=[{'symbol': '005930'}],
+            output_item_count=1,
+            refresh_state={'requested': False, 'status': 'not_requested'},
+        )
+        self.service._store_dashboard_cached_payload(
+            endpoint='monitored_symbols',
+            market_date=self.target_trade_date,
+            symbol=None,
+            payload={
+                'request': {
+                    'market_date': self.target_trade_date.isoformat(),
+                    'refresh': False,
+                },
+                'freshness': freshness,
+                'items': [{'symbol': '005930'}],
+            },
+        )
+
+        with patch(
+            'app.orders.exec_integration._utcnow',
+            return_value=generated_at + timedelta(seconds=2),
+        ):
+            cached = self.service._load_dashboard_cached_payload(
+                endpoint='monitored_symbols',
+                market_date=self.target_trade_date,
+                symbol=None,
+                refresh_state={
+                    'requested': False,
+                    'status': 'not_requested',
+                },
+                allow_stale=True,
+            )
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached['freshness']['cache_age_seconds'], 6)
+        self.assertEqual(cached['freshness']['status'], 'stale')
+        self.assertTrue(cached['freshness']['is_stale'])
+
+    async def test_failed_refresh_revokes_exact_removal_authority(self) -> None:
+        generated_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+        self.service._store_dashboard_cached_payload(
+            endpoint='monitored_symbols',
+            market_date=self.target_trade_date,
+            symbol=None,
+            payload={
+                'request': {
+                    'market_date': self.target_trade_date.isoformat(),
+                    'refresh': False,
+                },
+                'market_date': self.target_trade_date.isoformat(),
+                'source_coverage': {'membership_complete': True},
+                'freshness': {
+                    'schema_version': EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION,
+                    'endpoint': 'monitored_symbols',
+                    'market_date': self.target_trade_date.isoformat(),
+                    'status': 'fresh',
+                    'served_from_cache': False,
+                    'read_model_source': 'persisted_exec_read_model',
+                    'generated_at': generated_at.isoformat(),
+                    'cached_at': generated_at.isoformat(),
+                    'cache_age_seconds': 0,
+                    'cache_ttl_seconds': 5,
+                    'is_stale': False,
+                    'is_partial': False,
+                    'refreshing': False,
+                    'readback_synced_count': 0,
+                    'readback_missing_count': 0,
+                    'overview_item_count': 0,
+                    'output_item_count': 0,
+                },
+                'items': [],
+            },
+        )
+
+        cached = self.service._load_dashboard_cached_payload(
+            endpoint='monitored_symbols',
+            market_date=self.target_trade_date,
+            symbol=None,
+            refresh_state={
+                'requested': True,
+                'status': 'failed',
+                'in_flight': False,
+            },
+            allow_stale=True,
+        )
+
+        self.assertIsNotNone(cached)
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            cached
+        )
+        self.assertEqual(cached['freshness']['status'], 'partial')
+        self.assertTrue(cached['freshness']['is_partial'])
+        self.assertFalse(source.membership_complete)
+
+    async def test_runtime_monitored_payload_preserves_unmapped_live_membership(
+        self,
+    ) -> None:
+        empty_board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {'status': 'ready', 'mode': 'mock'},
+            'items': [],
+        }
+        complete_empty_exec = ExecRuntimeMonitoredSymbolMembership(
+            symbols=frozenset(),
+            membership_complete=True,
+        )
+        complete_exec_symbol = ExecRuntimeMonitoredSymbolMembership(
+            symbols=frozenset({'005930'}),
+            membership_complete=True,
+        )
+
+        with patch(
+            'app.orders.exec_integration.kis_realtime_price_service'
+        ) as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            holding_only = self.service._build_runtime_monitored_symbols_payload(
+                board=empty_board,
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols={'030000'},
+                live_exec_monitoring_membership=complete_empty_exec,
+            )
+            exec_only = self.service._build_runtime_monitored_symbols_payload(
+                board=empty_board,
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols=set(),
+                live_exec_monitoring_membership=complete_exec_symbol,
+            )
+            holding_with_regular_watch = (
+                self.service._build_runtime_monitored_symbols_payload(
+                    board={
+                        **empty_board,
+                        'items': [
+                            {
+                                'symbol': '005930',
+                                'name': 'Regular watch',
+                                'market': 'KOSPI',
+                                'intent': 'intraday_watch_buy',
+                                'status': 'accepted',
+                                'monitoring_state': 'watching_fill',
+                                'trigger_price': 70000,
+                                'planned_intents': [],
+                            }
+                        ],
+                    },
+                    refresh=False,
+                    refresh_state={
+                        'requested': False,
+                        'status': 'not_requested',
+                    },
+                    served_from_cache=False,
+                    live_holding_symbols={'030000'},
+                    live_exec_monitoring_membership=complete_empty_exec,
+                )
+            )
+
+        self.assertEqual(
+            holding_only['realtime_subscription']['desired_symbols'],
+            ['030000'],
+        )
+        self.assertEqual(
+            [item['symbol'] for item in holding_only['items']],
+            ['030000'],
+        )
+        self.assertTrue(holding_only['items'][0]['held_position'])
+        self.assertEqual(
+            holding_only['items'][0]['monitoring_state'],
+            'reconciling',
+        )
+        self.assertTrue(holding_only['source_coverage']['membership_complete'])
+
+        self.assertEqual(
+            exec_only['realtime_subscription']['desired_symbols'],
+            ['005930'],
+        )
+        self.assertEqual(
+            [item['symbol'] for item in exec_only['items']],
+            ['005930'],
+        )
+        self.assertTrue(exec_only['items'][0]['exec_monitoring_active'])
+        self.assertTrue(exec_only['items'][0]['exec_runtime_showable'])
+        self.assertTrue(exec_only['source_coverage']['membership_complete'])
+        self.assertEqual(
+            holding_with_regular_watch['realtime_subscription'][
+                'desired_symbols'
+            ],
+            ['030000', '005930'],
+        )
+
+    async def test_complete_direct_sources_clear_stale_board_membership_facts(
+        self,
+    ) -> None:
+        board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {'status': 'ready', 'mode': 'mock'},
+            'items': [
+                {
+                    'symbol': '030000',
+                    'name': 'Stale position',
+                    'market': 'KOSPI',
+                    'status': 'filled',
+                    'monitoring_state': 'watching_target_stop',
+                    'planned_intents': ['stop_sell', 'target_sell'],
+                    'held_position': True,
+                    'position_quantity': 5,
+                    'position_average_price': 100,
+                    'position_side': 'long',
+                    'exec_monitoring_active': True,
+                    'exec_runtime_showable': True,
+                    'exec_runtime_state': 'held_position',
+                    'exec_runtime_exclusion_reason': None,
+                    'exec_runtime_exclusion_reasons': [],
+                    'monitoring_statuses': [
+                        'portfolio_holding_active',
+                        'runtime_membership_active',
+                        'stop_sell_monitoring',
+                        'target_sell_monitoring',
+                    ],
+                }
+            ],
+        }
+
+        payload = self.service._build_runtime_monitored_symbols_payload(
+            board=board,
+            refresh=False,
+            refresh_state={'requested': False, 'status': 'not_requested'},
+            served_from_cache=False,
+            live_holding_symbols=set(),
+            live_exec_monitoring_membership=ExecRuntimeMonitoredSymbolMembership(
+                symbols=frozenset(),
+                membership_complete=True,
+            ),
+        )
+
+        item = payload['items'][0]
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+        self.assertFalse(item['held_position'])
+        self.assertEqual(item['position_quantity'], 0)
+        self.assertIsNone(item['position_average_price'])
+        self.assertIsNone(item['position_side'])
+        self.assertFalse(item['exec_monitoring_active'])
+        self.assertFalse(item['exec_runtime_showable'])
+        self.assertEqual(item['exec_runtime_state'], 'no_runtime_membership')
+        self.assertEqual(item['monitoring_state'], 'idle')
+        self.assertNotIn(
+            'portfolio_holding_active',
+            item['monitoring_statuses'],
+        )
+        self.assertNotIn(
+            'runtime_membership_active',
+            item['monitoring_statuses'],
+        )
+        self.assertEqual(source.protected_symbols, ())
+
+    async def test_existing_board_holding_outranks_regular_watch(self) -> None:
+        board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {'status': 'ready', 'mode': 'mock'},
+            'items': [
+                {
+                    'symbol': '005930',
+                    'name': 'Regular watch',
+                    'market': 'KOSPI',
+                    'intent': 'intraday_watch_buy',
+                    'status': 'accepted',
+                    'monitoring_state': 'watching_fill',
+                    'trigger_price': 70000,
+                    'planned_intents': [],
+                },
+                {
+                    'symbol': '030000',
+                    'name': 'Held board row',
+                    'market': 'KOSPI',
+                    'status': 'planned',
+                    'monitoring_state': 'idle',
+                    'planned_intents': ['target_sell'],
+                },
+            ],
+        }
+
+        payload = self.service._build_runtime_monitored_symbols_payload(
+            board=board,
+            refresh=False,
+            refresh_state={'requested': False, 'status': 'not_requested'},
+            served_from_cache=False,
+            live_holding_symbols={'030000'},
+            live_exec_monitoring_membership=ExecRuntimeMonitoredSymbolMembership(
+                symbols=frozenset(),
+                membership_complete=True,
+            ),
+        )
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+        self.assertEqual(
+            payload['realtime_subscription']['desired_symbols'],
+            ['030000', '005930'],
+        )
+        self.assertEqual(source.symbols, ('030000', '005930'))
+        self.assertEqual(source.protected_symbols, ('030000',))
 
     async def test_runtime_dashboard_readback_facts_override_blocked_eligibility(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
@@ -9884,8 +11362,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             ) as overview,
             patch.object(
                 self.service,
-                '_load_live_portfolio_holding_symbols',
-                new=AsyncMock(return_value={self.symbol}),
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(
+                    return_value=PortfolioHoldingSymbolMembership(
+                        symbols=frozenset({self.symbol}),
+                        membership_complete=True,
+                    )
+                ),
             ) as load_live_holdings,
             patch.object(self.service, '_store_dashboard_caches_from_overview') as store_caches,
         ):
@@ -9899,9 +11382,108 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         overview.assert_awaited_once()
-        load_live_holdings.assert_awaited_once_with(trigger='test:dashboard_background_refresh')
+        load_live_holdings.assert_awaited_once_with(
+            market_date=self.target_trade_date,
+            trigger='test:dashboard_background_refresh',
+        )
         store_caches.assert_called_once()
         self.assertEqual(store_caches.call_args.kwargs['live_holding_symbols'], {self.symbol})
+        self.assertTrue(
+            store_caches.call_args.kwargs[
+                'live_portfolio_holding_membership'
+            ].membership_complete
+        )
+
+    async def test_old_refresh_finalizer_cannot_clobber_replacement_state(
+        self,
+    ) -> None:
+        key = self.service._dashboard_refresh_key(
+            target_trade_date=self.target_trade_date,
+            account_reference=None,
+            symbol=None,
+        )
+
+        async def fail() -> None:
+            raise RuntimeError('old refresh failed')
+
+        release_replacement = asyncio.Event()
+        old_task = asyncio.create_task(fail())
+        await asyncio.sleep(0)
+        replacement = asyncio.create_task(release_replacement.wait())
+        self.service._dashboard_refresh_tasks[key] = replacement
+        self.service._dashboard_refresh_state[key] = {
+            'status': 'running',
+            'started_at': '2026-04-30T00:00:01+00:00',
+        }
+
+        self.service._finalize_dashboard_refresh_task(key, old_task)
+
+        self.assertIs(self.service._dashboard_refresh_tasks[key], replacement)
+        self.assertEqual(
+            self.service._dashboard_refresh_state[key]['status'],
+            'running',
+        )
+        release_replacement.set()
+        await replacement
+
+    async def test_background_refresh_cannot_be_overwritten_by_old_foreground_build(
+        self,
+    ) -> None:
+        monitored_key = self.service._dashboard_cache_key(
+            'monitored_symbols',
+            self.target_trade_date,
+            None,
+        )
+        monitored_lock = asyncio.Lock()
+        await monitored_lock.acquire()
+        self.service._dashboard_build_locks[monitored_key] = monitored_lock
+        fresh_board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {'status': 'ready', 'mode': 'mock'},
+            'items': [{'symbol': '027710'}],
+        }
+        fresh_monitored = {
+            'market_date': self.target_trade_date.isoformat(),
+            'items': [{'symbol': '027710'}],
+        }
+
+        with (
+            patch.object(
+                self.service,
+                '_build_runtime_daily_board_payload',
+                return_value=fresh_board,
+            ),
+            patch.object(
+                self.service,
+                '_build_runtime_monitored_symbols_payload',
+                return_value=fresh_monitored,
+            ),
+        ):
+            background_store = asyncio.create_task(
+                self.service._store_dashboard_caches_from_overview(
+                    market_date=self.target_trade_date,
+                    symbol=None,
+                    overview={'items': []},
+                    refresh_state={'status': 'succeeded'},
+                )
+            )
+            await asyncio.sleep(0)
+            self.service._store_dashboard_cached_payload(
+                endpoint='monitored_symbols',
+                market_date=self.target_trade_date,
+                symbol=None,
+                payload={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'items': [{'symbol': '005930'}],
+                },
+            )
+            monitored_lock.release()
+            await background_store
+
+        self.assertEqual(
+            self.service._dashboard_cache[monitored_key].payload['items'],
+            [{'symbol': '027710'}],
+        )
 
     async def test_dashboard_background_refresh_stores_monitored_cache_with_live_exec_overlay(self) -> None:
         key = self.service._dashboard_refresh_key(
@@ -9920,6 +11502,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'liveness': {
                 'autonomous': {
                     'monitoring': {
+                        'status': 'running',
+                        'last_success_at': '2026-04-30T00:00:00+00:00',
                         'last_cycle': {
                             'items': [
                                 {
@@ -9937,14 +11521,23 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 }
             },
         }
-
         with (
             patch('app.orders.exec_integration.kis_realtime_price_service') as price_service,
             patch.object(
                 self.service,
-                '_load_live_portfolio_holding_symbols',
+                '_load_live_portfolio_holding_membership',
                 new=AsyncMock(return_value=None),
             ) as load_live_holdings,
+            patch.object(
+                self.service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(
+                    return_value=ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({self.symbol}),
+                        membership_complete=True,
+                    )
+                ),
+            ),
         ):
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
@@ -9972,15 +11565,21 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 trigger='test',
             )
 
-        load_live_holdings.assert_awaited_once_with(trigger='test:dashboard_background_refresh')
+        load_live_holdings.assert_awaited_once_with(
+            market_date=self.target_trade_date,
+            trigger='test:dashboard_background_refresh',
+        )
         self.assertTrue(monitored['freshness']['served_from_cache'])
         item = next(candidate for candidate in monitored['items'] if candidate['symbol'] == self.symbol)
         self.assertTrue(item['exec_monitoring_active'])
         self.assertTrue(item['exec_runtime_showable'])
-        self.assertTrue(item['exec_agent_approved'])
-        self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertEqual(
+            item['exec_runtime_state'],
+            'runtime_membership_confirmed',
+        )
         self.assertIsNone(item['exec_runtime_exclusion_reason'])
-        self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
+        self.assertIn('runtime_membership_active', item['monitoring_statuses'])
 
     async def test_scheduled_exec_readback_refresh_reuses_dashboard_background_state(self) -> None:
         await self.service.dispatch_next_open_plan(
