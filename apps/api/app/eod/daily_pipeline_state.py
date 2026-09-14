@@ -519,13 +519,16 @@ class DailyPipelineRunStateService:
     def get_latest_run(
         self,
         *,
-        market_date: str | date,
+        market_date: str | date | None,
     ) -> dict[str, Any] | None:
-        normalized_market_date = _normalize_market_date(market_date)
         with session_scope() as session:
+            statement = select(DailyPipelineRun)
+            if market_date is not None:
+                statement = statement.where(
+                    DailyPipelineRun.market_date == _normalize_market_date(market_date)
+                )
             row = session.execute(
-                select(DailyPipelineRun)
-                .where(DailyPipelineRun.market_date == normalized_market_date)
+                statement
                 .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())
                 .limit(1)
             ).scalar_one_or_none()

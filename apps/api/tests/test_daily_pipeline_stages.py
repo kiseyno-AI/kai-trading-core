@@ -723,6 +723,126 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         self.assertEqual(status, 'partial')
 
+    def test_resolve_result_status_downgrades_completed_feedback_with_pending_role(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {
+                'status': 'completed',
+                'completed': True,
+                'final_pending': 0,
+                'progress': {
+                    'summary': {
+                        'expected_feedback_count': 239,
+                        'completed_feedback_count': 239,
+                        'failed_items': 0,
+                        'role_progress': {
+                            'fundamental-summarizer': {
+                                'status': 'partial',
+                                'total_symbols': 80,
+                                'processed_symbols': 79,
+                                'completed_symbols': 79,
+                                'pending_symbols': 1,
+                                'failed_items': 0,
+                            }
+                        },
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(status, 'partial')
+
+    def test_stage_result_details_omit_high_volume_nested_evidence(self) -> None:
+        details = DailyPipelineStageService._build_stage_run_details(
+            stage_id='signal_decider_evaluations',
+            result={
+                'status': 'completed',
+                'summary': {'evaluations_upserted': 200},
+                'evaluation_refresh': {
+                    'summary': {'evaluations_upserted': 200},
+                    'items': [{'symbol': f'{index:06d}'} for index in range(200)],
+                },
+                'cycles': [{'items': list(range(200))}],
+                'matched_symbols': [f'{index:06d}' for index in range(200)],
+                'progress': {
+                    'summary': {
+                        'completed_feedback_count': 200,
+                        'funnel_diagnostics': {'symbols': list(range(200))},
+                    }
+                },
+            },
+        )
+
+        result_summary = details['result_summary']
+        self.assertEqual(
+            result_summary['evaluation_refresh'],
+            {'summary': {'evaluations_upserted': 200}},
+        )
+        self.assertNotIn('cycles', result_summary)
+        self.assertNotIn('matched_symbols', result_summary)
+        self.assertNotIn(
+            'funnel_diagnostics',
+            result_summary['progress']['summary'],
+        )
+        self.assertEqual(
+            details['result_summary_omissions']['evaluation_refresh.items'],
+            {'type': 'list', 'item_count': 200},
+        )
+        self.assertEqual(
+            details['result_summary_omissions']['cycles'],
+            {'type': 'list', 'item_count': 1},
+        )
+        self.assertLess(len(str(details)), 5_000)
+
+    def test_stage_result_details_preserve_scalar_aggregates_with_bulk_field_names(self) -> None:
+        details = DailyPipelineStageService._build_stage_run_details(
+            stage_id='signal_decider_evaluations',
+            result={
+                'status': 'completed',
+                'summary': {
+                    'items': 201,
+                    'rows': 200,
+                    'stages': 3,
+                    'request_payload': None,
+                },
+            },
+        )
+
+        self.assertEqual(
+            details['result_summary']['summary'],
+            {
+                'items': 201,
+                'rows': 200,
+                'stages': 3,
+                'request_payload': None,
+            },
+        )
+        self.assertNotIn('result_summary_omissions', details)
+
+    def test_resolve_result_status_uses_role_boundary_and_completed_counts(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {
+                'status': 'completed',
+                'progress': {
+                    'summary': {
+                        'role_progress': {
+                            'fundamental-summarizer': {
+                                'status': 'completed',
+                                'boundary_status': 'incomplete',
+                                'total_symbols': 80,
+                                'processed_symbols': 80,
+                                'completed_symbols': 79,
+                                'pending_symbols': 0,
+                                'retry_pending_symbols': 1,
+                                'failed_items': 0,
+                            }
+                        }
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(status, 'partial')
+
     def test_resolve_result_status_normalizes_ok_to_completed(self) -> None:
         status = DailyPipelineStageService._resolve_result_status({'status': 'ok'})
 

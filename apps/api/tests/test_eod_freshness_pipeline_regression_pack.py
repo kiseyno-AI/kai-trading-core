@@ -516,6 +516,7 @@ class EODPipelineStatusRegressionPackTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: stage_counts,
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()

@@ -12,6 +12,50 @@ from app.eod.daily_pipeline_state import DailyPipelineRunStateService
 
 
 class DailyPipelineRunStateServiceTests(unittest.TestCase):
+    def test_latest_run_without_market_date_uses_actual_newest_run(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        DailyPipelineRun.__table__.create(engine)
+        DailyPipelineStageRun.__table__.create(engine)
+        session_factory = sessionmaker(bind=engine, future=True)
+        started_at = datetime(2026, 9, 12, tzinfo=timezone.utc)
+        with session_factory.begin() as session:
+            session.add_all(
+                [
+                    DailyPipelineRun(
+                        market_date=date(2026, 9, 8),
+                        trigger='auto_close_scheduler',
+                        status='completed',
+                        started_at=started_at,
+                        run_metadata={},
+                    ),
+                    DailyPipelineRun(
+                        market_date=date(2026, 9, 11),
+                        trigger='manual_daily_api',
+                        status='partial',
+                        started_at=started_at + timedelta(hours=1),
+                        run_metadata={},
+                    ),
+                ]
+            )
+
+        @contextmanager
+        def _session_scope():
+            with session_factory.begin() as session:
+                yield session
+
+        try:
+            with patch('app.eod.daily_pipeline_state.session_scope', _session_scope):
+                result = DailyPipelineRunStateService().get_latest_run(
+                    market_date=None
+                )
+        finally:
+            engine.dispose()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['market_date'], '2026-09-11')
+        self.assertEqual(result['trigger'], 'manual_daily_api')
+        self.assertEqual(result['status'], 'partial')
+
     def test_context_lookup_filters_before_limit_with_more_than_100_unrelated_runs(self) -> None:
         engine = create_engine('sqlite+pysqlite:///:memory:')
         DailyPipelineRun.__table__.create(engine)

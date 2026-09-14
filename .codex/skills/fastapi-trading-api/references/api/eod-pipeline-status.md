@@ -11,7 +11,7 @@ Automatic `/eod/pykrx/daily/run-if-due` runs publish official daily pipeline run
 
 The same payload also reports the default-selected filtering, factor/scoring, external-news, macro-context, agent-feedback, signal-decider, and signal-decider-evaluation stages. Persisted `daily_signal_features`, `external_news_items` classification state, `macro_context_observations`, `agent_context_feedback`, and `signal_decider_decision_snapshots` rows can mark omitted same-day stages completed/available so a resumed single-stage run does not make earlier persisted outputs look pending.
 
-The default `market_date` is the current Seoul calendar date from `server_time[:10]`. On weekends, holidays, or other break-days, callers must pass `market_date` explicitly if they want the previous trading day's pipeline view instead of the current calendar date.
+When `market_date` is omitted, the route selects the actual latest persisted official daily run and uses that run's market date for the full pipeline view. It falls back to the current Seoul calendar date only when no official run exists. An explicit `market_date` always wins; the route does not guess a previous trading day from the exchange calendar.
 
 The response now also includes `market` and `market_session` blocks. `market` is the current exchange-clock state, and `market_session` describes the semantics of the requested `market_date`, including the latest valid trading date and whether live quote or intraday data is expected for that date.
 
@@ -26,6 +26,8 @@ When a same-day feedback run is active, `agent_feedback_summaries` reflects the 
 `macro_context_refresh` reports persisted slow-moving macro context availability from `macro_context_observations`. `available` context maps to a completed stage, stale or partial context maps to partial, and missing context remains pending. Source statuses preserve World Bank availability and optional FRED disabled/missing-key state without blocking the whole pipeline.
 
 For `agent_feedback_summaries`, the status reader reconciles stale durable run summaries with persisted child feedback and failure rows. The stage `updated_at` follows the latest successful or failed child activity, and `details` exposes `current_active_roles`, `target_symbols`, `completed_symbols`, `failed_symbols_count`, `role_progress`, `latest_successful_feedback_at`, and `latest_failed_feedback_at` when failures exist.
+
+The durable fallback prefers the latest canonical daily-retry parent over a newer narrow child run. A completed stored stage with incomplete role progress is rendered as partial, with total/processed/remaining counts rebuilt from the role scopes. Official `result_summary` fields keep scalar aggregates but replace nested bulk evidence with `result_summary_omissions` metadata on write and read.
 
 Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may be `skipped` with reason metadata once same-date downstream output exists and there is no active/pre-open official stage row. This prevents `current_stage` from pointing at `master_refresh` after a resumed EOD or agent-stage recovery has already completed.
 
