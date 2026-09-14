@@ -4,7 +4,7 @@ import json
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import Select, select
 from sqlalchemy.dialects.postgresql import insert
@@ -32,10 +32,11 @@ class AgentFeedbackSessionCleanupService:
             delete_transcript=target.delete_transcript,
             emit_lifecycle_hooks=target.emit_lifecycle_hooks,
         )
-        if result.get('ok') and result.get('deleted'):
+        if result.get('ok') is True and isinstance(result.get('deleted'), bool):
             self._clear_failure(session_key=target.session_key)
             return {
                 'status': 'deleted',
+                'outcome': 'deleted' if result.get('deleted') else 'already_absent',
                 'session_key': target.session_key,
                 'result': result,
             }
@@ -45,6 +46,63 @@ class AgentFeedbackSessionCleanupService:
             'session_key': target.session_key,
             'result': result,
             'failure': failure,
+        }
+
+    def enqueue_deferred(
+        self,
+        *,
+        targets: Sequence[SessionCleanupTarget],
+        reason: str,
+    ) -> dict[str, Any]:
+        unique_targets = list({target.session_key: target for target in targets}.values())
+        if not unique_targets:
+            return {'status': 'noop', 'queued': 0, 'inserted': 0, 'already_queued': 0}
+
+        now = datetime.now(UTC)
+        cleanup_result = {
+            'ok': False,
+            'deleted': False,
+            'deferred': True,
+            'reason': reason,
+        }
+        values = [
+            {
+                'market_date': target.market_date,
+                'symbol': target.symbol,
+                'agent_name': target.agent_name,
+                'run_id': target.run_id,
+                'session_key': target.session_key,
+                'provider': 'openclaw',
+                'delete_transcript': target.delete_transcript,
+                'emit_lifecycle_hooks': target.emit_lifecycle_hooks,
+                'cleanup_attempts': 0,
+                'last_attempt_at': None,
+                'next_attempt_at': now,
+                'last_error': reason,
+                'cleanup_result': cleanup_result,
+            }
+            for target in unique_targets
+        ]
+        with session_scope(
+            statement_timeout_ms=settings.agent_feedback_db_statement_timeout_ms,
+            lock_timeout_ms=settings.agent_feedback_db_lock_timeout_ms,
+        ) as session:
+            stmt = (
+                insert(AgentFeedbackSessionCleanupFailure)
+                .values(values)
+                .on_conflict_do_nothing(
+                    constraint='uq_agent_feedback_session_cleanup_failures_session_key'
+                )
+                .returning(AgentFeedbackSessionCleanupFailure.id)
+            )
+            inserted = len(session.execute(stmt).scalars().all())
+
+        queued = len(unique_targets)
+        return {
+            'status': 'queued',
+            'queued': queued,
+            'inserted': inserted,
+            'already_queued': queued - inserted,
         }
 
     def run_pending_cleanup(self, *, limit: int = 100) -> dict[str, Any]:
@@ -162,7 +220,7 @@ class AgentFeedbackSessionCleanupService:
             ensure_ascii=False,
         )
         cmd = [
-            'openclaw', 'gateway', 'call', 'sessions.delete', '--token', token, '--params', params,
+            'openclaw', 'gateway', 'call', 'sessions.delete', '--json', '--token', token, '--params', params,
         ]
         timeout_seconds = max(1.0, float(settings.openclaw_session_cleanup_timeout_seconds or 30.0))
         try:
@@ -188,8 +246,23 @@ class AgentFeedbackSessionCleanupService:
         stdout = completed.stdout.strip()
         stderr = completed.stderr.strip()
         parsed = self._extract_json(stdout) if stdout else None
-        ok = completed.returncode == 0 and isinstance(parsed, dict) and bool(parsed.get('ok'))
-        deleted = bool(parsed.get('deleted')) if isinstance(parsed, dict) else False
+        response_shape_valid = (
+            isinstance(parsed, dict)
+            and isinstance(parsed.get('ok'), bool)
+            and isinstance(parsed.get('deleted'), bool)
+        )
+        ok = completed.returncode == 0 and response_shape_valid and parsed.get('ok') is True
+        deleted = parsed['deleted'] if response_shape_valid else False
+        error = None
+        if not ok:
+            parsed_error = parsed.get('error') if isinstance(parsed, dict) else None
+            error = stderr or parsed_error
+            if not error:
+                error = (
+                    'sessions.delete returned an invalid response'
+                    if not response_shape_valid
+                    else 'sessions.delete failed'
+                )
         return {
             'ok': ok,
             'deleted': deleted,
@@ -197,26 +270,23 @@ class AgentFeedbackSessionCleanupService:
             'stdout': stdout,
             'stderr': stderr,
             'parsed': parsed,
-            'error': None if ok and deleted else (stderr or (parsed.get('error') if isinstance(parsed, dict) else None)),
+            'error': error,
         }
 
     @staticmethod
     def _extract_json(stdout: str) -> dict[str, Any] | None:
-        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-        for line in reversed(lines):
-            if not line.startswith('{'):
+        decoder = json.JSONDecoder()
+        content = stdout.rstrip()
+        for index in range(len(content) - 1, -1, -1):
+            if content[index] != '{':
                 continue
             try:
-                parsed = json.loads(line)
+                parsed, end_index = decoder.raw_decode(content, index)
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict):
+            if isinstance(parsed, dict) and not content[end_index:].strip():
                 return parsed
-        try:
-            parsed = json.loads(stdout)
-        except json.JSONDecodeError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+        return None
 
     @staticmethod
     def _retry_delay_seconds(attempts: int) -> int:
