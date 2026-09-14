@@ -18,6 +18,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         now = datetime(2026, 9, 14, 7, 34, 11, tzinfo=timezone.utc)
         run = SimpleNamespace(
             id=387,
+            market_date=date(2026, 9, 14),
             status='running',
             error_message=None,
             completed_at=None,
@@ -25,6 +26,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             run_metadata={'mode': 'daily_auto'},
         )
         stage = SimpleNamespace(
+            market_date=date(2026, 9, 14),
             status='running',
             processed=3_148,
             total=3_549,
@@ -39,6 +41,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         )
         eod_run = SimpleNamespace(
             id=522,
+            market='KRX',
+            trade_date=date(2026, 9, 14),
+            source='pykrx',
             status='running',
             symbols_total=3_549,
             symbols_succeeded=3_147,
@@ -46,7 +51,12 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             error_message=None,
             completed_at=None,
             run_metadata={
-                'requested_symbols': ['005930', '000660'],
+                'requested_symbols': [
+                    '005930',
+                    '000660',
+                    '121850',
+                    '319660',
+                ],
                 'failed_symbols': ['121850'],
                 'unattempted_symbols': ['319660'],
                 'stage_progress': {
@@ -61,8 +71,18 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         runs_result.scalars.return_value = [run]
         stages_result = MagicMock()
         stages_result.scalars.return_value = [stage]
+        persisted_symbols_result = MagicMock()
+        persisted_symbols_result.scalars.return_value = [
+            '000660',
+            '005930',
+            '319660',
+        ]
         session = MagicMock()
-        session.execute.side_effect = [runs_result, stages_result]
+        session.execute.side_effect = [
+            runs_result,
+            stages_result,
+            persisted_symbols_result,
+        ]
         session.get.return_value = eod_run
         session_context = MagicMock()
         session_context.__enter__.return_value = session
@@ -90,6 +110,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(eod_run.error_message, reason)
         self.assertTrue(eod_run.run_metadata['resumable'])
         self.assertEqual(
+            eod_run.run_metadata['downstream_retry_symbols'],
+            ['005930', '000660'],
+        )
+        self.assertEqual(eod_run.run_metadata['downstream_retry_symbols_count'], 2)
+        self.assertEqual(
             eod_run.run_metadata['stage_progress']['price_collection']['status'],
             'failed',
         )
@@ -99,6 +124,79 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             ],
             'core_restart_interrupted',
         )
+
+    def test_startup_interrupt_does_not_close_mismatched_linked_eod_run(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 14, 7, 34, 11, tzinfo=timezone.utc)
+        mismatches = (
+            {'market': 'US'},
+            {'source': 'other'},
+            {'trade_date': date(2026, 9, 12)},
+        )
+
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                run = SimpleNamespace(
+                    id=387,
+                    market_date=date(2026, 9, 14),
+                    status='running',
+                    error_message=None,
+                    completed_at=None,
+                    updated_at=now - timedelta(seconds=6),
+                    run_metadata={'mode': 'daily_auto'},
+                )
+                stage = SimpleNamespace(
+                    market_date=date(2026, 9, 14),
+                    status='running',
+                    processed=3_148,
+                    total=3_549,
+                    remaining=401,
+                    error_message=None,
+                    current_step='fetch_symbol_ohlcv',
+                    current_activity='Collecting prices',
+                    completed_at=None,
+                    updated_at=now - timedelta(seconds=6),
+                    source_run_ids={'eod_run_id': 522},
+                    details={},
+                )
+                eod_attributes = {
+                    'id': 522,
+                    'market': 'KRX',
+                    'trade_date': date(2026, 9, 14),
+                    'source': 'pykrx',
+                    'status': 'running',
+                    'run_metadata': {},
+                    **mismatch,
+                }
+                eod_run = SimpleNamespace(**eod_attributes)
+                runs_result = MagicMock()
+                runs_result.scalars.return_value = [run]
+                stages_result = MagicMock()
+                stages_result.scalars.return_value = [stage]
+                session = MagicMock()
+                session.execute.side_effect = [runs_result, stages_result]
+                session.get.return_value = eod_run
+                session_context = MagicMock()
+                session_context.__enter__.return_value = session
+
+                with (
+                    patch(
+                        'app.eod.daily_pipeline_state.session_scope',
+                        return_value=session_context,
+                    ),
+                    patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+                ):
+                    result = (
+                        DailyPipelineRunStateService().mark_active_runs_interrupted(
+                            reason='Core restarted.'
+                        )
+                    )
+
+                self.assertEqual(result['interrupted_eod_run_ids'], [])
+                self.assertEqual(eod_run.status, 'running')
+                self.assertEqual(eod_run.run_metadata, {})
+                self.assertEqual(session.execute.call_count, 2)
 
     def test_latest_run_without_market_date_uses_actual_newest_run(self) -> None:
         engine = create_engine('sqlite+pysqlite:///:memory:')
