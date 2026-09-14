@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 from sqlalchemy import delete, select, text, update
@@ -13,6 +13,10 @@ from app.scanner.state import scanner_state
 
 logger = logging.getLogger(__name__)
 SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE = 1_000
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _iter_symbol_universe_chunks(rows: list[dict]):
@@ -50,7 +54,7 @@ def ensure_symbol(
                 standard_code=standard_code,
                 instrument_type=instrument_type,
                 source=source,
-                last_refreshed_at=datetime.utcnow(),
+                last_refreshed_at=_utcnow(),
             )
             session.add(record)
             session.flush()
@@ -65,7 +69,7 @@ def ensure_symbol(
         record.instrument_type = instrument_type
         record.source = source
         record.is_active = True
-        record.last_refreshed_at = datetime.utcnow()
+        record.last_refreshed_at = _utcnow()
         session.flush()
         return record.id
 
@@ -152,7 +156,7 @@ def upsert_symbol_universe(
     if not items:
         return 0
 
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     symbol_rows, valid_items = _build_symbol_universe_rows(
         items,
         source=source,
@@ -284,7 +288,7 @@ def replace_tracked_symbols(symbols: list[str]) -> None:
                     instrument_type='equity',
                     source='scanner',
                     is_active=True,
-                    last_refreshed_at=datetime.utcnow(),
+                    last_refreshed_at=_utcnow(),
                 )
                 session.add(record)
                 session.flush()

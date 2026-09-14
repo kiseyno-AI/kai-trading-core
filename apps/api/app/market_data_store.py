@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Sequence
 
@@ -142,6 +142,10 @@ DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
 RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 200
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _get_symbol(session, symbol: str) -> Symbol | None:
     return session.execute(select(Symbol).where(Symbol.symbol == symbol)).scalar_one_or_none()
 
@@ -164,13 +168,13 @@ def persist_quote_snapshot(payload: dict) -> None:
                 instrument_type='equity',
                 source='quote',
                 is_active=True,
-                last_refreshed_at=datetime.utcnow(),
+                last_refreshed_at=_utcnow(),
             )
             session.add(symbol)
             session.flush()
         elif payload.get('company_name'):
             symbol.name_ko = payload['company_name']
-            symbol.last_refreshed_at = datetime.utcnow()
+            symbol.last_refreshed_at = _utcnow()
 
         snapshot = QuoteSnapshot(
             symbol_id=symbol.id,
@@ -221,7 +225,7 @@ def persist_quote_snapshot(payload: dict) -> None:
         current.is_live = payload.get('is_live', False)
         current.fallback = payload.get('fallback', False)
         current.payload = payload
-        current.captured_at = datetime.utcnow()
+        current.captured_at = _utcnow()
 
 
 def _serialize_current_quote_cache_row(row: CurrentQuoteCache, *, symbol: str) -> dict:
@@ -301,7 +305,7 @@ def load_current_market_snapshot_context() -> dict[str, Any] | None:
 
 
 def persist_kis_intraday_snapshot(snapshot: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, snapshot['symbol'])
         if symbol is None:
@@ -448,7 +452,7 @@ def persist_market_status_snapshot(state: MarketState, *, source: str = 'api') -
                 is_trading_day=state.is_trading_day,
                 is_open=state.is_open,
                 reason=state.reason,
-                server_time=_parse_datetime(state.server_time) or datetime.utcnow(),
+                server_time=_parse_datetime(state.server_time) or _utcnow(),
                 session_open_at=_parse_datetime(state.session_open_at),
                 session_close_at=_parse_datetime(state.session_close_at),
                 source=source,
@@ -467,7 +471,7 @@ def persist_daily_price_bar(snapshot: dict, *, run_id: int | None = None) -> Non
                 instrument_type='equity',
                 source=snapshot.get('source', 'kis'),
                 is_active=True,
-                last_refreshed_at=datetime.utcnow(),
+                last_refreshed_at=_utcnow(),
             )
             session.add(symbol)
             session.flush()
@@ -514,7 +518,7 @@ def persist_daily_price_bar(snapshot: dict, *, run_id: int | None = None) -> Non
         row.dividend_yield = _as_decimal(snapshot['dividend_yield']) if snapshot.get('dividend_yield') is not None else None
         row.dps = _as_decimal(snapshot['dps']) if snapshot.get('dps') is not None else None
         row.source = snapshot.get('source', 'kis')
-        row.captured_at = datetime.utcnow()
+        row.captured_at = _utcnow()
 
 
 def persist_daily_price_bars(
@@ -531,7 +535,7 @@ def persist_daily_price_bars(
     if not bars:
         return 0
 
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         record = _get_symbol(session, symbol)
         if record is None:
@@ -635,7 +639,7 @@ def update_daily_price_bar_fundamentals(
     if not fundamentals_by_date:
         return 0
 
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         record = _get_symbol(session, symbol)
         if record is None:
@@ -1482,7 +1486,7 @@ def _build_daily_market_relative_rows_query(
 
 
 def upsert_daily_price_context(item: dict, *, run_id: int | None = None) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, item['symbol'])
         if symbol is None:
@@ -1502,7 +1506,10 @@ def upsert_daily_price_context(item: dict, *, run_id: int | None = None) -> None
             statement.on_conflict_do_update(
                 constraint='uq_daily_price_contexts_symbol_market_date',
                 set_={
-                    'eod_run_id': statement.excluded.eod_run_id,
+                    'eod_run_id': func.coalesce(
+                        statement.excluded.eod_run_id,
+                        DailyPriceContext.eod_run_id,
+                    ),
                     'source': statement.excluded.source,
                     'context_payload': statement.excluded.context_payload,
                     'captured_at': statement.excluded.captured_at,
@@ -1601,7 +1608,7 @@ def load_daily_price_context_history(
 
 
 def upsert_daily_technical_snapshot(snapshot: dict, *, run_id: int | None = None) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, snapshot['symbol'])
         if symbol is None:
@@ -1642,7 +1649,10 @@ def upsert_daily_technical_snapshot(snapshot: dict, *, run_id: int | None = None
             statement.on_conflict_do_update(
                 constraint='uq_daily_technical_snapshots_symbol_market_date',
                 set_={
-                    'eod_run_id': statement.excluded.eod_run_id,
+                    'eod_run_id': func.coalesce(
+                        statement.excluded.eod_run_id,
+                        DailyTechnicalSnapshot.eod_run_id,
+                    ),
                     'source': statement.excluded.source,
                     'close_price': statement.excluded.close_price,
                     'volume': statement.excluded.volume,
@@ -1781,7 +1791,7 @@ def load_daily_technical_snapshot_inputs(
 
 
 def upsert_daily_action_summary(summary: dict, *, run_id: int | None = None) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, summary['symbol'])
         if symbol is None:
@@ -1823,7 +1833,10 @@ def upsert_daily_action_summary(summary: dict, *, run_id: int | None = None) -> 
                 constraint='uq_daily_action_summaries_symbol_market_date',
                 set_={
                     'technical_snapshot_id': statement.excluded.technical_snapshot_id,
-                    'eod_run_id': statement.excluded.eod_run_id,
+                    'eod_run_id': func.coalesce(
+                        statement.excluded.eod_run_id,
+                        DailyActionSummary.eod_run_id,
+                    ),
                     'source': statement.excluded.source,
                     'action_label': statement.excluded.action_label,
                     'bias_direction': statement.excluded.bias_direction,
@@ -2239,7 +2252,7 @@ def replace_daily_trending_ranks(
     normalized_period = period.strip().lower()
     ranked_items = build_daily_trending_rank_items(items)
     symbols = [item['symbol'] for item in ranked_items]
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
 
     with session_scope() as session:
         session.execute(
@@ -2527,7 +2540,7 @@ def load_trending_stocks(
 
 
 def upsert_daily_signal_feature(feature: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, feature['symbol'])
         if symbol is None:
@@ -2586,7 +2599,7 @@ def upsert_daily_signal_features(features: Sequence[dict]) -> int:
     if not features:
         return 0
 
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     symbols = list(dict.fromkeys(feature['symbol'] for feature in features))
     with session_scope() as session:
         symbol_rows = session.execute(select(Symbol).where(Symbol.symbol.in_(symbols))).scalars().all()
@@ -2656,7 +2669,7 @@ def upsert_daily_signal_features(features: Sequence[dict]) -> int:
 
 
 def upsert_daily_market_risk_snapshot(snapshot: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, snapshot['symbol'])
         if symbol is None:
@@ -2726,7 +2739,7 @@ def upsert_daily_market_risk_snapshot(snapshot: dict) -> None:
 
 
 def upsert_daily_market_risk_filter_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -2799,7 +2812,7 @@ def upsert_daily_market_risk_filter_result(result: dict) -> None:
 
 
 def upsert_daily_piotroski_filter_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -2864,7 +2877,7 @@ def upsert_daily_piotroski_filter_result(result: dict) -> None:
 
 
 def upsert_daily_momentum_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -3276,7 +3289,7 @@ def load_agent_feedback_candidate_score_rows(
 
 
 def upsert_daily_low_risk_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -3349,7 +3362,7 @@ def upsert_daily_low_risk_factor_result(result: dict) -> None:
 
 
 def upsert_daily_beta_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -3525,7 +3538,7 @@ def load_daily_low_risk_factor_results(
 
 
 def upsert_daily_value_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -3647,7 +3660,7 @@ def load_daily_value_factor_results(
 
 
 def upsert_daily_advanced_value_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -3793,7 +3806,7 @@ def load_daily_advanced_value_factor_results(
 
 
 def upsert_daily_unified_value_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -3948,7 +3961,7 @@ def load_daily_unified_value_factor_results(
 
 
 def upsert_daily_quality_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -4131,7 +4144,7 @@ def load_daily_quality_factor_results(
 
 
 def upsert_daily_composite_factor_result(result: dict) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol = _get_symbol(session, result['symbol'])
         if symbol is None:
@@ -4383,7 +4396,7 @@ def upsert_daily_market_participation_context(
     market: str = 'KRX',
     source: str = 'kis_ranking',
 ) -> None:
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         values = {
             'market': market,
@@ -4471,7 +4484,7 @@ def upsert_daily_pykrx_enrichment_rows(
     def _chunks(items: list[dict[str, Any]], size: int = 25) -> list[list[dict[str, Any]]]:
         return [items[index:index + size] for index in range(0, len(items), size)]
 
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     symbol_inputs: dict[str, dict[str, Any]] = {}
     row_symbols: set[str] = set()
     for raw in rows:

@@ -30,7 +30,10 @@ from app.market_data_store import (
     persist_daily_price_bar,
     persist_daily_price_bars,
     persist_kis_intraday_snapshot,
+    upsert_daily_action_summary,
+    upsert_daily_price_context,
     upsert_daily_pykrx_enrichment_rows,
+    upsert_daily_technical_snapshot,
 )
 
 
@@ -152,6 +155,86 @@ class HistoricalPriceBarPersistenceTests(unittest.TestCase):
         self.assertEqual(created_symbol.symbol, '099999')
         self.assertEqual(created_symbol.name_ko, 'Historical listing')
         self.assertFalse(created_symbol.is_active)
+
+
+class EodLineagePreservingUpsertTests(unittest.TestCase):
+    def test_derived_upserts_preserve_existing_lineage_when_run_id_is_missing(
+        self,
+    ) -> None:
+        statements = []
+
+        class FakeSession:
+            def execute(self, statement):
+                statements.append(statement)
+                return None
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeSession()
+
+        with (
+            patch('app.market_data_store.session_scope', fake_session_scope),
+            patch(
+                'app.market_data_store._get_symbol',
+                return_value=SimpleNamespace(id=91),
+            ),
+        ):
+            upsert_daily_price_context(
+                {
+                    'symbol': '005930',
+                    'market_date': '2026-04-24',
+                    'source': 'stage_orchestrator',
+                    'context_payload': {'trend': 'up'},
+                },
+                run_id=None,
+            )
+            upsert_daily_technical_snapshot(
+                {
+                    'symbol': '005930',
+                    'market_date': '2026-04-24',
+                    'source': 'stage_orchestrator',
+                    'close_price': 70000,
+                    'volume': 1000,
+                    'trend_state': 'uptrend',
+                    'ma_alignment': 'bullish',
+                    'breakout_20d': False,
+                    'breakdown_20d': False,
+                    'signal_payload': {},
+                },
+                run_id=None,
+            )
+            upsert_daily_action_summary(
+                {
+                    'symbol': '005930',
+                    'market_date': '2026-04-24',
+                    'source': 'stage_orchestrator',
+                    'action_label': 'watch',
+                    'bias_direction': 'neutral',
+                    'signal_score': 0,
+                    'confidence_tier': 'low',
+                    'risk_tier': 'unknown',
+                    'reasons': [],
+                    'summary_payload': {},
+                },
+                run_id=None,
+            )
+
+        self.assertEqual(len(statements), 3)
+        table_names = (
+            'daily_price_contexts',
+            'daily_technical_snapshots',
+            'daily_action_summaries',
+        )
+        for statement, table_name in zip(statements, table_names, strict=True):
+            with self.subTest(table=table_name):
+                compiled = str(
+                    statement.compile(dialect=postgresql.dialect())
+                ).lower()
+                self.assertIn(
+                    'eod_run_id = coalesce('
+                    f'excluded.eod_run_id, {table_name}.eod_run_id)',
+                    compiled,
+                )
 
 
 class MarketRelativeQueryShapeTests(unittest.TestCase):
