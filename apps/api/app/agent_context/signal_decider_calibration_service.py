@@ -24,6 +24,9 @@ from app.agent_context.signal_decider_loop_service import (
     SIGNAL_DECIDER_EVALUATION_HORIZONS,
     signal_decider_loop_service,
 )
+from app.agent_context.signal_decider_snapshot_validity import (
+    is_decision_snapshot_valid_for_source_date,
+)
 from app.core.settings import settings
 
 
@@ -467,9 +470,37 @@ class SignalDeciderCalibrationService:
             policy_versions=[normalized_policy_version] if normalized_policy_version else None,
             dedupe_feedback_results=True,
         )
+        valid_source_rows = []
+        invalid_snapshot_exclusions = []
+        for row in source_rows:
+            if is_decision_snapshot_valid_for_source_date(row):
+                valid_source_rows.append(row)
+                continue
+            invalid_snapshot_exclusions.append(
+                {
+                    'snapshot_id': row.id,
+                    'feedback_id': row.feedback_id,
+                    'market_date': row.market_date.isoformat(),
+                    'symbol': row.symbol,
+                    'policy_version': row.policy_version,
+                    'decision_action': row.decision_action,
+                    'status_reason': 'snapshot_observed_at_or_after_target_open',
+                    'status_message': (
+                        'Snapshot has no canonical aware observation before the next KRX '
+                        'session open; linked outcomes and evaluations are quarantined.'
+                    ),
+                    'source_correction_required': True,
+                    'recompute_required': False,
+                    'matured': False,
+                    'stored_outcome': False,
+                    'stored_evaluation': False,
+                    'earliest_computable_date': None,
+                    'latest_available_trade_date': None,
+                }
+            )
         rows, model_identity_exclusions, model_identity_cohort = (
             select_model_identity_cohort_rows(
-                source_rows,
+                valid_source_rows,
                 role=SIGNAL_DECIDER_AGENT_NAME,
                 expected_model=expected_decider_model(
                     SIGNAL_DECIDER_AGENT_NAME,
@@ -493,7 +524,10 @@ class SignalDeciderCalibrationService:
         latest_trade_date_cache: dict[tuple[str, date], date | None] = {}
 
         mature_items: list[dict[str, Any]] = []
-        excluded_items: list[dict[str, Any]] = list(model_identity_exclusions)
+        excluded_items: list[dict[str, Any]] = [
+            *invalid_snapshot_exclusions,
+            *model_identity_exclusions,
+        ]
         coverage_items: list[dict[str, Any]] = []
         for row in rows:
             decision = self.loop_service._build_decision_snapshot(row)
@@ -642,7 +676,7 @@ class SignalDeciderCalibrationService:
             condition_clusters=clusters,
         )
         report_status = 'empty'
-        if source_rows:
+        if valid_source_rows:
             report_status = 'ready' if len(mature_items) >= resolved_min_sample_size else 'insufficient_sample'
 
         return {
@@ -666,7 +700,7 @@ class SignalDeciderCalibrationService:
             },
             'summary': {
                 'status': report_status,
-                'snapshots_considered': len(source_rows),
+                'snapshots_considered': len(valid_source_rows),
                 'mature_computed_count': len(mature_items),
                 'excluded_count': len(excluded_items),
                 'coverage': coverage_summary,

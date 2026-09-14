@@ -31,6 +31,11 @@ from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
+from app.agent_context.signal_decider_snapshot_validity import (
+    decision_snapshot_observed_at_utc,
+    decision_snapshot_target_open_at_utc,
+    is_decision_snapshot_pre_target_open,
+)
 from app.orders.signal_decider_alignment_gate import (
     ALIGNMENT_GATE_ACTION_BLOCK,
     ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE,
@@ -309,6 +314,41 @@ def _snapshot_cohort_fingerprint(
         }
         for snapshot in sorted(snapshots, key=lambda item: int(item.id))
     ]
+    canonical = json.dumps(
+        _to_json_safe(material),
+        default=str,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def _snapshot_scope_selection_fingerprint(
+    scope_state: dict[str, Any],
+) -> str:
+    selected_snapshots = [
+        snapshot
+        for snapshot in (scope_state.get('selected_by_key') or {}).values()
+        if snapshot is not None
+    ]
+    expired_snapshot_by_key = scope_state.get('expired_snapshot_by_key') or {}
+    material = {
+        'selected_snapshot_cohort': _snapshot_cohort_fingerprint(
+            selected_snapshots
+        ),
+        'expired_snapshots': [
+            {
+                'symbol': key[0],
+                'agent_name': key[1],
+                **copy.deepcopy(value),
+            }
+            for key, value in sorted(expired_snapshot_by_key.items())
+            if isinstance(key, tuple)
+            and len(key) == 2
+            and isinstance(value, dict)
+        ],
+    }
     canonical = json.dumps(
         _to_json_safe(material),
         default=str,
@@ -1007,6 +1047,10 @@ def _dispatch_authority_issue_reason(reason_code: str) -> dict[str, str]:
         'decision_input_generation_changed': (
             'The source, policy, eligibility, prior-decision, or upstream evidence '
             'bound to this decision changed; stale BUY authority is blocked.'
+        ),
+        'decision_snapshot_after_target_open': (
+            'The latest decision was observed at or after the target session '
+            'opened; expired next-open BUY authority is blocked.'
         ),
         'policy_scope_changed': (
             'The execution policy, route, or dispatch material changed; stale BUY '
@@ -2034,6 +2078,7 @@ class SignalDeciderNextOpenExecutionService:
             ).scalars().all()
             current_scope_state = self._load_latest_decider_scope_state(
                 source_market_date=source_market_date,
+                target_trade_date=resolved_target_date,
                 _session=session,
             )
             raw_latest_snapshots = sorted(
@@ -2074,6 +2119,9 @@ class SignalDeciderNextOpenExecutionService:
                 if int(snapshot.id) in valid_snapshot_ids
             ]
             current_source_run = current_scope_state.get('source_run')
+            expired_snapshot_by_key = (
+                current_scope_state.get('expired_snapshot_by_key') or {}
+            )
 
             account_targets, account_target_errors = self._parse_account_targets()
             account_targets_by_reference = {
@@ -2120,6 +2168,7 @@ class SignalDeciderNextOpenExecutionService:
                 scope = (str(row.symbol or '').strip().upper(), decision_agent_name)
                 latest = latest_by_scope.get(scope)
                 raw_latest = raw_latest_by_scope.get(scope)
+                expired_latest = expired_snapshot_by_key.get(scope)
                 latest_action = (
                     _short_term_tactical_action(latest)
                     if latest is not None
@@ -2177,6 +2226,10 @@ class SignalDeciderNextOpenExecutionService:
                     and int(raw_latest.id) in invalid_snapshot_ids
                 ):
                     reason_code = 'decision_input_generation_changed'
+                    replacement_action = 'reject'
+                    replacement_actionable = False
+                elif isinstance(expired_latest, dict):
+                    reason_code = 'decision_snapshot_after_target_open'
                     replacement_action = 'reject'
                     replacement_actionable = False
                 elif latest is None:
@@ -2969,10 +3022,14 @@ class SignalDeciderNextOpenExecutionService:
         )
         snapshot_generation_state = (
             self._load_latest_snapshot_generation_state(
-                source_market_date=source_market_date
+                source_market_date=source_market_date,
+                target_trade_date=resolved_target_date,
             )
         )
         snapshots = snapshot_generation_state['snapshots']
+        expired_snapshot_by_key = (
+            snapshot_generation_state.get('expired_snapshot_by_key') or {}
+        )
         generation_validation = snapshot_generation_state[
             'generation_validation'
         ]
@@ -3146,6 +3203,7 @@ class SignalDeciderNextOpenExecutionService:
             ).scalars().all()
             current_scope_state = self._load_latest_decider_scope_state(
                 source_market_date=source_market_date,
+                target_trade_date=resolved_target_date,
                 _session=session,
             )
             current_raw_snapshots = sorted(
@@ -3160,8 +3218,8 @@ class SignalDeciderNextOpenExecutionService:
                     snapshot.id,
                 ),
             )
-            if _snapshot_cohort_fingerprint(
-                current_raw_snapshots
+            if _snapshot_scope_selection_fingerprint(
+                current_scope_state
             ) != snapshot_generation_state[
                 'raw_snapshot_cohort_fingerprint'
             ]:
@@ -3652,23 +3710,35 @@ class SignalDeciderNextOpenExecutionService:
                     not in actionable_snapshot_scopes
                 ):
                     continue
+                row_scope = (
+                    row.symbol,
+                    _normalize_agent_name(row.decision_agent_name),
+                )
                 removal_code = (
-                    'account_route_removed'
-                    if (row.symbol, _normalize_agent_name(row.decision_agent_name))
-                    in actionable_snapshot_scopes
+                    'decision_snapshot_after_target_open'
+                    if row_scope in expired_snapshot_by_key
+                    else 'account_route_removed'
+                    if row_scope in actionable_snapshot_scopes
                     else 'candidate_removed'
                 )
-                removal_reason = _reason(
-                    removal_code,
-                    (
+                if removal_code == 'decision_snapshot_after_target_open':
+                    removal_message = (
+                        'The latest decision snapshot was observed at or after '
+                        'the target session opened; next-open BUY authority is expired.'
+                    )
+                elif removal_code == 'account_route_removed':
+                    removal_message = (
                         f'Configured account route no longer permits {row.decision_agent_name} '
                         f'for {row.symbol}.'
-                        if removal_code == 'account_route_removed'
-                        else (
-                            f'No latest decision candidate remains for {row.decision_agent_name} '
-                            f'on this account and symbol.'
-                        )
-                    ),
+                    )
+                else:
+                    removal_message = (
+                        f'No latest decision candidate remains for {row.decision_agent_name} '
+                        f'on this account and symbol.'
+                    )
+                removal_reason = _reason(
+                    removal_code,
+                    removal_message,
                 )
                 if _is_dispatch_terminal_status(row.execution_status):
                     observation_material = '|'.join(
@@ -4498,6 +4568,7 @@ class SignalDeciderNextOpenExecutionService:
         self,
         *,
         source_market_date: date,
+        target_trade_date: date | None = None,
         _session: Any | None = None,
     ) -> dict[str, Any]:
         owns_session = _session is None
@@ -5387,8 +5458,42 @@ class SignalDeciderNextOpenExecutionService:
             selected_by_key[key] = None
             evidenced_scope_keys.discard(key)
             reused_scope_keys.discard(key)
+
+        expired_snapshot_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
+        if target_trade_date is not None:
+            target_open_at = decision_snapshot_target_open_at_utc(
+                target_trade_date
+            )
+            for key, snapshot in list(selected_by_key.items()):
+                if snapshot is None:
+                    continue
+                observed_at = decision_snapshot_observed_at_utc(snapshot)
+                if is_decision_snapshot_pre_target_open(
+                    snapshot,
+                    target_trade_date=target_trade_date,
+                ):
+                    continue
+                expired_snapshot_by_key[key] = {
+                    'snapshot_id': int(snapshot.id),
+                    'observed_at': (
+                        observed_at.isoformat()
+                        if observed_at is not None
+                        else None
+                    ),
+                    'target_open_at': target_open_at.isoformat(),
+                }
+                # The canonical latest snapshot is terminal for its scope.  Do
+                # not resurrect an older BUY merely because the latest result
+                # was observed after the target session began.
+                selected_by_key[key] = None
+                evidenced_scope_keys.discard(key)
+                reused_scope_keys.discard(key)
         return {
             'selected_by_key': selected_by_key,
+            'expired_snapshot_by_key': expired_snapshot_by_key,
             'authoritative_run_id_by_key': authoritative_run_id_by_key,
             'evidenced_scope_keys': evidenced_scope_keys,
             'reused_scope_keys': reused_scope_keys,
@@ -5406,10 +5511,12 @@ class SignalDeciderNextOpenExecutionService:
         self,
         *,
         source_market_date: date,
+        target_trade_date: date | None = None,
         _session: Any | None = None,
     ) -> list[SignalDeciderDecisionSnapshot]:
         return self._load_latest_snapshot_generation_state(
             source_market_date=source_market_date,
+            target_trade_date=target_trade_date,
             _session=_session,
         )['snapshots']
 
@@ -5417,10 +5524,12 @@ class SignalDeciderNextOpenExecutionService:
         self,
         *,
         source_market_date: date,
+        target_trade_date: date | None = None,
         _session: Any | None = None,
     ) -> dict[str, Any]:
         scope_state = self._load_latest_decider_scope_state(
             source_market_date=source_market_date,
+            target_trade_date=target_trade_date,
             _session=_session,
         )
         raw_snapshots = sorted(
@@ -5447,8 +5556,11 @@ class SignalDeciderNextOpenExecutionService:
                 if int(snapshot.id) in valid_snapshot_ids
             ],
             'raw_snapshots': raw_snapshots,
-            'raw_snapshot_cohort_fingerprint': _snapshot_cohort_fingerprint(
-                raw_snapshots
+            'expired_snapshot_by_key': copy.deepcopy(
+                scope_state.get('expired_snapshot_by_key') or {}
+            ),
+            'raw_snapshot_cohort_fingerprint': (
+                _snapshot_scope_selection_fingerprint(scope_state)
             ),
             'generation_validation': generation_validation,
         }

@@ -2178,6 +2178,169 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn('035420', items_by_symbol)
 
+    def test_refresh_revokes_decision_observed_at_target_session_open(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            feedback_received_at=datetime(
+                2026,
+                4,
+                29,
+                23,
+                59,
+                59,
+                tzinfo=timezone.utc,
+            ),
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            initial = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='before_target_open_cutoff',
+            )
+            with session_scope() as session:
+                snapshot = session.get(
+                    SignalDeciderDecisionSnapshot,
+                    snapshot_id,
+                )
+                snapshot.feedback_received_at = datetime(
+                    2026,
+                    4,
+                    30,
+                    0,
+                    0,
+                    tzinfo=timezone.utc,
+                )
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='at_target_open_cutoff',
+            )
+
+        self.assertEqual(initial['summary']['eligible_count'], 1)
+        item = next(
+            row for row in refreshed['items'] if row['symbol'] == '005930'
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertIn(
+            'decision_snapshot_after_target_open',
+            {
+                reason['code']
+                for reason in item['validation']['blocking_reasons']
+            },
+        )
+
+    def test_scope_tombstones_late_latest_snapshot_without_older_fallback(
+        self,
+    ) -> None:
+        older_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            feedback_received_at=datetime(
+                2026,
+                4,
+                29,
+                23,
+                59,
+                59,
+                tzinfo=timezone.utc,
+            ),
+        )
+        late_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            feedback_received_at=datetime(
+                2026,
+                4,
+                30,
+                0,
+                0,
+                tzinfo=timezone.utc,
+            ),
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+        )
+
+        key = ('005930', 'signal-decider')
+        self.assertIsNone(state['selected_by_key'][key])
+        self.assertEqual(
+            state['expired_snapshot_by_key'][key]['snapshot_id'],
+            late_snapshot_id,
+        )
+        self.assertNotEqual(older_snapshot_id, late_snapshot_id)
+
+    def test_refresh_stages_revocation_for_handed_off_late_snapshot(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            feedback_received_at=datetime(
+                2026,
+                4,
+                29,
+                23,
+                59,
+                59,
+                tzinfo=timezone.utc,
+            ),
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='before_target_open_cutoff',
+            )
+            self._mark_row_as_handed_off()
+            with session_scope() as session:
+                snapshot = session.get(
+                    SignalDeciderDecisionSnapshot,
+                    snapshot_id,
+                )
+                snapshot.feedback_received_at = datetime(
+                    2026,
+                    4,
+                    30,
+                    0,
+                    0,
+                    tzinfo=timezone.utc,
+                )
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='late_snapshot_after_handoff',
+            )
+
+        item = next(
+            row for row in refreshed['items'] if row['symbol'] == '005930'
+        )
+        self.assertEqual(
+            item['execution_status'],
+            EXECUTION_STATUS_REVOCATION_PENDING,
+        )
+        self.assertEqual(
+            item['submission']['revocation']['reason_code'],
+            'decision_snapshot_after_target_open',
+        )
+
     def test_refresh_plan_items_accepts_only_explicit_krx_market_snapshots(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         domestic_snapshot_id = self._seed_snapshot(symbol='005930', market='KOSPI')
@@ -6485,7 +6648,11 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             load_count = 0
 
-            def expose_newer_wait_after_stale_read(*, source_market_date: date):
+            def expose_newer_wait_after_stale_read(
+                *,
+                source_market_date: date,
+                target_trade_date: date | None = None,
+            ):
                 nonlocal load_count
                 load_count += 1
                 if load_count == 1:
@@ -6499,7 +6666,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     )
                     return stale_snapshot_generation_state
                 return load_latest_generation_state(
-                    source_market_date=source_market_date
+                    source_market_date=source_market_date,
+                    target_trade_date=target_trade_date,
                 )
 
             with patch.object(
@@ -6526,6 +6694,94 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 'candidate_removed',
             }
             & {reason['code'] for reason in item['validation']['blocking_reasons']},
+        )
+
+    def test_refresh_retries_when_snapshot_crosses_target_open_cutoff(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            feedback_received_at=datetime(
+                2026,
+                4,
+                29,
+                23,
+                59,
+                59,
+                tzinfo=timezone.utc,
+            ),
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='seed_preopen_plan',
+            )
+            stale_state = service._load_latest_snapshot_generation_state(
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+            )
+            load_current_state = service._load_latest_snapshot_generation_state
+            load_count = 0
+
+            def cross_cutoff_after_initial_read(
+                *,
+                source_market_date: date,
+                target_trade_date: date | None = None,
+            ):
+                nonlocal load_count
+                load_count += 1
+                if load_count == 1:
+                    with session_scope() as session:
+                        snapshot = session.get(
+                            SignalDeciderDecisionSnapshot,
+                            snapshot_id,
+                        )
+                        snapshot.feedback_received_at = datetime(
+                            2026,
+                            4,
+                            30,
+                            0,
+                            0,
+                            tzinfo=timezone.utc,
+                        )
+                    return stale_state
+                return load_current_state(
+                    source_market_date=source_market_date,
+                    target_trade_date=target_trade_date,
+                )
+
+            with patch.object(
+                service,
+                '_load_latest_snapshot_generation_state',
+                side_effect=cross_cutoff_after_initial_read,
+            ):
+                refreshed = service.refresh_plan_items(
+                    target_trade_date=self.target_trade_date,
+                    trigger='cross_target_open_cutoff',
+                )
+
+        item = next(
+            row for row in refreshed['items'] if row['symbol'] == '005930'
+        )
+        self.assertGreaterEqual(load_count, 2)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertIn(
+            'decision_snapshot_after_target_open',
+            {
+                reason['code']
+                for reason in item['validation']['blocking_reasons']
+            },
         )
 
     def test_stale_policy_refresh_cannot_overwrite_newer_account_budget(self) -> None:
@@ -7890,6 +8146,77 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             generation['reason_code'],
             'decision_input_generation_changed',
+        )
+        self.assertFalse(generation['replacement_actionable'])
+
+    def test_dispatch_generation_rejects_snapshot_observed_at_target_open(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            feedback_received_at=datetime(
+                2026,
+                4,
+                29,
+                23,
+                59,
+                59,
+                tzinfo=timezone.utc,
+            ),
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_preopen_generation',
+            )
+        with session_scope() as session:
+            row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+            ).scalar_one()
+            expected_row_bindings = {
+                int(row.id): {
+                    'decision_snapshot_id': int(row.decision_snapshot_id),
+                    'row_revision_fingerprint': (
+                        _execution_plan_row_authority_fingerprint(row)
+                    ),
+                }
+            }
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                snapshot_id,
+            )
+            snapshot.feedback_received_at = datetime(
+                2026,
+                4,
+                30,
+                0,
+                0,
+                tzinfo=timezone.utc,
+            )
+
+        generation = service.inspect_dispatch_authority_generation(
+            target_trade_date=self.target_trade_date,
+            expected_row_bindings=expected_row_bindings,
+        )
+
+        self.assertEqual(generation['status'], 'invalid')
+        self.assertEqual(
+            generation['reason_code'],
+            'decision_snapshot_after_target_open',
         )
         self.assertFalse(generation['replacement_actionable'])
 

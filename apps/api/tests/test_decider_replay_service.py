@@ -1104,6 +1104,94 @@ class DeciderReplayServiceTests(unittest.TestCase):
 
 
 class DeciderReplayRepositoryTests(unittest.TestCase):
+    def test_replay_quarantines_late_canonical_snapshot_without_resurrecting_older_feedback(self) -> None:
+        older_valid = _snapshot_object(snapshot_id=1, symbol='005930')
+        older_valid.feedback_id = 77
+        older_valid.response_payload = {'tactical_action': 'scalp_buy_candidate'}
+        older_valid.created_at = datetime(2026, 6, 16, 6, 0, tzinfo=timezone.utc)
+        late_latest = _snapshot_object(snapshot_id=2, symbol='005930')
+        late_latest.feedback_id = 77
+        late_latest.response_payload = {'tactical_action': 'scalp_buy_candidate'}
+        late_latest.feedback_received_at = datetime(
+            2026,
+            6,
+            17,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
+        late_latest.created_at = datetime(2026, 6, 17, 0, 0, tzinfo=timezone.utc)
+        independent_valid = _snapshot_object(snapshot_id=3, symbol='000660')
+        independent_valid.response_payload = {'tactical_action': 'scalp_buy_candidate'}
+        independent_valid.created_at = datetime(2026, 6, 16, 6, 0, tzinfo=timezone.utc)
+        outcomes = [
+            SignalDeciderRealizedOutcome(
+                id=snapshot.id,
+                decision_snapshot_id=snapshot.id,
+                market_date=snapshot.market_date,
+                symbol=snapshot.symbol,
+                policy_version=snapshot.policy_version,
+                decision_action='buy',
+                horizon_days=5,
+                outcome_status='complete',
+                bars_observed=5,
+                close_return_pct=Decimal('0.01'),
+            )
+            for snapshot in (older_valid, late_latest, independent_valid)
+        ]
+
+        class FakeResult:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return list(self.rows)
+
+        results = iter(
+            [
+                FakeResult([older_valid, independent_valid, late_latest]),
+                FakeResult([]),
+                FakeResult(outcomes),
+                FakeResult([]),
+            ]
+        )
+        fake_session = type(
+            'FakeSession',
+            (),
+            {'execute': lambda _self, _statement: next(results)},
+        )()
+
+        @contextmanager
+        def test_session_scope():
+            yield fake_session
+
+        with (
+            patch('app.agent_context.decider_replay_service.session_scope', test_session_scope),
+            patch(
+                'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+                return_value=date(2026, 6, 17),
+            ),
+        ):
+            dataset = DeciderReplayRepository().list_replay_trades(
+                market_date_from=date(2026, 6, 16),
+                market_date_to=date(2026, 6, 16),
+                agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                symbols=None,
+                horizon_days=5,
+                cost_assumptions=DeciderReplayCostAssumptions(),
+            )
+
+        self.assertEqual([trade.snapshot_id for trade in dataset], [3])
+        self.assertEqual(dataset.source_decision_count, 2)
+        self.assertEqual(
+            dataset.excluded_reason_counts,
+            {'snapshot_observed_at_or_after_target_open': 1},
+        )
+        self.assertEqual(dataset.diagnostics['snapshot_validity_excluded_count'], 1)
+
     def test_replay_dataset_excludes_other_and_unverified_model_cohorts(self) -> None:
         engine = create_engine('sqlite+pysqlite:///:memory:')
         tables = [
@@ -1164,7 +1252,13 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     )
                 session.commit()
 
-            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+            with (
+                patch('app.agent_context.decider_replay_service.session_scope', test_session_scope),
+                patch(
+                    'app.agent_context.decider_replay_service.is_decision_snapshot_valid_for_source_date',
+                    return_value=True,
+                ),
+            ):
                 dataset = DeciderReplayRepository().list_replay_trades(
                     market_date_from=date(2026, 6, 16),
                     market_date_to=date(2026, 6, 16),
@@ -1257,7 +1351,13 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     )
                 session.commit()
 
-            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+            with (
+                patch('app.agent_context.decider_replay_service.session_scope', test_session_scope),
+                patch(
+                    'app.agent_context.decider_replay_service.is_decision_snapshot_valid_for_source_date',
+                    return_value=True,
+                ),
+            ):
                 repository = DeciderReplayRepository()
                 short_term_dataset = repository.list_replay_trades(
                     market_date_from=date(2026, 6, 16),
@@ -1423,7 +1523,13 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     )
                 session.commit()
 
-            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+            with (
+                patch('app.agent_context.decider_replay_service.session_scope', test_session_scope),
+                patch(
+                    'app.agent_context.decider_replay_service.is_decision_snapshot_valid_for_source_date',
+                    return_value=True,
+                ),
+            ):
                 dataset = DeciderReplayRepository().list_replay_trades(
                     market_date_from=date(2026, 6, 15),
                     market_date_to=date(2026, 6, 16),
@@ -1640,7 +1746,13 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                 )
                 session.commit()
 
-            with patch('app.agent_context.decider_replay_service.session_scope', test_session_scope):
+            with (
+                patch('app.agent_context.decider_replay_service.session_scope', test_session_scope),
+                patch(
+                    'app.agent_context.decider_replay_service.is_decision_snapshot_valid_for_source_date',
+                    return_value=True,
+                ),
+            ):
                 repository = DeciderReplayRepository()
                 trades = repository.list_wait_conflict_gate_trades(
                     market_date_from=date(2026, 6, 29),

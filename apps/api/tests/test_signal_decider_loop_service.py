@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -184,7 +184,7 @@ def _feedback_row(
         agent_name='signal-decider',
         agent_version='openclaw-v1',
         decision_run_id=f'signal-run-{snapshot_key}',
-        feedback_received_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+        feedback_received_at=datetime.fromisoformat(f'{market_date}T06:00:00+00:00'),
         policy_version=policy_version,
         decision_action=action,
         preferred_action=action,
@@ -259,7 +259,7 @@ def _feedback_row(
                 )
             },
         },
-        created_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+        created_at=datetime.fromisoformat(f'{market_date}T06:00:00+00:00'),
     )
 
 
@@ -3387,6 +3387,51 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(buy_outcomes[1]['entry_trade_date'], '2026-04-21')
         self.assertEqual(buy_outcomes[5]['exit_trade_date'], '2026-04-27')
 
+    def test_compute_evaluations_quarantines_snapshot_observed_at_target_open(self):
+        valid_row = _feedback_row(
+            feedback_id=1,
+            market_date='2026-04-20',
+            symbol='005930',
+            action='buy',
+        )
+        late_row = _feedback_row(
+            feedback_id=2,
+            market_date='2026-04-20',
+            symbol='000660',
+            action='buy',
+        )
+        late_row.feedback_received_at = datetime(2026, 4, 21, 0, 0, tzinfo=timezone.utc)
+        late_row.created_at = datetime(2026, 4, 20, 23, 59, tzinfo=timezone.utc)
+        repository = FakeSignalDeciderLoopRepository([valid_row, late_row])
+        service = SignalDeciderLoopService(repository=repository)
+        future_bars = [
+            {'trade_date': '2026-04-21', 'open_price': 100, 'high_price': 104, 'low_price': 99, 'close_price': 103, 'volume': 1000},
+        ]
+
+        with (
+            patch(
+                'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+                return_value=date(2026, 4, 21),
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['summary']['decisions_considered'], 1)
+        self.assertEqual(result['summary']['outcomes_upserted'], 1)
+        self.assertEqual(result['summary']['evaluations_upserted'], 1)
+        self.assertEqual([item['symbol'] for item in result['items']], ['005930'])
+        self.assertNotIn(2, {key[0] for key in repository.outcomes})
+        self.assertNotIn(2, {key[0] for key in repository.evaluations})
+
     def test_compute_evaluations_uses_earliest_future_bars_for_realized_outcomes(self):
         repository = FakeSignalDeciderLoopRepository(
             [_feedback_row(feedback_id=1, market_date='2026-04-20', symbol='005930', action='buy')]
@@ -4432,6 +4477,59 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['review_boundary']['manual_review_only'], True)
         self.assertEqual(result['review_boundary']['auto_apply_prompt_changes'], False)
 
+    def test_signal_decider_calibration_quarantines_late_snapshot_and_linked_results(self):
+        loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
+
+        with (
+            patch(
+                'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+                side_effect=lambda value: value + timedelta(days=1),
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+            ),
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            late_row = next(
+                row for row in loop_service.repository.snapshot_rows if row.id == 101
+            )
+            late_row.feedback_received_at = datetime(
+                2026,
+                4,
+                21,
+                0,
+                0,
+                tzinfo=timezone.utc,
+            )
+            result = calibration_service.build_report(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-29',
+                horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=2,
+                cluster_limit=5,
+            )
+
+        self.assertEqual(result['summary']['snapshots_considered'], 6)
+        self.assertEqual(result['summary']['mature_computed_count'], 3)
+        self.assertEqual(
+            result['exclusions']['status_reason_counts'][
+                'snapshot_observed_at_or_after_target_open'
+            ],
+            1,
+        )
+        decision_groups = {
+            item['bucket_value']: item
+            for item in result['group_summaries']['decision_actions']['items']
+        }
+        self.assertEqual(decision_groups['buy']['sample_count'], 1)
+
     def test_signal_decider_calibration_never_mixes_actual_model_identity_cohorts(self):
         loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
         expected_identity = build_observed_model_identity(
@@ -4634,6 +4732,50 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         self.assertEqual(result['rule_candidates']['summary']['candidate_count'], 0)
         self.assertEqual(result['rule_candidates']['status'], 'empty')
         self.assertEqual(result['rule_candidates']['thresholds']['min_sample_size'], 3)
+
+    def test_policy_candidate_generation_excludes_stored_evaluation_for_late_snapshot(self):
+        loop_service, _calibration_service, bars_by_symbol = (
+            _build_rule_candidate_calibration_fixture(
+                outcome_kind='bad_buy',
+                sample_count=3,
+            )
+        )
+
+        with (
+            patch(
+                'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+                side_effect=lambda value: value + timedelta(days=1),
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                side_effect=lambda symbol, **kwargs: bars_by_symbol[symbol],
+            ),
+        ):
+            loop_service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                evaluation_version='signal_decider_eval_test',
+            )
+            loop_service.repository.snapshot_rows[0].feedback_received_at = datetime(
+                2026,
+                4,
+                21,
+                0,
+                0,
+                tzinfo=timezone.utc,
+            )
+            result = loop_service.generate_policy_candidates(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[5],
+                primary_horizon_days=5,
+                evaluation_version='signal_decider_eval_test',
+                min_sample_size=3,
+            )
+
+        self.assertEqual(result['summary']['evaluations_considered'], 2)
+        self.assertEqual(result['summary']['candidates_generated'], 0)
 
     def test_signal_decider_calibration_factor_bucket_preserves_zero_server_score(self):
         tokens = SignalDeciderCalibrationService()._build_group_tokens(

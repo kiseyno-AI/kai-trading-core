@@ -13,6 +13,9 @@ from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
     normalize_feedback_scope_mode,
 )
+from app.agent_context.signal_decider_snapshot_validity import (
+    is_decision_snapshot_valid_for_source_date,
+)
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
@@ -20,6 +23,7 @@ from app.db_models import (
     BrokerOrder,
     DartDisclosureEvent,
     OrderRequest,
+    SignalDeciderDecisionSnapshot,
     SignalDeciderEvaluation,
     SignalDeciderExecutionPlanItem,
 )
@@ -628,6 +632,14 @@ def _load_prior_positive_decision_reasons(
     seen: set[tuple[str, str]] = set()
     matched = 0
     for row in rows:
+        if not is_decision_snapshot_valid_for_source_date(
+            {
+                'market_date': row.market_date,
+                'feedback_received_at': row.received_at,
+                'created_at': None,
+            }
+        ):
+            continue
         symbol = _normalize_symbol(row.symbol)
         agent_name = str(row.agent_name or '')
         key = (symbol, agent_name)
@@ -686,6 +698,15 @@ def _load_prior_missed_opportunity_reasons(
                             SignalDeciderEvaluation.grade_score,
                             SignalDeciderEvaluation.evaluation_version,
                             SignalDeciderEvaluation.evaluated_at,
+                            SignalDeciderDecisionSnapshot.feedback_received_at.label(
+                                'feedback_received_at'
+                            ),
+                            SignalDeciderDecisionSnapshot.created_at.label('created_at'),
+                        )
+                        .join(
+                            SignalDeciderDecisionSnapshot,
+                            SignalDeciderDecisionSnapshot.id
+                            == SignalDeciderEvaluation.decision_snapshot_id,
                         )
                         .where(SignalDeciderEvaluation.market_date < market_date)
                         .where(SignalDeciderEvaluation.symbol.in_(symbol_chunk))
@@ -715,6 +736,8 @@ def _load_prior_missed_opportunity_reasons(
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
+        if not is_decision_snapshot_valid_for_source_date(row):
+            continue
         matched += 1
         _append_forced_reason(
             reasons_by_symbol,
