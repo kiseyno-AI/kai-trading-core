@@ -84,7 +84,10 @@ from app.orders.next_open_execution import (
     _short_term_entry_quality_blocks,
     signal_decider_next_open_execution_service,
 )
-from app.quotes.kis_realtime_prices import KISRealtimePriceService
+from app.quotes.kis_realtime_prices import (
+    KISRealtimeMonitoredSymbolSource,
+    KISRealtimePriceService,
+)
 
 
 def _runtime_monitored_membership_payload(
@@ -930,6 +933,621 @@ class ExecIntegrationDashboardCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(build_calls, 1)
         self.assertEqual(first['items'], [{'symbol': '005930'}])
         self.assertEqual(second['freshness']['served_from_cache'], True)
+
+    async def test_realtime_source_cold_start_returns_holdings_without_dashboard_build(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        source_version = datetime(2026, 9, 14, 0, 0, tzinfo=timezone.utc)
+        call_order: list[str] = []
+        dashboard_started = asyncio.Event()
+        release_dashboard = asyncio.Event()
+
+        async def blocked_dashboard_refresh(**_kwargs):
+            call_order.append('dashboard_refresh_started')
+            dashboard_started.set()
+            await release_dashboard.wait()
+            raise RuntimeError('test dashboard refresh stopped')
+
+        async def load_holding_membership(**_kwargs):
+            call_order.append('portfolio_holdings_loaded')
+            return PortfolioHoldingSymbolMembership(
+                symbols=frozenset({'027710'}),
+                membership_complete=True,
+                source_version=source_version,
+            )
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=source_version,
+            ),
+            patch.object(
+                service,
+                'integration_status',
+                return_value={
+                    'enabled': True,
+                    'config_status': 'ready',
+                    'issues': [],
+                },
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(side_effect=load_holding_membership),
+            ) as load_holdings,
+            patch.object(
+                service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                service,
+                'list_signal_decider_exec_overview',
+                new=AsyncMock(side_effect=blocked_dashboard_refresh),
+            ),
+        ):
+            try:
+                source = await asyncio.wait_for(
+                    service.load_realtime_monitored_symbol_source(
+                        market_date=market_date,
+                        trigger='kis_realtime_price:background',
+                    ),
+                    timeout=1.0,
+                )
+                await asyncio.wait_for(
+                    dashboard_started.wait(),
+                    timeout=0.1,
+                )
+            finally:
+                release_dashboard.set()
+                tasks = list(service._dashboard_refresh_tasks.values())
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.assertEqual(source.symbols, ('027710',))
+        self.assertEqual(source.market_date, market_date.isoformat())
+        self.assertEqual(source.source_version, source_version)
+        self.assertFalse(source.membership_complete)
+        self.assertEqual(source.protected_symbols, ('027710',))
+        self.assertEqual(source.critical_protected_symbols, ('027710',))
+        load_holdings.assert_awaited_once()
+        self.assertEqual(
+            call_order,
+            ['portfolio_holdings_loaded', 'dashboard_refresh_started'],
+        )
+
+    async def test_realtime_source_merges_fresh_holdings_into_cached_membership(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        cached_version = datetime(
+            2026,
+            9,
+            14,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
+        holding_version = cached_version + timedelta(seconds=5)
+        cached_source = KISRealtimeMonitoredSymbolSource(
+            symbols=('035420', '005930'),
+            market_date=market_date.isoformat(),
+            source_version=cached_version,
+            membership_complete=True,
+            protected_symbols=('035420',),
+        )
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=holding_version,
+            ),
+            patch.object(
+                service,
+                '_ensure_dashboard_background_refresh',
+                return_value={
+                    'requested': True,
+                    'status': 'scheduled',
+                    'in_flight': True,
+                },
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value={'items': []},
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(
+                    return_value=PortfolioHoldingSymbolMembership(
+                        symbols=frozenset({'027710'}),
+                        membership_complete=True,
+                        source_version=holding_version,
+                    )
+                ),
+            ) as load_holdings,
+            patch.object(
+                KISRealtimePriceService,
+                '_runtime_monitored_source_from_payload',
+                return_value=cached_source,
+            ),
+        ):
+            source = await service.load_realtime_monitored_symbol_source(
+                market_date=market_date,
+                trigger='kis_realtime_price:background',
+            )
+
+        self.assertEqual(source.symbols, ('027710', '035420', '005930'))
+        self.assertEqual(source.source_version, holding_version)
+        self.assertFalse(source.membership_complete)
+        self.assertEqual(source.protected_symbols, ('027710', '035420'))
+        self.assertEqual(source.critical_protected_symbols, ('027710',))
+        load_holdings.assert_awaited_once()
+
+    async def test_realtime_source_does_not_promote_future_cached_version(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        holding_version = datetime(
+            2026,
+            9,
+            14,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
+        future_cached_source = KISRealtimeMonitoredSymbolSource(
+            symbols=('005930',),
+            market_date=market_date.isoformat(),
+            source_version=holding_version + timedelta(minutes=1),
+            membership_complete=False,
+            protected_symbols=('005930',),
+        )
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=holding_version,
+            ),
+            patch.object(
+                service,
+                '_ensure_dashboard_background_refresh',
+                return_value={
+                    'requested': True,
+                    'status': 'scheduled',
+                    'in_flight': True,
+                },
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value={'items': []},
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(
+                    return_value=PortfolioHoldingSymbolMembership(
+                        symbols=frozenset({'027710'}),
+                        membership_complete=True,
+                        source_version=holding_version,
+                    )
+                ),
+            ),
+            patch.object(
+                KISRealtimePriceService,
+                '_runtime_monitored_source_from_payload',
+                return_value=future_cached_source,
+            ),
+        ):
+            source = await service.load_realtime_monitored_symbol_source(
+                market_date=market_date,
+                trigger='kis_realtime_price:background',
+            )
+
+        self.assertEqual(source.symbols, ('027710',))
+        self.assertEqual(source.source_version, holding_version)
+        self.assertEqual(source.protected_symbols, ('027710',))
+        self.assertFalse(source.membership_complete)
+
+    async def test_realtime_source_recovers_exact_cached_membership_authority(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        cached_version = datetime(
+            2026,
+            9,
+            14,
+            0,
+            5,
+            tzinfo=timezone.utc,
+        )
+        holding_version = cached_version - timedelta(seconds=5)
+        cached_source = KISRealtimeMonitoredSymbolSource(
+            symbols=('027710', '005930'),
+            market_date=market_date.isoformat(),
+            source_version=cached_version,
+            membership_complete=True,
+            protected_symbols=('027710',),
+            critical_protected_symbols=('027710',),
+        )
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=cached_version,
+            ),
+            patch.object(
+                service,
+                '_ensure_dashboard_background_refresh',
+                return_value={
+                    'requested': True,
+                    'status': 'scheduled',
+                    'in_flight': True,
+                },
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value={'items': []},
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(
+                    return_value=PortfolioHoldingSymbolMembership(
+                        symbols=frozenset({'027710'}),
+                        membership_complete=True,
+                        source_version=holding_version,
+                    )
+                ),
+            ),
+            patch.object(
+                service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(
+                    return_value=ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({'005930'}),
+                        membership_complete=True,
+                        source_version=holding_version,
+                    )
+                ),
+            ),
+            patch.object(
+                KISRealtimePriceService,
+                '_runtime_monitored_source_from_payload',
+                return_value=cached_source,
+            ),
+        ):
+            source = await service.load_realtime_monitored_symbol_source(
+                market_date=market_date,
+                trigger='kis_realtime_price:background',
+            )
+
+        self.assertEqual(source.symbols, cached_source.symbols)
+        self.assertEqual(source.source_version, cached_version)
+        self.assertTrue(source.membership_complete)
+        self.assertEqual(source.protected_symbols, ('027710', '005930'))
+        self.assertEqual(
+            source.critical_protected_symbols,
+            cached_source.critical_protected_symbols,
+        )
+
+    async def test_realtime_source_keeps_newer_holding_removal_merge_only(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        cached_version = datetime(
+            2026,
+            9,
+            14,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
+        holding_version = cached_version + timedelta(seconds=1)
+        cached_source = KISRealtimeMonitoredSymbolSource(
+            symbols=('027710',),
+            market_date=market_date.isoformat(),
+            source_version=cached_version,
+            membership_complete=True,
+            protected_symbols=('027710',),
+            critical_protected_symbols=('027710',),
+        )
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=holding_version,
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value={'items': []},
+            ),
+            patch.object(
+                KISRealtimePriceService,
+                '_runtime_monitored_source_from_payload',
+                return_value=cached_source,
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(
+                    return_value=PortfolioHoldingSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=True,
+                        source_version=holding_version,
+                    )
+                ),
+            ),
+            patch.object(
+                service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                service,
+                '_ensure_dashboard_background_refresh',
+                return_value={
+                    'requested': True,
+                    'status': 'scheduled',
+                    'in_flight': True,
+                },
+            ),
+        ):
+            source = await service.load_realtime_monitored_symbol_source(
+                market_date=market_date,
+                trigger='kis_realtime_price:background',
+            )
+
+        self.assertEqual(source.symbols, ('027710',))
+        self.assertEqual(source.source_version, holding_version)
+        self.assertFalse(source.membership_complete)
+
+    async def test_realtime_source_ingests_slow_exec_membership_without_blocking_holdings(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        source_version = datetime(2026, 9, 14, 0, 0, tzinfo=timezone.utc)
+        exec_started = asyncio.Event()
+        release_exec = asyncio.Event()
+
+        async def load_exec_membership(**_kwargs):
+            exec_started.set()
+            await release_exec.wait()
+            return ExecRuntimeMonitoredSymbolMembership(
+                symbols=frozenset({'005930'}),
+                membership_complete=True,
+                source_version=source_version + timedelta(seconds=1),
+            )
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=source_version,
+            ),
+            patch.object(
+                service,
+                '_ensure_dashboard_background_refresh',
+                return_value={
+                    'requested': True,
+                    'status': 'scheduled',
+                    'in_flight': True,
+                },
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(
+                    return_value=PortfolioHoldingSymbolMembership(
+                        symbols=frozenset({'027710'}),
+                        membership_complete=True,
+                        source_version=source_version,
+                    )
+                ),
+            ),
+            patch.object(
+                service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(side_effect=load_exec_membership),
+            ) as load_exec,
+        ):
+            first = await asyncio.wait_for(
+                service.load_realtime_monitored_symbol_source(
+                    market_date=market_date,
+                    trigger='kis_realtime_price:background',
+                ),
+                timeout=1.0,
+            )
+            await asyncio.wait_for(exec_started.wait(), timeout=0.1)
+            second = await asyncio.wait_for(
+                service.load_realtime_monitored_symbol_source(
+                    market_date=market_date,
+                    trigger='kis_realtime_price:background',
+                ),
+                timeout=1.0,
+            )
+            release_exec.set()
+            await asyncio.sleep(0)
+            third = await service.load_realtime_monitored_symbol_source(
+                market_date=market_date,
+                trigger='kis_realtime_price:background',
+            )
+
+        self.assertEqual(first.symbols, ('027710',))
+        self.assertEqual(second.symbols, ('027710',))
+        self.assertEqual(third.symbols, ('027710', '005930'))
+        self.assertEqual(third.protected_symbols, ('027710', '005930'))
+        self.assertEqual(third.critical_protected_symbols, ('027710',))
+        self.assertFalse(third.membership_complete)
+        self.assertEqual(load_exec.await_count, 1)
+
+    async def test_realtime_source_bounds_cold_portfolio_wait_before_dashboard_refresh(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        source_version = datetime(2026, 9, 14, 0, 0, tzinfo=timezone.utc)
+        portfolio_started = asyncio.Event()
+        release_portfolio = asyncio.Event()
+
+        async def blocked_portfolio_membership(**_kwargs):
+            portfolio_started.set()
+            await release_portfolio.wait()
+            return PortfolioHoldingSymbolMembership(
+                symbols=frozenset({'027710'}),
+                membership_complete=True,
+                source_version=source_version,
+            )
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=source_version,
+            ),
+            patch(
+                'app.orders.exec_integration.'
+                'REALTIME_MONITORED_PORTFOLIO_WAIT_SECONDS',
+                0.01,
+                create=True,
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(side_effect=blocked_portfolio_membership),
+            ),
+            patch.object(
+                service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                service,
+                '_ensure_dashboard_background_refresh',
+                return_value={
+                    'requested': True,
+                    'status': 'scheduled',
+                    'in_flight': True,
+                },
+            ) as schedule_refresh,
+        ):
+            try:
+                source = await asyncio.wait_for(
+                    service.load_realtime_monitored_symbol_source(
+                        market_date=market_date,
+                        trigger='kis_realtime_price:background',
+                    ),
+                    timeout=0.2,
+                )
+            finally:
+                release_portfolio.set()
+
+        self.assertTrue(portfolio_started.is_set())
+        self.assertEqual(source.symbols, ())
+        self.assertFalse(source.membership_complete)
+        schedule_refresh.assert_called_once()
+
+    async def test_realtime_source_serves_cache_as_partial_while_portfolio_refresh_is_slow(
+        self,
+    ) -> None:
+        service = SignalDeciderExecIntegrationService(client=FakeExecClient())
+        market_date = date(2026, 9, 14)
+        source_version = datetime(2026, 9, 14, 0, 0, tzinfo=timezone.utc)
+        portfolio_started = asyncio.Event()
+        release_portfolio = asyncio.Event()
+        cached_source = KISRealtimeMonitoredSymbolSource(
+            symbols=('027710',),
+            market_date=market_date.isoformat(),
+            source_version=source_version,
+            membership_complete=True,
+            protected_symbols=('027710',),
+            critical_protected_symbols=('027710',),
+        )
+
+        async def blocked_portfolio_membership(**_kwargs):
+            portfolio_started.set()
+            await release_portfolio.wait()
+            return None
+
+        with (
+            patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=source_version,
+            ),
+            patch.object(
+                service,
+                '_load_dashboard_cached_payload',
+                return_value={'items': []},
+            ),
+            patch.object(
+                KISRealtimePriceService,
+                '_runtime_monitored_source_from_payload',
+                return_value=cached_source,
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(side_effect=blocked_portfolio_membership),
+            ),
+            patch.object(
+                service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                service,
+                '_ensure_dashboard_background_refresh',
+                return_value={
+                    'requested': True,
+                    'status': 'scheduled',
+                    'in_flight': True,
+                },
+            ),
+        ):
+            try:
+                source = await asyncio.wait_for(
+                    service.load_realtime_monitored_symbol_source(
+                        market_date=market_date,
+                        trigger='kis_realtime_price:background',
+                    ),
+                    timeout=0.1,
+                )
+            finally:
+                release_portfolio.set()
+                tasks = list(
+                    service._realtime_portfolio_membership_tasks.values()
+                )
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.assertTrue(portfolio_started.is_set())
+        self.assertEqual(source.symbols, cached_source.symbols)
+        self.assertEqual(source.source_version, source_version)
+        self.assertFalse(source.membership_complete)
 
     async def test_historical_daily_board_ignores_unscoped_current_runtime_activity(self) -> None:
         service = SignalDeciderExecIntegrationService(client=FakeExecClient())
