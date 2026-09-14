@@ -418,7 +418,7 @@ class EODBackgroundRunner:
                                 trigger='market_open_scheduler'
                             ),
                         )
-                if market.state == 'CLOSED':
+                if market.state in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
                     await self._run_async_step(
                         'auto_pykrx_schedule_daily_pipeline_if_due',
                         auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(),
