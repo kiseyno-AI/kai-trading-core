@@ -1009,31 +1009,50 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(stale_task['allowed_symbols'], ['027710'])
 
-    async def test_runtime_source_loader_disables_nested_publication(self) -> None:
+    async def test_runtime_source_loader_uses_nonblocking_integration_source(
+        self,
+    ) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
-        payload = _runtime_source_payload(
-            ['027710'],
-            generated_at=datetime.now(timezone.utc),
+        now = datetime.now(timezone.utc)
+        source = KISRealtimeMonitoredSymbolSource(
+            symbols=('027710',),
+            market_date=now.astimezone(
+                kis_realtime_prices.KST
+            ).date().isoformat(),
+            source_version=now,
             membership_complete=True,
+            protected_symbols=('027710',),
         )
-        list_symbols = AsyncMock(return_value=payload)
+        load_source = AsyncMock(return_value=source)
+        blocking_dashboard_source = AsyncMock(
+            side_effect=AssertionError(
+                'realtime source must not enter the dashboard builder'
+            )
+        )
 
-        with patch(
-            'app.orders.exec_integration.signal_decider_exec_integration_service.'
-            'list_runtime_monitored_symbols',
-            list_symbols,
+        with (
+            patch(
+                'app.orders.exec_integration.'
+                'signal_decider_exec_integration_service.'
+                'load_realtime_monitored_symbol_source',
+                load_source,
+            ),
+            patch(
+                'app.orders.exec_integration.'
+                'signal_decider_exec_integration_service.'
+                'list_runtime_monitored_symbols',
+                blocking_dashboard_source,
+            ),
         ):
-            source = await service._load_runtime_monitored_symbols(
+            result = await service._load_runtime_monitored_symbols(
                 trigger='background'
             )
 
-        self.assertIsInstance(source, KISRealtimeMonitoredSymbolSource)
-        self.assertEqual(source.symbols, ('027710',))
-        self.assertTrue(source.membership_complete)
-        self.assertTrue(list_symbols.await_args.kwargs['refresh'])
-        self.assertFalse(
-            list_symbols.await_args.kwargs['publish_realtime_observation']
+        self.assertIs(result, source)
+        load_source.assert_awaited_once_with(
+            trigger='kis_realtime_price:background',
         )
+        blocking_dashboard_source.assert_not_awaited()
 
     async def test_background_loop_does_not_force_subscription_source_refresh(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())

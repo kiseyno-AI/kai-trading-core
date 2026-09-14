@@ -100,7 +100,10 @@ from app.quotes.display_prices import (
     DISPLAY_FALLBACK_SOURCES,
     build_display_price_fields,
 )
-from app.quotes.kis_realtime_prices import kis_realtime_price_service
+from app.quotes.kis_realtime_prices import (
+    KISRealtimeMonitoredSymbolSource,
+    kis_realtime_price_service,
+)
 from app.repositories.symbol_repository import load_symbols
 
 INTEGRATION_MODE_DISABLED = 'disabled'
@@ -313,6 +316,7 @@ DASHBOARD_TODAY_ACTIVITY_SCHEMA_VERSION = EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEM
 DASHBOARD_TODAY_ACTIVITY_BROKER_ORDER_ID_LIMIT = 5
 EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_AGE = timedelta(seconds=60)
 EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_FUTURE_SKEW = timedelta(seconds=30)
+REALTIME_MONITORED_PORTFOLIO_WAIT_SECONDS = 5.0
 
 MARKET_TIME_ZONE = ZoneInfo('Asia/Seoul')
 DELEGATED_GATE_POLICY_VERSION = 'core_delegated_gate_policy_v1'
@@ -2213,10 +2217,18 @@ class SignalDeciderExecIntegrationService:
             date,
             ExecRuntimeMonitoredSymbolMembership,
         ] | None = None
+        self._realtime_exec_membership_tasks: dict[
+            date,
+            asyncio.Task[ExecRuntimeMonitoredSymbolMembership | None],
+        ] = {}
         self._latest_portfolio_holding_membership: tuple[
             date,
             PortfolioHoldingSymbolMembership,
         ] | None = None
+        self._realtime_portfolio_membership_tasks: dict[
+            date,
+            asyncio.Task[PortfolioHoldingSymbolMembership | None],
+        ] = {}
 
     async def _synchronize_open_buy_authority(
         self,
@@ -5351,6 +5363,282 @@ class SignalDeciderExecIntegrationService:
             except Exception:
                 pass
         return payload
+
+    async def load_realtime_monitored_symbol_source(
+        self,
+        *,
+        market_date: str | date | None = None,
+        trigger: str,
+    ) -> KISRealtimeMonitoredSymbolSource:
+        """Seed realtime subscriptions without waiting for a dashboard build."""
+        resolved_market_date = _normalize_date(market_date)
+        refresh_key = self._dashboard_refresh_key(
+            target_trade_date=resolved_market_date,
+            account_reference=None,
+            symbol=None,
+        )
+        cache_refresh_state = self._dashboard_refresh_payload(
+            refresh_key,
+            requested=False,
+        )
+        cached = self._load_dashboard_cached_payload(
+            endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
+            market_date=resolved_market_date,
+            symbol=None,
+            refresh_state=cache_refresh_state,
+            allow_stale=True,
+        )
+        cached_source: KISRealtimeMonitoredSymbolSource | None = None
+        if cached is not None:
+            cached_source = (
+                kis_realtime_price_service._runtime_monitored_source_from_payload(
+                    cached
+                )
+            )
+        now = _utcnow().astimezone(timezone.utc)
+        if cached_source is not None and (
+            cached_source.market_date != resolved_market_date.isoformat()
+            or cached_source.source_version is None
+            or cached_source.source_version
+            > now + EXEC_RUNTIME_MONITORED_MEMBERSHIP_MAX_FUTURE_SKEW
+        ):
+            cached_source = None
+        portfolio_membership_task = (
+            self._start_realtime_portfolio_membership_refresh(
+                market_date=resolved_market_date,
+                trigger=trigger,
+            )
+        )
+        exec_membership_task = self._start_realtime_exec_membership_refresh(
+            market_date=resolved_market_date,
+            trigger=trigger,
+        )
+        # Give cache-backed membership reads one event-loop turn to complete,
+        # without putting a usable exact dashboard snapshot behind live I/O.
+        await asyncio.sleep(0)
+        if cached_source is not None and cached_source.membership_complete:
+            holding_membership = (
+                self._take_completed_realtime_portfolio_membership(
+                    market_date=resolved_market_date,
+                    task=portfolio_membership_task,
+                )
+            )
+        else:
+            holding_membership = (
+                await self._wait_for_realtime_portfolio_membership(
+                    market_date=resolved_market_date,
+                    task=portfolio_membership_task,
+                )
+            )
+        holding_symbols = sorted(
+            holding_membership.symbols
+            if holding_membership is not None
+            else ()
+        )
+        exec_membership = self._take_completed_realtime_exec_membership(
+            market_date=resolved_market_date,
+            task=exec_membership_task,
+        )
+        exec_symbols = sorted(
+            exec_membership.symbols
+            if exec_membership is not None
+            else ()
+        )
+        cached_symbols = cached_source.symbols if cached_source else ()
+        cached_critical = set(
+            cached_source.critical_protected_symbols
+            if cached_source
+            else ()
+        )
+        cached_protected = set(
+            cached_source.protected_symbols if cached_source else ()
+        )
+        critical_symbols = set(holding_symbols) | cached_critical
+        protected_symbols = (
+            critical_symbols | set(exec_symbols) | cached_protected
+        )
+        cached_authority_is_current = bool(
+            cached_source is not None
+            and cached_source.membership_complete
+            and holding_membership is not None
+            and holding_membership.membership_complete
+            and holding_membership.source_version is not None
+            and exec_membership is not None
+            and exec_membership.membership_complete
+            and exec_membership.source_version is not None
+            and set(holding_symbols).issubset(cached_critical)
+            and set(exec_symbols).issubset(set(cached_symbols))
+            and holding_membership.source_version
+            <= cached_source.source_version
+            and exec_membership.source_version
+            <= cached_source.source_version
+        )
+        ordered_symbols = list(
+            dict.fromkeys(
+                [
+                    *holding_symbols,
+                    *(
+                        symbol
+                        for symbol in cached_symbols
+                        if symbol in cached_critical
+                    ),
+                    *exec_symbols,
+                    *(
+                        symbol
+                        for symbol in cached_symbols
+                        if symbol in cached_protected
+                        and symbol not in critical_symbols
+                    ),
+                    *cached_symbols,
+                ]
+            )
+        )
+        source_versions = [
+            value
+            for value in (
+                cached_source.source_version if cached_source else None,
+                holding_membership.source_version
+                if holding_membership is not None
+                else None,
+                exec_membership.source_version
+                if exec_membership is not None
+                else None,
+            )
+            if value is not None
+        ]
+        self._ensure_dashboard_background_refresh(
+            target_trade_date=resolved_market_date,
+            account_reference=None,
+            symbol=None,
+            refresh=True,
+            trigger=trigger,
+        )
+        return KISRealtimeMonitoredSymbolSource(
+            symbols=tuple(ordered_symbols),
+            market_date=resolved_market_date.isoformat(),
+            source_version=max(source_versions) if source_versions else None,
+            # New broker facts are merge-only until a complete dashboard cache
+            # includes them. An unchanged complete cache may retain its exact
+            # removal authority.
+            membership_complete=cached_authority_is_current,
+            protected_symbols=tuple(
+                symbol
+                for symbol in ordered_symbols
+                if symbol in protected_symbols
+            ),
+            critical_protected_symbols=tuple(
+                symbol
+                for symbol in ordered_symbols
+                if symbol in critical_symbols
+            ),
+        )
+
+    def _start_realtime_portfolio_membership_refresh(
+        self,
+        *,
+        market_date: date,
+        trigger: str,
+    ) -> asyncio.Task[PortfolioHoldingSymbolMembership | None]:
+        task = self._realtime_portfolio_membership_tasks.get(market_date)
+        if task is not None:
+            return task
+        task = asyncio.create_task(
+            self._load_live_portfolio_holding_membership(
+                market_date=market_date,
+                trigger=trigger,
+            ),
+            name=(
+                'portfolio-realtime-membership-refresh:'
+                f'{market_date.isoformat()}'
+            ),
+        )
+        self._realtime_portfolio_membership_tasks[market_date] = task
+        return task
+
+    def _take_completed_realtime_portfolio_membership(
+        self,
+        *,
+        market_date: date,
+        task: asyncio.Task[PortfolioHoldingSymbolMembership | None],
+    ) -> PortfolioHoldingSymbolMembership | None:
+        if not task.done():
+            return self._degraded_cached_portfolio_holding_membership(
+                market_date
+            )
+        if self._realtime_portfolio_membership_tasks.get(market_date) is task:
+            self._realtime_portfolio_membership_tasks.pop(
+                market_date,
+                None,
+            )
+        try:
+            return task.result()
+        except (asyncio.CancelledError, Exception):
+            return self._degraded_cached_portfolio_holding_membership(
+                market_date
+            )
+
+    async def _wait_for_realtime_portfolio_membership(
+        self,
+        *,
+        market_date: date,
+        task: asyncio.Task[PortfolioHoldingSymbolMembership | None],
+    ) -> PortfolioHoldingSymbolMembership | None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=REALTIME_MONITORED_PORTFOLIO_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            return self._degraded_cached_portfolio_holding_membership(
+                market_date
+            )
+        except Exception:
+            pass
+        return self._take_completed_realtime_portfolio_membership(
+            market_date=market_date,
+            task=task,
+        )
+
+    def _start_realtime_exec_membership_refresh(
+        self,
+        *,
+        market_date: date,
+        trigger: str,
+    ) -> asyncio.Task[ExecRuntimeMonitoredSymbolMembership | None]:
+        task = self._realtime_exec_membership_tasks.get(market_date)
+        if task is not None:
+            return task
+        task = asyncio.create_task(
+            self._load_live_exec_monitoring_symbols(
+                market_date=market_date,
+                trigger=trigger,
+            ),
+            name=(
+                'exec-realtime-membership-refresh:'
+                f'{market_date.isoformat()}'
+            ),
+        )
+        self._realtime_exec_membership_tasks[market_date] = task
+        return task
+
+    def _take_completed_realtime_exec_membership(
+        self,
+        *,
+        market_date: date,
+        task: asyncio.Task[ExecRuntimeMonitoredSymbolMembership | None],
+    ) -> ExecRuntimeMonitoredSymbolMembership | None:
+        if not task.done():
+            return self._degraded_cached_exec_monitoring_membership(
+                market_date
+            )
+        if self._realtime_exec_membership_tasks.get(market_date) is task:
+            self._realtime_exec_membership_tasks.pop(market_date, None)
+        try:
+            return task.result()
+        except (asyncio.CancelledError, Exception):
+            return self._degraded_cached_exec_monitoring_membership(
+                market_date
+            )
 
     async def _load_live_exec_monitoring_symbols(
         self,

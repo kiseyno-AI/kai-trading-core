@@ -1076,12 +1076,9 @@ class KISRealtimePriceService:
     ) -> KISRealtimeMonitoredSymbolSource:
         from app.orders.exec_integration import signal_decider_exec_integration_service
 
-        payload = await signal_decider_exec_integration_service.list_runtime_monitored_symbols(
-            refresh=True,
+        return await signal_decider_exec_integration_service.load_realtime_monitored_symbol_source(
             trigger=f'kis_realtime_price:{trigger}',
-            publish_realtime_observation=False,
         )
-        return self._runtime_monitored_source_from_payload(payload)
 
     async def _run(self) -> None:
         reconnect_delay = max(0.5, float(settings.kis_realtime_reconnect_base_delay_seconds))
