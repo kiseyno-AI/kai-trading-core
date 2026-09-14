@@ -3243,7 +3243,92 @@ class PykrxBackfillServiceTests(TestCase):
             self.assertIsNone(call.kwargs['retry_context'])
             self.assertTrue(call.kwargs['refresh_universe'])
 
-    def test_run_market_data_pipeline_logs_per_symbol_failures(self) -> None:
+    def test_run_market_data_pipeline_limits_symbol_stages_to_fresh_price_scope(self) -> None:
+        service = PykrxBackfillService()
+        service.symbol_pause_seconds = 0
+        symbols = [
+            PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics'),
+            PykrxSymbol(symbol='472220', market='KOSPI', name_ko='Missing Price'),
+        ]
+
+        def price_frame(_start: str, _end: str, symbol: str) -> SimpleNamespace:
+            return SimpleNamespace(empty=symbol == '472220')
+
+        with (
+            patch.object(service, 'load_active_universe', return_value=symbols),
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(
+                service,
+                '_map_symbol_bars',
+                return_value=[{
+                    'trade_date': '2026-04-03',
+                    'open_price': 1,
+                    'high_price': 2,
+                    'low_price': 1,
+                    'close_price': 2,
+                    'volume': 3,
+                    'turnover': 4,
+                }],
+            ),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', side_effect=price_frame),
+            patch(
+                'app.eod.pykrx_pipeline_runner._enrich_bars_with_market_turnover',
+                side_effect=lambda **kwargs: kwargs['bars'],
+            ),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                return_value={
+                    'requested_symbols': 1,
+                    'contexts_persisted': 1,
+                    'contexts_failed': 0,
+                    '_retry_metadata': {'failed_symbols': []},
+                },
+            ) as price_contexts,
+            patch(
+                'app.eod.pykrx_backfill.daily_technical_snapshot_service.rebuild_for_market_date',
+                return_value={
+                    'requested_symbols': 1,
+                    'snapshots_persisted': 1,
+                    'snapshots_failed': 0,
+                    '_retry_metadata': {'failed_symbols': []},
+                },
+            ) as technical_snapshots,
+            patch(
+                'app.eod.pykrx_backfill.daily_action_summary_service.rebuild_for_market_date',
+                return_value={
+                    'requested_symbols': 1,
+                    'action_summaries_persisted': 1,
+                    'action_summaries_failed': 0,
+                    '_retry_metadata': {'failed_symbols': []},
+                },
+            ) as action_summaries,
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='test',
+                refresh_universe=False,
+                mode='daily_auto',
+                selected_stages=('price_collection', 'technical_snapshots', 'action_summaries'),
+                chain_fundamentals_followup=False,
+            )
+
+        for stage in (price_contexts, technical_snapshots, action_summaries):
+            self.assertEqual(stage.call_args.kwargs['symbols'], ['005930'])
+        self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertEqual(result['price_retry_symbols'], ['472220'])
+        self.assertEqual(result['downstream_retry_symbols'], [])
+        self.assertEqual(result['technical_snapshots']['causally_skipped_symbols'], ['472220'])
+        completed_metadata = complete_run.call_args.kwargs['run_metadata']
+        self.assertEqual(completed_metadata['failed_symbols'], ['472220'])
+        self.assertEqual(completed_metadata['downstream_retry_symbols'], [])
+
+    def test_run_market_data_pipeline_skips_symbol_stages_when_no_price_was_collected(self) -> None:
         service = PykrxBackfillService()
         symbols = [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')]
 
@@ -3291,21 +3376,13 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['status'], 'completed_with_errors')
         self.assertEqual(result['failed_symbols'], ['005930'])
-        price_contexts.assert_called_once_with(
-            market_date='2026-04-03',
-            symbols=[],
-            source='pykrx',
-            run_id=12,
-            include_retry_metadata=True,
-        )
-        technical_snapshots.assert_called_once_with(
-            market_date='2026-04-03',
-            symbols=['005930'],
-            source='pykrx',
-            run_id=12,
-            progress_callback=ANY,
-            include_retry_metadata=True,
-        )
+        price_contexts.assert_not_called()
+        technical_snapshots.assert_not_called()
+        action_summaries.assert_not_called()
+        self.assertEqual(result['price_contexts']['reason'], 'no_fresh_price_rows')
+        self.assertEqual(result['technical_snapshots']['reason'], 'no_fresh_price_rows')
+        self.assertEqual(result['action_summaries']['reason'], 'no_fresh_price_rows')
+        self.assertEqual(result['technical_snapshots']['causally_skipped_symbols'], ['005930'])
         self.assertTrue(
             any(
                 call.kwargs.get('operation') == 'fetch_symbol_ohlcv'

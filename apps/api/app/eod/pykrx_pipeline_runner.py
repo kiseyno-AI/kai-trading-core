@@ -1463,9 +1463,18 @@ def run_market_data_pipeline(
 
     failed_symbol_set = set(failed_symbols)
     price_context_symbols = [item.symbol for item in symbols if item.symbol not in failed_symbol_set]
+    causal_price_skip = (
+        {
+            'causal_skip_reason': 'fresh_price_unavailable',
+            'causally_skipped_symbols': failed_symbols[:50],
+            'causally_skipped_symbols_count': len(failed_symbols),
+        }
+        if failed_symbols
+        else {}
+    )
     price_context_result: dict
     price_context_error_message: str | None = None
-    if mode != 'daily_stage_run':
+    if mode != 'daily_stage_run' and price_context_symbols:
         try:
             price_context_result = dependencies.price_context_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
@@ -1474,6 +1483,8 @@ def run_market_data_pipeline(
                 run_id=run_id,
                 include_retry_metadata=True,
             )
+            if failed_symbols:
+                price_context_result.update(causal_price_skip)
         except Exception as exc:
             price_context_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -1491,6 +1502,18 @@ def run_market_data_pipeline(
                 'failed_symbols': list(price_context_symbols),
             }
             price_context_error_message = f'Price context persistence failed: {exc}'
+    elif mode != 'daily_stage_run':
+        price_context_result = {
+            'skipped': True,
+            'status': 'skipped',
+            'reason': 'no_fresh_price_rows',
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+            'requested_symbols': 0,
+            'contexts_persisted': 0,
+            'contexts_failed': 0,
+            **causal_price_skip,
+        }
     else:
         price_context_result = {
             'skipped': True,
@@ -1673,11 +1696,11 @@ def run_market_data_pipeline(
 
     technical_snapshot_result: dict
     snapshot_error_message: str | None = None
-    if 'technical_snapshots' in requested_stage_set:
+    if 'technical_snapshots' in requested_stage_set and price_context_symbols:
         try:
             technical_snapshot_result = dependencies.technical_snapshot_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
-                symbols=[item.symbol for item in symbols],
+                symbols=price_context_symbols,
                 source='pykrx',
                 run_id=run_id,
                 progress_callback=make_stage_progress_callback(
@@ -1689,6 +1712,8 @@ def run_market_data_pipeline(
                 ),
                 include_retry_metadata=True,
             )
+            if failed_symbols:
+                technical_snapshot_result.update(causal_price_skip)
             technical_failed = int(technical_snapshot_result.get('snapshots_failed') or 0)
             technical_succeeded = int(technical_snapshot_result.get('snapshots_persisted') or 0)
             technical_total = technical_succeeded + technical_failed
@@ -1701,10 +1726,13 @@ def run_market_data_pipeline(
                 if technical_status == 'completed'
                 else 'Daily technical snapshots completed with errors',
                 processed=technical_total,
-                total=len(symbols),
+                total=len(price_context_symbols),
                 succeeded=technical_succeeded,
                 failed=technical_failed,
-                extra=_gap_policy_details(failed=technical_failed, total=technical_total),
+                extra={
+                    **_gap_policy_details(failed=technical_failed, total=technical_total),
+                    **causal_price_skip,
+                },
             )
         except Exception as exc:
             technical_snapshot_result = build_stage_failure_result(
@@ -1712,15 +1740,15 @@ def run_market_data_pipeline(
                 source='pykrx',
                 error=exc,
                 totals={
-                    'requested_symbols': len(symbols),
+                    'requested_symbols': len(price_context_symbols),
                     'snapshots_persisted': 0,
-                    'snapshots_failed': len(symbols),
+                    'snapshots_failed': len(price_context_symbols),
                 },
-                failed_symbols=[item.symbol for item in symbols],
+                failed_symbols=price_context_symbols,
                 items_key='items',
             )
             technical_snapshot_result['_retry_metadata'] = {
-                'failed_symbols': [item.symbol for item in symbols],
+                'failed_symbols': list(price_context_symbols),
             }
             snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
             persist_stage_progress(
@@ -1729,10 +1757,34 @@ def run_market_data_pipeline(
                 current_step='technical_snapshots_failed',
                 current_activity='Daily technical snapshot persistence failed',
                 processed=0,
-                total=len(symbols),
+                total=len(price_context_symbols),
                 succeeded=0,
-                failed=len(symbols),
+                failed=len(price_context_symbols),
+                extra=causal_price_skip,
             )
+    elif 'technical_snapshots' in requested_stage_set:
+        technical_snapshot_result = {
+            'skipped': True,
+            'status': 'skipped',
+            'reason': 'no_fresh_price_rows',
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+            'requested_symbols': 0,
+            'snapshots_persisted': 0,
+            'snapshots_failed': 0,
+            **causal_price_skip,
+        }
+        persist_stage_progress(
+            stage='technical_snapshots',
+            status='skipped',
+            current_step='technical_snapshots_skipped',
+            current_activity='Skipped technical snapshots because no fresh prices were collected',
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=0,
+            extra=causal_price_skip,
+        )
     else:
         technical_snapshot_result = {
             'skipped': True,
@@ -1743,11 +1795,11 @@ def run_market_data_pipeline(
 
     action_summary_result: dict
     action_summary_error_message: str | None = None
-    if 'action_summaries' in requested_stage_set:
+    if 'action_summaries' in requested_stage_set and price_context_symbols:
         try:
             action_summary_result = dependencies.action_summary_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
-                symbols=[item.symbol for item in symbols],
+                symbols=price_context_symbols,
                 source='pykrx',
                 run_id=run_id,
                 progress_callback=make_stage_progress_callback(
@@ -1759,6 +1811,8 @@ def run_market_data_pipeline(
                 ),
                 include_retry_metadata=True,
             )
+            if failed_symbols:
+                action_summary_result.update(causal_price_skip)
             action_failed = int(action_summary_result.get('action_summaries_failed') or 0)
             action_succeeded = int(action_summary_result.get('action_summaries_persisted') or 0)
             action_total = action_succeeded + action_failed
@@ -1771,10 +1825,13 @@ def run_market_data_pipeline(
                 if action_status == 'completed'
                 else 'Daily action summaries completed with errors',
                 processed=action_total,
-                total=len(symbols),
+                total=len(price_context_symbols),
                 succeeded=action_succeeded,
                 failed=action_failed,
-                extra=_gap_policy_details(failed=action_failed, total=action_total),
+                extra={
+                    **_gap_policy_details(failed=action_failed, total=action_total),
+                    **causal_price_skip,
+                },
             )
         except Exception as exc:
             action_summary_result = build_stage_failure_result(
@@ -1782,15 +1839,15 @@ def run_market_data_pipeline(
                 source='pykrx',
                 error=exc,
                 totals={
-                    'requested_symbols': len(symbols),
+                    'requested_symbols': len(price_context_symbols),
                     'action_summaries_persisted': 0,
-                    'action_summaries_failed': len(symbols),
+                    'action_summaries_failed': len(price_context_symbols),
                 },
-                failed_symbols=[item.symbol for item in symbols],
+                failed_symbols=price_context_symbols,
                 items_key='items',
             )
             action_summary_result['_retry_metadata'] = {
-                'failed_symbols': [item.symbol for item in symbols],
+                'failed_symbols': list(price_context_symbols),
             }
             action_summary_error_message = f'Action summary persistence failed: {exc}'
             persist_stage_progress(
@@ -1799,10 +1856,34 @@ def run_market_data_pipeline(
                 current_step='action_summaries_failed',
                 current_activity='Daily action summary persistence failed',
                 processed=0,
-                total=len(symbols),
+                total=len(price_context_symbols),
                 succeeded=0,
-                failed=len(symbols),
+                failed=len(price_context_symbols),
+                extra=causal_price_skip,
             )
+    elif 'action_summaries' in requested_stage_set:
+        action_summary_result = {
+            'skipped': True,
+            'status': 'skipped',
+            'reason': 'no_fresh_price_rows',
+            'market_date': latest_trade_date,
+            'source': 'pykrx',
+            'requested_symbols': 0,
+            'action_summaries_persisted': 0,
+            'action_summaries_failed': 0,
+            **causal_price_skip,
+        }
+        persist_stage_progress(
+            stage='action_summaries',
+            status='skipped',
+            current_step='action_summaries_skipped',
+            current_activity='Skipped action summaries because no fresh prices were collected',
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=0,
+            extra=causal_price_skip,
+        )
     else:
         action_summary_result = {
             'skipped': True,
