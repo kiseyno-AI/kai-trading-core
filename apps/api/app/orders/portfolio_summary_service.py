@@ -127,6 +127,13 @@ class PortfolioSummaryCacheRecord:
     refresh_trigger: str | None
 
 
+@dataclass(slots=True)
+class PortfolioSummaryRefreshOutcome:
+    cache_record: PortfolioSummaryCacheRecord | None
+    served_from_cache: bool
+    uncached_payload: dict[str, Any] | None = None
+
+
 class PortfolioSummaryService:
     def __init__(
         self,
@@ -148,6 +155,7 @@ class PortfolioSummaryService:
         self._cache: PortfolioSummaryCacheRecord | None = None
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: asyncio.Task | None = None
+        self._active_refresh_count = 0
 
     def runtime_status(self) -> dict[str, Any]:
         payload = self._runtime_status().to_payload()
@@ -180,7 +188,23 @@ class PortfolioSummaryService:
             cache_record = self._cache
             if cache_record is not None and not force and not self._refresh_is_due(cache_record):
                 return self._decorate_cached_payload(cache_record, served_from_cache=True)
-            return await self._refresh_portfolio_summary(cache_record=cache_record, trigger=trigger)
+            self._active_refresh_count += 1
+            try:
+                outcome = await self._refresh_portfolio_summary(
+                    cache_record=cache_record,
+                    trigger=trigger,
+                )
+            finally:
+                self._active_refresh_count -= 1
+
+            if outcome.cache_record is not None:
+                return self._decorate_cached_payload(
+                    outcome.cache_record,
+                    served_from_cache=outcome.served_from_cache,
+                )
+            if outcome.uncached_payload is None:
+                raise RuntimeError('Portfolio summary refresh completed without a result.')
+            return self._decorate_uncached_payload(outcome.uncached_payload)
 
     def _ensure_background_refresh(self, *, trigger: str) -> None:
         if self._refresh_task is not None and not self._refresh_task.done():
@@ -205,7 +229,7 @@ class PortfolioSummaryService:
         *,
         cache_record: PortfolioSummaryCacheRecord | None,
         trigger: str,
-    ) -> dict[str, Any]:
+    ) -> PortfolioSummaryRefreshOutcome:
         attempted_at = _utc_now()
         runtime_status = self._runtime_status()
         if not runtime_status.ready:
@@ -217,16 +241,23 @@ class PortfolioSummaryService:
                     error=message,
                     trigger=trigger,
                 )
-                return self._decorate_cached_payload(cached, served_from_cache=True)
-            return self._build_unavailable_summary(
-                as_of=attempted_at.isoformat(),
-                status='not_configured',
-                source='portfolio_summary_runtime',
-                message=message,
-                freshness=self._build_uncached_freshness_payload(
-                    attempted_at=attempted_at,
-                    last_refresh_status='error',
-                    last_refresh_error=message,
+                return PortfolioSummaryRefreshOutcome(
+                    cache_record=cached,
+                    served_from_cache=True,
+                )
+            return PortfolioSummaryRefreshOutcome(
+                cache_record=None,
+                served_from_cache=False,
+                uncached_payload=self._build_unavailable_summary(
+                    as_of=attempted_at.isoformat(),
+                    status='not_configured',
+                    source='portfolio_summary_runtime',
+                    message=message,
+                    freshness=self._build_uncached_freshness_payload(
+                        attempted_at=attempted_at,
+                        last_refresh_status='error',
+                        last_refresh_error=message,
+                    ),
                 ),
             )
 
@@ -240,7 +271,10 @@ class PortfolioSummaryService:
                     error=str(exc),
                     trigger=trigger,
                 )
-                return self._decorate_cached_payload(cached, served_from_cache=True)
+                return PortfolioSummaryRefreshOutcome(
+                    cache_record=cached,
+                    served_from_cache=True,
+                )
             raise
 
         refresh_status, refresh_error = self._classify_refresh_result(payload)
@@ -255,7 +289,10 @@ class PortfolioSummaryService:
             refresh_trigger=trigger,
         )
         self._cache = refreshed_record
-        return self._decorate_cached_payload(refreshed_record, served_from_cache=False)
+        return PortfolioSummaryRefreshOutcome(
+            cache_record=refreshed_record,
+            served_from_cache=False,
+        )
 
     async def _build_live_portfolio_summary(self) -> dict[str, Any]:
         as_of = _utc_now().isoformat()
@@ -303,6 +340,15 @@ class PortfolioSummaryService:
                 'lastSyncedAt': last_synced_at,
                 'source': 'kis_account_inquiry_v1',
                 'message': sync_message,
+            },
+            'accountCoverage': {
+                'status': (
+                    'complete'
+                    if len(accounts) == len(configured_accounts)
+                    else 'incomplete'
+                ),
+                'configuredCount': len(configured_accounts),
+                'returnedCount': len(accounts),
             },
             'accounts': accounts,
             'notices': notices,
@@ -390,6 +436,16 @@ class PortfolioSummaryService:
             )
             account_payload['holdings'] = holdings
             account_payload['allocation'] = self._build_allocation_rows(holdings)
+        if positions_result.get('observed_data') is not None:
+            account_payload['observedHoldings'] = self._normalize_holdings(
+                positions_result['observed_data'],
+                account_reference=account.account_reference,
+                as_of=positions_result['as_of'] or as_of,
+            )
+        if positions_result.get('completeness') is not None:
+            account_payload['holdingsCompleteness'] = copy.deepcopy(
+                positions_result['completeness']
+            )
         if activity_result['items'] is not None:
             account_payload['recentActivity'] = activity_result['items']
 
@@ -413,9 +469,41 @@ class PortfolioSummaryService:
     async def _capture_positions(self, account_reference: str) -> dict[str, Any]:
         try:
             data = await self.account_inquiry_service.get_positions(account_reference=account_reference)
-            return {'data': data, 'error': None, 'as_of': data.get('as_of')}
+            completeness = data.get('completeness')
+            if isinstance(completeness, dict) and completeness.get('status') != 'complete':
+                malformed_row_count = completeness.get('malformed_row_count')
+                detail = (
+                    f'Holdings incomplete: KIS returned {malformed_row_count} malformed position row(s).'
+                    if isinstance(malformed_row_count, int) and malformed_row_count > 0
+                    else 'Holdings incomplete: KIS positions response did not establish complete coverage.'
+                )
+                return {
+                    'data': None,
+                    'observed_data': data,
+                    'error': {
+                        'configured': True,
+                        'detail': detail,
+                        'retryable': True,
+                        'upstream_error_type': 'TradingAccountPositionsCompletenessError',
+                    },
+                    'as_of': data.get('as_of'),
+                    'completeness': completeness,
+                }
+            return {
+                'data': data,
+                'observed_data': None,
+                'error': None,
+                'as_of': data.get('as_of'),
+                'completeness': completeness if isinstance(completeness, dict) else None,
+            }
         except TradingAccountInquiryError as exc:
-            return {'data': None, 'error': self._normalize_inquiry_error(exc), 'as_of': None}
+            return {
+                'data': None,
+                'observed_data': None,
+                'error': self._normalize_inquiry_error(exc),
+                'as_of': None,
+                'completeness': None,
+            }
 
     async def _capture_recent_activity(self, account_reference: str) -> dict[str, Any]:
         try:
@@ -677,6 +765,17 @@ class PortfolioSummaryService:
         payload['notices'] = notices
         return serialize_portfolio_risk_equivalent_payload(payload)
 
+    def _decorate_uncached_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        decorated = copy.deepcopy(payload)
+        freshness = (
+            decorated.get('freshness')
+            if isinstance(decorated.get('freshness'), dict)
+            else {}
+        )
+        freshness['refreshInFlight'] = self._has_refresh_in_flight()
+        decorated['freshness'] = freshness
+        return serialize_portfolio_risk_equivalent_payload(decorated)
+
     def _build_cache_status_payload(
         self,
         cache_record: PortfolioSummaryCacheRecord | None,
@@ -788,7 +887,17 @@ class PortfolioSummaryService:
         return max(int(age.total_seconds()), 0)
 
     def _has_refresh_in_flight(self) -> bool:
-        return self._refresh_task is not None and not self._refresh_task.done()
+        background_task = self._refresh_task
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        background_refresh_scheduled = bool(
+            background_task is not None
+            and not background_task.done()
+            and background_task is not current_task
+        )
+        return self._active_refresh_count > 0 or background_refresh_scheduled
 
     def _format_datetime(self, value: datetime | None) -> str | None:
         if value is None:
