@@ -1,8 +1,9 @@
+import asyncio
 import inspect
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -171,6 +172,73 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(limited_fields['price_status'], 'limited')
         self.assertFalse(limited_fields['realtime_subscribed'])
         self.assertEqual(limited_fields['realtime_subscription_reason'], 'capacity_limited')
+
+    async def test_subscription_source_timeout_preserves_symbols_and_reuses_inflight_refresh(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='dashboard')
+        release_loader = asyncio.Event()
+
+        async def _blocked_loader(**_: object) -> list[str]:
+            await release_loader.wait()
+            return ['027710']
+
+        blocked_loader = AsyncMock(side_effect=_blocked_loader)
+
+        with (
+            patch.object(service, '_load_runtime_monitored_symbols', blocked_loader),
+            patch.object(
+                kis_realtime_prices,
+                'KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS',
+                0.01,
+            ),
+            patch.object(settings, 'kis_realtime_price_subscription_refresh_seconds', 60.0),
+        ):
+            first = await service.refresh_subscription_source_if_due(
+                trigger='background',
+                force=True,
+            )
+            second = await service.refresh_subscription_source_if_due(
+                trigger='background',
+                force=False,
+            )
+            release_loader.set()
+            await asyncio.wait_for(
+                asyncio.shield(service._source_refresh_task),
+                timeout=1,
+            )
+            completed = await service.refresh_subscription_source_if_due(
+                trigger='background',
+                force=False,
+            )
+
+        self.assertEqual(first['allowed_symbols'], ['005930'])
+        self.assertEqual(second['allowed_symbols'], ['005930'])
+        self.assertEqual(completed['allowed_symbols'], ['027710'])
+        self.assertEqual(blocked_loader.await_count, 1)
+        self.assertIsNone(service._source_refresh_task)
+        self.assertEqual(service.health_snapshot()['last_error']['stage'], 'subscription_source')
+        self.assertIn('timed out', service.health_snapshot()['last_error']['message'])
+        await service.stop()
+
+    async def test_background_loop_does_not_force_subscription_source_refresh(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+
+        async def _stop_after_refresh(**_: object) -> dict:
+            service._stop_requested = True
+            return {}
+
+        refresh = AsyncMock(side_effect=_stop_after_refresh)
+        wait_for_change = AsyncMock()
+        with (
+            patch.object(service, 'refresh_subscription_source_if_due', refresh),
+            patch.object(service, '_wait_for_change_or_timeout', wait_for_change),
+        ):
+            await service._run()
+
+        self.assertFalse(refresh.await_args.kwargs['force'])
+        wait_for_change.assert_awaited_once()
 
     async def test_failed_subscription_ack_clears_subscribed_symbol_for_retry(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
