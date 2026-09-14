@@ -222,6 +222,58 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('timed out', service.health_snapshot()['last_error']['message'])
         await service.stop()
 
+    async def test_inflight_source_refresh_is_not_reawaited_after_refresh_interval(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='dashboard')
+        release_loader = asyncio.Event()
+
+        async def _blocked_loader(**_: object) -> list[str]:
+            await release_loader.wait()
+            return ['027710']
+
+        blocked_loader = AsyncMock(side_effect=_blocked_loader)
+        source_task = asyncio.create_task(blocked_loader(trigger='background'))
+        service._source_refresh_task = source_task
+        service._last_source_refresh_monotonic = 0.0
+
+        try:
+            with (
+                patch.object(
+                    kis_realtime_prices,
+                    'KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS',
+                    1.0,
+                ),
+                patch.object(
+                    settings,
+                    'kis_realtime_price_subscription_refresh_seconds',
+                    1.0,
+                ),
+            ):
+                snapshot = await asyncio.wait_for(
+                    service.refresh_subscription_source_if_due(
+                        trigger='background',
+                        force=False,
+                    ),
+                    timeout=0.05,
+                )
+        finally:
+            release_loader.set()
+            await asyncio.wait_for(asyncio.shield(source_task), timeout=1)
+
+        self.assertEqual(snapshot['allowed_symbols'], ['005930'])
+        self.assertEqual(blocked_loader.await_count, 1)
+        self.assertIs(service._source_refresh_task, source_task)
+
+        completed = await service.refresh_subscription_source_if_due(
+            trigger='background',
+            force=False,
+        )
+        self.assertEqual(completed['allowed_symbols'], ['027710'])
+        self.assertIsNone(service._source_refresh_task)
+        await service.stop()
+
     async def test_background_loop_does_not_force_subscription_source_refresh(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
 
