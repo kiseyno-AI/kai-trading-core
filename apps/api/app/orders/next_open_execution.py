@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import math
+import time
 from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
@@ -131,6 +132,8 @@ EXECUTION_STATUS_REVOCATION_PENDING = 'revocation_pending'
 EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW = 'revocation_manual_review'
 EXECUTION_STATUS_REVOKED = 'revoked'
 EXECUTION_REVISION_HISTORY_LIMIT = 5
+PLAN_REFRESH_REVISION_RETRY_ATTEMPTS = 6
+PLAN_REFRESH_REVISION_RETRY_DELAY_SECONDS = 0.025
 EXECUTION_REVOCATION_LOCKED_STATUSES = frozenset(
     {
         EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
@@ -2913,7 +2916,7 @@ class SignalDeciderNextOpenExecutionService:
         trigger: str = 'manual',
         force: bool = False,
     ) -> dict[str, Any]:
-        for attempt in range(2):
+        for attempt in range(PLAN_REFRESH_REVISION_RETRY_ATTEMPTS):
             try:
                 return self._refresh_plan_items_once(
                     target_trade_date=target_trade_date,
@@ -2921,13 +2924,16 @@ class SignalDeciderNextOpenExecutionService:
                     force=force,
                 )
             except _PlanRefreshRevisionConflict:
-                if attempt == 1:
+                if attempt + 1 >= PLAN_REFRESH_REVISION_RETRY_ATTEMPTS:
                     raise RuntimeError(
                         'next-open plan refresh could not bind stable decision inputs'
                     )
                 logger.info(
                     'Retrying next-open plan refresh after decision inputs changed: %s',
                     target_trade_date,
+                )
+                time.sleep(
+                    PLAN_REFRESH_REVISION_RETRY_DELAY_SECONDS * (2**attempt)
                 )
         raise AssertionError('unreachable next-open plan refresh retry state')
 

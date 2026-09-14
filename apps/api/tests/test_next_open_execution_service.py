@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -185,6 +186,58 @@ def test_dispatch_authority_source_lock_contention_is_a_retryable_revision_confl
         assert exc.__cause__ is lock_error
     else:  # pragma: no cover - assertion branch
         raise AssertionError('lock contention must use bounded revision retry')
+
+
+def test_plan_refresh_retries_transient_revision_conflicts_with_backoff() -> None:
+    service = SignalDeciderNextOpenExecutionService()
+    expected = {'status': 'completed'}
+    refresh_once = MagicMock(
+        side_effect=[
+            _PlanRefreshRevisionConflict('writer one'),
+            _PlanRefreshRevisionConflict('writer two'),
+            expected,
+        ]
+    )
+    service._refresh_plan_items_once = refresh_once
+
+    with patch('app.orders.next_open_execution.time.sleep') as sleep:
+        result = service.refresh_plan_items(
+            target_trade_date='2026-04-30',
+            trigger='test',
+        )
+
+    assert result == expected
+    assert refresh_once.call_count == 3
+    assert [entry.args[0] for entry in sleep.call_args_list] == [0.025, 0.05]
+
+
+def test_plan_refresh_fails_closed_after_bounded_revision_conflicts() -> None:
+    service = SignalDeciderNextOpenExecutionService()
+    refresh_once = MagicMock(
+        side_effect=_PlanRefreshRevisionConflict('writer remains active')
+    )
+    service._refresh_plan_items_once = refresh_once
+
+    with (
+        patch('app.orders.next_open_execution.time.sleep') as sleep,
+        pytest.raises(
+            RuntimeError,
+            match='could not bind stable decision inputs',
+        ),
+    ):
+        service.refresh_plan_items(
+            target_trade_date='2026-04-30',
+            trigger='test',
+        )
+
+    assert refresh_once.call_count == 6
+    assert [entry.args[0] for entry in sleep.call_args_list] == [
+        0.025,
+        0.05,
+        0.1,
+        0.2,
+        0.4,
+    ]
 
 
 def test_dispatch_authority_source_locks_fence_real_postgres_writers_and_proofs(
@@ -1426,6 +1479,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
                 return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
             ),
+            patch('app.orders.next_open_execution.time.sleep'),
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -1436,7 +1490,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     trigger='test',
                 )
 
-        self.assertEqual(build_current_context.call_count, 2)
+        self.assertEqual(build_current_context.call_count, 6)
 
     def _seed_policy_version(self) -> None:
         with session_scope() as session:
