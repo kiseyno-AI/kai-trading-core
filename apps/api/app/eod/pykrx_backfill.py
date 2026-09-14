@@ -1720,8 +1720,29 @@ class PykrxBackfillService:
         ):
             incomplete_stages.insert(0, downstream_resume_from_stage)
         if not incomplete_stages:
+            is_followup_recovery_parent = bool(
+                pipeline_run.get('trigger')
+                == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            )
+            convergence_kwargs: dict[str, Any] = {
+                'pipeline_run_id': int(pipeline_run['id']),
+            }
+            if is_followup_recovery_parent:
+                convergence_kwargs['allow_satisfied_terminal'] = True
+            pipeline_convergence = (
+                daily_pipeline_run_state_service
+                .converge_terminal_stages_run(**convergence_kwargs)
+            )
+            pipeline_parent_finalized = bool(
+                pipeline_convergence.get('updated')
+                or pipeline_convergence.get('reason')
+                == 'already_non_resumable'
+            )
+            if not pipeline_parent_finalized:
+                return None
+
             eod_convergence: dict[str, Any] | None = None
-            if pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER:
+            if is_followup_recovery_parent:
                 eod_convergence = self._persist_successful_followup_recovery(
                     latest_eod_run=latest_eod_run,
                     recovery_result={
@@ -1740,12 +1761,6 @@ class PykrxBackfillService:
                 # resume branch above normally handles this; fail closed if
                 # that stage was not part of this run's resolved scope.
                 return None
-
-            pipeline_convergence = (
-                daily_pipeline_run_state_service.converge_terminal_stages_run(
-                    pipeline_run_id=int(pipeline_run['id']),
-                )
-            )
             if not (
                 pipeline_convergence.get('updated')
                 or (
@@ -1764,8 +1779,7 @@ class PykrxBackfillService:
             result = build_daily_skip_result(
                 reason=(
                     'followup_recovery_state_converged'
-                    if pipeline_run.get('trigger')
-                    == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+                    if is_followup_recovery_parent
                     else 'daily_pipeline_state_converged'
                 ),
                 market_date=market_date,
@@ -2016,10 +2030,41 @@ class PykrxBackfillService:
         if recovery_symbols:
             recovery_kwargs['symbols'] = recovery_symbols
         recovery_result = dict(daily_pipeline_stage_service.run(**recovery_kwargs))
-        convergence = self._persist_successful_followup_recovery(
-            latest_eod_run=latest_eod_run,
-            recovery_result=recovery_result,
+        pipeline_run_id = recovery_result.get('pipeline_run_id')
+        if (
+            pipeline_run_id is not None
+            and daily_pipeline_outcome_is_satisfied(recovery_result)
+        ):
+            pipeline_convergence = (
+                daily_pipeline_run_state_service
+                .converge_terminal_stages_run(
+                    pipeline_run_id=int(pipeline_run_id),
+                    allow_satisfied_terminal=True,
+                )
+            )
+        else:
+            pipeline_convergence = {
+                'updated': False,
+                'pipeline_run_id': pipeline_run_id,
+                'status': recovery_result.get('status'),
+                'reason': 'recovery_parent_not_satisfied',
+            }
+        pipeline_parent_finalized = bool(
+            pipeline_convergence.get('updated')
+            or pipeline_convergence.get('reason')
+            == 'already_non_resumable'
         )
+        if pipeline_parent_finalized:
+            convergence = self._persist_successful_followup_recovery(
+                latest_eod_run=latest_eod_run,
+                recovery_result=recovery_result,
+            )
+        else:
+            convergence = {
+                'updated': False,
+                'reason': 'recovery_parent_not_finalized',
+            }
+        convergence['pipeline_run'] = pipeline_convergence
         recovery_result.setdefault('triggered', True)
         recovery_result.setdefault('reason', 'incomplete_followups_resumed')
         recovery_result.setdefault('market_date', market_date)

@@ -222,6 +222,151 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(run.status, 'partial')
         self.assertFalse(run.run_metadata['resumable'])
 
+    def test_converge_satisfied_terminal_partial_marks_non_resumable(
+        self,
+    ) -> None:
+        completed_at = datetime(2026, 9, 14, 7, 39, 11, tzinfo=timezone.utc)
+        finalized_at = completed_at + timedelta(seconds=1)
+        run = SimpleNamespace(
+            id=393,
+            status='partial',
+            error_message='One factor row was unavailable.',
+            completed_at=completed_at,
+            updated_at=completed_at,
+            run_metadata={
+                'resolved_stages': ['momentum_factors'],
+                'resumable': True,
+                'reused_eod_collection_run_id': 526,
+            },
+        )
+        stage = SimpleNamespace(
+            stage_id='momentum_factors',
+            status='partial',
+            processed=100,
+            total=100,
+            succeeded=99,
+            failed=1,
+            error_message=None,
+            details={'result_summary': {'remaining_retryable_events': 0}},
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = [stage]
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stages_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=finalized_at,
+            ),
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .converge_terminal_stages_run(
+                    pipeline_run_id=393,
+                    allow_satisfied_terminal=True,
+                )
+            )
+
+        self.assertEqual(
+            result,
+            {
+                'updated': True,
+                'pipeline_run_id': 393,
+                'status': 'partial',
+                'resolved_stages': ['momentum_factors'],
+                'stage_statuses': {'momentum_factors': 'partial'},
+            },
+        )
+        self.assertEqual(run.status, 'partial')
+        self.assertEqual(run.error_message, 'One factor row was unavailable.')
+        self.assertEqual(run.completed_at, completed_at)
+        self.assertEqual(run.updated_at, finalized_at)
+        self.assertEqual(run.run_metadata['reused_eod_collection_run_id'], 526)
+        self.assertFalse(run.run_metadata['resumable'])
+        self.assertEqual(
+            run.run_metadata['terminal_satisfaction_confirmed_at'],
+            finalized_at.isoformat(),
+        )
+        self.assertEqual(
+            run.run_metadata['stage_statuses'],
+            {'momentum_factors': 'partial'},
+        )
+
+    def test_converge_satisfied_terminal_partial_rejects_retryable_stage(
+        self,
+    ) -> None:
+        completed_at = datetime(2026, 9, 14, 7, 39, 11, tzinfo=timezone.utc)
+        metadata = {
+            'resolved_stages': ['momentum_factors'],
+            'resumable': True,
+        }
+        run = SimpleNamespace(
+            id=394,
+            status='partial',
+            error_message='Retryable factor work remains.',
+            completed_at=completed_at,
+            updated_at=completed_at,
+            run_metadata=dict(metadata),
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = [
+            SimpleNamespace(
+                stage_id='momentum_factors',
+                status='partial',
+                processed=99,
+                total=100,
+                succeeded=99,
+                failed=0,
+                error_message=None,
+                details={
+                    'result_summary': {'remaining_retryable_events': 1},
+                },
+            )
+        ]
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stages_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .converge_terminal_stages_run(
+                    pipeline_run_id=394,
+                    allow_satisfied_terminal=True,
+                )
+            )
+
+        self.assertEqual(
+            result,
+            {
+                'updated': False,
+                'pipeline_run_id': 394,
+                'status': 'partial',
+                'reason': 'resolved_stages_incomplete',
+                'incomplete_stages': {'momentum_factors': 'partial'},
+            },
+        )
+        self.assertEqual(run.status, 'partial')
+        self.assertEqual(run.error_message, 'Retryable factor work remains.')
+        self.assertEqual(run.completed_at, completed_at)
+        self.assertEqual(run.updated_at, completed_at)
+        self.assertEqual(run.run_metadata, metadata)
+
     def test_converge_terminal_stages_run_derives_skipped_when_all_stages_skipped(
         self,
     ) -> None:

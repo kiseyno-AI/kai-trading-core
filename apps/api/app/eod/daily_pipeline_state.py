@@ -682,13 +682,16 @@ class DailyPipelineRunStateService:
         self,
         *,
         pipeline_run_id: int,
+        allow_satisfied_terminal: bool = False,
     ) -> dict[str, Any]:
         """Finalize an orphaned parent from complete persisted stage evidence.
 
         The caller must own the provider admission fence before asking a
         still-running parent to converge. This closes the checkpoint window
         where every stage commit succeeded but the final parent commit did
-        not.
+        not. Automatic follow-up recovery may explicitly opt in to sealing an
+        already-terminal satisfied parent as non-resumable while preserving
+        its status and diagnostics.
         """
         normalized_pipeline_run_id = int(pipeline_run_id)
         now = _utcnow()
@@ -707,7 +710,18 @@ class DailyPipelineRunStateService:
                 }
 
             current_status = str(run_row.status or '').strip().lower()
-            if current_status not in {'interrupted', 'running'}:
+            converging_interrupted_parent = current_status in {
+                'interrupted',
+                'running',
+            }
+            sealing_satisfied_terminal = bool(
+                allow_satisfied_terminal
+                and current_status in {'completed', 'partial', 'skipped'}
+            )
+            if not (
+                converging_interrupted_parent
+                or sealing_satisfied_terminal
+            ):
                 return {
                     'updated': False,
                     'pipeline_run_id': normalized_pipeline_run_id,
@@ -803,6 +817,49 @@ class DailyPipelineRunStateService:
                 terminal_status = 'skipped'
             else:
                 terminal_status = 'completed'
+            if sealing_satisfied_terminal:
+                if terminal_status != current_status:
+                    return {
+                        'updated': False,
+                        'pipeline_run_id': normalized_pipeline_run_id,
+                        'status': current_status,
+                        'reason': 'terminal_status_mismatch',
+                        'expected_status': terminal_status,
+                    }
+                if metadata.get('resumable') is False:
+                    return {
+                        'updated': False,
+                        'pipeline_run_id': normalized_pipeline_run_id,
+                        'status': current_status,
+                        'reason': 'already_non_resumable',
+                        'resolved_stages': resolved_stages,
+                        'stage_statuses': stage_statuses,
+                    }
+                merged_stage_statuses = (
+                    dict(metadata.get('stage_statuses') or {})
+                    if isinstance(metadata.get('stage_statuses'), Mapping)
+                    else {}
+                )
+                merged_stage_statuses.update(stage_statuses)
+                metadata.update(
+                    {
+                        'resumable': False,
+                        'terminal_satisfaction_confirmed_at': (
+                            now.isoformat()
+                        ),
+                        'stage_statuses': merged_stage_statuses,
+                    }
+                )
+                run_row.updated_at = now
+                run_row.run_metadata = metadata
+                return {
+                    'updated': True,
+                    'pipeline_run_id': normalized_pipeline_run_id,
+                    'status': current_status,
+                    'resolved_stages': resolved_stages,
+                    'stage_statuses': stage_statuses,
+                }
+
             metadata.update(
                 {
                     'resumable': False,

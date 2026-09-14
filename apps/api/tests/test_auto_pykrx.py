@@ -2296,6 +2296,15 @@ class PykrxBackfillServiceTests(TestCase):
                 return_value={'status': 'completed', 'pipeline_run_id': 92},
             ) as resume_stages,
             patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 92,
+                    'status': 'completed',
+                },
+            ),
+            patch(
                 'app.eod.pykrx_backfill.complete_eod_collection_run'
             ) as complete_eod_run,
         ):
@@ -2715,7 +2724,6 @@ class PykrxBackfillServiceTests(TestCase):
             },
             'stages': stage_rows,
         }
-
         with (
             patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
             patch('app.eod.pykrx_backfill.advisory_eod_collection_lock', return_value=_lock()),
@@ -2868,6 +2876,35 @@ class PykrxBackfillServiceTests(TestCase):
             },
             'stages': stage_rows,
         }
+        accepted_partial = {
+            'status': 'partial',
+            'pipeline_run_id': 92,
+            'stages': {
+                'momentum_factors': {
+                    'status': 'partial',
+                    'succeeded': 99,
+                    'failed': 1,
+                    'total': 100,
+                    'details': {
+                        'result_summary': {
+                            'remaining_retryable_events': 0,
+                        }
+                    },
+                }
+            },
+        }
+        persistence_order: list[str] = []
+
+        def finalize_parent(**_kwargs) -> dict:
+            persistence_order.append('pipeline_parent')
+            return {
+                'updated': True,
+                'pipeline_run_id': 92,
+                'status': 'partial',
+            }
+
+        def complete_eod(*_args, **_kwargs) -> None:
+            persistence_order.append('eod_scope')
 
         with (
             patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
@@ -2899,10 +2936,16 @@ class PykrxBackfillServiceTests(TestCase):
             ),
             patch(
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
-                return_value={'status': 'completed', 'pipeline_run_id': 92},
+                return_value=accepted_partial,
             ) as resume_stages,
             patch(
-                'app.eod.pykrx_backfill.complete_eod_collection_run'
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                side_effect=finalize_parent,
+            ) as converge_parent,
+            patch(
+                'app.eod.pykrx_backfill.complete_eod_collection_run',
+                side_effect=complete_eod,
             ) as complete_eod_run,
             patch(
                 'app.eod.pykrx_backfill.count_eod_run_persisted_symbols',
@@ -2920,6 +2963,7 @@ class PykrxBackfillServiceTests(TestCase):
         )
         expected_stages = list(AUTO_DAILY_TRACKED_STAGE_ORDER[recovery_index:])
         self.assertTrue(result['triggered'])
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['reason'], 'incomplete_followups_resumed')
         self.assertEqual(
             result['followup_recovery']['resume_from_stage'],
@@ -2939,6 +2983,10 @@ class PykrxBackfillServiceTests(TestCase):
             reused_eod_collection_run_id=7,
         )
         run_collection.assert_not_called()
+        converge_parent.assert_called_once_with(
+            pipeline_run_id=92,
+            allow_satisfied_terminal=True,
+        )
         count_persisted_symbols.assert_called_once_with(
             7,
             trade_date='2026-04-03',
@@ -2953,6 +3001,10 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             completion.kwargs['run_metadata']['downstream_retry_symbols'],
             [],
+        )
+        self.assertEqual(
+            persistence_order,
+            ['pipeline_parent', 'eod_scope'],
         )
 
     def test_no_parent_downstream_scope_recovers_in_admitted_price_scope(
@@ -3759,7 +3811,7 @@ class PykrxBackfillServiceTests(TestCase):
             resume_stages.call_args.kwargs['symbols'],
             ['000660'],
         )
-        converge_eod.assert_called_once()
+        converge_eod.assert_not_called()
 
     def test_price_retry_precedes_existing_downstream_recovery(self) -> None:
         service = PykrxBackfillService()
@@ -3976,7 +4028,10 @@ class PykrxBackfillServiceTests(TestCase):
             trade_date='2026-04-03',
         )
         complete_eod_run.assert_called_once()
-        converge_pipeline_run.assert_called_once_with(pipeline_run_id=92)
+        converge_pipeline_run.assert_called_once_with(
+            pipeline_run_id=92,
+            allow_satisfied_terminal=True,
+        )
         self.assertTrue(
             result['followup_recovery']['state_convergence'][
                 'pipeline_run'

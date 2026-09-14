@@ -253,6 +253,15 @@ class PykrxAutomaticRetryPacingTests(TestCase):
                 return_value={'status': 'completed', 'pipeline_run_id': 92},
             ) as resume_stages,
             patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 92,
+                    'status': 'completed',
+                },
+            ) as finalize_parent,
+            patch(
                 'app.eod.pykrx_backfill.update_eod_collection_run_progress'
             ) as update_eod_run,
             patch.object(
@@ -292,6 +301,10 @@ class PykrxAutomaticRetryPacingTests(TestCase):
                     recovery_start_index:
                 ]
             ),
+        )
+        finalize_parent.assert_called_once_with(
+            pipeline_run_id=92,
+            allow_satisfied_terminal=True,
         )
         persisted_metadata = update_eod_run.call_args.kwargs['run_metadata']
         self.assertEqual(
