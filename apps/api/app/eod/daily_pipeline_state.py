@@ -7,7 +7,7 @@ from sqlalchemy import or_, select, text
 
 from app.core.settings import settings
 from app.db import session_scope
-from app.db_models import DailyPipelineRun, DailyPipelineStageRun
+from app.db_models import DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun
 
 
 ACTIVE_DAILY_PIPELINE_STATUSES = {'running'}
@@ -634,6 +634,7 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         interrupted_run_ids: list[int] = []
+        linked_eod_run_ids: set[int] = set()
         with session_scope() as session:
             run_rows = list(
                 session.execute(
@@ -665,15 +666,95 @@ class DailyPipelineRunStateService:
                     details['interrupted_reason'] = reason
                     details['resumable'] = True
                     stage_row.status = 'interrupted'
+                    stage_row.remaining = max(
+                        _as_int(stage_row.total) - _as_int(stage_row.processed),
+                        0,
+                    )
                     stage_row.error_message = reason
                     stage_row.current_step = 'core_restart_interrupted'
                     stage_row.current_activity = reason
                     stage_row.completed_at = now
                     stage_row.updated_at = now
                     stage_row.details = details
+                    source_run_ids = (
+                        stage_row.source_run_ids
+                        if isinstance(stage_row.source_run_ids, dict)
+                        else {}
+                    )
+                    eod_run_id = _as_int(source_run_ids.get('eod_run_id'))
+                    if eod_run_id > 0:
+                        linked_eod_run_ids.add(eod_run_id)
+
+            # The scheduler starts only after this transaction. Closing the
+            # linked provider run now lets its normal scoped retry run on the
+            # first poll instead of waiting for the stale-running threshold.
+            interrupted_eod_run_ids: list[int] = []
+            for eod_run_id in sorted(linked_eod_run_ids):
+                eod_run = session.get(EODCollectionRun, eod_run_id)
+                if eod_run is None or eod_run.status != 'running':
+                    continue
+
+                interrupted_eod_run_ids.append(eod_run_id)
+                metadata = dict(eod_run.run_metadata or {})
+                stage_progress = dict(metadata.get('stage_progress') or {})
+                for stage_id, raw_progress in list(stage_progress.items()):
+                    if not isinstance(raw_progress, dict):
+                        continue
+                    progress = dict(raw_progress)
+                    if str(progress.get('status') or '').strip().lower() != 'running':
+                        continue
+                    progress.update(
+                        {
+                            'status': 'failed',
+                            'current_step': 'core_restart_interrupted',
+                            'current_activity': reason,
+                            'completed_at': now.isoformat(),
+                            'updated_at': now.isoformat(),
+                        }
+                    )
+                    stage_progress[stage_id] = progress
+
+                metadata.update(
+                    {
+                        'stage_progress': stage_progress,
+                        'current_step': 'core_restart_interrupted',
+                        'current_activity': reason,
+                        'last_progress_at': now.isoformat(),
+                        'interrupted_reason': reason,
+                        'interrupted_at': now.isoformat(),
+                        'resumable': True,
+                    }
+                )
+                if isinstance(metadata.get('failed_symbols'), list):
+                    metadata['failed_symbols_count'] = len(
+                        metadata['failed_symbols']
+                    )
+                if isinstance(metadata.get('unattempted_symbols'), list):
+                    metadata['unattempted_symbols_count'] = len(
+                        metadata['unattempted_symbols']
+                    )
+
+                eod_run.status = 'failed'
+                eod_run.symbols_succeeded = max(
+                    _as_int(eod_run.symbols_succeeded),
+                    0,
+                )
+                eod_run.symbols_failed = max(
+                    _as_int(eod_run.symbols_failed),
+                    max(
+                        _as_int(eod_run.symbols_total)
+                        - eod_run.symbols_succeeded,
+                        0,
+                    ),
+                )
+                eod_run.error_message = reason
+                eod_run.completed_at = now
+                eod_run.run_metadata = metadata
         return {
             'interrupted_runs': len(interrupted_run_ids),
             'run_ids': interrupted_run_ids,
+            'interrupted_eod_runs': len(interrupted_eod_run_ids),
+            'interrupted_eod_run_ids': interrupted_eod_run_ids,
             'reason': reason,
         }
 
