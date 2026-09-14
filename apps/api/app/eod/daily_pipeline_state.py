@@ -7,7 +7,13 @@ from sqlalchemy import or_, select, text
 
 from app.core.settings import settings
 from app.db import session_scope
-from app.db_models import DailyPipelineRun, DailyPipelineStageRun
+from app.db_models import (
+    DailyPipelineRun,
+    DailyPipelineStageRun,
+    DailyPriceBar,
+    EODCollectionRun,
+    Symbol,
+)
 
 
 ACTIVE_DAILY_PIPELINE_STATUSES = {'running'}
@@ -634,6 +640,7 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         interrupted_run_ids: list[int] = []
+        linked_eod_market_dates: dict[int, date] = {}
         with session_scope() as session:
             run_rows = list(
                 session.execute(
@@ -665,15 +672,148 @@ class DailyPipelineRunStateService:
                     details['interrupted_reason'] = reason
                     details['resumable'] = True
                     stage_row.status = 'interrupted'
+                    stage_row.remaining = max(
+                        _as_int(stage_row.total) - _as_int(stage_row.processed),
+                        0,
+                    )
                     stage_row.error_message = reason
                     stage_row.current_step = 'core_restart_interrupted'
                     stage_row.current_activity = reason
                     stage_row.completed_at = now
                     stage_row.updated_at = now
                     stage_row.details = details
+                    source_run_ids = (
+                        stage_row.source_run_ids
+                        if isinstance(stage_row.source_run_ids, dict)
+                        else {}
+                    )
+                    eod_run_id = _as_int(source_run_ids.get('eod_run_id'))
+                    if eod_run_id > 0:
+                        linked_eod_market_dates.setdefault(
+                            eod_run_id,
+                            _normalize_market_date(stage_row.market_date),
+                        )
+
+            # The scheduler starts only after this transaction. Closing the
+            # linked provider run now lets its normal scoped retry run on the
+            # first poll instead of waiting for the stale-running threshold.
+            interrupted_eod_run_ids: list[int] = []
+            for eod_run_id, expected_market_date in sorted(
+                linked_eod_market_dates.items()
+            ):
+                eod_run = session.get(EODCollectionRun, eod_run_id)
+                if (
+                    eod_run is None
+                    or eod_run.status != 'running'
+                    or eod_run.market != 'KRX'
+                    or eod_run.source != 'pykrx'
+                    or eod_run.trade_date != expected_market_date
+                ):
+                    continue
+
+                interrupted_eod_run_ids.append(eod_run_id)
+                metadata = dict(eod_run.run_metadata or {})
+                persisted_symbols = [
+                    str(symbol).strip()
+                    for symbol in session.execute(
+                        select(Symbol.symbol)
+                        .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+                        .where(DailyPriceBar.eod_run_id == eod_run_id)
+                        .order_by(Symbol.symbol.asc())
+                    ).scalars()
+                    if str(symbol).strip()
+                ]
+                price_retry_symbols = {
+                    str(symbol).strip()
+                    for key in ('failed_symbols', 'unattempted_symbols')
+                    for symbol in (metadata.get(key) or [])
+                    if str(symbol).strip()
+                }
+                requested_success_symbols = [
+                    str(symbol).strip()
+                    for symbol in (metadata.get('requested_symbols') or [])
+                    if str(symbol).strip()
+                    and str(symbol).strip() not in price_retry_symbols
+                ]
+                downstream_retry_symbols: list[str] = []
+                seen_downstream_symbols: set[str] = set()
+                for raw_symbol in [
+                    *requested_success_symbols,
+                    *(metadata.get('downstream_retry_symbols') or []),
+                    *persisted_symbols,
+                ]:
+                    symbol = str(raw_symbol).strip()
+                    if (
+                        not symbol
+                        or symbol in price_retry_symbols
+                        or symbol in seen_downstream_symbols
+                    ):
+                        continue
+                    seen_downstream_symbols.add(symbol)
+                    downstream_retry_symbols.append(symbol)
+                stage_progress = dict(metadata.get('stage_progress') or {})
+                for stage_id, raw_progress in list(stage_progress.items()):
+                    if not isinstance(raw_progress, dict):
+                        continue
+                    progress = dict(raw_progress)
+                    if str(progress.get('status') or '').strip().lower() != 'running':
+                        continue
+                    progress.update(
+                        {
+                            'status': 'failed',
+                            'current_step': 'core_restart_interrupted',
+                            'current_activity': reason,
+                            'completed_at': now.isoformat(),
+                            'updated_at': now.isoformat(),
+                        }
+                    )
+                    stage_progress[stage_id] = progress
+
+                metadata.update(
+                    {
+                        'stage_progress': stage_progress,
+                        'current_step': 'core_restart_interrupted',
+                        'current_activity': reason,
+                        'last_progress_at': now.isoformat(),
+                        'interrupted_reason': reason,
+                        'interrupted_at': now.isoformat(),
+                        'resumable': True,
+                        'downstream_retry_symbols': downstream_retry_symbols,
+                        'downstream_retry_symbols_count': len(
+                            downstream_retry_symbols
+                        ),
+                    }
+                )
+                if isinstance(metadata.get('failed_symbols'), list):
+                    metadata['failed_symbols_count'] = len(
+                        metadata['failed_symbols']
+                    )
+                if isinstance(metadata.get('unattempted_symbols'), list):
+                    metadata['unattempted_symbols_count'] = len(
+                        metadata['unattempted_symbols']
+                    )
+
+                eod_run.status = 'failed'
+                eod_run.symbols_succeeded = max(
+                    _as_int(eod_run.symbols_succeeded),
+                    len(persisted_symbols),
+                )
+                eod_run.symbols_failed = max(
+                    _as_int(eod_run.symbols_failed),
+                    max(
+                        _as_int(eod_run.symbols_total)
+                        - eod_run.symbols_succeeded,
+                        0,
+                    ),
+                )
+                eod_run.error_message = reason
+                eod_run.completed_at = now
+                eod_run.run_metadata = metadata
         return {
             'interrupted_runs': len(interrupted_run_ids),
             'run_ids': interrupted_run_ids,
+            'interrupted_eod_runs': len(interrupted_eod_run_ids),
+            'interrupted_eod_run_ids': interrupted_eod_run_ids,
             'reason': reason,
         }
 
