@@ -63,6 +63,20 @@ def _pipeline_status(*, pykrx_stage: dict, stage_overrides: dict[str, dict] | No
     return {'stages': stages}
 
 
+def _price_collection_stage(*, rows_persisted: int) -> dict:
+    return {
+        'task': 'price_collection',
+        'status': 'completed',
+        'processed': rows_persisted,
+        'total': rows_persisted,
+        'succeeded': rows_persisted,
+        'details': {
+            'rows_persisted': rows_persisted,
+            'markets': ['KOSPI', 'KOSDAQ'],
+        },
+    }
+
+
 def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
     payload = {
         'status': 'partial',
@@ -286,7 +300,7 @@ def test_inspect_feedback_prerequisites_warns_on_pykrx_provider_unavailable_with
     } == {'pykrx_provider_unavailable_optional_enrichment_degraded'}
 
 
-def test_inspect_feedback_prerequisites_allows_partial_pykrx_enrichment_coverage_as_warning():
+def test_inspect_feedback_prerequisites_blocks_low_partial_pykrx_enrichment_coverage():
     pykrx_stage = _pykrx_enrichment_stage(
         status='completed',
         category_overrides={
@@ -308,30 +322,31 @@ def test_inspect_feedback_prerequisites_allows_partial_pykrx_enrichment_coverage
             fs_div='CFS',
         )
 
-    assert result['status'] == 'ready'
-    assert result['blocked_stage_ids'] == []
-    warning_categories = result['stages']['pykrx_enrichment']['details']['decider_warning_categories']
-    assert warning_categories[0]['category'] == 'short_selling'
-    assert warning_categories[0]['expected_rows'] == 3
-    assert warning_categories[0]['present_rows'] == 2
-    assert warning_categories[0]['missing_rows'] == 1
-    assert warning_categories[0]['reason'] == 'required_pykrx_enrichment_category_near_complete'
+    assert result['status'] == 'blocked'
+    assert result['ready'] is False
+    assert result['blocked_stage_ids'] == ['pykrx_enrichment']
+    blocking_categories = result['stages']['pykrx_enrichment']['details']['decider_blocking_categories']
+    assert blocking_categories[0]['category'] == 'short_selling'
+    assert blocking_categories[0]['expected_rows'] == 3
+    assert blocking_categories[0]['present_rows'] == 2
+    assert blocking_categories[0]['missing_rows'] == 1
+    assert blocking_categories[0]['reason'] == 'incomplete_required_pykrx_enrichment_category'
 
 
-def test_inspect_feedback_prerequisites_allows_near_complete_pykrx_enrichment_coverage():
+def test_inspect_feedback_prerequisites_allows_pykrx_enrichment_above_minimum_coverage():
     pykrx_stage = _pykrx_enrichment_stage(
         status='completed',
         category_overrides={
             'investor_flow_symbol': {
-                'present_rows': 2679,
+                'present_rows': 2780,
                 'expected_rows': 2808,
-                'coverage_ratio': 0.95406,
+                'coverage_ratio': 0.990028,
                 'coverage_status': 'partial',
             },
             'valuation_snapshot': {
-                'present_rows': 2701,
+                'present_rows': 2780,
                 'expected_rows': 2808,
-                'coverage_ratio': 0.961895,
+                'coverage_ratio': 0.990028,
                 'coverage_status': 'partial',
             },
         },
@@ -353,37 +368,103 @@ def test_inspect_feedback_prerequisites_allows_near_complete_pykrx_enrichment_co
     assert [item['category'] for item in warning_categories] == ['investor_flow_symbol', 'valuation_snapshot']
 
 
-def test_pykrx_prerequisite_uses_category_row_counts_when_category_payloads_missing():
+def test_pykrx_category_row_counts_block_when_price_bar_universe_is_partial():
     stage = {
         'task': 'pykrx_enrichment',
-        'status': 'partial',
-        'processed': 7,
-        'total': 7,
-        'succeeded': 6,
+        'status': 'completed',
         'details': {
             'category_row_counts': {
-                'sector_classification': 2699,
-                'market_breadth': 3,
-                'investor_flow_market': 3,
-                'investor_flow_symbol': 2666,
-                'short_selling': 2805,
-                'valuation_snapshot': 2699,
-                'foreign_ownership': 2805,
+                'sector_classification': 400,
+                'market_breadth': 2,
+                'investor_flow_market': 2,
+                'investor_flow_symbol': 400,
+                'short_selling': 400,
+                'valuation_snapshot': 400,
             },
-            'failed_categories': ['valuation_snapshot'],
         },
     }
+    pipeline_status = _pipeline_status(pykrx_stage=stage)
+    pipeline_status['stages']['price_collection'] = _price_collection_stage(
+        rows_persisted=3547,
+    )
 
-    augmented = AgentFeedbackPrerequisiteService._augment_pykrx_enrichment_prerequisite_stage(stage)
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-14',
+            fs_div='CFS',
+        )
 
-    assert augmented['details']['decider_category_gate_status'] == 'ready'
-    assert augmented['details']['decider_waiting_categories'] == []
-    assert augmented['details']['decider_blocking_categories'] == []
-    warning_categories = {
-        item['category']
-        for item in augmented['details']['decider_warning_categories']
+    assert result['status'] == 'blocked'
+    assert result['ready'] is False
+    assert result['blocked_stage_ids'] == ['pykrx_enrichment']
+    details = result['stages']['pykrx_enrichment']['details']
+    assert details['decider_category_gate_status'] == 'blocked'
+    blocking_by_category = {
+        item['category']: item
+        for item in details['decider_blocking_categories']
     }
-    assert warning_categories == {'valuation_snapshot'}
+    assert set(blocking_by_category) == {
+        'sector_classification',
+        'investor_flow_symbol',
+        'short_selling',
+        'valuation_snapshot',
+    }
+    sector_gate = blocking_by_category['sector_classification']
+    assert sector_gate['coverage_status'] == 'partial'
+    assert sector_gate['expected_rows'] == 3547
+    assert sector_gate['present_rows'] == 400
+    assert sector_gate['missing_rows'] == 3147
+    assert sector_gate['coverage_ratio'] == round(400 / 3547, 6)
+    assert sector_gate['reason'] == 'incomplete_required_pykrx_enrichment_category'
+
+
+def test_pykrx_category_row_counts_are_ready_at_full_price_bar_coverage():
+    stage = {
+        'task': 'pykrx_enrichment',
+        'status': 'completed',
+        'details': {
+            'category_row_counts': {
+                'sector_classification': 3547,
+                'market_breadth': 2,
+                'investor_flow_market': 2,
+                'investor_flow_symbol': 3547,
+                'short_selling': 3547,
+                'valuation_snapshot': 3547,
+            },
+        },
+    }
+    pipeline_status = _pipeline_status(pykrx_stage=stage)
+    pipeline_status['stages']['price_collection'] = _price_collection_stage(
+        rows_persisted=3547,
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-14',
+            fs_div='CFS',
+        )
+
+    assert result['status'] == 'ready'
+    assert result['ready'] is True
+    assert result['blocked_stage_ids'] == []
+    details = result['stages']['pykrx_enrichment']['details']
+    assert details['decider_category_gate_status'] == 'ready'
+    assert details['decider_blocking_categories'] == []
+    assert details['decider_waiting_categories'] == []
+    gates = {
+        item['category']: item
+        for item in details['decider_category_gates']
+    }
+    assert gates['sector_classification']['expected_rows'] == 3547
+    assert gates['sector_classification']['coverage_status'] == 'complete'
+    assert gates['market_breadth']['expected_rows'] == 2
+    assert gates['market_breadth']['coverage_status'] == 'complete'
 
 
 def test_pykrx_prerequisite_preserves_existing_gate_details():

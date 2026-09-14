@@ -10,6 +10,7 @@ REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'investor_flow_symbol',
     'short_selling',
 )
+REQUIRED_CATEGORY_MIN_COVERAGE_RATIO = 0.99
 
 
 def _normalize_iso_date(value: str | date) -> str:
@@ -45,7 +46,7 @@ def _category_gate_item(
     expected_rows = _coerce_optional_int(payload.get('expected_rows'))
     present_rows = _coerce_optional_int(payload.get('present_rows')) or 0
     coverage_ratio = _coerce_optional_float(payload.get('coverage_ratio'))
-    if coverage_ratio is None and expected_rows and expected_rows > 0:
+    if expected_rows and expected_rows > 0:
         coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
     coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
     missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
@@ -59,6 +60,9 @@ def _category_gate_item(
     elif present_rows <= 0 or coverage_status == 'missing':
         gate_status = 'blocked'
         reason = 'missing_required_pykrx_enrichment_category'
+    elif coverage_ratio is None or coverage_ratio < REQUIRED_CATEGORY_MIN_COVERAGE_RATIO:
+        gate_status = 'blocked'
+        reason = 'required_pykrx_enrichment_category_below_min_coverage'
     else:
         gate_status = 'ready'
         reason = None if coverage_status == 'complete' else 'required_pykrx_enrichment_category_near_complete'

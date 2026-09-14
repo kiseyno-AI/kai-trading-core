@@ -4,6 +4,9 @@ from datetime import date
 from typing import Any
 
 from app.core.settings import settings
+from app.eod.daily_pipeline_outcomes import (
+    GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO,
+)
 
 FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
     'pykrx_enrichment',
@@ -21,7 +24,6 @@ FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
 )
 PREREQUISITE_WAITING_STATUSES = {'pending', 'running'}
 PREREQUISITE_BLOCKED_STATUSES = {'failed', 'partial', 'blocked'}
-GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
 PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID = 'pykrx_enrichment'
 PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES: tuple[str, ...] = (
     'sector_classification',
@@ -218,7 +220,7 @@ class AgentFeedbackPrerequisiteService:
         expected_rows = cls._coerce_optional_int(payload.get('expected_rows'))
         present_rows = cls._coerce_optional_int(payload.get('present_rows')) or 0
         coverage_ratio = cls._coerce_optional_float(payload.get('coverage_ratio'))
-        if coverage_ratio is None and expected_rows and expected_rows > 0:
+        if expected_rows and expected_rows > 0:
             coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
         coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
         missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
@@ -237,6 +239,9 @@ class AgentFeedbackPrerequisiteService:
         elif present_rows <= 0 or coverage_status == 'missing':
             gate_status = 'blocked'
             reason = 'missing_required_pykrx_enrichment_category'
+        elif coverage_ratio is None or coverage_ratio < GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO:
+            gate_status = 'blocked'
+            reason = 'incomplete_required_pykrx_enrichment_category'
         elif coverage_status != 'complete':
             gate_status = 'ready'
             reason = 'required_pykrx_enrichment_category_near_complete'
@@ -257,18 +262,30 @@ class AgentFeedbackPrerequisiteService:
         }
 
     @classmethod
-    def _augment_pykrx_enrichment_prerequisite_stage(cls, stage_payload: dict[str, Any]) -> dict[str, Any]:
+    def _augment_pykrx_enrichment_prerequisite_stage(
+        cls,
+        stage_payload: dict[str, Any],
+        *,
+        price_bar_universe_rows: int = 0,
+        price_market_count: int = 0,
+    ) -> dict[str, Any]:
         details = dict(stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {})
+        has_category_row_counts = isinstance(details.get('category_row_counts'), dict)
         if (
             str(details.get('decider_category_gate_status') or '').strip().lower()
             in {'ready', 'blocked', 'waiting'}
             and isinstance(details.get('decider_category_gates'), list)
+            and not has_category_row_counts
         ):
             return {
                 **stage_payload,
                 'details': details,
             }
-        category_payloads = cls._resolve_pykrx_category_payloads(details=details)
+        category_payloads = cls._resolve_pykrx_category_payloads(
+            details=details,
+            price_bar_universe_rows=price_bar_universe_rows,
+            price_market_count=price_market_count,
+        )
         result_summary = details.get('result_summary') if isinstance(details.get('result_summary'), dict) else {}
         provider_degraded = str(result_summary.get('status') or stage_payload.get('status') or '').strip().lower() == 'partial' and any(
             cls._has_pykrx_provider_error(dict(payload))
@@ -287,7 +304,13 @@ class AgentFeedbackPrerequisiteService:
         }
 
     @classmethod
-    def _resolve_pykrx_category_payloads(cls, *, details: dict[str, Any]) -> dict[str, Any]:
+    def _resolve_pykrx_category_payloads(
+        cls,
+        *,
+        details: dict[str, Any],
+        price_bar_universe_rows: int = 0,
+        price_market_count: int = 0,
+    ) -> dict[str, Any]:
         categories = details.get('categories')
         if isinstance(categories, dict) and categories:
             return dict(categories)
@@ -302,6 +325,22 @@ class AgentFeedbackPrerequisiteService:
         if not isinstance(row_counts, dict) or not row_counts:
             return {}
 
+        result_summary_payload = (
+            result_summary
+            if isinstance(result_summary, dict)
+            else {}
+        )
+        expected_symbol_rows = cls._coerce_positive_int(
+            details.get('requested_symbol_count'),
+            result_summary_payload.get('requested_symbol_count'),
+            price_bar_universe_rows,
+        )
+        expected_market_rows = cls._coerce_positive_int(
+            details.get('requested_market_count'),
+            result_summary_payload.get('requested_market_count'),
+            price_market_count,
+        )
+        market_scoped_categories = {'market_breadth', 'investor_flow_market'}
         payloads: dict[str, dict[str, Any]] = {}
         failed_categories = {
             str(category)
@@ -310,13 +349,31 @@ class AgentFeedbackPrerequisiteService:
         }
         for category in PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES:
             present_rows = cls._coerce_optional_int(row_counts.get(category)) or 0
+            market_scoped = category in market_scoped_categories
+            expected_rows = (
+                expected_market_rows
+                if market_scoped
+                else expected_symbol_rows
+            )
             if present_rows <= 0:
-                continue
+                coverage_status = 'missing'
+            elif expected_rows <= 0 or present_rows < expected_rows:
+                coverage_status = 'partial'
+            elif category in failed_categories:
+                coverage_status = 'partial'
+            else:
+                coverage_status = 'complete'
+            coverage_ratio = (
+                round(min(present_rows, expected_rows) / expected_rows, 6)
+                if expected_rows > 0
+                else None
+            )
             payloads[category] = {
+                'scope_type': 'market' if market_scoped else 'symbol',
                 'present_rows': present_rows,
-                'expected_rows': present_rows,
-                'coverage_ratio': 1.0,
-                'coverage_status': 'partial' if category in failed_categories else 'complete',
+                'expected_rows': expected_rows or None,
+                'coverage_ratio': coverage_ratio,
+                'coverage_status': coverage_status,
                 'reason': 'derived_from_category_row_counts',
             }
         return payloads
@@ -383,6 +440,32 @@ class AgentFeedbackPrerequisiteService:
             include_feedback_stage=False,
         )
         stages = pipeline_status.get('stages') if isinstance(pipeline_status.get('stages'), dict) else {}
+        price_stage = stages.get('price_collection') if isinstance(stages, dict) else None
+        price_stage = price_stage if isinstance(price_stage, dict) else {}
+        price_stage_details = (
+            price_stage.get('details')
+            if isinstance(price_stage.get('details'), dict)
+            else {}
+        )
+        price_bar_universe_rows = self._coerce_positive_int(
+            price_stage_details.get('stored_rows_present'),
+            price_stage_details.get('rows_persisted'),
+            price_stage_details.get('price_bars_persisted'),
+            price_stage.get('succeeded'),
+            price_stage.get('processed'),
+        )
+        price_markets = price_stage_details.get('markets')
+        price_market_count = (
+            len(
+                {
+                    str(market).strip()
+                    for market in price_markets
+                    if str(market or '').strip()
+                }
+            )
+            if isinstance(price_markets, (list, tuple, set))
+            else 0
+        )
 
         stage_items: list[dict[str, Any]] = []
         stage_map: dict[str, dict[str, Any]] = {}
@@ -402,7 +485,11 @@ class AgentFeedbackPrerequisiteService:
             )
             stage_payload.setdefault('task', stage_id)
             if stage_id == PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
-                stage_payload = self._augment_pykrx_enrichment_prerequisite_stage(stage_payload)
+                stage_payload = self._augment_pykrx_enrichment_prerequisite_stage(
+                    stage_payload,
+                    price_bar_universe_rows=price_bar_universe_rows,
+                    price_market_count=price_market_count,
+                )
             gate_status = self._classify_stage_gate_status(stage_payload)
             item = {
                 'stage': stage_id,
