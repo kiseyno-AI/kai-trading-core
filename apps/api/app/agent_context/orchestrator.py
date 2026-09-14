@@ -4034,16 +4034,14 @@ class AgentFeedbackOrchestrator:
         started_at = time.monotonic()
         cleanup_budget_seconds = max(0.0, float(max_seconds))
         cleanup_deadline = started_at + cleanup_budget_seconds
-        # Durable prequeueing has to survive every supported pool setting. A
-        # checkout can first wait for the shared pool and then reconnect a
-        # stale connection, so reserve both configured bounds plus a small SQL
-        # window. Actual session statement/lock limits are recomputed after
-        # checkout; the caller's cleanup/delete budget remains unchanged.
+        # Durable prequeueing uses a fresh, unpooled connection, so its budget
+        # is independent of the shared QueuePool and has no pre-ping phase.
+        # Reserve the configured connect bound plus a small SQL window. Actual
+        # statement/lock limits are recomputed after connect; the caller's
+        # cleanup/delete budget remains unchanged.
         persistence_budget_seconds = max(
             cleanup_budget_seconds,
-            float(getattr(settings, 'db_pool_timeout_seconds', 0.0))
-            + float(getattr(settings, 'db_connect_timeout_seconds', 0.0))
-            + 1.0,
+            float(getattr(settings, 'db_connect_timeout_seconds', 0.0)) + 1.0,
         )
         persistence_deadline = started_at + persistence_budget_seconds
         cleanup_results: list[dict[str, Any]] = []

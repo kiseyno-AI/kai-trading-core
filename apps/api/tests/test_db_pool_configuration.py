@@ -1,5 +1,7 @@
 from unittest.mock import patch
 
+from sqlalchemy.pool import NullPool
+
 from app import db
 from app.db_pool_watchdog import DatabasePoolWatchdog
 
@@ -36,6 +38,15 @@ def test_engine_uses_resilient_pool_and_connect_settings() -> None:
     assert kwargs['pool_recycle'] == db.settings.db_pool_recycle_seconds
     assert kwargs['pool_use_lifo'] == db.settings.db_pool_use_lifo
     assert kwargs['connect_args']['connect_timeout'] == db.settings.db_connect_timeout_seconds
+
+
+def test_isolated_engine_bypasses_pool_and_pre_ping() -> None:
+    kwargs = db._build_isolated_engine_kwargs()
+
+    assert kwargs['poolclass'] is NullPool
+    assert kwargs['connect_args']['connect_timeout'] == db.settings.db_connect_timeout_seconds
+    assert 'pool_timeout' not in kwargs
+    assert 'pool_pre_ping' not in kwargs
 
 
 def test_database_health_fails_fast_when_pool_is_exhausted() -> None:
@@ -82,6 +93,34 @@ def test_session_scope_recomputes_statement_limits_after_deadline_pool_checkout(
         ):
             pass
 
+    assert session.connection_calls == 1
+    assert session.statements == [
+        'SET LOCAL statement_timeout = 7000',
+        'SET LOCAL lock_timeout = 7000',
+    ]
+    assert session.committed is True
+    assert session.rolled_back is False
+    assert session.closed is True
+
+
+def test_session_scope_uses_isolated_connection_for_deadline_persistence() -> None:
+    session = _DeadlineSession()
+
+    with (
+        patch.object(db, 'SessionLocal') as shared_session_factory,
+        patch.object(db, 'IsolatedSessionLocal', return_value=session) as isolated_factory,
+        patch.object(db.time, 'monotonic', return_value=103.0),
+    ):
+        with db.session_scope(
+            statement_timeout_ms=30_000,
+            lock_timeout_ms=15_000,
+            deadline_monotonic=110.0,
+            isolated_connection=True,
+        ):
+            pass
+
+    shared_session_factory.assert_not_called()
+    isolated_factory.assert_called_once_with()
     assert session.connection_calls == 1
     assert session.statements == [
         'SET LOCAL statement_timeout = 7000',

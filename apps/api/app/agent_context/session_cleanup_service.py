@@ -72,12 +72,11 @@ class AgentFeedbackSessionCleanupService:
 
         if deadline_monotonic is not None:
             remaining_seconds = deadline_monotonic - time.monotonic()
-            # The shared QueuePool can wait this long before it raises. Do not
-            # begin a checkout when its worst-case wait already exceeds the
-            # remaining caller budget.
-            if remaining_seconds <= float(settings.db_pool_timeout_seconds):
+            # Cleanup prequeueing uses an isolated, unpooled connection below.
+            # Refuse work only when even its bounded connect cannot fit.
+            if remaining_seconds <= float(settings.db_connect_timeout_seconds):
                 raise CleanupPersistenceDeadlineExceeded(
-                    'cleanup retry prequeue deadline cannot bound database pool checkout'
+                    'cleanup retry prequeue deadline cannot bound database connect'
                 )
 
         now = datetime.now(UTC)
@@ -109,6 +108,7 @@ class AgentFeedbackSessionCleanupService:
             statement_timeout_ms=settings.agent_feedback_db_statement_timeout_ms,
             lock_timeout_ms=settings.agent_feedback_db_lock_timeout_ms,
             deadline_monotonic=deadline_monotonic,
+            isolated_connection=True,
         ) as session:
             stmt = (
                 insert(AgentFeedbackSessionCleanupFailure)

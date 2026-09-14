@@ -4446,7 +4446,8 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         persistence_started_at = time.monotonic()
         with (
-            patch.object(orchestrator_module.settings, 'db_pool_timeout_seconds', 20),
+            patch.object(orchestrator_module.settings, 'db_pool_timeout_seconds', 120),
+            patch.object(orchestrator_module.settings, 'db_connect_timeout_seconds', 5),
             patch.object(
                 orchestrator_module,
                 'runtime_feedback_state_store',
@@ -4472,7 +4473,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(deferred_batch['reason'], 'cleanup_time_budget_exhausted')
         self.assertGreater(
             deferred_batch['deadline_monotonic'] - persistence_started_at,
-            20,
+            5,
+        )
+        self.assertLess(
+            deferred_batch['deadline_monotonic'] - persistence_started_at,
+            7,
         )
         self.assertEqual(
             {target.session_key for target in deferred_batch['targets']},

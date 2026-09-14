@@ -2,7 +2,7 @@ import subprocess
 import unittest
 import uuid
 from datetime import UTC, date, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sqlalchemy import delete, select
 
@@ -13,7 +13,48 @@ from app.db_models import AgentFeedbackSessionCleanupFailure
 
 
 class AgentFeedbackSessionCleanupServiceTests(unittest.TestCase):
-    def test_enqueue_deferred_rejects_budget_that_cannot_bound_pool_checkout(self) -> None:
+    def test_enqueue_deferred_bypasses_shared_pool_wait_for_deadline_write(
+        self,
+    ) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        target = SessionCleanupTarget(
+            market_date=date(2026, 9, 11),
+            symbol='005930',
+            agent_name='eod-summarizer',
+            run_id='feedback-run-isolated-deadline',
+            session_key='feedback/eod-summarizer/isolated-deadline',
+        )
+        session = MagicMock()
+        session.execute.return_value.scalars.return_value.all.return_value = []
+
+        with (
+            patch.object(session_cleanup_module.time, 'monotonic', return_value=100.0),
+            patch.object(session_cleanup_module.settings, 'db_pool_timeout_seconds', 120),
+            patch.object(session_cleanup_module.settings, 'db_connect_timeout_seconds', 5),
+            patch.object(session_cleanup_module, 'session_scope') as scoped_session,
+        ):
+            scoped_session.return_value.__enter__.return_value = session
+            result = service.enqueue_deferred(
+                targets=[target],
+                reason='cleanup_time_budget_exhausted',
+                deadline_monotonic=106.0,
+            )
+
+        self.assertTrue(result['persistence_confirmed'])
+        scoped_session.assert_called_once_with(
+            statement_timeout_ms=(
+                session_cleanup_module.settings.agent_feedback_db_statement_timeout_ms
+            ),
+            lock_timeout_ms=(
+                session_cleanup_module.settings.agent_feedback_db_lock_timeout_ms
+            ),
+            deadline_monotonic=106.0,
+            isolated_connection=True,
+        )
+
+    def test_enqueue_deferred_rejects_budget_that_cannot_bound_isolated_connect(
+        self,
+    ) -> None:
         service = AgentFeedbackSessionCleanupService()
         target = SessionCleanupTarget(
             market_date=date(2026, 9, 11),
@@ -25,7 +66,8 @@ class AgentFeedbackSessionCleanupServiceTests(unittest.TestCase):
 
         with (
             patch.object(session_cleanup_module.time, 'monotonic', return_value=100.0),
-            patch.object(session_cleanup_module.settings, 'db_pool_timeout_seconds', 5),
+            patch.object(session_cleanup_module.settings, 'db_pool_timeout_seconds', 120),
+            patch.object(session_cleanup_module.settings, 'db_connect_timeout_seconds', 5),
             patch.object(session_cleanup_module, 'session_scope') as scoped_session,
         ):
             with self.assertRaises(
