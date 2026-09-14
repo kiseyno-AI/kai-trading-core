@@ -16,7 +16,7 @@ from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import defer
 
 from app.agent_context.read_service import (
@@ -46,12 +46,42 @@ from app.agent_context.signal_decider_loop_service import signal_decider_loop_se
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
+    AgentContextFeedback,
     AgentContextFeedbackFailure,
     AgentContextFeedbackRun,
+    BrokerOrder,
     CurrentMarketSnapshotCache,
+    DailyActionSummary,
+    DailyAdvancedValueFactorResult,
+    DailyBetaFactorResult,
+    DailyCompositeFactorResult,
+    DailyLowRiskFactorResult,
+    DailyMarketRiskFilterResult,
+    DailyMomentumFactorResult,
+    DailyPiotroskiFilterResult,
+    DailyPriceBar,
+    DailyPriceContext,
+    DailyPykrxEnrichmentRow,
+    DailyQualityFactorResult,
+    DailySignalFeature,
+    DailyTechnicalSnapshot,
+    DailyUnifiedValueFactorResult,
+    DailyValueFactorResult,
+    DartDisclosureEvent,
+    DartFundamentalsHighlight,
+    DartFundamentalsRow,
+    DartFundamentalsSnapshot,
+    ExternalNewsItem,
+    ExternalNewsItemClassification,
+    ExternalNewsItemSymbol,
+    MacroContextObservation,
+    OrderRequest,
     SignalDeciderDecisionSnapshot,
+    SignalDeciderEvaluation,
     SignalDeciderExecutionPlanItem,
     SignalDeciderPolicyVersion,
+    SignalDeciderRealizedOutcome,
+    Symbol,
 )
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
@@ -344,15 +374,83 @@ def _lock_dispatch_authority_source_tables(session: Any) -> None:
     if bind is None or bind.dialect.name != 'postgresql':
         return
     preparer = bind.dialect.identifier_preparer
-    for table in (
-        AgentContextFeedbackRun.__table__,
-        AgentContextFeedbackFailure.__table__,
-        SignalDeciderDecisionSnapshot.__table__,
-        SignalDeciderPolicyVersion.__table__,
-    ):
-        session.execute(
-            text(f'LOCK TABLE {preparer.format_table(table)} IN SHARE MODE')
+    def lock_tables(tables: Sequence[Any], *, mode: str) -> None:
+        formatted_tables = ', '.join(
+            preparer.format_table(table) for table in tables
         )
+        try:
+            session.execute(
+                text(
+                    f'LOCK TABLE {formatted_tables} IN {mode} MODE NOWAIT'
+                )
+            )
+        except OperationalError as exc:
+            original = getattr(exc, 'orig', None)
+            sqlstate = getattr(original, 'sqlstate', None) or getattr(
+                original,
+                'pgcode',
+                None,
+            )
+            if sqlstate == '55P03':
+                raise _PlanRefreshRevisionConflict(
+                    'dispatch authority source generation is being updated'
+                ) from exc
+            raise
+
+    # The ACK writes execution-plan rows. Taking the self-exclusive table mode
+    # first prevents cross-date proofs from both holding SHARE and deadlocking
+    # while upgrading for their disjoint row updates.
+    lock_tables(
+        (SignalDeciderExecutionPlanItem.__table__,),
+        mode='SHARE ROW EXCLUSIVE',
+    )
+
+    # Durable revalidation deliberately uses the existing read services, whose
+    # queries run in short independent sessions. The surrounding activation-ACK
+    # transaction therefore fences every table that can change that proof until
+    # its own commit. NOWAIT turns an active source writer into the same bounded,
+    # fail-closed revision retry used by the date advisory lock.
+    source_tables = sorted(
+        (
+            AgentContextFeedback.__table__,
+            AgentContextFeedbackFailure.__table__,
+            AgentContextFeedbackRun.__table__,
+            BrokerOrder.__table__,
+            CurrentMarketSnapshotCache.__table__,
+            DailyActionSummary.__table__,
+            DailyAdvancedValueFactorResult.__table__,
+            DailyBetaFactorResult.__table__,
+            DailyCompositeFactorResult.__table__,
+            DailyLowRiskFactorResult.__table__,
+            DailyMarketRiskFilterResult.__table__,
+            DailyMomentumFactorResult.__table__,
+            DailyPiotroskiFilterResult.__table__,
+            DailyPriceBar.__table__,
+            DailyPriceContext.__table__,
+            DailyPykrxEnrichmentRow.__table__,
+            DailyQualityFactorResult.__table__,
+            DailySignalFeature.__table__,
+            DailyTechnicalSnapshot.__table__,
+            DailyUnifiedValueFactorResult.__table__,
+            DailyValueFactorResult.__table__,
+            DartDisclosureEvent.__table__,
+            DartFundamentalsHighlight.__table__,
+            DartFundamentalsRow.__table__,
+            DartFundamentalsSnapshot.__table__,
+            ExternalNewsItemClassification.__table__,
+            ExternalNewsItemSymbol.__table__,
+            ExternalNewsItem.__table__,
+            MacroContextObservation.__table__,
+            OrderRequest.__table__,
+            SignalDeciderDecisionSnapshot.__table__,
+            SignalDeciderEvaluation.__table__,
+            SignalDeciderPolicyVersion.__table__,
+            SignalDeciderRealizedOutcome.__table__,
+            Symbol.__table__,
+        ),
+        key=lambda table: table.name,
+    )
+    lock_tables(source_tables, mode='SHARE')
 
 
 def _load_signal_decider_policy_authority(

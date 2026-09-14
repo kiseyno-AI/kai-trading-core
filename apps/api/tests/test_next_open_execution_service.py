@@ -6,7 +6,9 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from app.core.settings import Settings, settings
 from app.core.test_database_safety import (
@@ -109,12 +111,120 @@ def test_dispatch_authority_source_locks_use_one_deadlock_safe_order() -> None:
     _lock_dispatch_authority_source_tables(session)
 
     statements = [str(call.args[0]) for call in session.execute.call_args_list]
-    assert statements == [
-        'LOCK TABLE agent_context_feedback_runs IN SHARE MODE',
-        'LOCK TABLE agent_context_feedback_failures IN SHARE MODE',
-        'LOCK TABLE signal_decider_decision_snapshots IN SHARE MODE',
-        'LOCK TABLE signal_decider_policy_versions IN SHARE MODE',
+    expected_source_tables = [
+        'agent_context_feedback',
+        'agent_context_feedback_failures',
+        'agent_context_feedback_runs',
+        'broker_orders',
+        'current_market_snapshot_cache',
+        'daily_action_summaries',
+        'daily_advanced_value_factor_results',
+        'daily_beta_factor_results',
+        'daily_composite_factor_results',
+        'daily_low_risk_factor_results',
+        'daily_market_risk_filter_results',
+        'daily_momentum_factor_results',
+        'daily_piotroski_filter_results',
+        'daily_price_bars',
+        'daily_price_contexts',
+        'daily_pykrx_enrichment_rows',
+        'daily_quality_factor_results',
+        'daily_signal_features',
+        'daily_technical_snapshots',
+        'daily_unified_value_factor_results',
+        'daily_value_factor_results',
+        'dart_disclosure_events',
+        'dart_fundamentals_highlights',
+        'dart_fundamentals_rows',
+        'dart_fundamentals_snapshots',
+        'external_news_item_classifications',
+        'external_news_item_symbols',
+        'external_news_items',
+        'macro_context_observations',
+        'order_requests',
+        'signal_decider_decision_snapshots',
+        'signal_decider_evaluations',
+        'signal_decider_policy_versions',
+        'signal_decider_realized_outcomes',
+        'symbols',
     ]
+    assert statements == [
+        (
+            'LOCK TABLE signal_decider_execution_plan_items '
+            'IN SHARE ROW EXCLUSIVE MODE NOWAIT'
+        ),
+        (
+            f"LOCK TABLE {', '.join(expected_source_tables)} "
+            'IN SHARE MODE NOWAIT'
+        ),
+    ]
+
+
+def test_dispatch_authority_source_lock_contention_is_a_retryable_revision_conflict(
+) -> None:
+    class LockNotAvailableError(Exception):
+        sqlstate = '55P03'
+
+    session = MagicMock()
+    bind = MagicMock()
+    bind.dialect.name = 'postgresql'
+    bind.dialect.identifier_preparer.format_table.side_effect = (
+        lambda table: table.name
+    )
+    session.get_bind.return_value = bind
+    lock_error = OperationalError(
+        'LOCK TABLE source IN SHARE MODE NOWAIT',
+        {},
+        LockNotAvailableError('source writer is active'),
+    )
+    session.execute.side_effect = [MagicMock(), lock_error]
+
+    try:
+        _lock_dispatch_authority_source_tables(session)
+    except _PlanRefreshRevisionConflict as exc:
+        assert exc.__cause__ is lock_error
+    else:  # pragma: no cover - assertion branch
+        raise AssertionError('lock contention must use bounded revision retry')
+
+
+def test_dispatch_authority_source_locks_fence_real_postgres_writers_and_proofs(
+) -> None:
+    if engine.dialect.name != 'postgresql':
+        return
+
+    writer = Session(bind=engine)
+    first_proof = Session(bind=engine)
+    competing_proof = Session(bind=engine)
+    try:
+        writer.execute(
+            text('LOCK TABLE daily_price_bars IN ROW EXCLUSIVE MODE')
+        )
+        try:
+            _lock_dispatch_authority_source_tables(first_proof)
+        except _PlanRefreshRevisionConflict:
+            first_proof.rollback()
+        else:  # pragma: no cover - assertion branch
+            raise AssertionError('an active durable source writer must fence proof')
+
+        writer.rollback()
+        _lock_dispatch_authority_source_tables(first_proof)
+
+        try:
+            _lock_dispatch_authority_source_tables(competing_proof)
+        except _PlanRefreshRevisionConflict:
+            competing_proof.rollback()
+        else:  # pragma: no cover - assertion branch
+            raise AssertionError('activation proofs must serialize before ACK writes')
+
+        first_proof.rollback()
+        _lock_dispatch_authority_source_tables(competing_proof)
+    finally:
+        writer.rollback()
+        first_proof.rollback()
+        competing_proof.rollback()
+        writer.close()
+        first_proof.close()
+        competing_proof.close()
 
 
 def test_plan_refresh_lock_fails_fast_instead_of_holding_a_pool_waiter() -> None:
