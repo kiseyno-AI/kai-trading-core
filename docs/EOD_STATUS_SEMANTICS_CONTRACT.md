@@ -105,7 +105,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 
 ### pykrx stages
 
-- `stage_order` is the canonical default daily process order and contains the 24 web-facing stages shown in the Daily Process monitor.
+- `stage_order` is the canonical default daily process order shown in the Daily Process monitor. Consumers must use the returned order and `total_stages` instead of hard-coding a stage count.
 - `stages` is keyed by those same stage ids. Every default stage is present even when Core only has pending or fallback-inferred state for that stage.
 - Top-level summary fields mirror the stage map for operator UIs:
   `total_stages`, `completed_stages`, `skipped_stages`, `display_completed_stages`, `partial_stages`, `failed_stages`, `blocked_stages`, `running_stages`, `pending_stages`, `stage_status_counts`, `current_stage`, and `current_stage_status`.
@@ -113,10 +113,10 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
   `stage_id`, `task`, `label`, `group`, `order`, `depends_on`, `inspect_routes`, `output_tables`, `default_selected`, and `details.progress_source`.
 - Stage `details` also carries `rows_persisted`, `expected_rows`, and a readable `reason` where Core can infer one from diagnostics, activity, or errors.
 - Persisted `details.result_summary` is bounded on both write and read. Bulk evidence collections are replaced by `details.result_summary_omissions` metadata, while aggregate counts and operational status fields remain available. This also compacts historical oversized rows without rewriting them.
-- When the latest official daily run is only a resumed subset, same-date historical official stage rows and persisted outputs are still considered so omitted prior stages do not regress to opaque `pending`.
+- When the latest official daily run is only a resumed subset, omitted stages may be merged only from same-date history linked to the same exact EOD collection lineage. Conflicting or ambiguous `eod_collection_run_id`, `reused_eod_collection_run_id`, or stage source-run IDs fail closed instead of borrowing another run's completion. Automatic recovery transports `{trade_date, eod_run_id}` together and revalidates that pair under the collection lock; a missing or newer superseding automatic row yields `recovery_target_invalid_or_superseded` without a generic-latest fallback.
 - Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may report `skipped` with reason metadata once same-date downstream output exists and those global stages have no active official stage row.
-- The pykrx stage order is fixed:
-  `price_collection`, `technical_snapshots`, `action_summaries`, `trending_ranks`.
+- The stored-market-data stage order is fixed:
+  `price_collection`, `pykrx_enrichment`, `technical_snapshots`, `action_summaries`, `trending_ranks`, followed by the stored risk/filter/factor sequence. `signal_features` is produced after the factor sequence so feedback cannot consume a pre-factor snapshot from the same run.
 - Stage counts come from the selected pykrx `eod_collection_runs` row plus downstream rows linked by `eod_run_id`, with live stage progress from `run_metadata.stage_progress`.
 - The inferred current pykrx stage is resolved in this order:
   `run_metadata.stage`, then the latest populated `stage_progress` entry, then persisted downstream counts, then `price_collection` when a run exists but no better stage signal exists.
@@ -162,6 +162,8 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - `external_news_enrich` is based on the current material/noise/source-status contract in stored news rows: fully contract-classified rows are `completed`, partially contract-classified rows are `partial`, and rows that only have legacy or missing classifier payloads keep the enrich stage `pending` with reason metadata. Status details include contract-classified and legacy-classified counts.
 - `signal_decider` can be inferred as `completed` from same-date `agent_context_feedback` rows for `agent_name=signal-decider` and/or same-date `signal_decider_decision_snapshots`.
 - These persisted-output inferences are storage availability signals. They do not silently relax prerequisite gates.
+- A late decision snapshot whose canonical observation time is at or after its target KRX open is not valid persisted authority. It is a tombstone for next-open, replay, evaluation, calibration, eligibility, and policy-candidate consumers; readers must not fall back to an older snapshot for the same source date.
+- Once the next-open action window has passed, recovered feedback, decider, plan, and evaluation stages use an auditable terminal `skipped` outcome with `reason=next_open_window_expired`. This prevents a historical replay from manufacturing stale BUY authority or post-open learning evidence.
 
 ### gate summary
 
@@ -173,7 +175,9 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 
 - Overall pipeline `status` is `running` if any stage is `running`.
 - Overall pipeline `status` is `pending` only when every stage is `pending`.
-- Overall pipeline `status` is `completed` when every stage is `completed`, or when every remaining non-completed stage is explicitly `skipped` because skipped stages are non-actionable for that market-date view.
+- Overall pipeline `status` is `completed` when every stage has a terminal satisfied outcome. `completed` and an explicit `safe_skip=true`/expired terminal `skipped` outcome are satisfied; generic `skipped`, `waiting`, `blocked`, `partial`, `failed`, `interrupted`, or malformed outcomes are not silently promoted.
+- An interrupted or orphaned parent may converge to a terminal state only when every stage in its persisted resolved-stage set is terminally satisfied. Parent status alone, a non-price checkpoint, or unrelated same-date output is not sufficient convergence evidence.
+- Before an orphaned parent resumes downstream work, Core compares admitted exact-date membership `M` with persisted exact-date price symbols `P`. `M - P` remains retry debt, `P - M` is recorded as unexpected and excluded, and downstream work is restricted to the verified admitted scope in `M ∩ P`. A durable inherited downstream scope is never narrowed to the latest price-retry request; it must be proven against both exact-date membership and exact-date bars before execution and debt clearance.
 - On a same-day run where pykrx and fundamentals are complete but one or more default-selected factor stages still have no stored rows, overall status must stay `partial`.
 - Overall pipeline `status` is `failed` only when at least one stage is `failed` and no stage is `completed` or `partial`.
 - All other mixed states resolve to `partial`.
