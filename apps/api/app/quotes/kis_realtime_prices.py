@@ -485,13 +485,12 @@ class KISRealtimePriceService:
         interval = max(1.0, float(settings.kis_realtime_price_subscription_refresh_seconds))
         now_monotonic = time.monotonic()
         existing_source_task = self._source_refresh_task
+        if existing_source_task is not None and not existing_source_task.done():
+            return self.subscription_snapshot()
         if (
             not force
             and (now_monotonic - self._last_source_refresh_monotonic) < interval
-            and (
-                existing_source_task is None
-                or not existing_source_task.done()
-            )
+            and existing_source_task is None
         ):
             return self.subscription_snapshot()
         if self._source_refresh_lock is None:
