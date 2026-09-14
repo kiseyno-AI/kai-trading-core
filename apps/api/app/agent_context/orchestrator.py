@@ -4032,14 +4032,27 @@ class AgentFeedbackOrchestrator:
             return []
 
         started_at = time.monotonic()
-        deadline = started_at + max(0.0, float(max_seconds))
+        cleanup_budget_seconds = max(0.0, float(max_seconds))
+        cleanup_deadline = started_at + cleanup_budget_seconds
+        # Durable prequeueing has to survive every supported pool setting. A
+        # checkout can first wait for the shared pool and then reconnect a
+        # stale connection, so reserve both configured bounds plus a small SQL
+        # window. Actual session statement/lock limits are recomputed after
+        # checkout; the caller's cleanup/delete budget remains unchanged.
+        persistence_budget_seconds = max(
+            cleanup_budget_seconds,
+            float(getattr(settings, 'db_pool_timeout_seconds', 0.0))
+            + float(getattr(settings, 'db_connect_timeout_seconds', 0.0))
+            + 1.0,
+        )
+        persistence_deadline = started_at + persistence_budget_seconds
         cleanup_results: list[dict[str, Any]] = []
         deferred_session_keys: set[str] = set()
         try:
             retry_queue = agent_feedback_session_cleanup_service.enqueue_deferred(
                 targets=cleanup_targets,
                 reason='cleanup_time_budget_exhausted',
-                deadline_monotonic=deadline,
+                deadline_monotonic=persistence_deadline,
             )
         except Exception as exc:  # noqa: BLE001
             retry_queue = {
@@ -4068,7 +4081,7 @@ class AgentFeedbackOrchestrator:
             deferred_session_keys.update(target.session_key for target in cleanup_targets)
         else:
             for index, target in enumerate(cleanup_targets):
-                if deadline - time.monotonic() <= 0:
+                if cleanup_deadline - time.monotonic() <= 0:
                     deferred_session_keys.update(
                         item.session_key for item in cleanup_targets[index:]
                     )
@@ -4095,7 +4108,10 @@ class AgentFeedbackOrchestrator:
                     name='agent-feedback-session-cleanup',
                     daemon=True,
                 ).start()
-                remaining_seconds = max(0.0, deadline - time.monotonic())
+                remaining_seconds = max(
+                    0.0,
+                    cleanup_deadline - time.monotonic(),
+                )
                 if not completed.wait(timeout=remaining_seconds):
                     deferred_session_keys.update(
                         item.session_key for item in cleanup_targets[index:]
@@ -4116,6 +4132,7 @@ class AgentFeedbackOrchestrator:
                     'reason': 'cleanup_time_budget_exhausted',
                     'deferred_count': len(deferred_session_keys),
                     'max_seconds': max_seconds,
+                    'persistence_max_seconds': persistence_budget_seconds,
                     'retry_queue': retry_queue,
                 }
             )
@@ -4129,6 +4146,7 @@ class AgentFeedbackOrchestrator:
                     'cleaned_count': len(session_keys - deferred_session_keys),
                     'deferred_count': len(deferred_session_keys),
                     'max_seconds': max_seconds,
+                    'persistence_max_seconds': persistence_budget_seconds,
                     'retry_queue': retry_queue,
                 },
             )

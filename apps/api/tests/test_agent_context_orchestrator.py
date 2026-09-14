@@ -4444,24 +4444,36 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         runtime_store.start_run(state)
 
-        with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
-            with patch.object(
+        persistence_started_at = time.monotonic()
+        with (
+            patch.object(orchestrator_module.settings, 'db_pool_timeout_seconds', 20),
+            patch.object(
+                orchestrator_module,
+                'runtime_feedback_state_store',
+                runtime_store,
+            ),
+            patch.object(
                 orchestrator_module,
                 'agent_feedback_session_cleanup_service',
                 cleanup_service,
-            ):
-                result = service._cleanup_persisted_run_sessions(
-                    market_date=market_date,
-                    request_run_id=run_id,
-                    role='eod-summarizer',
-                    max_seconds=0,
-                )
+            ),
+        ):
+            result = service._cleanup_persisted_run_sessions(
+                market_date=market_date,
+                request_run_id=run_id,
+                role='eod-summarizer',
+                max_seconds=0,
+            )
 
         self.assertTrue(cleanup_service.deferred_completed.wait(timeout=1))
         self.assertEqual(cleanup_service.targets, [])
         self.assertEqual(len(cleanup_service.deferred_batches), 1)
         deferred_batch = cleanup_service.deferred_batches[0]
         self.assertEqual(deferred_batch['reason'], 'cleanup_time_budget_exhausted')
+        self.assertGreater(
+            deferred_batch['deadline_monotonic'] - persistence_started_at,
+            20,
+        )
         self.assertEqual(
             {target.session_key for target in deferred_batch['targets']},
             {
