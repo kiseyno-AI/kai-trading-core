@@ -10,7 +10,10 @@ from app.core.settings import settings
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
-from app.eod.daily_pipeline_tracking import run_tracked_market_risk_filter
+from app.eod.daily_pipeline_tracking import (
+    build_prior_date_current_only_stage_skip,
+    run_tracked_market_risk_filter,
+)
 from app.eod.freshness import eod_freshness_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pipeline_status import eod_pipeline_status_service
@@ -540,6 +543,14 @@ async def collect_daily_market_risk_snapshots(
     market_code: str = 'J',
 ) -> dict:
     try:
+        market_state = await async_get_market_state()
+        safety_skip = build_prior_date_current_only_stage_skip(
+            stage_id='market_risk_snapshots',
+            market_date=market_date,
+            current_market_date=str(market_state.server_time)[:10],
+        )
+        if safety_skip is not None:
+            return safety_skip
         parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
         return await daily_market_risk_snapshot_service.collect_for_market_date(
             market_date=market_date,

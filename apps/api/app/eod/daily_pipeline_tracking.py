@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any, Sequence
 
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
@@ -9,8 +10,42 @@ from app.signals.market_risk_filter import (
     daily_market_risk_filter_service,
 )
 from app.signals.market_risk_snapshot import DEFAULT_MARKET_CODE
+from app.market.clock import get_market_state
 
 MIN_BLOCKING_MARKET_RISK_COVERAGE_RATIO = 0.5
+
+
+def build_prior_date_current_only_stage_skip(
+    *,
+    stage_id: str,
+    market_date: str,
+    current_market_date: str | date | None = None,
+) -> dict[str, Any] | None:
+    target_text = str(market_date).strip()
+    target_date = (
+        datetime.strptime(target_text, '%Y%m%d').date()
+        if len(target_text) == 8 and target_text.isdigit()
+        else date.fromisoformat(target_text)
+    )
+    if current_market_date is None:
+        current_market_date = str(get_market_state().server_time)[:10]
+    current_text = str(current_market_date).strip()[:10]
+    current_date = (
+        datetime.strptime(current_text, '%Y%m%d').date()
+        if len(current_text) == 8 and current_text.isdigit()
+        else date.fromisoformat(current_text)
+    )
+    if target_date >= current_date:
+        return None
+    return {
+        'triggered': False,
+        'skipped': True,
+        'safe_skip': True,
+        'status': 'skipped',
+        'reason': 'point_in_time_recovery_current_only_stage',
+        'market_date': target_date.isoformat(),
+        'stage': stage_id,
+    }
 
 
 def _market_risk_filter_coverage_gate(result: dict[str, Any]) -> dict[str, Any]:
@@ -58,6 +93,12 @@ async def run_tracked_market_risk_filter(
     run_state_service=None,
 ) -> dict[str, Any]:
     stage_id = 'market_risk_filter'
+    safety_skip = build_prior_date_current_only_stage_skip(
+        stage_id=stage_id,
+        market_date=market_date,
+    )
+    if safety_skip is not None:
+        return safety_skip
     definition = STAGE_DEFINITIONS[stage_id]
     normalized_symbols = list(symbols or [])
     resolved_filter_service = filter_service or daily_market_risk_filter_service

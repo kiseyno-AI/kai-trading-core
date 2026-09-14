@@ -1570,9 +1570,17 @@ class EODRouteTests(unittest.TestCase):
         original_service = routes_eod.daily_market_risk_filter_service
         routes_eod.daily_market_risk_filter_service = fake_service
         try:
-            with patch(
-                'app.eod.daily_pipeline_tracking.daily_pipeline_run_state_service',
-                FakeDailyPipelineRunStateService(),
+            with (
+                patch(
+                    'app.eod.daily_pipeline_tracking.daily_pipeline_run_state_service',
+                    FakeDailyPipelineRunStateService(),
+                ),
+                patch(
+                    'app.eod.daily_pipeline_tracking.get_market_state',
+                    return_value=SimpleNamespace(
+                        server_time='2026-04-14T10:00:00+09:00'
+                    ),
+                ),
             ):
                 client = TestClient(self.app)
                 response = client.post(
@@ -1596,21 +1604,56 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(response.json()['pipeline_run_id'], 7001)
         self.assertEqual(response.json()['items'][0]['risk_state'], 'watchlist')
 
+    def test_prior_date_market_risk_filter_route_safe_skips_kis_write(self):
+        fake_service = FakeMarketRiskFilterService()
+        original_service = routes_eod.daily_market_risk_filter_service
+        routes_eod.daily_market_risk_filter_service = fake_service
+        try:
+            with patch(
+                'app.eod.daily_pipeline_tracking.get_market_state',
+                return_value=SimpleNamespace(
+                    server_time='2026-09-14T10:00:00+09:00'
+                ),
+            ):
+                response = TestClient(self.app).post(
+                    '/eod/market-risk-filters/compute',
+                    params={
+                        'market_date': '2026-09-11',
+                        'symbols': '005930',
+                    },
+                )
+        finally:
+            routes_eod.daily_market_risk_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['safe_skip'])
+        self.assertEqual(
+            response.json()['reason'],
+            'point_in_time_recovery_current_only_stage',
+        )
+        self.assertIsNone(fake_service.compute_args)
+
     def test_collect_market_risk_snapshots_route_calls_service(self):
         fake_service = FakeMarketRiskSnapshotService()
         original_service = routes_eod.daily_market_risk_snapshot_service
         routes_eod.daily_market_risk_snapshot_service = fake_service
         try:
-            client = TestClient(self.app)
-            response = client.post(
-                '/eod/market-risk-snapshots/collect',
-                params={
-                    'market_date': '2026-04-14',
-                    'symbols': '005930,000660',
-                    'source': 'kis_quote2_snapshot_v1',
-                    'market_code': 'UN',
-                },
-            )
+            with patch(
+                'app.api.routes_eod.async_get_market_state',
+                return_value=SimpleNamespace(
+                    server_time='2026-04-14T10:00:00+09:00'
+                ),
+            ):
+                client = TestClient(self.app)
+                response = client.post(
+                    '/eod/market-risk-snapshots/collect',
+                    params={
+                        'market_date': '2026-04-14',
+                        'symbols': '005930,000660',
+                        'source': 'kis_quote2_snapshot_v1',
+                        'market_code': 'UN',
+                    },
+                )
         finally:
             routes_eod.daily_market_risk_snapshot_service = original_service
 
@@ -1621,6 +1664,35 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.collect_args['market_code'], 'UN')
         self.assertEqual(response.json()['snapshots_persisted'], 2)
         self.assertTrue(response.json()['items'][0]['is_trade_halted'])
+
+    def test_prior_date_market_risk_snapshot_route_safe_skips_kis_write(self):
+        fake_service = FakeMarketRiskSnapshotService()
+        original_service = routes_eod.daily_market_risk_snapshot_service
+        routes_eod.daily_market_risk_snapshot_service = fake_service
+        try:
+            with patch(
+                'app.api.routes_eod.async_get_market_state',
+                return_value=SimpleNamespace(
+                    server_time='2026-09-14T10:00:00+09:00'
+                ),
+            ):
+                response = TestClient(self.app).post(
+                    '/eod/market-risk-snapshots/collect',
+                    params={
+                        'market_date': '2026-09-11',
+                        'symbols': '005930',
+                    },
+                )
+        finally:
+            routes_eod.daily_market_risk_snapshot_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['safe_skip'])
+        self.assertEqual(
+            response.json()['reason'],
+            'point_in_time_recovery_current_only_stage',
+        )
+        self.assertIsNone(fake_service.collect_args)
 
     def test_inspect_market_risk_snapshots_route_returns_single_item_for_symbol(self):
         fake_service = FakeMarketRiskSnapshotService()
