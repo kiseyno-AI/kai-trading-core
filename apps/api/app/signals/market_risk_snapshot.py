@@ -290,6 +290,9 @@ class DailyMarketRiskSnapshotService:
             )
 
         def _is_retryable_fetch_error(exc: Exception) -> bool:
+            retryable = getattr(exc, 'retryable', None)
+            if isinstance(retryable, bool):
+                return retryable
             return _is_rate_limit_error(exc) or _is_timeout_error(exc)
 
         async def _fetch_symbol(item: MarketRiskSymbolInput) -> dict[str, Any]:
