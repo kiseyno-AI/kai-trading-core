@@ -117,7 +117,14 @@ class AutoPykrxEODScheduler:
         market = await async_get_market_state()
         self._state.last_checked_at = _utcnow()
         self._state.last_market_state = market.state
-        self._state.last_market_date = market.server_time[:10]
+
+        if market.state == 'CLOSED':
+            target_market_date = market.server_time[:10]
+        elif market.state in {'WEEKEND', 'HOLIDAY'}:
+            target_market_date = market.latest_valid_trading_date
+        else:
+            target_market_date = None
+        self._state.last_market_date = target_market_date or market.server_time[:10]
 
         if not settings.eod_auto_pykrx_enabled:
             self._state.last_status = 'disabled'
@@ -141,7 +148,7 @@ class AutoPykrxEODScheduler:
 
         configured_markets = _parse_markets(settings.eod_auto_pykrx_markets)
         same_preflight_failure = (
-            self._state.preflight_failure_market_date == market.server_time[:10]
+            self._state.preflight_failure_market_date == target_market_date
             and self._state.preflight_failure_markets == configured_markets
         )
         if (
@@ -155,22 +162,30 @@ class AutoPykrxEODScheduler:
         if self._state.preflight_failure_market_date is not None and not same_preflight_failure:
             self._clear_preflight_backoff()
 
-        if market.state != 'CLOSED':
+        if market.state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
             self._state.last_status = 'idle'
             self._state.last_reason = f'market_not_closed:{market.state}'
             return
 
-        if not market.session_close_at:
+        if target_market_date is None:
+            self._state.last_status = 'idle'
+            self._state.last_reason = 'missing_latest_valid_trading_date'
+            return
+
+        if market.state == 'CLOSED' and not market.session_close_at:
             self._state.last_status = 'idle'
             self._state.last_reason = 'missing_session_close'
             return
 
-        close_at = datetime.fromisoformat(market.session_close_at)
-        eligible_at = close_at + timedelta(minutes=settings.eod_auto_pykrx_after_close_minutes)
-        if datetime.now(KST) < eligible_at:
-            self._state.last_status = 'idle'
-            self._state.last_reason = f'waiting_until:{eligible_at.isoformat()}'
-            return
+        if market.state == 'CLOSED':
+            close_at = datetime.fromisoformat(market.session_close_at)
+            eligible_at = close_at + timedelta(
+                minutes=settings.eod_auto_pykrx_after_close_minutes
+            )
+            if datetime.now(KST) < eligible_at:
+                self._state.last_status = 'idle'
+                self._state.last_reason = f'waiting_until:{eligible_at.isoformat()}'
+                return
 
         self._state.active_task = True
         self._state.last_started_at = _utcnow()
@@ -178,7 +193,7 @@ class AutoPykrxEODScheduler:
         self._state.last_reason = 'scheduled'
         self._task = asyncio.create_task(
             self._run_scheduled_daily_pipeline(
-                market.server_time[:10],
+                target_market_date,
                 markets=configured_markets,
             ),
             name='auto-pykrx-eod',

@@ -951,23 +951,37 @@ class PykrxBackfillService:
             'resume_from_stage': resume_from_stage,
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
         }
-        downstream_retry_symbols = _dedupe_symbol_codes(
-            (latest_eod_run.get('run_metadata') or {}).get(
-                'downstream_retry_symbols'
-            )
-            if isinstance(latest_eod_run.get('run_metadata'), dict)
-            else []
+        price_retry_symbols = set(
+            self._metadata_retry_symbol_codes(latest_eod_run)
         )
-        # The collection run only knows symbol failures from its immediate
-        # PyKRX stages. A later follow-up can fail independently or never run,
-        # so that subset cannot safely define the follow-up recovery universe.
+        downstream_retry_symbols = [
+            symbol
+            for symbol in _dedupe_symbol_codes(
+                (
+                    (latest_eod_run.get('run_metadata') or {}).get(
+                        'downstream_retry_symbols'
+                    )
+                    or []
+                )
+                if isinstance(latest_eod_run.get('run_metadata'), dict)
+                else []
+            )
+            if symbol not in price_retry_symbols
+        ]
+        # A later follow-up can fail independently of the immediate PyKRX
+        # stages, so a healthy collection resumes the full universe. When a
+        # price failure coexists, however, an unscoped resume would include a
+        # symbol with no same-day bar; use the durable downstream-safe scope.
         has_incomplete_followup_stage = any(
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in incomplete_stages
         )
-        recovery_symbols = (
-            [] if has_incomplete_followup_stage else downstream_retry_symbols
-        )
+        if has_incomplete_followup_stage:
+            recovery_symbols = (
+                downstream_retry_symbols if price_retry_symbols else []
+            )
+        else:
+            recovery_symbols = downstream_retry_symbols
         if recovery_symbols:
             recovery_kwargs['symbols'] = recovery_symbols
         recovery_result = dict(daily_pipeline_stage_service.run(**recovery_kwargs))
@@ -1049,22 +1063,45 @@ class PykrxBackfillService:
                 latest_status = latest_run.get('status')
                 latest_failed = int(latest_run.get('symbols_failed') or 0)
                 metadata_retry_symbols = self._metadata_retry_symbol_codes(latest_run)
-                collection_is_terminal = (
-                    latest_status == 'completed'
-                    and latest_failed == 0
-                ) or (
-                    latest_status == 'completed_with_errors'
-                    and latest_failed == 0
-                    and not metadata_retry_symbols
+                latest_metadata = (
+                    latest_run.get('run_metadata')
+                    if isinstance(latest_run.get('run_metadata'), dict)
+                    else {}
                 )
-                if collection_is_terminal and _is_auto_daily_trigger(trigger):
+                collection_is_terminal = bool(
+                    (
+                        latest_status == 'completed'
+                        and latest_failed == 0
+                    )
+                    or (
+                        latest_status == 'completed_with_errors'
+                        and latest_failed == 0
+                        and not metadata_retry_symbols
+                    )
+                )
+                has_downstream_retry_scope = bool(
+                    latest_metadata.get('downstream_retry_symbols')
+                )
+                if _is_auto_daily_trigger(trigger) and (
+                    collection_is_terminal or has_downstream_retry_scope
+                ):
                     recovery_result = self._resume_auto_daily_followups_if_due(
                         market_date=market_date_iso,
                         latest_available_trade_date=latest_trade_date,
                         latest_eod_run=latest_run,
                         markets=markets,
                     )
-                    if recovery_result is not None:
+                    recovery_exhausted = bool(
+                        recovery_result is not None
+                        and recovery_result.get('reason')
+                        == 'followup_recovery_limit_reached'
+                    )
+                    price_retry_pending = bool(
+                        latest_failed > 0 or metadata_retry_symbols
+                    )
+                    if recovery_result is not None and not (
+                        recovery_exhausted and price_retry_pending
+                    ):
                         _log_pykrx_fetch(
                             'run_daily_pipeline_if_due',
                             str(recovery_result.get('status') or 'skipped'),
