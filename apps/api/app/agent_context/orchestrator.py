@@ -3989,8 +3989,7 @@ class AgentFeedbackOrchestrator:
         if state is None:
             return []
 
-        rows_to_cleanup: list[dict[str, Any]] = []
-        failure_cleanup_targets: list[dict[str, Any]] = []
+        cleanup_targets: list[SessionCleanupTarget] = []
         cleaned_session_keys = set(state.cleaned_session_keys)
         for row in state.buffered_feedback_rows:
             agent_name = str(row.get('agent_name') or '')
@@ -4000,7 +3999,15 @@ class AgentFeedbackOrchestrator:
             session_key = self._session_key_from_response(response)
             if session_key is None or session_key in cleaned_session_keys:
                 continue
-            rows_to_cleanup.append(row)
+            cleanup_targets.append(
+                SessionCleanupTarget(
+                    market_date=market_date,
+                    symbol=str(row.get('symbol') or ''),
+                    agent_name=agent_name,
+                    run_id=row.get('run_id'),
+                    session_key=session_key,
+                )
+            )
             cleaned_session_keys.add(session_key)
 
         for failure in state.buffered_failures:
@@ -4010,68 +4017,67 @@ class AgentFeedbackOrchestrator:
             session_key = self._session_key_from_failure(failure)
             if session_key is None or session_key in cleaned_session_keys:
                 continue
-            failure_cleanup_targets.append(
-                {
-                    'market_date': market_date,
-                    'symbol': str(failure.get('symbol') or ''),
-                    'agent_name': agent_name,
-                    'run_id': request_run_id,
-                    'session_key': session_key,
-                }
+            cleanup_targets.append(
+                SessionCleanupTarget(
+                    market_date=market_date,
+                    symbol=str(failure.get('symbol') or ''),
+                    agent_name=agent_name,
+                    run_id=request_run_id,
+                    session_key=session_key,
+                )
             )
             cleaned_session_keys.add(session_key)
 
-        if not rows_to_cleanup and not failure_cleanup_targets:
+        if not cleanup_targets:
             return []
 
         started_at = time.monotonic()
         deadline = started_at + max(0.0, float(max_seconds))
+        retry_queue = agent_feedback_session_cleanup_service.enqueue_deferred(
+            targets=cleanup_targets,
+            reason='cleanup_time_budget_exhausted',
+        )
         cleanup_results: list[dict[str, Any]] = []
         deferred_session_keys: set[str] = set()
+        for index, target in enumerate(cleanup_targets):
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                deferred_session_keys.update(
+                    item.session_key for item in cleanup_targets[index:]
+                )
+                break
 
-        def _deadline_exceeded() -> bool:
-            return time.monotonic() >= deadline
+            completed = threading.Event()
+            outcome: dict[str, Any] = {}
 
-        seen_session_keys: set[str] = set()
-        for row in rows_to_cleanup:
-            response = row.get('summary') if isinstance(row.get('summary'), dict) else None
-            session_key = self._session_key_from_response(response)
-            if session_key is None or session_key in seen_session_keys:
-                continue
-            if _deadline_exceeded():
-                deferred_session_keys.add(session_key)
-                continue
-            cleanup_result = self._cleanup_feedback_session(
-                market_date=row['market_date'],
-                symbol=str(row.get('symbol') or ''),
-                agent_name=str(row.get('agent_name') or ''),
-                run_id=row.get('run_id'),
-                response=response,
-            )
-            if cleanup_result is not None:
-                cleanup_results.append(cleanup_result)
-            seen_session_keys.add(session_key)
+            def _delete_target(cleanup_target: SessionCleanupTarget = target) -> None:
+                try:
+                    outcome['result'] = agent_feedback_session_cleanup_service.delete_now(
+                        target=cleanup_target
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    outcome['error'] = exc
+                finally:
+                    completed.set()
 
-        for target in failure_cleanup_targets:
-            session_key = target.get('session_key')
-            if _deadline_exceeded():
-                if isinstance(session_key, str):
-                    deferred_session_keys.add(session_key)
-                continue
-            cleanup_results.append(self._cleanup_session_key(**target))
-        session_keys = {
-            session_key
-            for session_key in (
-                self._session_key_from_response(row.get('summary') if isinstance(row.get('summary'), dict) else None)
-                for row in rows_to_cleanup
-            )
-            if session_key is not None
-        }
-        session_keys.update(
-            target['session_key']
-            for target in failure_cleanup_targets
-            if isinstance(target.get('session_key'), str)
-        )
+            threading.Thread(
+                target=_delete_target,
+                name='agent-feedback-session-cleanup',
+                daemon=True,
+            ).start()
+            if not completed.wait(timeout=remaining_seconds):
+                deferred_session_keys.update(
+                    item.session_key for item in cleanup_targets[index:]
+                )
+                break
+            error = outcome.get('error')
+            if isinstance(error, Exception):
+                raise error
+            result = outcome.get('result')
+            if isinstance(result, dict):
+                cleanup_results.append(result)
+
+        session_keys = {target.session_key for target in cleanup_targets}
         if deferred_session_keys:
             cleanup_results.append(
                 {
@@ -4079,6 +4085,7 @@ class AgentFeedbackOrchestrator:
                     'reason': 'cleanup_time_budget_exhausted',
                     'deferred_count': len(deferred_session_keys),
                     'max_seconds': max_seconds,
+                    'retry_queue': retry_queue,
                 }
             )
             log_agent_feedback_event(
@@ -4091,6 +4098,7 @@ class AgentFeedbackOrchestrator:
                     'cleaned_count': len(session_keys - deferred_session_keys),
                     'deferred_count': len(deferred_session_keys),
                     'max_seconds': max_seconds,
+                    'retry_queue': retry_queue,
                 },
             )
         session_keys = session_keys - deferred_session_keys

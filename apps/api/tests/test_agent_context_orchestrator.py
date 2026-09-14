@@ -2705,10 +2705,21 @@ class ObservingFeedbackService(FakeFeedbackService):
 class FakeSessionCleanupService:
     def __init__(self):
         self.targets = []
+        self.deferred_batches = []
 
     def delete_now(self, *, target):
         self.targets.append(target)
         return {'status': 'deleted', 'session_key': target.session_key}
+
+    def enqueue_deferred(self, *, targets, reason):
+        targets = list(targets)
+        self.deferred_batches.append({'targets': targets, 'reason': reason})
+        return {
+            'status': 'queued',
+            'queued': len(targets),
+            'inserted': len(targets),
+            'already_queued': 0,
+        }
 
 
 class RaisingSessionCleanupService(FakeSessionCleanupService):
@@ -4383,6 +4394,143 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             result['session_cleanup'][0]['error'],
             'cleanup audit store unavailable',
         )
+
+    def test_persisted_cleanup_budget_enqueues_every_deferred_session(self):
+        service = AgentFeedbackOrchestrator()
+        runtime_store = RuntimeFeedbackStateStore()
+        cleanup_service = FakeSessionCleanupService()
+        market_date = date(2026, 9, 11)
+        run_id = 'feedback-run-cleanup-budget'
+        state = RuntimeFeedbackRunState(
+            run_id=run_id,
+            market_date=market_date,
+            requested_symbols=['005930', '000660'],
+            requested_roles=['eod-summarizer'],
+            role_sequence=['eod-summarizer'],
+            parallel_per_role=1,
+            batch_size=1,
+            started_at=datetime.now(timezone.utc),
+            buffered_feedback_rows=[
+                {
+                    'market_date': market_date,
+                    'symbol': '005930',
+                    'agent_name': 'eod-summarizer',
+                    'run_id': run_id,
+                    'summary': {
+                        'session_ref': {
+                            'session_key': 'feedback/eod-summarizer/deferred-success'
+                        }
+                    },
+                }
+            ],
+            buffered_failures=[
+                {
+                    'symbol': '000660',
+                    'agent_name': 'eod-summarizer',
+                    'session_key': 'feedback/eod-summarizer/deferred-failure',
+                }
+            ],
+        )
+        runtime_store.start_run(state)
+
+        with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+            with patch.object(
+                orchestrator_module,
+                'agent_feedback_session_cleanup_service',
+                cleanup_service,
+            ):
+                result = service._cleanup_persisted_run_sessions(
+                    market_date=market_date,
+                    request_run_id=run_id,
+                    role='eod-summarizer',
+                    max_seconds=0,
+                )
+
+        self.assertEqual(cleanup_service.targets, [])
+        self.assertEqual(len(cleanup_service.deferred_batches), 1)
+        deferred_batch = cleanup_service.deferred_batches[0]
+        self.assertEqual(deferred_batch['reason'], 'cleanup_time_budget_exhausted')
+        self.assertEqual(
+            {target.session_key for target in deferred_batch['targets']},
+            {
+                'feedback/eod-summarizer/deferred-success',
+                'feedback/eod-summarizer/deferred-failure',
+            },
+        )
+        self.assertEqual(result[-1]['status'], 'deferred')
+        self.assertEqual(result[-1]['retry_queue']['queued'], 2)
+
+    def test_persisted_cleanup_returns_at_budget_when_delete_blocks(self):
+        release_delete = threading.Event()
+
+        class BlockingSessionCleanupService(FakeSessionCleanupService):
+            def delete_now(self, *, target):
+                self.targets.append(target)
+                release_delete.wait(timeout=0.4)
+                return {'status': 'deleted', 'session_key': target.session_key}
+
+        service = AgentFeedbackOrchestrator()
+        runtime_store = RuntimeFeedbackStateStore()
+        cleanup_service = BlockingSessionCleanupService()
+        market_date = date(2026, 9, 11)
+        run_id = 'feedback-run-blocking-cleanup'
+        state = RuntimeFeedbackRunState(
+            run_id=run_id,
+            market_date=market_date,
+            requested_symbols=['005930', '000660'],
+            requested_roles=['eod-summarizer'],
+            role_sequence=['eod-summarizer'],
+            parallel_per_role=1,
+            batch_size=1,
+            started_at=datetime.now(timezone.utc),
+            buffered_feedback_rows=[
+                {
+                    'market_date': market_date,
+                    'symbol': symbol,
+                    'agent_name': 'eod-summarizer',
+                    'run_id': run_id,
+                    'summary': {
+                        'session_ref': {
+                            'session_key': f'feedback/eod-summarizer/blocking-{symbol}'
+                        }
+                    },
+                }
+                for symbol in ('005930', '000660')
+            ],
+        )
+        runtime_store.start_run(state)
+
+        started_at = time.monotonic()
+        try:
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_feedback_session_cleanup_service',
+                    cleanup_service,
+                ):
+                    result = service._cleanup_persisted_run_sessions(
+                        market_date=market_date,
+                        request_run_id=run_id,
+                        role='eod-summarizer',
+                        max_seconds=0.02,
+                    )
+        finally:
+            release_delete.set()
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(len(cleanup_service.deferred_batches), 1)
+        self.assertEqual(
+            {target.session_key for target in cleanup_service.deferred_batches[0]['targets']},
+            {
+                'feedback/eod-summarizer/blocking-005930',
+                'feedback/eod-summarizer/blocking-000660',
+            },
+        )
+        self.assertEqual(result[-1]['status'], 'deferred')
+        self.assertEqual(result[-1]['deferred_count'], 2)
+        snapshot = runtime_store.get_run(market_date, run_id=run_id)
+        self.assertEqual(snapshot.cleaned_session_keys, set())
 
     def test_same_date_subagent_dispatches_never_reuse_batch_session_keys(self):
         service = AgentFeedbackOrchestrator()
