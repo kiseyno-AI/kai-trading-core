@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, time as datetime_time, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -30,6 +30,11 @@ KST = ZoneInfo('Asia/Seoul')
 KIS_REALTIME_PRICE_TR_ID = 'H0STCNT0'
 KIS_REALTIME_PRICE_SOURCE = 'kis_realtime_ws'
 KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS = 10.0
+KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW = timedelta(seconds=30)
+KIS_REALTIME_MONITORED_SOURCE_SCHEMA_VERSION = (
+    'execution_runtime_dashboard_read_model_v1'
+)
+KIS_REALTIME_MONITORED_SOURCE_ENDPOINT = 'monitored_symbols'
 KIS_REALTIME_PRICE_COLUMNS = (
     'MKSC_SHRN_ISCD',
     'STCK_CNTG_HOUR',
@@ -84,8 +89,30 @@ class KISRealtimePriceSubscriptionError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class KISRealtimeMonitoredSymbolSource:
+    symbols: tuple[str, ...]
+    market_date: str | None
+    source_version: datetime | None
+    membership_complete: bool
+    protected_symbols: tuple[str, ...] = ()
+    critical_protected_symbols: tuple[str, ...] = ()
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def _isoformat(value: datetime | None) -> str | None:
@@ -267,12 +294,17 @@ class KISRealtimePriceService:
         self._stop_requested = False
         self._subscription_changed_event: asyncio.Event | None = None
         self._source_refresh_lock: asyncio.Lock | None = None
-        self._source_refresh_task: asyncio.Task[list[str]] | None = None
+        self._source_refresh_task: asyncio.Task[KISRealtimeMonitoredSymbolSource | list[str]] | None = None
+        self._source_refresh_observation_revision: int | None = None
         self._last_source_refresh_monotonic = 0.0
         self._state_lock = threading.RLock()
         self._prices: dict[str, KISRealtimePriceTick] = {}
         self._desired_symbols: set[str] = set()
         self._desired_symbol_order: list[str] = []
+        self._protected_symbols: set[str] = set()
+        self._critical_protected_symbols: set[str] = set()
+        self._observation_revision = 0
+        self._last_source_version: datetime | None = None
         self._subscribed_symbols: set[str] = set()
         self._limited_symbols: set[str] = set()
         self._last_observed_symbols_at: datetime | None = None
@@ -288,9 +320,12 @@ class KISRealtimePriceService:
             'ws_url': self.client.websocket_url(),
             'max_subscriptions': settings.kis_realtime_price_max_subscriptions,
             'desired_symbols': [],
+            'protected_symbols': [],
+            'critical_protected_symbols': [],
             'subscribed_symbols': [],
             'limited_symbols': [],
             'last_observed_symbols_at': None,
+            'last_source_version': None,
             'last_subscription_refresh_at': None,
             'last_connected_at': None,
             'last_disconnected_at': None,
@@ -316,6 +351,7 @@ class KISRealtimePriceService:
                 'prices_ingested': 0,
                 'parse_errors': 0,
                 'subscription_refreshes': 0,
+                'source_results_ignored': 0,
                 'subscribe_requests': 0,
                 'unsubscribe_requests': 0,
             },
@@ -354,6 +390,10 @@ class KISRealtimePriceService:
     def _sync_health_symbols_locked(self) -> None:
         ordered_symbols = self._ordered_desired_symbols_locked()
         self._health['desired_symbols'] = ordered_symbols
+        self._health['protected_symbols'] = sorted(self._protected_symbols)
+        self._health['critical_protected_symbols'] = sorted(
+            self._critical_protected_symbols
+        )
         self._health['subscribed_symbols'] = sorted(self._subscribed_symbols)
         self._health['limited_symbols'] = sorted(self._limited_symbols)
         self._health['last_observed_symbols_at'] = _isoformat(self._last_observed_symbols_at)
@@ -416,6 +456,7 @@ class KISRealtimePriceService:
         websocket = self._websocket
         self._task = None
         self._source_refresh_task = None
+        self._source_refresh_observation_revision = None
         self._websocket = None
 
         if self._subscription_changed_event is not None:
@@ -443,13 +484,12 @@ class KISRealtimePriceService:
 
         self._set_status('stopped')
 
-    def observe_monitored_symbols(
-        self,
+    @staticmethod
+    def _normalize_monitored_symbols(
         symbols: Iterable[Any],
         *,
-        trigger: str,
-        preserve_order: bool = False,
-    ) -> dict[str, Any]:
+        preserve_order: bool,
+    ) -> list[str]:
         if preserve_order:
             seen: set[str] = set()
             normalized_symbols = []
@@ -466,18 +506,468 @@ class KISRealtimePriceService:
                     if (symbol := _normalize_symbol(value))
                 }
             )
+        return normalized_symbols
+
+    def _replace_monitored_symbols(
+        self,
+        normalized_symbols: list[str],
+        *,
+        trigger: str,
+        source_version: datetime | None = None,
+    ) -> dict[str, Any]:
         with self._state_lock:
             before = set(self._desired_symbols)
             before_order = list(self._desired_symbol_order)
             self._desired_symbols = set(normalized_symbols)
             self._desired_symbol_order = list(normalized_symbols)
+            self._protected_symbols.intersection_update(self._desired_symbols)
+            self._critical_protected_symbols.intersection_update(
+                self._desired_symbols
+            )
+            self._observation_revision += 1
             self._last_observed_symbols_at = _utc_now()
+            if source_version is not None:
+                self._last_source_version = source_version
+                self._health['last_source_version'] = _isoformat(source_version)
             self._target_symbols_snapshot_locked()
             changed = before != self._desired_symbols or before_order != self._desired_symbol_order
             if changed:
                 self._health['subscription']['message'] = f'symbols_observed:{trigger}'
                 self._health['subscription']['updated_at'] = _isoformat(self._last_observed_symbols_at)
         if changed and self._subscription_changed_event is not None:
+            self._subscription_changed_event.set()
+        return self.subscription_snapshot()
+
+    def observe_monitored_symbols(
+        self,
+        symbols: Iterable[Any],
+        *,
+        trigger: str,
+        preserve_order: bool = False,
+    ) -> dict[str, Any]:
+        return self._replace_monitored_symbols(
+            self._normalize_monitored_symbols(
+                symbols,
+                preserve_order=preserve_order,
+            ),
+            trigger=trigger,
+        )
+
+    @classmethod
+    def _runtime_monitored_source_from_payload(
+        cls,
+        payload: dict[str, Any],
+    ) -> KISRealtimeMonitoredSymbolSource:
+        raw_items = payload.get('items')
+        items = raw_items if isinstance(raw_items, list) else []
+        source_items_are_valid = bool(
+            isinstance(raw_items, list)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get('symbol'), str)
+                and len(item['symbol']) == 6
+                and item['symbol'].isascii()
+                and item['symbol'].isdigit()
+                for item in raw_items
+            )
+        )
+        source_symbols = cls._normalize_monitored_symbols(
+            (
+                item.get('symbol')
+                for item in items
+                if isinstance(item, dict)
+            ),
+            preserve_order=True,
+        )
+        symbols = [
+            symbol
+            for symbol in source_symbols
+            if len(symbol) == 6 and symbol.isascii() and symbol.isdigit()
+        ]
+        source_symbols_are_krx = len(symbols) == len(source_symbols)
+        protected_symbols = [
+            symbol
+            for symbol in cls._normalize_monitored_symbols(
+                (
+                    item.get('symbol')
+                    for item in items
+                    if isinstance(item, dict)
+                    and cls._runtime_monitored_item_is_protected(item)
+                ),
+                preserve_order=True,
+            )
+            if symbol in symbols
+        ]
+        critical_protected_symbols = [
+            symbol
+            for symbol in cls._normalize_monitored_symbols(
+                (
+                    item.get('symbol')
+                    for item in items
+                    if isinstance(item, dict)
+                    and cls._runtime_monitored_item_protection_priority(item)
+                    == 2
+                ),
+                preserve_order=True,
+            )
+            if symbol in symbols
+        ]
+        freshness = (
+            payload.get('freshness')
+            if isinstance(payload.get('freshness'), dict)
+            else {}
+        )
+        source_coverage = (
+            payload.get('source_coverage')
+            if isinstance(payload.get('source_coverage'), dict)
+            else {}
+        )
+        realtime_subscription = (
+            payload.get('realtime_subscription')
+            if isinstance(payload.get('realtime_subscription'), dict)
+            else {}
+        )
+        desired_symbols = realtime_subscription.get('desired_symbols')
+        desired_symbol_count = realtime_subscription.get(
+            'desired_symbol_count'
+        )
+        subscription_summary_is_valid = bool(
+            isinstance(desired_symbols, list)
+            and desired_symbols == symbols
+            and isinstance(desired_symbol_count, int)
+            and not isinstance(desired_symbol_count, bool)
+            and desired_symbol_count == len(symbols)
+        )
+        market_date = (
+            str(payload['market_date'])
+            if payload.get('market_date') is not None
+            else None
+        )
+        source_version = _parse_iso_datetime(freshness.get('generated_at'))
+        source_version_is_plausible = bool(
+            source_version is not None
+            and source_version
+            <= _utc_now() + KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW
+        )
+        return KISRealtimeMonitoredSymbolSource(
+            symbols=tuple(symbols),
+            market_date=market_date,
+            source_version=source_version,
+            membership_complete=bool(
+                market_date
+                and source_version
+                and source_version_is_plausible
+                and source_items_are_valid
+                and source_symbols_are_krx
+                and subscription_summary_is_valid
+                and source_coverage.get('membership_complete') is True
+                and freshness.get('schema_version')
+                == KIS_REALTIME_MONITORED_SOURCE_SCHEMA_VERSION
+                and freshness.get('endpoint')
+                == KIS_REALTIME_MONITORED_SOURCE_ENDPOINT
+                and freshness.get('market_date') == market_date
+                and freshness.get('status') == 'fresh'
+                and freshness.get('is_stale') is False
+                and freshness.get('is_partial') is False
+                and freshness.get('refreshing') is False
+            ),
+            protected_symbols=tuple(protected_symbols),
+            critical_protected_symbols=tuple(
+                critical_protected_symbols
+            ),
+        )
+
+    @staticmethod
+    def _runtime_monitored_item_is_protected(item: dict[str, Any]) -> bool:
+        return (
+            KISRealtimePriceService._runtime_monitored_item_protection_priority(
+                item
+            )
+            > 0
+        )
+
+    @staticmethod
+    def _runtime_monitored_item_protection_priority(
+        item: dict[str, Any],
+    ) -> int:
+        monitoring_state = _normalize_text(item.get('monitoring_state')).lower()
+        if (
+            item.get('held_position')
+            or (_parse_decimal(item.get('position_quantity')) or Decimal('0'))
+            > Decimal('0')
+        ):
+            return 2
+        if monitoring_state in {'watching_target_stop', 'reconciling'}:
+            return 1
+        return 0
+
+    def observe_runtime_monitored_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        trigger: str,
+        expected_observation_revision: int | None = None,
+    ) -> dict[str, Any]:
+        return self._apply_runtime_monitored_source(
+            self._runtime_monitored_source_from_payload(payload),
+            trigger=trigger,
+            expected_observation_revision=expected_observation_revision,
+        )
+
+    def observation_revision(self) -> int:
+        with self._state_lock:
+            return self._observation_revision
+
+    def _apply_runtime_monitored_source(
+        self,
+        source: KISRealtimeMonitoredSymbolSource,
+        *,
+        trigger: str,
+        expected_observation_revision: int | None,
+    ) -> dict[str, Any]:
+        normalized_symbols = list(source.symbols)
+        incoming_protected = set(source.protected_symbols).intersection(
+            normalized_symbols
+        )
+        incoming_critical = set(
+            source.critical_protected_symbols
+        ).intersection(incoming_protected)
+        source_membership_complete = source.membership_complete
+        changed = False
+        applied = False
+        with self._state_lock:
+            current_market_date = _utc_now().astimezone(KST).date().isoformat()
+            source_is_stale = bool(
+                source.source_version is not None
+                and self._last_source_version is not None
+                and source.source_version < self._last_source_version
+            )
+            source_is_future = bool(
+                source.source_version is not None
+                and source.source_version
+                > _utc_now() + KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW
+            )
+            source_is_superseded = bool(
+                expected_observation_revision is not None
+                and expected_observation_revision != self._observation_revision
+            )
+            wrong_market_date = bool(
+                source.market_date is not None
+                and source.market_date != current_market_date
+            )
+            if (
+                source_is_stale
+                or source_is_future
+                or source_is_superseded
+                or wrong_market_date
+            ):
+                self._health['metrics']['source_results_ignored'] += 1
+            else:
+                current_order = self._ordered_desired_symbols_locked()
+                same_source_version = bool(
+                    source.source_version is not None
+                    and source.source_version == self._last_source_version
+                )
+                same_source_facts = bool(
+                    normalized_symbols == current_order
+                    and incoming_protected == self._protected_symbols
+                    and incoming_critical
+                    == self._critical_protected_symbols
+                )
+                if same_source_version and same_source_facts:
+                    return self.subscription_snapshot()
+                if same_source_version:
+                    source_membership_complete = False
+
+            if (
+                not (
+                    source_is_stale
+                    or source_is_future
+                    or source_is_superseded
+                    or wrong_market_date
+                )
+                and not source_membership_complete
+                and not normalized_symbols
+            ):
+                if (
+                    source.market_date == current_market_date
+                    and source.source_version is not None
+                ):
+                    self._observation_revision += 1
+                    self._last_source_version = source.source_version
+                    self._health['last_source_version'] = _isoformat(
+                        source.source_version
+                    )
+                self._health['metrics']['source_results_ignored'] += 1
+            elif not (
+                source_is_stale
+                or source_is_future
+                or source_is_superseded
+                or wrong_market_date
+            ):
+                if not source_membership_complete:
+                    current_order = self._ordered_desired_symbols_locked()
+                    current_protected = self._protected_symbols.intersection(
+                        current_order
+                    )
+                    current_critical = (
+                        self._critical_protected_symbols.intersection(
+                            current_protected
+                        )
+                    )
+                    current_secondary = current_protected - current_critical
+                    incoming_secondary = incoming_protected - incoming_critical
+                    effective_critical = current_critical | incoming_critical
+                    effective_secondary = (
+                        current_secondary | incoming_secondary
+                    ) - effective_critical
+                    effective_protected = (
+                        effective_critical | effective_secondary
+                    )
+                    seen: set[str] = set()
+
+                    def append_unseen(
+                        ordered: list[str],
+                        values: Iterable[str],
+                    ) -> None:
+                        for symbol in values:
+                            if symbol not in seen:
+                                seen.add(symbol)
+                                ordered.append(symbol)
+
+                    merged_symbols: list[str] = []
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol for symbol in normalized_symbols
+                            if symbol in incoming_critical
+                            and symbol in current_critical
+                        ),
+                    )
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol
+                            for symbol in normalized_symbols
+                            if symbol in incoming_critical
+                            and symbol not in current_critical
+                        ),
+                    )
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol
+                            for symbol in current_order
+                            if symbol in current_critical
+                            and symbol not in incoming_critical
+                        ),
+                    )
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol
+                            for symbol in normalized_symbols
+                            if symbol in incoming_secondary
+                            and symbol in current_secondary
+                        ),
+                    )
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol
+                            for symbol in normalized_symbols
+                            if symbol in incoming_secondary
+                            and symbol not in current_secondary
+                        ),
+                    )
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol
+                            for symbol in current_order
+                            if symbol in current_secondary
+                            and symbol not in incoming_secondary
+                            and symbol not in effective_critical
+                        ),
+                    )
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol
+                            for symbol in current_order
+                            if symbol not in effective_protected
+                        ),
+                    )
+                    append_unseen(
+                        merged_symbols,
+                        (
+                            symbol
+                            for symbol in normalized_symbols
+                            if symbol not in effective_protected
+                        ),
+                    )
+                    normalized_symbols = merged_symbols
+                    next_protected = effective_protected.intersection(
+                        normalized_symbols
+                    )
+                    next_critical = effective_critical.intersection(
+                        normalized_symbols
+                    )
+                else:
+                    next_protected = incoming_protected
+                    next_critical = incoming_critical
+                    next_secondary = next_protected - next_critical
+                    normalized_symbols = [
+                        *(
+                            symbol
+                            for symbol in normalized_symbols
+                            if symbol in next_critical
+                        ),
+                        *(
+                            symbol
+                            for symbol in normalized_symbols
+                            if symbol in next_secondary
+                        ),
+                        *(
+                            symbol
+                            for symbol in normalized_symbols
+                            if symbol not in next_protected
+                        ),
+                    ]
+                before = set(self._desired_symbols)
+                before_order = list(self._desired_symbol_order)
+                self._desired_symbols = set(normalized_symbols)
+                self._desired_symbol_order = normalized_symbols
+                self._protected_symbols = next_protected.intersection(
+                    self._desired_symbols
+                )
+                self._critical_protected_symbols = (
+                    next_critical.intersection(self._desired_symbols)
+                )
+                self._observation_revision += 1
+                self._last_observed_symbols_at = _utc_now()
+                if (
+                    source.market_date == current_market_date
+                    and source.source_version is not None
+                ):
+                    self._last_source_version = source.source_version
+                    self._health['last_source_version'] = _isoformat(
+                        source.source_version
+                    )
+                self._target_symbols_snapshot_locked()
+                changed = (
+                    before != self._desired_symbols
+                    or before_order != self._desired_symbol_order
+                )
+                if changed:
+                    self._health['subscription']['message'] = (
+                        f'symbols_observed:{trigger}'
+                    )
+                    self._health['subscription']['updated_at'] = _isoformat(
+                        self._last_observed_symbols_at
+                    )
+                applied = True
+        if applied and changed and self._subscription_changed_event is not None:
             self._subscription_changed_event.set()
         return self.subscription_snapshot()
 
@@ -506,6 +996,10 @@ class KISRealtimePriceService:
                 return self.subscription_snapshot()
             if source_task is None:
                 self._last_source_refresh_monotonic = now_monotonic
+                with self._state_lock:
+                    self._source_refresh_observation_revision = (
+                        self._observation_revision
+                    )
                 source_task = asyncio.create_task(
                     self._load_runtime_monitored_symbols(trigger=trigger),
                     name='kis-realtime-price-symbol-source',
@@ -531,6 +1025,7 @@ class KISRealtimePriceService:
             except Exception as exc:
                 if self._source_refresh_task is source_task:
                     self._source_refresh_task = None
+                    self._source_refresh_observation_revision = None
                 self._record_error(
                     stage='subscription_source',
                     message=str(exc),
@@ -539,26 +1034,54 @@ class KISRealtimePriceService:
                 )
                 logger.warning('KIS realtime price monitored-symbol refresh failed: %s', exc)
             else:
+                expected_observation_revision = (
+                    self._source_refresh_observation_revision
+                )
                 if self._source_refresh_task is source_task:
                     self._source_refresh_task = None
+                    self._source_refresh_observation_revision = None
                 with self._state_lock:
                     self._health['metrics']['subscription_refreshes'] += 1
                     self._health['last_subscription_refresh_at'] = _isoformat(_utc_now())
-                self.observe_monitored_symbols(symbols, trigger=trigger, preserve_order=True)
+                source = (
+                    symbols
+                    if isinstance(symbols, KISRealtimeMonitoredSymbolSource)
+                    else KISRealtimeMonitoredSymbolSource(
+                        # Unversioned legacy results may add symbols but cannot
+                        # prove that a missing symbol should be removed.
+                        symbols=tuple(
+                            self._normalize_monitored_symbols(
+                                symbols,
+                                preserve_order=True,
+                            )
+                        ),
+                        market_date=None,
+                        source_version=None,
+                        membership_complete=False,
+                    )
+                )
+                self._apply_runtime_monitored_source(
+                    source,
+                    trigger=trigger,
+                    expected_observation_revision=(
+                        expected_observation_revision
+                    ),
+                )
         return self.subscription_snapshot()
 
-    async def _load_runtime_monitored_symbols(self, *, trigger: str) -> list[str]:
+    async def _load_runtime_monitored_symbols(
+        self,
+        *,
+        trigger: str,
+    ) -> KISRealtimeMonitoredSymbolSource:
         from app.orders.exec_integration import signal_decider_exec_integration_service
 
         payload = await signal_decider_exec_integration_service.list_runtime_monitored_symbols(
-            refresh=False,
+            refresh=True,
             trigger=f'kis_realtime_price:{trigger}',
+            publish_realtime_observation=False,
         )
-        return [
-            str(item.get('symbol'))
-            for item in payload.get('items', [])
-            if isinstance(item, dict) and item.get('symbol')
-        ]
+        return self._runtime_monitored_source_from_payload(payload)
 
     async def _run(self) -> None:
         reconnect_delay = max(0.5, float(settings.kis_realtime_reconnect_base_delay_seconds))
@@ -1001,6 +1524,10 @@ class KISRealtimePriceService:
                 'allowed_symbols': allowed,
                 'limited_symbols': limited,
                 'subscribed_symbols': sorted(self._subscribed_symbols),
+                'protected_symbols': sorted(self._protected_symbols),
+                'critical_protected_symbols': sorted(
+                    self._critical_protected_symbols
+                ),
                 'max_subscriptions': settings.kis_realtime_price_max_subscriptions,
             }
 

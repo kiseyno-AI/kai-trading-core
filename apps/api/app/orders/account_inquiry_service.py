@@ -224,24 +224,109 @@ class TradingAccountInquiryService:
 
         balance_totals = _ensure_mapping(balance.get('output2'))
         total_asset_value = self._first_decimal(balance_totals, ('tot_evlu_amt',))
-        rows = [row for row in balance.get('output1', []) if isinstance(row, dict)]
+        source_rows: list[Any] = []
+        completeness_issues: list[dict[str, Any]] = []
+        raw_pages = balance.get('raw_pages')
+        if isinstance(raw_pages, list) and raw_pages:
+            for page_index, page in enumerate(raw_pages):
+                if not isinstance(page, dict):
+                    completeness_issues.append(
+                        {
+                            'code': 'position_page_not_object',
+                            'page_index': page_index,
+                        }
+                    )
+                    continue
+                page_rows = page.get('output1')
+                if not isinstance(page_rows, list):
+                    completeness_issues.append(
+                        {
+                            'code': 'position_rows_not_list',
+                            'page_index': page_index,
+                        }
+                    )
+                    continue
+                source_rows.extend(page_rows)
+        else:
+            output_rows = balance.get('output1')
+            if isinstance(output_rows, list):
+                source_rows = list(output_rows)
+            else:
+                completeness_issues.append({'code': 'position_rows_not_list'})
 
         filtered_rows: list[dict[str, Any]] = []
-        for row in rows:
-            row_symbol = _normalize_optional_text(_pick_first(row, 'pdno'), uppercase=True)
+        valid_source_row_count = 0
+        malformed_row_count = 0
+        for row_index, row in enumerate(source_rows):
+            if not isinstance(row, dict):
+                malformed_row_count += 1
+                completeness_issues.append(
+                    {
+                        'code': 'position_row_not_object',
+                        'row_index': row_index,
+                    }
+                )
+                continue
+
+            raw_symbol = _pick_first(row, 'pdno')
+            row_symbol = (
+                raw_symbol.strip().upper()
+                if isinstance(raw_symbol, str) and raw_symbol.strip()
+                else None
+            )
+            quantity = _safe_decimal(_pick_first(row, 'hldg_qty'))
+            if quantity is None or not quantity.is_finite() or quantity < Decimal('0'):
+                malformed_row_count += 1
+                completeness_issues.append(
+                    {
+                        'code': 'position_quantity_invalid',
+                        'row_index': row_index,
+                    }
+                )
+                continue
+            symbol_is_valid = bool(
+                row_symbol
+                and len(row_symbol) == 6
+                and row_symbol.isascii()
+                and row_symbol.isdigit()
+            )
+            if not symbol_is_valid:
+                malformed_row_count += 1
+                completeness_issues.append(
+                    {
+                        'code': (
+                            'positive_position_symbol_invalid'
+                            if quantity > Decimal('0')
+                            else 'position_symbol_invalid'
+                        ),
+                        'row_index': row_index,
+                    }
+                )
+                continue
+
+            valid_source_row_count += 1
             if normalized_symbol and row_symbol != normalized_symbol:
                 continue
-            quantity = _safe_decimal(_pick_first(row, 'hldg_qty')) or Decimal('0')
             if not include_zero and quantity <= Decimal('0'):
                 continue
             filtered_rows.append(row)
+
+        if balance.get('max_pages_reached') is True:
+            completeness_issues.append({'code': 'position_pagination_limit_reached'})
 
         total_positions_value = sum(
             (_safe_decimal(_pick_first(row, 'evlu_amt')) or Decimal('0'))
             for row in filtered_rows
         )
 
-        items = [self._normalize_position(row, total_asset_value=total_asset_value, total_positions_value=total_positions_value) for row in filtered_rows]
+        items = [
+            self._normalize_position(
+                row,
+                total_asset_value=total_asset_value,
+                total_positions_value=total_positions_value,
+            )
+            for row in filtered_rows
+        ]
         items.sort(key=lambda item: item.get('market_value') or 0, reverse=True)
 
         return {
@@ -250,6 +335,14 @@ class TradingAccountInquiryService:
             'as_of': _utc_now().isoformat(),
             'count': len(items),
             'items': items,
+            'completeness': {
+                'status': 'incomplete' if completeness_issues else 'complete',
+                'source_row_count': len(source_rows),
+                'valid_source_row_count': valid_source_row_count,
+                'returned_row_count': len(items),
+                'malformed_row_count': malformed_row_count,
+                'issues': completeness_issues,
+            },
             'raw': {
                 'provider': 'kis',
                 'source_api': 'inquire-balance',

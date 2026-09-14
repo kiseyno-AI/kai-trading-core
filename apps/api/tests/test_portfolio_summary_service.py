@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import timedelta
 
@@ -178,6 +179,45 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account['recentActivity'][0]['id'], 'ORDER-1')
         self.assertEqual(account['recentActivity'][0]['status'], 'filled')
         self.assertEqual(result['notices'], [])
+        self.assertEqual(
+            result['accountCoverage'],
+            {
+                'status': 'complete',
+                'configuredCount': 1,
+                'returnedCount': 1,
+            },
+        )
+
+    async def test_incomplete_holdings_coverage_degrades_authoritative_snapshot(self) -> None:
+        account_reference = 'KIS:12345678-01'
+        self._seed_synced_account(account_reference=account_reference)
+        self.inquiry_service.positions_results[account_reference]['completeness'] = {
+            'status': 'incomplete',
+            'source_row_count': 2,
+            'valid_source_row_count': 1,
+            'returned_row_count': 1,
+            'malformed_row_count': 1,
+            'issues': [
+                {
+                    'code': 'positive_position_symbol_invalid',
+                    'row_index': 1,
+                }
+            ],
+        }
+        service = self._build_service()
+
+        result = await service.get_portfolio_summary()
+
+        self.assertEqual(result['sync']['status'], 'unavailable')
+        self.assertEqual(result['freshness']['lastRefreshStatus'], 'degraded')
+        account = result['accounts'][0]
+        self.assertEqual(account['status'], 'stale')
+        self.assertNotIn('holdings', account)
+        self.assertEqual(account['observedHoldings'][0]['symbol'], '005930')
+        self.assertEqual(account['holdingsCompleteness']['status'], 'incomplete')
+        self.assertTrue(
+            any('holdings incomplete' in notice.lower() for notice in result['notices'])
+        )
 
     async def test_portfolio_summary_uses_kis_day_pnl_and_keeps_unrealized_separate(self) -> None:
         self._seed_synced_account(
@@ -245,6 +285,39 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.inquiry_service.summary_calls), 1)
         self.assertEqual(len(self.inquiry_service.positions_calls), 1)
         self.assertEqual(len(self.order_service.list_calls), 1)
+
+    async def test_foreground_refresh_marks_concurrent_cache_read_in_flight_and_completed_response_clear(
+        self,
+    ) -> None:
+        self._seed_synced_account(holdings=[])
+        service = self._build_service(cache_ttl_seconds=60)
+        await service.get_portfolio_summary()
+
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        original_build = service._build_live_portfolio_summary
+
+        async def blocked_build() -> dict:
+            refresh_started.set()
+            await release_refresh.wait()
+            return await original_build()
+
+        service._build_live_portfolio_summary = blocked_build
+        refresh_task = asyncio.create_task(
+            service.get_portfolio_summary(refresh=True)
+        )
+        try:
+            await asyncio.wait_for(refresh_started.wait(), timeout=1)
+
+            concurrent = await service.get_portfolio_summary(refresh=False)
+
+            self.assertTrue(service._refresh_lock.locked())
+            self.assertTrue(concurrent['freshness']['refreshInFlight'])
+        finally:
+            release_refresh.set()
+
+        completed = await asyncio.wait_for(refresh_task, timeout=1)
+        self.assertFalse(completed['freshness']['refreshInFlight'])
 
     async def test_stale_cache_returns_cached_payload_and_revalidates_in_background(self) -> None:
         account_reference = 'KIS:12345678-01'

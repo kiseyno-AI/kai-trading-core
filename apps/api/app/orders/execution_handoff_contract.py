@@ -283,12 +283,19 @@ class ExecutionMonitoredSymbolItemPayload(ExecutionRuntimeExecCardPayload):
     status_counts: dict[str, int]
 
 
+class ExecutionMonitoredSourceCoveragePayload(_ContractModel):
+    membership_complete: bool
+    live_holdings: Literal['complete', 'partial', 'unknown']
+    live_exec_monitoring: Literal['complete', 'unknown']
+
+
 class ExecutionMonitoredSymbolsPayload(_ContractModel):
     request: dict[str, Any]
     runtime: ExecutionRuntimeStatusPayload
     market_date: str
     summary: dict[str, Any]
     realtime_subscription: dict[str, Any]
+    source_coverage: ExecutionMonitoredSourceCoveragePayload | None = None
     freshness: ExecutionDashboardFreshnessPayload
     refresh: ExecutionDashboardRefreshPayload
     items: list[ExecutionMonitoredSymbolItemPayload]
@@ -618,6 +625,7 @@ class PortfolioRiskEquivalentPayload(_ContractModel):
     asOf: str
     source: Literal[PORTFOLIO_SUMMARY_READ_MODEL_SOURCE]
     sync: PortfolioSummarySyncPayload
+    accountCoverage: dict[str, Any] | None = None
     accounts: list[dict[str, Any]]
     notices: list[str]
     freshness: dict[str, Any] | None = None
