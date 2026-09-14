@@ -4171,6 +4171,87 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'execution_activation_fence_busy',
         )
 
+    async def test_transient_predispatch_generation_contention_converges(
+        self,
+    ) -> None:
+        original_inspect = (
+            signal_decider_next_open_execution_service
+            .inspect_dispatch_authority_generation
+        )
+        inspect_call_count = 0
+
+        def inspect_after_one_predispatch_conflict(**kwargs):
+            nonlocal inspect_call_count
+            inspect_call_count += 1
+            if inspect_call_count == 1:
+                raise _PlanRefreshRevisionConflict(
+                    'transient predispatch generation contention'
+                )
+            return original_inspect(**kwargs)
+
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            'inspect_dispatch_authority_generation',
+            side_effect=inspect_after_one_predispatch_conflict,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_transient_predispatch_generation_contention',
+            )
+
+        self.assertEqual(inspect_call_count, 6)
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 1)
+        self.assertEqual(self.client.revocation_calls, [])
+        self.assertEqual(
+            result['dispatch']['groups'][0]['activation_status'],
+            'activated',
+        )
+
+    async def test_persistent_predispatch_generation_contention_fails_closed(
+        self,
+    ) -> None:
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            'inspect_dispatch_authority_generation',
+            side_effect=_PlanRefreshRevisionConflict(
+                'persistent predispatch generation contention'
+            ),
+        ) as inspect_generation:
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_persistent_predispatch_generation_contention',
+            )
+
+        self.assertEqual(
+            inspect_generation.call_count,
+            CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS + 1,
+        )
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(self.client.activation_calls, [])
+        self.assertEqual(self.client.revocation_calls, [])
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(
+            group['dispatch_status'],
+            'skipped',
+        )
+        self.assertEqual(
+            group['authority_generation']['error_type'],
+            '_PlanRefreshRevisionConflict',
+        )
+        self.assertEqual(
+            group['error']['code'],
+            'dispatch_authority_fence_failed',
+        )
+
     async def test_bounded_post_activation_generation_contention_converges(
         self,
     ) -> None:

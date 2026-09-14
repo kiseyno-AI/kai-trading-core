@@ -605,6 +605,38 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
             {'response_payload': 'json_payload_too_large'},
         )
 
+    def test_oversized_decoded_json_snapshot_payload_fails_closed(self):
+        snapshot = SimpleNamespace(
+            id=109,
+            request_payload={},
+            response_payload={
+                'tactical_action': 'watch_for_trigger',
+                'padding': '한' * (1024 * 1024 // 3),
+            },
+            decision_run_id='oversized-decoded-payload',
+            agent_name='short-term-decider',
+            symbol='005930',
+            decision_action='wait',
+            preferred_action='wait',
+            next_day_open_action='wait',
+        )
+
+        result = AgentFeedbackOrchestrator().revalidate_persisted_decider_snapshots(
+            market_date='2026-04-23',
+            snapshots=[snapshot],
+        )
+
+        self.assertEqual(result['valid_snapshot_ids'], [])
+        self.assertEqual(result['invalid_snapshot_ids'], [109])
+        self.assertEqual(
+            result['validations'][0]['reason'],
+            'persisted_snapshot_payload_invalid',
+        )
+        self.assertEqual(
+            result['validations'][0]['payload_errors'],
+            {'response_payload': 'json_payload_too_large'},
+        )
+
     def test_persisted_snapshot_revalidation_uses_durable_generation(self):
         snapshot = SimpleNamespace(
             id=102,

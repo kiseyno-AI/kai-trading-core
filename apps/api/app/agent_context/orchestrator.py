@@ -133,6 +133,19 @@ def _parse_persisted_snapshot_json_object(
     value: Any,
 ) -> tuple[dict[str, Any], str | None]:
     if isinstance(value, dict):
+        try:
+            payload_size_bytes = len(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(',', ':'),
+                ).encode('utf-8')
+            )
+        except (RecursionError, TypeError, UnicodeEncodeError, ValueError):
+            return {}, 'json_decode_error'
+        if payload_size_bytes > PERSISTED_SNAPSHOT_JSON_MAX_BYTES:
+            return {}, 'json_payload_too_large'
         return dict(value), None
     if not isinstance(value, str):
         return {}, 'json_shape_not_object'

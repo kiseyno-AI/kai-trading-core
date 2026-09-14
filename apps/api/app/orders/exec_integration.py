@@ -4410,6 +4410,7 @@ class SignalDeciderExecIntegrationService:
                         target_trade_date=resolved_target_date,
                         rows=dispatch_rows,
                         revision_fingerprints=dispatch_revision_fingerprints,
+                        retry_plan_refresh_conflict=True,
                     )
                 )
                 if authority_generation_before.get('status') != 'valid':
