@@ -4032,50 +4032,95 @@ class AgentFeedbackOrchestrator:
             return []
 
         started_at = time.monotonic()
-        deadline = started_at + max(0.0, float(max_seconds))
-        retry_queue = agent_feedback_session_cleanup_service.enqueue_deferred(
-            targets=cleanup_targets,
-            reason='cleanup_time_budget_exhausted',
+        cleanup_budget_seconds = max(0.0, float(max_seconds))
+        cleanup_deadline = started_at + cleanup_budget_seconds
+        # Durable prequeueing uses a fresh, unpooled connection, so its budget
+        # is independent of the shared QueuePool and has no pre-ping phase.
+        # Reserve the configured connect bound plus a small SQL window. Actual
+        # statement/lock limits are recomputed after connect; the caller's
+        # cleanup/delete budget remains unchanged.
+        persistence_budget_seconds = max(
+            cleanup_budget_seconds,
+            float(getattr(settings, 'db_connect_timeout_seconds', 0.0)) + 1.0,
         )
+        persistence_deadline = started_at + persistence_budget_seconds
         cleanup_results: list[dict[str, Any]] = []
         deferred_session_keys: set[str] = set()
-        for index, target in enumerate(cleanup_targets):
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                deferred_session_keys.update(
-                    item.session_key for item in cleanup_targets[index:]
-                )
-                break
-
-            completed = threading.Event()
-            outcome: dict[str, Any] = {}
-
-            def _delete_target(cleanup_target: SessionCleanupTarget = target) -> None:
-                try:
-                    outcome['result'] = agent_feedback_session_cleanup_service.delete_now(
-                        target=cleanup_target
+        try:
+            retry_queue = agent_feedback_session_cleanup_service.enqueue_deferred(
+                targets=cleanup_targets,
+                reason='cleanup_time_budget_exhausted',
+                deadline_monotonic=persistence_deadline,
+            )
+        except Exception as exc:  # noqa: BLE001
+            retry_queue = {
+                'status': 'failed',
+                'queued': None,
+                'inserted': None,
+                'already_queued': None,
+                'requested_count': len(cleanup_targets),
+                'pending_count': len(cleanup_targets),
+                'persistence_confirmed': False,
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+            }
+            deferred_session_keys.update(target.session_key for target in cleanup_targets)
+            log_agent_feedback_event(
+                'cleanup_persisted_run_sessions_prequeue_failed',
+                status='failed',
+                market_date=market_date.isoformat(),
+                request_run_id=request_run_id,
+                role=role,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                requested_count=len(cleanup_targets),
+            )
+        if retry_queue.get('persistence_confirmed') is not True:
+            deferred_session_keys.update(target.session_key for target in cleanup_targets)
+        else:
+            for index, target in enumerate(cleanup_targets):
+                if cleanup_deadline - time.monotonic() <= 0:
+                    deferred_session_keys.update(
+                        item.session_key for item in cleanup_targets[index:]
                     )
-                except Exception as exc:  # noqa: BLE001
-                    outcome['error'] = exc
-                finally:
-                    completed.set()
+                    break
+                completed = threading.Event()
+                outcome: dict[str, Any] = {}
 
-            threading.Thread(
-                target=_delete_target,
-                name='agent-feedback-session-cleanup',
-                daemon=True,
-            ).start()
-            if not completed.wait(timeout=remaining_seconds):
-                deferred_session_keys.update(
-                    item.session_key for item in cleanup_targets[index:]
+                def _delete_target(
+                    cleanup_target: SessionCleanupTarget = target,
+                ) -> None:
+                    try:
+                        outcome['result'] = (
+                            agent_feedback_session_cleanup_service.delete_now(
+                                target=cleanup_target
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        outcome['error'] = exc
+                    finally:
+                        completed.set()
+
+                threading.Thread(
+                    target=_delete_target,
+                    name='agent-feedback-session-cleanup',
+                    daemon=True,
+                ).start()
+                remaining_seconds = max(
+                    0.0,
+                    cleanup_deadline - time.monotonic(),
                 )
-                break
-            error = outcome.get('error')
-            if isinstance(error, Exception):
-                raise error
-            result = outcome.get('result')
-            if isinstance(result, dict):
-                cleanup_results.append(result)
+                if not completed.wait(timeout=remaining_seconds):
+                    deferred_session_keys.update(
+                        item.session_key for item in cleanup_targets[index:]
+                    )
+                    break
+                error = outcome.get('error')
+                if isinstance(error, Exception):
+                    raise error
+                result = outcome.get('result')
+                if isinstance(result, dict):
+                    cleanup_results.append(result)
 
         session_keys = {target.session_key for target in cleanup_targets}
         if deferred_session_keys:
@@ -4085,6 +4130,7 @@ class AgentFeedbackOrchestrator:
                     'reason': 'cleanup_time_budget_exhausted',
                     'deferred_count': len(deferred_session_keys),
                     'max_seconds': max_seconds,
+                    'persistence_max_seconds': persistence_budget_seconds,
                     'retry_queue': retry_queue,
                 }
             )
@@ -4098,6 +4144,7 @@ class AgentFeedbackOrchestrator:
                     'cleaned_count': len(session_keys - deferred_session_keys),
                     'deferred_count': len(deferred_session_keys),
                     'max_seconds': max_seconds,
+                    'persistence_max_seconds': persistence_budget_seconds,
                     'retry_queue': retry_queue,
                 },
             )

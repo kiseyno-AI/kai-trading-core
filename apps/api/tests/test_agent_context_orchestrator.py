@@ -2706,20 +2706,31 @@ class FakeSessionCleanupService:
     def __init__(self):
         self.targets = []
         self.deferred_batches = []
+        self.deferred_completed = threading.Event()
 
     def delete_now(self, *, target):
         self.targets.append(target)
         return {'status': 'deleted', 'session_key': target.session_key}
 
-    def enqueue_deferred(self, *, targets, reason):
-        targets = list(targets)
-        self.deferred_batches.append({'targets': targets, 'reason': reason})
-        return {
-            'status': 'queued',
-            'queued': len(targets),
-            'inserted': len(targets),
-            'already_queued': 0,
-        }
+    def enqueue_deferred(self, *, targets, reason, deadline_monotonic=None):
+        try:
+            targets = list(targets)
+            self.deferred_batches.append(
+                {
+                    'targets': targets,
+                    'reason': reason,
+                    'deadline_monotonic': deadline_monotonic,
+                }
+            )
+            return {
+                'status': 'queued',
+                'queued': len(targets),
+                'inserted': len(targets),
+                'already_queued': 0,
+                'persistence_confirmed': True,
+            }
+        finally:
+            self.deferred_completed.set()
 
 
 class RaisingSessionCleanupService(FakeSessionCleanupService):
@@ -4433,23 +4444,41 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         runtime_store.start_run(state)
 
-        with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
-            with patch.object(
+        persistence_started_at = time.monotonic()
+        with (
+            patch.object(orchestrator_module.settings, 'db_pool_timeout_seconds', 120),
+            patch.object(orchestrator_module.settings, 'db_connect_timeout_seconds', 5),
+            patch.object(
+                orchestrator_module,
+                'runtime_feedback_state_store',
+                runtime_store,
+            ),
+            patch.object(
                 orchestrator_module,
                 'agent_feedback_session_cleanup_service',
                 cleanup_service,
-            ):
-                result = service._cleanup_persisted_run_sessions(
-                    market_date=market_date,
-                    request_run_id=run_id,
-                    role='eod-summarizer',
-                    max_seconds=0,
-                )
+            ),
+        ):
+            result = service._cleanup_persisted_run_sessions(
+                market_date=market_date,
+                request_run_id=run_id,
+                role='eod-summarizer',
+                max_seconds=0,
+            )
 
+        self.assertTrue(cleanup_service.deferred_completed.wait(timeout=1))
         self.assertEqual(cleanup_service.targets, [])
         self.assertEqual(len(cleanup_service.deferred_batches), 1)
         deferred_batch = cleanup_service.deferred_batches[0]
         self.assertEqual(deferred_batch['reason'], 'cleanup_time_budget_exhausted')
+        self.assertGreater(
+            deferred_batch['deadline_monotonic'] - persistence_started_at,
+            5,
+        )
+        self.assertLess(
+            deferred_batch['deadline_monotonic'] - persistence_started_at,
+            7,
+        )
         self.assertEqual(
             {target.session_key for target in deferred_batch['targets']},
             {
@@ -4529,6 +4558,85 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(result[-1]['status'], 'deferred')
         self.assertEqual(result[-1]['deferred_count'], 2)
+        snapshot = runtime_store.get_run(market_date, run_id=run_id)
+        self.assertEqual(snapshot.cleaned_session_keys, set())
+
+    def test_persisted_cleanup_surfaces_retry_prequeue_deadline_without_deleting(self):
+        class DeadlinePrequeueSessionCleanupService(FakeSessionCleanupService):
+            def enqueue_deferred(self, *, targets, reason, deadline_monotonic=None):
+                targets = list(targets)
+                self.deferred_batches.append(
+                    {
+                        'targets': targets,
+                        'reason': reason,
+                        'deadline_monotonic': deadline_monotonic,
+                    }
+                )
+                raise TimeoutError('cleanup retry prequeue deadline exhausted')
+
+        service = AgentFeedbackOrchestrator()
+        runtime_store = RuntimeFeedbackStateStore()
+        cleanup_service = DeadlinePrequeueSessionCleanupService()
+        market_date = date(2026, 9, 11)
+        run_id = 'feedback-run-blocking-prequeue'
+        state = RuntimeFeedbackRunState(
+            run_id=run_id,
+            market_date=market_date,
+            requested_symbols=['005930'],
+            requested_roles=['eod-summarizer'],
+            role_sequence=['eod-summarizer'],
+            parallel_per_role=1,
+            batch_size=1,
+            started_at=datetime.now(timezone.utc),
+            buffered_feedback_rows=[
+                {
+                    'market_date': market_date,
+                    'symbol': '005930',
+                    'agent_name': 'eod-summarizer',
+                    'run_id': run_id,
+                    'summary': {
+                        'session_ref': {
+                            'session_key': 'feedback/eod-summarizer/blocking-prequeue'
+                        }
+                    },
+                }
+            ],
+        )
+        runtime_store.start_run(state)
+
+        with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+            with patch.object(
+                orchestrator_module,
+                'agent_feedback_session_cleanup_service',
+                cleanup_service,
+            ):
+                with patch.object(orchestrator_module, 'log_agent_feedback_event') as log_event:
+                    result = service._cleanup_persisted_run_sessions(
+                        market_date=market_date,
+                        request_run_id=run_id,
+                        role='eod-summarizer',
+                        max_seconds=10,
+                    )
+
+        self.assertEqual(cleanup_service.targets, [])
+        self.assertEqual(result[-1]['status'], 'deferred')
+        self.assertEqual(result[-1]['deferred_count'], 1)
+        self.assertEqual(result[-1]['retry_queue']['status'], 'failed')
+        self.assertIsNone(result[-1]['retry_queue']['queued'])
+        self.assertEqual(result[-1]['retry_queue']['requested_count'], 1)
+        self.assertEqual(result[-1]['retry_queue']['pending_count'], 1)
+        self.assertFalse(result[-1]['retry_queue']['persistence_confirmed'])
+        self.assertEqual(result[-1]['retry_queue']['error_type'], 'TimeoutError')
+        log_event.assert_any_call(
+            'cleanup_persisted_run_sessions_prequeue_failed',
+            status='failed',
+            market_date=market_date.isoformat(),
+            request_run_id=run_id,
+            role='eod-summarizer',
+            error_type='TimeoutError',
+            error_message='cleanup retry prequeue deadline exhausted',
+            requested_count=1,
+        )
         snapshot = runtime_store.get_run(market_date, run_id=run_id)
         self.assertEqual(snapshot.cleaned_session_keys, set())
 

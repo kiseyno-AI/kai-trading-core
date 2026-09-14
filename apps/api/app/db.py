@@ -10,6 +10,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.core.settings import settings
 from app.db_models import Base
@@ -66,6 +67,14 @@ def _build_engine_kwargs() -> dict[str, object]:
     }
 
 
+def _build_isolated_engine_kwargs() -> dict[str, object]:
+    return {
+        'poolclass': NullPool,
+        'future': True,
+        'connect_args': _build_engine_connect_args(),
+    }
+
+
 def _build_database_url() -> str:
     if settings.database_url:
         return settings.database_url
@@ -78,6 +87,13 @@ def _build_database_url() -> str:
 DATABASE_URL = _build_database_url()
 engine = create_engine(DATABASE_URL, **_build_engine_kwargs())
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+isolated_engine = create_engine(DATABASE_URL, **_build_isolated_engine_kwargs())
+IsolatedSessionLocal = sessionmaker(
+    bind=isolated_engine,
+    autoflush=False,
+    autocommit=False,
+    future=True,
+)
 
 
 def pool_status() -> dict[str, object]:
@@ -134,9 +150,30 @@ def session_scope(
     *,
     statement_timeout_ms: int | None = None,
     lock_timeout_ms: int | None = None,
+    deadline_monotonic: float | None = None,
+    isolated_connection: bool = False,
 ):
-    session = SessionLocal()
+    session_factory = IsolatedSessionLocal if isolated_connection else SessionLocal
+    session = session_factory()
     try:
+        if deadline_monotonic is not None:
+            # Connection acquisition is intentionally forced before calculating
+            # SQL limits. A shared pool wait or an isolated connect may spend
+            # part of the caller's budget, so calculate from what remains.
+            session.connection()
+            remaining_timeout_ms = int(
+                (deadline_monotonic - time.monotonic()) * 1000
+            )
+            if remaining_timeout_ms <= 0:
+                raise TimeoutError('database session deadline exhausted during checkout')
+            statement_timeout_ms = min(
+                statement_timeout_ms or remaining_timeout_ms,
+                remaining_timeout_ms,
+            )
+            lock_timeout_ms = min(
+                lock_timeout_ms or remaining_timeout_ms,
+                remaining_timeout_ms,
+            )
         if statement_timeout_ms is not None:
             session.execute(text(f'SET LOCAL statement_timeout = {int(statement_timeout_ms)}'))
         if lock_timeout_ms is not None:

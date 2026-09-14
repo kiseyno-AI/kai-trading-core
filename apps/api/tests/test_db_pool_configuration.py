@@ -1,7 +1,34 @@
 from unittest.mock import patch
 
+from sqlalchemy.pool import NullPool
+
 from app import db
 from app.db_pool_watchdog import DatabasePoolWatchdog
+
+
+class _DeadlineSession:
+    def __init__(self) -> None:
+        self.connection_calls = 0
+        self.statements = []
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def connection(self):
+        self.connection_calls += 1
+        return object()
+
+    def execute(self, statement):
+        self.statements.append(str(statement))
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_engine_uses_resilient_pool_and_connect_settings() -> None:
@@ -11,6 +38,15 @@ def test_engine_uses_resilient_pool_and_connect_settings() -> None:
     assert kwargs['pool_recycle'] == db.settings.db_pool_recycle_seconds
     assert kwargs['pool_use_lifo'] == db.settings.db_pool_use_lifo
     assert kwargs['connect_args']['connect_timeout'] == db.settings.db_connect_timeout_seconds
+
+
+def test_isolated_engine_bypasses_pool_and_pre_ping() -> None:
+    kwargs = db._build_isolated_engine_kwargs()
+
+    assert kwargs['poolclass'] is NullPool
+    assert kwargs['connect_args']['connect_timeout'] == db.settings.db_connect_timeout_seconds
+    assert 'pool_timeout' not in kwargs
+    assert 'pool_pre_ping' not in kwargs
 
 
 def test_database_health_fails_fast_when_pool_is_exhausted() -> None:
@@ -41,6 +77,58 @@ def test_database_health_does_not_stack_connection_attempts() -> None:
     assert connected is False
     assert error is not None
     assert 'already in progress' in error
+
+
+def test_session_scope_recomputes_statement_limits_after_deadline_pool_checkout() -> None:
+    session = _DeadlineSession()
+
+    with (
+        patch.object(db, 'SessionLocal', return_value=session),
+        patch.object(db.time, 'monotonic', return_value=103.0),
+    ):
+        with db.session_scope(
+            statement_timeout_ms=30_000,
+            lock_timeout_ms=15_000,
+            deadline_monotonic=110.0,
+        ):
+            pass
+
+    assert session.connection_calls == 1
+    assert session.statements == [
+        'SET LOCAL statement_timeout = 7000',
+        'SET LOCAL lock_timeout = 7000',
+    ]
+    assert session.committed is True
+    assert session.rolled_back is False
+    assert session.closed is True
+
+
+def test_session_scope_uses_isolated_connection_for_deadline_persistence() -> None:
+    session = _DeadlineSession()
+
+    with (
+        patch.object(db, 'SessionLocal') as shared_session_factory,
+        patch.object(db, 'IsolatedSessionLocal', return_value=session) as isolated_factory,
+        patch.object(db.time, 'monotonic', return_value=103.0),
+    ):
+        with db.session_scope(
+            statement_timeout_ms=30_000,
+            lock_timeout_ms=15_000,
+            deadline_monotonic=110.0,
+            isolated_connection=True,
+        ):
+            pass
+
+    shared_session_factory.assert_not_called()
+    isolated_factory.assert_called_once_with()
+    assert session.connection_calls == 1
+    assert session.statements == [
+        'SET LOCAL statement_timeout = 7000',
+        'SET LOCAL lock_timeout = 7000',
+    ]
+    assert session.committed is True
+    assert session.rolled_back is False
+    assert session.closed is True
 
 
 class _WatchdogCursor:
