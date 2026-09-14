@@ -153,6 +153,38 @@ def _gap_policy_details(*, failed: int, total: int) -> dict[str, Any]:
     }
 
 
+def _classify_pykrx_enrichment_categories(
+    *,
+    category_results: dict[str, Any],
+    coverage_categories: dict[str, Any],
+    preflight_failed_categories: Sequence[str],
+) -> dict[str, list[str]]:
+    provider_error_categories = sorted(
+        category
+        for category, details in category_results.items()
+        if isinstance(details, dict) and details.get('errors')
+    )
+    coverage_gap_categories = sorted(
+        category
+        for category, coverage_payload in coverage_categories.items()
+        if isinstance(coverage_payload, dict)
+        and int(coverage_payload.get('expected_rows') or 0)
+        > int(coverage_payload.get('present_rows') or 0)
+    )
+    unresolved_categories = sorted(
+        {*coverage_gap_categories, *preflight_failed_categories}
+    )
+    recovered_categories = sorted(
+        set(provider_error_categories) - set(unresolved_categories)
+    )
+    return {
+        'provider_error_categories': provider_error_categories,
+        'coverage_gap_categories': coverage_gap_categories,
+        'recovered_categories': recovered_categories,
+        'unresolved_categories': unresolved_categories,
+    }
+
+
 def _resolve_requested_stages(
     *,
     mode: str,
@@ -1556,17 +1588,6 @@ def run_market_data_pipeline(
                 if isinstance(pykrx_enrichment_result.get('categories'), dict)
                 else {}
             )
-            collection_failed_categories = [
-                category
-                for category, details in category_results.items()
-                if isinstance(details, dict) and details.get('errors')
-            ]
-            failed_categories = sorted(
-                {
-                    *collection_failed_categories,
-                    *(preflight.get('failed_categories') or []),
-                }
-            )
             category_row_counts = {
                 category: int((details or {}).get('rows_persisted') or 0)
                 for category, details in category_results.items()
@@ -1578,6 +1599,17 @@ def run_market_data_pipeline(
                 and isinstance(pykrx_enrichment_result.get('coverage', {}).get('categories'), dict)
                 else {}
             )
+            category_classification = _classify_pykrx_enrichment_categories(
+                category_results=category_results,
+                coverage_categories=coverage_categories,
+                preflight_failed_categories=preflight.get('failed_categories') or [],
+            )
+            provider_error_categories = category_classification['provider_error_categories']
+            recovered_categories = category_classification['recovered_categories']
+            failed_categories = category_classification['unresolved_categories']
+            pykrx_enrichment_result['provider_error_categories'] = provider_error_categories
+            pykrx_enrichment_result['recovered_categories'] = recovered_categories
+            pykrx_enrichment_result['unresolved_categories'] = failed_categories
             blocking_failed_categories: list[str] = []
             tolerated_failed_categories: list[str] = []
             for category in failed_categories:
@@ -1600,9 +1632,7 @@ def run_market_data_pipeline(
                     blocking_failed_categories.append(category)
             stage_status = (
                 'completed'
-                if pykrx_enrichment_result.get('status') == 'completed'
-                and preflight.get('allowed')
-                and not failed_categories
+                if preflight.get('allowed') and not failed_categories
                 else 'partial'
             )
             enrichment_failed_count = len(failed_categories)
@@ -1635,6 +1665,8 @@ def run_market_data_pipeline(
                     'categories_requested': pykrx_enrichment_result.get('categories_requested'),
                     'category_row_counts': category_row_counts,
                     'failed_categories': failed_categories,
+                    'provider_error_categories': provider_error_categories,
+                    'recovered_categories': recovered_categories,
                     'blocking_failed_categories': blocking_failed_categories,
                     'tolerated_failed_categories': tolerated_failed_categories,
                     'minor_missing_gap_policy': {
@@ -1653,6 +1685,8 @@ def run_market_data_pipeline(
                 categories_requested=pykrx_enrichment_result.get('categories_requested'),
                 category_row_counts=category_row_counts,
                 failed_categories=failed_categories,
+                provider_error_categories=provider_error_categories,
+                recovered_categories=recovered_categories,
                 blocking_failed_categories=blocking_failed_categories,
                 tolerated_failed_categories=tolerated_failed_categories,
                 downstream_preflight_status=preflight.get('status'),
