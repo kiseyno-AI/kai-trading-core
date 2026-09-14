@@ -798,7 +798,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['official_run']['id'], 501)
         stage = result['stages']['market_risk_filter']
         self.assertEqual(stage['status'], 'running')
-        self.assertEqual(stage['order'], 9)
+        self.assertEqual(stage['order'], 8)
         self.assertEqual(stage['group'], 'market_data')
         self.assertEqual(stage['details']['progress_source'], 'official_run')
         self.assertEqual(stage['processed'], 7)
@@ -1625,7 +1625,6 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'technical_snapshots',
                 'action_summaries',
                 'trending_ranks',
-                'signal_features',
                 'market_risk_filter',
                 'fundamentals_daily_refresh',
                 'piotroski_filter',
@@ -1637,6 +1636,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'unified_value_factors',
                 'quality_factors',
                 'composite_factors',
+                'signal_features',
                 'external_news_collect',
                 'external_news_enrich',
                 'macro_context_refresh',
@@ -2566,15 +2566,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['signal_decider_evaluations']['status'], 'completed')
         pykrx_stage = result['stages']['pykrx_enrichment']
         self.assertEqual(pykrx_stage['status'], 'completed')
-        self.assertEqual(pykrx_stage['gate_status'], 'ready')
-        self.assertEqual(pykrx_stage['details']['decider_category_gate_status'], 'ready')
-        self.assertEqual(result['gate_summary']['status'], 'ready')
-        self.assertEqual(result['gate_summary']['blocked_stage_ids'], [])
-        warning_categories = pykrx_stage['details']['decider_warning_categories']
-        self.assertIn('sector_classification', {item['category'] for item in warning_categories})
+        self.assertEqual(pykrx_stage['gate_status'], 'blocked')
+        self.assertEqual(pykrx_stage['details']['decider_category_gate_status'], 'blocked')
+        self.assertEqual(result['gate_summary']['status'], 'blocked')
+        self.assertEqual(result['gate_summary']['blocked_stage_ids'], ['pykrx_enrichment'])
+        blocking_categories = pykrx_stage['details']['decider_blocking_categories']
+        self.assertIn('sector_classification', {item['category'] for item in blocking_categories})
         self.assertEqual(
-            warning_categories[0]['reason'],
-            'required_pykrx_enrichment_category_near_complete',
+            blocking_categories[0]['reason'],
+            'incomplete_required_pykrx_enrichment_category',
         )
 
     def test_read_preserves_incomplete_official_history_for_persisted_output_stage(self):

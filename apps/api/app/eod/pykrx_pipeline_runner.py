@@ -4,8 +4,10 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Callable, Sequence
 
+from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
@@ -17,7 +19,12 @@ from app.eod.pykrx_pipeline_support import (
     build_stage_failure_result,
     make_stage_progress_callback,
 )
-from app.eod.run_stage_support import extract_next_open_plan_stage_counts
+from app.eod.run_stage_support import (
+    build_expired_decision_replay_result,
+    build_next_open_window_expired_result,
+    extract_next_open_plan_stage_counts,
+)
+from app.market.clock import get_market_state
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
 logger = logging.getLogger(__name__)
@@ -53,7 +60,9 @@ FACTOR_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
 )
 AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'fundamentals_daily_refresh',
+    'piotroski_filter',
     *FACTOR_FOLLOWUP_STAGE_ORDER,
+    'signal_features',
     'external_news_collect',
     'external_news_enrich',
     'macro_context_refresh',
@@ -68,12 +77,77 @@ AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
     'technical_snapshots',
     'action_summaries',
     'trending_ranks',
-    'signal_features',
     'market_risk_filter',
     *AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
 )
 MAX_NON_BLOCKING_STAGE_MISSING_RATIO = 0.10
 PYKRX_PROVIDER_OUTAGE_EARLY_ABORT_FAILURES = 20
+POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS: frozenset[str] = frozenset(
+    {
+        'master_refresh',
+        'pykrx_universe_refresh',
+        'signal_features',
+        'market_risk_snapshots',
+        'market_risk_filter',
+        'fundamentals_daily_refresh',
+        'external_news_collect',
+        'external_news_enrich',
+        'macro_context_refresh',
+        'intraday_snapshots',
+    }
+)
+POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS: frozenset[str] = frozenset(
+    {
+        'auto_close',
+        'auto_close_scheduler',
+        'auto_eod_followup_resume',
+        'internal_ops_cli',
+        'internal_ops_cli_stage',
+        'manual_api',
+        'manual_api_stage',
+        'manual_daily_api',
+    }
+)
+
+
+def resolve_point_in_time_recovery(
+    *,
+    market_date: str,
+    requested: bool = False,
+    recovery_context: bool = False,
+    market: Any | None = None,
+    current_market_date: date | str | None = None,
+) -> bool:
+    """Fail closed when a daily boundary is asked to write a prior KRX date."""
+
+    if requested:
+        return True
+    if not recovery_context:
+        return False
+    if current_market_date is None:
+        resolved_market = market if market is not None else get_market_state()
+        current_market_date = str(resolved_market.server_time)[:10]
+    else:
+        current_market_date = str(current_market_date)[:10]
+    return date.fromisoformat(market_date) < date.fromisoformat(
+        current_market_date
+    )
+
+
+def _build_point_in_time_current_only_skip(
+    *,
+    stage_id: str,
+    market_date: str,
+) -> dict[str, Any]:
+    return {
+        'triggered': False,
+        'skipped': True,
+        'safe_skip': True,
+        'status': 'skipped',
+        'reason': 'point_in_time_recovery_current_only_stage',
+        'market_date': market_date,
+        'stage': stage_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -130,6 +204,44 @@ def _missing_ratio(*, failed: int, total: int) -> float | None:
     if total <= 0:
         return None
     return max(failed, 0) / total
+
+
+def _merge_inherited_downstream_scope(
+    *,
+    requested_symbols: Sequence[str],
+    inherited_symbols: Sequence[str],
+    current_price_failure_symbols: Sequence[str],
+    current_failure_symbols: Sequence[str],
+    preserve_deferred_followup_scope: bool,
+) -> tuple[list[str], list[str]]:
+    requested_symbol_set = set(requested_symbols)
+    pending_inherited_symbols = [
+        symbol
+        for symbol in dict.fromkeys(inherited_symbols)
+        if symbol not in requested_symbol_set
+    ]
+    if not pending_inherited_symbols and not current_failure_symbols:
+        return [], []
+
+    price_failure_symbol_set = set(current_price_failure_symbols)
+    newly_collected_symbols = (
+        [
+            symbol
+            for symbol in dict.fromkeys(requested_symbols)
+            if symbol not in price_failure_symbol_set
+        ]
+        if preserve_deferred_followup_scope
+        else []
+    )
+    return pending_inherited_symbols, list(
+        dict.fromkeys(
+            [
+                *pending_inherited_symbols,
+                *newly_collected_symbols,
+                *current_failure_symbols,
+            ]
+        )
+    )
 
 
 def _is_non_blocking_gap(*, failed: int, total: int) -> bool:
@@ -235,6 +347,8 @@ def _consume_retry_failed_symbols(result: dict[str, Any]) -> list[str]:
 
 
 def _resolve_result_status(result: dict[str, Any]) -> str:
+    if result.get('safe_skip') is True:
+        return 'completed'
     if result.get('triggered') is False:
         if _is_already_completed_followup_result(result):
             return 'completed'
@@ -265,14 +379,25 @@ def _is_already_completed_followup_result(result: dict[str, Any]) -> bool:
         return False
     if str(result.get('reason') or '').strip().lower() != 'already_completed':
         return False
-    existing_run = result.get('existing_run') if isinstance(result.get('existing_run'), dict) else {}
-    existing_status = str(existing_run.get('status') or result.get('status') or '').strip().lower()
-    return existing_status in {'completed', 'partial', 'completed_with_errors'}
+    existing_run = (
+        result.get('existing_run')
+        if isinstance(result.get('existing_run'), dict)
+        else {}
+    )
+    existing_status = str(existing_run.get('status') or '').strip().lower()
+    return existing_status == 'completed'
 
 
-def _is_satisfied_followup_result(result: dict[str, Any]) -> bool:
-    status = _resolve_result_status(result)
-    return status in {'completed', 'partial'}
+def _is_satisfied_followup_result(
+    result: dict[str, Any],
+    *,
+    stage_id: str | None = None,
+) -> bool:
+    outcome = dict(result)
+    outcome['status'] = _resolve_result_status(result)
+    if stage_id:
+        outcome['stage'] = stage_id
+    return daily_pipeline_outcome_is_satisfied(outcome)
 
 
 def _extract_result_counts(result: dict[str, Any], *, default_total: int = 0) -> dict[str, int]:
@@ -510,6 +635,35 @@ class _OfficialDailyPipelineTracker:
                 error_message=str(exc),
             )
 
+    def link_eod_run(self, eod_run_id: int) -> None:
+        self.eod_run_id = int(eod_run_id)
+        if (
+            not self.enabled
+            or self.service is None
+            or self.pipeline_run_id is None
+        ):
+            return
+        try:
+            self.service.link_eod_run(
+                pipeline_run_id=self.pipeline_run_id,
+                eod_run_id=self.eod_run_id,
+            )
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            logger.warning(
+                'daily pipeline EOD link failed for provider run %s: %s',
+                self.eod_run_id,
+                exc,
+            )
+            self.log_fetch(
+                'daily_pipeline_tracking',
+                'failed',
+                stage='link_eod_run',
+                run_id=self.eod_run_id,
+                pipeline_run_id=self.pipeline_run_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+
     def finish_run(self, *, status: str | None = None, error_message: str | None = None) -> None:
         if not self.enabled or self.service is None or self.pipeline_run_id is None:
             return
@@ -552,6 +706,17 @@ class _OfficialDailyPipelineTracker:
         if statuses <= {'completed', 'skipped'}:
             return 'completed'
         return 'partial'
+
+
+def _run_daily_piotroski_filter_followup(
+    *,
+    market_date: str,
+) -> dict[str, Any]:
+    from app.signals.piotroski_filter import daily_piotroski_filter_service
+
+    return daily_piotroski_filter_service.rebuild_for_market_date(
+        market_date=market_date,
+    )
 
 
 def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
@@ -804,6 +969,7 @@ def _run_daily_feedback_followup(
     from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
 
     return _run_daily_agent_feedback_followup(
+        stage_id='agent_feedback_summaries',
         market_date=market_date,
         enabled=enabled,
         roles=SUMMARIZER_AGENT_NAMES,
@@ -822,6 +988,7 @@ def _run_daily_signal_decider_followup(
     from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
 
     return _run_daily_agent_feedback_followup(
+        stage_id='signal_decider',
         market_date=market_date,
         enabled=enabled,
         roles=DECISION_SUPPORT_AGENT_NAMES,
@@ -842,6 +1009,12 @@ def _run_daily_next_open_execution_plan_followup(*, market_date: str, enabled: b
 
     from app.orders.next_open_execution import signal_decider_next_open_execution_service
 
+    expired_result = build_next_open_window_expired_result(
+        market_date=market_date,
+        market=get_market_state(),
+    )
+    if expired_result is not None:
+        return expired_result
     target_trade_date = (date.fromisoformat(market_date) + timedelta(days=1)).isoformat()
     return signal_decider_next_open_execution_service.refresh_plan_items(
         target_trade_date=target_trade_date,
@@ -851,6 +1024,7 @@ def _run_daily_next_open_execution_plan_followup(*, market_date: str, enabled: b
 
 def _run_daily_agent_feedback_followup(
     *,
+    stage_id: str,
     market_date: str,
     enabled: bool,
     roles: tuple[str, ...],
@@ -863,6 +1037,14 @@ def _run_daily_agent_feedback_followup(
             'reason': 'followup_disabled',
             'market_date': market_date,
         }
+
+    expired_result = build_expired_decision_replay_result(
+        stage_id=stage_id,
+        market_date=market_date,
+        market=get_market_state(),
+    )
+    if expired_result is not None:
+        return expired_result
 
     from datetime import date, datetime, timezone
 
@@ -904,6 +1086,16 @@ def _run_daily_agent_feedback_followup(
         ),
         bypass_prerequisite_gate=bypass_prerequisite_gate,
     )
+    expired_after_completion = build_expired_decision_replay_result(
+        stage_id=stage_id,
+        market_date=market_date,
+        market=get_market_state(),
+    )
+    if expired_after_completion is not None:
+        return {
+            **expired_after_completion,
+            'completed_after_action_window': True,
+        }
     return {
         'triggered': True,
         'prerequisite_gate_bypassed': bypass_prerequisite_gate,
@@ -919,11 +1111,19 @@ def _run_daily_signal_decider_evaluation_followup(*, market_date: str, enabled: 
             'market_date': market_date,
         }
 
+    expired_result = build_expired_decision_replay_result(
+        stage_id='signal_decider_evaluations',
+        market_date=market_date,
+        market=get_market_state(),
+    )
+    if expired_result is not None:
+        return expired_result
+
     from app.agent_context.signal_decider_evaluation_maintenance_service import (
         signal_decider_evaluation_maintenance_service,
     )
 
-    return signal_decider_evaluation_maintenance_service.refresh_recent_coverage(
+    result = signal_decider_evaluation_maintenance_service.refresh_recent_coverage(
         as_of_market_date=market_date,
         refresh_calendar=True,
         # Cover the longest 10-session outcome horizon plus weekends/holidays
@@ -931,6 +1131,17 @@ def _run_daily_signal_decider_evaluation_followup(*, market_date: str, enabled: 
         calendar_lookback_days=21,
         trigger='eod_pykrx_followup',
     )
+    expired_after_completion = build_expired_decision_replay_result(
+        stage_id='signal_decider_evaluations',
+        market_date=market_date,
+        market=get_market_state(),
+    )
+    if expired_after_completion is not None:
+        return {
+            **expired_after_completion,
+            'completed_after_action_window': True,
+        }
+    return result
 
 
 def run_market_data_pipeline(
@@ -950,15 +1161,26 @@ def run_market_data_pipeline(
     selected_stages: Sequence[str] | None = None,
     chain_fundamentals_followup: bool = True,
     track_daily_pipeline: bool = False,
+    point_in_time_recovery: bool = False,
 ) -> dict:
     normalized_start = dependencies.normalize_yyyymmdd(start_date)
     normalized_end = dependencies.normalize_yyyymmdd(end_date)
     historical_backfill = mode == 'historical_backfill'
+    # Production entry points resolve prior-date recovery before reaching this
+    # low-level runner. Keeping this boundary explicit avoids making direct
+    # fixture/simulation calls depend on the process wall clock.
+    point_in_time_recovery = bool(point_in_time_recovery)
+    point_in_time_scope = historical_backfill or point_in_time_recovery
     resolved_selected_stages = _resolve_requested_stages(
         mode=mode,
         selected_stages=selected_stages,
     )
     requested_stage_set = set(resolved_selected_stages)
+    if mode == 'daily_auto' and chain_fundamentals_followup:
+        # Signal features consume same-day factor tables. Treat the requested
+        # stage as a chained follow-up so it is written once, after factors,
+        # instead of persisting a stale pre-factor snapshot first.
+        requested_stage_set.discard('signal_features')
     if historical_backfill and symbols_override is not None:
         raise ValueError(
             'symbols_override is not allowed for historical_backfill; '
@@ -993,21 +1215,34 @@ def run_market_data_pipeline(
     # ``refresh_universe=False`` is safe for current daily jobs, but loading the
     # active table here would introduce survivorship bias into a backfill.
     effective_refresh_universe = (
-        (refresh_universe or historical_backfill) and symbols_override is None
+        (refresh_universe or point_in_time_scope) and symbols_override is None
     )
     if symbols_override is not None:
-        universe_snapshot = None
+        inherited_point_in_time_snapshot = (
+            (retry_context or {}).get('point_in_time_universe_snapshot')
+            if point_in_time_recovery
+            and isinstance(
+                (retry_context or {}).get('point_in_time_universe_snapshot'),
+                dict,
+            )
+            else None
+        )
+        universe_snapshot = (
+            dict(inherited_point_in_time_snapshot)
+            if inherited_point_in_time_snapshot is not None
+            else None
+        )
         symbols = list(symbols_override)
     elif effective_refresh_universe:
         snapshot = service.fetch_recent_universe_snapshot(
             markets=markets,
             # A requested symbol may sort beyond a caller-provided global cap;
             # inspect the complete point-in-time membership before filtering it.
-            limit=None if historical_backfill and symbol else limit,
+            limit=None if point_in_time_scope and symbol else limit,
             end_date=normalized_end,
             # KIS master files represent the current listing set. Using them for
             # a historical cross-section silently introduces survivorship bias.
-            allow_master_fallback=mode != 'historical_backfill',
+            allow_master_fallback=not point_in_time_scope,
         )
         if not snapshot.get('complete', True):
             unavailable_markets = ','.join(snapshot.get('unavailable_markets') or [])
@@ -1016,13 +1251,27 @@ def run_market_data_pipeline(
                 f'{unavailable_markets or "unknown"}.'
             )
         symbols = snapshot['symbols']
-        historical_snapshot = historical_backfill
+        historical_snapshot = point_in_time_scope
         deactivate_missing = not historical_snapshot and limit is None and symbol is None
         persisted = (
             0
             if historical_snapshot
             else service._persist_universe(symbols, deactivate_missing=deactivate_missing)
         )
+        market_membership = build_market_membership_snapshot(
+            symbols=symbols,
+            markets=markets,
+        )
+        if historical_snapshot:
+            market_membership['symbol_metadata'] = [
+                {
+                    'symbol': item.symbol,
+                    'market': item.market,
+                    'name_ko': item.name_ko,
+                    'standard_code': item.standard_code,
+                }
+                for item in symbols
+            ]
         universe_snapshot = {
             'source': 'pykrx',
             'markets': list(markets),
@@ -1040,10 +1289,7 @@ def run_market_data_pipeline(
             'point_in_time': historical_snapshot,
             'current_universe_mutated': not historical_snapshot,
             'forced_for_point_in_time': historical_snapshot and not refresh_universe,
-            'market_membership': build_market_membership_snapshot(
-                symbols=symbols,
-                markets=markets,
-            ),
+            'market_membership': market_membership,
         }
     else:
         universe_snapshot = None
@@ -1051,7 +1297,7 @@ def run_market_data_pipeline(
 
     if symbol:
         symbols = [item for item in symbols if item.symbol == symbol]
-        if not symbols and not historical_backfill:
+        if not symbols and not point_in_time_scope:
             matched = service.find_symbol(symbol, markets=markets)
             if matched is not None:
                 symbols = [matched]
@@ -1060,9 +1306,34 @@ def run_market_data_pipeline(
 
     latest_trade_date = service.resolve_latest_trade_date(end_date=normalized_end)
     requested_symbol_codes = [item.symbol for item in symbols]
+    inherited_downstream_symbols = list(
+        dict.fromkeys(
+            str(symbol).strip()
+            for symbol in (
+                (retry_context or {}).get(
+                    'inherited_downstream_retry_symbols'
+                )
+                or []
+            )
+            if str(symbol).strip()
+        )
+    )
+    inherited_downstream_resume_from_stage = str(
+        (retry_context or {}).get(
+            'inherited_downstream_retry_resume_from_stage'
+        )
+        or ''
+    ).strip()
+    if inherited_downstream_resume_from_stage not in {
+        stage_id
+        for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+        if stage_id != 'price_collection'
+    }:
+        inherited_downstream_resume_from_stage = ''
     unattempted_symbols = list(requested_symbol_codes)
     run_metadata = {
         'mode': mode,
+        'point_in_time_recovery': point_in_time_recovery,
         'requested_start_date': normalized_start,
         'requested_end_date': normalized_end,
         'latest_available_trade_date': latest_trade_date,
@@ -1081,6 +1352,25 @@ def run_market_data_pipeline(
     }
     if retry_context is not None:
         run_metadata['retry'] = retry_context
+    if inherited_downstream_symbols:
+        run_metadata['inherited_downstream_retry_symbols'] = (
+            inherited_downstream_symbols
+        )
+        run_metadata['inherited_downstream_retry_symbols_count'] = len(
+            inherited_downstream_symbols
+        )
+        # Canonical scope must exist from EOD creation onward so every early
+        # failure path carries it into the next scheduler attempt.
+        run_metadata['downstream_retry_symbols'] = (
+            inherited_downstream_symbols
+        )
+        run_metadata['downstream_retry_symbols_count'] = len(
+            inherited_downstream_symbols
+        )
+        if inherited_downstream_resume_from_stage:
+            run_metadata['downstream_retry_resume_from_stage'] = (
+                inherited_downstream_resume_from_stage
+            )
     first_symbol = symbols[0].symbol if symbols else None
     run_metadata = dependencies.update_run_stage_metadata(
         run_metadata,
@@ -1103,6 +1393,10 @@ def run_market_data_pipeline(
         selected_stages=resolved_selected_stages,
         chain_fundamentals_followup=chain_fundamentals_followup,
     )
+    # Keep the intended stage contract on the EOD row itself. The official
+    # tracker is fail-open, so this is the durable evidence used to detect a
+    # restart between EOD finalization and the first follow-up checkpoint.
+    run_metadata['expected_daily_pipeline_stages'] = list(tracked_stages)
     daily_pipeline_tracker = _OfficialDailyPipelineTracker(
         service=dependencies.daily_pipeline_run_state_service if track_daily_pipeline else None,
         log_fetch=dependencies.log_fetch,
@@ -1137,6 +1431,11 @@ def run_market_data_pipeline(
             'pipeline_run': pipeline_admission,
         }
 
+    if daily_pipeline_tracker.pipeline_run_id is not None:
+        run_metadata['daily_pipeline_run_id'] = (
+            daily_pipeline_tracker.pipeline_run_id
+        )
+
     try:
         run_id = dependencies.create_eod_collection_run(
             market='KRX',
@@ -1149,7 +1448,7 @@ def run_market_data_pipeline(
     except Exception as exc:
         daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
         raise
-    daily_pipeline_tracker.eod_run_id = run_id
+    daily_pipeline_tracker.link_eod_run(run_id)
 
     symbols_succeeded = 0
     symbols_failed = 0
@@ -1275,7 +1574,7 @@ def run_market_data_pipeline(
                     run_id=run_id,
                     name_ko=item.name_ko,
                     standard_code=item.standard_code,
-                    update_current_symbol_state=not historical_backfill,
+                    update_current_symbol_state=not point_in_time_scope,
                 )
                 bars_upserted += persisted_count
                 symbols_succeeded += 1
@@ -1506,7 +1805,7 @@ def run_market_data_pipeline(
     )
     price_context_result: dict
     price_context_error_message: str | None = None
-    if mode != 'daily_stage_run' and price_context_symbols:
+    if price_context_symbols:
         try:
             price_context_result = dependencies.price_context_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
@@ -1534,7 +1833,7 @@ def run_market_data_pipeline(
                 'failed_symbols': list(price_context_symbols),
             }
             price_context_error_message = f'Price context persistence failed: {exc}'
-    elif mode != 'daily_stage_run':
+    else:
         price_context_result = {
             'skipped': True,
             'status': 'skipped',
@@ -1545,13 +1844,6 @@ def run_market_data_pipeline(
             'contexts_persisted': 0,
             'contexts_failed': 0,
             **causal_price_skip,
-        }
-    else:
-        price_context_result = {
-            'skipped': True,
-            'reason': 'stage_orchestrator_skipped_implicit_price_contexts',
-            'market_date': latest_trade_date,
-            'source': 'pykrx',
         }
 
     pykrx_enrichment_result: dict
@@ -1572,10 +1864,15 @@ def run_market_data_pipeline(
                     'required_downstream_categories': list(REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES),
                 },
             )
+            enrichment_kwargs: dict[str, Any] = {
+                'market_date': latest_trade_date,
+                'markets': markets,
+                'symbols': [item.symbol for item in symbols],
+            }
+            if point_in_time_recovery:
+                enrichment_kwargs['point_in_time_recovery'] = True
             pykrx_enrichment_result = dependencies.pykrx_enrichment_service.collect_for_market_date(
-                market_date=latest_trade_date,
-                markets=markets,
-                symbols=[item.symbol for item in symbols],
+                **enrichment_kwargs
             )
             preflight = build_pykrx_enrichment_preflight(
                 market_date=latest_trade_date,
@@ -2009,7 +2306,23 @@ def run_market_data_pipeline(
 
     signal_feature_result: dict
     signal_feature_error_message: str | None = None
-    if 'signal_features' in requested_stage_set:
+    if point_in_time_recovery and 'signal_features' in requested_stage_set:
+        signal_feature_result = _build_point_in_time_current_only_skip(
+            stage_id='signal_features',
+            market_date=latest_trade_date,
+        )
+        persist_stage_progress(
+            stage='signal_features',
+            status='completed',
+            current_step='signal_features_safety_skipped',
+            current_activity='Skipped current-only KIS rankings during point-in-time recovery',
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=0,
+            extra={'result_summary': signal_feature_result},
+        )
+    elif 'signal_features' in requested_stage_set:
         try:
             persist_stage_progress(
                 stage='signal_features',
@@ -2104,7 +2417,23 @@ def run_market_data_pipeline(
 
     market_risk_filter_result: dict
     market_risk_filter_error_message: str | None = None
-    if 'market_risk_filter' in requested_stage_set:
+    if point_in_time_recovery and 'market_risk_filter' in requested_stage_set:
+        market_risk_filter_result = _build_point_in_time_current_only_skip(
+            stage_id='market_risk_filter',
+            market_date=latest_trade_date,
+        )
+        persist_stage_progress(
+            stage='market_risk_filter',
+            status='completed',
+            current_step='market_risk_filter_safety_skipped',
+            current_activity='Skipped current-only KIS risk data during point-in-time recovery',
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=0,
+            extra={'result_summary': market_risk_filter_result},
+        )
+    elif 'market_risk_filter' in requested_stage_set:
         try:
             persist_stage_progress(
                 stage='market_risk_filter',
@@ -2179,26 +2508,77 @@ def run_market_data_pipeline(
             'source': MARKET_RISK_FILTER_SOURCE,
         }
 
+    downstream_failures_by_stage: dict[str, set[str]] = {}
+    for failed_stage_id, stage_result in (
+        ('pykrx_enrichment', pykrx_enrichment_result),
+        ('technical_snapshots', price_context_result),
+        ('technical_snapshots', technical_snapshot_result),
+        ('action_summaries', action_summary_result),
+        ('trending_ranks', trending_rank_result),
+        ('market_risk_filter', market_risk_filter_result),
+        ('signal_features', signal_feature_result),
+    ):
+        stage_failed_symbols = _consume_retry_failed_symbols(stage_result)
+        if stage_failed_symbols:
+            downstream_failures_by_stage.setdefault(
+                failed_stage_id,
+                set(),
+            ).update(stage_failed_symbols)
     downstream_failed_symbols = {
         failed_symbol
-        for stage_result in (
-            price_context_result,
-            pykrx_enrichment_result,
-            technical_snapshot_result,
-            action_summary_result,
-            trending_rank_result,
-            signal_feature_result,
-            market_risk_filter_result,
-        )
-        for failed_symbol in _consume_retry_failed_symbols(stage_result)
+        for stage_failed_symbols in downstream_failures_by_stage.values()
+        for failed_symbol in stage_failed_symbols
     }
     price_retry_symbol_codes = list(dict.fromkeys(failed_symbols))
     price_retry_symbol_set = set(price_retry_symbol_codes)
-    downstream_retry_symbol_codes = [
+    current_downstream_retry_symbol_codes = [
         code
         for code in requested_symbol_codes
         if code in downstream_failed_symbols and code not in price_retry_symbol_set
     ]
+    (
+        pending_inherited_downstream_symbols,
+        downstream_retry_symbol_codes,
+    ) = _merge_inherited_downstream_scope(
+        requested_symbols=requested_symbol_codes,
+        inherited_symbols=inherited_downstream_symbols,
+        current_price_failure_symbols=price_retry_symbol_codes,
+        current_failure_symbols=current_downstream_retry_symbol_codes,
+        preserve_deferred_followup_scope=bool(
+            chain_fundamentals_followup and mode == 'daily_auto'
+        ),
+    )
+    run_metadata['inherited_downstream_retry_symbols'] = (
+        pending_inherited_downstream_symbols
+    )
+    run_metadata['inherited_downstream_retry_symbols_count'] = len(
+        pending_inherited_downstream_symbols
+    )
+    downstream_resume_candidates: list[str] = []
+    if (
+        pending_inherited_downstream_symbols
+        and inherited_downstream_resume_from_stage
+    ):
+        downstream_resume_candidates.append(
+            inherited_downstream_resume_from_stage
+        )
+    current_downstream_retry_symbol_set = set(
+        current_downstream_retry_symbol_codes
+    )
+    downstream_resume_candidates.extend(
+        stage_id
+        for stage_id, stage_failed_symbols in downstream_failures_by_stage.items()
+        if current_downstream_retry_symbol_set.intersection(
+            stage_failed_symbols
+        )
+    )
+    if downstream_retry_symbol_codes and downstream_resume_candidates:
+        run_metadata['downstream_retry_resume_from_stage'] = min(
+            downstream_resume_candidates,
+            key=AUTO_DAILY_TRACKED_STAGE_ORDER.index,
+        )
+    elif not downstream_retry_symbol_codes:
+        run_metadata.pop('downstream_retry_resume_from_stage', None)
     retry_symbol_codes = list(
         dict.fromkeys(
             [*price_retry_symbol_codes, *downstream_retry_symbol_codes]
@@ -2251,6 +2631,11 @@ def run_market_data_pipeline(
         incomplete_prefix='Market risk filter persistence incomplete for symbols: ',
         total_keys=('matched_symbols', 'matched_symbol_count', 'requested_symbol_count', 'results_persisted'),
     )
+    if pending_inherited_downstream_symbols:
+        run_errors.append(
+            'Inherited downstream recovery remains pending for '
+            f'{len(pending_inherited_downstream_symbols)} symbols.'
+        )
 
     status = 'completed' if not run_errors else 'completed_with_errors'
     # Only collection failures belong in the full-pipeline retry scope.  A
@@ -2445,6 +2830,8 @@ def run_market_data_pipeline(
                     'reason': 'factor_followup_missing_stage_result',
                     'market_date': factor_result.get('market_date'),
                 }
+            elif not raw_stage_result:
+                raw_stage_result = factor_result
             counts = _extract_result_counts(nested_result, default_total=0)
             if stage_status == 'failed' and counts['failed'] <= 0:
                 counts['failed'] = 1
@@ -2485,6 +2872,32 @@ def run_market_data_pipeline(
         record_factor_followup_result(factor_result)
         return factor_result
 
+    def collect_post_factor_signal_features() -> dict[str, Any]:
+        stage_result = dict(
+            asyncio.run(
+                dependencies.signal_feature_service.refresh_for_market_date(
+                    market_date=latest_trade_date,
+                    include_retry_metadata=True,
+                )
+            )
+        )
+        source_errors = stage_result.get('source_errors')
+        if source_errors:
+            stage_result['status'] = 'partial'
+            stage_result.setdefault(
+                'reason',
+                'signal_feature_sources_incomplete',
+            )
+        return stage_result
+
+    def run_signal_feature_followup() -> dict[str, Any]:
+        return run_followup_stage(
+            'signal_features',
+            activity='Collecting post-factor daily KIS signal features',
+            call=collect_post_factor_signal_features,
+            default_total=len(requested_symbol_codes),
+        )
+
     dart_auto_followup_enabled = bool((dependencies.settings.dart_api_key or '').strip())
     should_chain_fundamentals = (
         chain_fundamentals_followup
@@ -2493,8 +2906,291 @@ def run_market_data_pipeline(
         and mode == 'daily_auto'
         and status in {'completed', 'completed_with_errors'}
     )
+    should_defer_daily_followups = (
+        chain_fundamentals_followup
+        and mode == 'daily_auto'
+        and status in {'completed', 'completed_with_errors'}
+        and bool(downstream_retry_symbol_codes)
+    )
+    downstream_recovery_pending_reason = (
+        'inherited_downstream_recovery_pending'
+        if pending_inherited_downstream_symbols
+        else 'downstream_recovery_pending'
+    )
+
+    def build_downstream_recovery_pending_result(
+        stage_id: str,
+    ) -> dict[str, Any]:
+        stage_result = build_blocked_followup_result(
+            stage_id,
+            downstream_recovery_pending_reason,
+            upstream_status=status,
+        )
+        stage_result['pending_symbols_count'] = len(
+            downstream_retry_symbol_codes
+        )
+        stage_result['pending_symbols'] = downstream_retry_symbol_codes[:50]
+        return stage_result
+
     try:
-        if should_chain_fundamentals:
+        if should_defer_daily_followups:
+            result['fundamentals_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'fundamentals_daily_refresh'
+                )
+            )
+            record_followup_result(
+                'fundamentals_daily_refresh',
+                result['fundamentals_followup'],
+            )
+            result['piotroski_filter_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'piotroski_filter'
+                )
+            )
+            record_followup_result(
+                'piotroski_filter',
+                result['piotroski_filter_followup'],
+            )
+            result['factor_scoring_followup'] = (
+                build_downstream_recovery_pending_result('momentum_factors')
+            )
+            record_factor_followup_result(result['factor_scoring_followup'])
+            result['signal_feature_followup'] = (
+                build_downstream_recovery_pending_result('signal_features')
+            )
+            record_followup_result(
+                'signal_features',
+                result['signal_feature_followup'],
+            )
+            result['signal_features'] = result['signal_feature_followup']
+            result['external_news_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'external_news_collect'
+                )
+            )
+            record_followup_result(
+                'external_news_collect',
+                result['external_news_followup'],
+            )
+            result['external_news_enrichment_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'external_news_enrich'
+                )
+            )
+            record_followup_result(
+                'external_news_enrich',
+                result['external_news_enrichment_followup'],
+            )
+            result['macro_context_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'macro_context_refresh'
+                )
+            )
+            record_followup_result(
+                'macro_context_refresh',
+                result['macro_context_followup'],
+            )
+            result['intraday_snapshot_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'intraday_snapshots'
+                )
+            )
+            result['feedback_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'agent_feedback_summaries'
+                )
+            )
+            record_followup_result(
+                'agent_feedback_summaries',
+                result['feedback_followup'],
+            )
+            result['signal_decider_followup'] = (
+                build_downstream_recovery_pending_result('signal_decider')
+            )
+            record_followup_result(
+                'signal_decider',
+                result['signal_decider_followup'],
+            )
+            result['next_open_execution_plan_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'next_open_execution_plan'
+                )
+            )
+            record_followup_result(
+                'next_open_execution_plan',
+                result['next_open_execution_plan_followup'],
+            )
+            result['signal_decider_evaluation_followup'] = (
+                build_downstream_recovery_pending_result(
+                    'signal_decider_evaluations'
+                )
+            )
+            record_followup_result(
+                'signal_decider_evaluations',
+                result['signal_decider_evaluation_followup'],
+            )
+        elif (
+            point_in_time_recovery
+            and chain_fundamentals_followup
+            and mode == 'daily_auto'
+            and status in {'completed', 'completed_with_errors'}
+        ):
+            for result_key, stage_id in (
+                ('fundamentals_followup', 'fundamentals_daily_refresh'),
+                ('signal_feature_followup', 'signal_features'),
+                ('external_news_followup', 'external_news_collect'),
+                ('external_news_enrichment_followup', 'external_news_enrich'),
+                ('macro_context_followup', 'macro_context_refresh'),
+            ):
+                stage_result = _build_point_in_time_current_only_skip(
+                    stage_id=stage_id,
+                    market_date=latest_trade_date,
+                )
+                result[result_key] = stage_result
+                record_followup_result(stage_id, stage_result)
+            result['signal_features'] = result['signal_feature_followup']
+            result['intraday_snapshot_followup'] = (
+                _build_point_in_time_current_only_skip(
+                    stage_id='intraday_snapshots',
+                    market_date=latest_trade_date,
+                )
+            )
+
+            try:
+                result['piotroski_filter_followup'] = run_followup_stage(
+                    'piotroski_filter',
+                    activity=(
+                        'Rebuilding as-of Piotroski filter for '
+                        'point-in-time recovery'
+                    ),
+                    call=lambda: _run_daily_piotroski_filter_followup(
+                        market_date=latest_trade_date,
+                    ),
+                    default_total=len(requested_symbol_codes),
+                )
+            except Exception as exc:
+                result['piotroski_filter_followup'] = {
+                    'triggered': True,
+                    'status': 'failed',
+                    'reason': 'piotroski_filter_failed',
+                    'market_date': latest_trade_date,
+                    'error_type': type(exc).__name__,
+                    'error_message': str(exc),
+                }
+            if _is_satisfied_followup_result(
+                result['piotroski_filter_followup'],
+                stage_id='piotroski_filter',
+            ):
+                result['factor_scoring_followup'] = run_factor_followup()
+            else:
+                result['factor_scoring_followup'] = (
+                    build_blocked_followup_result(
+                        'momentum_factors',
+                        'piotroski_filter_incomplete',
+                        upstream_status=_resolve_result_status(
+                            result['piotroski_filter_followup']
+                        ),
+                    )
+                )
+                record_factor_followup_result(
+                    result['factor_scoring_followup']
+                )
+
+            feedback_ready = (
+                _is_satisfied_followup_result(
+                    result['piotroski_filter_followup'],
+                    stage_id='piotroski_filter',
+                )
+                and _is_satisfied_followup_result(
+                    result['factor_scoring_followup']
+                )
+            )
+            if feedback_ready:
+                result['feedback_followup'] = run_followup_stage(
+                    'agent_feedback_summaries',
+                    activity='Running point-in-time recovery feedback summaries',
+                    call=lambda: _run_daily_feedback_followup(
+                        market_date=latest_trade_date,
+                        enabled=bool(
+                            dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh
+                        ),
+                        progress_callback=feedback_progress_callback,
+                    ),
+                )
+            else:
+                result['feedback_followup'] = build_blocked_followup_result(
+                    'agent_feedback_summaries',
+                    'stored_recovery_inputs_incomplete',
+                    upstream_status='blocked',
+                )
+                record_followup_result(
+                    'agent_feedback_summaries',
+                    result['feedback_followup'],
+                )
+
+            if _is_satisfied_followup_result(
+                result['feedback_followup'],
+                stage_id='agent_feedback_summaries',
+            ):
+                result['signal_decider_followup'] = run_followup_stage(
+                    'signal_decider',
+                    activity='Running point-in-time recovery signal deciders',
+                    call=lambda: _run_daily_signal_decider_followup(
+                        market_date=latest_trade_date,
+                        enabled=bool(
+                            dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh
+                        ),
+                        progress_callback=signal_decider_progress_callback,
+                    ),
+                )
+            else:
+                result['signal_decider_followup'] = build_blocked_followup_result(
+                    'signal_decider',
+                    'feedback_followup_incomplete',
+                    upstream_status=_resolve_result_status(
+                        result['feedback_followup']
+                    ),
+                )
+                record_followup_result(
+                    'signal_decider', result['signal_decider_followup']
+                )
+
+            if _is_satisfied_followup_result(
+                result['signal_decider_followup'],
+                stage_id='signal_decider',
+            ):
+                result['next_open_execution_plan_followup'] = run_followup_stage(
+                    'next_open_execution_plan',
+                    activity='Refreshing point-in-time recovery next-open plan',
+                    call=lambda: _run_daily_next_open_execution_plan_followup(
+                        market_date=latest_trade_date,
+                        enabled=True,
+                    ),
+                )
+                result['signal_decider_evaluation_followup'] = run_followup_stage(
+                    'signal_decider_evaluations',
+                    activity='Evaluating point-in-time recovery deciders',
+                    call=lambda: _run_daily_signal_decider_evaluation_followup(
+                        market_date=latest_trade_date,
+                        enabled=True,
+                    ),
+                )
+            else:
+                for result_key, stage_id in (
+                    ('next_open_execution_plan_followup', 'next_open_execution_plan'),
+                    ('signal_decider_evaluation_followup', 'signal_decider_evaluations'),
+                ):
+                    stage_result = build_blocked_followup_result(
+                        stage_id,
+                        'signal_decider_followup_incomplete',
+                        upstream_status=_resolve_result_status(
+                            result['signal_decider_followup']
+                        ),
+                    )
+                    result[result_key] = stage_result
+                    record_followup_result(stage_id, stage_result)
+        elif should_chain_fundamentals:
             result['fundamentals_followup'] = run_followup_stage(
                 'fundamentals_daily_refresh',
                 activity='Running DART fundamentals daily refresh follow-up',
@@ -2503,14 +3199,83 @@ def run_market_data_pipeline(
                         market_date=latest_trade_date,
                         capture_limit=500,
                         trigger='eod_pykrx_followup',
+                        run_piotroski_followup=False,
                         run_feedback_followup=False,
                         progress_callback=fundamentals_progress_callback,
                     )
                 ),
             )
             fundamentals_status = _resolve_result_status(result['fundamentals_followup'])
-            if _is_satisfied_followup_result(result['fundamentals_followup']):
+            fundamentals_satisfied = _is_satisfied_followup_result(
+                result['fundamentals_followup'],
+                stage_id='fundamentals_daily_refresh',
+            )
+            if fundamentals_satisfied:
+                try:
+                    result['piotroski_filter_followup'] = (
+                        run_followup_stage(
+                            'piotroski_filter',
+                            activity='Rebuilding daily Piotroski filter follow-up',
+                            call=lambda: (
+                                _run_daily_piotroski_filter_followup(
+                                    market_date=latest_trade_date,
+                                )
+                            ),
+                            default_total=len(requested_symbol_codes),
+                        )
+                    )
+                except Exception as exc:
+                    result['piotroski_filter_followup'] = {
+                        'triggered': True,
+                        'status': 'failed',
+                        'reason': 'piotroski_filter_failed',
+                        'market_date': latest_trade_date,
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc),
+                    }
+            else:
+                result['piotroski_filter_followup'] = (
+                    build_blocked_followup_result(
+                        'piotroski_filter',
+                        'fundamentals_followup_incomplete',
+                        upstream_status=fundamentals_status,
+                    )
+                )
+                record_followup_result(
+                    'piotroski_filter',
+                    result['piotroski_filter_followup'],
+                )
+            piotroski_status = _resolve_result_status(
+                result['piotroski_filter_followup']
+            )
+            piotroski_satisfied = _is_satisfied_followup_result(
+                result['piotroski_filter_followup'],
+                stage_id='piotroski_filter',
+            )
+            if fundamentals_satisfied and piotroski_satisfied:
                 result['factor_scoring_followup'] = run_factor_followup()
+                factor_status = _resolve_result_status(
+                    result['factor_scoring_followup']
+                )
+                if _is_satisfied_followup_result(
+                    result['factor_scoring_followup']
+                ):
+                    result['signal_feature_followup'] = (
+                        run_signal_feature_followup()
+                    )
+                else:
+                    result['signal_feature_followup'] = (
+                        build_blocked_followup_result(
+                            'signal_features',
+                            'factor_scoring_followup_incomplete',
+                            upstream_status=factor_status,
+                        )
+                    )
+                    record_followup_result(
+                        'signal_features',
+                        result['signal_feature_followup'],
+                    )
+                result['signal_features'] = result['signal_feature_followup']
                 result['external_news_followup'] = run_followup_stage(
                     'external_news_collect',
                     activity='Running external news collection follow-up',
@@ -2536,14 +3301,32 @@ def run_market_data_pipeline(
                     ),
                 )
             else:
+                factor_block_reason = (
+                    'piotroski_filter_incomplete'
+                    if fundamentals_satisfied
+                    else 'fundamentals_followup_incomplete'
+                )
                 result['factor_scoring_followup'] = {
                     'triggered': False,
                     'status': 'blocked',
-                    'reason': 'fundamentals_followup_incomplete',
+                    'reason': factor_block_reason,
                     'market_date': latest_trade_date,
                     'fundamentals_status': fundamentals_status or None,
+                    'piotroski_status': piotroski_status or None,
                 }
                 record_factor_followup_result(result['factor_scoring_followup'])
+                result['signal_feature_followup'] = (
+                    build_blocked_followup_result(
+                        'signal_features',
+                        'factor_scoring_followup_incomplete',
+                        upstream_status='blocked',
+                    )
+                )
+                record_followup_result(
+                    'signal_features',
+                    result['signal_feature_followup'],
+                )
+                result['signal_features'] = result['signal_feature_followup']
                 result['external_news_followup'] = {
                     'triggered': False,
                     'reason': 'factor_scoring_followup_incomplete',
@@ -2566,12 +3349,23 @@ def run_market_data_pipeline(
                     upstream_status='blocked',
                 )
                 record_followup_result('macro_context_refresh', result['macro_context_followup'])
-            factor_status = _resolve_result_status(result.get('factor_scoring_followup') or {})
+            factor_status = _resolve_result_status(
+                result.get('factor_scoring_followup') or {}
+            )
+            factor_satisfied = _is_satisfied_followup_result(
+                result.get('factor_scoring_followup') or {}
+            )
+            signal_feature_status = _resolve_result_status(
+                result.get('signal_feature_followup') or {}
+            )
             result['intraday_snapshot_followup'] = _run_daily_intraday_snapshot_followup(
                 market_date=latest_trade_date,
                 enabled=bool(dependencies.settings.kis_intraday_snapshot_enabled),
             )
-            if factor_status in {'completed', 'partial'}:
+            if (
+                factor_satisfied
+                and signal_feature_status == 'completed'
+            ):
                 result['feedback_followup'] = run_followup_stage(
                     'agent_feedback_summaries',
                     activity='Running agent feedback summary follow-up',
@@ -2582,7 +3376,10 @@ def run_market_data_pipeline(
                     ),
                 )
                 feedback_status = _resolve_result_status(result['feedback_followup'])
-                if feedback_status in {'completed', 'partial'}:
+                if _is_satisfied_followup_result(
+                    result['feedback_followup'],
+                    stage_id='agent_feedback_summaries',
+                ):
                     result['signal_decider_followup'] = run_followup_stage(
                         'signal_decider',
                         activity='Running signal-decider follow-up',
@@ -2601,7 +3398,10 @@ def run_market_data_pipeline(
                     )
                     record_followup_result('signal_decider', result['signal_decider_followup'])
                     signal_decider_status = 'blocked'
-                if signal_decider_status in {'completed', 'partial'}:
+                if _is_satisfied_followup_result(
+                    result['signal_decider_followup'],
+                    stage_id='signal_decider',
+                ):
                     result['next_open_execution_plan_followup'] = run_followup_stage(
                         'next_open_execution_plan',
                         activity='Refreshing next-open execution plan after signal deciders',
@@ -2638,22 +3438,32 @@ def run_market_data_pipeline(
                         result['signal_decider_evaluation_followup'],
                     )
             else:
+                downstream_reason = (
+                    'factor_scoring_followup_incomplete'
+                    if not factor_satisfied
+                    else 'signal_feature_followup_incomplete'
+                )
+                downstream_status = (
+                    factor_status
+                    if not factor_satisfied
+                    else signal_feature_status
+                )
                 result['feedback_followup'] = build_blocked_followup_result(
                     'agent_feedback_summaries',
-                    'factor_scoring_followup_incomplete',
-                    upstream_status=factor_status,
+                    downstream_reason,
+                    upstream_status=downstream_status,
                 )
                 record_followup_result('agent_feedback_summaries', result['feedback_followup'])
                 result['signal_decider_followup'] = build_blocked_followup_result(
                     'signal_decider',
-                    'factor_scoring_followup_incomplete',
-                    upstream_status=factor_status,
+                    downstream_reason,
+                    upstream_status=downstream_status,
                 )
                 record_followup_result('signal_decider', result['signal_decider_followup'])
                 result['next_open_execution_plan_followup'] = build_blocked_followup_result(
                     'next_open_execution_plan',
-                    'factor_scoring_followup_incomplete',
-                    upstream_status=factor_status,
+                    downstream_reason,
+                    upstream_status=downstream_status,
                 )
                 record_followup_result(
                     'next_open_execution_plan',
@@ -2661,8 +3471,8 @@ def run_market_data_pipeline(
                 )
                 result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
                     'signal_decider_evaluations',
-                    'factor_scoring_followup_incomplete',
-                    upstream_status=factor_status,
+                    downstream_reason,
+                    upstream_status=downstream_status,
                 )
                 record_followup_result(
                     'signal_decider_evaluations',
@@ -2675,6 +3485,17 @@ def run_market_data_pipeline(
                 'market_date': latest_trade_date,
             }
             record_followup_result('fundamentals_daily_refresh', result['fundamentals_followup'])
+            result['piotroski_filter_followup'] = (
+                build_blocked_followup_result(
+                    'piotroski_filter',
+                    'dart_api_key_not_configured',
+                    upstream_status='skipped',
+                )
+            )
+            record_followup_result(
+                'piotroski_filter',
+                result['piotroski_filter_followup'],
+            )
             result['factor_scoring_followup'] = {
                 'triggered': False,
                 'status': 'blocked',
@@ -2682,6 +3503,16 @@ def run_market_data_pipeline(
                 'market_date': latest_trade_date,
             }
             record_factor_followup_result(result['factor_scoring_followup'])
+            result['signal_feature_followup'] = build_blocked_followup_result(
+                'signal_features',
+                'factor_scoring_followup_incomplete',
+                upstream_status='blocked',
+            )
+            record_followup_result(
+                'signal_features',
+                result['signal_feature_followup'],
+            )
+            result['signal_features'] = result['signal_feature_followup']
             result['external_news_followup'] = run_followup_stage(
                 'external_news_collect',
                 activity='Running external news collection follow-up',

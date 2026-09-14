@@ -1,6 +1,10 @@
 import unittest
+from datetime import date
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.eod.run_stage_support import (
+    build_next_open_window_expired_result,
     build_stage_counts,
     extract_fundamentals_refresh_metrics,
     normalize_run_status,
@@ -10,6 +14,108 @@ from app.eod.run_stage_support import (
 
 
 class EODRunStageSupportTests(unittest.TestCase):
+    def test_open_prior_date_next_open_window_is_skipped(self):
+        market = SimpleNamespace(
+            state='OPEN',
+            server_time='2026-09-14T10:00:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            result = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=market,
+            )
+
+        self.assertEqual(
+            result,
+            {
+                'triggered': False,
+                'status': 'skipped',
+                'reason': 'next_open_window_expired',
+                'market_date': '2026-09-11',
+                'target_trade_date': '2026-09-14',
+                'current_market_date': '2026-09-14',
+                'market_state': 'OPEN',
+            },
+        )
+
+    def test_closed_current_target_next_open_window_is_skipped(self):
+        market = SimpleNamespace(
+            state='CLOSED',
+            server_time='2026-09-14T16:00:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            result = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=market,
+            )
+
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['reason'], 'next_open_window_expired')
+
+    def test_preopen_current_target_next_open_window_remains_eligible(self):
+        market = SimpleNamespace(
+            state='PREOPEN',
+            server_time='2026-09-14T08:00:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            result = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=market,
+            )
+
+        self.assertIsNone(result)
+
+    def test_non_open_states_skip_targets_before_current_calendar_date(self):
+        for market_state in ('PREOPEN', 'WEEKEND', 'HOLIDAY'):
+            with self.subTest(market_state=market_state):
+                market = SimpleNamespace(
+                    state=market_state,
+                    server_time='2026-09-14T08:00:00+09:00',
+                )
+
+                with patch(
+                    'app.orders.next_open_execution.'
+                    'normalize_next_open_target_trade_date',
+                    return_value=date(2026, 9, 11),
+                ):
+                    result = build_next_open_window_expired_result(
+                        market_date='2026-09-10',
+                        market=market,
+                    )
+
+                self.assertEqual(result['status'], 'skipped')
+                self.assertEqual(result['reason'], 'next_open_window_expired')
+                self.assertEqual(result['market_state'], market_state)
+
+    def test_open_future_target_next_open_window_remains_eligible(self):
+        market = SimpleNamespace(
+            state='OPEN',
+            server_time='2026-09-14T10:00:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 15),
+        ):
+            result = build_next_open_window_expired_result(
+                market_date='2026-09-14',
+                market=market,
+            )
+
+        self.assertIsNone(result)
+
     def test_select_preferred_eod_run_skips_historical_backfill_when_daily_row_exists(self):
         historical_run = {
             'id': 10,
