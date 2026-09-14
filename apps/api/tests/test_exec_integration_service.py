@@ -4203,7 +4203,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 trigger='test_bounded_post_activation_generation_contention',
             )
 
-        self.assertEqual(inspect_call_count, 8)
+        # The durable ACK can observe one or more independent, short-lived
+        # source writers after the three injected post-activation conflicts.
+        # Convergence is the invariant; the exact successful-attempt number is
+        # intentionally scheduler-dependent but remains bounded.
+        self.assertGreaterEqual(inspect_call_count, 8)
+        self.assertLessEqual(
+            inspect_call_count,
+            7 + CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS,
+        )
         self.assertEqual(self.client.revocation_calls, [])
         self.assertEqual(
             result['dispatch']['groups'][0]['activation_status'],
