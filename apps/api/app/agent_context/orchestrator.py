@@ -125,6 +125,7 @@ OPENCLAW_SESSION_REGISTRY_WARNING_BYTES = 64 * 1024 * 1024
 OPENCLAW_SESSION_REGISTRY_MAX_BYTES = 128 * 1024 * 1024
 OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2)
 PERSISTED_SNAPSHOT_JSON_MAX_BYTES = 1024 * 1024
+POST_DECISION_NEWS_SCAN_LIMIT = 50
 _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK = threading.Lock()
 
 
@@ -2901,6 +2902,7 @@ class AgentFeedbackOrchestrator:
         market_date: date,
         news_items: Sequence[dict[str, Any]],
         disclosures: Sequence[dict[str, Any]],
+        source_knowledge_cutoff_at: datetime | None = None,
     ) -> list[dict[str, Any]]:
         reasons: list[dict[str, Any]] = []
         concerning_news = []
@@ -2958,7 +2960,43 @@ class AgentFeedbackOrchestrator:
             except (TypeError, ValueError):
                 # An unparseable new disclosure cannot safely authorize reuse.
                 receipt_date = None
-            if receipt_date is not None and receipt_date <= market_date:
+
+            raw_observed_at = item.get('created_at')
+            try:
+                observed_at = (
+                    raw_observed_at
+                    if isinstance(raw_observed_at, datetime)
+                    else datetime.fromisoformat(
+                        str(raw_observed_at).replace('Z', '+00:00')
+                    )
+                )
+            except (TypeError, ValueError):
+                observed_at = None
+            if (
+                observed_at is not None
+                and observed_at.tzinfo is not None
+                and observed_at.utcoffset() is not None
+            ):
+                observed_at = observed_at.astimezone(timezone.utc)
+            else:
+                observed_at = None
+
+            observed_after_cutoff = bool(
+                source_knowledge_cutoff_at is not None
+                and observed_at is not None
+                and observed_at >= source_knowledge_cutoff_at
+            )
+            same_day_observation_unavailable = bool(
+                source_knowledge_cutoff_at is not None
+                and receipt_date == market_date
+                and observed_at is None
+            )
+            if (
+                receipt_date is not None
+                and receipt_date <= market_date
+                and not observed_after_cutoff
+                and not same_day_observation_unavailable
+            ):
                 continue
             new_disclosures.append(
                 {
@@ -2967,6 +3005,11 @@ class AgentFeedbackOrchestrator:
                         receipt_date.isoformat()
                         if receipt_date is not None
                         else raw_receipt_date
+                    ),
+                    'observed_at': (
+                        observed_at.isoformat()
+                        if observed_at is not None
+                        else raw_observed_at
                     ),
                     'filing_category': item.get('filing_category'),
                     'is_financial_report': item.get('is_financial_report'),
@@ -3037,16 +3080,21 @@ class AgentFeedbackOrchestrator:
 
         symbols = sorted({symbol for _, symbol in source_keys})
         try:
-            news_by_symbol = {
-                symbol: list_external_news_items(
+            news_by_symbol: dict[str, list[dict[str, Any]]] = {}
+            capped_news_symbols: set[str] = set()
+            for symbol in symbols:
+                news_items = list_external_news_items(
                     symbols=[symbol],
-                    limit=50,
+                    limit=POST_DECISION_NEWS_SCAN_LIMIT + 1,
                     published_before=authority_check_at,
                     collected_before=authority_check_at,
                     observed_after=cutoff,
                 )
-                for symbol in symbols
-            }
+                if len(news_items) > POST_DECISION_NEWS_SCAN_LIMIT:
+                    capped_news_symbols.add(symbol)
+                news_by_symbol[symbol] = news_items[
+                    :POST_DECISION_NEWS_SCAN_LIMIT
+                ]
         except Exception as exc:  # noqa: BLE001
             return {
                 key: {
@@ -3070,6 +3118,8 @@ class AgentFeedbackOrchestrator:
                 .list_recent_events_by_stock_codes(
                     stock_codes=symbols,
                     receipt_date_to=disclosure_cutoff_date,
+                    observed_at_or_after=cutoff,
+                    observed_before=authority_check_at,
                     limit_per_symbol=max(5, int(disclosures_limit)),
                 )
             )
@@ -3090,10 +3140,22 @@ class AgentFeedbackOrchestrator:
         failures: dict[tuple[str, str], dict[str, Any]] = {}
         for key in source_keys:
             _, symbol = key
+            if symbol in capped_news_symbols:
+                failures[key] = {
+                    'reason': 'post_decision_material_context_unavailable',
+                    'reasons': [
+                        {
+                            'code': 'post_decision_news_scan_limit_exceeded',
+                            'scan_limit': POST_DECISION_NEWS_SCAN_LIMIT,
+                        }
+                    ],
+                }
+                continue
             reasons = self._post_decision_material_reasons(
                 market_date=market_date,
                 news_items=news_by_symbol.get(symbol, []),
                 disclosures=disclosures_by_symbol.get(symbol, []),
+                source_knowledge_cutoff_at=cutoff,
             )
             if reasons:
                 failures[key] = {

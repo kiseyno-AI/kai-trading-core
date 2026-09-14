@@ -6799,6 +6799,7 @@ class AgentContextReadService:
             fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
                 stock_codes=normalized_symbols,
                 fs_div=normalized_fs_div,
+                captured_before=external_news_knowledge_cutoff_at,
             )
         except SQLAlchemyError:
             dart_storage_unavailable = True
@@ -6811,6 +6812,7 @@ class AgentContextReadService:
             disclosures_by_symbol = self.disclosure_repository.list_recent_events_by_stock_codes(
                 stock_codes=normalized_symbols,
                 receipt_date_to=normalized_market_date,
+                observed_before=external_news_knowledge_cutoff_at,
                 limit_per_symbol=disclosures_limit,
             )
         except SQLAlchemyError:

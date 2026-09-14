@@ -973,9 +973,23 @@ class FakeFundamentalsRepository:
     def list_stored_fundamentals(self, *, stock_codes, fs_div=None):
         raise AssertionError('agent context should use summary fundamentals path')
 
-    def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+    def list_stored_fundamentals_summary(
+        self,
+        *,
+        stock_codes,
+        fs_div=None,
+        captured_before=None,
+    ):
         assert stock_codes == ['005930', '000660']
         assert fs_div == 'CFS'
+        assert captured_before == datetime(
+            2026,
+            4,
+            8,
+            6,
+            30,
+            tzinfo=timezone.utc,
+        )
         return [
             {
                 'rcept_no': '20250312000123',
@@ -1178,9 +1192,24 @@ class FakeFundamentalsRepository:
 
 
 class FakeDisclosureRepository:
-    def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+    def list_recent_events_by_stock_codes(
+        self,
+        *,
+        stock_codes,
+        receipt_date_to=None,
+        observed_before=None,
+        limit_per_symbol=5,
+    ):
         assert stock_codes == ['005930', '000660']
         assert receipt_date_to.isoformat() == '2026-04-08'
+        assert observed_before == datetime(
+            2026,
+            4,
+            8,
+            6,
+            30,
+            tzinfo=timezone.utc,
+        )
         assert limit_per_symbol == 3
         return {
             '005930': [
@@ -1364,7 +1393,13 @@ class ExternalNewsKnowledgeCutoffTests(unittest.TestCase):
 class AgentContextReadServiceTests(unittest.TestCase):
     def test_symbol_day_context_wires_fresh_stored_open_drive_evidence_into_regime(self):
         class EmptyFundamentalsRepository:
-            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+            def list_stored_fundamentals_summary(
+                self,
+                *,
+                stock_codes,
+                fs_div=None,
+                captured_before=None,
+            ):
                 return []
 
         class EmptyDisclosureRepository:
@@ -1373,6 +1408,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 *,
                 stock_codes,
                 receipt_date_to=None,
+                observed_before=None,
                 limit_per_symbol=5,
             ):
                 return {symbol: [] for symbol in stock_codes}
@@ -3127,11 +3163,24 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
     def test_get_symbol_day_context_marks_liquidity_context_storage_unavailable_when_price_context_store_fails(self):
         class EmptyFundamentalsRepository:
-            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+            def list_stored_fundamentals_summary(
+                self,
+                *,
+                stock_codes,
+                fs_div=None,
+                captured_before=None,
+            ):
                 return []
 
         class EmptyDisclosureRepository:
-            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+            def list_recent_events_by_stock_codes(
+                self,
+                *,
+                stock_codes,
+                receipt_date_to=None,
+                observed_before=None,
+                limit_per_symbol=5,
+            ):
                 return {symbol: [] for symbol in stock_codes}
 
         service = AgentContextReadService(
@@ -3251,11 +3300,24 @@ class AgentContextReadServiceTests(unittest.TestCase):
         }
 
         class EmptyFundamentalsRepository:
-            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+            def list_stored_fundamentals_summary(
+                self,
+                *,
+                stock_codes,
+                fs_div=None,
+                captured_before=None,
+            ):
                 return []
 
         class EmptyDisclosureRepository:
-            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+            def list_recent_events_by_stock_codes(
+                self,
+                *,
+                stock_codes,
+                receipt_date_to=None,
+                observed_before=None,
+                limit_per_symbol=5,
+            ):
                 return {symbol: [] for symbol in stock_codes}
 
         service = AgentContextReadService(
@@ -3410,11 +3472,24 @@ class AgentContextReadServiceTests(unittest.TestCase):
 
     def test_get_symbol_day_context_factor_summary_distinguishes_storage_missing_non_eligible_and_history_states(self):
         class EmptyFundamentalsRepository:
-            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+            def list_stored_fundamentals_summary(
+                self,
+                *,
+                stock_codes,
+                fs_div=None,
+                captured_before=None,
+            ):
                 return []
 
         class EmptyDisclosureRepository:
-            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+            def list_recent_events_by_stock_codes(
+                self,
+                *,
+                stock_codes,
+                receipt_date_to=None,
+                observed_before=None,
+                limit_per_symbol=5,
+            ):
                 return {symbol: [] for symbol in stock_codes}
 
         service = AgentContextReadService(
@@ -4255,11 +4330,24 @@ class AgentContextReadServiceTests(unittest.TestCase):
         ]
 
         class EmptyFundamentalsRepository:
-            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+            def list_stored_fundamentals_summary(
+                self,
+                *,
+                stock_codes,
+                fs_div=None,
+                captured_before=None,
+            ):
                 return []
 
         class EmptyDisclosureRepository:
-            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+            def list_recent_events_by_stock_codes(
+                self,
+                *,
+                stock_codes,
+                receipt_date_to=None,
+                observed_before=None,
+                limit_per_symbol=5,
+            ):
                 return {symbol: [] for symbol in stock_codes}
 
         service = AgentContextReadService(
@@ -4305,11 +4393,24 @@ class AgentContextReadServiceTests(unittest.TestCase):
         captured_at = '2026-04-08T15:00:00+09:00'
 
         class EmptyFundamentalsRepository:
-            def list_stored_fundamentals_summary(self, *, stock_codes, fs_div=None):
+            def list_stored_fundamentals_summary(
+                self,
+                *,
+                stock_codes,
+                fs_div=None,
+                captured_before=None,
+            ):
                 return []
 
         class EmptyDisclosureRepository:
-            def list_recent_events_by_stock_codes(self, *, stock_codes, receipt_date_to=None, limit_per_symbol=5):
+            def list_recent_events_by_stock_codes(
+                self,
+                *,
+                stock_codes,
+                receipt_date_to=None,
+                observed_before=None,
+                limit_per_symbol=5,
+            ):
                 return {symbol: [] for symbol in stock_codes}
 
         service = AgentContextReadService(
