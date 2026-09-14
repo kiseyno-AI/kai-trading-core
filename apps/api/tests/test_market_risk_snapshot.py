@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from sqlalchemy import delete, select
 
+from app.brokers.kis.client import KISHTTPError
 from app.db import engine, session_scope
 from app.db_models import DailyMarketRiskSnapshot, EODCollectionRun, Symbol
 from app.market_data_store import load_daily_market_risk_snapshots
@@ -230,6 +231,79 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upsert.call_count, 0)
         retry_delays = [call.args[0] for call in sleep.call_args_list if call.args[0] >= 1.0]
         self.assertEqual(retry_delays, [1.0, 2.0, 4.0])
+
+    async def test_collect_for_market_date_honors_kis_retryable_error_contract(self) -> None:
+        client = FakeKISRiskClient(
+            responses={
+                '008775': {
+                    'output': {
+                        'mrkt_warn_cls_code': '00',
+                        'mang_issu_yn': 'N',
+                        'invt_caful_yn': 'N',
+                        'short_over_yn': 'N',
+                        'ssts_hot_yn': 'N',
+                        'vi_cls_code': '00',
+                        'insn_pbnt_yn': 'N',
+                        'trht_yn': 'N',
+                    }
+                },
+                '159800': {
+                    'output': {
+                        'mrkt_warn_cls_code': '00',
+                        'mang_issu_yn': 'N',
+                        'invt_caful_yn': 'N',
+                        'short_over_yn': 'N',
+                        'ssts_hot_yn': 'N',
+                        'vi_cls_code': '00',
+                        'insn_pbnt_yn': 'N',
+                        'trht_yn': 'N',
+                    }
+                },
+            },
+            errors={
+                '008775': [
+                    KISHTTPError(
+                        'KIS request failed [500] inquire-price-2',
+                        status_code=500,
+                        retryable=True,
+                    ),
+                    None,
+                ],
+                '159800': [
+                    KISHTTPError(
+                        'KIS request failed [429] rate limit',
+                        status_code=429,
+                        retryable=False,
+                    ),
+                    None,
+                ],
+            },
+        )
+        service = DailyMarketRiskSnapshotService(client=client)
+        inputs = [
+            MarketRiskSymbolInput(symbol='008775', name_ko='호텔신라우', market='KOSPI'),
+            MarketRiskSymbolInput(symbol='159800', name_ko='마이티코스피100', market='KOSPI'),
+        ]
+
+        with (
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(inputs, ['008775', '159800'], []),
+            ),
+            patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+        ):
+            result = await service.collect_for_market_date(market_date='2026-09-11')
+
+        self.assertEqual(client.calls.count('008775'), 2)
+        self.assertEqual(client.calls.count('159800'), 1)
+        self.assertEqual(result['snapshots_persisted'], 1)
+        self.assertEqual(result['snapshots_failed'], 1)
+        self.assertEqual(result['failed_symbols'], ['159800'])
+        self.assertEqual(upsert.call_count, 1)
+        retry_delays = [call.args[0] for call in sleep.call_args_list if call.args[0] >= 1.0]
+        self.assertEqual(retry_delays, [1.0])
 
     def test_inspect_resolves_latest_on_or_before_requested_market_date(self) -> None:
         service = DailyMarketRiskSnapshotService()

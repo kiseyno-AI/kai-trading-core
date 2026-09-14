@@ -97,6 +97,43 @@ def test_concurrent_cold_calls_share_one_token_request(tmp_path) -> None:
     assert sum(result['cached'] is False for result in results) == 1
 
 
+def test_process_singleton_client_supports_recreated_event_loops(tmp_path) -> None:
+    client = KISClient(use_mock=False)
+    call_count = 0
+
+    async def fake_request(*args, **kwargs) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.02)
+        return _token_response(f'token-{call_count}')
+
+    async def issue_concurrently() -> list[dict]:
+        return await asyncio.gather(
+            client.issue_access_token(),
+            client.issue_access_token(),
+        )
+
+    with patch('app.brokers.kis.client.request_with_audit', side_effect=fake_request):
+        with patch.dict(
+            settings.__dict__,
+            _settings_overrides(tmp_path / 'first-loop-cache'),
+            clear=False,
+        ):
+            first_results = asyncio.run(issue_concurrently())
+        with patch.dict(
+            settings.__dict__,
+            _settings_overrides(tmp_path / 'second-loop-cache'),
+            clear=False,
+        ):
+            second_results = asyncio.run(issue_concurrently())
+
+    assert call_count == 2
+    assert {result['access_token'] for result in first_results} == {'token-1'}
+    assert {result['access_token'] for result in second_results} == {'token-2'}
+    assert sum(result['cached'] is False for result in first_results) == 1
+    assert sum(result['cached'] is False for result in second_results) == 1
+
+
 def test_concurrent_failure_is_shared_during_cooldown(tmp_path) -> None:
     async def exercise() -> tuple[list[object], object, int]:
         client = KISClient(use_mock=False)
