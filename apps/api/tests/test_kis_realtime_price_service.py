@@ -13,6 +13,7 @@ from app.core.settings import settings
 from app.quotes import kis_realtime_prices
 from app.quotes.kis_realtime_prices import (
     KIS_REALTIME_PRICE_COLUMNS,
+    KISRealtimeMonitoredSymbolSource,
     KISRealtimePriceSubscriptionError,
     KISRealtimePriceService,
     parse_realtime_price_message,
@@ -69,6 +70,71 @@ def _message_for_rows(rows: list[dict[str, str]]) -> str:
     for row in rows:
         payload_values.extend(row.get(column, '') for column in KIS_REALTIME_PRICE_COLUMNS)
     return f"0|H0STCNT0|{len(rows):03d}|{'^'.join(payload_values)}"
+
+
+def _runtime_source_payload(
+    symbols: list[str],
+    *,
+    generated_at: datetime,
+    membership_complete: bool,
+    protected_symbols: set[str] | None = None,
+    critical_symbols: set[str] | None = None,
+) -> dict:
+    protected_symbols = protected_symbols or set()
+    critical_symbols = critical_symbols or set()
+    return {
+        'market_date': generated_at.astimezone(kis_realtime_prices.KST).date().isoformat(),
+        'items': [
+            {
+                'symbol': symbol,
+                **(
+                    {'held_position': True, 'position_quantity': 1}
+                    if symbol in critical_symbols
+                    else {}
+                ),
+                **(
+                    {'monitoring_state': 'reconciling'}
+                    if symbol in protected_symbols
+                    else {}
+                ),
+            }
+            for symbol in symbols
+        ],
+        'realtime_subscription': {
+            'desired_symbols': symbols,
+            'desired_symbol_count': len(symbols),
+        },
+        'source_coverage': {'membership_complete': membership_complete},
+        'freshness': {
+            'schema_version': 'execution_runtime_dashboard_read_model_v1',
+            'endpoint': 'monitored_symbols',
+            'market_date': generated_at.astimezone(
+                kis_realtime_prices.KST
+            ).date().isoformat(),
+            'status': 'fresh',
+            'generated_at': generated_at.isoformat(),
+            'is_stale': False,
+            'is_partial': False,
+            'refreshing': False,
+        },
+    }
+
+
+def _runtime_source(
+    symbols: list[str],
+    *,
+    protected_symbols: tuple[str, ...] = (),
+) -> KISRealtimeMonitoredSymbolSource:
+    generated_at = datetime.now(timezone.utc)
+    return KISRealtimeMonitoredSymbolSource(
+        symbols=tuple(symbols),
+        market_date=generated_at.astimezone(
+            kis_realtime_prices.KST
+        ).date().isoformat(),
+        source_version=generated_at,
+        membership_complete=True,
+        protected_symbols=protected_symbols,
+    )
 
 
 class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -180,9 +246,11 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         service.observe_monitored_symbols(['005930'], trigger='dashboard')
         release_loader = asyncio.Event()
 
-        async def _blocked_loader(**_: object) -> list[str]:
+        async def _blocked_loader(
+            **_: object,
+        ) -> KISRealtimeMonitoredSymbolSource:
             await release_loader.wait()
-            return ['027710']
+            return _runtime_source(['027710'])
 
         blocked_loader = AsyncMock(side_effect=_blocked_loader)
 
@@ -229,9 +297,11 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         service.observe_monitored_symbols(['005930'], trigger='dashboard')
         release_loader = asyncio.Event()
 
-        async def _blocked_loader(**_: object) -> list[str]:
+        async def _blocked_loader(
+            **_: object,
+        ) -> KISRealtimeMonitoredSymbolSource:
             await release_loader.wait()
-            return ['027710']
+            return _runtime_source(['027710'])
 
         blocked_loader = AsyncMock(side_effect=_blocked_loader)
         source_task = asyncio.create_task(blocked_loader(trigger='background'))
@@ -273,6 +343,697 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed['allowed_symbols'], ['027710'])
         self.assertIsNone(service._source_refresh_task)
         await service.stop()
+
+    async def test_completed_source_refresh_does_not_replace_newer_observation(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='initial-dashboard')
+        loader_started = asyncio.Event()
+        release_loader = asyncio.Event()
+
+        async def _slow_stale_loader(**_: object) -> list[str]:
+            loader_started.set()
+            await release_loader.wait()
+            return []
+
+        with (
+            patch.object(
+                service,
+                '_load_runtime_monitored_symbols',
+                AsyncMock(side_effect=_slow_stale_loader),
+            ),
+            patch.object(
+                kis_realtime_prices,
+                'KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS',
+                0.01,
+            ),
+            patch.object(
+                settings,
+                'kis_realtime_price_subscription_refresh_seconds',
+                60.0,
+            ),
+        ):
+            timed_out = await service.refresh_subscription_source_if_due(
+                trigger='background',
+                force=True,
+            )
+            await asyncio.wait_for(loader_started.wait(), timeout=1)
+            service.observe_monitored_symbols(
+                ['027710'],
+                trigger='newer-dashboard',
+                preserve_order=True,
+            )
+            release_loader.set()
+            await asyncio.wait_for(
+                asyncio.shield(service._source_refresh_task),
+                timeout=1,
+            )
+            completed = await service.refresh_subscription_source_if_due(
+                trigger='background',
+                force=False,
+            )
+
+        self.assertEqual(timed_out['allowed_symbols'], ['005930'])
+        self.assertEqual(completed['allowed_symbols'], ['027710'])
+        self.assertIsNone(service._source_refresh_task)
+        await service.stop()
+
+    async def test_unversioned_empty_source_cannot_clear_current_symbols(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['027710'],
+            trigger='current-dashboard',
+            preserve_order=True,
+        )
+
+        with patch.object(
+            service,
+            '_load_runtime_monitored_symbols',
+            new=AsyncMock(return_value=[]),
+        ):
+            snapshot = await service.refresh_subscription_source_if_due(
+                trigger='legacy-source',
+                force=True,
+            )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+        await service.stop()
+
+    async def test_non_authoritative_empty_source_preserves_current_symbols(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['027710'],
+            trigger='current-dashboard',
+            preserve_order=True,
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                [],
+                generated_at=datetime.now(timezone.utc),
+                membership_complete=False,
+            ),
+            trigger='incomplete-dashboard',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+        self.assertEqual(
+            service.health_snapshot()['metrics']['source_results_ignored'],
+            1,
+        )
+
+    async def test_non_authoritative_source_preserves_current_capacity_order(
+        self,
+    ) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['027710'],
+            trigger='current-dashboard',
+            preserve_order=True,
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['005930'],
+                generated_at=datetime.now(timezone.utc),
+                membership_complete=False,
+            ),
+            trigger='incomplete-dashboard',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+        self.assertEqual(snapshot['limited_symbols'], ['005930'])
+
+    async def test_non_authoritative_protected_source_preempts_regular_symbol(
+        self,
+    ) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['005930'],
+            trigger='current-regular',
+            preserve_order=True,
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=datetime.now(timezone.utc),
+                membership_complete=False,
+                protected_symbols={'027710'},
+            ),
+            trigger='incomplete-protected',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+        self.assertEqual(snapshot['limited_symbols'], ['005930'])
+        self.assertEqual(snapshot['protected_symbols'], ['027710'])
+
+    async def test_incomplete_source_cannot_downgrade_current_protection(
+        self,
+    ) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=now,
+                membership_complete=True,
+                protected_symbols={'027710'},
+            ),
+            trigger='complete-protected',
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['005930', '027710'],
+                generated_at=now + timedelta(seconds=1),
+                membership_complete=False,
+            ),
+            trigger='incomplete-regular',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+        self.assertEqual(snapshot['limited_symbols'], ['005930'])
+        self.assertEqual(snapshot['protected_symbols'], ['027710'])
+
+    async def test_new_incomplete_protected_symbol_preempts_retained_protection(
+        self,
+    ) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['000001'],
+                generated_at=now,
+                membership_complete=True,
+                protected_symbols={'000001'},
+            ),
+            trigger='older-complete-protected',
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['000002'],
+                generated_at=now + timedelta(seconds=1),
+                membership_complete=False,
+                protected_symbols={'000002'},
+            ),
+            trigger='newer-incomplete-protected',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['000002'])
+        self.assertEqual(snapshot['limited_symbols'], ['000001'])
+        self.assertEqual(
+            snapshot['protected_symbols'],
+            ['000001', '000002'],
+        )
+
+    async def test_new_reconciling_symbol_cannot_preempt_retained_live_holding(
+        self,
+    ) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=now,
+                membership_complete=True,
+                protected_symbols={'027710'},
+                critical_symbols={'027710'},
+            ),
+            trigger='complete-live-holding',
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['030000'],
+                generated_at=now + timedelta(seconds=1),
+                membership_complete=False,
+                protected_symbols={'030000'},
+            ),
+            trigger='incomplete-reconciling',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+        self.assertEqual(snapshot['limited_symbols'], ['030000'])
+        self.assertEqual(snapshot['critical_protected_symbols'], ['027710'])
+
+    async def test_complete_source_can_demote_stale_protection(self) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=now,
+                membership_complete=True,
+                protected_symbols={'027710'},
+            ),
+            trigger='complete-protected',
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['005930', '027710'],
+                generated_at=now + timedelta(seconds=1),
+                membership_complete=True,
+            ),
+            trigger='complete-demotion',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['005930'])
+        self.assertEqual(snapshot['limited_symbols'], ['027710'])
+        self.assertEqual(snapshot['protected_symbols'], [])
+
+    async def test_complete_source_prioritizes_protected_symbol(self) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['005930', '030000'],
+                generated_at=datetime.now(timezone.utc),
+                membership_complete=True,
+                protected_symbols={'030000'},
+            ),
+            trigger='complete-protected-order',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['030000'])
+        self.assertEqual(snapshot['limited_symbols'], ['005930'])
+        self.assertEqual(snapshot['protected_symbols'], ['030000'])
+
+    async def test_planned_exit_intents_alone_do_not_take_capacity(self) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        payload = _runtime_source_payload(
+            ['005930', '030000'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+        payload['items'][0]['monitoring_state'] = 'watching_fill'
+        payload['items'][1].update(
+            {
+                'monitoring_state': 'idle',
+                'planned_intents': ['target_sell', 'stop_sell'],
+            }
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            payload,
+            trigger='planned-intents-only',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['005930'])
+        self.assertEqual(snapshot['limited_symbols'], ['030000'])
+        self.assertEqual(snapshot['protected_symbols'], [])
+
+    async def test_other_market_date_cannot_replace_current_symbols(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['027710'],
+            trigger='current-dashboard',
+            preserve_order=True,
+        )
+        payload = _runtime_source_payload(
+            [],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+        payload['market_date'] = '2000-01-01'
+
+        snapshot = service.observe_runtime_monitored_payload(
+            payload,
+            trigger='historical-dashboard',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+        self.assertEqual(
+            service.health_snapshot()['metrics']['source_results_ignored'],
+            1,
+        )
+
+    async def test_unversioned_or_unscoped_payload_cannot_clear_symbols(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['027710'],
+            trigger='current-dashboard',
+            preserve_order=True,
+        )
+        generated_at = datetime.now(timezone.utc)
+        missing_market_date = _runtime_source_payload(
+            [],
+            generated_at=generated_at,
+            membership_complete=True,
+        )
+        missing_market_date.pop('market_date')
+        missing_source_version = _runtime_source_payload(
+            [],
+            generated_at=generated_at,
+            membership_complete=True,
+        )
+        missing_source_version['freshness'].pop('generated_at')
+
+        for trigger, payload in (
+            ('missing-market-date', missing_market_date),
+            ('missing-source-version', missing_source_version),
+        ):
+            snapshot = service.observe_runtime_monitored_payload(
+                payload,
+                trigger=trigger,
+            )
+            self.assertEqual(snapshot['allowed_symbols'], ['027710'])
+
+    async def test_non_krx_symbol_revokes_complete_membership_authority(self) -> None:
+        payload = _runtime_source_payload(
+            ['005930', 'AAPL'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+
+        self.assertEqual(source.symbols, ('005930',))
+        self.assertFalse(source.membership_complete)
+
+    async def test_unicode_digit_symbol_revokes_complete_membership_authority(
+        self,
+    ) -> None:
+        payload = _runtime_source_payload(
+            ['005930', '００５９３０'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+
+        self.assertEqual(source.symbols, ('005930',))
+        self.assertFalse(source.membership_complete)
+
+    async def test_subscription_summary_mismatch_revokes_complete_membership_authority(
+        self,
+    ) -> None:
+        payload = _runtime_source_payload(
+            ['005930'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+        payload['realtime_subscription'] = {
+            'desired_symbols': [],
+            'desired_symbol_count': 0,
+        }
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+
+        self.assertEqual(source.symbols, ('005930',))
+        self.assertFalse(source.membership_complete)
+
+    async def test_missing_explicit_freshness_flag_revokes_complete_authority(
+        self,
+    ) -> None:
+        payload = _runtime_source_payload(
+            ['005930'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+        payload['freshness'].pop('is_partial')
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+
+        self.assertFalse(source.membership_complete)
+
+    async def test_malformed_item_revokes_complete_membership_authority(self) -> None:
+        payload = _runtime_source_payload(
+            ['005930'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+        payload['items'].append('not-an-item')
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+
+        self.assertEqual(source.symbols, ('005930',))
+        self.assertFalse(source.membership_complete)
+
+    async def test_authoritative_fresh_empty_source_clears_current_symbols(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['027710'],
+            trigger='current-dashboard',
+            preserve_order=True,
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                [],
+                generated_at=datetime.now(timezone.utc),
+                membership_complete=True,
+            ),
+            trigger='complete-dashboard',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], [])
+
+    async def test_older_source_version_cannot_replace_newer_membership(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        newer_version = datetime.now(timezone.utc)
+        newer = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=newer_version,
+                membership_complete=True,
+            ),
+            trigger='newer-dashboard',
+        )
+        observed_at = service.health_snapshot()['last_observed_symbols_at']
+
+        older = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                [],
+                generated_at=newer_version - timedelta(minutes=1),
+                membership_complete=True,
+            ),
+            trigger='older-cache',
+        )
+
+        self.assertEqual(newer['allowed_symbols'], ['027710'])
+        self.assertEqual(older['allowed_symbols'], ['027710'])
+        self.assertEqual(
+            service.health_snapshot()['last_observed_symbols_at'],
+            observed_at,
+        )
+
+    async def test_newer_incomplete_empty_blocks_older_complete_empty(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['027710'],
+            trigger='current-dashboard',
+            preserve_order=True,
+        )
+        initial_revision = service.observation_revision()
+        newer_version = datetime.now(timezone.utc)
+
+        newer = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                [],
+                generated_at=newer_version,
+                membership_complete=False,
+            ),
+            trigger='newer-incomplete',
+            expected_observation_revision=initial_revision,
+        )
+        older = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                [],
+                generated_at=newer_version - timedelta(minutes=1),
+                membership_complete=True,
+            ),
+            trigger='older-complete',
+            expected_observation_revision=initial_revision,
+        )
+
+        self.assertEqual(newer['allowed_symbols'], ['027710'])
+        self.assertEqual(older['allowed_symbols'], ['027710'])
+        self.assertGreater(service.observation_revision(), initial_revision)
+        self.assertEqual(
+            service.health_snapshot()['last_source_version'],
+            newer_version.isoformat(),
+        )
+
+    async def test_future_source_cannot_replace_or_poison_current_membership(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=now,
+                membership_complete=True,
+            ),
+            trigger='current',
+        )
+
+        future = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['005930'],
+                generated_at=now + timedelta(hours=2),
+                membership_complete=True,
+            ),
+            trigger='future',
+        )
+        next_current = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['000660'],
+                generated_at=now + timedelta(seconds=1),
+                membership_complete=True,
+            ),
+            trigger='next-current',
+        )
+
+        self.assertEqual(future['allowed_symbols'], ['027710'])
+        self.assertEqual(next_current['allowed_symbols'], ['000660'])
+        self.assertEqual(
+            service.health_snapshot()['last_source_version'],
+            (now + timedelta(seconds=1)).isoformat(),
+        )
+
+    async def test_equal_version_conflict_is_merge_only(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['005930'],
+                generated_at=now,
+                membership_complete=True,
+            ),
+            trigger='first',
+        )
+
+        conflict = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['000660'],
+                generated_at=now,
+                membership_complete=True,
+            ),
+            trigger='conflict',
+        )
+
+        self.assertEqual(
+            set(conflict['desired_symbols']),
+            {'000660', '005930'},
+        )
+
+    async def test_identical_cached_observation_does_not_cancel_newer_refresh(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        initial_payload = _runtime_source_payload(
+            ['005930'],
+            generated_at=now,
+            membership_complete=True,
+        )
+        service.observe_runtime_monitored_payload(
+            initial_payload,
+            trigger='initial',
+        )
+        initial_revision = service.observation_revision()
+
+        service.observe_runtime_monitored_payload(
+            initial_payload,
+            trigger='same-cached-payload',
+            expected_observation_revision=initial_revision,
+        )
+        refreshed = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=now + timedelta(seconds=1),
+                membership_complete=True,
+            ),
+            trigger='newer-background-result',
+            expected_observation_revision=initial_revision,
+        )
+
+        self.assertEqual(service.observation_revision(), initial_revision + 1)
+        self.assertEqual(refreshed['allowed_symbols'], ['027710'])
+
+    async def test_newer_timestamp_cannot_bypass_stale_revision_fence(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        now = datetime.now(timezone.utc)
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['005930'],
+                generated_at=now,
+                membership_complete=True,
+            ),
+            trigger='base',
+        )
+        stale_revision = service.observation_revision()
+        service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['027710'],
+                generated_at=now + timedelta(seconds=1),
+                membership_complete=True,
+            ),
+            trigger='direct-newer-observation',
+        )
+
+        stale_task = service.observe_runtime_monitored_payload(
+            _runtime_source_payload(
+                ['000660'],
+                generated_at=now + timedelta(seconds=2),
+                membership_complete=True,
+            ),
+            trigger='slow-stale-task',
+            expected_observation_revision=stale_revision,
+        )
+
+        self.assertEqual(stale_task['allowed_symbols'], ['027710'])
+
+    async def test_runtime_source_loader_disables_nested_publication(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        payload = _runtime_source_payload(
+            ['027710'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+        list_symbols = AsyncMock(return_value=payload)
+
+        with patch(
+            'app.orders.exec_integration.signal_decider_exec_integration_service.'
+            'list_runtime_monitored_symbols',
+            list_symbols,
+        ):
+            source = await service._load_runtime_monitored_symbols(
+                trigger='background'
+            )
+
+        self.assertIsInstance(source, KISRealtimeMonitoredSymbolSource)
+        self.assertEqual(source.symbols, ('027710',))
+        self.assertTrue(source.membership_complete)
+        self.assertTrue(list_symbols.await_args.kwargs['refresh'])
+        self.assertFalse(
+            list_symbols.await_args.kwargs['publish_realtime_observation']
+        )
 
     async def test_background_loop_does_not_force_subscription_source_refresh(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
