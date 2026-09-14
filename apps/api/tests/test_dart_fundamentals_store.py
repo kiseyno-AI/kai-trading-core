@@ -167,6 +167,44 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         self.created_event_ids.append(event_id)
         return event_id
 
+    def test_list_stored_fundamentals_summary_excludes_snapshots_at_or_after_cutoff(self):
+        stock_code = f'T{uuid4().hex[:10]}'
+        _, before_snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2024,
+        )
+        _, at_cutoff_snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 8),
+            capture_status='captured',
+            business_year=2025,
+        )
+        cutoff = datetime(2026, 4, 8, 6, 30, tzinfo=timezone.utc)
+        with session_scope() as session:
+            before_snapshot = session.get(
+                DartFundamentalsSnapshot,
+                before_snapshot_id,
+            )
+            at_cutoff_snapshot = session.get(
+                DartFundamentalsSnapshot,
+                at_cutoff_snapshot_id,
+            )
+            before_snapshot.captured_at = cutoff - timedelta(microseconds=1)
+            at_cutoff_snapshot.captured_at = cutoff
+
+        rows = self.repository.list_stored_fundamentals_summary(
+            stock_codes=[stock_code],
+            fs_div='CFS',
+            captured_before=cutoff,
+        )
+
+        self.assertEqual(
+            [row['id'] for row in rows],
+            [before_snapshot_id],
+        )
+
     def test_fail_stale_capture_runs_uses_last_progress_at_when_present(self):
         now = datetime.now(timezone.utc)
         fresh_run_id = self._create_run(trigger='test_stale_fresh_progress')

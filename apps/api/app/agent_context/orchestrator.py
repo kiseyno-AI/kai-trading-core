@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 from urllib.parse import quote, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi.encoders import jsonable_encoder
@@ -25,6 +26,7 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
     build_agent_feedback_role_funnel,
+    load_agent_feedback_eligibility_records,
     resolve_agent_feedback_scope,
     split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics,
 )
@@ -34,6 +36,9 @@ from app.agent_context.orchestrator_helpers import (
     build_completed_dispatch_item as _build_completed_dispatch_item,
     build_failed_dispatch_item as _build_failed_dispatch_item,
     build_response_storage_payload as _build_response_storage_payload,
+    build_decider_input_generation as _build_decider_input_generation,
+    build_durable_decider_input_generation as _build_durable_decider_input_generation,
+    build_decider_source_context_generation as _build_decider_source_context_generation,
     build_signal_decider_payload as _build_signal_decider_payload_helper,
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
     coerce_decoded_batch_response as _coerce_decoded_batch_response,
@@ -83,7 +88,10 @@ from app.agent_context.model_identity import (
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
 from app.agent_context.payload_builder import agent_payload_builder
-from app.agent_context.read_service import agent_context_read_service
+from app.agent_context.read_service import (
+    agent_context_read_service,
+    resolve_external_news_knowledge_cutoff_for_symbols,
+)
 from app.agent_context.roles import DEFAULT_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES, SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.response_contract import (
@@ -109,11 +117,51 @@ from app.agent_context.signal_decider_loop_service import (
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, EODCollectionRun
+from app.external_news.store import list_external_news_items
 
 logger = logging.getLogger(__name__)
 
 OPENCLAW_SESSION_REGISTRY_WARNING_BYTES = 64 * 1024 * 1024
 OPENCLAW_SESSION_REGISTRY_MAX_BYTES = 128 * 1024 * 1024
+OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2)
+PERSISTED_SNAPSHOT_JSON_MAX_BYTES = 1024 * 1024
+POST_DECISION_NEWS_SCAN_LIMIT = 50
+_OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK = threading.Lock()
+
+
+def _parse_persisted_snapshot_json_object(
+    value: Any,
+) -> tuple[dict[str, Any], str | None]:
+    if isinstance(value, dict):
+        try:
+            payload_size_bytes = len(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(',', ':'),
+                ).encode('utf-8')
+            )
+        except (RecursionError, TypeError, UnicodeEncodeError, ValueError):
+            return {}, 'json_decode_error'
+        if payload_size_bytes > PERSISTED_SNAPSHOT_JSON_MAX_BYTES:
+            return {}, 'json_payload_too_large'
+        return dict(value), None
+    if not isinstance(value, str):
+        return {}, 'json_shape_not_object'
+    try:
+        payload_size_bytes = len(value.encode('utf-8'))
+    except UnicodeEncodeError:
+        return {}, 'json_decode_error'
+    if payload_size_bytes > PERSISTED_SNAPSHOT_JSON_MAX_BYTES:
+        return {}, 'json_payload_too_large'
+    try:
+        parsed, failure = decode_strict_agent_json_object(value)
+    except RecursionError:
+        return {}, 'json_decode_error'
+    if failure is not None or not isinstance(parsed, dict):
+        return {}, failure or 'json_shape_not_object'
+    return parsed, None
 
 
 class AgentDispatchError(RuntimeError):
@@ -819,53 +867,77 @@ class OpenClawAgentClient:
             )
         registry_path = self._session_artifacts_dir(agent_name=agent_name) / 'sessions.json'
         registry_snapshot = None
-        try:
-            registry_snapshot = read_bounded_regular_file(
-                registry_path,
-                max_bytes=OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
-            )
-            registry_size = registry_snapshot.fingerprint['size']
-            if registry_size >= OPENCLAW_SESSION_REGISTRY_WARNING_BYTES:
-                logger.warning(
-                    'OpenClaw session registry is approaching the model identity verification limit',
-                    extra={
-                        'agent_name': agent_name,
-                        'registry_size_bytes': registry_size,
-                        'registry_max_bytes': OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
-                    },
-                )
-            registry = json.loads(registry_snapshot.content)
-        except (SafeFileReadError, UnicodeError, json.JSONDecodeError, RecursionError):
-            entry = None
-        else:
-            entry = registry.get(session_key) if isinstance(registry, dict) else None
-        if not isinstance(entry, dict):
-            entry = {}
         started_ms = int(dispatch_started_at.timestamp() * 1000)
-        observed_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        entry_started_ms = entry.get('startedAt')
-        entry_ended_ms = entry.get('endedAt')
-        entry_updated_ms = entry.get('updatedAt')
-        observed_session_id = str(entry.get('sessionId') or '').strip() or None
-        timing_valid = all(
-            isinstance(value, (int, float)) and not isinstance(value, bool)
-            for value in (entry_started_ms, entry_ended_ms, entry_updated_ms)
-        )
-        timing_valid = bool(
-            timing_valid
-            and entry_started_ms >= started_ms - 5_000
-            and entry_started_ms <= observed_ms + 5_000
-            and entry_ended_ms >= entry_started_ms
-            and entry_ended_ms <= observed_ms + 5_000
-            and entry_updated_ms >= entry_ended_ms
-            and entry_updated_ms <= observed_ms + 5_000
-        )
-        session_valid = observed_session_id is not None and (
-            session_id is None or observed_session_id == session_id
-        )
-        status_valid = str(entry.get('status') or '').lower() in {'completed', 'done'}
-        if not timing_valid or not session_valid or not status_valid:
-            entry = {}
+        entry: dict[str, Any] = {}
+        warned_for_size = False
+        retry_delays = (0.0, *OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS)
+        with _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK:
+            for retry_delay in retry_delays:
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+                try:
+                    candidate_snapshot = read_bounded_regular_file(
+                        registry_path,
+                        max_bytes=OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
+                    )
+                    registry_snapshot = candidate_snapshot
+                    registry_size = candidate_snapshot.fingerprint['size']
+                    if (
+                        registry_size >= OPENCLAW_SESSION_REGISTRY_WARNING_BYTES
+                        and not warned_for_size
+                    ):
+                        warned_for_size = True
+                        logger.warning(
+                            'OpenClaw session registry is approaching the model identity verification limit',
+                            extra={
+                                'agent_name': agent_name,
+                                'registry_size_bytes': registry_size,
+                                'registry_max_bytes': OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
+                            },
+                        )
+                    registry = json.loads(candidate_snapshot.content)
+                except (SafeFileReadError, UnicodeError, json.JSONDecodeError, RecursionError):
+                    continue
+
+                candidate = registry.get(session_key) if isinstance(registry, dict) else None
+                if not isinstance(candidate, dict):
+                    continue
+                status = str(candidate.get('status') or '').strip().lower()
+                if status not in {'completed', 'done'}:
+                    continue
+
+                entry_started_ms = candidate.get('startedAt')
+                entry_ended_ms = candidate.get('endedAt')
+                entry_updated_ms = candidate.get('updatedAt')
+                timing_fields_complete = all(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    for value in (entry_started_ms, entry_ended_ms, entry_updated_ms)
+                )
+                if not timing_fields_complete:
+                    continue
+                observed_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                timing_valid = bool(
+                    entry_started_ms >= started_ms - 5_000
+                    and entry_started_ms <= observed_ms + 5_000
+                    and entry_ended_ms >= entry_started_ms
+                    and entry_ended_ms <= observed_ms + 5_000
+                    and entry_updated_ms >= entry_ended_ms
+                    and entry_updated_ms <= observed_ms + 5_000
+                )
+                if not timing_valid:
+                    continue
+
+                observed_session_id = str(candidate.get('sessionId') or '').strip() or None
+                if observed_session_id is None:
+                    continue
+                if session_id is not None and observed_session_id != session_id:
+                    continue
+                if not str(candidate.get('modelProvider') or '').strip() or not str(
+                    candidate.get('model') or ''
+                ).strip():
+                    continue
+                entry = candidate
+                break
         return build_observed_model_identity(
             role=role,
             expected_model=expected_model,
@@ -2205,6 +2277,7 @@ class AgentFeedbackOrchestrator:
         signal_decider_policy: dict[str, Any] | None = None,
         agent_name: str = SIGNAL_DECIDER_AGENT_NAME,
         previous_decision_context: dict[str, Any] | None = None,
+        source_knowledge_cutoff_at: str | None = None,
     ) -> dict[str, Any]:
         payload = _build_signal_decider_payload_helper(
             item=item,
@@ -2218,7 +2291,1198 @@ class AgentFeedbackOrchestrator:
             previous_decision_context=previous_decision_context,
         )
         payload['orchestration']['required_upstream_roles'] = list(UPSTREAM_SUMMARY_ROLES)
+        payload['decision_input_generation'] = _build_decider_input_generation(
+            source_context=item,
+            market_context=(
+                payload.get('market_context')
+                if isinstance(payload.get('market_context'), dict)
+                else {}
+            ),
+            policy_context=(
+                payload.get('signal_decider_policy')
+                if isinstance(payload.get('signal_decider_policy'), dict)
+                else {}
+            ),
+            previous_decision_context=(
+                payload.get('previous_decision_context')
+                if isinstance(payload.get('previous_decision_context'), dict)
+                else {}
+            ),
+            upstream_summaries=(
+                payload.get('upstream_summaries')
+                if isinstance(payload.get('upstream_summaries'), dict)
+                else {}
+            ),
+            upstream_traceability=(
+                payload.get('upstream_traceability')
+                if isinstance(payload.get('upstream_traceability'), dict)
+                else {}
+            ),
+        )
+        payload['durable_decision_input_generation'] = (
+            _build_durable_decider_input_generation(
+                source_context=item,
+                source_knowledge_cutoff_at=source_knowledge_cutoff_at,
+                policy_context=(
+                    payload.get('signal_decider_policy')
+                    if isinstance(payload.get('signal_decider_policy'), dict)
+                    else {}
+                ),
+                previous_decision_context=(
+                    payload.get('previous_decision_context')
+                    if isinstance(payload.get('previous_decision_context'), dict)
+                    else {}
+                ),
+                upstream_summaries=(
+                    payload.get('upstream_summaries')
+                    if isinstance(payload.get('upstream_summaries'), dict)
+                    else {}
+                ),
+                upstream_traceability=(
+                    payload.get('upstream_traceability')
+                    if isinstance(payload.get('upstream_traceability'), dict)
+                    else {}
+                ),
+            )
+        )
         return payload
+
+    def _revalidate_decider_dispatch_inputs(
+        self,
+        *,
+        market_date: date,
+        request_run_id: str,
+        source_items: Sequence[dict[str, Any]],
+        source_context_scope_symbols: Sequence[str],
+        eligibility_scope_symbols: Sequence[str] | None,
+        fs_div: str | None,
+        disclosures_limit: int,
+        allow_current_run_feedback: bool = False,
+        revalidate_market_context: bool = True,
+        allow_persisted_current_run_upstream: bool = False,
+        durable_source_generation: bool = False,
+        source_knowledge_cutoff_at: str | None = None,
+        revalidate_post_decision_material_context: bool = False,
+        post_decision_check_at: datetime | None = None,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        symbols = _normalize_requested_symbols(
+            [str(item.get('symbol') or '') for item in source_items]
+        )
+        context_scope_symbols = _normalize_requested_symbols(
+            source_context_scope_symbols
+        )
+        source_keys = {
+            (
+                str(
+                    item.get('role') or item.get('agent_name') or ''
+                ).strip(),
+                str(item.get('symbol') or '').strip().upper(),
+            )
+            for item in source_items
+            if str(item.get('symbol') or '').strip()
+        }
+        failures: dict[tuple[str, str], dict[str, Any]] = {}
+
+        try:
+            refreshed_context = agent_context_read_service.get_symbol_day_context(
+                market_date=market_date,
+                symbols=context_scope_symbols,
+                fs_div=fs_div,
+                disclosures_limit=disclosures_limit,
+                knowledge_cutoff_at=source_knowledge_cutoff_at,
+            )
+            refreshed_by_symbol = {
+                str(item.get('symbol') or '').strip().upper(): item
+                for item in (refreshed_context.get('items') or [])
+                if isinstance(item, dict) and item.get('symbol')
+            }
+        except Exception as exc:  # noqa: BLE001
+            for key in source_keys:
+                failures[key] = {
+                    'reason': 'source_context_revalidation_failed',
+                    'error_type': type(exc).__name__,
+                }
+            return failures
+
+        refreshed_market_context: dict[str, Any] | None = None
+        if revalidate_market_context:
+            try:
+                refreshed_market_context = (
+                    signal_decider_market_context_builder.build(
+                        market_date=market_date
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                for key in source_keys:
+                    failures[key] = {
+                        'reason': 'market_context_revalidation_failed',
+                        'error_type': type(exc).__name__,
+                    }
+                return failures
+
+        try:
+            if eligibility_scope_symbols is None:
+                refreshed_records = load_agent_feedback_eligibility_records(
+                    market_date=market_date,
+                    requested_symbols=None,
+                )
+                refreshed_records_by_symbol = {
+                    str(record.get('symbol') or '').strip().upper(): record
+                    for record in refreshed_records
+                    if str(record.get('symbol') or '').strip()
+                }
+                refreshed_eligible_set = {
+                    symbol
+                    for symbol, record in refreshed_records_by_symbol.items()
+                    if not bool(record.get('hard_blocked'))
+                    and not bool(record.get('cap_excluded'))
+                }
+                refreshed_eligibility = {
+                    'records_by_symbol': refreshed_records_by_symbol,
+                }
+            else:
+                refreshed_eligible_symbols, _, refreshed_eligibility = (
+                    _split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
+                        market_date=market_date,
+                        requested_symbols=eligibility_scope_symbols,
+                    )
+                )
+                refreshed_eligible_set = set(refreshed_eligible_symbols)
+        except Exception as exc:  # noqa: BLE001
+            refreshed_eligible_set = set()
+            refreshed_eligibility = {
+                'lookup_error_type': type(exc).__name__,
+            }
+
+        state = runtime_feedback_state_store.get_run(
+            market_date,
+            run_id=request_run_id,
+        )
+        buffered_lookup = _feedback_row_lookup(
+            state.buffered_feedback_rows if state is not None else []
+        )
+        persisted_source_symbols = {
+            str(item.get('symbol') or '').strip().upper()
+            for item in source_items
+            if any(
+                isinstance(trace, dict)
+                and (
+                    str(trace.get('source') or '').startswith('persisted_feedback')
+                    or (
+                        allow_persisted_current_run_upstream
+                        and str(trace.get('source') or '') == 'current_run_buffer'
+                    )
+                )
+                for trace in (
+                    item.get('upstream_traceability', {}).values()
+                    if isinstance(item.get('upstream_traceability'), dict)
+                    else []
+                )
+            )
+        }
+        persisted_decisions: dict[str, dict[str, Any]] = {}
+        persisted_lookup_error: str | None = None
+        if persisted_source_symbols:
+            try:
+                persisted_decisions = (
+                    agent_context_reuse_service.build_latest_decisions(
+                        market_date=market_date,
+                        symbols=sorted(persisted_source_symbols),
+                        roles=UPSTREAM_SUMMARY_ROLES,
+                        force_recompute=False,
+                        knowledge_cutoff_at=source_knowledge_cutoff_at,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                persisted_lookup_error = type(exc).__name__
+
+        decision_roles = sorted(
+            {
+                str(item.get('role') or item.get('agent_name') or '').strip()
+                for item in source_items
+                if str(item.get('role') or item.get('agent_name') or '').strip()
+                in DECISION_SUPPORT_AGENT_NAMES
+            }
+        )
+        current_decisions: dict[str, dict[str, Any]] = {}
+        current_decision_lookup_error: str | None = None
+        if decision_roles:
+            try:
+                current_decisions = (
+                    agent_context_reuse_service.build_latest_decisions(
+                        market_date=market_date,
+                        symbols=symbols,
+                        roles=decision_roles,
+                        force_recompute=False,
+                        knowledge_cutoff_at=source_knowledge_cutoff_at,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                current_decision_lookup_error = type(exc).__name__
+
+        for source_item in source_items:
+            symbol = str(source_item.get('symbol') or '').strip().upper()
+            decision_role = str(
+                source_item.get('role') or source_item.get('agent_name') or ''
+            ).strip()
+            reasons: list[dict[str, Any]] = []
+            if symbol not in refreshed_eligible_set:
+                record = (
+                    refreshed_eligibility.get('records_by_symbol', {}).get(
+                        symbol
+                    )
+                    if isinstance(
+                        refreshed_eligibility.get('records_by_symbol'),
+                        dict,
+                    )
+                    else None
+                )
+                reasons.append(
+                    {
+                        'code': 'eligibility_changed_or_unavailable',
+                        'hard_block_reasons': (
+                            record.get('hard_block_reasons')
+                            if isinstance(record, dict)
+                            else None
+                        ),
+                        'lookup_error_type': refreshed_eligibility.get(
+                            'lookup_error_type'
+                        ),
+                    }
+                )
+            expected_generation = source_item.get(
+                'durable_decision_input_generation'
+                if durable_source_generation
+                else 'decision_input_generation'
+            )
+            raw_refreshed_item = refreshed_by_symbol.get(symbol)
+            refreshed_item = (
+                dict(raw_refreshed_item)
+                if isinstance(raw_refreshed_item, dict)
+                else None
+            )
+            refreshed_eligibility_record = (
+                refreshed_eligibility.get('records_by_symbol', {}).get(symbol)
+                if isinstance(
+                    refreshed_eligibility.get('records_by_symbol'),
+                    dict,
+                )
+                else None
+            )
+            expected_symbol_context = source_item.get('symbol_day_context')
+            eligibility_was_part_of_generation = bool(
+                isinstance(expected_symbol_context, dict)
+                and 'agent_feedback_eligibility' in expected_symbol_context
+            )
+            if isinstance(refreshed_item, dict) and eligibility_was_part_of_generation:
+                if isinstance(refreshed_eligibility_record, dict):
+                    refreshed_item['agent_feedback_eligibility'] = (
+                        refreshed_eligibility_record
+                    )
+                else:
+                    refreshed_item.pop('agent_feedback_eligibility', None)
+            refreshed_policy_context: dict[str, Any] = {}
+            try:
+                if decision_role == SIGNAL_DECIDER_AGENT_NAME:
+                    refreshed_policy_context = (
+                        self._attach_signal_decider_performance_criteria(
+                            policy_context=(
+                                signal_decider_loop_service
+                                .get_active_policy_context()
+                            ),
+                            market_date=market_date,
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                reasons.append(
+                    {
+                        'code': 'policy_context_revalidation_failed',
+                        'error_type': type(exc).__name__,
+                    }
+                )
+
+            expected_previous_context = (
+                source_item.get('previous_decision_context')
+                if isinstance(source_item.get('previous_decision_context'), dict)
+                else {}
+            )
+            refreshed_previous_context = expected_previous_context
+            current_decision = current_decisions.get(symbol, {}).get(
+                decision_role
+            )
+            current_feedback = (
+                getattr(current_decision, 'latest_feedback', None)
+                if current_decision is not None
+                else None
+            )
+            current_feedback_run_id = (
+                str(current_feedback.get('run_id') or '').strip()
+                if isinstance(current_feedback, dict)
+                else ''
+            )
+            current_run_feedback_is_authoritative = bool(
+                allow_current_run_feedback
+                and current_feedback_run_id == request_run_id
+                and not bool(
+                    getattr(current_decision, 'should_dispatch', True)
+                )
+            )
+            if current_decision_lookup_error is not None:
+                reasons.append(
+                    {
+                        'code': 'previous_decision_revalidation_failed',
+                        'error_type': current_decision_lookup_error,
+                    }
+                )
+            elif not current_run_feedback_is_authoritative:
+                refreshed_previous_context = (
+                    build_previous_decision_context(
+                        role=decision_role,
+                        latest_feedback=(
+                            current_feedback
+                            if isinstance(current_feedback, dict)
+                            else None
+                        ),
+                    )
+                    or {}
+                )
+                if bool(
+                    current_decision is not None
+                    and getattr(current_decision, 'should_dispatch', False)
+                    and current_feedback_run_id == request_run_id
+                ):
+                    reasons.append(
+                        {
+                            'code': 'current_run_decision_failure_detected',
+                            'reuse_reason': getattr(
+                                current_decision,
+                                'reason',
+                                None,
+                            ),
+                        }
+                    )
+
+            generation_inputs = {
+                'source_context': refreshed_item,
+                'policy_context': refreshed_policy_context,
+                'previous_decision_context': refreshed_previous_context,
+                'upstream_summaries': (
+                    source_item.get('upstream_summaries')
+                    if isinstance(source_item.get('upstream_summaries'), dict)
+                    else {}
+                ),
+                'upstream_traceability': (
+                    source_item.get('upstream_traceability')
+                    if isinstance(source_item.get('upstream_traceability'), dict)
+                    else {}
+                ),
+            }
+            if isinstance(refreshed_item, dict):
+                if durable_source_generation:
+                    observed_generation = (
+                        _build_durable_decider_input_generation(
+                            source_knowledge_cutoff_at=(
+                                source_knowledge_cutoff_at
+                            ),
+                            **generation_inputs
+                        )
+                    )
+                else:
+                    observed_generation = _build_decider_input_generation(
+                        **generation_inputs,
+                        market_context=(
+                            refreshed_market_context
+                            if revalidate_market_context
+                            and isinstance(refreshed_market_context, dict)
+                            else (
+                                source_item.get('market_context')
+                                if isinstance(
+                                    source_item.get('market_context'), dict
+                                )
+                                else {}
+                            )
+                        ),
+                    )
+            else:
+                observed_generation = None
+            if not isinstance(expected_generation, dict):
+                reasons.append({'code': 'source_generation_missing'})
+            elif observed_generation is None:
+                reasons.append({'code': 'source_context_missing'})
+            else:
+                component_reason_by_key = {
+                    'source_context_fingerprint': 'source_context_changed',
+                    'policy_context_fingerprint': 'policy_context_changed',
+                    'previous_decision_context_fingerprint': (
+                        'previous_decision_context_changed'
+                    ),
+                }
+                if revalidate_market_context:
+                    component_reason_by_key[
+                        'market_context_fingerprint'
+                    ] = 'market_context_changed'
+                for component_key, reason_code in component_reason_by_key.items():
+                    if expected_generation.get(
+                        component_key
+                    ) != observed_generation.get(component_key):
+                        reasons.append({'code': reason_code})
+
+            upstream_traceability = source_item.get('upstream_traceability')
+            upstream_summaries = source_item.get('upstream_summaries')
+            if not isinstance(upstream_traceability, dict):
+                upstream_traceability = {}
+            if not isinstance(upstream_summaries, dict):
+                upstream_summaries = {}
+            for upstream_role in UPSTREAM_SUMMARY_ROLES:
+                trace = upstream_traceability.get(upstream_role)
+                expected_summary = upstream_summaries.get(upstream_role)
+                if not isinstance(trace, dict) or not isinstance(
+                    expected_summary,
+                    dict,
+                ):
+                    reasons.append(
+                        {
+                            'code': 'upstream_trace_missing',
+                            'role': upstream_role,
+                        }
+                    )
+                    continue
+                source = str(trace.get('source') or '')
+                if source == 'current_run_buffer':
+                    buffered_row = buffered_lookup.get((symbol, upstream_role))
+                    buffered_feedback = (
+                        buffered_row.get('feedback')
+                        if isinstance(buffered_row, dict)
+                        and isinstance(buffered_row.get('feedback'), dict)
+                        else None
+                    )
+                    buffered_identity_matches = bool(
+                        buffered_feedback == expected_summary
+                        and str((buffered_row or {}).get('run_id') or '')
+                        == str(trace.get('run_id') or '')
+                    )
+                    if buffered_identity_matches:
+                        continue
+                    if allow_persisted_current_run_upstream:
+                        if persisted_lookup_error is not None:
+                            reasons.append(
+                                {
+                                    'code': (
+                                        'persisted_current_run_upstream_'
+                                        'revalidation_failed'
+                                    ),
+                                    'role': upstream_role,
+                                    'error_type': persisted_lookup_error,
+                                }
+                            )
+                            continue
+                        decision = persisted_decisions.get(symbol, {}).get(
+                            upstream_role
+                        )
+                        latest_feedback = (
+                            getattr(decision, 'latest_feedback', None)
+                            if decision is not None
+                            else None
+                        )
+                        persisted_identity_matches = bool(
+                            decision is not None
+                            and not bool(
+                                getattr(decision, 'should_dispatch', True)
+                            )
+                            and isinstance(latest_feedback, dict)
+                            and str(latest_feedback.get('run_id') or '')
+                            == str(trace.get('run_id') or '')
+                            and latest_feedback.get('feedback_payload')
+                            == expected_summary
+                            and (
+                                trace.get('feedback_id') is None
+                                or str(latest_feedback.get('id'))
+                                == str(trace.get('feedback_id'))
+                            )
+                            and (
+                                trace.get('received_at') is None
+                                or str(latest_feedback.get('received_at') or '')
+                                == str(trace.get('received_at') or '')
+                            )
+                        )
+                        if persisted_identity_matches:
+                            continue
+                        reasons.append(
+                            {
+                                'code': 'persisted_current_run_upstream_changed',
+                                'role': upstream_role,
+                                'reuse_reason': (
+                                    getattr(decision, 'reason', None)
+                                    if decision is not None
+                                    else None
+                                ),
+                            }
+                        )
+                    else:
+                        reasons.append(
+                            {
+                                'code': 'current_run_upstream_changed',
+                                'role': upstream_role,
+                            }
+                        )
+                    continue
+                if not source.startswith('persisted_feedback'):
+                    reasons.append(
+                        {
+                            'code': 'upstream_trace_source_invalid',
+                            'role': upstream_role,
+                        }
+                    )
+                    continue
+                if persisted_lookup_error is not None:
+                    reasons.append(
+                        {
+                            'code': 'persisted_upstream_revalidation_failed',
+                            'role': upstream_role,
+                            'error_type': persisted_lookup_error,
+                        }
+                    )
+                    continue
+                decision = persisted_decisions.get(symbol, {}).get(upstream_role)
+                latest_feedback = (
+                    getattr(decision, 'latest_feedback', None)
+                    if decision is not None
+                    else None
+                )
+                identity_matches = bool(
+                    decision is not None
+                    and not bool(getattr(decision, 'should_dispatch', True))
+                    and isinstance(latest_feedback, dict)
+                    and str(latest_feedback.get('run_id') or '')
+                    == str(trace.get('run_id') or '')
+                    and latest_feedback.get('feedback_payload') == expected_summary
+                    and (
+                        trace.get('feedback_id') is None
+                        or str(latest_feedback.get('id'))
+                        == str(trace.get('feedback_id'))
+                    )
+                    and (
+                        trace.get('received_at') is None
+                        or str(latest_feedback.get('received_at') or '')
+                        == str(trace.get('received_at') or '')
+                    )
+                )
+                if not identity_matches:
+                    reasons.append(
+                        {
+                            'code': 'persisted_upstream_changed',
+                            'role': upstream_role,
+                            'reuse_reason': (
+                                getattr(decision, 'reason', None)
+                                if decision is not None
+                                else None
+                            ),
+                        }
+                    )
+
+            if reasons:
+                failures[(decision_role, symbol)] = {
+                    'reason': 'decider_inputs_changed_during_dispatch',
+                    'expected_generation': expected_generation,
+                    'observed_generation': observed_generation,
+                    'reasons': reasons,
+                }
+        if (
+            revalidate_post_decision_material_context
+            and source_knowledge_cutoff_at
+        ):
+            post_decision_failures = (
+                self._load_post_decision_material_context_failures(
+                    market_date=market_date,
+                    source_items=source_items,
+                    source_knowledge_cutoff_at=source_knowledge_cutoff_at,
+                    disclosures_limit=disclosures_limit,
+                    check_at=post_decision_check_at,
+                )
+            )
+            for key, post_decision_failure in post_decision_failures.items():
+                if key in failures:
+                    failures[key]['post_decision_material_context'] = (
+                        post_decision_failure
+                    )
+                else:
+                    failures[key] = post_decision_failure
+        return failures
+
+    @staticmethod
+    def _post_decision_material_reasons(
+        *,
+        market_date: date,
+        news_items: Sequence[dict[str, Any]],
+        disclosures: Sequence[dict[str, Any]],
+        source_knowledge_cutoff_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        reasons: list[dict[str, Any]] = []
+        concerning_news = []
+        for item in news_items:
+            if not isinstance(item, dict):
+                continue
+            classification = (
+                item.get('classification')
+                if isinstance(item.get('classification'), dict)
+                else {}
+            )
+            materiality = str(
+                item.get('materiality')
+                or classification.get('materiality')
+                or 'unknown'
+            ).strip().lower()
+            if materiality == 'noise':
+                continue
+            concerning_news.append(
+                {
+                    'external_news_item_id': item.get('id'),
+                    'provider': item.get('provider'),
+                    'provider_item_id': item.get('provider_item_id'),
+                    'materiality': materiality,
+                    'published_at': item.get('published_at'),
+                    'collected_at': item.get('collected_at'),
+                    'associated_at': item.get('associated_at'),
+                    'classified_at': (
+                        item.get('classification_provenance') or {}
+                    ).get('classified_at'),
+                }
+            )
+        if concerning_news:
+            reasons.append(
+                {
+                    'code': 'post_decision_news_requires_redecision',
+                    'event_count': len(concerning_news),
+                    'events': concerning_news[:20],
+                }
+            )
+
+        new_disclosures = []
+        for item in disclosures:
+            if not isinstance(item, dict):
+                continue
+            raw_receipt_date = item.get('receipt_date')
+            try:
+                receipt_date = (
+                    raw_receipt_date.date()
+                    if isinstance(raw_receipt_date, datetime)
+                    else raw_receipt_date
+                    if isinstance(raw_receipt_date, date)
+                    else date.fromisoformat(str(raw_receipt_date))
+                )
+            except (TypeError, ValueError):
+                # An unparseable new disclosure cannot safely authorize reuse.
+                receipt_date = None
+
+            raw_observed_at = item.get('created_at')
+            try:
+                observed_at = (
+                    raw_observed_at
+                    if isinstance(raw_observed_at, datetime)
+                    else datetime.fromisoformat(
+                        str(raw_observed_at).replace('Z', '+00:00')
+                    )
+                )
+            except (TypeError, ValueError):
+                observed_at = None
+            if (
+                observed_at is not None
+                and observed_at.tzinfo is not None
+                and observed_at.utcoffset() is not None
+            ):
+                observed_at = observed_at.astimezone(timezone.utc)
+            else:
+                observed_at = None
+
+            observed_after_cutoff = bool(
+                source_knowledge_cutoff_at is not None
+                and observed_at is not None
+                and observed_at >= source_knowledge_cutoff_at
+            )
+            same_day_observation_unavailable = bool(
+                source_knowledge_cutoff_at is not None
+                and receipt_date == market_date
+                and observed_at is None
+            )
+            if (
+                receipt_date is not None
+                and receipt_date <= market_date
+                and not observed_after_cutoff
+                and not same_day_observation_unavailable
+            ):
+                continue
+            new_disclosures.append(
+                {
+                    'rcept_no': item.get('rcept_no'),
+                    'receipt_date': (
+                        receipt_date.isoformat()
+                        if receipt_date is not None
+                        else raw_receipt_date
+                    ),
+                    'observed_at': (
+                        observed_at.isoformat()
+                        if observed_at is not None
+                        else raw_observed_at
+                    ),
+                    'filing_category': item.get('filing_category'),
+                    'is_financial_report': item.get('is_financial_report'),
+                }
+            )
+        if new_disclosures:
+            reasons.append(
+                {
+                    'code': 'post_decision_disclosure_requires_redecision',
+                    'event_count': len(new_disclosures),
+                    'events': new_disclosures[:20],
+                }
+            )
+        return reasons
+
+    def _load_post_decision_material_context_failures(
+        self,
+        *,
+        market_date: date,
+        source_items: Sequence[dict[str, Any]],
+        source_knowledge_cutoff_at: str,
+        disclosures_limit: int,
+        check_at: datetime | None = None,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        source_keys = {
+            (
+                str(item.get('role') or item.get('agent_name') or '').strip(),
+                str(item.get('symbol') or '').strip().upper(),
+            )
+            for item in source_items
+            if str(item.get('symbol') or '').strip()
+        }
+        if not source_keys:
+            return {}
+        try:
+            cutoff = datetime.fromisoformat(
+                str(source_knowledge_cutoff_at).replace('Z', '+00:00')
+            )
+        except (TypeError, ValueError):
+            cutoff = None
+        if (
+            cutoff is None
+            or cutoff.tzinfo is None
+            or cutoff.utcoffset() is None
+        ):
+            return {
+                key: {
+                    'reason': 'post_decision_material_context_unavailable',
+                    'reasons': [
+                        {'code': 'source_knowledge_cutoff_missing_or_invalid'}
+                    ],
+                }
+                for key in source_keys
+            }
+        cutoff = cutoff.astimezone(timezone.utc)
+        authority_check_at = (check_at or datetime.now(timezone.utc))
+        if (
+            authority_check_at.tzinfo is None
+            or authority_check_at.utcoffset() is None
+        ):
+            authority_check_at = authority_check_at.replace(
+                tzinfo=timezone.utc
+            )
+        else:
+            authority_check_at = authority_check_at.astimezone(timezone.utc)
+        if authority_check_at <= cutoff:
+            return {}
+
+        symbols = sorted({symbol for _, symbol in source_keys})
+        try:
+            news_by_symbol: dict[str, list[dict[str, Any]]] = {}
+            capped_news_symbols: set[str] = set()
+            for symbol in symbols:
+                news_items = list_external_news_items(
+                    symbols=[symbol],
+                    limit=POST_DECISION_NEWS_SCAN_LIMIT + 1,
+                    published_before=authority_check_at,
+                    collected_before=authority_check_at,
+                    observed_after=cutoff,
+                )
+                if len(news_items) > POST_DECISION_NEWS_SCAN_LIMIT:
+                    capped_news_symbols.add(symbol)
+                news_by_symbol[symbol] = news_items[
+                    :POST_DECISION_NEWS_SCAN_LIMIT
+                ]
+        except Exception as exc:  # noqa: BLE001
+            return {
+                key: {
+                    'reason': 'post_decision_material_context_unavailable',
+                    'reasons': [
+                        {
+                            'code': 'post_decision_news_lookup_failed',
+                            'error_type': type(exc).__name__,
+                        }
+                    ],
+                }
+                for key in source_keys
+            }
+
+        try:
+            disclosure_cutoff_date = authority_check_at.astimezone(
+                ZoneInfo('Asia/Seoul')
+            ).date()
+            disclosures_by_symbol = (
+                agent_context_read_service.disclosure_repository
+                .list_recent_events_by_stock_codes(
+                    stock_codes=symbols,
+                    receipt_date_to=disclosure_cutoff_date,
+                    observed_at_or_after=cutoff,
+                    observed_before=authority_check_at,
+                    limit_per_symbol=max(5, int(disclosures_limit)),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                key: {
+                    'reason': 'post_decision_material_context_unavailable',
+                    'reasons': [
+                        {
+                            'code': 'post_decision_disclosure_lookup_failed',
+                            'error_type': type(exc).__name__,
+                        }
+                    ],
+                }
+                for key in source_keys
+            }
+
+        failures: dict[tuple[str, str], dict[str, Any]] = {}
+        for key in source_keys:
+            _, symbol = key
+            if symbol in capped_news_symbols:
+                failures[key] = {
+                    'reason': 'post_decision_material_context_unavailable',
+                    'reasons': [
+                        {
+                            'code': 'post_decision_news_scan_limit_exceeded',
+                            'scan_limit': POST_DECISION_NEWS_SCAN_LIMIT,
+                        }
+                    ],
+                }
+                continue
+            reasons = self._post_decision_material_reasons(
+                market_date=market_date,
+                news_items=news_by_symbol.get(symbol, []),
+                disclosures=disclosures_by_symbol.get(symbol, []),
+                source_knowledge_cutoff_at=cutoff,
+            )
+            if reasons:
+                failures[key] = {
+                    'reason': 'post_decision_material_context_changed',
+                    'source_knowledge_cutoff_at': cutoff.isoformat(),
+                    'reasons': reasons,
+                }
+        return failures
+
+    def revalidate_persisted_decider_snapshots(
+        self,
+        *,
+        market_date: str | date,
+        snapshots: Sequence[Any],
+    ) -> dict[str, Any]:
+        """Revalidate immutable decision inputs before next-open execution use.
+
+        Non-actionable snapshots created before the durable generation fence remain
+        readable for migration compatibility. An actionable legacy snapshot fails
+        closed until a decider retry regenerates it with fenced inputs. Persisted
+        payload strings must decode to bounded JSON objects before either path is
+        classified. Newly fenced snapshots fail closed when their source-day EOD
+        data, eligibility, policy, prior decision, or exact upstream lineage no
+        longer matches. Current-session quote/order-book context is intentionally
+        delegated to the next-open live market authority gate.
+        """
+
+        normalized_market_date = (
+            market_date
+            if isinstance(market_date, date)
+            else date.fromisoformat(market_date)
+        )
+        validation_by_snapshot_id: dict[int, dict[str, Any]] = {}
+        grouped: dict[str, dict[str, Any]] = {}
+
+        for snapshot in snapshots:
+            snapshot_id = int(getattr(snapshot, 'id'))
+            request_payload, request_payload_error = (
+                _parse_persisted_snapshot_json_object(
+                    getattr(snapshot, 'request_payload', None)
+                )
+            )
+            response_payload, response_payload_error = (
+                _parse_persisted_snapshot_json_object(
+                    getattr(snapshot, 'response_payload', None)
+                )
+            )
+            payload_errors = {
+                name: error
+                for name, error in (
+                    ('request_payload', request_payload_error),
+                    ('response_payload', response_payload_error),
+                )
+                if error is not None
+            }
+            if payload_errors:
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'persisted_snapshot_payload_invalid',
+                    'payload_errors': payload_errors,
+                }
+                continue
+
+            fence = request_payload.get('decision_input_generation_fence')
+            if (
+                not isinstance(fence, dict)
+                or fence.get('enforcement') != 'required'
+            ):
+                action_values = {
+                    str(value or '').strip().lower()
+                    for value in (
+                        getattr(snapshot, 'decision_action', None),
+                        getattr(snapshot, 'next_day_open_action', None),
+                        response_payload.get('preferred_action'),
+                        response_payload.get('tactical_action'),
+                    )
+                }
+                actionable_legacy = bool(
+                    action_values
+                    & {'buy', 'scalp_buy_candidate', 'watch_for_trigger'}
+                )
+                validation_by_snapshot_id[snapshot_id] = (
+                    {
+                        'status': 'invalid',
+                        'reason': (
+                            'actionable_snapshot_missing_durable_generation_fence'
+                        ),
+                    }
+                    if actionable_legacy
+                    else {
+                        'status': 'legacy_unenforced',
+                        'reason': 'durable_generation_fence_not_present',
+                    }
+                )
+                continue
+
+            revalidation_request = request_payload.get(
+                'source_revalidation_request'
+            )
+            durable_generation = request_payload.get(
+                'durable_decision_input_generation'
+            )
+            decision_run_id = str(
+                getattr(snapshot, 'decision_run_id', None) or ''
+            ).strip()
+            if (
+                not isinstance(revalidation_request, dict)
+                or not decision_run_id
+                or 'eligibility_scope_symbols' not in revalidation_request
+                or not isinstance(
+                    revalidation_request.get('source_context_scope_symbols'),
+                    list,
+                )
+                or not revalidation_request.get('source_context_scope_symbols')
+                or not isinstance(
+                    durable_generation,
+                    dict,
+                )
+            ):
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'durable_generation_metadata_missing',
+                }
+                continue
+
+            if (
+                durable_generation.get('schema_version')
+                != 'durable_decider_input_generation_v1'
+                or durable_generation.get('durable_reuse_eligible') is not True
+            ):
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'snapshot_source_not_durable',
+                    'non_durable_reasons': list(
+                        durable_generation.get('non_durable_reasons') or []
+                    ),
+                }
+                continue
+
+            raw_eligibility_scope = revalidation_request.get(
+                'eligibility_scope_symbols'
+            )
+            if raw_eligibility_scope is not None and not isinstance(
+                raw_eligibility_scope,
+                list,
+            ):
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'durable_generation_metadata_invalid',
+                }
+                continue
+            try:
+                disclosures_limit = max(
+                    0,
+                    int(revalidation_request.get('disclosures_limit', 5)),
+                )
+            except (TypeError, ValueError):
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'durable_generation_metadata_invalid',
+                }
+                continue
+            raw_knowledge_cutoff = revalidation_request.get(
+                'knowledge_cutoff_at'
+            )
+            try:
+                parsed_knowledge_cutoff = datetime.fromisoformat(
+                    str(raw_knowledge_cutoff).replace('Z', '+00:00')
+                )
+            except (TypeError, ValueError):
+                parsed_knowledge_cutoff = None
+            if (
+                parsed_knowledge_cutoff is None
+                or parsed_knowledge_cutoff.tzinfo is None
+                or parsed_knowledge_cutoff.utcoffset() is None
+            ):
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'durable_knowledge_cutoff_missing_or_invalid',
+                }
+                continue
+            normalized_knowledge_cutoff = (
+                parsed_knowledge_cutoff.astimezone(timezone.utc).isoformat()
+            )
+            group_material = {
+                'decision_run_id': decision_run_id,
+                'fs_div': revalidation_request.get('fs_div'),
+                'disclosures_limit': disclosures_limit,
+                'source_context_scope_symbols': revalidation_request[
+                    'source_context_scope_symbols'
+                ],
+                'eligibility_scope_symbols': raw_eligibility_scope,
+                'source_knowledge_cutoff_at': normalized_knowledge_cutoff,
+            }
+            group_key = json.dumps(
+                group_material,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(',', ':'),
+            )
+            group = grouped.setdefault(
+                group_key,
+                {
+                    'material': group_material,
+                    'snapshots': [],
+                    'source_items': [],
+                },
+            )
+            group['snapshots'].append(snapshot)
+            group['source_items'].append(request_payload)
+
+        for group in grouped.values():
+            material = group['material']
+            try:
+                failures = self._revalidate_decider_dispatch_inputs(
+                    market_date=normalized_market_date,
+                    request_run_id=material['decision_run_id'],
+                    source_items=group['source_items'],
+                    source_context_scope_symbols=material[
+                        'source_context_scope_symbols'
+                    ],
+                    eligibility_scope_symbols=material[
+                        'eligibility_scope_symbols'
+                    ],
+                    fs_div=material['fs_div'],
+                    disclosures_limit=material['disclosures_limit'],
+                    allow_current_run_feedback=True,
+                    revalidate_market_context=False,
+                    allow_persisted_current_run_upstream=True,
+                    durable_source_generation=True,
+                    revalidate_post_decision_material_context=True,
+                    source_knowledge_cutoff_at=material[
+                        'source_knowledge_cutoff_at'
+                    ],
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures = {
+                    (
+                        str(getattr(snapshot, 'agent_name', None) or '').strip(),
+                        str(getattr(snapshot, 'symbol', None) or '')
+                        .strip()
+                        .upper(),
+                    ): {
+                        'reason': 'durable_generation_revalidation_failed',
+                        'error_type': type(exc).__name__,
+                    }
+                    for snapshot in group['snapshots']
+                }
+
+            for snapshot in group['snapshots']:
+                snapshot_id = int(getattr(snapshot, 'id'))
+                scope_key = (
+                    str(getattr(snapshot, 'agent_name', None) or '').strip(),
+                    str(getattr(snapshot, 'symbol', None) or '').strip().upper(),
+                )
+                failure = failures.get(scope_key)
+                validation_by_snapshot_id[snapshot_id] = (
+                    {
+                        'status': 'invalid',
+                        'reason': 'durable_decider_inputs_changed',
+                        'details': failure,
+                    }
+                    if isinstance(failure, dict)
+                    else {
+                        'status': 'valid',
+                        'reason': 'durable_decider_inputs_unchanged',
+                    }
+                )
+
+        valid_snapshot_ids = sorted(
+            snapshot_id
+            for snapshot_id, validation in validation_by_snapshot_id.items()
+            if validation.get('status') in {'valid', 'legacy_unenforced'}
+        )
+        invalid_snapshot_ids = sorted(
+            set(validation_by_snapshot_id).difference(valid_snapshot_ids)
+        )
+        snapshot_identity_by_id = {
+            int(getattr(snapshot, 'id')): {
+                'symbol': str(getattr(snapshot, 'symbol', '') or '')
+                .strip()
+                .upper(),
+                'agent_name': str(
+                    getattr(snapshot, 'agent_name', '') or ''
+                ).strip(),
+            }
+            for snapshot in snapshots
+        }
+        generation_material = {
+            'schema_version': 'persisted_decider_generation_validation_v1',
+            'market_date': normalized_market_date.isoformat(),
+            'valid_snapshot_ids': valid_snapshot_ids,
+            'invalid_snapshot_ids': invalid_snapshot_ids,
+            'validations': [
+                {
+                    'snapshot_id': snapshot_id,
+                    **snapshot_identity_by_id.get(snapshot_id, {}),
+                    **validation_by_snapshot_id[snapshot_id],
+                }
+                for snapshot_id in sorted(validation_by_snapshot_id)
+            ],
+        }
+        encoded = json.dumps(
+            jsonable_encoder(generation_material),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        return {
+            **generation_material,
+            'generation_fingerprint': (
+                'sha256:' + hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+            ),
+        }
 
     def _prepare_role_dispatch_items(
         self,
@@ -2227,6 +3491,11 @@ class AgentFeedbackOrchestrator:
         market_date: date,
         request_run_id: str,
         symbol_context_items: Sequence[dict[str, Any]],
+        source_context_scope_symbols: Sequence[str],
+        eligibility_scope_symbols: Sequence[str] | None,
+        fs_div: str | None,
+        disclosures_limit: int,
+        source_knowledge_cutoff_at: str | None,
         reuse_decisions: dict[str, dict[str, Any]],
         upstream_reuse_decisions: dict[str, dict[str, Any]],
         all_failures: list[dict[str, Any]],
@@ -2315,19 +3584,39 @@ class AgentFeedbackOrchestrator:
                 role=role,
                 latest_feedback=getattr(decision, 'latest_feedback', None) if decision is not None else None,
             )
-            dispatch_items.append(
-                self._build_signal_decider_payload(
-                    item=item,
-                    market_date=market_date,
-                    request_run_id=request_run_id,
-                    market_context=market_context,
-                    upstream_summaries=upstream_summaries,
-                    upstream_traceability=upstream_traceability,
-                    signal_decider_policy=active_signal_decider_policy,
-                    agent_name=role,
-                    previous_decision_context=previous_decision_context,
-                )
+            payload = self._build_signal_decider_payload(
+                item=item,
+                market_date=market_date,
+                request_run_id=request_run_id,
+                market_context=market_context,
+                upstream_summaries=upstream_summaries,
+                upstream_traceability=upstream_traceability,
+                signal_decider_policy=active_signal_decider_policy,
+                agent_name=role,
+                previous_decision_context=previous_decision_context,
+                source_knowledge_cutoff_at=source_knowledge_cutoff_at,
             )
+            payload['source_revalidation_request'] = {
+                'schema_version': 'decider_source_revalidation_request_v1',
+                'source_context_scope_symbols': list(
+                    source_context_scope_symbols
+                ),
+                'eligibility_scope_symbols': (
+                    list(eligibility_scope_symbols)
+                    if eligibility_scope_symbols is not None
+                    else None
+                ),
+                'fs_div': fs_div,
+                'disclosures_limit': int(disclosures_limit),
+                'knowledge_cutoff_at': source_knowledge_cutoff_at,
+            }
+            payload['decision_input_generation_fence'] = {
+                'schema_version': 'decision_input_generation_fence_v1',
+                'enforcement': 'required',
+                'durable_revalidation_required': True,
+                'market_context_authority': 'next_open_live_market_gate',
+            }
+            dispatch_items.append(payload)
         return dispatch_items
 
     def _attach_signal_decider_performance_criteria(
@@ -2897,6 +4186,31 @@ class AgentFeedbackOrchestrator:
                 role: sorted(symbols)
                 for role, symbols in state.reused_symbols_by_role.items()
             },
+            'completed_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in state.completed_symbols_by_role.items()
+            },
+            'failed_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in state.failed_symbols_by_role.items()
+            },
+            'stale_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in state.stale_symbols_by_role.items()
+            },
+            'retry_pending_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in state.retry_pending_symbols_by_role.items()
+            },
+            'reused_feedback_evidence_by_role': {
+                role: {
+                    symbol: dict(evidence)
+                    for symbol, evidence in sorted(symbol_evidence.items())
+                }
+                for role, symbol_evidence in sorted(
+                    state.reused_feedback_evidence_by_role.items()
+                )
+            },
             'flush_result': flush_result,
             'fatal_error': fatal_error,
             'last_activity_at': state.last_activity_at.isoformat() if state.last_activity_at else None,
@@ -3352,8 +4666,10 @@ class AgentFeedbackOrchestrator:
         roles: Sequence[str] | None = None,
         fs_div: str | None = None,
         disclosures_limit: int = 5,
+        knowledge_cutoff_at: datetime | str | None = None,
         reuse_existing: bool = True,
         request_run_id: str | None = None,
+        parent_run_id: str | None = None,
         force: bool = False,
         force_recompute: bool = False,
         auto_scope: bool = False,
@@ -3361,6 +4677,15 @@ class AgentFeedbackOrchestrator:
         funnel_diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
+        effective_knowledge_cutoff_at, _knowledge_cutoff_source = (
+            resolve_external_news_knowledge_cutoff_for_symbols(
+                market_date=normalized_market_date,
+                symbols=symbols,
+                knowledge_cutoff_at=knowledge_cutoff_at,
+            )
+        )
+        requested_knowledge_cutoff_at = effective_knowledge_cutoff_at.isoformat()
+        normalized_parent_run_id = str(parent_run_id or '').strip() or None
         specs = self._select_specs(roles=roles)
         requested_role_names = [spec.role for spec in specs]
         requested_symbols = _normalize_requested_symbols(symbols)
@@ -3375,9 +4700,11 @@ class AgentFeedbackOrchestrator:
                     'symbols': requested_symbols,
                     'requested_symbols': requested_symbols,
                     'request_run_id': None,
+                    'parent_run_id': normalized_parent_run_id,
                     'roles': [spec.role for spec in specs],
                     'fs_div': fs_div,
                     'disclosures_limit': disclosures_limit,
+                    'knowledge_cutoff_at': requested_knowledge_cutoff_at,
                     'reuse_existing': reuse_existing,
                     'force_recompute': force_recompute,
                     'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
@@ -3400,11 +4727,17 @@ class AgentFeedbackOrchestrator:
                 'failures': [],
                 'prerequisites': prerequisites,
             }
-        if auto_scope and role_symbol_scopes is not None and funnel_diagnostics is not None:
+        uses_precomputed_auto_scope = bool(
+            auto_scope
+            and role_symbol_scopes is not None
+            and funnel_diagnostics is not None
+        )
+        if uses_precomputed_auto_scope:
             dispatch_symbols = _ordered_union(role_symbol_scopes.values())
             skipped_symbols = []
             eligibility_diagnostics = {}
             public_eligibility_diagnostics = {}
+            eligibility_scope_symbols_for_revalidation = None
         else:
             dispatch_symbols, skipped_symbols, eligibility_diagnostics = (
                 _split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics(
@@ -3412,6 +4745,7 @@ class AgentFeedbackOrchestrator:
                     requested_symbols=requested_symbols,
                 )
             )
+            eligibility_scope_symbols_for_revalidation = requested_symbols
             public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
             eligibility_collapse = _requested_scope_eligibility_collapse(
                 requested_symbols=requested_symbols,
@@ -3425,9 +4759,11 @@ class AgentFeedbackOrchestrator:
                         'symbols': dispatch_symbols,
                         'requested_symbols': requested_symbols,
                         'request_run_id': None,
+                        'parent_run_id': normalized_parent_run_id,
                         'roles': requested_role_names,
                         'fs_div': fs_div,
                         'disclosures_limit': disclosures_limit,
+                        'knowledge_cutoff_at': requested_knowledge_cutoff_at,
                         'reuse_existing': reuse_existing,
                         'force_recompute': force_recompute,
                         'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
@@ -3502,9 +4838,11 @@ class AgentFeedbackOrchestrator:
             'broad_symbols': list(dispatch_symbols),
             'requested_symbols': requested_symbols,
             'request_run_id': request_run_id,
+            'parent_run_id': normalized_parent_run_id,
             'roles': requested_role_names,
             'fs_div': fs_div,
             'disclosures_limit': disclosures_limit,
+            'knowledge_cutoff_at': requested_knowledge_cutoff_at,
             'symbol_chunk_size': batch_size,
             'parallel_subtasks': role_parallelism,
             'role_parallel_subtasks': role_parallelism,
@@ -3598,8 +4936,63 @@ class AgentFeedbackOrchestrator:
                 slot_state='released' if done else 'active',
             )
 
+        def reuse_evidence_for_decision(
+            decision: Any,
+        ) -> dict[str, Any] | None:
+            latest_feedback = getattr(decision, 'latest_feedback', None)
+            feedback_run_id = (
+                str(latest_feedback.get('run_id') or '').strip()
+                if isinstance(latest_feedback, dict)
+                else ''
+            )
+            feedback_received_at = str(
+                getattr(decision, 'latest_feedback_received_at', None)
+                or (
+                    latest_feedback.get('received_at')
+                    if isinstance(latest_feedback, dict)
+                    else None
+                )
+                or ''
+            ).strip()
+            if not feedback_run_id or not feedback_received_at:
+                return None
+            feedback_id = getattr(decision, 'latest_feedback_id', None)
+            return {
+                'schema_version': 'agent_feedback_reuse_evidence_v1',
+                'feedback_id': (
+                    int(feedback_id) if feedback_id is not None else None
+                ),
+                'feedback_run_id': feedback_run_id,
+                'feedback_received_at': feedback_received_at,
+                'decision_snapshot_id': getattr(
+                    decision,
+                    'latest_decision_snapshot_id',
+                    None,
+                ),
+                'decision_snapshot_fingerprint': getattr(
+                    decision,
+                    'latest_decision_snapshot_fingerprint',
+                    None,
+                ),
+                'decision_snapshot_observed_at': getattr(
+                    decision,
+                    'latest_decision_snapshot_observed_at',
+                    None,
+                ),
+            }
+
         def mark_reused(role: str, reuse_items: dict[str, Any]) -> None:
-            reused_symbols = list(reuse_items.keys())
+            reuse_evidence = {
+                symbol: evidence
+                for symbol, decision in reuse_items.items()
+                if (evidence := reuse_evidence_for_decision(decision)) is not None
+                and (
+                    role not in DECISION_SUPPORT_AGENT_NAMES
+                    or bool(evidence.get('decision_snapshot_id'))
+                    or bool(evidence.get('decision_snapshot_fingerprint'))
+                )
+            }
+            reused_symbols = list(reuse_evidence)
             if not reused_symbols:
                 return
 
@@ -3609,9 +5002,14 @@ class AgentFeedbackOrchestrator:
                 current.last_activity_at = datetime.now(timezone.utc)
                 current.completed_symbols_by_role.setdefault(role, set()).update(reused_symbols)
                 current.reused_symbols_by_role.setdefault(role, set()).update(reused_symbols)
+                current.reused_feedback_evidence_by_role.setdefault(
+                    role,
+                    {},
+                ).update(reuse_evidence)
 
             runtime_feedback_state_store.update_run(normalized_market_date, _update, run_id=request_run_id)
-            for symbol, decision in reuse_items.items():
+            for symbol in reused_symbols:
+                decision = reuse_items[symbol]
                 log_agent_feedback_event(
                     'reuse_applied',
                     status='reused',
@@ -3643,6 +5041,7 @@ class AgentFeedbackOrchestrator:
                         symbols=[symbol],
                         roles=[role],
                         force_recompute=True,
+                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     ).get(symbol, {}).get(role)
                     input_fingerprint_payload = getattr(fingerprint_decision, 'input_fingerprint_payload', None)
                 except Exception:  # noqa: BLE001
@@ -3747,6 +5146,18 @@ class AgentFeedbackOrchestrator:
                         batch_symbols=batch_symbols,
                     )
                 )
+                # Failure scope is part of the durable run verdict, not merely
+                # a side effect of writing the detail row.  Record it when the
+                # tombstone is buffered so a failure-table outage cannot leave
+                # a mixed/partial child summary looking fully successful to
+                # next-open lineage validation.
+                normalized_role = str(role or agent_name or '').strip()
+                normalized_symbol = str(symbol or '').strip().upper()
+                if normalized_role and normalized_symbol:
+                    current.failed_symbols_by_role.setdefault(
+                        normalized_role,
+                        set(),
+                    ).add(normalized_symbol)
 
             snapshot = runtime_feedback_state_store.update_run(
                 normalized_market_date,
@@ -3835,6 +5246,10 @@ class AgentFeedbackOrchestrator:
 
         all_items: list[dict[str, Any]] = []
         all_failures: list[dict[str, Any]] = []
+        accepted_decider_source_items: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
         symbol_context = {'items': []}
         response_payload: dict[str, Any] | None = None
         raised_exception: Exception | None = None
@@ -3962,7 +5377,33 @@ class AgentFeedbackOrchestrator:
                         symbols=scoped_dispatch_symbols,
                         roles=requested_role_names,
                         force_recompute=force_recompute,
+                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
+                    reuse_decisions = {
+                        symbol: {
+                            role: decision
+                            for role, decision in decisions_by_role.items()
+                            if bool(decision.should_dispatch)
+                            or (
+                                (
+                                    evidence := reuse_evidence_for_decision(
+                                        decision
+                                    )
+                                )
+                                is not None
+                                and (
+                                    role not in DECISION_SUPPORT_AGENT_NAMES
+                                    or bool(evidence.get('decision_snapshot_id'))
+                                    or bool(
+                                        evidence.get(
+                                            'decision_snapshot_fingerprint'
+                                        )
+                                    )
+                                )
+                            )
+                        }
+                        for symbol, decisions_by_role in reuse_decisions.items()
+                    }
                 upstream_reuse_decisions = {}
                 if (
                     not skip_terminal_reconciliation
@@ -3974,7 +5415,17 @@ class AgentFeedbackOrchestrator:
                         symbols=scoped_dispatch_symbols,
                         roles=UPSTREAM_SUMMARY_ROLES,
                         force_recompute=False,
+                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
+                    upstream_reuse_decisions = {
+                        symbol: {
+                            role: decision
+                            for role, decision in decisions_by_role.items()
+                            if bool(decision.should_dispatch)
+                            or reuse_evidence_for_decision(decision) is not None
+                        }
+                        for symbol, decisions_by_role in upstream_reuse_decisions.items()
+                    }
                 symbols_requiring_context = [] if skip_terminal_reconciliation else scoped_dispatch_symbols
                 if reuse_decisions:
                     symbols_requiring_context = [
@@ -3990,17 +5441,33 @@ class AgentFeedbackOrchestrator:
                     ]
                 if symbols_requiring_context and not run_openclaw_dispatch_preflight(symbols_requiring_context):
                     symbols_requiring_context = []
+                source_context_scope_symbols_for_revalidation = list(
+                    symbols_requiring_context
+                )
+                source_knowledge_cutoff_at: str | None = None
                 if symbols_requiring_context:
                     symbol_context = agent_context_read_service.get_symbol_day_context(
                         market_date=normalized_market_date,
                         symbols=symbols_requiring_context,
                         fs_div=fs_div,
                         disclosures_limit=disclosures_limit,
+                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
                     _attach_agent_feedback_eligibility_context(
                         items=symbol_context.get('items') or [],
                         diagnostics=eligibility_diagnostics,
                     )
+                    symbol_context_request = symbol_context.get('request')
+                    if isinstance(symbol_context_request, dict):
+                        raw_knowledge_cutoff = symbol_context_request.get(
+                            'knowledge_cutoff_at'
+                        )
+                        source_knowledge_cutoff_at = (
+                            str(raw_knowledge_cutoff).strip()
+                            if raw_knowledge_cutoff is not None
+                            and str(raw_knowledge_cutoff).strip()
+                            else None
+                        )
                 if not skip_terminal_reconciliation:
                     self._checkpoint_run_state(
                         market_date=normalized_market_date,
@@ -4091,6 +5558,17 @@ class AgentFeedbackOrchestrator:
                             for item in symbol_context['items']
                             if str(item.get('symbol') or '').strip().upper() in role_scope_set
                         ],
+                        source_context_scope_symbols=(
+                            source_context_scope_symbols_for_revalidation
+                        ),
+                        eligibility_scope_symbols=(
+                            eligibility_scope_symbols_for_revalidation
+                        ),
+                        fs_div=fs_div,
+                        disclosures_limit=disclosures_limit,
+                        source_knowledge_cutoff_at=(
+                            source_knowledge_cutoff_at
+                        ),
                         reuse_decisions=reuse_decisions,
                         upstream_reuse_decisions=upstream_reuse_decisions,
                         all_failures=all_failures,
@@ -4296,6 +5774,37 @@ class AgentFeedbackOrchestrator:
                                                 (source_item, feedback_candidate, normalized_feedback)
                                             )
 
+                                    input_generation_failures: dict[
+                                        tuple[str, str],
+                                        dict[str, Any],
+                                    ] = {}
+                                    if (
+                                        contract_failure is None
+                                        and role in DECISION_SUPPORT_AGENT_NAMES
+                                        and staged_feedback
+                                    ):
+                                        input_generation_failures = (
+                                            self._revalidate_decider_dispatch_inputs(
+                                                market_date=normalized_market_date,
+                                                request_run_id=request_run_id,
+                                                source_items=[
+                                                    source_item
+                                                    for source_item, _, _ in staged_feedback
+                                                ],
+                                                source_context_scope_symbols=(
+                                                    source_context_scope_symbols_for_revalidation
+                                                ),
+                                                eligibility_scope_symbols=(
+                                                    eligibility_scope_symbols_for_revalidation
+                                                ),
+                                                fs_div=fs_div,
+                                                disclosures_limit=disclosures_limit,
+                                                source_knowledge_cutoff_at=(
+                                                    source_knowledge_cutoff_at
+                                                ),
+                                            )
+                                        )
+
                                     if contract_failure is not None:
                                         failure_class = (
                                             'response_identity_mismatch'
@@ -4416,6 +5925,105 @@ class AgentFeedbackOrchestrator:
                                             attempt_id = dispatch_context['attempt_id']
                                             batch_symbols = dispatch_context['batch_symbols']
                                             session_key = dispatch_context['session_key']
+                                            input_generation_failure = (
+                                                input_generation_failures.get(
+                                                    (role, symbol)
+                                                )
+                                            )
+                                            if input_generation_failure is not None:
+                                                failure_kind = (
+                                                    FeedbackFailureKind
+                                                    .DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH
+                                                    .value
+                                                )
+                                                failure_context = {
+                                                    **source_item,
+                                                    'dependency_status': (
+                                                        'blocked_upstream_changed_during_dispatch'
+                                                    ),
+                                                    'failure_status': (
+                                                        'dependency/upstream-changed-during-dispatch'
+                                                    ),
+                                                    'failure_kind': failure_kind,
+                                                    'input_generation_revalidation': (
+                                                        input_generation_failure
+                                                    ),
+                                                    'response_correlation': (
+                                                        response_correlation or None
+                                                    ),
+                                                }
+                                                failure = _build_failed_dispatch_item(
+                                                    role=role,
+                                                    agent_name=spec.agent_name,
+                                                    symbol=symbol,
+                                                    error=failure_kind,
+                                                    retryable=True,
+                                                    failure_kind=failure_kind,
+                                                    context=failure_context,
+                                                    dispatch_id=dispatch_id,
+                                                    attempt_id=attempt_id,
+                                                    slot=slot,
+                                                    session_key=session_key,
+                                                    session_id=dispatch_context.get(
+                                                        'session_id'
+                                                    ),
+                                                    response_id=dispatch_context.get(
+                                                        'response_id'
+                                                    ),
+                                                    request_marker=dispatch_context.get(
+                                                        'request_marker'
+                                                    ),
+                                                    batch_symbols=batch_symbols,
+                                                )
+                                                all_failures.append(failure)
+                                                log_agent_feedback_event(
+                                                    'normalized_response_rejected',
+                                                    status='rejected',
+                                                    market_date=(
+                                                        normalized_market_date.isoformat()
+                                                    ),
+                                                    request_run_id=request_run_id,
+                                                    dispatch_id=dispatch_id,
+                                                    attempt_id=attempt_id,
+                                                    role=role,
+                                                    agent_name=spec.agent_name,
+                                                    symbol=symbol,
+                                                    batch_symbols=batch_symbols,
+                                                    slot=slot,
+                                                    session_key=session_key,
+                                                    error_type=(
+                                                        'DecisionInputGenerationChanged'
+                                                    ),
+                                                    error_message=failure_kind,
+                                                    failure_kind=failure_kind,
+                                                    failure_context=(
+                                                        input_generation_failure
+                                                    ),
+                                                )
+                                                buffer_failure(
+                                                    role,
+                                                    symbol,
+                                                    failure_kind,
+                                                    True,
+                                                    failure_kind=failure_kind,
+                                                    context=failure_context,
+                                                    agent_name=spec.agent_name,
+                                                    dispatch_id=dispatch_id,
+                                                    attempt_id=attempt_id,
+                                                    slot=slot,
+                                                    session_key=session_key,
+                                                    session_id=dispatch_context.get(
+                                                        'session_id'
+                                                    ),
+                                                    response_id=dispatch_context.get(
+                                                        'response_id'
+                                                    ),
+                                                    request_marker=dispatch_context.get(
+                                                        'request_marker'
+                                                    ),
+                                                    batch_symbols=batch_symbols,
+                                                )
+                                                continue
                                             mismatch_flags = _extract_response_mismatch_flags(normalized_feedback)
                                             log_agent_feedback_event(
                                                 'normalized_response_accepted',
@@ -4459,6 +6067,10 @@ class AgentFeedbackOrchestrator:
                                                     normalized_feedback=normalized_feedback,
                                                 )
                                             )
+                                            if role in DECISION_SUPPORT_AGENT_NAMES:
+                                                accepted_decider_source_items[
+                                                    (role, symbol)
+                                                ] = dict(source_item)
                                     staged_batch_outcomes = True
                                 except Exception as exc:
                                     error_details = exc.details if isinstance(exc, AgentDispatchError) else {}
@@ -4688,10 +6300,141 @@ class AgentFeedbackOrchestrator:
                     )
 
                 if not skip_terminal_reconciliation:
+                    if accepted_decider_source_items:
+                        final_generation_failures = (
+                            self._revalidate_decider_dispatch_inputs(
+                                market_date=normalized_market_date,
+                                request_run_id=request_run_id,
+                                source_items=list(
+                                    accepted_decider_source_items.values()
+                                ),
+                                source_context_scope_symbols=(
+                                    source_context_scope_symbols_for_revalidation
+                                ),
+                                eligibility_scope_symbols=(
+                                    eligibility_scope_symbols_for_revalidation
+                                ),
+                                fs_div=fs_div,
+                                disclosures_limit=disclosures_limit,
+                                source_knowledge_cutoff_at=(
+                                    source_knowledge_cutoff_at
+                                ),
+                                revalidate_post_decision_material_context=True,
+                                allow_current_run_feedback=True,
+                            )
+                        )
+                        invalidated_keys = set(
+                            accepted_decider_source_items
+                        ).intersection(final_generation_failures)
+                        for role, symbol in sorted(invalidated_keys):
+                            source_item = accepted_decider_source_items[
+                                (role, symbol)
+                            ]
+                            validation_failure = final_generation_failures[
+                                (role, symbol)
+                            ]
+                            failure_kind = (
+                                FeedbackFailureKind
+                                .DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH
+                                .value
+                            )
+                            failure_context = {
+                                **source_item,
+                                'dependency_status': (
+                                    'blocked_upstream_changed_before_finalization'
+                                ),
+                                'failure_status': (
+                                    'dependency/upstream-changed-during-dispatch'
+                                ),
+                                'failure_kind': failure_kind,
+                                'input_generation_revalidation': validation_failure,
+                            }
+                            failure = _build_failed_dispatch_item(
+                                role=role,
+                                agent_name=role,
+                                symbol=symbol,
+                                error=failure_kind,
+                                retryable=True,
+                                failure_kind=failure_kind,
+                                context=failure_context,
+                                dispatch_id=source_item.get('dispatch_id'),
+                                slot=source_item.get('session_slot'),
+                                session_key=source_item.get('session_key'),
+                                batch_symbols=[symbol],
+                            )
+                            all_failures.append(failure)
+                            buffer_failure(
+                                role,
+                                symbol,
+                                failure_kind,
+                                True,
+                                failure_kind=failure_kind,
+                                context=failure_context,
+                                agent_name=role,
+                                dispatch_id=source_item.get('dispatch_id'),
+                                slot=source_item.get('session_slot'),
+                                session_key=source_item.get('session_key'),
+                                batch_symbols=[symbol],
+                            )
+                            log_agent_feedback_event(
+                                'decision_input_generation_finalization_rejected',
+                                status='rejected',
+                                market_date=normalized_market_date.isoformat(),
+                                request_run_id=request_run_id,
+                                dispatch_id=source_item.get('dispatch_id'),
+                                role=role,
+                                agent_name=role,
+                                symbol=symbol,
+                                batch_symbols=[symbol],
+                                failure_kind=failure_kind,
+                                failure_context=validation_failure,
+                            )
+
+                        if invalidated_keys:
+                            def _invalidate_decider_successes(
+                                current: RuntimeFeedbackRunState,
+                            ) -> None:
+                                for invalid_role, invalid_symbol in invalidated_keys:
+                                    current.completed_symbols_by_role.setdefault(
+                                        invalid_role,
+                                        set(),
+                                    ).discard(invalid_symbol)
+                                    current.stale_symbols_by_role.setdefault(
+                                        invalid_role,
+                                        set(),
+                                    ).add(invalid_symbol)
+                                    current.retry_pending_symbols_by_role.setdefault(
+                                        invalid_role,
+                                        set(),
+                                    ).add(invalid_symbol)
+
+                            runtime_feedback_state_store.update_run(
+                                normalized_market_date,
+                                _invalidate_decider_successes,
+                                run_id=request_run_id,
+                            )
+                            all_items[:] = [
+                                item
+                                for item in all_items
+                                if (
+                                    str(item.get('role') or ''),
+                                    str(item.get('symbol') or ''),
+                                )
+                                not in invalidated_keys
+                            ]
+                            self._flush_and_checkpoint_pending_run_buffers(
+                                market_date=normalized_market_date,
+                                request_run_id=request_run_id,
+                                request_payload=request_payload,
+                                reason='finalize_decider_input_generation',
+                                lifecycle_stage='final_input_generation_checked',
+                                current_role=state.current_role,
+                                status='running',
+                            )
                     final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
                     progress_counts = final_snapshot.to_progress_summary()
                     completed_count = int(progress_counts.get('completed_feedback_count') or 0)
-                    failed_count = len(final_snapshot.buffered_failures)
+                    failed_count = int(progress_counts.get('failed_items') or 0)
                     final_status = _resolve_dispatch_status(completed=completed_count, failed=failed_count)
                     response_payload = {
                         'request': request_payload,
@@ -4779,7 +6522,7 @@ class AgentFeedbackOrchestrator:
             final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
             progress_counts = final_snapshot.to_progress_summary() if final_snapshot is not None else {}
             completed_count = int(progress_counts.get('completed_feedback_count') or 0)
-            failed_count = len(final_snapshot.buffered_failures) if final_snapshot is not None else 0
+            failed_count = int(progress_counts.get('failed_items') or 0)
             if raised_exception is not None or finalization_error is not None:
                 final_status = 'partial' if (completed_count > 0 or failed_count > 0) else 'failed'
             elif scoped_dispatch_symbols:

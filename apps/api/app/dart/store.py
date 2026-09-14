@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -15,6 +15,17 @@ def _normalize_date(value: date | str) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
+
+
+def _normalize_observation_timestamp(value: datetime | str) -> datetime:
+    normalized = (
+        value
+        if isinstance(value, datetime)
+        else datetime.fromisoformat(value.replace('Z', '+00:00'))
+    )
+    if normalized.tzinfo is None or normalized.utcoffset() is None:
+        raise ValueError('disclosure observation cutoff must include a timezone offset')
+    return normalized.astimezone(timezone.utc)
 
 
 def _serialize_run(row: DartDisclosureSyncRun) -> dict:
@@ -216,6 +227,8 @@ class DartSyncRepository:
         *,
         stock_codes: list[str],
         receipt_date_to: date | str | None = None,
+        observed_at_or_after: datetime | str | None = None,
+        observed_before: datetime | str | None = None,
         limit_per_symbol: int = 5,
     ) -> dict[str, list[dict]]:
         normalized_stock_codes = [code for code in dict.fromkeys(stock_codes) if code]
@@ -223,6 +236,16 @@ class DartSyncRepository:
             return {code: [] for code in normalized_stock_codes}
 
         cutoff_date = _normalize_date(receipt_date_to) if receipt_date_to is not None else None
+        observation_start = (
+            _normalize_observation_timestamp(observed_at_or_after)
+            if observed_at_or_after is not None
+            else None
+        )
+        observation_end = (
+            _normalize_observation_timestamp(observed_before)
+            if observed_before is not None
+            else None
+        )
         ranked_events = (
             select(
                 DartDisclosureEvent.id.label('event_id'),
@@ -240,6 +263,14 @@ class DartSyncRepository:
         )
         if cutoff_date is not None:
             ranked_events = ranked_events.where(DartDisclosureEvent.receipt_date <= cutoff_date)
+        if observation_start is not None:
+            ranked_events = ranked_events.where(
+                DartDisclosureEvent.created_at >= observation_start
+            )
+        if observation_end is not None:
+            ranked_events = ranked_events.where(
+                DartDisclosureEvent.created_at < observation_end
+            )
         ranked_events_subquery = ranked_events.subquery()
 
         with session_scope() as session:

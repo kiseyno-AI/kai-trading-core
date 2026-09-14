@@ -706,10 +706,15 @@ class FakeSignalDeciderLoopRepository:
             }
             if existing and existing['status'] in {'active', 'retired'}:
                 stored['status'] = existing['status']
-                stored['metadata'] = _merge_policy_metadata_preserving_audit(
-                    metadata_payload=stored['metadata'],
-                    existing_metadata_payload=existing.get('metadata'),
-                )
+                stored['parent_policy_version'] = existing[
+                    'parent_policy_version'
+                ]
+                stored['source_candidate_version'] = existing[
+                    'source_candidate_version'
+                ]
+                stored['change_summary'] = existing['change_summary']
+                stored['rule_bundle'] = existing['rule_bundle']
+                stored['metadata'] = existing['metadata']
                 stored['activated_by'] = existing['activated_by']
                 stored['activated_at'] = existing['activated_at']
                 stored['retired_at'] = existing['retired_at']
@@ -4052,8 +4057,16 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
 
                 persisted = repository.policy_versions['signal_decider_policy_v2']
                 self.assertEqual(persisted['status'], existing_status)
+                self.assertEqual(
+                    persisted['change_summary'],
+                    'Previously approved candidate.',
+                )
+                self.assertEqual(
+                    persisted['rule_bundle']['review_mode'],
+                    'manual_only',
+                )
                 self.assertEqual(persisted['metadata']['policy_origin'], 'candidate_generation')
-                self.assertEqual(persisted['metadata']['evidence']['support_ratio'], 1.0)
+                self.assertNotIn('evidence', persisted['metadata'])
                 self.assertEqual(
                     persisted['metadata']['activation_history'][0]['activated_by'],
                     'human.reviewer',

@@ -3,18 +3,23 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func, or_, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
-from app.agent_context.roles import DEFAULT_AGENT_NAMES, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import (
+    DECISION_SUPPORT_AGENT_NAMES,
+    DEFAULT_AGENT_NAMES,
+    SIGNAL_DECIDER_AGENT_NAME,
+)
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
     AgentContextFeedbackFailure,
+    AgentContextFeedbackRun,
     DailyActionSummary,
     DailyPriceBar,
     DailyPykrxEnrichmentRow,
@@ -23,6 +28,7 @@ from app.db_models import (
     DartFundamentalsHighlight,
     DartFundamentalsRow,
     DartFundamentalsSnapshot,
+    SignalDeciderDecisionSnapshot,
     Symbol,
 )
 
@@ -39,6 +45,7 @@ FUNDAMENTAL_REUSE_STALE_REASONS = {
     'forced_recompute',
     'fundamental_input_fingerprint_changed',
     'fundamental_input_fingerprint_missing',
+    'knowledge_cutoff_mismatch',
     'stored_fundamental_input_fingerprint_missing',
     'source_updated',
     'stale_market_feedback',
@@ -55,6 +62,9 @@ class FeedbackReuseDecision:
     latest_feedback_received_at: str | None
     latest_source_updated_at: str | None
     latest_feedback: dict[str, Any] | None
+    latest_decision_snapshot_id: int | None = None
+    latest_decision_snapshot_fingerprint: str | None = None
+    latest_decision_snapshot_observed_at: str | None = None
     input_fingerprint: str | None = None
     stored_input_fingerprint: str | None = None
     input_fingerprint_payload: dict[str, Any] | None = None
@@ -126,6 +136,80 @@ def _is_stale_dispatch_reason(reason: str | None) -> bool:
     return str(reason or '') in FUNDAMENTAL_REUSE_STALE_REASONS
 
 
+def _normalized_evidence_datetime(value: Any) -> datetime:
+    if not isinstance(value, datetime):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _normalize_knowledge_cutoff_at(value: datetime | str) -> datetime:
+    parsed = value
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    if not isinstance(parsed, datetime):
+        raise ValueError('knowledge_cutoff_at must be an ISO-8601 datetime')
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError('knowledge_cutoff_at must include a timezone offset')
+    return parsed.astimezone(timezone.utc)
+
+
+def _request_payload_knowledge_cutoff_at(payload: Any) -> datetime | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ('admission_knowledge_cutoff_at', 'knowledge_cutoff_at'):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return _normalize_knowledge_cutoff_at(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _failure_supersedes_feedback(
+    *,
+    feedback: Any,
+    failure: Any,
+    run_order_by_id: dict[str, tuple[datetime, int, datetime, int]],
+) -> bool:
+    if failure is None:
+        return False
+    if feedback is None:
+        return True
+
+    feedback_market_date = getattr(feedback, 'market_date', None)
+    failure_market_date = getattr(failure, 'market_date', None)
+    if isinstance(feedback_market_date, date) and isinstance(
+        failure_market_date,
+        date,
+    ):
+        if failure_market_date > feedback_market_date:
+            return True
+        if failure_market_date < feedback_market_date:
+            return False
+
+    feedback_run_id = str(getattr(feedback, 'run_id', None) or '').strip()
+    failure_run_id = str(getattr(failure, 'run_id', None) or '').strip()
+    if feedback_run_id and failure_run_id and feedback_run_id != failure_run_id:
+        feedback_run_order = run_order_by_id.get(feedback_run_id)
+        failure_run_order = run_order_by_id.get(failure_run_id)
+        if feedback_run_order is not None and failure_run_order is not None:
+            return failure_run_order >= feedback_run_order
+
+    feedback_received_at = _normalized_evidence_datetime(
+        getattr(feedback, 'received_at', None)
+    )
+    failure_received_at = _normalized_evidence_datetime(
+        getattr(failure, 'received_at', None)
+    )
+    # A same-run, missing-lineage, or equal-time conflict is ambiguous and must
+    # remain retryable instead of allowing a potentially invalid success.
+    return failure_received_at >= feedback_received_at
+
+
 class AgentContextReuseService:
     def build_latest_decisions(
         self,
@@ -134,10 +218,16 @@ class AgentContextReuseService:
         symbols: Sequence[str],
         roles: Sequence[str],
         force_recompute: bool = False,
+        knowledge_cutoff_at: datetime | str | None = None,
     ) -> dict[str, dict[str, FeedbackReuseDecision]]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
         requested_roles = [role for role in roles if role in ROLE_TO_AGENT]
+        normalized_knowledge_cutoff_at = (
+            _normalize_knowledge_cutoff_at(knowledge_cutoff_at)
+            if knowledge_cutoff_at is not None
+            else None
+        )
 
         if not normalized_symbols:
             raise ValueError('symbols is required')
@@ -193,6 +283,10 @@ class AgentContextReuseService:
                         .where(AgentContextFeedback.market_date == normalized_market_date)
                         .where(AgentContextFeedback.symbol.in_(chunk))
                         .where(AgentContextFeedback.agent_name == agent_name)
+                        .order_by(
+                            AgentContextFeedback.received_at.asc(),
+                            AgentContextFeedback.id.asc(),
+                        )
                     ).all()
                     for row in same_day_feedback_rows:
                         if not hasattr(row, 'feedback_payload'):
@@ -247,6 +341,152 @@ class AgentContextReuseService:
                     if failure_row is not None:
                         latest_failure_map[(failure_row.symbol, agent_name)] = failure_row
 
+            evidence_run_ids = {
+                str(row.run_id or '').strip()
+                for row in (
+                    *latest_feedback_map.values(),
+                    *latest_failure_map.values(),
+                )
+                if str(getattr(row, 'run_id', None) or '').strip()
+            }
+            run_order_by_id: dict[
+                str,
+                tuple[datetime, int, datetime, int],
+            ] = {}
+            run_knowledge_cutoff_by_id: dict[str, datetime | None] = {}
+            if evidence_run_ids:
+                run_rows = session.execute(
+                    select(
+                        AgentContextFeedbackRun.id,
+                        AgentContextFeedbackRun.run_id,
+                        AgentContextFeedbackRun.started_at,
+                        AgentContextFeedbackRun.request_payload,
+                    ).where(
+                        AgentContextFeedbackRun.run_id.in_(evidence_run_ids)
+                    )
+                ).all()
+                run_metadata_by_id = {
+                    str(row.run_id): {
+                        'direct_order': (
+                            _normalized_evidence_datetime(row.started_at),
+                            int(row.id),
+                        ),
+                        'parent_run_id': str(
+                            (
+                                row.request_payload.get('parent_run_id')
+                                if isinstance(row.request_payload, dict)
+                                else None
+                            )
+                            or ''
+                        ).strip(),
+                        'knowledge_cutoff_at': (
+                            _request_payload_knowledge_cutoff_at(
+                                row.request_payload
+                            )
+                        ),
+                    }
+                    for row in run_rows
+                    if str(row.run_id or '').strip()
+                }
+                parent_run_ids = {
+                    metadata['parent_run_id']
+                    for metadata in run_metadata_by_id.values()
+                    if metadata['parent_run_id']
+                }
+                missing_parent_run_ids = parent_run_ids.difference(
+                    run_metadata_by_id
+                )
+                if missing_parent_run_ids:
+                    parent_rows = session.execute(
+                        select(
+                            AgentContextFeedbackRun.id,
+                            AgentContextFeedbackRun.run_id,
+                            AgentContextFeedbackRun.started_at,
+                        ).where(
+                            AgentContextFeedbackRun.run_id.in_(
+                                missing_parent_run_ids
+                            )
+                        )
+                    ).all()
+                    for row in parent_rows:
+                        run_id = str(row.run_id or '').strip()
+                        if not run_id:
+                            continue
+                        run_metadata_by_id[run_id] = {
+                            'direct_order': (
+                                _normalized_evidence_datetime(row.started_at),
+                                int(row.id),
+                            ),
+                            'parent_run_id': '',
+                            'knowledge_cutoff_at': None,
+                        }
+                for run_id in evidence_run_ids:
+                    metadata = run_metadata_by_id.get(run_id)
+                    if metadata is None:
+                        continue
+                    run_knowledge_cutoff_by_id[run_id] = metadata[
+                        'knowledge_cutoff_at'
+                    ]
+                    direct_order = metadata['direct_order']
+                    parent_run_id = metadata['parent_run_id']
+                    if parent_run_id:
+                        parent_metadata = run_metadata_by_id.get(parent_run_id)
+                        if parent_metadata is None:
+                            continue
+                        lineage_order = parent_metadata['direct_order']
+                    else:
+                        lineage_order = direct_order
+                    run_order_by_id[run_id] = (
+                        lineage_order[0],
+                        lineage_order[1],
+                        direct_order[0],
+                        direct_order[1],
+                    )
+
+            latest_snapshot_by_feedback_key: dict[
+                tuple[int, str, str, str],
+                Any,
+            ] = {}
+            feedback_ids = {
+                int(row.id)
+                for row in latest_feedback_map.values()
+                if row.id is not None
+            }
+            if feedback_ids and set(requested_roles).intersection(
+                DECISION_SUPPORT_AGENT_NAMES
+            ):
+                snapshot_rows = session.execute(
+                    select(
+                        SignalDeciderDecisionSnapshot.id,
+                        SignalDeciderDecisionSnapshot.feedback_id,
+                        SignalDeciderDecisionSnapshot.content_fingerprint,
+                        SignalDeciderDecisionSnapshot.decision_run_id,
+                        SignalDeciderDecisionSnapshot.feedback_received_at,
+                        SignalDeciderDecisionSnapshot.symbol,
+                        SignalDeciderDecisionSnapshot.agent_name,
+                    )
+                    .where(
+                        SignalDeciderDecisionSnapshot.feedback_id.in_(
+                            feedback_ids
+                        ),
+                        SignalDeciderDecisionSnapshot.agent_name.in_(
+                            DECISION_SUPPORT_AGENT_NAMES
+                        ),
+                    )
+                    .order_by(
+                        SignalDeciderDecisionSnapshot.created_at.desc(),
+                        SignalDeciderDecisionSnapshot.id.desc(),
+                    )
+                ).all()
+                for snapshot_row in snapshot_rows:
+                    key = (
+                        int(snapshot_row.feedback_id),
+                        str(snapshot_row.symbol),
+                        str(snapshot_row.agent_name),
+                        str(snapshot_row.decision_run_id or ''),
+                    )
+                    latest_snapshot_by_feedback_key.setdefault(key, snapshot_row)
+
             for symbol in normalized_symbols:
                 symbol_id = symbol_id_map.get(symbol)
                 for role in requested_roles:
@@ -294,11 +534,35 @@ class AgentContextReuseService:
                         continue
 
                     feedback_received_at = latest_feedback.received_at
+                    latest_decision_snapshot = (
+                        latest_snapshot_by_feedback_key.get(
+                            (
+                                int(latest_feedback.id),
+                                symbol,
+                                agent_name,
+                                str(latest_feedback.run_id or ''),
+                            )
+                        )
+                        if role in DECISION_SUPPORT_AGENT_NAMES
+                        else None
+                    )
+                    has_newer_failure = _failure_supersedes_feedback(
+                        feedback=latest_feedback,
+                        failure=latest_failure,
+                        run_order_by_id=run_order_by_id,
+                    )
                     latest_feedback_payload = latest_feedback.feedback_payload if isinstance(latest_feedback.feedback_payload, dict) else {}
                     latest_risk_flags = latest_feedback_payload.get('risk_flags') if isinstance(latest_feedback_payload.get('risk_flags'), list) else []
                     has_retryable_feedback_gap = any(
                         isinstance(flag, str) and flag in {'missing_batch_feedback', 'unstructured_response'}
                         for flag in latest_risk_flags
+                    ) or has_newer_failure
+                    has_knowledge_cutoff_mismatch = (
+                        normalized_knowledge_cutoff_at is not None
+                        and run_knowledge_cutoff_by_id.get(
+                            str(latest_feedback.run_id or '').strip()
+                        )
+                        != normalized_knowledge_cutoff_at
                     )
                     feedback_market_date = latest_feedback.market_date if latest_feedback is not None else None
                     is_stale_market_feedback = feedback_market_date is None or feedback_market_date != normalized_market_date
@@ -316,17 +580,28 @@ class AgentContextReuseService:
                             latest_source_updated_at=latest_source_updated_at,
                             feedback_received_at=feedback_received_at,
                         )
+                        if has_newer_failure:
+                            reason = 'latest_failure_pending_retry'
                     else:
                         should_dispatch = force_recompute or is_stale_market_feedback or has_retryable_feedback_gap or (
                             latest_source_updated_at is not None and feedback_received_at is not None and latest_source_updated_at > feedback_received_at
                         )
                         reason = (
                             'forced_recompute' if force_recompute else (
-                                'stale_market_feedback' if is_stale_market_feedback else (
-                                    'retryable_feedback_gap' if has_retryable_feedback_gap else ('source_updated' if should_dispatch else 'reuse_latest_feedback')
+                                'latest_failure_pending_retry' if has_newer_failure else (
+                                    'stale_market_feedback' if is_stale_market_feedback else (
+                                        'retryable_feedback_gap' if has_retryable_feedback_gap else ('source_updated' if should_dispatch else 'reuse_latest_feedback')
+                                    )
                                 )
                             )
                         )
+                    if (
+                        has_knowledge_cutoff_mismatch
+                        and not force_recompute
+                        and not has_newer_failure
+                    ):
+                        should_dispatch = True
+                        reason = 'knowledge_cutoff_mismatch'
                     decisions[symbol][role] = FeedbackReuseDecision(
                         symbol=symbol,
                         agent_name=agent_name,
@@ -348,6 +623,23 @@ class AgentContextReuseService:
                             'input_fingerprint': stored_input_fingerprint,
                             'input_fingerprint_payload': stored_input_fingerprint_payload,
                         },
+                        latest_decision_snapshot_id=(
+                            int(latest_decision_snapshot.id)
+                            if latest_decision_snapshot is not None
+                            else None
+                        ),
+                        latest_decision_snapshot_fingerprint=(
+                            str(latest_decision_snapshot.content_fingerprint)
+                            if latest_decision_snapshot is not None
+                            and latest_decision_snapshot.content_fingerprint
+                            else None
+                        ),
+                        latest_decision_snapshot_observed_at=(
+                            latest_decision_snapshot.feedback_received_at.isoformat()
+                            if latest_decision_snapshot is not None
+                            and latest_decision_snapshot.feedback_received_at
+                            else None
+                        ),
                         input_fingerprint=input_fingerprint,
                         stored_input_fingerprint=stored_input_fingerprint,
                         input_fingerprint_payload=input_fingerprint_payload,
@@ -503,7 +795,7 @@ class AgentContextReuseService:
                         .where(DailyTechnicalSnapshot.market_date == market_date)
                     ).scalar_one()
                 )
-        elif role == SIGNAL_DECIDER_AGENT_NAME:
+        elif role in DECISION_SUPPORT_AGENT_NAMES:
             timestamps.append(
                 session.execute(
                     select(func.max(AgentContextFeedback.received_at))

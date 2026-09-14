@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Any, Sequence
 
-from sqlalchemy import and_, desc, or_, select
+from sqlalchemy import and_, desc, exists, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -389,6 +389,7 @@ def list_external_news_items(
     published_since: datetime | None = None,
     published_before: datetime | None = None,
     collected_before: datetime | None = None,
+    observed_after: datetime | None = None,
 ) -> list[dict[str, Any]]:
     with session_scope() as session:
         stmt = (
@@ -433,6 +434,30 @@ def list_external_news_items(
             stmt = stmt.where(
                 ExternalNewsItem.collected_at < collected_before,
                 ExternalNewsItemSymbol.associated_at < collected_before,
+            )
+        if observed_after:
+            classification_window = [
+                ExternalNewsItemClassification.external_news_item_id
+                == ExternalNewsItem.id,
+                ExternalNewsItemClassification.classified_at
+                >= observed_after,
+            ]
+            if collected_before:
+                classification_window.append(
+                    ExternalNewsItemClassification.classified_at
+                    < collected_before
+                )
+            stmt = stmt.where(
+                or_(
+                    ExternalNewsItem.published_at >= observed_after,
+                    ExternalNewsItem.collected_at >= observed_after,
+                    ExternalNewsItemSymbol.associated_at >= observed_after,
+                    exists(
+                        select(ExternalNewsItemClassification.id).where(
+                            *classification_window
+                        )
+                    ),
+                )
             )
         rows = session.execute(stmt).all()
         classifications = _load_latest_external_news_classifications(

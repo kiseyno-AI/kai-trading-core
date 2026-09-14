@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
@@ -23,6 +23,11 @@ from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.eod.pykrx_enrichment_gate import (
+    REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
+    build_pykrx_enrichment_preflight,
+)
+from app.eod.run_stage_support import extract_next_open_plan_stage_counts
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
 from app.macro_context.service import macro_context_service
@@ -868,16 +873,25 @@ class DailyPipelineStageService:
         if stage_id == 'pykrx_enrichment':
             category_results = result.get('categories') if isinstance(result.get('categories'), dict) else {}
             categories_requested = result.get('categories_requested') or list(category_results)
-            failed_categories = [
+            failed_categories = {
                 category
                 for category, details in category_results.items()
                 if isinstance(details, dict) and details.get('errors')
-            ]
+            }
+            downstream_preflight = (
+                result.get('downstream_preflight')
+                if isinstance(result.get('downstream_preflight'), dict)
+                else {}
+            )
+            failed_categories.update(
+                str(category)
+                for category in downstream_preflight.get('failed_categories') or []
+            )
             succeeded = sum(
                 1
                 for category, details in category_results.items()
                 if isinstance(details, dict)
-                and category not in set(failed_categories)
+                and category not in failed_categories
                 and int(details.get('rows_persisted') or 0) > 0
             )
             failed = len(failed_categories)
@@ -898,16 +912,53 @@ class DailyPipelineStageService:
                 'succeeded': succeeded,
                 'failed': failed,
             }
-        if stage_id == 'next_open_execution_plan':
+        if stage_id == 'external_news_collect':
             summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
-            total = _int(summary.get('items_total'))
-            eligible = _int(summary.get('eligible_count'))
-            blocked = _int(summary.get('blocked_count'))
+            total_key = (
+                'eligible_symbol_count'
+                if 'eligible_symbol_count' in summary
+                else 'requested_symbol_count'
+            )
+            succeeded_key = (
+                'collected_symbol_count'
+                if 'collected_symbol_count' in summary
+                else 'matched_symbol_count'
+            )
+            total = _int(summary.get(total_key))
+            succeeded = _int(summary.get(succeeded_key))
+            failed = max(total - succeeded, 0)
             return {
-                'processed': eligible + blocked,
+                'processed': min(succeeded + failed, total) if total else succeeded + failed,
                 'total': total,
-                'succeeded': eligible,
-                'failed': blocked,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
+        if stage_id == 'external_news_enrich':
+            inspected = _int(result.get('items_inspected'))
+            missing_item_ids = result.get('missing_item_ids')
+            remaining = _int(result.get('items_remaining_at_least'))
+            failed_preview_count = (
+                len(set(missing_item_ids))
+                if isinstance(missing_item_ids, list)
+                else 0
+            )
+            failed = max(
+                failed_preview_count,
+                _int(result.get('items_missing_classification')) - remaining,
+            )
+            return {
+                'processed': inspected,
+                'total': inspected + remaining,
+                'succeeded': max(inspected - failed, 0),
+                'failed': min(failed, inspected),
+            }
+        if stage_id == 'next_open_execution_plan':
+            counts = extract_next_open_plan_stage_counts(result)
+            return {
+                'processed': counts.processed,
+                'total': counts.total,
+                'succeeded': counts.succeeded,
+                'failed': counts.failed,
             }
 
         count_pairs = (
@@ -952,6 +1003,69 @@ class DailyPipelineStageService:
         return {'processed': 0, 'total': 0, 'succeeded': 0, 'failed': 0}
 
     @staticmethod
+    def _extract_stage_count_semantics(
+        *,
+        stage_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if stage_id != 'external_news_enrich':
+            return {}
+        try:
+            remaining_at_least = int(result.get('items_remaining_at_least') or 0)
+        except (TypeError, ValueError):
+            remaining_at_least = 0
+        if remaining_at_least <= 0:
+            return {}
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id=stage_id,
+            result=result,
+        )
+        return {
+            'total': 'lower_bound',
+            'total_at_least': counts['total'],
+            'remaining': 'lower_bound',
+            'remaining_at_least': remaining_at_least,
+        }
+
+    @staticmethod
+    def _has_explicit_zero_stage_scope(
+        *,
+        stage_id: str,
+        result: dict[str, Any],
+    ) -> bool:
+        def _is_explicit_zero(payload: dict[str, Any], key: str) -> bool:
+            if key not in payload:
+                return False
+            value = payload.get(key)
+            if isinstance(value, bool) or value is None:
+                return False
+            if isinstance(value, int):
+                return value == 0
+            if isinstance(value, float):
+                return value == 0.0
+            if not isinstance(value, str):
+                return False
+            try:
+                return int(value.strip()) == 0
+            except ValueError:
+                return False
+
+        if stage_id == 'external_news_collect':
+            summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
+            total_key = (
+                'eligible_symbol_count'
+                if 'eligible_symbol_count' in summary
+                else 'requested_symbol_count'
+            )
+            return _is_explicit_zero(summary, total_key)
+        if stage_id == 'external_news_enrich':
+            return _is_explicit_zero(
+                result,
+                'items_inspected',
+            ) and _is_explicit_zero(result, 'items_remaining_at_least')
+        return False
+
+    @staticmethod
     def _extract_stage_source_run_ids(result: dict[str, Any]) -> dict[str, Any]:
         source_run_ids = result.get('source_run_ids') if isinstance(result.get('source_run_ids'), dict) else {}
         extracted = dict(source_run_ids)
@@ -973,13 +1087,20 @@ class DailyPipelineStageService:
             for key, value in result.items()
             if key not in omitted_keys and not key.endswith('_payload')
         }
-        return {
+        details = {
             'group': definition.group,
             'depends_on': list(definition.depends_on),
             'output_tables': list(definition.output_tables),
             'inspect_routes': list(definition.inspect_routes),
             'result_summary': result_summary,
         }
+        count_semantics = DailyPipelineStageService._extract_stage_count_semantics(
+            stage_id=stage_id,
+            result=result,
+        )
+        if count_semantics:
+            details['count_semantics'] = count_semantics
+        return details
 
     def _execute_stage(
         self,
@@ -1013,11 +1134,24 @@ class DailyPipelineStageService:
                 deactivate_missing=symbol_limit is None,
             )
         if stage_id == 'pykrx_enrichment':
-            return self.pykrx_enrichment_service.collect_for_market_date(
+            result = self.pykrx_enrichment_service.collect_for_market_date(
                 market_date=market_date,
                 markets=markets,
                 symbols=symbols,
             )
+            preflight = build_pykrx_enrichment_preflight(
+                market_date=market_date,
+                coverage=dict(result.get('coverage') or {}),
+                categories=REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
+            )
+            result['downstream_preflight'] = preflight
+            if (
+                not preflight.get('allowed')
+                and str(result.get('status') or '').strip().lower()
+                not in {'failed', 'blocked', 'waiting'}
+            ):
+                result['status'] = 'partial'
+            return result
         if stage_id == 'technical_snapshots':
             return daily_technical_snapshot_service.rebuild_for_market_date(
                 market_date=market_date,
@@ -1167,6 +1301,10 @@ class DailyPipelineStageService:
                     market_date=date.fromisoformat(market_date),
                     roles=roles,
                     symbols=tuple(symbols) if symbols else None,
+                    # A production retry of a completed source day must see
+                    # information collected after that session close. The
+                    # resolved instant remains fixed for every child cycle.
+                    knowledge_cutoff_at=datetime.now(timezone.utc),
                     feedback_scope_mode=(
                         FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
                         if stage_id == 'agent_feedback_summaries'
@@ -1237,9 +1375,30 @@ class DailyPipelineStageService:
             payload.setdefault('market_date', result.get('latest_available_trade_date'))
             return payload
         if stage_id == 'price_collection':
+            try:
+                total = max(int(result.get('symbols_total') or 0), 0)
+                succeeded = max(int(result.get('symbols_succeeded') or 0), 0)
+                failed = max(int(result.get('symbols_failed') or 0), 0)
+            except (TypeError, ValueError):
+                total = succeeded = failed = 0
+            aggregate_status = str(result.get('status') or '').strip().lower()
+            if failed > 0:
+                price_status = 'partial' if succeeded > 0 else 'failed'
+            elif total > 0 and succeeded < total:
+                price_status = 'partial'
+            elif total <= 0 and aggregate_status in {
+                'failed',
+                'blocked',
+                'waiting',
+                'interrupted',
+                'abandoned',
+            }:
+                price_status = aggregate_status
+            else:
+                price_status = 'completed'
             return {
                 'run_id': result.get('run_id'),
-                'status': result.get('status'),
+                'status': price_status,
                 'market_date': result.get('latest_available_trade_date'),
                 'symbols_total': result.get('symbols_total'),
                 'symbols_succeeded': result.get('symbols_succeeded'),
@@ -1335,7 +1494,18 @@ class DailyPipelineStageService:
 
     @staticmethod
     def _resolve_result_status(result: dict[str, Any]) -> str:
+        def _failure_count(value: Any) -> int:
+            if isinstance(value, (list, tuple, set, dict)):
+                return len(value)
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
         failed_keys = (
+            'failed',
+            'failed_count',
+            'failed_items',
             'results_failed',
             'snapshots_failed',
             'action_summaries_failed',
@@ -1348,15 +1518,43 @@ class DailyPipelineStageService:
             if raw_gate_status in {'waiting', 'blocked'}:
                 return raw_gate_status
             return 'skipped'
-        raw_status = str(result.get('status') or '').strip()
+        nested_payloads = [result]
+        summary_payload = result.get('summary')
+        if isinstance(summary_payload, dict):
+            nested_payloads.append(summary_payload)
+        progress_payload = result.get('progress')
+        if isinstance(progress_payload, dict):
+            nested_payloads.append(progress_payload)
+            progress_summary = progress_payload.get('summary')
+            if isinstance(progress_summary, dict):
+                nested_payloads.append(progress_summary)
+        has_reported_failures = False
+        for payload in nested_payloads:
+            for failed_key in failed_keys:
+                if _failure_count(payload.get(failed_key)) > 0:
+                    has_reported_failures = True
+                    break
+            if has_reported_failures:
+                break
+
+        raw_status = str(result.get('status') or '').strip().lower()
+        normalized_status = {
+            'ok': 'completed',
+            'recovered': 'completed',
+            'completed_with_errors': 'partial',
+            'warning': 'partial',
+            'unavailable': 'partial',
+            'disabled': 'skipped',
+            'not_configured': 'skipped',
+        }.get(raw_status, raw_status)
         if raw_status:
-            if raw_status == 'unavailable':
+            if normalized_status == 'completed' and has_reported_failures:
                 return 'partial'
-            return 'partial' if raw_status == 'completed_with_errors' else raw_status
+            return normalized_status
         if 'completed' in result and 'final_pending' in result:
             return 'completed' if bool(result.get('completed')) else 'partial'
         if result.get('error') or result.get('error_message'):
-            if any(int(result.get(failed_key) or 0) > 0 for failed_key in failed_keys):
+            if has_reported_failures:
                 return 'partial'
             if DailyPipelineStageService._has_successful_work(result):
                 return 'partial'
@@ -1364,7 +1562,7 @@ class DailyPipelineStageService:
 
         for failed_key in failed_keys:
             if failed_key in result:
-                return 'completed' if int(result.get(failed_key) or 0) == 0 else 'partial'
+                return 'completed' if _failure_count(result.get(failed_key)) == 0 else 'partial'
         return 'completed'
 
     @staticmethod

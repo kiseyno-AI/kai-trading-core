@@ -39,6 +39,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _normalize_capture_cutoff(value: datetime | str) -> datetime:
+    normalized = (
+        value
+        if isinstance(value, datetime)
+        else datetime.fromisoformat(value.replace('Z', '+00:00'))
+    )
+    if normalized.tzinfo is None or normalized.utcoffset() is None:
+        raise ValueError('captured_before must include a timezone offset')
+    return normalized.astimezone(timezone.utc)
+
+
 def _capture_run_activity_at(row: DartFundamentalsCaptureRun) -> datetime:
     progress_at = (row.run_metadata or {}).get('last_progress_at')
     if isinstance(progress_at, str):
@@ -781,10 +792,12 @@ class DartFundamentalsRepository:
         *,
         stock_codes: list[str],
         fs_div: str | None = None,
+        captured_before: datetime | str | None = None,
     ) -> list[dict[str, Any]]:
         return self._list_stored_fundamentals(
             stock_codes=stock_codes,
             fs_div=fs_div,
+            captured_before=captured_before,
             include_statement_rows=False,
         )
 
@@ -793,6 +806,7 @@ class DartFundamentalsRepository:
         *,
         stock_codes: list[str],
         fs_div: str | None = None,
+        captured_before: datetime | str | None = None,
         include_statement_rows: bool,
     ) -> list[dict[str, Any]]:
         if not stock_codes:
@@ -809,6 +823,11 @@ class DartFundamentalsRepository:
             )
             if fs_div:
                 stmt = stmt.where(DartFundamentalsSnapshot.fs_div == fs_div)
+            if captured_before is not None:
+                stmt = stmt.where(
+                    DartFundamentalsSnapshot.captured_at
+                    < _normalize_capture_cutoff(captured_before)
+                )
 
             snapshot_rows = session.execute(
                 stmt.order_by(

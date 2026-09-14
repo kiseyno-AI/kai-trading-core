@@ -496,6 +496,185 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
     assert future['actual_model_ref'] is None
 
 
+def test_post_dispatch_session_observation_retries_until_registry_is_finalized(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_key = 'feedback/signal-decider/test-run'
+    started_at = datetime.now(timezone.utc)
+    started_ms = int(started_at.timestamp() * 1000)
+    registry = tmp_path / 'agents' / 'signal-decider' / 'sessions' / 'sessions.json'
+    registry.parent.mkdir(parents=True)
+
+    def write_entry(*, finalized: bool) -> None:
+        entry = {
+            'sessionId': 'session-1',
+            'status': 'done' if finalized else 'running',
+            'startedAt': started_ms,
+            'endedAt': started_ms + 10,
+            'updatedAt': started_ms + 10,
+        }
+        if finalized:
+            entry.update({'modelProvider': 'openai', 'model': 'gpt-5.6-sol'})
+        registry.write_text(json.dumps({session_key: entry}), encoding='utf-8')
+
+    write_entry(finalized=False)
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    sleep = Mock(side_effect=lambda _: write_entry(finalized=True))
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+    monkeypatch.setattr(orchestrator_module.time, 'sleep', sleep)
+
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='signal-decider',
+        agent_name='signal-decider',
+        session_key=session_key,
+        expected_model='openai/gpt-5.6-sol',
+        dispatch_started_at=started_at,
+        session_id='session-1',
+    )
+
+    assert observed['actual_model_ref'] == 'openai/gpt-5.6-sol'
+    assert observed['verified'] is True
+    sleep.assert_called_once()
+
+
+@pytest.mark.parametrize('stale_field', ['startedAt', 'sessionId', 'status'])
+def test_post_dispatch_session_observation_retries_past_reused_terminal_entry(
+    tmp_path,
+    monkeypatch,
+    stale_field,
+) -> None:
+    session_key = 'feedback/signal-decider/reused-slot'
+    started_at = datetime.now(timezone.utc)
+    started_ms = int(started_at.timestamp() * 1000)
+    registry = tmp_path / 'agents' / 'signal-decider' / 'sessions' / 'sessions.json'
+    registry.parent.mkdir(parents=True)
+
+    old_entry = {
+        'sessionId': 'old-session',
+        'status': 'done',
+        'startedAt': started_ms,
+        'endedAt': started_ms + 10,
+        'updatedAt': started_ms + 10,
+        'modelProvider': 'openai',
+        'model': 'gpt-5.5',
+    }
+    if stale_field == 'startedAt':
+        old_started_ms = started_ms - int(timedelta(minutes=1).total_seconds() * 1000)
+        old_entry.update(
+            {
+                'sessionId': 'session-1',
+                'startedAt': old_started_ms,
+                'endedAt': old_started_ms + 10,
+                'updatedAt': old_started_ms + 10,
+            }
+        )
+    elif stale_field == 'status':
+        old_entry.update({'sessionId': 'session-1', 'status': 'failed'})
+    registry.write_text(json.dumps({session_key: old_entry}), encoding='utf-8')
+
+    def publish_current_entry(_: float) -> None:
+        registry.write_text(
+            json.dumps(
+                {
+                    session_key: {
+                        'sessionId': 'session-1',
+                        'status': 'done',
+                        'startedAt': started_ms,
+                        'endedAt': started_ms + 20,
+                        'updatedAt': started_ms + 20,
+                        'modelProvider': 'openai',
+                        'model': 'gpt-5.6-sol',
+                    }
+                }
+            ),
+            encoding='utf-8',
+        )
+
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    sleep = Mock(side_effect=publish_current_entry)
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+    monkeypatch.setattr(orchestrator_module.time, 'sleep', sleep)
+
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='signal-decider',
+        agent_name='signal-decider',
+        session_key=session_key,
+        expected_model='openai/gpt-5.6-sol',
+        dispatch_started_at=started_at,
+        session_id='session-1',
+    )
+
+    assert observed['actual_model_ref'] == 'openai/gpt-5.6-sol'
+    assert observed['verified'] is True
+    sleep.assert_called_once()
+
+
+def test_post_dispatch_session_observation_stops_after_bounded_retries(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_key = 'feedback/signal-decider/test-run'
+    started_at = datetime.now(timezone.utc)
+    started_ms = int(started_at.timestamp() * 1000)
+    registry = tmp_path / 'agents' / 'signal-decider' / 'sessions' / 'sessions.json'
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps(
+            {
+                session_key: {
+                    'sessionId': 'session-1',
+                    'status': 'running',
+                    'startedAt': started_ms,
+                    'endedAt': started_ms + 10,
+                    'updatedAt': started_ms + 10,
+                }
+            }
+        ),
+        encoding='utf-8',
+    )
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    sleep = Mock()
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+    monkeypatch.setattr(orchestrator_module.time, 'sleep', sleep)
+
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='signal-decider',
+        agent_name='signal-decider',
+        session_key=session_key,
+        expected_model='openai/gpt-5.6-sol',
+        dispatch_started_at=started_at,
+        session_id='session-1',
+    )
+
+    assert observed['actual_model_ref'] is None
+    assert observed['verified'] is False
+    assert sleep.call_count == len(
+        orchestrator_module.OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS
+    )
+
+
 def test_post_dispatch_session_registry_warns_before_bounded_fail_closed_limit(tmp_path, monkeypatch) -> None:
     session_key = 'feedback/short-term-decider/test-run'
     started_at = datetime.now(timezone.utc)

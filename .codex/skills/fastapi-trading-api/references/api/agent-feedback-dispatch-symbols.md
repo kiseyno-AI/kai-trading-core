@@ -12,6 +12,22 @@ Before live OpenClaw dispatch starts, Core preflights gateway auth. Missing `OPE
 
 For `fundamental-summarizer`, `reuse_existing=true` reuses a prior trading date only when the stored fundamental input fingerprint matches the current DART/disclosure/valuation input fingerprint. `force_recompute=true` bypasses reuse explicitly without changing the prerequisite gate behavior.
 
+`knowledge_cutoff_at` is an optional timezone-aware instant that acts as an
+exclusive upper bound for both stored-news publication time and collection
+time. The same effective instant is fixed across every requested role. When it
+is omitted, a completed historical KRX date uses 15:30 KST and a historical
+US-only request uses the XNYS calendar's actual close, including early closes.
+When the field is omitted, current or future dates use request time. Mixed
+KRX/US symbol requests require an explicit cutoff. Timezone-naive or explicitly
+future values fail with HTTP 400. Response and durable request payloads
+serialize the effective instant in UTC, so an input such as
+`2026-04-15T15:30:00+09:00` is returned as
+`2026-04-15T06:30:00+00:00`.
+
+When `reuse_existing=true`, feedback reuse also requires the stored run's
+effective cutoff to be the same normalized UTC instant. Equivalent timezone
+offsets match; a missing, earlier, or later stored cutoff redispatches.
+
 ## Example request
 ```http
 POST /agent-context/feedback/dispatch/symbols
@@ -27,6 +43,9 @@ Content-Type: application/json
     "short-term-decider",
     "signal-decider"
   ],
+  "fs_div": "CFS",
+  "disclosures_limit": 5,
+  "knowledge_cutoff_at": "2026-04-15T15:30:00+09:00",
   "reuse_existing": true,
   "force_recompute": false,
   "wait_for_completion": false,
@@ -49,30 +68,13 @@ Content-Type: application/json
       "short-term-decider",
       "signal-decider"
     ],
+    "fs_div": "CFS",
+    "disclosures_limit": 5,
+    "knowledge_cutoff_at": "2026-04-15T06:30:00+00:00",
     "reuse_existing": true,
     "scope": "requested_symbols_scored_by_strategy_aware_prefilter",
-    "auto_scope": false,
     "eligibility_rule": "strategy_aware_prefilter_scoring_v1",
     "eligibility_filters": ["market_risk_filter", "piotroski_filter"],
-    "role_symbol_counts": {
-      "eod-summarizer": 2,
-      "technical-summarizer": 2,
-      "fundamental-summarizer": 2,
-      "short-term-decider": 2,
-      "signal-decider": 2
-    },
-    "funnel_diagnostics": {
-      "schema_version": "agent_feedback_funnel_v1",
-      "requested_scope_bypass": true,
-      "role_diagnostics": {
-        "signal-decider": {
-          "role_cap": {
-            "requested_scope_bypass": true,
-            "bypass_reason": "requested_symbol_scope_cap_bypass"
-          }
-        }
-      }
-    },
     "force_recompute": false,
     "wait_for_completion": false
   },

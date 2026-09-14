@@ -70,6 +70,10 @@ class RuntimeFeedbackRunState:
     completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     failed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     reused_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
+    reused_feedback_evidence_by_role: dict[
+        str,
+        dict[str, dict[str, Any]],
+    ] = field(default_factory=dict)
     stale_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     retry_pending_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)
     first_pass_completed_symbols_by_role: dict[str, set[str]] = field(default_factory=dict)

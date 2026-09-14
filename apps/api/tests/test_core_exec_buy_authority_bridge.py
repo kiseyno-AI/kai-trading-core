@@ -1010,6 +1010,7 @@ class CoreExecBuyAuthorityBridgeTests(unittest.IsolatedAsyncioTestCase):
             planned_side='buy',
             account_reference=ACCOUNT_REFERENCE,
             decision_agent_name='signal-decider',
+            submission_payload={},
         )
         blocked_sync = {
             'applies': True,

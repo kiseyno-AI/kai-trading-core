@@ -1,6 +1,6 @@
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
@@ -9,6 +9,7 @@ from app.eod.pipeline_status import (
     _load_daily_pipeline_stage_history,
     _load_latest_feedback_run_summary,
     _load_latest_pipeline_pykrx_run,
+    _load_pipeline_pykrx_run_rows,
 )
 
 
@@ -234,6 +235,342 @@ def _incomplete_official_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_official_completed_stage_with_failed_items_is_reported_partial(self):
+        market_date = '2026-05-28'
+        official_item = _completed_official_stage(
+            run_id=386,
+            stage_id='signal_decider',
+            market_date=market_date,
+            processed=160,
+            total=160,
+        )
+        official_item['stage']['succeeded'] = 60
+        official_item['stage']['failed'] = 100
+        official_run = {
+            **official_item['run'],
+            'stages': {'signal_decider': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['signal_decider']
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['source_status'], 'completed')
+        self.assertEqual(stage['failed'], 100)
+        self.assertEqual(stage['current_activity'], 'Completed with 100 failed items.')
+
+    def test_completed_next_open_plan_is_blocked_when_decider_counts_are_incomplete(self):
+        market_date = '2026-05-28'
+        decider_item = _completed_official_stage(
+            run_id=386,
+            stage_id='signal_decider',
+            market_date=market_date,
+            processed=160,
+            total=160,
+        )
+        decider_item['stage']['succeeded'] = 60
+        decider_item['stage']['failed'] = 100
+        plan_item = _completed_official_stage(
+            run_id=386,
+            stage_id='next_open_execution_plan',
+            market_date=market_date,
+            processed=0,
+            total=0,
+        )
+        official_run = {
+            **decider_item['run'],
+            'stages': {
+                'signal_decider': decider_item['stage'],
+                'next_open_execution_plan': plan_item['stage'],
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['next_open_execution_plan']
+        self.assertEqual(stage['status'], 'blocked')
+        self.assertEqual(stage['source_status'], 'completed')
+        self.assertEqual(stage['details']['status_repair_reason'], 'signal_decider_incomplete')
+
+    def test_official_external_news_results_repair_legacy_zero_counters(self):
+        market_date = '2026-05-28'
+        collect_item = _completed_official_stage(
+            run_id=386,
+            stage_id='external_news_collect',
+            market_date=market_date,
+            processed=0,
+            total=201,
+        )
+        collect_item['stage']['succeeded'] = 0
+        collect_item['stage']['details'] = {
+            'result_summary': {
+                'summary': {
+                    'eligible_symbol_count': 201,
+                    'collected_symbol_count': 201,
+                    'items_inserted': 252,
+                }
+            }
+        }
+        enrich_item = _completed_official_stage(
+            run_id=386,
+            stage_id='external_news_enrich',
+            market_date=market_date,
+            processed=0,
+            total=0,
+        )
+        enrich_item['stage']['succeeded'] = 0
+        enrich_item['stage']['details'] = {
+            'result_summary': {
+                'items_inspected': 703,
+                'items_updated': 703,
+                'items_missing_classification': 0,
+                'items_remaining_at_least': 0,
+                'missing_item_ids': [],
+            }
+        }
+        official_run = {
+            **collect_item['run'],
+            'stages': {
+                'external_news_collect': collect_item['stage'],
+                'external_news_enrich': enrich_item['stage'],
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        collect_stage = result['stages']['external_news_collect']
+        self.assertEqual(collect_stage['processed'], 201)
+        self.assertEqual(collect_stage['total'], 201)
+        self.assertEqual(collect_stage['succeeded'], 201)
+        self.assertEqual(collect_stage['failed'], 0)
+        enrich_stage = result['stages']['external_news_enrich']
+        self.assertEqual(enrich_stage['processed'], 703)
+        self.assertEqual(enrich_stage['total'], 703)
+        self.assertEqual(enrich_stage['succeeded'], 703)
+        self.assertEqual(enrich_stage['failed'], 0)
+
+    def test_official_external_news_enrichment_recovers_legacy_lower_bound_semantics(self):
+        market_date = '2026-05-28'
+        official_item = _completed_official_stage(
+            run_id=386,
+            stage_id='external_news_enrich',
+            market_date=market_date,
+            processed=703,
+            total=704,
+        )
+        official_item['stage']['succeeded'] = 701
+        official_item['stage']['failed'] = 2
+        official_item['stage']['remaining'] = 1
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'items_inspected': 703,
+                'items_missing_classification': 3,
+                'items_remaining_at_least': 1,
+                'missing_item_ids': [11, 12],
+            }
+        }
+        official_run = {
+            **official_item['run'],
+            'stages': {'external_news_enrich': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        self.assertEqual(
+            result['stages']['external_news_enrich']['details']['count_semantics'],
+            {
+                'total': 'lower_bound',
+                'total_at_least': 704,
+                'remaining': 'lower_bound',
+                'remaining_at_least': 1,
+            },
+        )
+
+    def test_official_external_news_explicit_zero_scope_clears_stale_legacy_total(self):
+        market_date = '2026-05-28'
+        official_item = _completed_official_stage(
+            run_id=386,
+            stage_id='external_news_collect',
+            market_date=market_date,
+            processed=0,
+            total=201,
+        )
+        official_item['stage']['succeeded'] = 0
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'status': 'disabled',
+                'summary': {
+                    'requested_symbol_count': 201,
+                    'eligible_symbol_count': 0,
+                    'collected_symbol_count': 0,
+                },
+            }
+        }
+        official_run = {
+            **official_item['run'],
+            'stages': {'external_news_collect': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['external_news_collect']
+        self.assertEqual(stage['processed'], 0)
+        self.assertEqual(stage['total'], 0)
+        self.assertEqual(stage['succeeded'], 0)
+        self.assertEqual(stage['failed'], 0)
+        self.assertEqual(stage['remaining'], 0)
+
+    def test_official_external_news_failure_counters_are_not_overwritten(self):
+        market_date = '2026-05-28'
+        official_item = _completed_official_stage(
+            run_id=386,
+            stage_id='external_news_collect',
+            market_date=market_date,
+            processed=0,
+            total=201,
+        )
+        official_item['stage']['succeeded'] = 0
+        official_item['stage']['failed'] = 1
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'summary': {
+                    'eligible_symbol_count': 201,
+                    'collected_symbol_count': 201,
+                }
+            }
+        }
+        official_run = {
+            **official_item['run'],
+            'stages': {'external_news_collect': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['external_news_collect']
+        self.assertEqual(stage['processed'], 0)
+        self.assertEqual(stage['succeeded'], 0)
+        self.assertEqual(stage['failed'], 1)
+
+    def test_pykrx_enrichment_diagnostics_do_not_change_official_stage_status(self):
+        market_date = '2026-05-28'
+        official_item = _incomplete_official_stage(
+            run_id=386,
+            stage_id='pykrx_enrichment',
+            market_date=market_date,
+            status='partial',
+            updated_at='2026-05-28T08:45:00+00:00',
+            succeeded=2,
+            failed=5,
+        )
+        official_run = {
+            **official_item['run'],
+            'stages': {'pykrx_enrichment': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            pykrx_enrichment_loader=lambda **_: _full_pykrx_enrichment_coverage(
+                symbol_count=10,
+                market_count=2,
+                updated_at='2026-05-28T08:40:00+00:00',
+            ),
+        )
+
+        without_diagnostics = service.read(
+            market_date=market_date,
+            include_pykrx_enrichment_coverage=False,
+        )
+        with_diagnostics = service.read(
+            market_date=market_date,
+            include_pykrx_enrichment_coverage=True,
+        )
+
+        self.assertEqual(
+            without_diagnostics['stages']['pykrx_enrichment']['status'],
+            'partial',
+        )
+        self.assertEqual(
+            with_diagnostics['stages']['pykrx_enrichment']['status'],
+            'partial',
+        )
+        self.assertEqual(
+            with_diagnostics['stages']['pykrx_enrichment']['gate_status'],
+            'ready',
+        )
+        self.assertTrue(
+            with_diagnostics['stages']['pykrx_enrichment']['details']['categories']
+        )
+        self.assertEqual(
+            with_diagnostics['stages']['pykrx_enrichment']['details'][
+                'coverage_diagnostics_source'
+            ],
+            'stage_specific_fallback',
+        )
+        self.assertEqual(
+            with_diagnostics['stages']['pykrx_enrichment']['details'][
+                'coverage_diagnostics_updated_at'
+            ],
+            '2026-05-28T08:40:00+00:00',
+        )
+
     def test_load_daily_pipeline_stage_history_filters_stage_market_date_for_history_index(self):
         class _CapturedResult:
             def all(self):
@@ -322,6 +659,56 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['id'], daily_failed_run['id'])
         self.assertEqual(result['status'], 'failed')
         reconcile_run.assert_called_once_with(latest_run=daily_running_run)
+
+    def test_load_pipeline_pykrx_run_rows_filters_historical_runs_in_sql_before_limit(self):
+        daily_run = {'id': 901, 'run_metadata': {'mode': 'daily_auto'}}
+
+        with patch(
+            'app.eod.pipeline_status.list_eod_collection_runs',
+            return_value=[daily_run],
+        ) as list_runs:
+            result = _load_pipeline_pykrx_run_rows(trade_date='2026-04-21')
+
+        self.assertEqual(result, [daily_run])
+        list_runs.assert_called_once_with(
+            market='KRX',
+            trade_date='2026-04-21',
+            source='pykrx',
+            excluded_run_metadata_modes=('historical_backfill',),
+            limit=10,
+        )
+
+    def test_load_pipeline_pykrx_run_rows_falls_back_to_latest_historical_run(self):
+        historical_run = {
+            'id': 900,
+            'run_metadata': {'mode': 'historical_backfill'},
+        }
+
+        with patch(
+            'app.eod.pipeline_status.list_eod_collection_runs',
+            side_effect=[[], [historical_run]],
+        ) as list_runs:
+            result = _load_pipeline_pykrx_run_rows(trade_date='2026-04-21')
+
+        self.assertEqual(result, [historical_run])
+        self.assertEqual(
+            list_runs.call_args_list,
+            [
+                call(
+                    market='KRX',
+                    trade_date='2026-04-21',
+                    source='pykrx',
+                    excluded_run_metadata_modes=('historical_backfill',),
+                    limit=10,
+                ),
+                call(
+                    market='KRX',
+                    trade_date='2026-04-21',
+                    source='pykrx',
+                    limit=1,
+                ),
+            ],
+        )
 
     def test_read_returns_pending_when_no_runs_exist(self):
         service = EODPipelineStatusService(

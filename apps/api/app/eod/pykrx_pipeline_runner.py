@@ -17,6 +17,7 @@ from app.eod.pykrx_pipeline_support import (
     build_stage_failure_result,
     make_stage_progress_callback,
 )
+from app.eod.run_stage_support import extract_next_open_plan_stage_counts
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
 logger = logging.getLogger(__name__)
@@ -208,7 +209,7 @@ def _resolve_result_status(result: dict[str, Any]) -> str:
         status = _normalize_stage_status(result.get('status'))
         return status if status in {'waiting', 'blocked', 'failed', 'partial'} else 'skipped'
     status = _normalize_stage_status(result.get('status'))
-    if status != 'completed' or result.get('status'):
+    if status != 'completed':
         return status
     failed_keys = (
         'symbols_failed',
@@ -276,6 +277,14 @@ def _extract_result_counts(result: dict[str, Any], *, default_total: int = 0) ->
         }
 
     summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
+    if 'items_total' in summary:
+        counts = extract_next_open_plan_stage_counts(result)
+        return {
+            'processed': counts.processed,
+            'total': counts.total,
+            'succeeded': counts.succeeded,
+            'failed': counts.failed,
+        }
     if summary:
         succeeded = _int(
             summary.get('completed_count')
@@ -823,7 +832,7 @@ def _run_daily_agent_feedback_followup(
             'market_date': market_date,
         }
 
-    from datetime import date
+    from datetime import date, datetime, timezone
 
     from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
     from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
@@ -854,6 +863,7 @@ def _run_daily_agent_feedback_followup(
         config=FeedbackRetryCycleConfig(
             market_date=date.fromisoformat(market_date),
             roles=roles,
+            knowledge_cutoff_at=datetime.now(timezone.utc),
             feedback_scope_mode=feedback_scope_mode,
             max_cycles=settings.openclaw_feedback_retry_max_cycles,
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,

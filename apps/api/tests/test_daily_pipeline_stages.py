@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.eod.daily_pipeline_state import _build_stage_duration_details
@@ -174,6 +174,25 @@ class _FakeSkippedPykrxStageRunner:
             'market_date': kwargs['market_date'],
             'latest_available_trade_date': kwargs['market_date'],
             'source': 'pykrx',
+        }
+
+
+class _FakePartiallySuccessfulPykrxStageRunner:
+    def run_daily_pipeline_stages(self, **kwargs):
+        return {
+            'run_id': 902,
+            'status': 'completed_with_errors',
+            'latest_available_trade_date': kwargs['market_date'],
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'bars_upserted': 2,
+            'technical_snapshots': {
+                'market_date': kwargs['market_date'],
+                'status': 'partial',
+                'snapshots_persisted': 1,
+                'snapshots_failed': 1,
+            },
         }
 
 
@@ -395,6 +414,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(pykrx_runner.calls[0]['symbols'], ['005930', '000660'])
         self.assertEqual(feedback_retry_service.calls[0]['config'].roles, SUMMARIZER_AGENT_NAMES)
         self.assertEqual(feedback_retry_service.calls[1]['config'].roles, DECISION_SUPPORT_AGENT_NAMES)
+        for feedback_call in feedback_retry_service.calls:
+            cutoff = feedback_call['config'].knowledge_cutoff_at
+            self.assertIsInstance(cutoff, datetime)
+            self.assertIsNotNone(cutoff.utcoffset())
+            self.assertLessEqual(cutoff, datetime.now(timezone.utc))
         self.assertEqual(evaluation_service.calls[0]['as_of_market_date'], '2026-04-14')
         self.assertEqual(evaluation_service.calls[0]['symbols'], ['005930', '000660'])
         self.assertGreaterEqual(execute_stage.call_count, 3)
@@ -681,6 +705,171 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         self.assertEqual(status, 'partial')
 
+    def test_resolve_result_status_downgrades_completed_feedback_with_failures(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {
+                'status': 'completed',
+                'completed': True,
+                'final_pending': 0,
+                'progress': {
+                    'summary': {
+                        'expected_feedback_count': 160,
+                        'completed_feedback_count': 60,
+                        'failed_items': 100,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(status, 'partial')
+
+    def test_resolve_result_status_normalizes_ok_to_completed(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status({'status': 'ok'})
+
+        self.assertEqual(status, 'completed')
+
+    def test_resolve_result_status_downgrades_ok_with_failures(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {'status': 'ok', 'summary': {'failed_count': 1}}
+        )
+
+        self.assertEqual(status, 'partial')
+
+    def test_resolve_result_status_accepts_failed_item_collections(self) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {'error': 'some items failed', 'failed_items': ['005930']}
+        )
+
+        self.assertEqual(status, 'partial')
+
+    def test_extract_stage_counts_uses_external_news_collection_summary(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='external_news_collect',
+            result={
+                'status': 'ok',
+                'summary': {
+                    'eligible_symbol_count': 201,
+                    'collected_symbol_count': 201,
+                    'items_inserted': 252,
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 201,
+                'total': 201,
+                'succeeded': 201,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_preserves_explicit_zero_eligible_news_scope(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='external_news_collect',
+            result={
+                'status': 'disabled',
+                'summary': {
+                    'requested_symbol_count': 201,
+                    'eligible_symbol_count': 0,
+                    'collected_symbol_count': 0,
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_uses_external_news_enrichment_result(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='external_news_enrich',
+            result={
+                'status': 'partial',
+                'items_inspected': 703,
+                'items_updated': 701,
+                'items_missing_classification': 3,
+                'items_remaining_at_least': 1,
+                'missing_item_ids': [11, 12],
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 703,
+                'total': 704,
+                'succeeded': 701,
+                'failed': 2,
+            },
+        )
+
+    def test_extract_stage_counts_keeps_news_failures_beyond_id_preview(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='external_news_enrich',
+            result={
+                'status': 'partial',
+                'items_inspected': 120,
+                'items_missing_classification': 101,
+                'items_remaining_at_least': 1,
+                'missing_item_ids': list(range(50)),
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 120,
+                'total': 121,
+                'succeeded': 20,
+                'failed': 100,
+            },
+        )
+
+    def test_build_stage_run_details_marks_external_news_total_as_lower_bound(self) -> None:
+        details = DailyPipelineStageService._build_stage_run_details(
+            stage_id='external_news_enrich',
+            result={
+                'status': 'partial',
+                'items_inspected': 703,
+                'items_remaining_at_least': 1,
+            },
+        )
+
+        self.assertEqual(
+            details['count_semantics'],
+            {
+                'total': 'lower_bound',
+                'total_at_least': 704,
+                'remaining': 'lower_bound',
+                'remaining_at_least': 1,
+            },
+        )
+
+    def test_explicit_zero_stage_scope_rejects_lossy_or_boolean_counts(self) -> None:
+        self.assertFalse(
+            DailyPipelineStageService._has_explicit_zero_stage_scope(
+                stage_id='external_news_collect',
+                result={'summary': {'eligible_symbol_count': 0.5}},
+            )
+        )
+        self.assertFalse(
+            DailyPipelineStageService._has_explicit_zero_stage_scope(
+                stage_id='external_news_enrich',
+                result={
+                    'items_inspected': False,
+                    'items_remaining_at_least': 0,
+                },
+            )
+        )
+
     def test_execute_stage_routes_macro_context_refresh_to_service(self) -> None:
         service = DailyPipelineStageService()
 
@@ -807,7 +996,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             result={
                 'summary': {
                     'items_total': 18,
-                    'eligible_count': 14,
+                    'eligible_count': 4,
+                    'monitor_candidate_count': 10,
                     'blocked_count': 4,
                 }
             },
@@ -815,7 +1005,124 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         self.assertEqual(
             counts,
-            {'processed': 18, 'total': 18, 'succeeded': 14, 'failed': 4},
+            {'processed': 18, 'total': 18, 'succeeded': 18, 'failed': 0},
+        )
+
+    def test_price_stage_ignores_unrelated_grouped_stage_failure(self) -> None:
+        service = DailyPipelineStageService()
+
+        result = service._extract_pykrx_stage_result(
+            'price_collection',
+            {
+                'run_id': 901,
+                'status': 'completed_with_errors',
+                'latest_available_trade_date': '2026-04-14',
+                'symbols_total': 2,
+                'symbols_succeeded': 2,
+                'symbols_failed': 0,
+                'technical_snapshots': {
+                    'status': 'partial',
+                    'snapshots_persisted': 1,
+                    'snapshots_failed': 1,
+                },
+            },
+        )
+
+        self.assertEqual(result['status'], 'completed')
+
+    def test_grouped_technical_failure_does_not_block_enrichment_after_price_success(self) -> None:
+        enrichment_service = MagicMock()
+        enrichment_service.collect_for_market_date.return_value = {
+            'status': 'completed',
+            'categories_requested': [],
+            'categories': {},
+            'coverage': {},
+        }
+        service = DailyPipelineStageService(
+            pykrx_service=_FakePartiallySuccessfulPykrxStageRunner(),
+            pykrx_enrichment_service_ref=enrichment_service,
+        )
+
+        with patch(
+            'app.eod.daily_pipeline_stages.build_pykrx_enrichment_preflight',
+            return_value={'allowed': True, 'failed_categories': []},
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'price_collection',
+                    'pykrx_enrichment',
+                    'technical_snapshots',
+                ],
+            )
+
+        self.assertEqual(result['stages']['price_collection']['status'], 'completed')
+        self.assertEqual(result['stages']['technical_snapshots']['status'], 'partial')
+        self.assertEqual(result['stages']['pykrx_enrichment']['status'], 'completed')
+        enrichment_service.collect_for_market_date.assert_called_once()
+
+    def test_execute_pykrx_enrichment_blocks_zero_required_coverage(self) -> None:
+        required_categories = (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        )
+        collection_result = {
+            'status': 'completed',
+            'categories_requested': list(required_categories),
+            'categories': {
+                category: {'status': 'completed', 'rows_persisted': 0, 'errors': []}
+                for category in required_categories
+            },
+            'coverage': {
+                'categories': {
+                    category: {
+                        'scope_type': 'symbol',
+                        'expected_rows': 1,
+                        'present_rows': 0,
+                        'coverage_ratio': 0.0,
+                        'coverage_status': 'missing',
+                    }
+                    for category in required_categories
+                }
+            },
+        }
+        enrichment_service = MagicMock()
+        enrichment_service.collect_for_market_date.return_value = collection_result
+        service = DailyPipelineStageService(
+            pykrx_enrichment_service_ref=enrichment_service,
+        )
+
+        result = service._execute_stage(
+            stage_id='pykrx_enrichment',
+            market_date='2026-04-14',
+            symbols=['005930'],
+            markets=['KOSPI'],
+            force=False,
+            bypass_prerequisite_gate=False,
+            fs_div='CFS',
+            symbol_limit=None,
+            symbol_offset=0,
+            capture_limit=500,
+            retry_cycles=None,
+            feedback_max_cycles=3,
+            feedback_outer_batch_size=20,
+            reuse_existing_feedback=True,
+        )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertFalse(result['downstream_preflight']['allowed'])
+        self.assertEqual(
+            set(result['downstream_preflight']['failed_categories']),
+            set(required_categories),
+        )
+
+    def test_recovered_stage_status_is_terminal_completed(self) -> None:
+        self.assertEqual(
+            DailyPipelineStageService._resolve_result_status(
+                {'status': 'recovered'}
+            ),
+            'completed',
         )
 
     def test_run_blocks_next_open_plan_when_signal_decider_is_incomplete(self) -> None:

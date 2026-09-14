@@ -364,12 +364,23 @@ class ExternalNewsAssociationStoreTests(unittest.TestCase):
                 published_before=second_symbol_seen + timedelta(days=1),
                 collected_before=repeated_second_symbol + timedelta(seconds=1),
             )
+            post_cutoff_association = list_external_news_items(
+                symbols=['000660'],
+                observed_after=first_seen + timedelta(minutes=30),
+                published_before=second_symbol_seen + timedelta(days=1),
+                collected_before=repeated_second_symbol + timedelta(seconds=1),
+            )
 
         self.assertEqual(first, {'inserted': 1, 'updated': 0, 'skipped': 0})
         self.assertEqual(second, {'inserted': 0, 'updated': 0, 'skipped': 1})
         self.assertEqual(repeated, {'inserted': 0, 'updated': 0, 'skipped': 1})
         self.assertEqual(before_second_association, [])
         self.assertEqual(len(after_second_association), 1)
+        self.assertEqual(len(post_cutoff_association), 1)
+        self.assertEqual(
+            post_cutoff_association[0]['associated_at'],
+            second_symbol_seen.replace(tzinfo=None).isoformat(),
+        )
         self.assertEqual(after_second_association[0]['symbol'], '000660')
         self.assertEqual(after_second_association[0]['title'], 'original title')
 
@@ -543,6 +554,12 @@ class ExternalNewsAssociationStoreTests(unittest.TestCase):
                 published_before=classified_at + timedelta(microseconds=1),
                 collected_before=classified_at + timedelta(microseconds=1),
             )
+            post_classification = list_external_news_items(
+                symbols=['005930'],
+                observed_after=classified_at,
+                published_before=classified_at + timedelta(microseconds=1),
+                collected_before=classified_at + timedelta(microseconds=1),
+            )
 
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['classification_versions_inserted'], 1)
@@ -551,6 +568,7 @@ class ExternalNewsAssociationStoreTests(unittest.TestCase):
             after_cutoff[0]['classification'],
             embedded_payload['classification'],
         )
+        self.assertEqual(len(post_classification), 1)
         self.assertEqual(
             after_cutoff[0]['classification_provenance'],
             {

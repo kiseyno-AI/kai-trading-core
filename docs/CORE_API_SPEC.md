@@ -1491,6 +1491,237 @@ Authorization: Bearer <token>
 
 ---
 
+## 4.5 `POST /agent-context/feedback/dispatch/symbols`
+Dispatches the requested role sequence for an explicit symbol set. With
+`wait_for_completion=false`, the response returns after the durable run is
+queued; with `true`, it returns the completed orchestration payload.
+
+`knowledge_cutoff_at` has the same semantics as the symbol-day read: it must be
+timezone-aware and is an exclusive upper bound for news publication and
+collection timestamps in every role input. A historical KRX date defaults to
+15:30 KST when omitted; a historical US date uses the actual XNYS session
+close, and mixed KRX/US requests require an explicit cutoff. When the field is
+omitted, current or future dates use request time; a timezone-naive or
+explicitly future cutoff is rejected. Background runs persist one canonical
+UTC effective cutoff in their durable request payload, including when the
+value was derived from a default.
+
+With `reuse_existing=true`, persisted feedback is reusable only when its run
+records the same effective cutoff instant. Equivalent timezone offsets compare
+equal after UTC normalization; a missing, earlier, or later stored cutoff
+fails closed and redispatches the role.
+
+### Example request
+```http
+POST /agent-context/feedback/dispatch/symbols
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+```json
+{
+  "market_date": "2026-04-14",
+  "symbols": ["005930", "000660"],
+  "roles": ["eod-summarizer", "technical-summarizer", "signal-decider"],
+  "fs_div": "CFS",
+  "disclosures_limit": 5,
+  "knowledge_cutoff_at": "2026-04-14T15:30:00+09:00",
+  "reuse_existing": true,
+  "wait_for_completion": false,
+  "force": false,
+  "force_recompute": false
+}
+```
+
+### Example queued response
+```json
+{
+  "request": {
+    "market_date": "2026-04-14",
+    "symbols": ["005930", "000660"],
+    "requested_symbols": ["005930", "000660"],
+    "roles": ["eod-summarizer", "technical-summarizer", "signal-decider"],
+    "fs_div": "CFS",
+    "disclosures_limit": 5,
+    "knowledge_cutoff_at": "2026-04-14T06:30:00+00:00",
+    "reuse_existing": true,
+    "force_recompute": false,
+    "scope": "requested_symbols_scored_by_strategy_aware_prefilter",
+    "eligibility_rule": "strategy_aware_prefilter_scoring_v1",
+    "eligibility_filters": ["market_risk_filter", "piotroski_filter"],
+    "request_run_id": "symbol-run-2026-04-14-a1b2c3d4e5",
+    "wait_for_completion": false
+  },
+  "summary": {
+    "status": "queued",
+    "queued": 2
+  }
+}
+```
+
+### Notes
+- A prerequisite gate can return `summary.status="waiting"` or `"blocked"`, `summary.gated=true`, a `prerequisites` object, and no dispatched items.
+- The synchronous response contains `request`, `summary`, `items`, and `failures`; use the returned run id with the feedback progress endpoint for durable inspection.
+- `force=true` bypasses the prerequisite gate. `force_recompute=true` bypasses reuse but does not independently bypass prerequisites.
+
+---
+
+## 4.6 `POST /agent-context/feedback/retry-cycles`
+Runs bounded retry cycles over incomplete feedback. An explicit `symbols` list
+limits the run to that set; omitting it selects the persisted eligible scope.
+
+`knowledge_cutoff_at` must be timezone-aware and remains fixed across every
+cycle and role in the run. It is the exclusive upper bound for news publication
+and collection timestamps. When omitted, historical KRX dates use 15:30 KST;
+historical US dates use the actual XNYS session close, and mixed-market scopes
+require an explicit cutoff. When the field is omitted, current or future dates
+use request time. Naive or explicitly future values fail with HTTP 400 rather
+than silently changing the evidence window.
+
+Reuse and durable cycle resume use the normalized effective cutoff as part of
+their identity. Equivalent timezone offsets match, while a missing, earlier,
+or later cutoff cannot be reused or resumed and therefore requires fresh work.
+Active retry runs join only when scope, scope mode, and effective cutoff all
+match. Separate current/future requests whose omitted cutoffs resolve to
+different request-time instants do not join.
+
+### Example request
+```http
+POST /agent-context/feedback/retry-cycles
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+```json
+{
+  "market_date": "2026-04-14",
+  "symbols": ["005930"],
+  "roles": ["technical-summarizer", "signal-decider"],
+  "knowledge_cutoff_at": "2026-04-14T15:30:00+09:00",
+  "feedback_scope_mode": "decider_scope_fast_path",
+  "max_cycles": 2,
+  "outer_batch_size": 10,
+  "reuse_existing": true,
+  "force": false,
+  "force_recompute": false
+}
+```
+
+### Example response
+```json
+{
+  "market_date": "2026-04-14",
+  "roles": ["technical-summarizer", "signal-decider"],
+  "max_cycles": 2,
+  "outer_batch_size": 10,
+  "reuse_existing": true,
+  "force_recompute": false,
+  "feedback_scope_mode": "decider_scope_fast_path",
+  "requested_symbols": ["005930"],
+  "eligible_symbols": ["005930"],
+  "skipped_symbols": [],
+  "run_id": "feedback-cycle-2026-04-14-a1b2c3d4e5",
+  "status": "completed",
+  "cycles": [],
+  "final_pending": 0,
+  "completed": true,
+  "progress": {
+    "request": {
+      "market_date": "2026-04-14",
+      "symbols": ["005930"],
+      "expected_agents": ["technical-summarizer", "signal-decider"],
+      "run_id": "feedback-cycle-2026-04-14-a1b2c3d4e5",
+      "feedback_scope_mode": "decider_scope_fast_path"
+    },
+    "summary": {
+      "pending_symbols": 0,
+      "progress_percent": 100.0
+    }
+  }
+}
+```
+
+### Notes
+- The supplied cutoff instant is normalized to UTC, stored in the durable run request, and frozen across the role inputs identified by `run_id`.
+- `status` may be `waiting` or `blocked` with `gated=true` and a `prerequisites` object when source stages are incomplete.
+- `feedback_scope_mode` is either `decider_scope_fast_path` or `broad_feedback_universe`.
+
+---
+
+## 4.7 `POST /agent-context/feedback/followup`
+Runs the same bounded retry engine as `/feedback/retry-cycles` for automatic or
+operator-initiated follow-up recovery. It has the same response contract; its
+`outer_batch_size` request limit is 500 rather than 200.
+
+`knowledge_cutoff_at` is normalized once and the same instant is propagated to
+the retry configuration and all role inputs. It must include a timezone offset,
+is exclusive for news publication and collection time, and stays fixed for the
+whole follow-up. When omitted, current or future dates use request time. The
+same 15:30 KST historical default and HTTP 400 rejection rules apply;
+historical US dates use the actual XNYS close, mixed-market scopes require an
+explicit value, and invalid explicit values fail with HTTP 400.
+
+The same exact normalized-cutoff reuse, resume, and active-run join rules as
+`/feedback/retry-cycles` apply to follow-up requests.
+
+### Example request
+```http
+POST /agent-context/feedback/followup
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+```json
+{
+  "market_date": "2026-04-14",
+  "symbols": ["005930"],
+  "roles": ["signal-decider"],
+  "knowledge_cutoff_at": "2026-04-14T15:30:00+09:00",
+  "feedback_scope_mode": "decider_scope_fast_path",
+  "max_cycles": 1,
+  "outer_batch_size": 20,
+  "reuse_existing": true,
+  "force": false,
+  "force_recompute": false
+}
+```
+
+### Example response
+```json
+{
+  "market_date": "2026-04-14",
+  "roles": ["signal-decider"],
+  "max_cycles": 1,
+  "outer_batch_size": 20,
+  "reuse_existing": true,
+  "force_recompute": false,
+  "feedback_scope_mode": "decider_scope_fast_path",
+  "requested_symbols": ["005930"],
+  "eligible_symbols": ["005930"],
+  "skipped_symbols": [],
+  "run_id": "feedback-cycle-2026-04-14-f6e7d8c9b0",
+  "status": "completed",
+  "cycles": [],
+  "final_pending": 0,
+  "completed": true,
+  "progress": {
+    "request": {
+      "market_date": "2026-04-14",
+      "symbols": ["005930"],
+      "expected_agents": ["signal-decider"],
+      "run_id": "feedback-cycle-2026-04-14-f6e7d8c9b0",
+      "feedback_scope_mode": "decider_scope_fast_path"
+    },
+    "summary": {
+      "pending_symbols": 0,
+      "progress_percent": 100.0
+    }
+  }
+}
+```
+
+---
+
 # 5. Execution Handoff / Runtime Contract
 
 Core's execution handoff boundary is versioned in code at

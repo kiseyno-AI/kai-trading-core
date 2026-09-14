@@ -9,6 +9,7 @@ from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARY_REUSE_REASON,
     AgentContextReuseService,
     _extract_fingerprint_payload,
+    _failure_supersedes_feedback,
 )
 from app.agent_context.retry_service import AgentFeedbackRetryService
 
@@ -59,12 +60,230 @@ class _ReuseSession:
         return _ReuseExecuteResult()
 
 
+class _TimestampResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+
+class _TimestampSession:
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def execute(self, _statement):
+        self.calls += 1
+        return _TimestampResult(self.value)
+
+
+class _RowsResult:
+    def __init__(self, rows=()):
+        self._rows = list(rows)
+
+    def all(self):
+        return list(self._rows)
+
+    def scalars(self):
+        return _EmptyScalars()
+
+
+class _CutoffReuseSession:
+    def __init__(
+        self,
+        knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+    ):
+        feedback = SimpleNamespace(
+            id=7,
+            market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
+            symbol='CUTOFFTEST',
+            agent_name='eod-summarizer',
+            run_id='cutoff-reuse-run',
+            summary_payload={},
+            feedback_payload={'summary': 'reusable'},
+            context_payload={},
+            received_at=datetime(2026, 4, 16, 6, 32, tzinfo=timezone.utc),
+        )
+        run = SimpleNamespace(
+            id=11,
+            run_id='cutoff-reuse-run',
+            started_at=datetime(2026, 4, 16, 6, 31, tzinfo=timezone.utc),
+            request_payload=(
+                {'knowledge_cutoff_at': knowledge_cutoff_at}
+                if knowledge_cutoff_at is not None
+                else {}
+            ),
+        )
+        self._results = iter(
+            (
+                _RowsResult(),
+                _RowsResult([feedback]),
+                _RowsResult(),
+                _RowsResult([run]),
+            )
+        )
+
+    def execute(self, _statement):
+        return next(self._results)
+
+
 @contextmanager
 def _reuse_session_scope():
     yield _ReuseSession()
 
 
+@contextmanager
+def _cutoff_reuse_session_scope():
+    yield _CutoffReuseSession()
+
+
+@contextmanager
+def _missing_cutoff_reuse_session_scope():
+    yield _CutoffReuseSession(knowledge_cutoff_at=None)
+
+
 class FundamentalReuseServiceTests(unittest.TestCase):
+    def test_feedback_reuse_requires_exact_effective_cutoff_instant(self):
+        service = AgentContextReuseService()
+        symbol = 'CUTOFFTEST'
+        role = 'eod-summarizer'
+        market_date = __import__('datetime').date.fromisoformat('2026-04-16')
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _cutoff_reuse_session_scope,
+        ):
+            equivalent = service.build_latest_decisions(
+                market_date=market_date,
+                symbols=[symbol],
+                roles=[role],
+                knowledge_cutoff_at='2026-04-16T15:30:00+09:00',
+            )[symbol][role]
+        self.assertFalse(equivalent.should_dispatch)
+        self.assertEqual(equivalent.reason, 'reuse_latest_feedback')
+
+        for mismatched_cutoff in (
+            '2026-04-16T05:30:00+00:00',
+            '2026-04-16T07:30:00+00:00',
+        ):
+            with self.subTest(mismatched_cutoff=mismatched_cutoff):
+                with patch(
+                    'app.agent_context.reuse_service.session_scope',
+                    _cutoff_reuse_session_scope,
+                ):
+                    mismatch = service.build_latest_decisions(
+                        market_date=market_date,
+                        symbols=[symbol],
+                        roles=[role],
+                        knowledge_cutoff_at=mismatched_cutoff,
+                    )[symbol][role]
+                self.assertTrue(mismatch.should_dispatch)
+                self.assertEqual(mismatch.reason, 'knowledge_cutoff_mismatch')
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _missing_cutoff_reuse_session_scope,
+        ):
+            missing = service.build_latest_decisions(
+                market_date=market_date,
+                symbols=[symbol],
+                roles=[role],
+                knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+            )[symbol][role]
+        self.assertTrue(missing.should_dispatch)
+        self.assertEqual(missing.reason, 'knowledge_cutoff_mismatch')
+
+    def test_newer_run_success_supersedes_late_failure_from_older_run(self):
+        earlier = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
+        later = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+        feedback = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='newer-success-run',
+            received_at=later,
+        )
+        failure = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='older-failure-run',
+            received_at=later.replace(minute=30),
+        )
+
+        self.assertFalse(
+            _failure_supersedes_feedback(
+                feedback=feedback,
+                failure=failure,
+                run_order_by_id={
+                    'older-failure-run': (earlier, 10),
+                    'newer-success-run': (later, 20),
+                },
+            )
+        )
+
+    def test_newer_run_failure_supersedes_earlier_success(self):
+        earlier = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
+        later = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+        feedback = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='older-success-run',
+            received_at=later.replace(minute=30),
+        )
+        failure = SimpleNamespace(
+            market_date=earlier.date(),
+            run_id='newer-failure-run',
+            received_at=later,
+        )
+
+        self.assertTrue(
+            _failure_supersedes_feedback(
+                feedback=feedback,
+                failure=failure,
+                run_order_by_id={
+                    'older-success-run': (earlier, 10),
+                    'newer-failure-run': (later, 20),
+                },
+            )
+        )
+
+    def test_missing_run_lineage_keeps_equal_time_failure_fail_closed(self):
+        observed_at = datetime(2026, 4, 16, 5, 0, tzinfo=timezone.utc)
+        feedback = SimpleNamespace(
+            market_date=observed_at.date(),
+            run_id='unknown-success-run',
+            received_at=observed_at,
+        )
+        failure = SimpleNamespace(
+            market_date=observed_at.date(),
+            run_id='unknown-failure-run',
+            received_at=observed_at,
+        )
+
+        self.assertTrue(
+            _failure_supersedes_feedback(
+                feedback=feedback,
+                failure=failure,
+                run_order_by_id={},
+            )
+        )
+
+    def test_both_deciders_track_newer_upstream_feedback(self):
+        service = AgentContextReuseService()
+        updated_at = datetime(2026, 4, 16, 5, 30, tzinfo=timezone.utc)
+
+        for role in ('short-term-decider', 'signal-decider'):
+            session = _TimestampSession(updated_at)
+            result = service._get_latest_source_updated_at(
+                session=session,
+                role=role,
+                market_date=__import__('datetime').date.fromisoformat(
+                    '2026-04-16'
+                ),
+                symbol='005930',
+                symbol_id=101,
+            )
+
+            self.assertEqual(result, updated_at)
+            self.assertEqual(session.calls, 1)
+
     def test_fundamental_reuse_decision_accepts_matching_fingerprint_across_dates(self):
         should_dispatch, reason = AgentContextReuseService._decide_fundamental_reuse(
             force_recompute=False,
@@ -158,13 +377,18 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             with patch(
                 'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
                 return_value=decisions,
-            ):
+            ) as build_latest_decisions:
                 snapshot = service._build_role_sequence_snapshot(
                     market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
                     roles=('fundamental-summarizer',),
                     eligible_symbols=('005930',),
+                    knowledge_cutoff_at='2026-04-16T15:30:00+09:00',
                 )
 
+        self.assertEqual(
+            build_latest_decisions.call_args.kwargs['knowledge_cutoff_at'],
+            '2026-04-16T15:30:00+09:00',
+        )
         role_state = snapshot.role_states['fundamental-summarizer']
         self.assertEqual(role_state.completed_symbols, ('005930',))
         self.assertEqual(role_state.reused_symbols, ('005930',))
@@ -198,7 +422,7 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         )
         self.assertIn('technical-summarizer', missing_roles)
 
-    def test_decider_upstream_bundle_uses_same_day_feedback_pending_refresh(self):
+    def test_decider_upstream_bundle_blocks_same_day_feedback_pending_refresh(self):
         decision = _decision(
             should_dispatch=True,
             reason='fundamental_input_fingerprint_changed',
@@ -217,10 +441,9 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             upstream_summary_roles=('fundamental-summarizer',),
         )
 
-        self.assertEqual(missing_roles, [])
-        self.assertEqual(upstream_summaries['fundamental-summarizer']['summary'], 'reusable fundamentals')
-        self.assertTrue(upstream_traceability['fundamental-summarizer']['refresh_pending'])
-        self.assertEqual(upstream_traceability['fundamental-summarizer']['source'], 'persisted_feedback')
+        self.assertEqual(missing_roles, ['fundamental-summarizer'])
+        self.assertNotIn('fundamental-summarizer', upstream_summaries)
+        self.assertNotIn('fundamental-summarizer', upstream_traceability)
 
 
 if __name__ == '__main__':
