@@ -4261,6 +4261,7 @@ class SignalDeciderNextOpenExecutionService:
                 symbols=missing_symbols,
                 categories=missing_categories,
                 allow_kis_candidate_fallback=True,
+                point_in_time_recovery=True,
             )
         return self._inspect_candidate_pykrx_enrichment(
             source_market_date=source_market_date,

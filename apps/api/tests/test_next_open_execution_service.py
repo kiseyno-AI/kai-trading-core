@@ -8417,8 +8417,50 @@ class CandidateEnrichmentRepairTests(unittest.TestCase):
             symbols=['004370'],
             categories=['investor_flow_symbol', 'short_selling'],
             allow_kis_candidate_fallback=True,
+            point_in_time_recovery=True,
         )
         self.assertEqual(result['004370']['missing_categories'], [])
+
+    @patch('app.eod.pykrx_enrichment.pykrx_enrichment_service')
+    def test_prior_date_repair_remains_blocked_without_historical_enrichment(
+        self,
+        enrichment_service,
+    ):
+        service = SignalDeciderNextOpenExecutionService.__new__(
+            SignalDeciderNextOpenExecutionService
+        )
+        missing = {
+            '004370': {
+                'missing_categories': [
+                    'investor_flow_symbol',
+                    'short_selling',
+                ],
+                'allowed': False,
+            }
+        }
+        service._inspect_candidate_pykrx_enrichment = MagicMock(
+            side_effect=[missing, missing]
+        )
+
+        result = service._repair_and_inspect_candidate_pykrx_enrichment(
+            source_market_date=date(2026, 9, 11),
+            symbols=['004370'],
+            categories=['investor_flow_symbol', 'short_selling'],
+        )
+
+        enrichment_service.collect_for_market_date.assert_called_once_with(
+            market_date=date(2026, 9, 11),
+            markets=['KOSPI', 'KOSDAQ', 'KONEX'],
+            symbols=['004370'],
+            categories=['investor_flow_symbol', 'short_selling'],
+            allow_kis_candidate_fallback=True,
+            point_in_time_recovery=True,
+        )
+        self.assertFalse(result['004370']['allowed'])
+        self.assertEqual(
+            result['004370']['missing_categories'],
+            ['investor_flow_symbol', 'short_selling'],
+        )
 
 
 class NextOpenSetupCleanupSafetyTests(unittest.TestCase):
