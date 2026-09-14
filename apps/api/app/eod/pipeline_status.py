@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
 from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
@@ -179,7 +180,7 @@ def _load_latest_fundamentals_refresh_run(*, market_date: str, fs_div: str) -> d
     return payload.get('latest_run')
 
 
-def _load_latest_daily_pipeline_run(*, market_date: str) -> dict[str, Any] | None:
+def _load_latest_daily_pipeline_run(*, market_date: str | None) -> dict[str, Any] | None:
     try:
         return daily_pipeline_run_state_service.get_latest_run(market_date=market_date)
     except SQLAlchemyError:
@@ -700,7 +701,12 @@ def _load_latest_feedback_run_summary(*, market_date: str) -> dict[str, Any] | N
 
     run_snapshot = agent_context_feedback_run_state_service.find_latest_run(
         market_date=normalized_market_date,
+        request_modes=[DAILY_RETRY_CYCLE_MODE],
     )
+    if run_snapshot is None:
+        run_snapshot = agent_context_feedback_run_state_service.find_latest_run(
+            market_date=normalized_market_date,
+        )
     if run_snapshot is None:
         return None
 
@@ -795,16 +801,36 @@ class EODPipelineStatusService:
         include_pykrx_enrichment_coverage: bool = True,
     ) -> dict[str, Any]:
         market_state = self.market_state_loader()
-        # The default operator view stays on the current Seoul calendar date.
-        # Callers must pass market_date explicitly when they want a previous trade date on weekends or break-days.
-        resolved_market_date = date.fromisoformat(market_date or str(market_state.server_time)[:10]).isoformat()
+        explicit_market_date = (
+            date.fromisoformat(market_date).isoformat()
+            if market_date is not None
+            else None
+        )
+        official_run = self.official_run_loader(market_date=explicit_market_date)
+        official_market_date = (
+            (official_run or {}).get('market_date')
+            if explicit_market_date is None
+            else None
+        )
+        try:
+            latest_persisted_market_date = (
+                date.fromisoformat(str(official_market_date)[:10]).isoformat()
+                if official_market_date is not None
+                else None
+            )
+        except ValueError:
+            latest_persisted_market_date = None
+        resolved_market_date = (
+            explicit_market_date
+            or latest_persisted_market_date
+            or date.fromisoformat(str(market_state.server_time)[:10]).isoformat()
+        )
         market_session = build_market_session_metadata(
             requested_date=resolved_market_date,
             current_state=market_state,
         )
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         pykrx_run = self.pykrx_run_loader(trade_date=resolved_market_date)
-        official_run = self.official_run_loader(market_date=resolved_market_date)
         official_stage_history = dict(
             self.official_stage_history_loader(market_date=resolved_market_date) or {}
         )
@@ -1537,6 +1563,7 @@ class EODPipelineStatusService:
     ) -> dict[str, Any]:
         definition = STAGE_DEFINITIONS[stage_id]
         status = str(official_stage.get('status') or 'pending').strip().lower()
+        stored_status = status
         fallback_status = str(fallback_stage.get('status') or '').strip().lower()
         use_fallback_progress = (
             status == 'running'
@@ -1557,6 +1584,16 @@ class EODPipelineStatusService:
             if isinstance(official_details.get('result_summary'), dict)
             else {}
         )
+        result_summary_status = (
+            DailyPipelineStageService._resolve_result_status(result_summary)
+            if result_summary
+            else status
+        )
+        status_repaired_from_result_summary = (
+            stored_status == 'completed' and result_summary_status == 'partial'
+        )
+        if status_repaired_from_result_summary:
+            status = 'partial'
         should_repair_legacy_counts = (
             counts.processed == 0
             and counts.succeeded == 0
@@ -1580,8 +1617,19 @@ class EODPipelineStatusService:
                 )
             ):
                 counts = build_stage_counts(**result_counts)
+        if (
+            stage_id == 'agent_feedback_summaries'
+            and stored_status == 'completed'
+            and result_summary
+        ):
+            feedback_counts = DailyPipelineStageService._extract_stage_counts(
+                stage_id=stage_id,
+                result=result_summary,
+            )
+            if feedback_counts['total'] > 0:
+                counts = build_stage_counts(**feedback_counts)
         status_repaired_for_incomplete_counts = (
-            status == 'completed'
+            stored_status == 'completed'
             and (counts.failed > 0 or counts.remaining > 0)
         )
         if status_repaired_for_incomplete_counts:
@@ -1596,6 +1644,21 @@ class EODPipelineStatusService:
             if uses_fallback_coverage_diagnostics
             else official_details
         )
+        if result_summary:
+            compacted_result_summary, read_time_omissions = (
+                DailyPipelineStageService.compact_stage_result_summary(result_summary)
+            )
+            details['result_summary'] = compacted_result_summary
+            if read_time_omissions:
+                existing_omissions = details.get('result_summary_omissions')
+                details['result_summary_omissions'] = {
+                    **(
+                        dict(existing_omissions)
+                        if isinstance(existing_omissions, dict)
+                        else {}
+                    ),
+                    **read_time_omissions,
+                }
         count_semantics = DailyPipelineStageService._extract_stage_count_semantics(
             stage_id=stage_id,
             result=result_summary,
@@ -1605,9 +1668,13 @@ class EODPipelineStatusService:
         if uses_fallback_coverage_diagnostics:
             details['coverage_diagnostics_source'] = 'stage_specific_fallback'
             details['coverage_diagnostics_updated_at'] = fallback_stage.get('updated_at')
-        if status_repaired_for_incomplete_counts:
+        if status_repaired_for_incomplete_counts or status_repaired_from_result_summary:
             details['status_repaired_from'] = 'completed'
-            details['status_repair_reason'] = 'incomplete_terminal_counts'
+            details['status_repair_reason'] = (
+                'incomplete_terminal_counts'
+                if status_repaired_for_incomplete_counts
+                else 'incomplete_result_summary'
+            )
         details['mode'] = 'official_daily_pipeline_run_state'
         details['pipeline_run_id'] = official_run.get('id')
         details['pipeline_trigger'] = official_run.get('trigger')
@@ -1618,11 +1685,16 @@ class EODPipelineStatusService:
         current_activity = official_stage.get('current_activity')
         if use_fallback_progress:
             current_activity = fallback_stage.get('current_activity') or current_activity
-        if status_repaired_for_incomplete_counts:
+        if status_repaired_for_incomplete_counts or status_repaired_from_result_summary:
             current_activity = (
                 f'Completed with {counts.failed} failed items.'
                 if counts.failed > 0
-                else f'Incomplete with {counts.remaining} items remaining.'
+                else (
+                    f'Incomplete with {counts.remaining} '
+                    f'{"item" if counts.remaining == 1 else "items"} remaining.'
+                    if counts.remaining > 0
+                    else 'Incomplete role progress reported.'
+                )
             )
         if status in {'failed', 'interrupted', 'abandoned'} and official_stage.get('error_message'):
             current_activity = official_stage.get('error_message')

@@ -2,6 +2,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import call, patch
 
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
     DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
@@ -718,6 +719,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_enrichment_loader=lambda **_: {},
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()
@@ -1034,13 +1036,14 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             {'signal_decider_evaluations': 'partial'},
         )
 
-    def test_read_keeps_break_day_default_market_date_on_current_calendar_day(self):
+    def test_read_uses_break_day_calendar_date_when_no_official_run_exists(self):
         service = EODPipelineStatusService(
             market_state_loader=lambda: _FakeBreakDayMarketState(),
             pykrx_run_loader=lambda **_: None,
             pykrx_stage_counts_loader=lambda *_: {},
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()
@@ -1068,6 +1071,159 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['price_collection']['status'], 'pending')
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['market_date'], '2026-05-05')
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'pending')
+
+    def test_read_without_market_date_uses_latest_persisted_run_date(self):
+        latest_run = {
+            'id': 386,
+            'market_date': '2026-05-04',
+            'trigger': 'manual_daily_api',
+            'status': 'partial',
+            'current_stage': 'price_collection',
+            'started_at': '2026-05-05T09:00:00+00:00',
+            'updated_at': '2026-05-05T10:00:00+00:00',
+            'completed_at': '2026-05-05T10:00:00+00:00',
+            'error_message': None,
+            'run_metadata': {},
+            'stages': {},
+        }
+        official_run_dates = []
+        pykrx_dates = []
+
+        def _load_official_run(*, market_date):
+            official_run_dates.append(market_date)
+            return latest_run if market_date is None else None
+
+        def _load_pykrx_run(*, trade_date):
+            pykrx_dates.append(trade_date)
+            return None
+
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeBreakDayMarketState(),
+            pykrx_run_loader=_load_pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=_load_official_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(official_run_dates, [None])
+        self.assertEqual(pykrx_dates, ['2026-05-04'])
+        self.assertEqual(result['market_date'], '2026-05-04')
+        self.assertEqual(result['official_run']['id'], 386)
+
+    def test_official_stage_result_summary_is_compacted_on_read(self):
+        market_date = '2026-04-21'
+        official_item = _completed_official_stage(
+            run_id=386,
+            stage_id='signal_decider_evaluations',
+            market_date=market_date,
+            processed=200,
+            total=200,
+        )
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'status': 'completed',
+                'summary': {'evaluations_upserted': 200},
+                'evaluation_refresh': {
+                    'summary': {'evaluations_upserted': 200},
+                    'items': [{'symbol': f'{index:06d}'} for index in range(200)],
+                },
+            }
+        }
+        official_run = {
+            **official_item['run'],
+            'stages': {'signal_decider_evaluations': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read(market_date=market_date)
+
+        details = result['stages']['signal_decider_evaluations']['details']
+        self.assertEqual(
+            details['result_summary']['evaluation_refresh'],
+            {'summary': {'evaluations_upserted': 200}},
+        )
+        self.assertEqual(
+            details['result_summary_omissions']['evaluation_refresh.items'],
+            {'type': 'list', 'item_count': 200},
+        )
+
+    def test_official_feedback_stage_repairs_counts_and_activity_from_role_progress(self):
+        market_date = '2026-04-21'
+        official_item = _completed_official_stage(
+            run_id=386,
+            stage_id='agent_feedback_summaries',
+            market_date=market_date,
+            processed=239,
+            total=239,
+        )
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'status': 'completed',
+                'progress': {
+                    'summary': {
+                        'role_progress': {
+                            'eod-summarizer': {
+                                'status': 'completed',
+                                'total_symbols': 80,
+                                'processed_symbols': 80,
+                                'completed_symbols': 80,
+                                'pending_symbols': 0,
+                                'failed_items': 0,
+                            },
+                            'technical-summarizer': {
+                                'status': 'completed',
+                                'total_symbols': 80,
+                                'processed_symbols': 80,
+                                'completed_symbols': 80,
+                                'pending_symbols': 0,
+                                'failed_items': 0,
+                            },
+                            'fundamental-summarizer': {
+                                'status': 'partial',
+                                'total_symbols': 80,
+                                'processed_symbols': 79,
+                                'completed_symbols': 79,
+                                'pending_symbols': 1,
+                                'failed_items': 0,
+                            },
+                        }
+                    }
+                },
+            }
+        }
+        official_run = {
+            **official_item['run'],
+            'stages': {'agent_feedback_summaries': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['agent_feedback_summaries']
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['processed'], 239)
+        self.assertEqual(stage['total'], 240)
+        self.assertEqual(stage['succeeded'], 239)
+        self.assertEqual(stage['failed'], 0)
+        self.assertEqual(stage['remaining'], 1)
+        self.assertEqual(stage['current_activity'], 'Incomplete with 1 item remaining.')
 
     def test_read_reports_live_stage_progress_for_pykrx_and_fundamentals(self):
         pykrx_run = {
@@ -1169,6 +1325,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: stage_counts,
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()
@@ -1324,6 +1481,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: {},
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()
@@ -2057,12 +2215,16 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         ), patch(
             'app.agent_context.run_state_service.agent_context_feedback_run_state_service.find_latest_run',
             return_value=stale_run_snapshot,
-        ), patch(
+        ) as latest_run_loader, patch(
             'app.agent_context.progress_service.agent_context_progress_service.get_feedback_progress',
             return_value=reconciled_progress,
         ) as progress_loader:
             result = service.read(market_date='2026-06-19')
 
+        self.assertEqual(
+            latest_run_loader.call_args.kwargs['request_modes'],
+            [DAILY_RETRY_CYCLE_MODE],
+        )
         progress_loader.assert_called_once()
         stage = result['stages']['agent_feedback_summaries']
         self.assertEqual(stage['status'], 'running')
@@ -2117,6 +2279,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: stage_counts,
             live_symbol_count_loader=lambda: 4458,
             fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
             price_bar_count_loader=lambda **_: 3683,
             technical_snapshot_count_loader=lambda _: 3683,
             action_summary_count_loader=lambda _: 3683,
@@ -2195,6 +2358,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: stage_counts,
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            official_run_loader=lambda **_: None,
             row_count_stage_counts_loader=lambda **_: _full_feedback_prerequisite_stage_counts(
                 total=3,
                 updated_at='2026-04-21T10:15:00+00:00',

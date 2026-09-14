@@ -20,8 +20,8 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 
 ## Shared rules
 
-- Default date selection is calendar-date based, not prior-trading-date based.
-  Both routes derive their default day from the current Seoul server date. They do not backshift to the previous trading day on weekends, holidays, or other break-days.
+- Default date selection is route-specific.
+  `/eod/freshness` derives its default day from the current Seoul server date. `/eod/pipeline/status` uses the market date of the latest persisted official daily run, falling back to the current Seoul date only when no official run exists. Neither route guesses a previous trading day from the calendar.
 - Stored availability and in-flight progress are separate concerns.
   `/eod/freshness` answers what persisted data is available. `/eod/pipeline/status` answers which pipeline stage is currently active and how much work is in progress.
 - Historical backfill rows must not outrank the daily pipeline row when both exist for the same trade date.
@@ -98,8 +98,8 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 ### Scope
 
 - This route is operator-facing and live-progress-oriented.
-- The default `market_date` is the current Seoul calendar date from `market_state.server_time[:10]`.
-- On weekends, holidays, and other break-days, callers must pass an explicit `market_date` if they want to inspect the previous trading day's pipeline run instead of the current calendar date.
+- When `market_date` is omitted, the route selects the actual latest persisted official daily run by `started_at` and durable id, then uses that run's market date for all fallback and coverage reads.
+- When no official daily run exists, the route falls back to the current Seoul calendar date from `market_state.server_time[:10]`. An explicit `market_date` always wins.
 - `fs_div` defaults to the configured DART fundamentals default and is normalized to uppercase.
 - Default reads are polling-safe. Expensive PyKRX enrichment coverage scans, row-count missing-symbol diagnostics, and feedback-run context are omitted unless `include_diagnostics=true` and/or `include_feedback_context=true` is passed.
 
@@ -112,6 +112,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Each stage includes normalized monitor metadata in addition to legacy fields:
   `stage_id`, `task`, `label`, `group`, `order`, `depends_on`, `inspect_routes`, `output_tables`, `default_selected`, and `details.progress_source`.
 - Stage `details` also carries `rows_persisted`, `expected_rows`, and a readable `reason` where Core can infer one from diagnostics, activity, or errors.
+- Persisted `details.result_summary` is bounded on both write and read. Bulk evidence collections are replaced by `details.result_summary_omissions` metadata, while aggregate counts and operational status fields remain available. This also compacts historical oversized rows without rewriting them.
 - When the latest official daily run is only a resumed subset, same-date historical official stage rows and persisted outputs are still considered so omitted prior stages do not regress to opaque `pending`.
 - Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may report `skipped` with reason metadata once same-date downstream output exists and those global stages have no active official stage row.
 - The pykrx stage order is fixed:
@@ -123,6 +124,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - A later pykrx stage stays `pending` until that later stage has actually started.
   Persisted completion of earlier stages does not advance later stages by implication alone.
 - If a stage-progress entry still says `running` after the owning run has already ended, that stale running progress must be downgraded to the final run outcome instead of continuing to display as live work.
+- A stored `completed` agent-feedback stage is downgraded to `partial` when any role-level progress remains pending, running, partial, or has processed fewer symbols than its declared total.
 
 ### fundamentals stage
 
@@ -179,11 +181,11 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 ## Non-trading-day behavior
 
 - Weekend behavior:
-  `today.trade_date` and default pipeline `market_date` stay on the weekend calendar date; prior availability remains visible only through `latest.*` or an explicit query date. `market_session.status=weekend`, `latest_valid_trading_date` points at the prior session, and intraday or quote data is marked not expected for that requested date.
+  `today.trade_date` stays on the weekend calendar date. Default pipeline status instead uses the market date of the latest persisted official run when one exists. `market_session` describes whichever date that route selected; an explicit pipeline date remains authoritative.
 - Market-closed same-day behavior:
   After the market closes, `today` still refers to that same Seoul calendar date. If same-day EOD persistence is not finished yet, `today` can remain `missing` while `latest` still points to the previous stored trade date. `market_session.status=closed` and `recommendation_basis=latest_completed_eod` make that same-day closed state explicit.
 - Break-day behavior:
-  Exchange holidays and other non-trading break-days still keep the requested calendar date as the default route date, but `market_session.status=holiday` now distinguishes them from a weekend. The routes do not auto-resolve a previous trading date into `today` or the default pipeline `market_date`; consumers should read `latest_valid_trading_date` when they need the last completed trading session.
+  Exchange holidays and other non-trading break-days keep the current calendar date in `/eod/freshness.today`. Pipeline status uses its latest persisted official run date when available and otherwise falls back to the current calendar date. Neither route infers a prior trading day solely from the calendar.
 
 ## Test anchors
 

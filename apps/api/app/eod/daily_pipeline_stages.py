@@ -832,6 +832,28 @@ class DailyPipelineStageService:
         return status.replace('_', ' ').capitalize()
 
     @staticmethod
+    def _extract_role_progress(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        progress = result.get('progress')
+        progress = progress if isinstance(progress, dict) else {}
+        progress_summary = progress.get('summary')
+        summary = result.get('summary')
+        candidates = (
+            progress_summary if isinstance(progress_summary, dict) else {},
+            progress,
+            summary if isinstance(summary, dict) else {},
+            result,
+        )
+        for payload in candidates:
+            role_progress = payload.get('role_progress')
+            if isinstance(role_progress, dict):
+                return {
+                    str(role): state
+                    for role, state in role_progress.items()
+                    if isinstance(state, dict)
+                }
+        return {}
+
+    @staticmethod
     def _extract_stage_counts(*, stage_id: str, result: dict[str, Any]) -> dict[str, int]:
         def _int(value: Any) -> int:
             try:
@@ -839,6 +861,44 @@ class DailyPipelineStageService:
             except (TypeError, ValueError):
                 return 0
 
+        if stage_id == 'agent_feedback_summaries':
+            role_progress = DailyPipelineStageService._extract_role_progress(result)
+            if role_progress:
+                total = processed = succeeded = failed = 0
+                for role_state in role_progress.values():
+                    role_total = max(_int(role_state.get('total_symbols')), 0)
+                    role_failed = max(_int(role_state.get('failed_items')), 0)
+                    role_processed = max(
+                        _int(role_state.get('processed_symbols')),
+                        0,
+                    )
+                    if 'processed_symbols' not in role_state:
+                        role_processed = max(
+                            _int(role_state.get('completed_symbols')) + role_failed,
+                            0,
+                        )
+                    if 'completed_symbols' in role_state:
+                        role_succeeded = max(
+                            _int(role_state.get('completed_symbols')),
+                            0,
+                        )
+                    elif str(role_state.get('status') or '').strip().lower() in {
+                        'complete',
+                        'completed',
+                    }:
+                        role_succeeded = max(role_processed - role_failed, 0)
+                    else:
+                        role_succeeded = 0
+                    total += role_total
+                    processed += role_processed
+                    succeeded += role_succeeded
+                    failed += role_failed
+                return {
+                    'processed': processed,
+                    'total': total,
+                    'succeeded': succeeded,
+                    'failed': failed,
+                }
         if stage_id == 'price_collection':
             total = _int(result.get('symbols_total'))
             succeeded = _int(result.get('symbols_succeeded'))
@@ -1079,14 +1139,80 @@ class DailyPipelineStageService:
         return extracted
 
     @staticmethod
+    def compact_stage_result_summary(
+        result: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """Remove bulk evidence while retaining the operational result summary."""
+
+        omitted_keys = {
+            'cycles',
+            'eligible_symbols',
+            'funnel_diagnostics',
+            'items',
+            'matched_symbols',
+            'payloads',
+            'requested_symbols',
+            'role_symbol_scopes',
+            'rows',
+            'stages',
+        }
+        max_list_items = 100
+        omissions: dict[str, dict[str, Any]] = {}
+
+        def _describe(value: Any) -> dict[str, Any]:
+            if isinstance(value, dict):
+                return {'type': 'object', 'item_count': len(value)}
+            if isinstance(value, (list, tuple, set)):
+                return {'type': 'list', 'item_count': len(value)}
+            if isinstance(value, str):
+                return {'type': 'string', 'character_count': len(value)}
+            return {'type': type(value).__name__}
+
+        def _compact(value: Any, *, path: str) -> tuple[bool, Any]:
+            if isinstance(value, dict):
+                compacted: dict[str, Any] = {}
+                for raw_key, nested_value in value.items():
+                    key = str(raw_key)
+                    nested_path = f'{path}.{key}' if path else key
+                    is_named_bulk_field = key in omitted_keys or key.endswith('_payload')
+                    is_bulk_value = isinstance(
+                        nested_value,
+                        (dict, list, tuple, set),
+                    ) or (
+                        isinstance(nested_value, str)
+                        and len(nested_value) > 1_000
+                    )
+                    if is_named_bulk_field and is_bulk_value:
+                        omissions[nested_path] = _describe(nested_value)
+                        continue
+                    keep, nested_compacted = _compact(nested_value, path=nested_path)
+                    if keep:
+                        compacted[key] = nested_compacted
+                return True, compacted
+            if isinstance(value, (list, tuple, set)):
+                if len(value) > max_list_items:
+                    omissions[path] = _describe(value)
+                    return False, None
+                compacted_items = []
+                for index, nested_value in enumerate(value):
+                    keep, nested_compacted = _compact(
+                        nested_value,
+                        path=f'{path}[{index}]',
+                    )
+                    if keep:
+                        compacted_items.append(nested_compacted)
+                return True, compacted_items
+            return True, value
+
+        _, compacted_result = _compact(result, path='')
+        return compacted_result, omissions
+
+    @staticmethod
     def _build_stage_run_details(*, stage_id: str, result: dict[str, Any]) -> dict[str, Any]:
         definition = STAGE_DEFINITIONS[stage_id]
-        omitted_keys = {'items', 'rows', 'payloads'}
-        result_summary = {
-            key: value
-            for key, value in result.items()
-            if key not in omitted_keys and not key.endswith('_payload')
-        }
+        result_summary, result_summary_omissions = (
+            DailyPipelineStageService.compact_stage_result_summary(result)
+        )
         details = {
             'group': definition.group,
             'depends_on': list(definition.depends_on),
@@ -1094,6 +1220,8 @@ class DailyPipelineStageService:
             'inspect_routes': list(definition.inspect_routes),
             'result_summary': result_summary,
         }
+        if result_summary_omissions:
+            details['result_summary_omissions'] = result_summary_omissions
         count_semantics = DailyPipelineStageService._extract_stage_count_semantics(
             stage_id=stage_id,
             result=result,
@@ -1528,6 +1656,58 @@ class DailyPipelineStageService:
             progress_summary = progress_payload.get('summary')
             if isinstance(progress_summary, dict):
                 nested_payloads.append(progress_summary)
+        has_incomplete_role = False
+        incomplete_role_statuses = {
+            'abandoned',
+            'blocked',
+            'completed_with_failures',
+            'failed',
+            'incomplete',
+            'interrupted',
+            'partial',
+            'pending',
+            'running',
+            'waiting',
+        }
+        for role_state in DailyPipelineStageService._extract_role_progress(result).values():
+            role_status = str(role_state.get('status') or '').strip().lower()
+            boundary_status = str(
+                role_state.get('boundary_status') or ''
+            ).strip().lower()
+            if (
+                role_status in incomplete_role_statuses
+                or boundary_status in incomplete_role_statuses
+                or role_state.get('incomplete') is True
+            ):
+                has_incomplete_role = True
+                break
+            for key in (
+                'failed_items',
+                'in_progress_symbols',
+                'pending_symbols',
+                'retry_pending_symbols',
+            ):
+                try:
+                    if int(role_state.get(key) or 0) > 0:
+                        has_incomplete_role = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if has_incomplete_role:
+                break
+            total = role_state.get('total_symbols')
+            for completed_key in ('processed_symbols', 'completed_symbols'):
+                completed = role_state.get(completed_key)
+                if total is None or completed is None:
+                    continue
+                try:
+                    if int(completed) < int(total):
+                        has_incomplete_role = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if has_incomplete_role:
+                break
         has_reported_failures = False
         for payload in nested_payloads:
             for failed_key in failed_keys:
@@ -1548,11 +1728,17 @@ class DailyPipelineStageService:
             'not_configured': 'skipped',
         }.get(raw_status, raw_status)
         if raw_status:
-            if normalized_status == 'completed' and has_reported_failures:
+            if normalized_status == 'completed' and (
+                has_reported_failures or has_incomplete_role
+            ):
                 return 'partial'
             return normalized_status
         if 'completed' in result and 'final_pending' in result:
-            return 'completed' if bool(result.get('completed')) else 'partial'
+            return (
+                'completed'
+                if bool(result.get('completed')) and not has_incomplete_role
+                else 'partial'
+            )
         if result.get('error') or result.get('error_message'):
             if has_reported_failures:
                 return 'partial'

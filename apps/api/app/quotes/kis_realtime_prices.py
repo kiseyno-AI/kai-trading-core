@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo('Asia/Seoul')
 KIS_REALTIME_PRICE_TR_ID = 'H0STCNT0'
 KIS_REALTIME_PRICE_SOURCE = 'kis_realtime_ws'
+KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS = 10.0
 KIS_REALTIME_PRICE_COLUMNS = (
     'MKSC_SHRN_ISCD',
     'STCK_CNTG_HOUR',
@@ -266,6 +267,7 @@ class KISRealtimePriceService:
         self._stop_requested = False
         self._subscription_changed_event: asyncio.Event | None = None
         self._source_refresh_lock: asyncio.Lock | None = None
+        self._source_refresh_task: asyncio.Task[list[str]] | None = None
         self._last_source_refresh_monotonic = 0.0
         self._state_lock = threading.RLock()
         self._prices: dict[str, KISRealtimePriceTick] = {}
@@ -410,8 +412,10 @@ class KISRealtimePriceService:
     async def stop(self) -> None:
         self._stop_requested = True
         task = self._task
+        source_refresh_task = self._source_refresh_task
         websocket = self._websocket
         self._task = None
+        self._source_refresh_task = None
         self._websocket = None
 
         if self._subscription_changed_event is not None:
@@ -427,6 +431,13 @@ class KISRealtimePriceService:
             task.cancel()
             try:
                 await task
+            except asyncio.CancelledError:
+                pass
+
+        if source_refresh_task is not None and not source_refresh_task.done():
+            source_refresh_task.cancel()
+            try:
+                await source_refresh_task
             except asyncio.CancelledError:
                 pass
 
@@ -473,17 +484,54 @@ class KISRealtimePriceService:
     async def refresh_subscription_source_if_due(self, *, trigger: str, force: bool = False) -> dict[str, Any]:
         interval = max(1.0, float(settings.kis_realtime_price_subscription_refresh_seconds))
         now_monotonic = time.monotonic()
-        if not force and (now_monotonic - self._last_source_refresh_monotonic) < interval:
+        existing_source_task = self._source_refresh_task
+        if (
+            not force
+            and (now_monotonic - self._last_source_refresh_monotonic) < interval
+            and (
+                existing_source_task is None
+                or not existing_source_task.done()
+            )
+        ):
             return self.subscription_snapshot()
         if self._source_refresh_lock is None:
             self._source_refresh_lock = asyncio.Lock()
         async with self._source_refresh_lock:
             now_monotonic = time.monotonic()
-            if not force and (now_monotonic - self._last_source_refresh_monotonic) < interval:
+            source_task = self._source_refresh_task
+            if (
+                source_task is None
+                and not force
+                and (now_monotonic - self._last_source_refresh_monotonic) < interval
+            ):
                 return self.subscription_snapshot()
+            if source_task is None:
+                self._last_source_refresh_monotonic = now_monotonic
+                source_task = asyncio.create_task(
+                    self._load_runtime_monitored_symbols(trigger=trigger),
+                    name='kis-realtime-price-symbol-source',
+                )
+                self._source_refresh_task = source_task
             try:
-                symbols = await self._load_runtime_monitored_symbols(trigger=trigger)
+                symbols = await asyncio.wait_for(
+                    asyncio.shield(source_task),
+                    timeout=KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                message = (
+                    'monitored-symbol refresh timed out after '
+                    f'{KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS:g}s'
+                )
+                self._record_error(
+                    stage='subscription_source',
+                    message=message,
+                    fatal=False,
+                    retryable=True,
+                )
+                logger.warning('KIS realtime price %s', message)
             except Exception as exc:
+                if self._source_refresh_task is source_task:
+                    self._source_refresh_task = None
                 self._record_error(
                     stage='subscription_source',
                     message=str(exc),
@@ -492,7 +540,8 @@ class KISRealtimePriceService:
                 )
                 logger.warning('KIS realtime price monitored-symbol refresh failed: %s', exc)
             else:
-                self._last_source_refresh_monotonic = now_monotonic
+                if self._source_refresh_task is source_task:
+                    self._source_refresh_task = None
                 with self._state_lock:
                     self._health['metrics']['subscription_refreshes'] += 1
                     self._health['last_subscription_refresh_at'] = _isoformat(_utc_now())
@@ -517,7 +566,7 @@ class KISRealtimePriceService:
         max_reconnect_delay = max(reconnect_delay, float(settings.kis_realtime_reconnect_max_delay_seconds))
 
         while not self._stop_requested:
-            await self.refresh_subscription_source_if_due(trigger='background', force=True)
+            await self.refresh_subscription_source_if_due(trigger='background', force=False)
             allowed_symbols, _ = self._target_symbols_snapshot()
             if not allowed_symbols:
                 self._set_status('idle_no_symbols')
