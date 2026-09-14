@@ -4,6 +4,31 @@ from app import db
 from app.db_pool_watchdog import DatabasePoolWatchdog
 
 
+class _DeadlineSession:
+    def __init__(self) -> None:
+        self.connection_calls = 0
+        self.statements = []
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def connection(self):
+        self.connection_calls += 1
+        return object()
+
+    def execute(self, statement):
+        self.statements.append(str(statement))
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_engine_uses_resilient_pool_and_connect_settings() -> None:
     kwargs = db._build_engine_kwargs()
 
@@ -41,6 +66,30 @@ def test_database_health_does_not_stack_connection_attempts() -> None:
     assert connected is False
     assert error is not None
     assert 'already in progress' in error
+
+
+def test_session_scope_recomputes_statement_limits_after_deadline_pool_checkout() -> None:
+    session = _DeadlineSession()
+
+    with (
+        patch.object(db, 'SessionLocal', return_value=session),
+        patch.object(db.time, 'monotonic', return_value=103.0),
+    ):
+        with db.session_scope(
+            statement_timeout_ms=30_000,
+            lock_timeout_ms=15_000,
+            deadline_monotonic=110.0,
+        ):
+            pass
+
+    assert session.connection_calls == 1
+    assert session.statements == [
+        'SET LOCAL statement_timeout = 7000',
+        'SET LOCAL lock_timeout = 7000',
+    ]
+    assert session.committed is True
+    assert session.rolled_back is False
+    assert session.closed is True
 
 
 class _WatchdogCursor:

@@ -134,9 +134,29 @@ def session_scope(
     *,
     statement_timeout_ms: int | None = None,
     lock_timeout_ms: int | None = None,
+    deadline_monotonic: float | None = None,
 ):
     session = SessionLocal()
     try:
+        if deadline_monotonic is not None:
+            # Checkout is intentionally forced before calculating the SQL
+            # limits. QueuePool may spend part of the caller's budget waiting
+            # for a connection, so a timeout calculated before checkout would
+            # let the following statement run past the aggregate deadline.
+            session.connection()
+            remaining_timeout_ms = int(
+                (deadline_monotonic - time.monotonic()) * 1000
+            )
+            if remaining_timeout_ms <= 0:
+                raise TimeoutError('database session deadline exhausted during checkout')
+            statement_timeout_ms = min(
+                statement_timeout_ms or remaining_timeout_ms,
+                remaining_timeout_ms,
+            )
+            lock_timeout_ms = min(
+                lock_timeout_ms or remaining_timeout_ms,
+                remaining_timeout_ms,
+            )
         if statement_timeout_ms is not None:
             session.execute(text(f'SET LOCAL statement_timeout = {int(statement_timeout_ms)}'))
         if lock_timeout_ms is not None:

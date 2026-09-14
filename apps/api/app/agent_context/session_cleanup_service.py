@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Sequence
@@ -12,6 +13,10 @@ from sqlalchemy.dialects.postgresql import insert
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import AgentFeedbackSessionCleanupFailure
+
+
+class CleanupPersistenceDeadlineExceeded(TimeoutError):
+    """Raised before a cleanup retry write that cannot fit its caller budget."""
 
 
 @dataclass(frozen=True)
@@ -53,10 +58,27 @@ class AgentFeedbackSessionCleanupService:
         *,
         targets: Sequence[SessionCleanupTarget],
         reason: str,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
         unique_targets = list({target.session_key: target for target in targets}.values())
         if not unique_targets:
-            return {'status': 'noop', 'queued': 0, 'inserted': 0, 'already_queued': 0}
+            return {
+                'status': 'noop',
+                'queued': 0,
+                'inserted': 0,
+                'already_queued': 0,
+                'persistence_confirmed': True,
+            }
+
+        if deadline_monotonic is not None:
+            remaining_seconds = deadline_monotonic - time.monotonic()
+            # The shared QueuePool can wait this long before it raises. Do not
+            # begin a checkout when its worst-case wait already exceeds the
+            # remaining caller budget.
+            if remaining_seconds <= float(settings.db_pool_timeout_seconds):
+                raise CleanupPersistenceDeadlineExceeded(
+                    'cleanup retry prequeue deadline cannot bound database pool checkout'
+                )
 
         now = datetime.now(UTC)
         cleanup_result = {
@@ -86,6 +108,7 @@ class AgentFeedbackSessionCleanupService:
         with session_scope(
             statement_timeout_ms=settings.agent_feedback_db_statement_timeout_ms,
             lock_timeout_ms=settings.agent_feedback_db_lock_timeout_ms,
+            deadline_monotonic=deadline_monotonic,
         ) as session:
             stmt = (
                 insert(AgentFeedbackSessionCleanupFailure)
@@ -103,6 +126,7 @@ class AgentFeedbackSessionCleanupService:
             'queued': queued,
             'inserted': inserted,
             'already_queued': queued - inserted,
+            'persistence_confirmed': True,
         }
 
     def run_pending_cleanup(self, *, limit: int = 100) -> dict[str, Any]:
