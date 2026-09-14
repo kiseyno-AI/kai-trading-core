@@ -951,10 +951,13 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             result = service.run(
                 market_date='2026-04-14',
                 stages=['momentum_factors', 'composite_factors'],
+                trigger='auto_eod_followup_resume',
             )
 
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
         self.assertEqual(result['stages']['composite_factors']['status'], 'completed')
+        self.assertFalse(result['pipeline_run']['run_metadata']['resumable'])
         self.assertEqual(
             [call.args[0] for call in execute_stage.call_args_list],
             ['momentum_factors', 'composite_factors'],

@@ -766,15 +766,21 @@ class DailyPipelineStageService:
                 raise
 
         overall_status = self._resolve_overall_status(stage_outcomes.values())
+        run_metadata = {
+            'stage_statuses': {
+                stage_id: outcome.get('status')
+                for stage_id, outcome in stage_outcomes.items()
+            },
+        }
+        if overall_status == 'partial' and all(
+            daily_pipeline_outcome_is_satisfied(outcome)
+            for outcome in stage_outcomes.values()
+        ):
+            run_metadata['resumable'] = False
         final_run = self.run_state_service.finish_run(
             pipeline_run_id=pipeline_run_id,
             status=overall_status,
-            run_metadata={
-                'stage_statuses': {
-                    stage_id: outcome.get('status')
-                    for stage_id, outcome in stage_outcomes.items()
-                },
-            },
+            run_metadata=run_metadata,
         )
 
         return {
