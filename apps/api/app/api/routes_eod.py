@@ -519,9 +519,11 @@ async def compute_daily_market_risk_filters(
     market_code: str = 'J',
 ) -> dict:
     try:
+        market_state = await async_get_market_state()
         parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
         return await run_tracked_market_risk_filter(
             market_date=market_date,
+            current_market_date=str(market_state.server_time)[:10],
             symbols=parsed_symbols,
             source=source,
             market_code=market_code,

@@ -84,6 +84,7 @@ def _market_risk_filter_coverage_gate(result: dict[str, Any]) -> dict[str, Any]:
 async def run_tracked_market_risk_filter(
     *,
     market_date: str,
+    current_market_date: str | date | None = None,
     symbols: Sequence[str] | None = None,
     source: str = MARKET_RISK_FILTER_SOURCE,
     market_code: str = DEFAULT_MARKET_CODE,
@@ -96,6 +97,7 @@ async def run_tracked_market_risk_filter(
     safety_skip = build_prior_date_current_only_stage_skip(
         stage_id=stage_id,
         market_date=market_date,
+        current_market_date=current_market_date,
     )
     if safety_skip is not None:
         return safety_skip
