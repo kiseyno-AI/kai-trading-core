@@ -1,5 +1,7 @@
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+from types import SimpleNamespace
 import unittest
-from datetime import date
 from unittest.mock import patch
 
 from app.agent_context.eligibility import (
@@ -7,6 +9,8 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_SCOPE_REQUESTED,
     AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY,
     _load_forced_inclusion_reasons,
+    _load_prior_missed_opportunity_reasons,
+    _load_prior_positive_decision_reasons,
     build_agent_feedback_role_funnel,
     load_agent_feedback_eligible_symbols,
     load_agent_feedback_eligibility_records,
@@ -21,6 +25,90 @@ from app.agent_context.run_modes import (
 
 
 class AgentFeedbackEligibilityTests(unittest.TestCase):
+    def test_prior_positive_decision_does_not_fall_back_past_late_latest_feedback(self) -> None:
+        late_feedback = SimpleNamespace(
+            symbol='005930',
+            agent_name='signal-decider',
+            market_date=date(2026, 4, 20),
+            feedback_payload={'next_day_open_action': 'buy'},
+            normalized_feedback_payload={'next_day_open_action': 'buy'},
+            received_at=datetime(2026, 4, 21, 0, 0, tzinfo=timezone.utc),
+        )
+        query_result = SimpleNamespace(first=lambda: late_feedback)
+        fake_session = SimpleNamespace(execute=lambda _statement: query_result)
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        reasons_by_symbol: dict[str, list[dict]] = {}
+        with (
+            patch('app.agent_context.eligibility.session_scope', fake_session_scope),
+            patch(
+                'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+                return_value=date(2026, 4, 21),
+            ),
+        ):
+            result = _load_prior_positive_decision_reasons(
+                market_date=date(2026, 4, 30),
+                symbols=['005930'],
+                reasons_by_symbol=reasons_by_symbol,
+            )
+
+        self.assertEqual(result, {'status': 'loaded', 'matched_symbols': 0})
+        self.assertEqual(reasons_by_symbol, {})
+
+    def test_prior_missed_opportunity_ignores_evaluation_linked_to_late_snapshot(self) -> None:
+        late_evaluation = SimpleNamespace(
+            symbol='005930',
+            market_date=date(2026, 4, 20),
+            decision_action='wait',
+            horizon_days=5,
+            grade_label='missed_opportunity_after_wait',
+            grade_score=0.8,
+            evaluation_version='signal_decider_eval_test',
+            evaluated_at=datetime(2026, 4, 30, 6, 0, tzinfo=timezone.utc),
+            feedback_received_at=datetime(2026, 4, 21, 0, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 4, 20, 23, 59, tzinfo=timezone.utc),
+        )
+        older_valid_evaluation = SimpleNamespace(
+            symbol='005930',
+            market_date=date(2026, 4, 19),
+            decision_action='wait',
+            horizon_days=5,
+            grade_label='missed_opportunity_after_wait',
+            grade_score=0.7,
+            evaluation_version='signal_decider_eval_test',
+            evaluated_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            feedback_received_at=datetime(2026, 4, 19, 6, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 4, 19, 6, 0, tzinfo=timezone.utc),
+        )
+        query_result = SimpleNamespace(
+            all=lambda: [late_evaluation, older_valid_evaluation]
+        )
+        fake_session = SimpleNamespace(execute=lambda _statement: query_result)
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        reasons_by_symbol: dict[str, list[dict]] = {}
+        with (
+            patch('app.agent_context.eligibility.session_scope', fake_session_scope),
+            patch(
+                'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+                return_value=date(2026, 4, 21),
+            ),
+        ):
+            result = _load_prior_missed_opportunity_reasons(
+                market_date=date(2026, 4, 30),
+                symbols=['005930'],
+                reasons_by_symbol=reasons_by_symbol,
+            )
+
+        self.assertEqual(result, {'status': 'loaded', 'matched_symbols': 0})
+        self.assertEqual(reasons_by_symbol, {})
+
     def test_load_agent_feedback_eligible_symbols_uses_market_risk_hard_gate_with_piotroski_soft_penalty(self) -> None:
         with patch(
             'app.agent_context.eligibility.load_daily_piotroski_filter_results',

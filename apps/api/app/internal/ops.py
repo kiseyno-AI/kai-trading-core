@@ -33,7 +33,10 @@ from app.db import init_database
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
-from app.eod.daily_pipeline_tracking import run_tracked_market_risk_filter
+from app.eod.daily_pipeline_tracking import (
+    build_prior_date_current_only_stage_skip,
+    run_tracked_market_risk_filter,
+)
 from app.eod.master import refresh_master_if_due
 from app.eod.master_state import master_refresh_state
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -547,6 +550,13 @@ def collect_market_risk_snapshots(
     market_code: str = 'J',
 ) -> dict[str, Any]:
     bootstrap_runtime()
+    safety_skip = build_prior_date_current_only_stage_skip(
+        stage_id='market_risk_snapshots',
+        market_date=market_date,
+        current_market_date=str(get_market_state().server_time)[:10],
+    )
+    if safety_skip is not None:
+        return safety_skip
     parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
     return asyncio.run(
         daily_market_risk_snapshot_service.collect_for_market_date(

@@ -32,7 +32,7 @@ def build_daily_retry_context(
     max_attempts: int,
     symbol_count: int,
 ) -> dict[str, Any]:
-    return {
+    context = {
         'retry_of_run_id': run.get('id'),
         'previous_status': run.get('status'),
         'previous_symbols_failed': int(run.get('symbols_failed') or 0),
@@ -40,6 +40,40 @@ def build_daily_retry_context(
         'max_attempts': int(max_attempts),
         'symbol_count': int(symbol_count),
     }
+    metadata = (
+        run.get('run_metadata')
+        if isinstance(run.get('run_metadata'), Mapping)
+        else {}
+    )
+    price_retry_symbols = {
+        str(symbol).strip()
+        for key in ('failed_symbols', 'unattempted_symbols')
+        for symbol in (metadata.get(key) or [])
+        if str(symbol).strip()
+    }
+    inherited_downstream_symbols = list(
+        dict.fromkeys(
+            str(symbol).strip()
+            for symbol in (
+                [
+                    *(metadata.get('downstream_retry_symbols') or []),
+                    *(
+                        metadata.get(
+                            'inherited_downstream_retry_symbols'
+                        )
+                        or []
+                    ),
+                ]
+            )
+            if str(symbol).strip()
+            and str(symbol).strip() not in price_retry_symbols
+        )
+    )
+    if inherited_downstream_symbols:
+        context['inherited_downstream_retry_symbols'] = (
+            inherited_downstream_symbols
+        )
+    return context
 
 
 def make_stage_progress_callback(

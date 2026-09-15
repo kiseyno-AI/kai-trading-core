@@ -20,6 +20,9 @@ from app.agent_context.model_identity import (
     expected_decider_model,
     select_model_identity_cohort_rows,
 )
+from app.agent_context.signal_decider_snapshot_validity import (
+    is_decision_snapshot_valid_for_source_date,
+)
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
@@ -986,6 +989,16 @@ class DeciderReplayRepository:
                 and row.decision_action == 'buy'
             ]
             source_decision_count = len(candidate_snapshot_rows)
+            snapshot_validity_exclusions: Counter[str] = Counter()
+            valid_candidate_snapshot_rows = []
+            for row in candidate_snapshot_rows:
+                if is_decision_snapshot_valid_for_source_date(row):
+                    valid_candidate_snapshot_rows.append(row)
+                else:
+                    snapshot_validity_exclusions[
+                        'snapshot_observed_at_or_after_target_open'
+                    ] += 1
+            candidate_snapshot_rows = valid_candidate_snapshot_rows
             (
                 candidate_snapshot_rows,
                 model_identity_exclusions,
@@ -1067,6 +1080,7 @@ class DeciderReplayRepository:
 
             trades: list[DeciderReplayTrade] = []
             excluded_reason_counts: Counter[str] = Counter(canonical_action_exclusions)
+            excluded_reason_counts.update(snapshot_validity_exclusions)
             excluded_reason_counts.update(
                 str(item['status_reason']) for item in model_identity_exclusions
             )
@@ -1114,6 +1128,9 @@ class DeciderReplayRepository:
                     'actual_lifecycle_excluded_count': len(actual_rows) - actual_eligible_count,
                     'actual_lifecycle_excluded_reason_counts': dict(
                         sorted(actual_excluded_reason_counts.items())
+                    ),
+                    'snapshot_validity_excluded_count': sum(
+                        snapshot_validity_exclusions.values()
                     ),
                     'model_identity_cohort': model_identity_cohort,
                 },

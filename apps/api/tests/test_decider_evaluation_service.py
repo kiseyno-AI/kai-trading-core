@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 import unittest
+from unittest.mock import patch
 
 from app.agent_context.decider_evaluation_service import (
     DeciderPostDecisionEvaluationService,
@@ -45,6 +46,16 @@ def _feedback_source(
         'agent_version': 'openclaw-v1',
         'run_id': f'run-{feedback_id}',
         'received_at': datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+        'feedback_received_at': (
+            datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc)
+            if decision_snapshot_id is not None
+            else None
+        ),
+        'created_at': (
+            datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc)
+            if decision_snapshot_id is not None
+            else None
+        ),
         'normalized_feedback_payload': normalized_feedback_payload,
         'feedback_payload': normalized_feedback_payload,
     }
@@ -113,6 +124,43 @@ class FakeDeciderEvaluationRepository:
 
 
 class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
+    def test_compute_evaluations_quarantines_feedback_with_late_decision_snapshot(self):
+        source = _feedback_source(market_date='2026-04-23')
+        source['feedback_received_at'] = datetime(
+            2026,
+            4,
+            24,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
+        source['created_at'] = datetime(
+            2026,
+            4,
+            23,
+            23,
+            59,
+            tzinfo=timezone.utc,
+        )
+        repository = FakeDeciderEvaluationRepository([source])
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: [],
+        )
+
+        with patch(
+            'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+            return_value=date(2026, 4, 24),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-23',
+                market_date_to='2026-04-23',
+            )
+
+        self.assertEqual(result['summary']['feedback_rows_considered'], 0)
+        self.assertEqual(result['summary']['evaluations_upserted'], 0)
+        self.assertEqual(repository.upserted_items, [])
+
     def test_compute_evaluations_marks_target_hit_before_stop(self):
         repository = FakeDeciderEvaluationRepository([_feedback_source()])
         bars_by_symbol = {
@@ -291,4 +339,3 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(item['outcome_label'], OUTCOME_NOT_APPLICABLE)
         self.assertEqual(item['source']['decision_snapshot_id'], None)
         self.assertIn('unsupported_tactical_action_for_generic_5d_evaluation', item['data_quality_warnings'])
-

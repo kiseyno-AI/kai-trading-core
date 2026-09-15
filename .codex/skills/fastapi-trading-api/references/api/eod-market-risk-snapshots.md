@@ -3,7 +3,9 @@
 ## Summary
 Collects or reads the persisted KIS market-risk status snapshot for Korean equities.
 
-The collect path calls KIS `inquire-price-2` for the requested symbol/date scope, normalizes only the source status fields, and stores one reusable snapshot row per symbol/date in `daily_market_risk_snapshots`.
+The collect path calls KIS `inquire-price-2` only when `market_date` is the current Seoul market date, normalizes only the source status fields, and stores one reusable snapshot row per symbol/date in `daily_market_risk_snapshots`.
+
+For a prior `market_date`, the POST route returns HTTP 200 with an auditable safe-skip response. It does not call KIS or persist current observations as historical rows. Use the GET route to read snapshots that were already stored for that date.
 
 The read path is intentionally snapshot-first: it returns normalized KIS status flags and raw payload provenance without mixing in downstream filter policy outputs.
 
@@ -35,6 +37,20 @@ POST /eod/market-risk-snapshots/collect?market_date=2026-04-15&symbols=005930,00
       "source_endpoint": "inquire-price-2"
     }
   ]
+}
+```
+
+## Prior-date safe-skip response
+
+```json
+{
+  "triggered": false,
+  "skipped": true,
+  "safe_skip": true,
+  "status": "skipped",
+  "reason": "point_in_time_recovery_current_only_stage",
+  "market_date": "2026-04-15",
+  "stage": "market_risk_snapshots"
 }
 ```
 

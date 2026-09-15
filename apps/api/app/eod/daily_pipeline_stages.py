@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
+from app.agent_context.derived_contexts import daily_price_context_service
 from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
@@ -19,6 +20,7 @@ from app.agent_context.signal_decider_loop_service import (
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.action_summaries import daily_action_summary_service
+from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -27,7 +29,17 @@ from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
     build_pykrx_enrichment_preflight,
 )
-from app.eod.run_stage_support import extract_next_open_plan_stage_counts
+from app.eod.pykrx_pipeline_runner import (
+    POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS,
+    POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS,
+    resolve_point_in_time_recovery,
+)
+from app.eod.run_stage_support import (
+    EXPIRED_DECISION_REPLAY_STAGE_IDS,
+    build_expired_decision_replay_result,
+    build_next_open_window_expired_result,
+    extract_next_open_plan_stage_counts,
+)
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
 from app.macro_context.service import macro_context_service
@@ -63,7 +75,6 @@ PYKRX_PIPELINE_STAGE_ORDER: tuple[str, ...] = (
     'technical_snapshots',
     'action_summaries',
     'trending_ranks',
-    'signal_features',
     'market_risk_filter',
 )
 FACTOR_STAGE_ORDER: tuple[str, ...] = (
@@ -86,6 +97,7 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
     'fundamentals_daily_refresh',
     'piotroski_filter',
     *FACTOR_STAGE_ORDER,
+    'signal_features',
     'external_news_collect',
     'external_news_enrich',
     'macro_context_refresh',
@@ -103,6 +115,7 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'fundamentals_daily_refresh',
     'piotroski_filter',
     *FACTOR_STAGE_ORDER,
+    'signal_features',
     'external_news_collect',
     'external_news_enrich',
     'macro_context_refresh',
@@ -111,7 +124,6 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'next_open_execution_plan',
     'signal_decider_evaluations',
 )
-
 
 @dataclass(frozen=True)
 class DailyStageDefinition:
@@ -201,11 +213,11 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         id='technical_snapshots',
         label='technical snapshot compute',
         group='market_data',
-        description='Rebuild persisted daily technical snapshots from stored price bars.',
+        description='Rebuild persisted daily price contexts and technical snapshots from stored price bars.',
         depends_on=('price_collection',),
         supports_symbols=True,
         inspect_routes=('/eod/technical-snapshots',),
-        output_tables=('daily_technical_snapshots',),
+        output_tables=('daily_price_contexts', 'daily_technical_snapshots'),
         default_selected=True,
     ),
     'action_summaries': DailyStageDefinition(
@@ -233,8 +245,12 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         id='signal_features',
         label='KIS daily signal feature collect',
         group='market_data',
-        description='Collect ranking-based KIS daily signal features and participation context.',
-        depends_on=('price_collection',),
+        description='Collect ranking-based KIS daily signal features and participation context after same-day filters and factor scores are ready.',
+        depends_on=(
+            'market_risk_filter',
+            'piotroski_filter',
+            *FACTOR_STAGE_ORDER,
+        ),
         inspect_routes=('/eod/signal-features',),
         output_tables=('daily_signal_features', 'daily_market_participation_contexts'),
         default_selected=True,
@@ -420,6 +436,7 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
             'market_risk_filter',
             'piotroski_filter',
             *FACTOR_STAGE_ORDER,
+            'signal_features',
             'external_news_collect',
             'external_news_enrich',
             'macro_context_refresh',
@@ -439,7 +456,11 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         supports_symbols=True,
         supports_capture_limit=True,
         inspect_routes=('/agent-context/feedback/progress', '/agent-context/feedback/latest'),
-        output_tables=('agent_context_feedback', 'agent_context_feedback_runs'),
+        output_tables=(
+            'agent_context_feedback',
+            'agent_context_feedback_runs',
+            'signal_decider_decision_snapshots',
+        ),
         default_selected=True,
     ),
     'signal_decider_evaluations': DailyStageDefinition(
@@ -529,6 +550,8 @@ class DailyPipelineStageService:
         reuse_existing_feedback: bool = True,
         resume_from_stage: str | None = None,
         trigger: str = 'stage_orchestrator',
+        reused_eod_collection_run_id: int | None = None,
+        point_in_time_recovery: bool = False,
     ) -> dict[str, Any]:
         validated_request = self.validate_run_request(
             market_date=market_date,
@@ -538,6 +561,19 @@ class DailyPipelineStageService:
         requested_stages = validated_request['requested_stages']
         resolved_stages = validated_request['resolved_stages']
         resolved_market_date = validated_request['market_date']
+        point_in_time_recovery = resolve_point_in_time_recovery(
+            market_date=resolved_market_date,
+            requested=point_in_time_recovery,
+            recovery_context=(
+                trigger in POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS
+            ),
+            market=(
+                get_market_state()
+                if not point_in_time_recovery
+                and trigger in POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS
+                else None
+            ),
+        )
         resolved_symbols = self._normalize_symbols(symbols)
         resolved_markets = self._normalize_markets(markets)
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
@@ -562,6 +598,12 @@ class DailyPipelineStageService:
                 'reuse_existing_feedback': reuse_existing_feedback,
                 'feedback_force_recompute': bool(force and not reuse_existing_feedback),
                 'bypass_prerequisite_gate': bypass_prerequisite_gate,
+                'reused_eod_collection_run_id': (
+                    int(reused_eod_collection_run_id)
+                    if reused_eod_collection_run_id is not None
+                    else None
+                ),
+                'point_in_time_recovery': point_in_time_recovery,
             },
         )
         pipeline_run_id = int(pipeline_run['id'])
@@ -581,16 +623,23 @@ class DailyPipelineStageService:
         pykrx_requested = [stage_id for stage_id in resolved_stages if stage_id in PYKRX_PIPELINE_STAGE_ORDER]
         if 'price_collection' in pykrx_requested:
             try:
-                pykrx_result = self.pykrx_service.run_daily_pipeline_stages(
-                    market_date=resolved_market_date,
-                    stages=pykrx_requested,
-                    markets=resolved_markets,
-                    trigger=trigger,
-                    refresh_universe=(
-                        settings.eod_auto_pykrx_refresh_universe if refresh_universe is None else refresh_universe
+                pykrx_kwargs = {
+                    'market_date': resolved_market_date,
+                    'stages': pykrx_requested,
+                    'markets': resolved_markets,
+                    'trigger': trigger,
+                    'refresh_universe': (
+                        settings.eod_auto_pykrx_refresh_universe
+                        if refresh_universe is None
+                        else refresh_universe
                     ),
-                    force=force,
-                    symbols=resolved_symbols,
+                    'force': force,
+                    'symbols': resolved_symbols,
+                }
+                if point_in_time_recovery:
+                    pykrx_kwargs['point_in_time_recovery'] = True
+                pykrx_result = self.pykrx_service.run_daily_pipeline_stages(
+                    **pykrx_kwargs,
                 )
             except Exception as exc:
                 self.run_state_service.finish_run(
@@ -624,7 +673,9 @@ class DailyPipelineStageService:
                 dependency
                 for dependency in STAGE_DEFINITIONS[stage_id].depends_on
                 if dependency in resolved_stages
-                and str((stage_outcomes.get(dependency) or {}).get('status') or '').lower() != 'completed'
+                and not self._dependency_outcome_is_satisfied(
+                    stage_outcomes.get(dependency)
+                )
             ]
             if incomplete_dependencies and stage_id != 'next_open_execution_plan':
                 stage_result = {
@@ -646,7 +697,9 @@ class DailyPipelineStageService:
             if stage_id == 'next_open_execution_plan':
                 decider_outcome = stage_outcomes.get('signal_decider')
                 decider_status = str((decider_outcome or {}).get('status') or '').strip().lower()
-                if decider_outcome is not None and decider_status != 'completed':
+                if decider_outcome is not None and not self._dependency_outcome_is_satisfied(
+                    decider_outcome
+                ):
                     stage_result = {
                         'triggered': False,
                         'status': 'blocked',
@@ -679,6 +732,8 @@ class DailyPipelineStageService:
                     feedback_max_cycles=feedback_max_cycles,
                     feedback_outer_batch_size=feedback_outer_batch_size,
                     reuse_existing_feedback=reuse_existing_feedback,
+                    point_in_time_recovery=point_in_time_recovery,
+                    run_id=reused_eod_collection_run_id,
                     progress_callback=self._build_progress_callback(
                         pipeline_run_id=pipeline_run_id,
                         stage_id=stage_id,
@@ -711,15 +766,21 @@ class DailyPipelineStageService:
                 raise
 
         overall_status = self._resolve_overall_status(stage_outcomes.values())
+        run_metadata = {
+            'stage_statuses': {
+                stage_id: outcome.get('status')
+                for stage_id, outcome in stage_outcomes.items()
+            },
+        }
+        if overall_status == 'partial' and all(
+            daily_pipeline_outcome_is_satisfied(outcome)
+            for outcome in stage_outcomes.values()
+        ):
+            run_metadata['resumable'] = False
         final_run = self.run_state_service.finish_run(
             pipeline_run_id=pipeline_run_id,
             status=overall_status,
-            run_metadata={
-                'stage_statuses': {
-                    stage_id: outcome.get('status')
-                    for stage_id, outcome in stage_outcomes.items()
-                },
-            },
+            run_metadata=run_metadata,
         )
 
         return {
@@ -908,6 +969,24 @@ class DailyPipelineStageService:
                 'processed': processed,
                 'total': total,
                 'succeeded': succeeded,
+                'failed': failed,
+            }
+        if stage_id == 'technical_snapshots' and (
+            'contexts_persisted' in result or 'contexts_failed' in result
+        ):
+            snapshot_succeeded = _int(result.get('snapshots_persisted'))
+            snapshot_failed = _int(result.get('snapshots_failed'))
+            context_succeeded = _int(result.get('contexts_persisted'))
+            context_failed = _int(result.get('contexts_failed'))
+            total = max(
+                snapshot_succeeded + snapshot_failed,
+                context_succeeded + context_failed,
+            )
+            failed = max(snapshot_failed, context_failed)
+            return {
+                'processed': total,
+                'total': total,
+                'succeeded': max(total - failed, 0),
                 'failed': failed,
             }
         if stage_id == 'market_risk_filter':
@@ -1247,8 +1326,31 @@ class DailyPipelineStageService:
         feedback_max_cycles: int,
         feedback_outer_batch_size: int,
         reuse_existing_feedback: bool,
+        point_in_time_recovery: bool = False,
+        run_id: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
+        if (
+            point_in_time_recovery
+            and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
+        ):
+            return {
+                'triggered': False,
+                'skipped': True,
+                'safe_skip': True,
+                'status': 'skipped',
+                'reason': 'point_in_time_recovery_current_only_stage',
+                'market_date': market_date,
+                'stage': stage_id,
+            }
+        if stage_id in EXPIRED_DECISION_REPLAY_STAGE_IDS:
+            expired_decision_result = build_expired_decision_replay_result(
+                stage_id=stage_id,
+                market_date=market_date,
+                market=get_market_state(),
+            )
+            if expired_decision_result is not None:
+                return expired_decision_result
         if stage_id == 'master_refresh':
             symbols_refreshed = refresh_master_if_due(force=force)
             return {
@@ -1262,10 +1364,15 @@ class DailyPipelineStageService:
                 deactivate_missing=symbol_limit is None,
             )
         if stage_id == 'pykrx_enrichment':
+            enrichment_kwargs: dict[str, Any] = {
+                'market_date': market_date,
+                'markets': markets,
+                'symbols': symbols,
+            }
+            if point_in_time_recovery:
+                enrichment_kwargs['point_in_time_recovery'] = True
             result = self.pykrx_enrichment_service.collect_for_market_date(
-                market_date=market_date,
-                markets=markets,
-                symbols=symbols,
+                **enrichment_kwargs
             )
             preflight = build_pykrx_enrichment_preflight(
                 market_date=market_date,
@@ -1281,21 +1388,44 @@ class DailyPipelineStageService:
                 result['status'] = 'partial'
             return result
         if stage_id == 'technical_snapshots':
-            return daily_technical_snapshot_service.rebuild_for_market_date(
+            price_context_result = daily_price_context_service.rebuild_for_market_date(
                 market_date=market_date,
                 symbols=symbols,
                 source='stage_orchestrator',
+                run_id=run_id,
             )
+            technical_result = daily_technical_snapshot_service.rebuild_for_market_date(
+                market_date=market_date,
+                symbols=symbols,
+                source='stage_orchestrator',
+                run_id=run_id,
+            )
+            return {
+                **technical_result,
+                'contexts_persisted': int(
+                    price_context_result.get('contexts_persisted') or 0
+                ),
+                'contexts_failed': int(
+                    price_context_result.get('contexts_failed') or 0
+                ),
+                'price_contexts': {
+                    key: value
+                    for key, value in price_context_result.items()
+                    if key != 'items'
+                },
+            }
         if stage_id == 'action_summaries':
             return daily_action_summary_service.rebuild_for_market_date(
                 market_date=market_date,
                 symbols=symbols,
                 source='stage_orchestrator',
+                run_id=run_id,
             )
         if stage_id == 'trending_ranks':
             return compute_and_persist_daily_trending_ranks(
                 market_date=market_date,
                 source='stage_orchestrator',
+                run_id=run_id,
             )
         if stage_id == 'signal_features':
             return asyncio.run(
@@ -1424,7 +1554,7 @@ class DailyPipelineStageService:
                 if stage_id == 'agent_feedback_summaries'
                 else DECISION_SUPPORT_AGENT_NAMES
             )
-            return self.feedback_retry_service.run_retry_cycles(
+            result = self.feedback_retry_service.run_retry_cycles(
                 config=FeedbackRetryCycleConfig(
                     market_date=date.fromisoformat(market_date),
                     roles=roles,
@@ -1449,9 +1579,26 @@ class DailyPipelineStageService:
                 force=force and not reuse_existing_feedback,
                 bypass_prerequisite_gate=bypass_prerequisite_gate,
             )
+            expired_after_completion = build_expired_decision_replay_result(
+                stage_id=stage_id,
+                market_date=market_date,
+                market=get_market_state(),
+            )
+            if expired_after_completion is not None:
+                return {
+                    **expired_after_completion,
+                    'completed_after_action_window': True,
+                }
+            return result
         if stage_id == 'next_open_execution_plan':
             from app.orders.next_open_execution import signal_decider_next_open_execution_service
 
+            expired_result = build_next_open_window_expired_result(
+                market_date=market_date,
+                market=get_market_state(),
+            )
+            if expired_result is not None:
+                return expired_result
             target_trade_date = (date.fromisoformat(market_date) + timedelta(days=1)).isoformat()
             return signal_decider_next_open_execution_service.refresh_plan_items(
                 target_trade_date=target_trade_date,
@@ -1469,12 +1616,23 @@ class DailyPipelineStageService:
                     market_date=market_date,
                     prerequisites=prerequisites,
                 )
-            return self.decision_loop_service.compute_recent_evaluations(
+            result = self.decision_loop_service.compute_recent_evaluations(
                 as_of_market_date=market_date,
                 lookback_days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
                 symbols=symbols,
                 force_recompute=force,
             )
+            expired_after_completion = build_expired_decision_replay_result(
+                stage_id=stage_id,
+                market_date=market_date,
+                market=get_market_state(),
+            )
+            if expired_after_completion is not None:
+                return {
+                    **expired_after_completion,
+                    'completed_after_action_window': True,
+                }
+            return result
         raise ValueError(f'Unsupported daily stage: {stage_id}')
 
     @staticmethod
@@ -1535,6 +1693,24 @@ class DailyPipelineStageService:
                 'bars_upserted': result.get('bars_upserted'),
             }
         payload = dict(result.get(stage_id) or {})
+        if stage_id == 'technical_snapshots':
+            price_context_result = (
+                result.get('price_contexts')
+                if isinstance(result.get('price_contexts'), dict)
+                else {}
+            )
+            if price_context_result:
+                payload['contexts_persisted'] = int(
+                    price_context_result.get('contexts_persisted') or 0
+                )
+                payload['contexts_failed'] = int(
+                    price_context_result.get('contexts_failed') or 0
+                )
+                payload['price_contexts'] = {
+                    key: value
+                    for key, value in price_context_result.items()
+                    if key != 'items'
+                }
         payload.setdefault('run_id', result.get('run_id'))
         payload.setdefault('market_date', result.get('latest_available_trade_date'))
         return payload
@@ -1548,6 +1724,10 @@ class DailyPipelineStageService:
             'status': self._resolve_result_status(result),
             'result': result,
         }
+
+    @staticmethod
+    def _dependency_outcome_is_satisfied(outcome: dict[str, Any] | None) -> bool:
+        return daily_pipeline_outcome_is_satisfied(outcome)
 
     def _resolve_stage_ids(self, requested_stages: Sequence[str]) -> list[str]:
         requested_set: set[str] = set()
@@ -1641,6 +1821,8 @@ class DailyPipelineStageService:
             'symbols_failed',
             'contexts_failed',
         )
+        if result.get('safe_skip') is True:
+            return 'completed'
         if result.get('skipped') or result.get('triggered') is False:
             raw_gate_status = str(result.get('status') or '').strip().lower()
             if raw_gate_status in {'waiting', 'blocked'}:
@@ -1746,9 +1928,8 @@ class DailyPipelineStageService:
                 return 'partial'
             return 'failed'
 
-        for failed_key in failed_keys:
-            if failed_key in result:
-                return 'completed' if _failure_count(result.get(failed_key)) == 0 else 'partial'
+        if any(failed_key in result for failed_key in failed_keys):
+            return 'partial' if has_reported_failures else 'completed'
         return 'completed'
 
     @staticmethod

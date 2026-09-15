@@ -6,6 +6,7 @@ from datetime import date, datetime
 import logging
 import time
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import func, select
@@ -90,6 +91,10 @@ def _normalize_yyyymmdd(value: str | date) -> str:
     return _normalize_iso_date(value).replace('-', '')
 
 
+def _current_krx_calendar_date() -> date:
+    return datetime.now(ZoneInfo('Asia/Seoul')).date()
+
+
 def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -131,6 +136,25 @@ def _normalize_categories(categories: Sequence[str] | None) -> list[str]:
         seen.add(category)
         normalized.append(category)
     return normalized or list(DEFAULT_PYKRX_ENRICHMENT_CATEGORIES)
+
+
+def _prepare_rows_for_persistence(
+    rows: Sequence[dict[str, Any]],
+    *,
+    point_in_time_recovery: bool,
+) -> list[dict[str, Any]]:
+    if not point_in_time_recovery:
+        return list(rows)
+    return [
+        {
+            **row,
+            # Historical enrichment may reference a symbol that has since
+            # moved market, changed name/source, or become inactive. The row
+            # is date-scoped evidence; it must never refresh current Symbol.
+            'skip_symbol_upsert': True,
+        }
+        for row in rows
+    ]
 
 
 def _to_int(value: Any) -> int | None:
@@ -262,9 +286,15 @@ class PykrxEnrichmentService:
         symbols: Sequence[str] | None = None,
         categories: Sequence[str] | None = None,
         allow_kis_candidate_fallback: bool = False,
+        point_in_time_recovery: bool = False,
     ) -> dict[str, Any]:
         market_date_iso = _normalize_iso_date(market_date)
         market_date_yyyymmdd = _normalize_yyyymmdd(market_date)
+        point_in_time_recovery = bool(
+            point_in_time_recovery
+            or date.fromisoformat(market_date_iso)
+            < _current_krx_calendar_date()
+        )
         normalized_markets = _normalize_markets(markets) or ['KOSPI', 'KOSDAQ', 'KONEX']
         normalized_symbols = _normalize_symbols(symbols)
         resolved_categories = _normalize_categories(categories)
@@ -366,6 +396,7 @@ class PykrxEnrichmentService:
 
             if (
                 allow_kis_candidate_fallback
+                and not point_in_time_recovery
                 and normalized_symbols
                 and category in {'investor_flow_symbol', 'short_selling'}
             ):
@@ -385,7 +416,13 @@ class PykrxEnrichmentService:
                     category_rows.extend(kis_rows)
                     details['kis_candidate_fallback'] = kis_details
 
-            persisted_count = upsert_daily_pykrx_enrichment_rows(rows=category_rows)
+            category_rows = _prepare_rows_for_persistence(
+                category_rows,
+                point_in_time_recovery=point_in_time_recovery,
+            )
+            persisted_count = upsert_daily_pykrx_enrichment_rows(
+                rows=category_rows
+            )
             should_fallback = persisted_count <= 0 and (details.get('errors') or category in SYMBOL_ENRICHMENT_CATEGORIES)
             if (
                 category == 'valuation_snapshot'
@@ -402,9 +439,16 @@ class PykrxEnrichmentService:
                     markets=normalized_markets,
                     symbol_filter=symbol_filter,
                     symbol_meta=symbol_meta,
+                    point_in_time_recovery=point_in_time_recovery,
                 )
                 if fallback_rows:
-                    persisted_count = upsert_daily_pykrx_enrichment_rows(rows=fallback_rows)
+                    fallback_rows = _prepare_rows_for_persistence(
+                        fallback_rows,
+                        point_in_time_recovery=point_in_time_recovery,
+                    )
+                    persisted_count = upsert_daily_pykrx_enrichment_rows(
+                        rows=fallback_rows
+                    )
                     details['fallback'] = {
                         **fallback_result,
                         'rows_persisted': persisted_count,
@@ -451,6 +495,7 @@ class PykrxEnrichmentService:
         )
         return {
             'market_date': market_date_iso,
+            'point_in_time_recovery': point_in_time_recovery,
             'markets': normalized_markets,
             'symbols_requested': normalized_symbols or None,
             'categories_requested': resolved_categories,
@@ -744,6 +789,7 @@ class PykrxEnrichmentService:
         markets: Sequence[str],
         symbol_filter: set[str],
         symbol_meta: dict[str, dict[str, Any]],
+        point_in_time_recovery: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if category == 'valuation_snapshot':
             latest_price_date = self._latest_price_bar_valuation_date(market_date_iso=market_date_iso, markets=markets)
@@ -762,6 +808,18 @@ class PykrxEnrichmentService:
                 symbol_meta=symbol_meta,
             )
         if category == 'sector_classification':
+            if point_in_time_recovery:
+                # Daily price bars carry no dated sector identity. Falling
+                # back through today's Symbol metadata would stamp hindsight
+                # into the requested date. Only previously persisted rows
+                # strictly before the target are admissible.
+                return self._collect_rows_from_latest_enrichment(
+                    category=category,
+                    market_date_iso=market_date_iso,
+                    markets=markets,
+                    symbol_filter=symbol_filter,
+                    symbol_meta=symbol_meta,
+                )
             return self._collect_sector_rows_from_symbols(
                 market_date_iso=market_date_iso,
                 markets=markets,

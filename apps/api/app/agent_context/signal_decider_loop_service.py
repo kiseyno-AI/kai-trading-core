@@ -34,6 +34,9 @@ from app.agent_context.model_identity import (
     expected_decider_model,
     select_model_identity_cohort_rows,
 )
+from app.agent_context.signal_decider_snapshot_validity import (
+    is_decision_snapshot_valid_for_source_date,
+)
 from app.market.session import next_krx_trading_date
 from app.core.settings import settings
 from app.db import session_scope as _base_session_scope
@@ -3905,6 +3908,11 @@ class SignalDeciderLoopService:
             dedupe_feedback_results=True,
             lightweight_results=True,
         )
+        rows = [
+            row
+            for row in rows
+            if is_decision_snapshot_valid_for_source_date(row)
+        ]
         if not rows:
             return {
                 'request': {
@@ -4184,6 +4192,11 @@ class SignalDeciderLoopService:
             symbols=normalized_symbols or None,
             dedupe_feedback_results=True,
         )
+        snapshot_rows = [
+            row
+            for row in snapshot_rows
+            if is_decision_snapshot_valid_for_source_date(row)
+        ]
         (
             snapshot_rows,
             model_identity_exclusions,

@@ -3,6 +3,7 @@ import json
 import unittest
 from contextlib import redirect_stdout
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -731,6 +732,12 @@ class InternalOpsTests(unittest.TestCase):
                 'app.eod.daily_pipeline_tracking.daily_pipeline_run_state_service',
                 FakeDailyPipelineRunStateService(),
             ),
+            patch(
+                'app.eod.daily_pipeline_tracking.get_market_state',
+                return_value=SimpleNamespace(
+                    server_time='2026-04-14T10:00:00+09:00'
+                ),
+            ),
         ):
             result = ops.compute_market_risk_filters(
                 market_date='2026-04-14',
@@ -755,6 +762,12 @@ class InternalOpsTests(unittest.TestCase):
                 'app.internal.ops.daily_market_risk_snapshot_service.collect_for_market_date',
                 new=AsyncMock(return_value={'snapshots_persisted': 2}),
             ) as collect_snapshots,
+            patch(
+                'app.internal.ops.get_market_state',
+                return_value=SimpleNamespace(
+                    server_time='2026-04-14T10:00:00+09:00'
+                ),
+            ),
         ):
             result = ops.collect_market_risk_snapshots(
                 market_date='2026-04-14',
@@ -769,6 +782,46 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(collect_snapshots.call_args.kwargs['symbols'], ['005930', '000660'])
         self.assertEqual(collect_snapshots.call_args.kwargs['source'], MARKET_RISK_SNAPSHOT_SOURCE)
         self.assertEqual(collect_snapshots.call_args.kwargs['market_code'], 'UN')
+
+    def test_prior_date_market_risk_cli_commands_safe_skip_kis_writes(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch(
+                'app.internal.ops.daily_market_risk_snapshot_service.'
+                'collect_for_market_date',
+                new=AsyncMock(),
+            ) as collect_snapshots,
+            patch(
+                'app.internal.ops.daily_market_risk_filter_service.'
+                'rebuild_for_market_date',
+                new=AsyncMock(),
+            ) as compute_filters,
+            patch(
+                'app.internal.ops.get_market_state',
+                return_value=SimpleNamespace(
+                    server_time='2026-09-14T10:00:00+09:00'
+                ),
+            ),
+            patch(
+                'app.eod.daily_pipeline_tracking.get_market_state',
+                return_value=SimpleNamespace(
+                    server_time='2026-09-14T10:00:00+09:00'
+                ),
+            ),
+        ):
+            snapshot_result = ops.collect_market_risk_snapshots(
+                market_date='2026-09-11',
+                symbols='005930',
+            )
+            filter_result = ops.compute_market_risk_filters(
+                market_date='2026-09-11',
+                symbols='005930',
+            )
+
+        self.assertTrue(snapshot_result['safe_skip'])
+        self.assertTrue(filter_result['safe_skip'])
+        collect_snapshots.assert_not_awaited()
+        compute_filters.assert_not_awaited()
 
     def test_compute_low_risk_factors_uses_canonical_feature_version(self) -> None:
         with (

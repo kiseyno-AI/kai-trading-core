@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.daily_pipeline_state import _build_stage_duration_details
 from app.eod.daily_pipeline_stages import FACTOR_STAGE_ORDER, DailyPipelineStageService
 
@@ -211,6 +212,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.prerequisite_patcher.start()
         self.addCleanup(self.prerequisite_patcher.stop)
+        self.market_state_patcher = patch(
+            'app.eod.daily_pipeline_stages.get_market_state',
+            return_value=MagicMock(
+                state='CLOSED',
+                server_time='2026-04-14T16:00:00+09:00',
+            ),
+        )
+        self.market_state_patcher.start()
+        self.addCleanup(self.market_state_patcher.stop)
 
     def test_describe_returns_canonical_stage_order_and_default_sequence(self) -> None:
         service = DailyPipelineStageService()
@@ -235,6 +245,14 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertIn('external_news_collect', payload['default_daily_stage_order'])
         self.assertIn('external_news_enrich', payload['default_daily_stage_order'])
         self.assertIn('macro_context_refresh', payload['default_daily_stage_order'])
+        self.assertLess(
+            payload['default_daily_stage_order'].index('composite_factors'),
+            payload['default_daily_stage_order'].index('signal_features'),
+        )
+        self.assertLess(
+            payload['default_daily_stage_order'].index('signal_features'),
+            payload['default_daily_stage_order'].index('external_news_collect'),
+        )
         self.assertLess(
             payload['default_daily_stage_order'].index('external_news_collect'),
             payload['default_daily_stage_order'].index('external_news_enrich'),
@@ -303,6 +321,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ],
         )
         self.assertTrue(composite_stage['default_selected'])
+        signal_feature_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'signal_features'
+        )
+        self.assertEqual(
+            signal_feature_stage['depends_on'],
+            ['market_risk_filter', 'piotroski_filter', *FACTOR_STAGE_ORDER],
+        )
         external_news_stage = next(
             stage
             for stage in payload['stages']
@@ -335,10 +362,20 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'market_risk_filter',
                 'piotroski_filter',
                 *FACTOR_STAGE_ORDER,
+                'signal_features',
                 'external_news_collect',
                 'external_news_enrich',
                 'macro_context_refresh',
             ],
+        )
+        signal_decider_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'signal_decider'
+        )
+        self.assertIn(
+            'signal_decider_decision_snapshots',
+            signal_decider_stage['output_tables'],
         )
         self.assertTrue(external_news_stage['default_selected'])
         self.assertTrue(external_news_enrich_stage['default_selected'])
@@ -373,6 +410,262 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'recovery_already_completed')
         self.assertEqual(result['pipeline_run_id'], 315)
         self.assertEqual(pykrx_runner.calls, [])
+
+    def test_recovery_threads_reused_eod_run_id_to_all_derived_writers(self) -> None:
+        service = DailyPipelineStageService()
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.daily_price_context_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'contexts_persisted': 2,
+                    'contexts_failed': 0,
+                    'items': [],
+                },
+            ) as rebuild_contexts,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_technical_snapshot_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'snapshots_persisted': 2,
+                    'snapshots_failed': 0,
+                },
+            ) as rebuild_snapshots,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_action_summary_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'action_summaries_persisted': 2,
+                    'action_summaries_failed': 0,
+                },
+            ) as rebuild_action_summaries,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'compute_and_persist_daily_trending_ranks',
+                return_value={
+                    'trending_ranks_persisted': 6,
+                    'periods_persisted': 3,
+                },
+            ) as rebuild_trending_ranks,
+        ):
+            result = service.run(
+                market_date='2026-04-24',
+                stages=[
+                    'technical_snapshots',
+                    'action_summaries',
+                    'trending_ranks',
+                ],
+                symbols=['005930', '000660'],
+                reused_eod_collection_run_id=7,
+                trigger='auto_followup_recovery',
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        expected_symbol_scope = {
+            'market_date': '2026-04-24',
+            'symbols': ['005930', '000660'],
+            'source': 'stage_orchestrator',
+            'run_id': 7,
+        }
+        rebuild_contexts.assert_called_once_with(**expected_symbol_scope)
+        rebuild_snapshots.assert_called_once_with(**expected_symbol_scope)
+        rebuild_action_summaries.assert_called_once_with(**expected_symbol_scope)
+        rebuild_trending_ranks.assert_called_once_with(
+            market_date='2026-04-24',
+            source='stage_orchestrator',
+            run_id=7,
+        )
+
+    def test_prior_date_recovery_skips_current_only_stages_but_runs_as_of_stages(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        call_kwargs = {
+            'market_date': '2026-09-11',
+            'symbols': ['099999'],
+            'markets': ['KOSPI'],
+            'force': False,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+            'point_in_time_recovery': True,
+        }
+        current_only_stage_ids = (
+            'master_refresh',
+            'pykrx_universe_refresh',
+            'signal_features',
+            'market_risk_snapshots',
+            'market_risk_filter',
+            'fundamentals_daily_refresh',
+            'external_news_collect',
+            'external_news_enrich',
+            'macro_context_refresh',
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.daily_piotroski_filter_service.'
+                'rebuild_for_market_date',
+                return_value={'results_persisted': 1, 'results_failed': 0},
+            ) as rebuild_piotroski,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_momentum_factor_service.'
+                'rebuild_for_market_date',
+                return_value={'results_persisted': 1, 'results_failed': 0},
+            ) as rebuild_momentum,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_price_context_service.'
+                'rebuild_for_market_date',
+                return_value={'contexts_persisted': 1, 'contexts_failed': 0},
+            ) as rebuild_context,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_technical_snapshot_service.'
+                'rebuild_for_market_date',
+                return_value={'snapshots_persisted': 1, 'snapshots_failed': 0},
+            ) as rebuild_technical,
+            patch.object(
+                service.pykrx_enrichment_service,
+                'collect_for_market_date',
+                return_value={'status': 'completed', 'coverage': {}},
+            ) as collect_enrichment,
+        ):
+            skipped_results = {
+                stage_id: service._execute_stage(
+                    stage_id=stage_id,
+                    **call_kwargs,
+                )
+                for stage_id in current_only_stage_ids
+            }
+            piotroski_result = service._execute_stage(
+                stage_id='piotroski_filter',
+                **call_kwargs,
+            )
+            service._execute_stage(
+                stage_id='pykrx_enrichment',
+                **call_kwargs,
+            )
+            price_derived_result = service._execute_stage(
+                stage_id='technical_snapshots',
+                **call_kwargs,
+            )
+
+        for stage_id, result in skipped_results.items():
+            with self.subTest(stage_id=stage_id):
+                self.assertFalse(result['triggered'])
+                self.assertTrue(result['safe_skip'])
+                self.assertEqual(result['status'], 'skipped')
+                self.assertEqual(
+                    result['reason'],
+                    'point_in_time_recovery_current_only_stage',
+                )
+        self.assertEqual(piotroski_result['results_persisted'], 1)
+        rebuild_piotroski.assert_called_once_with(
+            market_date='2026-09-11',
+        )
+        collect_enrichment.assert_called_once_with(
+            market_date='2026-09-11',
+            markets=['KOSPI'],
+            symbols=['099999'],
+            point_in_time_recovery=True,
+        )
+        self.assertEqual(price_derived_result['snapshots_persisted'], 1)
+        rebuild_context.assert_called_once_with(
+            market_date='2026-09-11',
+            symbols=['099999'],
+            source='stage_orchestrator',
+            run_id=None,
+        )
+        rebuild_technical.assert_called_once_with(
+            market_date='2026-09-11',
+            symbols=['099999'],
+            source='stage_orchestrator',
+            run_id=None,
+        )
+
+    def test_prior_date_recovery_runs_as_of_piotroski_before_factor_chain(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.daily_piotroski_filter_service.'
+                'rebuild_for_market_date',
+                return_value={'results_persisted': 1, 'results_failed': 0},
+            ) as rebuild_piotroski,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_momentum_factor_service.'
+                'rebuild_for_market_date',
+                return_value={'results_persisted': 1, 'results_failed': 0},
+            ) as rebuild_momentum,
+        ):
+            result = service.run(
+                market_date='2026-09-11',
+                stages=['piotroski_filter', 'momentum_factors'],
+                symbols=['099999'],
+                trigger='manual_api',
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            result['stages']['piotroski_filter']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['momentum_factors']['status'],
+            'completed',
+        )
+        rebuild_piotroski.assert_called_once_with(market_date='2026-09-11')
+        rebuild_momentum.assert_called_once_with(
+            market_date='2026-09-11',
+            symbols=['099999'],
+        )
+
+    def test_production_boundaries_auto_promote_prior_date_current_only_skip(
+        self,
+    ) -> None:
+        for trigger in (
+            'manual_api',
+            'manual_api_stage',
+            'internal_ops_cli',
+            'internal_ops_cli_stage',
+        ):
+            with self.subTest(trigger=trigger):
+                service = DailyPipelineStageService()
+                with (
+                    patch(
+                        'app.eod.daily_pipeline_stages.get_market_state',
+                        return_value=MagicMock(
+                            state='OPEN',
+                            server_time='2026-09-14T10:00:00+09:00',
+                        ),
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_stages.'
+                        'daily_market_risk_snapshot_service.'
+                        'collect_for_market_date',
+                    ) as collect_current_risk,
+                ):
+                    result = service.run(
+                        market_date='2026-09-11',
+                        stages=['market_risk_snapshots'],
+                        symbols=['099999'],
+                        trigger=trigger,
+                    )
+
+                self.assertEqual(result['status'], 'completed')
+                stage = result['stages']['market_risk_snapshots']
+                self.assertEqual(stage['status'], 'completed')
+                self.assertTrue(stage['result']['safe_skip'])
+                collect_current_risk.assert_not_called()
 
     def test_run_reorders_requested_subset_and_splits_feedback_stages(self) -> None:
         pykrx_runner = _FakePykrxStageRunner()
@@ -444,7 +737,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'technical_snapshots',
                 'action_summaries',
                 'trending_ranks',
-                'signal_features',
                 'market_risk_filter',
             ],
         )
@@ -472,9 +764,247 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'composite_factors',
             ],
         )
-        self.assertEqual(executed_stage_ids[13], 'external_news_collect')
-        self.assertEqual(executed_stage_ids[14], 'external_news_enrich')
-        self.assertEqual(executed_stage_ids[15], 'macro_context_refresh')
+        self.assertEqual(executed_stage_ids[13], 'signal_features')
+        self.assertEqual(executed_stage_ids[14], 'external_news_collect')
+        self.assertEqual(executed_stage_ids[15], 'external_news_enrich')
+        self.assertEqual(executed_stage_ids[16], 'macro_context_refresh')
+
+    def test_run_treats_already_completed_skip_as_satisfied_dependency(self) -> None:
+        service = DailyPipelineStageService()
+
+        def execute(stage_id, **_):
+            if stage_id == 'fundamentals_daily_refresh':
+                return {
+                    'triggered': False,
+                    'reason': 'already_completed',
+                    'market_date': '2026-04-14',
+                }
+            return {'status': 'completed', 'stage_id': stage_id}
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=execute) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['fundamentals_daily_refresh', 'advanced_value_factors'],
+            )
+
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'skipped')
+        self.assertEqual(result['stages']['advanced_value_factors']['status'], 'completed')
+        self.assertEqual(
+            [call.args[0] for call in execute_stage.call_args_list],
+            ['fundamentals_daily_refresh', 'advanced_value_factors'],
+        )
+
+    def test_run_keeps_non_satisfied_skip_dependency_blocked(self) -> None:
+        service = DailyPipelineStageService()
+
+        def execute(stage_id, **_):
+            if stage_id == 'fundamentals_daily_refresh':
+                return {
+                    'triggered': False,
+                    'reason': 'already_running',
+                    'market_date': '2026-04-14',
+                }
+            raise AssertionError('dependent stage must not run after an unsafe skip')
+
+        with (
+            patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
+            patch.object(service, '_execute_stage', side_effect=execute) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['fundamentals_daily_refresh', 'advanced_value_factors'],
+            )
+
+        self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'skipped')
+        self.assertEqual(result['stages']['advanced_value_factors']['status'], 'blocked')
+        self.assertEqual(
+            result['stages']['advanced_value_factors']['result']['incomplete_dependencies'],
+            ['fundamentals_daily_refresh'],
+        )
+        self.assertEqual(
+            [call.args[0] for call in execute_stage.call_args_list],
+            ['fundamentals_daily_refresh'],
+        )
+
+    def test_recovery_treats_terminal_optional_context_gaps_as_ordering_only(
+        self,
+    ) -> None:
+        optional_context_results = (
+            (
+                'external_news_collect',
+                {
+                    'status': 'disabled',
+                    'reason': 'provider_disabled',
+                    'summary': {
+                        'requested_symbol_count': 2,
+                        'eligible_symbol_count': 0,
+                        'collected_symbol_count': 0,
+                    },
+                },
+                'skipped',
+            ),
+            (
+                'external_news_enrich',
+                {
+                    'status': 'partial',
+                    'items_inspected': 2,
+                    'items_missing_classification': 1,
+                    'items_remaining_at_least': 1,
+                    'missing_item_ids': [101],
+                },
+                'partial',
+            ),
+            (
+                'macro_context_refresh',
+                {
+                    'status': 'unavailable',
+                    'observations_upserted': 0,
+                    'observations_failed': 3,
+                },
+                'partial',
+            ),
+            (
+                'macro_context_refresh',
+                {
+                    'status': 'partial',
+                    'observations_upserted': 2,
+                    'observations_failed': 1,
+                },
+                'partial',
+            ),
+        )
+
+        for stage_id, optional_result, expected_status in optional_context_results:
+            with self.subTest(stage_id=stage_id, optional_result=optional_result):
+                run_state_service = _FakePipelineRunStateService()
+                service = DailyPipelineStageService(
+                    run_state_service=run_state_service,
+                )
+
+                def execute(current_stage_id, **_):
+                    if current_stage_id == stage_id:
+                        return dict(optional_result)
+                    return {'status': 'completed', 'stage_id': current_stage_id}
+
+                with (
+                    patch.object(
+                        service,
+                        '_normalize_market_date',
+                        return_value='2026-04-14',
+                    ),
+                    patch.object(
+                        service,
+                        '_execute_stage',
+                        side_effect=execute,
+                    ) as execute_stage,
+                ):
+                    result = service.run(
+                        market_date='2026-04-14',
+                        stages=[stage_id, 'agent_feedback_summaries'],
+                        trigger='auto_eod_followup_resume',
+                    )
+
+                self.assertEqual(
+                    result['stages'][stage_id]['status'],
+                    expected_status,
+                )
+                self.assertEqual(
+                    result['stages']['agent_feedback_summaries']['status'],
+                    'completed',
+                )
+                self.assertEqual(
+                    [call.args[0] for call in execute_stage.call_args_list],
+                    [stage_id, 'agent_feedback_summaries'],
+                )
+                self.assertTrue(daily_pipeline_outcome_is_satisfied(result))
+
+    def test_run_allows_terminal_high_coverage_factor_partial_dependency(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+
+        def execute(stage_id, **_):
+            if stage_id == 'momentum_factors':
+                return {
+                    'status': 'partial',
+                    'results_persisted': 99,
+                    'results_failed': 1,
+                    'remaining_retryable_events': 0,
+                }
+            return {'status': 'completed', 'stage_id': stage_id}
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['momentum_factors', 'composite_factors'],
+                trigger='auto_eod_followup_resume',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
+        self.assertEqual(result['stages']['composite_factors']['status'], 'completed')
+        self.assertFalse(result['pipeline_run']['run_metadata']['resumable'])
+        self.assertEqual(
+            [call.args[0] for call in execute_stage.call_args_list],
+            ['momentum_factors', 'composite_factors'],
+        )
+
+    def test_run_blocks_unproven_factor_partial_dependency(self) -> None:
+        service = DailyPipelineStageService()
+
+        for partial_result in (
+            {
+                'status': 'partial',
+                'results_persisted': 98,
+                'results_failed': 2,
+                'remaining_retryable_events': 0,
+            },
+            {
+                'status': 'partial',
+                'results_persisted': 99,
+                'results_failed': 1,
+                'retry_cycles_requested': 3,
+                'retry_cycles_completed': 1,
+                'remaining_retryable_events': 1,
+            },
+        ):
+            with self.subTest(partial_result=partial_result):
+                with (
+                    patch.object(
+                        service,
+                        '_normalize_market_date',
+                        return_value='2026-04-14',
+                    ),
+                    patch.object(
+                        service,
+                        '_execute_stage',
+                        side_effect=[partial_result],
+                    ) as execute_stage,
+                ):
+                    result = service.run(
+                        market_date='2026-04-14',
+                        stages=['momentum_factors', 'composite_factors'],
+                    )
+
+                self.assertEqual(
+                    result['stages']['composite_factors']['status'],
+                    'blocked',
+                )
+                self.assertEqual(execute_stage.call_count, 1)
 
     def test_run_resume_from_market_risk_filter_preserves_upstream_outputs_by_not_rerunning_them(self) -> None:
         service = DailyPipelineStageService()
@@ -1023,6 +1553,60 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
+    def test_technical_stage_repairs_price_contexts_for_the_same_scope(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        call_kwargs = {
+            'stage_id': 'technical_snapshots',
+            'market_date': '2026-04-24',
+            'symbols': ['005930', '000660'],
+            'markets': ['KOSPI'],
+            'force': False,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+        }
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.daily_price_context_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'contexts_persisted': 2,
+                    'contexts_failed': 0,
+                    'items': [{'symbol': '005930'}],
+                },
+            ) as rebuild_contexts,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_technical_snapshot_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'snapshots_persisted': 2,
+                    'snapshots_failed': 0,
+                },
+            ) as rebuild_snapshots,
+        ):
+            result = service._execute_stage(**call_kwargs)
+
+        expected_scope = {
+            'market_date': '2026-04-24',
+            'symbols': ['005930', '000660'],
+            'source': 'stage_orchestrator',
+            'run_id': None,
+        }
+        rebuild_contexts.assert_called_once_with(**expected_scope)
+        rebuild_snapshots.assert_called_once_with(**expected_scope)
+        self.assertEqual(result['contexts_persisted'], 2)
+        self.assertEqual(result['contexts_failed'], 0)
+        self.assertNotIn('items', result['price_contexts'])
+
     def test_execute_stage_routes_unified_value_factor_stage_to_service(self) -> None:
         service = DailyPipelineStageService()
 
@@ -1082,10 +1666,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
     def test_execute_stage_refreshes_next_open_plan_after_decider(self) -> None:
         service = DailyPipelineStageService()
 
-        with patch(
-            'app.orders.next_open_execution.signal_decider_next_open_execution_service.refresh_plan_items',
-            return_value={'summary': {'items_total': 2, 'eligible_count': 1}},
-        ) as refresh_plan:
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=MagicMock(state='PREOPEN'),
+            ),
+            patch(
+                'app.orders.next_open_execution.signal_decider_next_open_execution_service.refresh_plan_items',
+                return_value={'summary': {'items_total': 2, 'eligible_count': 1}},
+            ) as refresh_plan,
+        ):
             result = service._execute_stage(
                 stage_id='next_open_execution_plan',
                 market_date='2026-04-14',
@@ -1101,6 +1691,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 feedback_max_cycles=3,
                 feedback_outer_batch_size=20,
                 reuse_existing_feedback=True,
+                point_in_time_recovery=True,
             )
 
         self.assertEqual(result['summary']['items_total'], 2)
@@ -1109,6 +1700,159 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             trigger='daily_pipeline_post_decider',
             force=False,
         )
+
+    def test_execute_stage_skips_expired_prior_date_open_plan(self) -> None:
+        service = DailyPipelineStageService()
+        market = MagicMock(
+            state='OPEN',
+            server_time='2026-09-14T10:00:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.orders.next_open_execution.normalize_next_open_target_trade_date',
+                return_value=datetime(2026, 9, 14).date(),
+            ),
+            patch(
+                'app.orders.next_open_execution.signal_decider_next_open_execution_service.refresh_plan_items',
+            ) as refresh_plan,
+        ):
+            result = service._execute_stage(
+                stage_id='next_open_execution_plan',
+                market_date='2026-09-11',
+                symbols=None,
+                markets=None,
+                force=False,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['reason'], 'next_open_window_expired')
+        refresh_plan.assert_not_called()
+
+    def test_execute_stage_skips_expired_prior_date_decision_replay(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        evaluation_service = _FakeSignalDeciderEvaluationService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+            decision_loop_service=evaluation_service,
+        )
+        market = MagicMock(
+            state='OPEN',
+            server_time='2026-09-14T10:00:00+09:00',
+        )
+        call_kwargs = {
+            'market_date': '2026-09-11',
+            'symbols': ['005930'],
+            'markets': [],
+            'force': False,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+        }
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=datetime(2026, 9, 14).date(),
+            ),
+        ):
+            results = [
+                service._execute_stage(stage_id=stage_id, **call_kwargs)
+                for stage_id in (
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'signal_decider_evaluations',
+                )
+            ]
+
+        self.assertTrue(
+            all(result['status'] == 'skipped' for result in results)
+        )
+        self.assertTrue(
+            all(
+                result['reason'] == 'next_open_window_expired'
+                for result in results
+            )
+        )
+        self.assertEqual(feedback_retry_service.calls, [])
+        self.assertEqual(evaluation_service.calls, [])
+
+    def test_execute_decider_crossing_market_open_finishes_as_expired(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+        )
+        call_kwargs = {
+            'stage_id': 'signal_decider',
+            'market_date': '2026-09-11',
+            'symbols': ['005930'],
+            'markets': [],
+            'force': False,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+        }
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                side_effect=[
+                    MagicMock(
+                        state='PREOPEN',
+                        server_time='2026-09-14T08:59:00+09:00',
+                    ),
+                    MagicMock(
+                        state='OPEN',
+                        server_time='2026-09-14T09:01:00+09:00',
+                    ),
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=datetime(2026, 9, 14).date(),
+            ),
+        ):
+            result = service._execute_stage(**call_kwargs)
+
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['reason'], 'next_open_window_expired')
+        self.assertEqual(len(feedback_retry_service.calls), 1)
 
     def test_next_open_plan_stage_counts_eligible_and_blocked_rows(self) -> None:
         counts = DailyPipelineStageService._extract_stage_counts(
@@ -1180,6 +1924,56 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['technical_snapshots']['status'], 'partial')
         self.assertEqual(result['stages']['pykrx_enrichment']['status'], 'completed')
         enrichment_service.collect_for_market_date.assert_called_once()
+
+    def test_grouped_price_context_failure_marks_technical_stage_partial(
+        self,
+    ) -> None:
+        pykrx_runner = MagicMock()
+        pykrx_runner.run_daily_pipeline_stages.return_value = {
+            'run_id': 903,
+            'status': 'completed_with_errors',
+            'latest_available_trade_date': '2026-04-14',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'bars_upserted': 2,
+            'price_contexts': {
+                'contexts_persisted': 1,
+                'contexts_failed': 1,
+                '_retry_metadata': {'failed_symbols': ['000660']},
+            },
+            'technical_snapshots': {
+                'market_date': '2026-04-14',
+                'snapshots_persisted': 2,
+                'snapshots_failed': 0,
+            },
+        }
+        service = DailyPipelineStageService(pykrx_service=pykrx_runner)
+
+        result = service.run(
+            market_date='2026-04-14',
+            stages=['price_collection', 'technical_snapshots'],
+        )
+
+        technical = result['stages']['technical_snapshots']
+        self.assertEqual(technical['status'], 'partial')
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(technical['result']['contexts_persisted'], 1)
+        self.assertEqual(technical['result']['contexts_failed'], 1)
+        self.assertEqual(
+            technical['result']['price_contexts']['_retry_metadata'][
+                'failed_symbols'
+            ],
+            ['000660'],
+        )
+        technical_finish = next(
+            event
+            for event in self.run_state_service.stage_events
+            if event['event'] == 'finish_stage'
+            and event['stage_id'] == 'technical_snapshots'
+        )
+        self.assertEqual(technical_finish['status'], 'partial')
+        self.assertEqual(technical_finish['failed'], 1)
 
     def test_execute_pykrx_enrichment_blocks_zero_required_coverage(self) -> None:
         required_categories = (

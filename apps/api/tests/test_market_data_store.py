@@ -18,6 +18,7 @@ from app.db_models import (
     KISIntradaySnapshot,
     Symbol,
 )
+from app.eod.pykrx_enrichment import PykrxEnrichmentService
 from app.market_data_store import (
     _build_daily_market_relative_rows_query,
     _build_prior_market_turnover_bars_query,
@@ -30,7 +31,10 @@ from app.market_data_store import (
     persist_daily_price_bar,
     persist_daily_price_bars,
     persist_kis_intraday_snapshot,
+    upsert_daily_action_summary,
+    upsert_daily_price_context,
     upsert_daily_pykrx_enrichment_rows,
+    upsert_daily_technical_snapshot,
 )
 
 
@@ -152,6 +156,86 @@ class HistoricalPriceBarPersistenceTests(unittest.TestCase):
         self.assertEqual(created_symbol.symbol, '099999')
         self.assertEqual(created_symbol.name_ko, 'Historical listing')
         self.assertFalse(created_symbol.is_active)
+
+
+class EodLineagePreservingUpsertTests(unittest.TestCase):
+    def test_derived_upserts_preserve_existing_lineage_when_run_id_is_missing(
+        self,
+    ) -> None:
+        statements = []
+
+        class FakeSession:
+            def execute(self, statement):
+                statements.append(statement)
+                return None
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeSession()
+
+        with (
+            patch('app.market_data_store.session_scope', fake_session_scope),
+            patch(
+                'app.market_data_store._get_symbol',
+                return_value=SimpleNamespace(id=91),
+            ),
+        ):
+            upsert_daily_price_context(
+                {
+                    'symbol': '005930',
+                    'market_date': '2026-04-24',
+                    'source': 'stage_orchestrator',
+                    'context_payload': {'trend': 'up'},
+                },
+                run_id=None,
+            )
+            upsert_daily_technical_snapshot(
+                {
+                    'symbol': '005930',
+                    'market_date': '2026-04-24',
+                    'source': 'stage_orchestrator',
+                    'close_price': 70000,
+                    'volume': 1000,
+                    'trend_state': 'uptrend',
+                    'ma_alignment': 'bullish',
+                    'breakout_20d': False,
+                    'breakdown_20d': False,
+                    'signal_payload': {},
+                },
+                run_id=None,
+            )
+            upsert_daily_action_summary(
+                {
+                    'symbol': '005930',
+                    'market_date': '2026-04-24',
+                    'source': 'stage_orchestrator',
+                    'action_label': 'watch',
+                    'bias_direction': 'neutral',
+                    'signal_score': 0,
+                    'confidence_tier': 'low',
+                    'risk_tier': 'unknown',
+                    'reasons': [],
+                    'summary_payload': {},
+                },
+                run_id=None,
+            )
+
+        self.assertEqual(len(statements), 3)
+        table_names = (
+            'daily_price_contexts',
+            'daily_technical_snapshots',
+            'daily_action_summaries',
+        )
+        for statement, table_name in zip(statements, table_names, strict=True):
+            with self.subTest(table=table_name):
+                compiled = str(
+                    statement.compile(dialect=postgresql.dialect())
+                ).lower()
+                self.assertIn(
+                    'eod_run_id = coalesce('
+                    f'excluded.eod_run_id, {table_name}.eod_run_id)',
+                    compiled,
+                )
 
 
 class MarketRelativeQueryShapeTests(unittest.TestCase):
@@ -1038,7 +1122,7 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
         DailyPykrxEnrichmentRow.__table__.create(bind=engine, checkfirst=True)
 
     def setUp(self) -> None:
-        self.symbols = ['661501', '661502']
+        self.symbols = ['661501', '661502', '661503']
 
     def tearDown(self) -> None:
         with session_scope() as session:
@@ -1049,6 +1133,108 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
                 session.execute(delete(DailyPriceBar).where(DailyPriceBar.symbol_id.in_(symbol_ids)))
                 session.execute(delete(DailyPykrxEnrichmentRow).where(DailyPykrxEnrichmentRow.symbol_id.in_(symbol_ids)))
             session.execute(delete(DailyPykrxEnrichmentRow).where(DailyPykrxEnrichmentRow.scope_key.in_(self.symbols)))
+            session.execute(delete(Symbol).where(Symbol.symbol == '661503'))
+
+    def test_point_in_time_enrichment_preserves_inactive_current_symbol_state(
+        self,
+    ) -> None:
+        refreshed_at = datetime(2026, 9, 14, 1, 2, tzinfo=timezone.utc)
+        with session_scope() as session:
+            session.execute(delete(Symbol).where(Symbol.symbol == '661503'))
+            session.add(
+                Symbol(
+                    symbol='661503',
+                    standard_code='CURRENT-CODE',
+                    name_ko='Current name',
+                    market='KOSDAQ',
+                    source_payload={'sector_name': 'Current sector'},
+                    instrument_type='current-type',
+                    source='kis_master',
+                    is_active=False,
+                    last_refreshed_at=refreshed_at,
+                )
+            )
+
+        historical_row = {
+            'market_date': '2026-09-11',
+            'market': 'KOSPI',
+            'category': 'sector_classification',
+            'scope_type': 'symbol',
+            'scope_key': '661503',
+            'source': 'pykrx',
+            'symbol': '661503',
+            'name_ko': 'Historical name',
+            'standard_code': 'HISTORICAL-CODE',
+            'payload': {'market': 'KOSPI', 'sector_name': 'Historical sector'},
+        }
+        with (
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_sector_classification_rows',
+                return_value=(
+                    [historical_row],
+                    {
+                        'category': 'sector_classification',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 1,
+                        'errors': [],
+                    },
+                ),
+            ),
+            patch.object(
+                PykrxEnrichmentService,
+                '_build_coverage_summary',
+                return_value={
+                    'requested_symbol_count': 1,
+                    'requested_market_count': 1,
+                    'categories': {
+                        'sector_classification': {
+                            'expected_rows': 1,
+                            'present_rows': 1,
+                            'coverage_ratio': 1.0,
+                            'coverage_status': 'complete',
+                        }
+                    },
+                },
+            ),
+        ):
+            result = PykrxEnrichmentService().collect_for_market_date(
+                market_date='2026-09-11',
+                markets=['KOSPI'],
+                symbols=['661503'],
+                categories=['sector_classification'],
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        with session_scope() as session:
+            symbol = session.execute(
+                select(Symbol).where(Symbol.symbol == '661503')
+            ).scalar_one()
+            current_state = {
+                'standard_code': symbol.standard_code,
+                'name_ko': symbol.name_ko,
+                'market': symbol.market,
+                'source_payload': dict(symbol.source_payload or {}),
+                'instrument_type': symbol.instrument_type,
+                'source': symbol.source,
+                'is_active': symbol.is_active,
+                'last_refreshed_at': symbol.last_refreshed_at,
+            }
+
+        self.assertEqual(
+            current_state,
+            {
+                'standard_code': 'CURRENT-CODE',
+                'name_ko': 'Current name',
+                'market': 'KOSDAQ',
+                'source_payload': {'sector_name': 'Current sector'},
+                'instrument_type': 'current-type',
+                'source': 'kis_master',
+                'is_active': False,
+                'last_refreshed_at': refreshed_at,
+            },
+        )
 
     def test_upsert_and_load_daily_pykrx_enrichment_rows(self) -> None:
         inserted = upsert_daily_pykrx_enrichment_rows(

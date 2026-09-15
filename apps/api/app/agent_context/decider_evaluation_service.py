@@ -8,6 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
+from app.agent_context.signal_decider_snapshot_validity import (
+    is_decision_snapshot_valid_for_source_date,
+)
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
@@ -294,6 +297,26 @@ class DeciderPostDecisionEvaluationRepository:
             .limit(1)
             .scalar_subquery()
         )
+        snapshot_feedback_received_at_subquery = (
+            select(SignalDeciderDecisionSnapshot.feedback_received_at)
+            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
+            .order_by(
+                SignalDeciderDecisionSnapshot.created_at.desc(),
+                SignalDeciderDecisionSnapshot.id.desc(),
+            )
+            .limit(1)
+            .scalar_subquery()
+        )
+        snapshot_created_at_subquery = (
+            select(SignalDeciderDecisionSnapshot.created_at)
+            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
+            .order_by(
+                SignalDeciderDecisionSnapshot.created_at.desc(),
+                SignalDeciderDecisionSnapshot.id.desc(),
+            )
+            .limit(1)
+            .scalar_subquery()
+        )
         with session_scope() as session:
             stmt = (
                 select(
@@ -307,6 +330,8 @@ class DeciderPostDecisionEvaluationRepository:
                     AgentContextFeedback.normalized_feedback_payload.label('normalized_feedback_payload'),
                     AgentContextFeedback.feedback_payload.label('feedback_payload'),
                     snapshot_id_subquery.label('decision_snapshot_id'),
+                    snapshot_feedback_received_at_subquery.label('feedback_received_at'),
+                    snapshot_created_at_subquery.label('created_at'),
                 )
                 .where(
                     AgentContextFeedback.market_date >= market_date_from,
@@ -440,6 +465,12 @@ class DeciderPostDecisionEvaluationService:
             agent_names=normalized_agent_names,
             symbols=normalized_symbols or None,
         )
+        source_rows = [
+            source_row
+            for source_row in source_rows
+            if source_row.get('decision_snapshot_id') is None
+            or is_decision_snapshot_valid_for_source_date(source_row)
+        ]
         evaluation_items = [
             self._build_evaluation_item(source_row=source_row, window_days=resolved_window_days)
             for source_row in source_rows

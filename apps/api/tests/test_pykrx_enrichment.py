@@ -1,5 +1,6 @@
 import unittest
 from copy import deepcopy
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import pandas as pd
@@ -409,6 +410,115 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(upsert_calls[1][0]['payload']['per'], 11.4)
         self.assertEqual(result['status'], 'recovered')
         self.assertEqual(result['categories']['valuation_snapshot']['fallback']['rows_persisted'], 1)
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_point_in_time_sector_failure_never_uses_current_symbol_sector(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {
+                'symbol': '099999',
+                'name_ko': 'Current name',
+                'market': 'KOSPI',
+                'standard_code': 'CURRENT-CODE',
+                'sector_name': 'Current sector',
+            }
+        ]
+        current_sector_rows = [
+            {
+                'market_date': '2026-09-11',
+                'market': 'KOSPI',
+                'category': 'sector_classification',
+                'scope_type': 'symbol',
+                'scope_key': '099999',
+                'source': 'daily_price_bars_reconstructed',
+                'symbol': '099999',
+                'payload': {'sector_name': 'Current sector'},
+            }
+        ]
+        persisted_rows: list[dict] = []
+
+        def upsert_side_effect(*, rows):
+            persisted_rows.extend(deepcopy(rows))
+            return len(rows)
+
+        with (
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_sector_classification_rows',
+                return_value=(
+                    [],
+                    {
+                        'category': 'sector_classification',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 0,
+                        'errors': [{'market': 'KOSPI', 'error': 'provider down'}],
+                    },
+                ),
+            ),
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_sector_rows_from_symbols',
+                return_value=(
+                    current_sector_rows,
+                    {
+                        'category': 'sector_classification',
+                        'scope_type': 'symbol',
+                        'fallback_source': 'daily_price_bars',
+                        'rows_prepared': 1,
+                    },
+                ),
+            ) as current_sector_fallback,
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_rows_from_latest_enrichment',
+                return_value=(
+                    [],
+                    {
+                        'category': 'sector_classification',
+                        'scope_type': 'symbol',
+                        'fallback_source': 'latest_pykrx_enrichment',
+                        'rows_prepared': 0,
+                        'reason': 'no_prior_enrichment_rows',
+                    },
+                ),
+            ) as historical_sector_fallback,
+            patch.object(
+                PykrxEnrichmentService,
+                '_build_coverage_summary',
+                return_value={
+                    'requested_symbol_count': 1,
+                    'requested_market_count': 1,
+                    'categories': {},
+                },
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                side_effect=upsert_side_effect,
+            ),
+            patch(
+                'app.eod.pykrx_enrichment._current_krx_calendar_date',
+                return_value=date(2026, 9, 14),
+            ),
+        ):
+            result = PykrxEnrichmentService().collect_for_market_date(
+                market_date='2026-09-11',
+                markets=['KOSPI'],
+                symbols=['099999'],
+                categories=['sector_classification'],
+            )
+
+        current_sector_fallback.assert_not_called()
+        historical_sector_fallback.assert_called_once()
+        self.assertTrue(result['point_in_time_recovery'])
+        self.assertEqual(result['status'], 'partial')
+        self.assertFalse(
+            any(
+                row.get('payload', {}).get('sector_name') == 'Current sector'
+                for row in persisted_rows
+            )
+        )
 
     @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_inspect_reports_partial_coverage_for_missing_categories(self, load_symbols_mock):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Sequence
 
@@ -13,6 +13,10 @@ from app.db import session_scope
 from app.db_models import DailyPriceBar, Symbol
 
 KIS_VALUATION_BACKFILL_SOURCE = 'kis_quote_valuation'
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -201,7 +205,7 @@ def _extract_valuation(raw: dict[str, Any], target: ValuationTarget) -> dict[str
 def _persist_valuation(*, market_date: date, symbol: str, valuation: dict[str, Decimal | None]) -> int:
     if valuation.get('per') is None or valuation.get('pbr') is None:
         return 0
-    refreshed_at = datetime.utcnow()
+    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol_id = session.execute(select(Symbol.id).where(Symbol.symbol == symbol).limit(1)).scalar_one_or_none()
         if symbol_id is None:
