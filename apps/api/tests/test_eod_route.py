@@ -1576,10 +1576,14 @@ class EODRouteTests(unittest.TestCase):
                     FakeDailyPipelineRunStateService(),
                 ),
                 patch(
-                    'app.eod.daily_pipeline_tracking.get_market_state',
+                    'app.api.routes_eod.async_get_market_state',
                     return_value=SimpleNamespace(
                         server_time='2026-04-14T10:00:00+09:00'
                     ),
+                ) as async_market_state,
+                patch(
+                    'app.eod.daily_pipeline_tracking.get_market_state',
+                    side_effect=AssertionError('sync market clock must not run in async route'),
                 ),
             ):
                 client = TestClient(self.app)
@@ -1603,16 +1607,23 @@ class EODRouteTests(unittest.TestCase):
         self.assertIn('progress_callback', fake_service.compute_args)
         self.assertEqual(response.json()['pipeline_run_id'], 7001)
         self.assertEqual(response.json()['items'][0]['risk_state'], 'watchlist')
+        async_market_state.assert_awaited_once_with()
 
     def test_prior_date_market_risk_filter_route_safe_skips_kis_write(self):
         fake_service = FakeMarketRiskFilterService()
         original_service = routes_eod.daily_market_risk_filter_service
         routes_eod.daily_market_risk_filter_service = fake_service
         try:
-            with patch(
-                'app.eod.daily_pipeline_tracking.get_market_state',
-                return_value=SimpleNamespace(
-                    server_time='2026-09-14T10:00:00+09:00'
+            with (
+                patch(
+                    'app.api.routes_eod.async_get_market_state',
+                    return_value=SimpleNamespace(
+                        server_time='2026-09-14T10:00:00+09:00'
+                    ),
+                ) as async_market_state,
+                patch(
+                    'app.eod.daily_pipeline_tracking.get_market_state',
+                    side_effect=AssertionError('sync market clock must not run in async route'),
                 ),
             ):
                 response = TestClient(self.app).post(
@@ -1631,6 +1642,7 @@ class EODRouteTests(unittest.TestCase):
             response.json()['reason'],
             'point_in_time_recovery_current_only_stage',
         )
+        async_market_state.assert_awaited_once_with()
         self.assertIsNone(fake_service.compute_args)
 
     def test_collect_market_risk_snapshots_route_calls_service(self):
