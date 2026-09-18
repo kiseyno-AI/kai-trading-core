@@ -19,7 +19,11 @@ from app.eod.pykrx_backfill import (
     PykrxSymbol,
 )
 from app.eod.pykrx_import import suppress_pykrx_login_env
-from app.eod.market_membership import validate_market_membership_snapshot
+from app.eod.market_membership import (
+    build_market_membership_snapshot,
+    validate_market_membership_snapshot,
+)
+from app.eod.pykrx_pipeline_support import build_daily_retry_context
 from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
     AUTO_DAILY_TRACKED_STAGE_ORDER,
@@ -164,6 +168,27 @@ def _point_in_time_universe_snapshot(
         'market_status': {market: 'pykrx_market_ohlcv' for market in markets},
         'unavailable_markets': [],
         'market_errors': [],
+    }
+
+
+def _stored_daily_universe_snapshot(
+    symbols: list[PykrxSymbol],
+    *,
+    market_date: str = '2026-04-03',
+) -> dict:
+    markets = sorted({item.market.upper() for item in symbols})
+    return {
+        'source': 'pykrx',
+        'markets': markets,
+        'latest_trade_date': market_date,
+        'membership_basis': 'end_date_snapshot',
+        'complete': True,
+        'point_in_time': False,
+        'current_universe_mutated': True,
+        'market_membership': build_market_membership_snapshot(
+            symbols=symbols,
+            markets=markets,
+        ),
     }
 
 
@@ -1663,6 +1688,173 @@ class PykrxBackfillServiceTests(TestCase):
         load_symbols.assert_not_called()
         find_current.assert_not_called()
 
+    def test_point_in_time_price_retry_promotes_inherited_daily_snapshot(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        inherited_symbol = PykrxSymbol('005930', 'KOSPI', '삼성전자')
+        retry_symbol = PykrxSymbol('472220', 'KOSPI', '가격 재시도 종목')
+        run = {
+            'id': 8,
+            'trade_date': '2026-09-11',
+            'status': 'completed_with_errors',
+            'symbols_total': 1,
+            'symbols_succeeded': 0,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'markets': ['KOSPI'],
+                'requested_symbols': ['472220'],
+                'failed_symbols': ['472220'],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': ['005930'],
+                'universe_snapshot': _stored_daily_universe_snapshot(
+                    [inherited_symbol, retry_symbol],
+                    market_date='2026-09-11',
+                ),
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=[],
+            ),
+            patch.object(
+                service,
+                'fetch_recent_universe_snapshot',
+                side_effect=RuntimeError('provider unavailable'),
+            ) as refetch_snapshot,
+        ):
+            retry_codes = service._failed_symbol_codes_for_run(
+                run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+            retry_symbols = service._load_retry_symbols_for_run(
+                run,
+                markets=('KOSPI',),
+                symbol_codes=retry_codes,
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(retry_codes, ['472220'])
+        self.assertTrue(retry_codes.universe_snapshot['point_in_time'])
+        self.assertTrue(
+            retry_codes.universe_snapshot[
+                'promoted_from_frozen_daily_snapshot'
+            ]
+        )
+        self.assertEqual(
+            [(item.symbol, item.market) for item in retry_symbols],
+            [('472220', 'KOSPI')],
+        )
+        self.assertEqual(
+            retry_symbols.universe_snapshot,
+            retry_codes.universe_snapshot,
+        )
+        refetch_snapshot.assert_not_called()
+
+    def test_point_in_time_price_retry_recovers_snapshot_from_retry_lineage(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        inherited_symbol = PykrxSymbol('005930', 'KOSPI', '삼성전자')
+        retry_symbol = PykrxSymbol('472220', 'KOSPI', '가격 재시도 종목')
+        run = {
+            'id': 10,
+            'trade_date': '2026-09-11',
+            'status': 'completed_with_errors',
+            'symbols_total': 1,
+            'symbols_succeeded': 0,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'markets': ['KOSPI'],
+                'requested_symbols': ['472220'],
+                'failed_symbols': ['472220'],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': ['005930'],
+                'retry': {'retry_of_run_id': 9},
+            },
+        }
+        ancestors = {
+            9: {
+                'id': 9,
+                'trade_date': '2026-09-11',
+                'trigger': 'auto_close_scheduler',
+                'run_metadata': {
+                    'mode': 'daily_auto',
+                    'markets': ['KOSPI'],
+                    'retry': {'retry_of_run_id': 8},
+                },
+            },
+            8: {
+                'id': 8,
+                'trade_date': '2026-09-11',
+                'trigger': 'auto_close_scheduler',
+                'run_metadata': {
+                    'mode': 'daily_auto',
+                    'markets': ['KOSPI'],
+                    'universe_snapshot': _stored_daily_universe_snapshot(
+                        [inherited_symbol, retry_symbol],
+                        market_date='2026-09-11',
+                    ),
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=[],
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_automatic_daily_eod_collection_run_by_id',
+                side_effect=lambda **kwargs: ancestors.get(
+                    kwargs['eod_run_id']
+                ),
+            ) as load_ancestor,
+            patch.object(
+                service,
+                'fetch_recent_universe_snapshot',
+                side_effect=RuntimeError('provider unavailable'),
+            ) as refetch_snapshot,
+        ):
+            retry_codes = service._failed_symbol_codes_for_run(
+                run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+            retry_symbols = service._load_retry_symbols_for_run(
+                run,
+                markets=('KOSPI',),
+                symbol_codes=retry_codes,
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(
+            [item.kwargs['eod_run_id'] for item in load_ancestor.call_args_list],
+            [9, 8],
+        )
+        self.assertEqual(retry_codes, ['472220'])
+        self.assertTrue(retry_codes.universe_snapshot['point_in_time'])
+        self.assertTrue(
+            retry_codes.universe_snapshot[
+                'promoted_from_frozen_daily_snapshot'
+            ]
+        )
+        self.assertEqual(
+            [(item.symbol, item.market) for item in retry_symbols],
+            [('472220', 'KOSPI')],
+        )
+        self.assertEqual(
+            retry_symbols.universe_snapshot,
+            retry_codes.universe_snapshot,
+        )
+        refetch_snapshot.assert_not_called()
+
     def test_metadata_less_retry_inherits_persisted_exact_membership_scope(
         self,
     ) -> None:
@@ -2110,6 +2302,15 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
                 return_value={'status': 'completed', 'pipeline_run_id': 92},
             ) as resume_stages,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 92,
+                    'status': 'completed',
+                },
+            ),
             patch.object(
                 service,
                 '_persist_successful_followup_recovery',
@@ -2201,6 +2402,15 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
                 return_value={'status': 'completed', 'pipeline_run_id': 92},
             ) as resume_stages,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 92,
+                    'status': 'completed',
+                },
+            ),
             patch.object(
                 service,
                 '_persist_successful_followup_recovery',
@@ -2220,6 +2430,182 @@ class PykrxBackfillServiceTests(TestCase):
             resume_stages.call_args.kwargs['symbols'],
             ['005930', '000660'],
         )
+
+    def test_point_in_time_followup_recovers_membership_from_retry_lineage(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        symbols = [
+            PykrxSymbol('005930', 'KOSPI', '삼성전자'),
+            PykrxSymbol('000660', 'KOSPI', 'SK하이닉스'),
+            PykrxSymbol('472220', 'KOSPI', '가격 재시도 종목'),
+        ]
+        latest_eod_run = {
+            'id': 10,
+            'trade_date': '2026-09-11',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed_with_errors',
+            'symbols_total': 1,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'markets': ['KOSPI'],
+                'requested_symbols': ['472220'],
+                'failed_symbols': [],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': ['005930', '000660'],
+                'retry': {'retry_of_run_id': 9},
+            },
+        }
+        ancestors = {
+            9: {
+                'id': 9,
+                'trade_date': '2026-09-11',
+                'trigger': 'auto_close_scheduler',
+                'run_metadata': {
+                    'mode': 'daily_auto',
+                    'markets': ['KOSPI'],
+                    'retry': {'retry_of_run_id': 8},
+                },
+            },
+            8: {
+                'id': 8,
+                'trade_date': '2026-09-11',
+                'trigger': 'auto_close_scheduler',
+                'run_metadata': {
+                    'mode': 'daily_auto',
+                    'markets': ['KOSPI'],
+                    'universe_snapshot': _stored_daily_universe_snapshot(
+                        symbols,
+                        market_date='2026-09-11',
+                    ),
+                },
+            },
+        }
+        pipeline_run = {
+            'id': 91,
+            'trigger': 'auto_close_scheduler',
+            'status': 'partial',
+            'run_metadata': {
+                'resolved_stages': ['technical_snapshots'],
+                'eod_collection_run_id': 10,
+            },
+            'stages': {'technical_snapshots': {'status': 'failed'}},
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=0,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_automatic_daily_eod_collection_run_by_id',
+                side_effect=lambda **kwargs: ancestors.get(
+                    kwargs['eod_run_id']
+                ),
+            ) as load_ancestor,
+            patch.object(
+                service,
+                'fetch_recent_universe_snapshot',
+                side_effect=RuntimeError('provider unavailable'),
+            ) as refetch_snapshot,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                return_value={'status': 'completed', 'pipeline_run_id': 92},
+            ) as resume_stages,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 92,
+                    'status': 'completed',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+                return_value={'updated': True, 'status': 'completed'},
+            ),
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-09-11',
+                latest_available_trade_date='2026-09-11',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            [item.kwargs['eod_run_id'] for item in load_ancestor.call_args_list],
+            [9, 8],
+        )
+        refetch_snapshot.assert_not_called()
+        self.assertEqual(
+            resume_stages.call_args.kwargs['symbols'],
+            ['005930', '000660'],
+        )
+        self.assertTrue(
+            resume_stages.call_args.kwargs['point_in_time_recovery']
+        )
+
+    def test_retry_lineage_snapshot_cannot_omit_latest_admitted_scope(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_metadata = {
+            'markets': ['KOSPI'],
+            'requested_symbols': ['472220'],
+            'downstream_retry_symbols': ['005930'],
+            'retry': {'retry_of_run_id': 8},
+        }
+        ancestor = {
+            'id': 8,
+            'trade_date': '2026-09-11',
+            'trigger': 'auto_close_scheduler',
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'markets': ['KOSPI'],
+                'universe_snapshot': _stored_daily_universe_snapshot(
+                    [PykrxSymbol('005930', 'KOSPI', '삼성전자')],
+                    market_date='2026-09-11',
+                ),
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_automatic_daily_eod_collection_run_by_id',
+                return_value=ancestor,
+            ),
+            patch.object(
+                service,
+                'fetch_recent_universe_snapshot',
+                side_effect=RuntimeError('provider unavailable'),
+            ) as refetch_snapshot,
+        ):
+            membership, markets = (
+                service._resolve_point_in_time_followup_membership(
+                    market_date='2026-09-11',
+                    metadata=latest_metadata,
+                    markets=('KOSPI',),
+                    eod_run_id=9,
+                )
+            )
+
+        self.assertIsNone(membership)
+        self.assertEqual(markets, ('KOSPI',))
+        refetch_snapshot.assert_called_once()
 
     def test_current_orphan_keeps_verified_inherited_scope_after_price_retry(
         self,
@@ -2410,6 +2796,15 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
                 return_value={'status': 'completed', 'pipeline_run_id': 92},
             ) as resume_stages,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 92,
+                    'status': 'completed',
+                },
+            ),
             patch.object(
                 service,
                 '_persist_successful_followup_recovery',
@@ -8257,6 +8652,27 @@ class PykrxBackfillServiceTests(TestCase):
                 name_ko='retry symbol',
             )
         ]
+        universe_snapshot = _stored_daily_universe_snapshot(
+            [
+                PykrxSymbol('005930', 'KOSPI', 'inherited symbol'),
+                symbols[0],
+            ]
+        )
+        retry_context = build_daily_retry_context(
+            {
+                'id': 7,
+                'status': 'completed_with_errors',
+                'symbols_failed': 1,
+                'run_metadata': {
+                    'failed_symbols': ['472220'],
+                    'downstream_retry_symbols': ['005930'],
+                    'universe_snapshot': universe_snapshot,
+                },
+            },
+            attempt=1,
+            max_attempts=5,
+            symbol_count=1,
+        )
 
         with (
             patch.object(
@@ -8285,15 +8701,12 @@ class PykrxBackfillServiceTests(TestCase):
             result = service._run_market_data_pipeline(
                 start_date='20260403',
                 end_date='20260403',
-                markets=('KOSDAQ',),
+                markets=('KOSPI', 'KOSDAQ'),
                 trigger='auto_close_scheduler',
                 refresh_universe=False,
                 mode='daily_auto',
                 symbols_override=symbols,
-                retry_context={
-                    'retry_of_run_id': 7,
-                    'inherited_downstream_retry_symbols': ['005930'],
-                },
+                retry_context=retry_context,
                 selected_stages=PYKRX_STAGE_SEQUENCE,
                 chain_fundamentals_followup=False,
             )
@@ -8307,6 +8720,14 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             completed_metadata['inherited_downstream_retry_symbols'],
             ['005930'],
+        )
+        self.assertEqual(
+            completed_metadata['universe_snapshot'],
+            universe_snapshot,
+        )
+        self.assertEqual(
+            retry_context['inherited_universe_snapshot'],
+            universe_snapshot,
         )
 
     def test_successful_small_price_retry_preserves_inherited_enrichment_stage(

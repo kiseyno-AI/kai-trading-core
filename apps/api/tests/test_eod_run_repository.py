@@ -17,6 +17,7 @@ from app.repositories.eod_run_repository import (
     create_eod_collection_run,
     eod_collection_advisory_lock_keys,
     list_eod_collection_runs,
+    load_automatic_daily_eod_collection_run_by_id,
     load_exact_automatic_daily_eod_collection_run,
     load_most_complete_eod_collection_run,
     load_oldest_outstanding_auto_eod_recovery_date,
@@ -534,6 +535,78 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             )
 
         self.assertIsNone(loaded)
+
+    def test_automatic_daily_loader_by_id_keeps_superseded_lineage_scoped(
+        self,
+    ) -> None:
+        started_at = datetime(2026, 9, 14, tzinfo=timezone.utc)
+        with self.session_factory.begin() as session:
+            selected_run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 9, 11),
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed_with_errors',
+                symbols_total=2,
+                symbols_succeeded=1,
+                symbols_failed=1,
+                started_at=started_at,
+                run_metadata={'mode': 'daily_auto'},
+            )
+            manual_run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 9, 11),
+                source='pykrx',
+                trigger='manual_api',
+                status='completed',
+                symbols_total=2,
+                symbols_succeeded=2,
+                symbols_failed=0,
+                started_at=started_at + timedelta(minutes=1),
+                run_metadata={'mode': 'manual'},
+            )
+            session.add_all([selected_run, manual_run])
+            session.flush()
+            selected_run_id = selected_run.id
+            manual_run_id = manual_run.id
+            session.add(
+                EODCollectionRun(
+                    market='KRX',
+                    trade_date=date(2026, 9, 11),
+                    source='pykrx',
+                    trigger='auto_close_scheduler',
+                    status='completed',
+                    symbols_total=2,
+                    symbols_succeeded=2,
+                    symbols_failed=0,
+                    started_at=started_at + timedelta(minutes=2),
+                    run_metadata={'mode': 'daily_auto'},
+                )
+            )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            loaded = load_automatic_daily_eod_collection_run_by_id(
+                eod_run_id=selected_run_id,
+                trade_date='2026-09-11',
+            )
+            manual = load_automatic_daily_eod_collection_run_by_id(
+                eod_run_id=manual_run_id,
+                trade_date='2026-09-11',
+            )
+            wrong_date = load_automatic_daily_eod_collection_run_by_id(
+                eod_run_id=selected_run_id,
+                trade_date='2026-09-12',
+            )
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded['id'], selected_run_id)
+        self.assertEqual(loaded['trade_date'], '2026-09-11')
+        self.assertEqual(loaded['status'], 'completed_with_errors')
+        self.assertIsNone(manual)
+        self.assertIsNone(wrong_date)
 
     def test_bounded_candidate_lookup_avoids_json_materialization(self) -> None:
         with self.session_factory.begin() as session:

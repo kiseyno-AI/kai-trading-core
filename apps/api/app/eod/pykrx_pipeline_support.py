@@ -73,6 +73,12 @@ def build_daily_retry_context(
         context['inherited_downstream_retry_symbols'] = (
             inherited_downstream_symbols
         )
+    universe_snapshot = metadata.get('universe_snapshot')
+    if isinstance(universe_snapshot, Mapping):
+        # A retry may contain only the failed price subset. Keep the original
+        # exact-date membership proof attached to every descendant so recovery
+        # after midnight does not depend on a fresh provider response.
+        context['inherited_universe_snapshot'] = dict(universe_snapshot)
     return context
 
 

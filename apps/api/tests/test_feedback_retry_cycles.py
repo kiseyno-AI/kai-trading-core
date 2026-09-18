@@ -3153,6 +3153,99 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(run_state_service.started[0]['request_payload']['force_recompute'], False)
 
+    def test_run_retry_cycles_propagates_gate_bypass_to_child_dispatch(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        roles = ('eod-summarizer',)
+        symbols = ('005930',)
+        pending_snapshot = _snapshot(
+            symbols=symbols,
+            role_states={
+                'eod-summarizer': _role_state(
+                    role='eod-summarizer',
+                    symbols=symbols,
+                    boundary_pending=symbols,
+                    retry_pending=symbols,
+                )
+            },
+        )
+        completed_snapshot = _snapshot(
+            symbols=symbols,
+            role_states={
+                'eod-summarizer': _role_state(
+                    role='eod-summarizer',
+                    symbols=symbols,
+                    completed=symbols,
+                )
+            },
+        )
+        snapshots = SnapshotSequence(
+            [pending_snapshot, pending_snapshot, completed_snapshot]
+        )
+        progress = {
+            'request': {'expected_agents': list(roles)},
+            'summary': {'run_status': 'completed'},
+        }
+
+        with (
+            patch.object(
+                service,
+                '_build_role_sequence_snapshot',
+                side_effect=snapshots,
+            ),
+            patch(
+                'app.agent_context.retry_service.load_agent_feedback_eligibility_records',
+                return_value=[],
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_context_feedback_run_state_service',
+                run_state_service,
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols',
+                return_value={
+                    'request': {'roles': list(roles), 'symbols': list(symbols)},
+                    'summary': {'status': 'completed', 'completed': 1, 'failed': 0},
+                },
+            ) as dispatch_child,
+            patch(
+                'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                return_value=progress,
+            ),
+        ):
+            result = service._run_retry_cycles_admitted(
+                config=SimpleNamespace(
+                    market_date=date.fromisoformat('2040-04-17'),
+                    roles=roles,
+                    max_cycles=1,
+                    outer_batch_size=20,
+                    reuse_existing=True,
+                ),
+                bypass_prerequisite_gate=True,
+                prerequisites=_feedback_prerequisites(
+                    status='waiting',
+                    missing_stage_ids=['fundamentals_daily_refresh'],
+                ),
+                preloaded_eligible_symbols=symbols,
+                effective_knowledge_cutoff_at=datetime(
+                    2040,
+                    4,
+                    17,
+                    6,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                knowledge_cutoff_source='market_close',
+            )
+
+        dispatch_child.assert_called_once()
+        dispatch_kwargs = dispatch_child.call_args.kwargs
+        self.assertEqual(dispatch_kwargs['symbols'], ['005930'])
+        self.assertIs(dispatch_kwargs['force'], True)
+        self.assertIs(dispatch_kwargs['force_recompute'], False)
+        self.assertIs(dispatch_kwargs['reuse_existing'], False)
+        self.assertTrue(result['completed'])
+
     def test_run_retry_cycles_persists_role_boundaries_and_advances_past_terminal_failures(self):
         service = AgentFeedbackRetryService()
         run_state_service = RecordingRunStateService()
