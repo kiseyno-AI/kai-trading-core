@@ -273,6 +273,121 @@ class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
             'Marked abandoned after 30 minutes without completion.',
         )
 
+    def test_startup_abandons_active_rows_and_revokes_retry_ownership(self):
+        service = AgentContextFeedbackRunStateService()
+        market_date = date.fromisoformat('2026-04-14')
+        started_at = datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc)
+        running_row = _build_run_row(
+            row_id=2,
+            run_id='orphaned-retry-run',
+            market_date=market_date,
+            started_at=started_at,
+            status='running',
+            request_payload={
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'retry_admission': {'owner_token': 'old-owner'},
+            },
+        )
+        running_row.symbols_total = 10
+        running_row.completed_count = 3
+        running_row.failed_count = 1
+        running_row.completed_at = None
+        running_row.summary_payload = {
+            'existing': 'preserved',
+            'progress_summary': {'expected_feedback_count': 30},
+        }
+        completed_row = _build_run_row(
+            row_id=1,
+            run_id='completed-run',
+            market_date=market_date,
+            started_at=started_at,
+            status='completed',
+            request_payload={'mode': 'daily_retry_cycle_role_sequenced'},
+        )
+        queued_row = _build_run_row(
+            row_id=3,
+            run_id='orphaned-queued-run',
+            market_date=market_date,
+            started_at=started_at,
+            status='queued',
+            request_payload={'mode': 'role_sequential_runtime_buffered'},
+        )
+        queued_row.completed_at = None
+        fake_session = FakeRunStateSession(
+            [running_row, queued_row, completed_row]
+        )
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with patch(
+            'app.agent_context.run_state_service.session_scope',
+            fake_session_scope,
+        ):
+            result = service.mark_active_runs_abandoned(
+                reason='Core restarted during feedback work.',
+            )
+
+        self.assertEqual(
+            result,
+            {
+                'abandoned_runs': 2,
+                'run_ids': [
+                    'orphaned-retry-run',
+                    'orphaned-queued-run',
+                ],
+            },
+        )
+        self.assertEqual(running_row.status, 'abandoned')
+        self.assertEqual(running_row.failed_count, 27)
+        self.assertIsNotNone(running_row.completed_at)
+        self.assertEqual(
+            running_row.request_payload['retry_admission'][
+                'ownership_revoked_reason'
+            ],
+            'core_restart',
+        )
+        self.assertEqual(
+            running_row.request_payload['retry_admission']['owner_token'],
+            'old-owner',
+        )
+        self.assertEqual(
+            running_row.summary_payload['startup_active_abandoned_reason'],
+            'Core restarted during feedback work.',
+        )
+        self.assertEqual(
+            running_row.summary_payload['existing'],
+            'preserved',
+        )
+        self.assertEqual(
+            running_row.summary_payload['lifecycle_stage'],
+            'startup_abandoned',
+        )
+        self.assertEqual(
+            running_row.summary_payload['progress_summary']['run_status'],
+            'abandoned',
+        )
+        self.assertEqual(
+            running_row.summary_payload['progress_summary'][
+                'run_table_status'
+            ],
+            'abandoned',
+        )
+        self.assertFalse(
+            running_row.summary_payload['progress_summary']['is_live']
+        )
+        self.assertIsNone(
+            running_row.summary_payload['progress_summary']['current_role']
+        )
+        self.assertEqual(
+            running_row.summary_payload['progress_summary']['failed_items'],
+            27,
+        )
+        self.assertEqual(queued_row.status, 'abandoned')
+        self.assertIsNotNone(queued_row.completed_at)
+        self.assertEqual(completed_row.status, 'completed')
+
     def test_resolve_run_requested_symbols_prefers_actual_dispatch_scope(self):
         service = AgentContextFeedbackRunStateService()
 

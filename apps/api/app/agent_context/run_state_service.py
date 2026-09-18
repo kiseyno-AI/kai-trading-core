@@ -145,6 +145,30 @@ class AgentContextFeedbackRunStateService:
         max_age_minutes = max(1, int(settings.eod_auto_pykrx_stale_run_minutes or 30))
         return datetime.now(timezone.utc) - updated_at > timedelta(minutes=max_age_minutes)
 
+    @staticmethod
+    def _expected_feedback_count(row: AgentContextFeedbackRun) -> int:
+        symbols_total = max(0, int(row.symbols_total or 0))
+        summary_payload = (
+            dict(row.summary_payload)
+            if isinstance(row.summary_payload, dict)
+            else {}
+        )
+        progress_summary = (
+            summary_payload.get('progress_summary')
+            if isinstance(summary_payload.get('progress_summary'), dict)
+            else {}
+        )
+        for container in (progress_summary, summary_payload):
+            try:
+                expected_feedback_count = int(
+                    container.get('expected_feedback_count')
+                )
+            except (TypeError, ValueError):
+                continue
+            if expected_feedback_count >= 0:
+                return max(symbols_total, expected_feedback_count)
+        return symbols_total
+
     def _mark_stale_running_rows_abandoned(self, *, market_date: date) -> int:
         now = datetime.now(timezone.utc)
         abandoned = 0
@@ -165,7 +189,11 @@ class AgentContextFeedbackRunStateService:
                 snapshot = self._serialize_run(row)
                 if not self._is_stale_running_row(snapshot):
                     continue
-                failed_remaining = max(int(row.symbols_total or 0) - int(row.completed_count or 0), 0)
+                failed_remaining = max(
+                    self._expected_feedback_count(row)
+                    - int(row.completed_count or 0),
+                    0,
+                )
                 row.status = 'abandoned'
                 row.failed_count = max(int(row.failed_count or 0), failed_remaining)
                 row.completed_at = now
@@ -178,6 +206,108 @@ class AgentContextFeedbackRunStateService:
                 row.summary_payload = summary_payload
                 abandoned += 1
         return abandoned
+
+    def mark_active_runs_abandoned(self, *, reason: str) -> dict[str, Any]:
+        """Fence durable feedback work that cannot survive a Core restart."""
+
+        now = datetime.now(timezone.utc)
+        abandoned_run_ids: list[str] = []
+        active_statuses = {'queued', 'running'}
+        with session_scope() as session:
+            rows = (
+                session.execute(
+                    select(AgentContextFeedbackRun)
+                    .where(
+                        AgentContextFeedbackRun.status.in_(active_statuses)
+                    )
+                    .order_by(
+                        AgentContextFeedbackRun.started_at.asc(),
+                        AgentContextFeedbackRun.id.asc(),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                if (
+                    str(row.status or '').strip().lower()
+                    not in active_statuses
+                ):
+                    continue
+                failed_remaining = max(
+                    self._expected_feedback_count(row)
+                    - int(row.completed_count or 0),
+                    0,
+                )
+                row.status = 'abandoned'
+                row.failed_count = max(
+                    int(row.failed_count or 0),
+                    failed_remaining,
+                )
+                row.completed_at = now
+                row.updated_at = now
+
+                request_payload = dict(row.request_payload or {})
+                retry_admission = (
+                    dict(request_payload.get('retry_admission'))
+                    if isinstance(
+                        request_payload.get('retry_admission'),
+                        dict,
+                    )
+                    else {}
+                )
+                retry_admission.update(
+                    {
+                        'ownership_revoked_at': now.isoformat(),
+                        'ownership_revoked_reason': 'core_restart',
+                    }
+                )
+                request_payload['retry_admission'] = retry_admission
+                row.request_payload = request_payload
+
+                summary_payload = dict(row.summary_payload or {})
+                progress_summary = (
+                    dict(summary_payload.get('progress_summary'))
+                    if isinstance(
+                        summary_payload.get('progress_summary'),
+                        dict,
+                    )
+                    else {}
+                )
+                try:
+                    previous_failed_items = int(
+                        progress_summary.get('failed_items') or 0
+                    )
+                except (TypeError, ValueError):
+                    previous_failed_items = 0
+                progress_summary.update(
+                    {
+                        'run_status': 'abandoned',
+                        'run_table_status': 'abandoned',
+                        'is_live': False,
+                        'run_completed_at': now.isoformat(),
+                        'current_role': None,
+                        'failed_items': max(
+                            previous_failed_items,
+                            int(row.failed_count or 0),
+                        ),
+                    }
+                )
+                summary_payload.update(
+                    {
+                        'lifecycle_stage': 'startup_abandoned',
+                        'startup_active_abandoned_at': now.isoformat(),
+                        'startup_active_abandoned_reason': reason,
+                        'progress_summary': progress_summary,
+                    }
+                )
+                row.summary_payload = summary_payload
+                abandoned_run_ids.append(str(row.run_id or ''))
+
+        return {
+            'abandoned_runs': len(abandoned_run_ids),
+            'run_ids': abandoned_run_ids,
+        }
 
     def start_run(
         self,
