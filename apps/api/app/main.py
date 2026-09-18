@@ -28,6 +28,9 @@ from app.api.routes_portfolio import router as portfolio_router
 from app.api.routes_trading_accounts import router as trading_accounts_router
 from app.api.routes_trading import router as trading_router
 from app.api.routes_us_equities import router as us_equities_router
+from app.agent_context.run_state_service import (
+    agent_context_feedback_run_state_service,
+)
 from app.agent_context.signal_decider_evaluation_maintenance_service import (
     signal_decider_evaluation_maintenance_service,
 )
@@ -100,6 +103,13 @@ async def lifespan(_: FastAPI):
         await asyncio.to_thread(
             daily_pipeline_run_state_service.mark_active_runs_interrupted,
             reason='Core process started while previous daily pipeline run was still marked running.',
+        )
+        await asyncio.to_thread(
+            agent_context_feedback_run_state_service.mark_active_runs_abandoned,
+            reason=(
+                'Core process started while previous agent feedback work was '
+                'still marked active.'
+            ),
         )
         tracked_symbols = await asyncio.to_thread(load_tracked_symbols)
         scanner_state.hydrate(tracked_symbols)
