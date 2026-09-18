@@ -1218,18 +1218,25 @@ def run_market_data_pipeline(
         (refresh_universe or point_in_time_scope) and symbols_override is None
     )
     if symbols_override is not None:
-        inherited_point_in_time_snapshot = (
+        inherited_universe_snapshot = (
             (retry_context or {}).get('point_in_time_universe_snapshot')
             if point_in_time_recovery
             and isinstance(
                 (retry_context or {}).get('point_in_time_universe_snapshot'),
                 dict,
             )
-            else None
+            else (
+                (retry_context or {}).get('inherited_universe_snapshot')
+                if isinstance(
+                    (retry_context or {}).get('inherited_universe_snapshot'),
+                    dict,
+                )
+                else None
+            )
         )
         universe_snapshot = (
-            dict(inherited_point_in_time_snapshot)
-            if inherited_point_in_time_snapshot is not None
+            dict(inherited_universe_snapshot)
+            if inherited_universe_snapshot is not None
             else None
         )
         symbols = list(symbols_override)

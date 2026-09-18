@@ -491,6 +491,29 @@ def load_exact_automatic_daily_eod_collection_run(
         return _serialize_eod_collection_run(row)
 
 
+def load_automatic_daily_eod_collection_run_by_id(
+    *,
+    eod_run_id: int,
+    trade_date: str | date,
+) -> dict[str, Any] | None:
+    """Load one automatic daily EOD ancestor without requiring it to be latest."""
+
+    normalized_trade_date = _normalize_trade_date(trade_date)
+    normalized_run_id = int(eod_run_id)
+    with session_scope() as session:
+        row = session.execute(
+            select(EODCollectionRun).where(
+                EODCollectionRun.id == normalized_run_id,
+                EODCollectionRun.market == 'KRX',
+                EODCollectionRun.source == 'pykrx',
+                EODCollectionRun.trade_date == normalized_trade_date,
+            )
+        ).scalar_one_or_none()
+        if row is None or not _is_automatic_daily_eod_run(row):
+            return None
+        return _serialize_eod_collection_run(row)
+
+
 def _load_eod_recovery_metadata(
     session: Any,
     *,

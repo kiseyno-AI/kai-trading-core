@@ -2909,7 +2909,13 @@ class AgentFeedbackRetryService:
                                     # role/symbol scope. Anything still queued here
                                     # must be recomputed, not reclassified by the child.
                                     reuse_existing=False,
-                                    force=force,
+                                    # `bypass_prerequisite_gate` is deliberately
+                                    # separate from `force_recompute`, but the child
+                                    # orchestrator uses `force` for its own copy of
+                                    # the prerequisite gate. Propagate the resolved
+                                    # gate-bypass decision so a safe resume is not
+                                    # blocked again inside every child batch.
+                                    force=should_bypass_prerequisite_gate,
                                     force_recompute=effective_force_recompute,
                                     auto_scope=requested_symbols is None,
                                     role_symbol_scopes={role: dispatch_chunk},

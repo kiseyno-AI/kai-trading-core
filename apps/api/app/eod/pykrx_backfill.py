@@ -61,6 +61,7 @@ from app.market_data_store import (
     upsert_symbol_universe,
 )
 from app.repositories.eod_run_repository import (
+    load_automatic_daily_eod_collection_run_by_id,
     load_exact_automatic_daily_eod_collection_run,
 )
 
@@ -341,6 +342,43 @@ def _validated_point_in_time_membership_symbols(
     ):
         return None
     return membership_symbols
+
+
+def _validated_frozen_daily_membership_evidence(
+    metadata: Mapping[str, Any],
+    *,
+    markets: Sequence[str],
+    expected_market_date: str,
+) -> tuple[set[str], dict[str, Any]] | None:
+    """Promote an immutable exact-date daily snapshot into recovery evidence."""
+
+    universe_snapshot = (
+        metadata.get('universe_snapshot')
+        if isinstance(metadata.get('universe_snapshot'), Mapping)
+        else None
+    )
+    if (
+        universe_snapshot is None
+        or universe_snapshot.get('complete') is not True
+    ):
+        return None
+    promoted_snapshot = {
+        **dict(universe_snapshot),
+        'point_in_time': True,
+        'current_universe_mutated': False,
+        'promoted_from_frozen_daily_snapshot': True,
+    }
+    membership_symbols = _validated_point_in_time_membership_symbols(
+        {
+            **dict(metadata),
+            'universe_snapshot': promoted_snapshot,
+        },
+        markets=markets,
+        expected_market_date=expected_market_date,
+    )
+    if membership_symbols is None:
+        return None
+    return membership_symbols, promoted_snapshot
 
 
 def _validate_point_in_time_universe_snapshot(
@@ -1171,14 +1209,106 @@ class PykrxBackfillService:
             'stages': stages,
         }
 
+    def _resolve_frozen_daily_membership_from_retry_lineage(
+        self,
+        *,
+        market_date: str,
+        metadata: Mapping[str, Any],
+        markets: Sequence[str],
+        eod_run_id: int | None = None,
+    ) -> tuple[set[str], dict[str, Any], tuple[str, ...]] | None:
+        """Resolve canonical exact-date evidence only from one retry lineage."""
+
+        source_markets = _point_in_time_source_markets(
+            metadata,
+            fallback=markets,
+        )
+        current_evidence = _validated_frozen_daily_membership_evidence(
+            metadata,
+            markets=source_markets,
+            expected_market_date=market_date,
+        )
+        if current_evidence:
+            membership_symbols, universe_snapshot = current_evidence
+            return membership_symbols, universe_snapshot, source_markets
+
+        lineage_metadata = metadata
+        visited_run_ids = (
+            {int(eod_run_id)} if eod_run_id is not None else set()
+        )
+        max_lineage_depth = MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE + 1
+        for _ in range(max_lineage_depth):
+            retry_context = (
+                lineage_metadata.get('retry')
+                if isinstance(lineage_metadata.get('retry'), Mapping)
+                else {}
+            )
+            try:
+                parent_run_id = int(retry_context.get('retry_of_run_id'))
+            except (TypeError, ValueError):
+                break
+            if parent_run_id <= 0 or parent_run_id in visited_run_ids:
+                break
+            visited_run_ids.add(parent_run_id)
+            try:
+                parent_run = load_automatic_daily_eod_collection_run_by_id(
+                    eod_run_id=parent_run_id,
+                    trade_date=market_date,
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.warning(
+                    'Unable to inspect PyKRX retry ancestor %s for %s: %s',
+                    parent_run_id,
+                    market_date,
+                    exc,
+                )
+                break
+            if not isinstance(parent_run, Mapping):
+                break
+            parent_metadata = (
+                parent_run.get('run_metadata')
+                if isinstance(parent_run.get('run_metadata'), Mapping)
+                else {}
+            )
+            parent_markets = _point_in_time_source_markets(
+                parent_metadata,
+                fallback=source_markets,
+            )
+            ancestor_evidence = _validated_frozen_daily_membership_evidence(
+                {
+                    **dict(metadata),
+                    'markets': list(parent_markets),
+                    'universe_snapshot': parent_metadata.get(
+                        'universe_snapshot'
+                    ),
+                },
+                markets=parent_markets,
+                expected_market_date=market_date,
+            )
+            if ancestor_evidence:
+                membership_symbols, universe_snapshot = ancestor_evidence
+                logger.info(
+                    'Recovered exact-date PyKRX membership for %s from retry ancestor %s.',
+                    market_date,
+                    parent_run_id,
+                )
+                return (
+                    membership_symbols,
+                    universe_snapshot,
+                    parent_markets,
+                )
+            lineage_metadata = parent_metadata
+        return None
+
     def _resolve_point_in_time_followup_membership(
         self,
         *,
         market_date: str,
         metadata: Mapping[str, Any],
         markets: Sequence[str],
+        eod_run_id: int | None = None,
     ) -> tuple[set[str] | None, tuple[str, ...]]:
-        """Return exact-date membership, refetching only from PyKRX if needed."""
+        """Return exact-date membership from the run lineage or PyKRX."""
 
         source_markets = _point_in_time_source_markets(
             metadata,
@@ -1190,6 +1320,18 @@ class PykrxBackfillService:
             expected_market_date=market_date,
         )
         if membership_symbols:
+            return membership_symbols, source_markets
+
+        lineage_evidence = (
+            self._resolve_frozen_daily_membership_from_retry_lineage(
+                market_date=market_date,
+                metadata=metadata,
+                markets=source_markets,
+                eod_run_id=eod_run_id,
+            )
+        )
+        if lineage_evidence:
+            membership_symbols, _, source_markets = lineage_evidence
             return membership_symbols, source_markets
 
         try:
@@ -1437,6 +1579,7 @@ class PykrxBackfillService:
                     market_date=market_date,
                     metadata=metadata,
                     markets=source_markets,
+                    eod_run_id=run_id,
                 )
             )
             if not membership_symbols:
@@ -1472,6 +1615,7 @@ class PykrxBackfillService:
                         market_date=market_date,
                         metadata=metadata,
                         markets=source_markets,
+                        eod_run_id=run_id,
                     )
                 )
                 try:
@@ -1953,6 +2097,7 @@ class PykrxBackfillService:
                 market_date=market_date,
                 metadata=latest_eod_metadata,
                 markets=recovery_markets,
+                eod_run_id=int(latest_eod_run['id']),
             )
             if not point_in_time_membership_symbols:
                 requested_recovery_symbols = _dedupe_symbol_codes(
@@ -3260,7 +3405,6 @@ class PykrxBackfillService:
                 **metadata,
                 'universe_snapshot': universe_snapshot,
             }
-            membership = universe_snapshot.get('market_membership')
             membership_markets = _point_in_time_source_markets(
                 evidence_metadata,
                 fallback=markets,
@@ -3270,6 +3414,33 @@ class PykrxBackfillService:
                 markets=membership_markets,
                 expected_market_date=str(run.get('trade_date') or ''),
             )
+            if validated is None:
+                lineage_evidence = (
+                    self._resolve_frozen_daily_membership_from_retry_lineage(
+                        market_date=str(run.get('trade_date') or ''),
+                        metadata=evidence_metadata,
+                        markets=membership_markets,
+                        eod_run_id=int(run['id']),
+                    )
+                )
+                if lineage_evidence:
+                    (
+                        _,
+                        universe_snapshot,
+                        membership_markets,
+                    ) = lineage_evidence
+                    evidence_metadata = {
+                        **metadata,
+                        'markets': list(membership_markets),
+                        'universe_snapshot': universe_snapshot,
+                    }
+                    validated = _validate_point_in_time_universe_snapshot(
+                        universe_snapshot,
+                        markets=membership_markets,
+                        expected_market_date=str(
+                            run.get('trade_date') or ''
+                        ),
+                    )
             if (
                 validated is not None
                 and _validated_point_in_time_membership_symbols(
@@ -3329,6 +3500,7 @@ class PykrxBackfillService:
                     retry_symbols,
                     universe_snapshot=exact_date_universe_snapshot,
                 )
+            membership = universe_snapshot.get('market_membership')
             market_by_symbol = {
                 symbol: market
                 for market, market_symbols in validated.items()
@@ -3409,48 +3581,82 @@ class PykrxBackfillService:
                 trade_date=run.get('trade_date'),
             )
         )
-        requested_symbols = metadata.get('requested_symbols') if metadata else None
-        if requested_symbols:
-            return [
-                symbol
-                for symbol in _dedupe_symbol_codes(requested_symbols)
-                if symbol not in persisted_symbols
-            ]
-
+        requested_symbols = _dedupe_symbol_codes(
+            metadata.get('requested_symbols') or []
+        )
         metadata_retry_symbols = self._metadata_retry_symbol_codes(run)
-        if metadata_retry_symbols:
-            return [
-                symbol
-                for symbol in metadata_retry_symbols
-                if symbol not in persisted_symbols
-            ]
+        scoped_retry_symbols = (
+            requested_symbols or metadata_retry_symbols
+        )
+        missing_scoped_symbols = [
+            symbol
+            for symbol in scoped_retry_symbols
+            if symbol not in persisted_symbols
+        ]
+        point_in_time_required = bool(
+            point_in_time_recovery
+            or metadata.get('point_in_time_recovery')
+        )
+        if not point_in_time_required:
+            if requested_symbols:
+                return missing_scoped_symbols
+            if metadata_retry_symbols:
+                return missing_scoped_symbols
 
+        membership_markets = _point_in_time_source_markets(
+            metadata,
+            fallback=markets,
+        )
+        universe_snapshot = (
+            metadata.get('universe_snapshot')
+            if isinstance(metadata.get('universe_snapshot'), dict)
+            else {}
+        )
         membership_symbols = _validated_point_in_time_membership_symbols(
             metadata,
-            markets=markets,
+            markets=membership_markets,
             expected_market_date=str(run.get('trade_date') or ''),
         )
+        canonical_snapshot: dict[str, Any] | None = (
+            dict(universe_snapshot)
+            if membership_symbols is not None
+            else None
+        )
+        if point_in_time_required and membership_symbols is None:
+            lineage_evidence = (
+                self._resolve_frozen_daily_membership_from_retry_lineage(
+                    market_date=str(run.get('trade_date') or ''),
+                    metadata=metadata,
+                    markets=membership_markets,
+                    eod_run_id=int(run['id']),
+                )
+            )
+            if lineage_evidence:
+                (
+                    membership_symbols,
+                    canonical_snapshot,
+                    membership_markets,
+                ) = lineage_evidence
+
         if membership_symbols is not None:
-            universe_snapshot = metadata.get('universe_snapshot')
-            missing_symbols = sorted(membership_symbols - persisted_symbols)
-            if (
-                (point_in_time_recovery or metadata.get('point_in_time_recovery'))
-                and isinstance(universe_snapshot, dict)
-            ):
+            missing_symbols = (
+                missing_scoped_symbols
+                if scoped_retry_symbols
+                else sorted(membership_symbols - persisted_symbols)
+            )
+            if not set(missing_symbols).issubset(membership_symbols):
+                return []
+            if point_in_time_required and canonical_snapshot is not None:
                 return PointInTimeRetryCodes(
                     missing_symbols,
-                    universe_snapshot=dict(universe_snapshot),
+                    universe_snapshot=canonical_snapshot,
                     unexpected_persisted_symbols=sorted(
                         persisted_symbols - membership_symbols
                     ),
                 )
             return missing_symbols
 
-        if point_in_time_recovery or metadata.get('point_in_time_recovery'):
-            membership_markets = _point_in_time_source_markets(
-                metadata,
-                fallback=markets,
-            )
+        if point_in_time_required:
             try:
                 provider_snapshot = self.fetch_recent_universe_snapshot(
                     markets=membership_markets,
@@ -3484,8 +3690,15 @@ class PykrxBackfillService:
             )
             if not membership_symbols:
                 return []
+            missing_symbols = (
+                missing_scoped_symbols
+                if scoped_retry_symbols
+                else sorted(membership_symbols - persisted_symbols)
+            )
+            if not set(missing_symbols).issubset(membership_symbols):
+                return []
             return PointInTimeRetryCodes(
-                sorted(membership_symbols - persisted_symbols),
+                missing_symbols,
                 universe_snapshot=universe_snapshot,
                 unexpected_persisted_symbols=sorted(
                     persisted_symbols - membership_symbols
