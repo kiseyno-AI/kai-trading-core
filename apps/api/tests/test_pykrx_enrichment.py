@@ -416,11 +416,93 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(result['categories']['short_selling']['rows_persisted'], 2)
         self.assertEqual(result['coverage']['categories']['sector_classification']['expected_rows'], 2)
         self.assertEqual(result['coverage']['categories']['short_selling']['expected_rows'], 2)
+        short_rows = [
+            row
+            for row in persisted_rows
+            if row.get('category') == 'short_selling'
+        ]
+        self.assertTrue(short_rows)
+        self.assertTrue(
+            all(row['payload']['universe_market_complete'] for row in short_rows)
+        )
+        self.assertEqual(
+            {
+                row['payload']['universe_reference_count']
+                for row in short_rows
+            },
+            {2},
+        )
         extra_rows = [row for row in persisted_rows if row.get('symbol') == '000660']
         self.assertTrue(extra_rows)
         self.assertTrue(all(row['name_ko'] == 'SK하이닉스' for row in extra_rows))
         self.assertTrue(all(row['standard_code'] == 'KR7000660001' for row in extra_rows))
         self.assertIsNone(load_symbols_mock.call_args.kwargs['symbols'])
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_full_market_short_collection_replaces_konex_provider_scope(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '900001', 'market': 'KONEX', 'name_ko': '테스트'},
+        ]
+        coverage = {
+            'market_date': '2026-09-18',
+            'requested_symbol_count': 1,
+            'requested_market_count': 1,
+            'categories': {
+                'short_selling': {
+                    'present_rows': 0,
+                    'expected_rows': None,
+                    'coverage_status': 'unavailable',
+                    'expectation_status': 'unavailable',
+                },
+            },
+        }
+        service = PykrxEnrichmentService()
+        with (
+            patch.object(
+                service,
+                '_collect_short_selling_rows',
+                return_value=(
+                    [],
+                    {
+                        'category': 'short_selling',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 0,
+                        'errors': [],
+                    },
+                ),
+            ),
+            patch.object(
+                service,
+                '_build_coverage_summary',
+                return_value=coverage,
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=1,
+            ) as upsert_mock,
+        ):
+            service.collect_for_market_date(
+                market_date='2026-09-18',
+                markets=['KONEX'],
+                symbols=['900001'],
+                categories=['short_selling'],
+                use_full_market_coverage=True,
+            )
+
+        self.assertEqual(
+            upsert_mock.call_args_list[0].kwargs['replace_scopes'],
+            [
+                {
+                    'market_date': '2026-09-18',
+                    'market': 'KONEX',
+                    'category': 'short_selling',
+                    'source': 'pykrx',
+                }
+            ],
+        )
 
     def test_fetch_frame_preserves_krx_credentials_for_authenticated_provider_requests(self):
         service = PykrxEnrichmentService()
@@ -1527,7 +1609,166 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                 self.assertIsNone(coverage['expected_rows'])
                 self.assertEqual(coverage['expectation_status'], 'unavailable')
 
-    def test_konex_only_full_market_required_coverage_is_not_applicable(self):
+    def test_mixed_market_short_coverage_requires_konex_membership_proof(self):
+        service = PykrxEnrichmentService()
+        kospi_sector = {
+            'category': 'sector_classification',
+            'market': 'KOSPI',
+            'scope_key': '005930',
+            'symbol': '005930',
+            'source': 'pykrx',
+            'payload': {
+                **_universe_reference_payload(['005930']),
+                'sector_name': '반도체',
+            },
+        }
+        kospi_short = {
+            'category': 'short_selling',
+            'market': 'KOSPI',
+            'scope_key': '005930',
+            'symbol': '005930',
+            'source': 'pykrx',
+            'payload': {
+                'short_volume': {
+                    'short_volume': 1,
+                    'total_volume': 10,
+                    'short_volume_ratio_pct': 10.0,
+                },
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[
+                    {'symbol': '005930', 'market': 'KOSPI'},
+                    {'symbol': '900001', 'market': 'KONEX'},
+                ],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[kospi_sector, kospi_short],
+            ),
+        ):
+            coverage = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KOSPI', 'KONEX'],
+                symbols=None,
+                categories=[
+                    'sector_classification',
+                    'investor_flow_symbol',
+                    'short_selling',
+                ],
+            )
+
+        short_selling = coverage['categories']['short_selling']
+        self.assertIsNone(short_selling['expected_rows'])
+        self.assertEqual(short_selling['expectation_status'], 'unavailable')
+        self.assertEqual(
+            short_selling['expected_universe_source'],
+            'fresh_pykrx_short_selling_universe_unavailable',
+        )
+
+    def test_konex_short_coverage_uses_own_membership_proof(self):
+        service = PykrxEnrichmentService()
+        konex_short = {
+            'category': 'short_selling',
+            'market': 'KONEX',
+            'scope_key': '900001',
+            'symbol': '900001',
+            'source': 'pykrx',
+            'payload': {
+                'universe_market_complete': True,
+                'universe_market_row_count': 1,
+                **_universe_reference_payload(['900001']),
+                'short_volume': {
+                    'short_volume': 1,
+                    'total_volume': 10,
+                    'short_volume_ratio_pct': 10.0,
+                },
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '900001', 'market': 'KONEX'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[konex_short],
+            ),
+        ):
+            coverage = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KONEX'],
+                symbols=None,
+                categories=['short_selling'],
+            )
+
+        short_selling = coverage['categories']['short_selling']
+        self.assertEqual(short_selling['expected_rows'], 1)
+        self.assertEqual(short_selling['present_rows'], 1)
+        self.assertEqual(short_selling['expectation_status'], 'available')
+        self.assertEqual(short_selling['coverage_status'], 'complete')
+        self.assertEqual(
+            short_selling['expected_universe_source'],
+            'fresh_pykrx_short_selling_universe',
+        )
+
+    def test_konex_partial_retries_cannot_union_certify_short_coverage(self):
+        service = PykrxEnrichmentService()
+        reference_payload = _universe_reference_payload(['900001', '900002'])
+        partial_rows = [
+            {
+                'category': 'short_selling',
+                'market': 'KONEX',
+                'scope_key': symbol,
+                'symbol': symbol,
+                'source': 'pykrx',
+                'payload': {
+                    'universe_market_complete': False,
+                    'universe_market_row_count': 1,
+                    **reference_payload,
+                    'short_volume': {
+                        'short_volume': 1,
+                        'total_volume': 10,
+                        'short_volume_ratio_pct': 10.0,
+                    },
+                },
+            }
+            for symbol in ('900001', '900002')
+        ]
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[
+                    {'symbol': '900001', 'market': 'KONEX'},
+                    {'symbol': '900002', 'market': 'KONEX'},
+                ],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=partial_rows,
+            ),
+        ):
+            coverage = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KONEX'],
+                symbols=None,
+                categories=['short_selling'],
+            )
+
+        short_selling = coverage['categories']['short_selling']
+        self.assertIsNone(short_selling['expected_rows'])
+        self.assertEqual(short_selling['expectation_status'], 'unavailable')
+        self.assertEqual(short_selling['coverage_status'], 'unavailable')
+
+    def test_konex_only_unsupported_required_coverage_is_not_applicable(self):
         service = PykrxEnrichmentService()
         required_categories = [
             'sector_classification',
