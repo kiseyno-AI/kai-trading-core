@@ -1123,8 +1123,14 @@ def load_eod_run_persisted_symbols(
     run_id: int,
     *,
     trade_date: str | date | None = None,
+    statement_timeout_ms: int | None = None,
 ) -> list[str]:
-    with session_scope() as session:
+    session_options = (
+        {'statement_timeout_ms': statement_timeout_ms}
+        if statement_timeout_ms is not None
+        else {}
+    )
+    with session_scope(**session_options) as session:
         statement = (
             select(Symbol.symbol)
             .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)

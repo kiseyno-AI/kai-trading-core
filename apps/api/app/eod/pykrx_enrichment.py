@@ -124,7 +124,7 @@ SHORT_BALANCE_METRIC_KEYS = (
 )
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
-PYKRX_COVERAGE_READ_TIMEOUT_MS = 15_000
+PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 15_000
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
@@ -1124,7 +1124,9 @@ class PykrxEnrichmentService:
         market_date_iso: str,
         markets: Sequence[str],
     ) -> date | None:
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS
+        ) as session:
             stmt = (
                 select(DailyPriceBar.trade_date)
                 .where(
@@ -1152,7 +1154,9 @@ class PykrxEnrichmentService:
             bool(allowed_symbols)
             and len(allowed_symbols) <= MAX_SQL_SYMBOL_FILTER_SIZE
         )
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS
+        ) as session:
             stmt = (
                 select(DailyPriceBar, Symbol)
                 .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
@@ -1312,7 +1316,9 @@ class PykrxEnrichmentService:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         normalized_markets = set(_normalize_markets(markets))
         allowed_symbols = {_normalize_symbol(symbol) for symbol in symbol_filter if _normalize_symbol(symbol)}
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS
+        ) as session:
             candidate_dates = [
                 item[0]
                 for item in session.execute(
@@ -1540,6 +1546,8 @@ class PykrxEnrichmentService:
         breadth_rows = load_daily_market_relative_contexts(
             market_date=market_date_iso,
             symbols=symbols,
+            markets=markets,
+            statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS,
         )
         payload_by_market: dict[str, dict[str, Any]] = {}
         for row in breadth_rows:
@@ -2136,7 +2144,7 @@ class PykrxEnrichmentService:
                     markets=normalized_markets or None,
                     symbols=normalized_symbols or None,
                     limit=None,
-                    statement_timeout_ms=PYKRX_COVERAGE_READ_TIMEOUT_MS,
+                    statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS,
                     order_results=False,
                     include_symbol_metadata=False,
                 )
@@ -2148,7 +2156,7 @@ class PykrxEnrichmentService:
                     categories=market_categories,
                     markets=normalized_markets or None,
                     limit=None,
-                    statement_timeout_ms=PYKRX_COVERAGE_READ_TIMEOUT_MS,
+                    statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS,
                     order_results=False,
                     include_symbol_metadata=False,
                 )
@@ -2490,7 +2498,10 @@ class PykrxEnrichmentService:
             statuses=['completed'],
         )
         if latest_run is not None:
-            persisted_symbols = load_eod_run_persisted_symbols(int(latest_run['id']))
+            persisted_symbols = load_eod_run_persisted_symbols(
+                int(latest_run['id']),
+                statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS,
+            )
             if persisted_symbols:
                 return load_symbols(
                     markets=list(markets) or None,
