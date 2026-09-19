@@ -955,22 +955,37 @@ def load_daily_market_relative_contexts(
     *,
     market_date: str | date,
     symbols: list[str],
+    markets: Sequence[str] | None = None,
+    statement_timeout_ms: int | None = None,
 ) -> list[dict]:
     normalized_symbols = list(dict.fromkeys(symbols))
     if not normalized_symbols:
         return []
 
     normalized_market_date = _normalize_trade_date(market_date)
-    with session_scope() as session:
-        target_markets = [
-            market
-            for market, in session.execute(
-                select(Symbol.market)
-                .where(Symbol.symbol.in_(normalized_symbols))
-                .distinct()
-            ).all()
-            if market
-        ]
+    session_options = (
+        {'statement_timeout_ms': statement_timeout_ms}
+        if statement_timeout_ms is not None
+        else {}
+    )
+    with session_scope(**session_options) as session:
+        target_markets = list(
+            dict.fromkeys(
+                str(market).strip().upper()
+                for market in (markets or [])
+                if str(market).strip()
+            )
+        )
+        if not target_markets:
+            target_markets = [
+                market
+                for market, in session.execute(
+                    select(Symbol.market)
+                    .where(Symbol.symbol.in_(normalized_symbols))
+                    .distinct()
+                ).all()
+                if market
+            ]
         if not target_markets:
             return []
 

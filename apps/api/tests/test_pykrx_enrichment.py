@@ -70,6 +70,7 @@ def _universe_reference_payload(symbols: list[str]) -> dict:
 
 class PykrxEnrichmentServiceTests(unittest.TestCase):
     def test_large_price_fallback_filter_avoids_massive_sql_in_clause(self):
+        captured_scope_kwargs: dict[str, object] = {}
         captured_statements = []
         included_symbol = SimpleNamespace(
             symbol='005930',
@@ -111,7 +112,8 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                 return _Result()
 
         @contextmanager
-        def fake_session_scope():
+        def fake_session_scope(**kwargs):
+            captured_scope_kwargs.update(kwargs)
             yield _Session()
 
         allowed_symbols = {f'X{index:05d}' for index in range(500)}
@@ -127,6 +129,10 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             )
 
         self.assertEqual([row['symbol'] for row in rows], ['005930'])
+        self.assertEqual(
+            captured_scope_kwargs,
+            {'statement_timeout_ms': 15_000},
+        )
         self.assertNotIn('symbols.symbol IN', str(captured_statements[0]))
 
     def test_fetch_frame_applies_timeout_to_session_requests(self):
@@ -794,6 +800,16 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(result['coverage']['categories']['sector_classification']['coverage_status'], 'complete')
         self.assertEqual(result['coverage']['categories']['market_breadth']['coverage_status'], 'complete')
         self.assertEqual(result['coverage']['categories']['short_selling']['present_rows'], 1)
+        self.assertEqual(
+            load_daily_market_relative_contexts_mock.call_args.kwargs[
+                'statement_timeout_ms'
+            ],
+            15_000,
+        )
+        self.assertEqual(
+            load_daily_market_relative_contexts_mock.call_args.kwargs['markets'],
+            ['KOSPI'],
+        )
 
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
@@ -2494,7 +2510,10 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
 
         with (
             patch('app.eod.pykrx_enrichment.load_latest_eod_collection_run', return_value={'id': 42}),
-            patch('app.eod.pykrx_enrichment.load_eod_run_persisted_symbols', return_value=['005930', '000660']),
+            patch(
+                'app.eod.pykrx_enrichment.load_eod_run_persisted_symbols',
+                return_value=['005930', '000660'],
+            ) as persisted_symbols_mock,
             patch('app.eod.pykrx_enrichment.load_symbols', return_value=symbol_rows) as load_symbols_mock,
             patch(
                 'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
@@ -2505,7 +2524,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                     markets=markets,
                     symbols=symbols,
                 ),
-            ),
+            ) as load_rows_mock,
         ):
             result = PykrxEnrichmentService().inspect(
                 market_date='2026-04-21',
@@ -2518,6 +2537,10 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             markets=['KOSPI', 'KOSDAQ', 'KONEX'],
             symbols=['005930', '000660'],
             limit=2,
+        )
+        persisted_symbols_mock.assert_called_once_with(
+            42,
+            statement_timeout_ms=15_000,
         )
         coverage = result['coverage']['categories']['short_selling']
         self.assertEqual(result['coverage']['requested_symbol_count'], 2)

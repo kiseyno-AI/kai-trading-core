@@ -21,6 +21,7 @@ from app.repositories.eod_run_repository import (
 
 
 ACTIVE_DAILY_PIPELINE_STATUSES = {'running'}
+DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS = 15_000
 STARTUP_RECOVERABLE_EOD_STATUSES = {
     'running',
     'completed',
@@ -403,7 +404,9 @@ class DailyPipelineRunStateService:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_status = str(status or 'running')
         terminal = normalized_status in TERMINAL_DAILY_PIPELINE_STATUSES
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
+        ) as session:
             run_row = session.execute(
                 select(DailyPipelineRun)
                 .where(DailyPipelineRun.id == int(pipeline_run_id))
@@ -520,7 +523,9 @@ class DailyPipelineRunStateService:
         run_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = _utcnow()
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
+        ) as session:
             row = session.execute(
                 select(DailyPipelineRun)
                 .where(DailyPipelineRun.id == int(pipeline_run_id))

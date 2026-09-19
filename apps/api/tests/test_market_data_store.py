@@ -115,6 +115,47 @@ class DailyPykrxEnrichmentReadTests(unittest.TestCase):
         self.assertNotIn('ORDER BY', statement_text)
         self.assertNotIn('JOIN symbols', statement_text)
 
+    def test_market_relative_read_uses_explicit_timeout(self) -> None:
+        captured_scope_kwargs: dict[str, object] = {}
+        captured_statements = []
+        results = iter([[]])
+
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def all(self):
+                return self._rows
+
+        class _Session:
+            @staticmethod
+            def execute(statement):
+                captured_statements.append(statement)
+                return _Result(next(results))
+
+        @contextmanager
+        def fake_session_scope(**kwargs):
+            captured_scope_kwargs.update(kwargs)
+            yield _Session()
+
+        with patch(
+            'app.market_data_store.session_scope',
+            new=fake_session_scope,
+        ):
+            rows = load_daily_market_relative_contexts(
+                market_date='2026-09-18',
+                symbols=['005930'],
+                markets=['KOSPI'],
+                statement_timeout_ms=15_000,
+            )
+
+        self.assertEqual(rows[0]['status'], 'unavailable')
+        self.assertEqual(
+            captured_scope_kwargs,
+            {'statement_timeout_ms': 15_000},
+        )
+        self.assertEqual(len(captured_statements), 1)
+
 
 class HistoricalPriceBarPersistenceTests(unittest.TestCase):
     @staticmethod

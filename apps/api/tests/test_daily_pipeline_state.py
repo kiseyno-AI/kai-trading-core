@@ -2072,7 +2072,10 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         session_context = MagicMock()
         session_context.__enter__.return_value = session
 
-        with patch('app.eod.daily_pipeline_state.session_scope', return_value=session_context):
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ) as session_scope_mock:
             with self.assertRaisesRegex(
                 ValueError,
                 r'daily pipeline run is not active: 341 \(abandoned\)',
@@ -2081,6 +2084,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     pipeline_run_id=341,
                     status='completed',
                 )
+        session_scope_mock.assert_called_once_with(statement_timeout_ms=15_000)
 
     def test_finish_stage_recomputes_stale_remaining_from_terminal_counts(self) -> None:
         now = datetime(2026, 9, 12, 16, 5, tzinfo=timezone.utc)
@@ -2125,7 +2129,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             patch(
                 'app.eod.daily_pipeline_state.session_scope',
                 return_value=session_context,
-            ),
+            ) as session_scope_mock,
             patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
         ):
             result = DailyPipelineRunStateService().finish_stage(
@@ -2141,6 +2145,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
 
         self.assertEqual(result['remaining'], 0)
         self.assertEqual(stage.remaining, 0)
+        session_scope_mock.assert_called_once_with(statement_timeout_ms=15_000)
 
     def test_direct_terminal_update_recomputes_stale_remaining(self) -> None:
         now = datetime(2026, 9, 12, 16, 5, tzinfo=timezone.utc)
