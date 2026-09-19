@@ -124,6 +124,7 @@ SHORT_BALANCE_METRIC_KEYS = (
 )
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
+PYKRX_COVERAGE_READ_TIMEOUT_MS = 15_000
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
@@ -2135,6 +2136,9 @@ class PykrxEnrichmentService:
                     markets=normalized_markets or None,
                     symbols=normalized_symbols or None,
                     limit=None,
+                    statement_timeout_ms=PYKRX_COVERAGE_READ_TIMEOUT_MS,
+                    order_results=False,
+                    include_symbol_metadata=False,
                 )
             )
         if market_categories:
@@ -2144,6 +2148,9 @@ class PykrxEnrichmentService:
                     categories=market_categories,
                     markets=normalized_markets or None,
                     limit=None,
+                    statement_timeout_ms=PYKRX_COVERAGE_READ_TIMEOUT_MS,
+                    order_results=False,
+                    include_symbol_metadata=False,
                 )
             )
 
