@@ -93,6 +93,92 @@ def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
     assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'ready'
 
 
+def test_konex_only_pykrx_categories_satisfy_feedback_prerequisites():
+    not_applicable = {
+        category: {
+            'present_rows': 0,
+            'expected_rows': 0,
+            'coverage_ratio': None,
+            'coverage_status': 'not_applicable',
+            'expectation_status': 'not_applicable',
+            'latest_captured_at': None,
+        }
+        for category in PYKRX_DECIDER_ENRICHMENT_REQUIRED_CATEGORIES
+    }
+    pipeline_status = _pipeline_status(
+        pykrx_stage=_pykrx_enrichment_stage(
+            category_overrides=not_applicable,
+        )
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-18',
+            fs_div='CFS',
+        )
+
+    assert result['status'] == 'ready'
+    assert result['ready'] is True
+    assert result['blocked_stage_ids'] == []
+    assert result['waiting_stage_ids'] == []
+    details = result['stages']['pykrx_enrichment']['details']
+    assert details['decider_category_gate_status'] == 'ready'
+    assert details['decider_blocking_categories'] == []
+    assert details['decider_waiting_categories'] == []
+    assert {
+        item['gate_status']
+        for item in details['decider_category_gates']
+    } == {'not_applicable'}
+
+
+def test_zero_expected_rows_without_explicit_not_applicable_remains_waiting():
+    pipeline_status = _pipeline_status(
+        pykrx_stage=_pykrx_enrichment_stage(
+            category_overrides={
+                'investor_flow_symbol': {
+                    'present_rows': 0,
+                    'expected_rows': 0,
+                    'coverage_ratio': None,
+                    'coverage_status': 'missing',
+                    'expectation_status': 'available',
+                    'latest_captured_at': None,
+                },
+            },
+        )
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-18',
+            fs_div='CFS',
+        )
+
+    assert result['status'] == 'waiting'
+    assert result['ready'] is False
+    details = result['stages']['pykrx_enrichment']['details']
+    assert details['decider_category_gate_status'] == 'waiting'
+    assert details['decider_not_applicable_categories'] == []
+    assert details['decider_waiting_categories'] == [
+        {
+            'category': 'investor_flow_symbol',
+            'scope_type': 'symbol',
+            'gate_status': 'waiting',
+            'coverage_status': 'missing',
+            'expected_rows': 0,
+            'present_rows': 0,
+            'missing_rows': 0,
+            'coverage_ratio': None,
+            'reason': 'coverage_expectation_unavailable',
+        }
+    ]
+
+
 def test_terminal_partial_prerequisite_waits_when_retry_cycles_remain():
     payload = {
         'status': 'partial',

@@ -67,6 +67,13 @@ MARKET_ENRICHMENT_CATEGORIES = {
     'market_breadth',
     'investor_flow_market',
 }
+FULL_MARKET_COVERAGE_CATEGORIES = {
+    'sector_classification',
+    'market_breadth',
+    'investor_flow_market',
+    'investor_flow_symbol',
+    'short_selling',
+}
 CATEGORY_SCOPE_TYPE = {
     'sector_classification': 'symbol',
     'market_breadth': 'market',
@@ -645,12 +652,60 @@ class PykrxEnrichmentService:
                 categories_with_errors.append(category)
             category_results[category] = details
 
-        coverage = self._build_coverage_summary(
-            market_date=market_date_iso,
-            markets=normalized_markets,
-            symbols=None if use_full_market_coverage else normalized_symbols,
-            categories=resolved_categories,
-        )
+        full_market_coverage_categories = [
+            category
+            for category in resolved_categories
+            if use_full_market_coverage
+            and category in FULL_MARKET_COVERAGE_CATEGORIES
+        ]
+        requested_symbol_coverage_categories = [
+            category
+            for category in resolved_categories
+            if category not in full_market_coverage_categories
+        ]
+        coverage_parts: list[dict[str, Any]] = []
+        if full_market_coverage_categories:
+            coverage_parts.append(
+                self._build_coverage_summary(
+                    market_date=market_date_iso,
+                    markets=normalized_markets,
+                    symbols=None,
+                    categories=full_market_coverage_categories,
+                )
+            )
+        if requested_symbol_coverage_categories:
+            coverage_parts.append(
+                self._build_coverage_summary(
+                    market_date=market_date_iso,
+                    markets=normalized_markets,
+                    symbols=normalized_symbols,
+                    categories=requested_symbol_coverage_categories,
+                )
+            )
+        coverage = {
+            'market_date': market_date_iso,
+            'requested_symbol_count': max(
+                (
+                    int(part.get('requested_symbol_count') or 0)
+                    for part in coverage_parts
+                ),
+                default=0,
+            ),
+            'requested_market_count': max(
+                (
+                    int(part.get('requested_market_count') or 0)
+                    for part in coverage_parts
+                ),
+                default=0,
+            ),
+            'categories': {
+                category: payload
+                for part in coverage_parts
+                for category, payload in dict(
+                    part.get('categories') or {}
+                ).items()
+            },
+        }
         recovered_categories = [
             category
             for category, details in category_results.items()
@@ -678,7 +733,15 @@ class PykrxEnrichmentService:
             'point_in_time_recovery': point_in_time_recovery,
             'markets': normalized_markets,
             'symbols_requested': normalized_symbols or None,
-            'coverage_scope': 'full_market' if use_full_market_coverage else 'requested_symbols',
+            'coverage_scope': (
+                'mixed'
+                if full_market_coverage_categories
+                and requested_symbol_coverage_categories
+                and normalized_symbols
+                else 'full_market'
+                if full_market_coverage_categories
+                else 'requested_symbols'
+            ),
             'categories_requested': resolved_categories,
             'status': status,
             'categories': category_results,
@@ -2178,7 +2241,25 @@ class PykrxEnrichmentService:
                         }
                         expected_scope_keys -= unsupported_known_symbols
                     expected_rows = len(expected_scope_keys)
-                    expected_universe_source = 'explicit_requested_symbols'
+                    if (
+                        supported_markets is not None
+                        and unsupported_known_symbols == normalized_symbol_set
+                    ):
+                        expectation_status = 'not_applicable'
+                        expected_universe_source = (
+                            'explicit_requested_symbols_unsupported_markets'
+                        )
+                    else:
+                        expected_universe_source = 'explicit_requested_symbols'
+                elif (
+                    supported_markets is not None
+                    and requested_markets
+                    and not (set(requested_markets) & supported_markets)
+                ):
+                    expected_scope_keys = set()
+                    expected_rows = 0
+                    expectation_status = 'not_applicable'
+                    expected_universe_source = 'requested_markets'
                 elif category == 'sector_classification':
                     if not fresh_stock_universe_available:
                         expected_rows = None
@@ -2239,6 +2320,8 @@ class PykrxEnrichmentService:
                 'coverage_status': (
                     'unavailable'
                     if expectation_status == 'unavailable'
+                    else 'not_applicable'
+                    if expectation_status == 'not_applicable'
                     else _coverage_status(
                         present_rows=present_rows,
                         expected_rows=expected_rows,

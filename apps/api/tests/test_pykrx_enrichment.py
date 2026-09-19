@@ -171,6 +171,134 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
 
         self.assertIsNone(build_coverage_mock.call_args.kwargs['symbols'])
 
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_full_market_collection_keeps_optional_coverage_batch_scoped(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '005930', 'market': 'KOSPI'},
+            {'symbol': '000660', 'market': 'KOSPI'},
+        ]
+
+        def coverage_summary(*, market_date, markets, symbols, categories):
+            expected_rows = 2 if symbols is None else len(symbols)
+            return {
+                'market_date': market_date,
+                'requested_symbol_count': expected_rows,
+                'requested_market_count': len(markets or []),
+                'categories': {
+                    category: {
+                        'scope_type': 'market'
+                        if category == 'market_breadth'
+                        else 'symbol',
+                        'expected_rows': expected_rows,
+                        'present_rows': expected_rows,
+                        'coverage_status': 'complete',
+                    }
+                    for category in categories
+                },
+            }
+
+        with (
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_market_breadth_rows',
+                return_value=(
+                    [],
+                    {
+                        'category': 'market_breadth',
+                        'scope_type': 'market',
+                        'rows_prepared': 0,
+                        'errors': [],
+                    },
+                ),
+            ),
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_valuation_snapshot_rows',
+                return_value=(
+                    [],
+                    {
+                        'category': 'valuation_snapshot',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 0,
+                        'errors': [],
+                    },
+                ),
+            ),
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_foreign_ownership_rows',
+                return_value=(
+                    [],
+                    {
+                        'category': 'foreign_ownership',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 0,
+                        'errors': [],
+                    },
+                ),
+            ),
+            patch.object(
+                PykrxEnrichmentService,
+                '_collect_fallback_rows',
+                return_value=([], {'status': 'unavailable'}),
+            ),
+            patch.object(
+                PykrxEnrichmentService,
+                '_build_coverage_summary',
+                side_effect=coverage_summary,
+            ) as build_coverage_mock,
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=0,
+            ),
+        ):
+            result = PykrxEnrichmentService().collect_for_market_date(
+                market_date='2026-09-18',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=[
+                    'market_breadth',
+                    'valuation_snapshot',
+                    'foreign_ownership',
+                ],
+                use_full_market_coverage=True,
+            )
+
+        self.assertEqual(
+            [
+                (call.kwargs['symbols'], call.kwargs['categories'])
+                for call in build_coverage_mock.call_args_list
+            ],
+            [
+                (None, ['market_breadth']),
+                (
+                    ['005930'],
+                    ['valuation_snapshot', 'foreign_ownership'],
+                ),
+            ],
+        )
+        self.assertEqual(
+            result['coverage']['categories']['market_breadth'][
+                'expected_rows'
+            ],
+            2,
+        )
+        self.assertEqual(
+            result['coverage']['categories']['valuation_snapshot'][
+                'expected_rows'
+            ],
+            1,
+        )
+        self.assertEqual(
+            result['coverage']['categories']['foreign_ownership'][
+                'expected_rows'
+            ],
+            1,
+        )
+
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
@@ -1398,6 +1526,87 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                 coverage = result['categories'][category]
                 self.assertIsNone(coverage['expected_rows'])
                 self.assertEqual(coverage['expectation_status'], 'unavailable')
+
+    def test_konex_only_full_market_required_coverage_is_not_applicable(self):
+        service = PykrxEnrichmentService()
+        required_categories = [
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        ]
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '900001', 'market': 'KONEX'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[],
+            ),
+        ):
+            coverage = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KONEX'],
+                symbols=None,
+                categories=required_categories,
+            )
+
+        for category in required_categories:
+            with self.subTest(category=category):
+                payload = coverage['categories'][category]
+                self.assertEqual(payload['expected_rows'], 0)
+                self.assertEqual(
+                    payload['expectation_status'],
+                    'not_applicable',
+                )
+                self.assertEqual(
+                    payload['coverage_status'],
+                    'not_applicable',
+                )
+
+        preflight = build_pykrx_enrichment_preflight(
+            market_date='2026-09-18',
+            coverage=coverage,
+            categories=required_categories,
+        )
+        self.assertEqual(preflight['status'], 'not_applicable')
+        self.assertTrue(preflight['allowed'])
+        self.assertEqual(preflight['failed_categories'], [])
+        self.assertEqual(
+            [
+                item['category']
+                for item in preflight['not_applicable_categories']
+            ],
+            required_categories,
+        )
+
+    def test_explicit_unsupported_symbols_are_not_applicable(self):
+        service = PykrxEnrichmentService()
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '900001', 'market': 'KONEX'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[],
+            ),
+        ):
+            coverage = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KONEX'],
+                symbols=['900001'],
+                categories=['sector_classification'],
+            )
+
+        payload = coverage['categories']['sector_classification']
+        self.assertEqual(payload['expected_rows'], 0)
+        self.assertEqual(payload['expectation_status'], 'not_applicable')
+        self.assertEqual(payload['coverage_status'], 'not_applicable')
 
     def test_truncated_sector_response_cannot_self_certify_complete(self):
         service = PykrxEnrichmentService()

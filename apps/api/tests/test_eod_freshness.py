@@ -146,6 +146,36 @@ def _pykrx_enrichment_coverage(
 
 
 class EODFreshnessServiceTests(unittest.TestCase):
+    def test_pykrx_freshness_treats_not_applicable_categories_as_satisfied(self):
+        coverage = _pykrx_enrichment_coverage(
+            market_date='2026-09-18',
+            symbol_count=1,
+            market_count=1,
+        )
+        for category in (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        ):
+            coverage['categories'][category] = {
+                'scope_type': 'symbol',
+                'present_rows': 0,
+                'expected_rows': 0,
+                'coverage_ratio': None,
+                'coverage_status': 'not_applicable',
+                'expectation_status': 'not_applicable',
+                'latest_captured_at': None,
+            }
+
+        result = EODFreshnessService._build_pykrx_enrichment_stage(
+            coverage=coverage,
+            fallback_market_date='2026-09-18',
+        )
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['missing_categories'], [])
+        self.assertEqual(result['partial_categories'], [])
+
     def test_read_returns_missing_when_no_run_or_data(self):
         service = EODFreshnessService(
             market_state_loader=lambda: _FakeMarketState(),

@@ -320,6 +320,7 @@ class EODFreshnessService:
                 'expected_rows': expected_rows,
                 'coverage_ratio': item.get('coverage_ratio'),
                 'coverage_status': coverage_status,
+                'expectation_status': item.get('expectation_status'),
                 'latest_captured_at': item.get('latest_captured_at'),
             }
             candidate = item.get('latest_captured_at')
@@ -329,12 +330,23 @@ class EODFreshnessService:
         missing_categories = [
             category
             for category, item in categories.items()
-            if item['coverage_status'] == 'missing' or int(item.get('present_rows') or 0) <= 0
+            if item['coverage_status'] != 'not_applicable'
+            and (
+                item['coverage_status'] == 'missing'
+                or int(item.get('present_rows') or 0) <= 0
+            )
+        ]
+        not_applicable_categories = [
+            category
+            for category, item in categories.items()
+            if item['coverage_status'] == 'not_applicable'
         ]
         partial_categories = [
             category
             for category, item in categories.items()
-            if category not in missing_categories and item['coverage_status'] != 'complete'
+            if category not in missing_categories
+            and category not in not_applicable_categories
+            and item['coverage_status'] != 'complete'
         ]
         if not category_rows:
             status = 'missing'
@@ -353,9 +365,12 @@ class EODFreshnessService:
             'requested_market_count': coverage_payload.get('requested_market_count'),
             'category_count': len(categories),
             'complete_category_count': sum(
-                1 for item in categories.values() if item['coverage_status'] == 'complete'
+                1
+                for item in categories.values()
+                if item['coverage_status'] in {'complete', 'not_applicable'}
             ),
             'missing_categories': missing_categories,
+            'not_applicable_categories': not_applicable_categories,
             'partial_categories': partial_categories,
             'categories': categories,
         }
