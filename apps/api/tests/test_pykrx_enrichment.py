@@ -1,8 +1,10 @@
 import os
 import hashlib
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pandas as pd
@@ -67,6 +69,66 @@ def _universe_reference_payload(symbols: list[str]) -> dict:
 
 
 class PykrxEnrichmentServiceTests(unittest.TestCase):
+    def test_large_price_fallback_filter_avoids_massive_sql_in_clause(self):
+        captured_statements = []
+        included_symbol = SimpleNamespace(
+            symbol='005930',
+            market='KOSPI',
+            name_ko='삼성전자',
+            standard_code='KR7005930003',
+        )
+        excluded_symbol = SimpleNamespace(
+            symbol='000660',
+            market='KOSPI',
+            name_ko='SK하이닉스',
+            standard_code='KR7000660001',
+        )
+        bar = SimpleNamespace(
+            open_price=1,
+            high_price=2,
+            low_price=1,
+            close_price=2,
+            volume=10,
+            turnover=20,
+            per=None,
+            pbr=None,
+            bps=None,
+            eps=None,
+            dividend_yield=None,
+            dps=None,
+            source='test',
+        )
+
+        class _Result:
+            @staticmethod
+            def all():
+                return [(bar, included_symbol), (bar, excluded_symbol)]
+
+        class _Session:
+            @staticmethod
+            def execute(statement):
+                captured_statements.append(statement)
+                return _Result()
+
+        @contextmanager
+        def fake_session_scope():
+            yield _Session()
+
+        allowed_symbols = {f'X{index:05d}' for index in range(500)}
+        allowed_symbols.add('005930')
+        with patch(
+            'app.eod.pykrx_enrichment.session_scope',
+            new=fake_session_scope,
+        ):
+            rows = PykrxEnrichmentService()._daily_price_rows_for_fallback(
+                market_date_iso='2026-09-18',
+                markets=['KOSPI', 'KOSDAQ'],
+                symbol_filter=allowed_symbols,
+            )
+
+        self.assertEqual([row['symbol'] for row in rows], ['005930'])
+        self.assertNotIn('symbols.symbol IN', str(captured_statements[0]))
+
     def test_fetch_frame_applies_timeout_to_session_requests(self):
         observed_timeouts: list[object] = []
 

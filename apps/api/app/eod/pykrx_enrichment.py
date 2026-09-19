@@ -123,6 +123,7 @@ SHORT_BALANCE_METRIC_KEYS = (
     'short_balance_ratio_pct',
 )
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
+MAX_SQL_SYMBOL_FILTER_SIZE = 500
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
@@ -1146,6 +1147,10 @@ class PykrxEnrichmentService:
         source_market_date_iso = source_market_date_iso or market_date_iso
         normalized_markets = set(_normalize_markets(markets))
         allowed_symbols = {_normalize_symbol(symbol) for symbol in symbol_filter if _normalize_symbol(symbol)}
+        use_sql_symbol_filter = (
+            bool(allowed_symbols)
+            and len(allowed_symbols) <= MAX_SQL_SYMBOL_FILTER_SIZE
+        )
         with session_scope() as session:
             stmt = (
                 select(DailyPriceBar, Symbol)
@@ -1154,7 +1159,7 @@ class PykrxEnrichmentService:
             )
             if normalized_markets:
                 stmt = stmt.where(Symbol.market.in_(sorted(normalized_markets)))
-            if allowed_symbols:
+            if use_sql_symbol_filter:
                 stmt = stmt.where(Symbol.symbol.in_(sorted(allowed_symbols)))
             stmt = stmt.order_by(Symbol.market.asc(), Symbol.symbol.asc())
             rows = session.execute(stmt).all()
@@ -1179,6 +1184,7 @@ class PykrxEnrichmentService:
                     'source': bar.source,
                 }
                 for bar, symbol in rows
+                if not allowed_symbols or symbol.symbol in allowed_symbols
             ]
 
     def _collect_valuation_snapshot_rows_from_daily_price_bars(
