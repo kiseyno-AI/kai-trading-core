@@ -124,7 +124,7 @@ SHORT_BALANCE_METRIC_KEYS = (
 )
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
-PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 15_000
+PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 30_000
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
@@ -1727,44 +1727,53 @@ class PykrxEnrichmentService:
             if len(frames_by_investor) != len(SYMBOL_INVESTOR_GROUPS):
                 continue
 
-            common_tickers = set.intersection(
+            # Each valid KRX investor frame omits tickers with zero activity
+            # for that group. Preserve those tickers and record the omitted
+            # group's metrics as zero instead of discarding the whole symbol.
+            market_tickers = set.union(
                 *(set(frame.index.tolist()) for frame in frames_by_investor.values())
             )
-            for investor, frame in frames_by_investor.items():
-                for ticker in sorted(common_tickers):
-                    record = frame.loc[ticker]
-                    symbol = str(ticker).strip().upper().zfill(6) if str(ticker).strip().isdigit() else str(ticker).strip().upper()
-                    if allowed_symbols and symbol not in allowed_symbols:
-                        continue
-                    symbol_info = symbol_meta.get(symbol) or {}
-                    entry = rows_by_symbol.setdefault(
-                        symbol,
-                        {
-                            'market_date': market_date_iso,
-                            'market': market,
-                            'category': 'investor_flow_symbol',
-                            'scope_type': 'symbol',
-                            'scope_key': symbol,
-                            'source': 'pykrx',
-                            'symbol': symbol,
-                            'name_ko': record.get('종목명') or symbol_info.get('name_ko') or symbol,
-                            'standard_code': symbol_info.get('standard_code'),
-                            'payload': {
-                                'market': market,
-                                'window_start_date': market_date_iso,
-                                'window_end_date': market_date_iso,
-                                'investor_groups': {},
-                            },
-                        },
-                    )
-                    entry['payload']['investor_groups'][investor] = {
-                        'sell_volume': _to_int(record.get('매도거래량')),
-                        'buy_volume': _to_int(record.get('매수거래량')),
-                        'net_volume': _to_int(record.get('순매수거래량')),
-                        'sell_value': _to_int(record.get('매도거래대금')),
-                        'buy_value': _to_int(record.get('매수거래대금')),
-                        'net_value': _to_int(record.get('순매수거래대금')),
+            for ticker in sorted(market_tickers):
+                symbol = str(ticker).strip().upper().zfill(6) if str(ticker).strip().isdigit() else str(ticker).strip().upper()
+                if allowed_symbols and symbol not in allowed_symbols:
+                    continue
+                records_by_investor = {
+                    investor: frame.loc[ticker] if ticker in frame.index else None
+                    for investor, frame in frames_by_investor.items()
+                }
+                representative_record = next(
+                    record
+                    for record in records_by_investor.values()
+                    if record is not None
+                )
+                symbol_info = symbol_meta.get(symbol) or {}
+                investor_groups: dict[str, dict[str, int | None]] = {}
+                for investor, record in records_by_investor.items():
+                    investor_groups[investor] = {
+                        'sell_volume': _to_int(record.get('매도거래량')) if record is not None else 0,
+                        'buy_volume': _to_int(record.get('매수거래량')) if record is not None else 0,
+                        'net_volume': _to_int(record.get('순매수거래량')) if record is not None else 0,
+                        'sell_value': _to_int(record.get('매도거래대금')) if record is not None else 0,
+                        'buy_value': _to_int(record.get('매수거래대금')) if record is not None else 0,
+                        'net_value': _to_int(record.get('순매수거래대금')) if record is not None else 0,
                     }
+                rows_by_symbol[symbol] = {
+                    'market_date': market_date_iso,
+                    'market': market,
+                    'category': 'investor_flow_symbol',
+                    'scope_type': 'symbol',
+                    'scope_key': symbol,
+                    'source': 'pykrx',
+                    'symbol': symbol,
+                    'name_ko': representative_record.get('종목명') or symbol_info.get('name_ko') or symbol,
+                    'standard_code': symbol_info.get('standard_code'),
+                    'payload': {
+                        'market': market,
+                        'window_start_date': market_date_iso,
+                        'window_end_date': market_date_iso,
+                        'investor_groups': investor_groups,
+                    },
+                }
 
         rows = list(rows_by_symbol.values())
         return rows, {
@@ -2298,10 +2307,22 @@ class PykrxEnrichmentService:
             'investor_flow_symbol' in time_sensitive_categories
             and fresh_stock_universe_available
         ):
+            # The historical sector endpoint can include inactive symbols
+            # outside the exact EOD collection. Coverage is actionable only
+            # for the independently collected, active price universe.
+            active_collection_stock_symbols = {
+                str(item.get('symbol') or '').strip().upper()
+                for item in active_symbol_rows
+                if _row_market(item) in requested_stock_markets
+                and str(item.get('symbol') or '').strip()
+            }
+            active_fresh_stock_symbols = (
+                fresh_stock_symbols & active_collection_stock_symbols
+            )
             price_rows = self._daily_price_rows_for_fallback(
                 market_date_iso=market_date,
                 markets=normalized_markets,
-                symbol_filter=fresh_stock_symbols,
+                symbol_filter=active_fresh_stock_symbols,
             )
             price_row_symbols = {
                 str(item.get('symbol') or '').strip().upper()
@@ -2313,9 +2334,10 @@ class PykrxEnrichmentService:
                 for item in price_rows
                 if str(item.get('symbol') or '').strip()
                 and int(item.get('volume') or 0) > 0
-            } & fresh_stock_symbols
-            positive_volume_universe_available = bool(positive_volume_stock_symbols) and fresh_stock_symbols.issubset(
-                price_row_symbols
+            } & active_fresh_stock_symbols
+            positive_volume_universe_available = (
+                bool(positive_volume_stock_symbols)
+                and active_fresh_stock_symbols.issubset(price_row_symbols)
             )
 
         category_summaries: dict[str, dict[str, Any]] = {}

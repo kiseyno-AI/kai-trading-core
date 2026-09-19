@@ -131,7 +131,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual([row['symbol'] for row in rows], ['005930'])
         self.assertEqual(
             captured_scope_kwargs,
-            {'statement_timeout_ms': 15_000},
+            {'statement_timeout_ms': 30_000},
         )
         self.assertNotIn('symbols.symbol IN', str(captured_statements[0]))
 
@@ -804,7 +804,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             load_daily_market_relative_contexts_mock.call_args.kwargs[
                 'statement_timeout_ms'
             ],
-            15_000,
+            30_000,
         )
         self.assertEqual(
             load_daily_market_relative_contexts_mock.call_args.kwargs['markets'],
@@ -1216,7 +1216,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertFalse(is_decision_usable_pykrx_enrichment_row(row))
 
     @patch('app.eod.pykrx_enrichment.stock.get_market_net_purchases_of_equities_by_ticker')
-    def test_symbol_investor_rows_require_ticker_in_every_investor_frame(
+    def test_symbol_investor_rows_zero_fill_absent_investor_activity(
         self,
         get_investor_flow_mock,
     ):
@@ -1249,9 +1249,21 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(details['errors'], [])
-        self.assertEqual([row['symbol'] for row in rows], ['005930'])
+        self.assertEqual([row['symbol'] for row in rows], ['000660', '005930'])
+        rows_by_symbol = {row['symbol']: row for row in rows}
         self.assertEqual(
-            set(rows[0]['payload']['investor_groups']),
+            rows_by_symbol['000660']['payload']['investor_groups']['외국인'],
+            {
+                'sell_volume': 0,
+                'buy_volume': 0,
+                'net_volume': 0,
+                'sell_value': 0,
+                'buy_value': 0,
+                'net_value': 0,
+            },
+        )
+        self.assertEqual(
+            set(rows_by_symbol['000660']['payload']['investor_groups']),
             {'개인', '외국인', '기관합계'},
         )
 
@@ -1406,7 +1418,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertIsNone(load_rows_mock.call_args.kwargs['limit'])
         self.assertEqual(
             load_rows_mock.call_args.kwargs['statement_timeout_ms'],
-            15_000,
+            30_000,
         )
         self.assertFalse(load_rows_mock.call_args.kwargs['order_results'])
         self.assertFalse(
@@ -1578,6 +1590,120 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(coverage['expected_rows'], 2)
         self.assertEqual(coverage['present_rows'], 1)
         self.assertEqual(coverage['coverage_status'], 'partial')
+
+    def test_investor_expectation_uses_active_universe_and_requires_its_prices(self):
+        service = PykrxEnrichmentService()
+        sector_symbols = ['005930', '000660']
+        sector_rows = [
+            {
+                'category': 'sector_classification',
+                'market': 'KOSPI',
+                'scope_key': symbol,
+                'symbol': symbol,
+                'source': 'pykrx',
+                'payload': {
+                    'universe_market_complete': True,
+                    'universe_market_row_count': 2,
+                    **_universe_reference_payload(sector_symbols),
+                    'sector_name': '반도체',
+                },
+            }
+            for symbol in sector_symbols
+        ]
+        investor_row = {
+            'category': 'investor_flow_symbol',
+            'market': 'KOSPI',
+            'scope_key': '005930',
+            'symbol': '005930',
+            'source': 'pykrx',
+            'payload': {'investor_groups': _complete_investor_groups()},
+        }
+        short_rows = [
+            {
+                'category': 'short_selling',
+                'market': 'KOSPI',
+                'scope_key': symbol,
+                'symbol': symbol,
+                'source': 'pykrx',
+                'payload': {
+                    'short_volume': {
+                        'short_volume': 1,
+                        'total_volume': 10,
+                        'short_volume_ratio_pct': 10.0,
+                    }
+                },
+            }
+            for symbol in sector_symbols
+        ]
+
+        cases = (
+            (
+                'inactive_sector_symbol_excluded',
+                [{'symbol': '005930', 'market': 'KOSPI'}],
+                'available',
+                1,
+                'complete',
+            ),
+            (
+                'active_sector_symbol_missing_price',
+                [
+                    {'symbol': '005930', 'market': 'KOSPI'},
+                    {'symbol': '000660', 'market': 'KOSPI'},
+                ],
+                'unavailable',
+                None,
+                'unavailable',
+            ),
+        )
+        for (
+            case_name,
+            active_symbol_rows,
+            expectation_status,
+            expected_rows,
+            coverage_status,
+        ) in cases:
+            with self.subTest(case=case_name):
+                with (
+                    patch.object(
+                        service,
+                        '_load_coverage_symbol_rows',
+                        return_value=active_symbol_rows,
+                    ),
+                    patch.object(
+                        service,
+                        '_daily_price_rows_for_fallback',
+                        return_value=[
+                            {
+                                'symbol': '005930',
+                                'market': 'KOSPI',
+                                'volume': 100,
+                            },
+                        ],
+                    ),
+                    patch(
+                        'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                        return_value=[*sector_rows, investor_row, *short_rows],
+                    ),
+                ):
+                    result = service._build_coverage_summary(
+                        market_date='2026-09-18',
+                        markets=['KOSPI'],
+                        symbols=None,
+                        categories=[
+                            'sector_classification',
+                            'investor_flow_symbol',
+                            'short_selling',
+                        ],
+                    )
+
+                investor = result['categories']['investor_flow_symbol']
+                self.assertEqual(
+                    investor['expectation_status'], expectation_status
+                )
+                self.assertEqual(investor['expected_rows'], expected_rows)
+                self.assertEqual(investor['coverage_status'], coverage_status)
+                if expected_rows is not None:
+                    self.assertEqual(investor['present_rows'], expected_rows)
 
     def test_investor_expectation_waits_when_all_stock_volumes_are_zero(self):
         service = PykrxEnrichmentService()
@@ -2543,14 +2669,14 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         )
         persisted_symbols_mock.assert_called_once_with(
             42,
-            statement_timeout_ms=15_000,
+            statement_timeout_ms=30_000,
         )
         latest_run_mock.assert_called_once_with(
             market='KRX',
             trade_date='2026-04-21',
             source='pykrx',
             statuses=['completed'],
-            statement_timeout_ms=15_000,
+            statement_timeout_ms=30_000,
         )
         coverage = result['coverage']['categories']['short_selling']
         self.assertEqual(result['coverage']['requested_symbol_count'], 2)
