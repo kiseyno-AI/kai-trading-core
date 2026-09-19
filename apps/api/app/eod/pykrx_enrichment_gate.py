@@ -46,12 +46,13 @@ def _category_gate_item(
     expected_rows = _coerce_optional_int(payload.get('expected_rows'))
     present_rows = _coerce_optional_int(payload.get('present_rows')) or 0
     coverage_ratio = _coerce_optional_float(payload.get('coverage_ratio'))
+    expectation_status = str(payload.get('expectation_status') or 'available').strip().lower()
     if expected_rows and expected_rows > 0:
         coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
     coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
     missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
 
-    if missing_category_payload:
+    if missing_category_payload or expectation_status == 'unavailable':
         gate_status = 'waiting'
         reason = 'coverage_expectation_unavailable'
     elif expected_rows is None or expected_rows <= 0:
@@ -72,6 +73,7 @@ def _category_gate_item(
         'scope_type': payload.get('scope_type'),
         'gate_status': gate_status,
         'coverage_status': coverage_status,
+        'expectation_status': expectation_status,
         'expected_rows': expected_rows,
         'present_rows': present_rows,
         'missing_rows': missing_rows,

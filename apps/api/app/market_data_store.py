@@ -4477,8 +4477,27 @@ def load_daily_market_participation_context_history(
 def upsert_daily_pykrx_enrichment_rows(
     *,
     rows: list[dict[str, Any]],
+    replace_scopes: Sequence[dict[str, Any]] | None = None,
 ) -> int:
-    if not rows:
+    normalized_replace_scopes: list[dict[str, Any]] = []
+    for raw_scope in replace_scopes or []:
+        market = str(raw_scope.get('market') or '').strip().upper()
+        category = str(raw_scope.get('category') or '').strip()
+        source = str(raw_scope.get('source') or '').strip()
+        if not market or not category or not source or not raw_scope.get('market_date'):
+            raise ValueError(
+                'market_date, market, category, and source are required for replacement scopes'
+            )
+        normalized_replace_scopes.append(
+            {
+                'market_date': _normalize_trade_date(raw_scope['market_date']),
+                'market': market,
+                'category': category,
+                'source': source,
+            }
+        )
+
+    if not rows and not normalized_replace_scopes:
         return 0
 
     def _chunks(items: list[dict[str, Any]], size: int = 25) -> list[list[dict[str, Any]]]:
@@ -4543,6 +4562,16 @@ def upsert_daily_pykrx_enrichment_rows(
                     select(Symbol.symbol, Symbol.id).where(Symbol.symbol.in_(sorted(row_symbols)))
                 ).all()
             }
+
+        for replace_scope in normalized_replace_scopes:
+            session.execute(
+                delete(DailyPykrxEnrichmentRow).where(
+                    DailyPykrxEnrichmentRow.market_date == replace_scope['market_date'],
+                    DailyPykrxEnrichmentRow.market == replace_scope['market'],
+                    DailyPykrxEnrichmentRow.category == replace_scope['category'],
+                    DailyPykrxEnrichmentRow.source == replace_scope['source'],
+                )
+            )
 
         values: list[dict[str, Any]] = []
         for raw in rows:

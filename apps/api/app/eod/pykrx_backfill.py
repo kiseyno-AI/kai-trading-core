@@ -4,9 +4,7 @@ import argparse
 import asyncio
 import logging
 import math
-import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -25,7 +23,10 @@ from app.eod.pykrx_pipeline_support import (
     build_daily_retry_context,
     build_daily_skip_result,
 )
-from app.eod.pykrx_import import import_pykrx_stock, import_pykrx_webio, suppress_pykrx_login_env
+from app.eod.pykrx_import import (
+    import_pykrx_stock,
+    pykrx_request_context,
+)
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
@@ -77,18 +78,7 @@ class _LazyPykrxStock:
         return getattr(pykrx_stock, name)
 
 
-class _LazyPykrxWebIO:
-    def __getattr__(self, name: str) -> Any:
-        try:
-            pykrx_webio = import_pykrx_webio()
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f'PyKRX webio client is unavailable: {exc}') from exc
-        return getattr(pykrx_webio, name)
-
-
 stock = _LazyPykrxStock()
-webio = _LazyPykrxWebIO()
-_PYKRX_REQUEST_TIMEOUT_LOCK = threading.RLock()
 
 DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
 MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
@@ -177,34 +167,10 @@ def _current_krx_calendar_date() -> date:
     return datetime.now(ZoneInfo('Asia/Seoul')).date()
 
 
-@contextmanager
-def _pykrx_request_timeout(timeout_seconds: int):
-    if timeout_seconds <= 0:
-        yield
-        return
-
-    with _PYKRX_REQUEST_TIMEOUT_LOCK:
-        original_get = webio.requests.get
-        original_post = webio.requests.post
-
-        def _wrap_with_timeout(func):
-            def _wrapped(*args, **kwargs):
-                kwargs.setdefault('timeout', timeout_seconds)
-                return func(*args, **kwargs)
-
-            return _wrapped
-
-        webio.requests.get = _wrap_with_timeout(original_get)
-        webio.requests.post = _wrap_with_timeout(original_post)
-        try:
-            yield
-        finally:
-            webio.requests.get = original_get
-            webio.requests.post = original_post
-
-
 def _call_pykrx(func, *args, **kwargs):
-    with suppress_pykrx_login_env(), _pykrx_request_timeout(settings.eod_pykrx_request_timeout_seconds):
+    with pykrx_request_context(
+        timeout_seconds=settings.eod_pykrx_request_timeout_seconds
+    ):
         return func(*args, **kwargs)
 
 

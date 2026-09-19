@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections import defaultdict
 import asyncio
 from datetime import date, datetime
+import hashlib
 import logging
+import math
 import time
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
@@ -16,7 +18,7 @@ from app.core.settings import settings
 from app.brokers.kis.provider import kis_real_client
 from app.db import session_scope
 from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
-from app.eod.pykrx_import import import_pykrx_stock, suppress_pykrx_login_env
+from app.eod.pykrx_import import import_pykrx_stock, pykrx_request_context
 from app.market_data_store import (
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
@@ -38,6 +40,12 @@ class _LazyPykrxStock:
 
 
 stock = _LazyPykrxStock()
+
+
+def _market_ticker_membership_frame(*, date: str, market: str) -> pd.DataFrame:
+    tickers = stock.get_market_ticker_list(date=date, market=market)
+    normalized = list(tickers or [])
+    return pd.DataFrame({'symbol': normalized}, index=normalized)
 
 DEFAULT_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'sector_classification',
@@ -72,13 +80,111 @@ SECTOR_SUPPORTED_MARKETS = {'KOSPI', 'KOSDAQ'}
 SHORTING_SUPPORTED_MARKETS = {'KOSPI', 'KOSDAQ', 'KONEX'}
 CATEGORY_SUPPORTED_MARKETS = {
     'sector_classification': SECTOR_SUPPORTED_MARKETS,
+    'investor_flow_symbol': SECTOR_SUPPORTED_MARKETS,
+    'short_selling': SECTOR_SUPPORTED_MARKETS,
 }
 SYMBOL_INVESTOR_GROUPS: tuple[str, ...] = ('개인', '외국인', '기관합계')
+INVESTOR_FLOW_METRIC_KEYS = (
+    'sell_volume',
+    'buy_volume',
+    'net_volume',
+    'sell_value',
+    'buy_value',
+    'net_value',
+)
+TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES = {
+    'sector_classification',
+    'investor_flow_market',
+    'investor_flow_symbol',
+    'short_selling',
+}
+SHORT_VOLUME_METRIC_KEYS = (
+    'short_volume',
+    'total_volume',
+    'short_volume_ratio_pct',
+)
+SHORT_VALUE_METRIC_KEYS = (
+    'short_value',
+    'total_value',
+    'short_value_ratio_pct',
+)
+SHORT_BALANCE_METRIC_KEYS = (
+    'short_balance_qty',
+    'listed_shares',
+    'short_balance_amount',
+    'market_cap',
+    'short_balance_ratio_pct',
+)
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
     log_fetch_event(service='pykrx_enrichment', operation=operation, status=status, **fields)
+
+
+def is_decision_usable_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
+    category = row.get('category')
+    source = row.get('source')
+    payload = dict(row.get('payload') or {})
+    if category in TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES and source == 'pykrx_carry_forward':
+        return False
+    if category == 'sector_classification':
+        return source == 'pykrx' and bool(str(payload.get('sector_name') or '').strip())
+    if category == 'investor_flow_market':
+        raw_groups = payload.get('investor_groups')
+        if not isinstance(raw_groups, list):
+            return False
+        investor_groups = {
+            str(item.get('investor_type') or '').strip(): item
+            for item in raw_groups
+            if isinstance(item, dict) and str(item.get('investor_type') or '').strip()
+        }
+        groups_complete = all(
+            _metric_group_complete(
+                dict(investor_groups.get(group_name) or {}),
+                INVESTOR_FLOW_METRIC_KEYS,
+            )
+            for group_name in SYMBOL_INVESTOR_GROUPS
+        )
+        gross_activity = any(
+            (_to_float((investor_groups.get(group_name) or {}).get(metric_key)) or 0.0) > 0
+            for group_name in SYMBOL_INVESTOR_GROUPS
+            for metric_key in ('sell_volume', 'buy_volume', 'sell_value', 'buy_value')
+        )
+        return groups_complete and gross_activity
+    if category == 'investor_flow_symbol':
+        investor_groups = dict(payload.get('investor_groups') or {})
+        groups_complete = all(
+            _metric_group_complete(
+                dict(investor_groups.get(group_name) or {}),
+                INVESTOR_FLOW_METRIC_KEYS,
+            )
+            for group_name in SYMBOL_INVESTOR_GROUPS
+        )
+        gross_activity = any(
+            (_to_float((investor_groups.get(group_name) or {}).get(metric_key)) or 0.0) > 0
+            for group_name in SYMBOL_INVESTOR_GROUPS
+            for metric_key in ('sell_volume', 'buy_volume', 'sell_value', 'buy_value')
+        )
+        return groups_complete and gross_activity
+    if category == 'short_selling':
+        return _metric_group_complete(
+            dict(payload.get('short_volume') or {}),
+            SHORT_VOLUME_METRIC_KEYS,
+        )
+    return True
+
+
+def _metric_group_complete(payload: dict[str, Any], keys: Sequence[str]) -> bool:
+    return all(_to_float(payload.get(key)) is not None for key in keys)
+
+
+def _decision_source_priority(row: dict[str, Any]) -> tuple[int, str]:
+    source_priority = {
+        'kis_open_api': 1,
+        'pykrx': 2,
+    }.get(str(row.get('source') or ''), 0)
+    return source_priority, str(row.get('captured_at') or '')
 
 
 def _normalize_iso_date(value: str | date) -> str:
@@ -165,13 +271,13 @@ def _to_int(value: Any) -> int | None:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value)
+        return int(value) if math.isfinite(value) else None
     text = str(value).strip().replace(',', '')
     if not text:
         return None
     try:
         return int(float(text))
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -181,13 +287,15 @@ def _to_float(value: Any, *, digits: int = 6) -> float | None:
     if isinstance(value, bool):
         return float(int(value))
     if isinstance(value, (int, float)):
-        return round(float(value), digits)
+        number = float(value)
+        return round(number, digits) if math.isfinite(number) else None
     text = str(value).strip().replace(',', '')
     if not text:
         return None
     try:
-        return round(float(text), digits)
-    except ValueError:
+        number = float(text)
+        return round(number, digits) if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -227,6 +335,11 @@ def _normalize_symbol(value: Any) -> str:
     return text.zfill(6) if text.isdigit() else text
 
 
+def _symbol_membership_sha256(symbols: Sequence[str] | set[str]) -> str:
+    normalized = sorted({_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)})
+    return hashlib.sha256('\n'.join(normalized).encode('utf-8')).hexdigest()
+
+
 def _frame_value(frame: pd.DataFrame, symbol: str, column: Any) -> Any:
     if frame.empty or symbol not in frame.index:
         return None
@@ -248,6 +361,23 @@ def _frame_value_candidates(frame: pd.DataFrame, symbol: str, *columns: Any) -> 
             pass
         return value
     return None
+
+
+def _frame_has_positive_metric(frame: pd.DataFrame, *columns: Any) -> bool:
+    for ticker in frame.index.tolist():
+        value = _to_float(_frame_value_candidates(frame, ticker, *columns))
+        if value is not None and value > 0:
+            return True
+    return False
+
+
+def _frame_has_any_positive_metric(frame: pd.DataFrame, *columns: Any) -> bool:
+    for ticker in frame.index.tolist():
+        for column in columns:
+            value = _to_float(_frame_value(frame, ticker, column))
+            if value is not None and value > 0:
+                return True
+    return False
 
 
 def _first_present(*values: Any) -> Any:
@@ -287,6 +417,7 @@ class PykrxEnrichmentService:
         categories: Sequence[str] | None = None,
         allow_kis_candidate_fallback: bool = False,
         point_in_time_recovery: bool = False,
+        use_full_market_coverage: bool = False,
     ) -> dict[str, Any]:
         market_date_iso = _normalize_iso_date(market_date)
         market_date_yyyymmdd = _normalize_yyyymmdd(market_date)
@@ -308,6 +439,14 @@ class PykrxEnrichmentService:
             else []
         )
         active_symbol_rows = (
+            load_symbols(
+                is_active=True,
+                markets=normalized_markets,
+                symbols=None,
+                limit=5000,
+            )
+            if use_full_market_coverage
+            else
             [
                 {
                     'symbol': item['symbol'],
@@ -330,6 +469,9 @@ class PykrxEnrichmentService:
         cache: dict[tuple[Any, ...], pd.DataFrame] = {}
         category_results: dict[str, dict[str, Any]] = {}
         categories_with_errors: list[str] = []
+        required_collection_symbol_filter = (
+            None if use_full_market_coverage else symbol_filter
+        )
 
         for category in resolved_categories:
             category_rows: list[dict[str, Any]]
@@ -338,7 +480,7 @@ class PykrxEnrichmentService:
                     market_date_iso=market_date_iso,
                     market_date_yyyymmdd=market_date_yyyymmdd,
                     markets=normalized_markets,
-                    symbol_filter=symbol_filter,
+                    symbol_filter=required_collection_symbol_filter,
                     symbol_meta=symbol_meta,
                     cache=cache,
                 )
@@ -360,7 +502,7 @@ class PykrxEnrichmentService:
                     market_date_iso=market_date_iso,
                     market_date_yyyymmdd=market_date_yyyymmdd,
                     markets=normalized_markets,
-                    symbol_filter=symbol_filter,
+                    symbol_filter=required_collection_symbol_filter,
                     symbol_meta=symbol_meta,
                     cache=cache,
                 )
@@ -369,7 +511,7 @@ class PykrxEnrichmentService:
                     market_date_iso=market_date_iso,
                     market_date_yyyymmdd=market_date_yyyymmdd,
                     markets=normalized_markets,
-                    symbol_filter=symbol_filter,
+                    symbol_filter=required_collection_symbol_filter,
                     symbol_meta=symbol_meta,
                     cache=cache,
                 )
@@ -420,9 +562,47 @@ class PykrxEnrichmentService:
                 category_rows,
                 point_in_time_recovery=point_in_time_recovery,
             )
-            persisted_count = upsert_daily_pykrx_enrichment_rows(
-                rows=category_rows
-            )
+            if (
+                use_full_market_coverage
+                and category
+                in {
+                    'sector_classification',
+                    'investor_flow_market',
+                    'investor_flow_symbol',
+                    'short_selling',
+                }
+            ):
+                provider_rows = [
+                    row for row in category_rows if row.get('source') == 'pykrx'
+                ]
+                non_provider_rows = [
+                    row for row in category_rows if row.get('source') != 'pykrx'
+                ]
+                replace_markets = [
+                    market
+                    for market in normalized_markets
+                    if market in SECTOR_SUPPORTED_MARKETS
+                ]
+                persisted_count = upsert_daily_pykrx_enrichment_rows(
+                    rows=provider_rows,
+                    replace_scopes=[
+                        {
+                            'market_date': market_date_iso,
+                            'market': market,
+                            'category': category,
+                            'source': 'pykrx',
+                        }
+                        for market in replace_markets
+                    ],
+                )
+                if non_provider_rows:
+                    persisted_count += upsert_daily_pykrx_enrichment_rows(
+                        rows=non_provider_rows
+                    )
+            else:
+                persisted_count = upsert_daily_pykrx_enrichment_rows(
+                    rows=category_rows
+                )
             should_fallback = persisted_count <= 0 and (details.get('errors') or category in SYMBOL_ENRICHMENT_CATEGORIES)
             if (
                 category == 'valuation_snapshot'
@@ -468,7 +648,7 @@ class PykrxEnrichmentService:
         coverage = self._build_coverage_summary(
             market_date=market_date_iso,
             markets=normalized_markets,
-            symbols=normalized_symbols,
+            symbols=None if use_full_market_coverage else normalized_symbols,
             categories=resolved_categories,
         )
         recovered_categories = [
@@ -498,6 +678,7 @@ class PykrxEnrichmentService:
             'point_in_time_recovery': point_in_time_recovery,
             'markets': normalized_markets,
             'symbols_requested': normalized_symbols or None,
+            'coverage_scope': 'full_market' if use_full_market_coverage else 'requested_symbols',
             'categories_requested': resolved_categories,
             'status': status,
             'categories': category_results,
@@ -683,7 +864,7 @@ class PykrxEnrichmentService:
             market_date=market_date_iso,
             categories=list(SYMBOL_ENRICHMENT_CATEGORIES),
             symbols=normalized_symbols,
-            limit=max(len(normalized_symbols) * len(SYMBOL_ENRICHMENT_CATEGORIES), 200),
+            limit=None,
         )
         if not resolved_markets:
             symbol_meta = load_symbols(symbols=normalized_symbols, limit=max(len(normalized_symbols), 200))
@@ -692,7 +873,7 @@ class PykrxEnrichmentService:
             market_date=market_date_iso,
             categories=list(MARKET_ENRICHMENT_CATEGORIES),
             markets=resolved_markets or None,
-            limit=max(len(resolved_markets or []) * len(MARKET_ENRICHMENT_CATEGORIES), 20),
+            limit=None,
         )
         sector_rows = load_daily_pykrx_enrichment_rows(
             market_date=market_date_iso,
@@ -703,25 +884,35 @@ class PykrxEnrichmentService:
 
         by_symbol: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         by_market: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-        sector_rows_by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        sector_rows_by_market_and_symbol: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
 
-        for row in symbol_rows:
+        for row in sorted(symbol_rows, key=_decision_source_priority):
+            if not is_decision_usable_pykrx_enrichment_row(row):
+                continue
             symbol = row.get('symbol')
             if symbol:
                 by_symbol[symbol][row['category']] = row
-        for row in market_rows:
+        for row in sorted(market_rows, key=_decision_source_priority):
+            if not is_decision_usable_pykrx_enrichment_row(row):
+                continue
             market = str(row.get('market') or '').strip().upper()
             if market:
                 by_market[market][row['category']] = row
-        for row in sector_rows:
+        for row in sorted(sector_rows, key=_decision_source_priority):
+            if not is_decision_usable_pykrx_enrichment_row(row):
+                continue
             market = str(row.get('market') or '').strip().upper()
-            if market:
-                sector_rows_by_market[market].append(row)
+            symbol = str(row.get('symbol') or row.get('scope_key') or '').strip().upper()
+            if market and symbol:
+                sector_rows_by_market_and_symbol[market][symbol] = row
 
         return {
             'by_symbol': dict(by_symbol),
             'by_market': dict(by_market),
-            'sector_rows_by_market': dict(sector_rows_by_market),
+            'sector_rows_by_market': {
+                market: list(rows_by_symbol.values())
+                for market, rows_by_symbol in sector_rows_by_market_and_symbol.items()
+            },
         }
 
     def _fetch_frame(
@@ -731,19 +922,33 @@ class PykrxEnrichmentService:
         operation: str,
         func: Any,
         *args: Any,
+        require_non_empty: bool = False,
+        frame_validator: Any | None = None,
         **kwargs: Any,
     ) -> pd.DataFrame:
         if cache_key in cache:
-            return cache[cache_key]
+            cached_frame = cache[cache_key]
+            if (
+                (not require_non_empty or not cached_frame.empty)
+                and (frame_validator is None or bool(frame_validator(cached_frame)))
+            ):
+                return cached_frame
+            del cache[cache_key]
 
         last_error: Exception | None = None
         for attempt in range(self._retry_count + 1):
             started_at = time.perf_counter()
             try:
-                with suppress_pykrx_login_env():
+                with pykrx_request_context(
+                    timeout_seconds=settings.eod_pykrx_request_timeout_seconds
+                ):
                     frame = func(*args, **kwargs)
                 if not isinstance(frame, pd.DataFrame):
                     raise TypeError(f'{operation} returned non-DataFrame payload')
+                if require_non_empty and frame.empty:
+                    raise RuntimeError(f'{operation} returned empty DataFrame')
+                if frame_validator is not None and not bool(frame_validator(frame)):
+                    raise RuntimeError(f'{operation} returned semantically invalid DataFrame')
                 cache[cache_key] = frame
                 _log_pykrx_enrichment_fetch(
                     operation,
@@ -776,9 +981,11 @@ class PykrxEnrichmentService:
     def _active_symbol_filter(
         self,
         *,
-        symbol_filter: set[str],
+        symbol_filter: set[str] | None,
         symbol_meta: dict[str, dict[str, Any]],
     ) -> set[str]:
+        if symbol_filter is None:
+            return set()
         return symbol_filter or set(symbol_meta)
 
     def _collect_fallback_rows(
@@ -791,6 +998,14 @@ class PykrxEnrichmentService:
         symbol_meta: dict[str, dict[str, Any]],
         point_in_time_recovery: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if category in TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES:
+            return [], {
+                'category': category,
+                'scope_type': CATEGORY_SCOPE_TYPE[category],
+                'fallback_source': None,
+                'rows_prepared': 0,
+                'reason': 'time_sensitive_carry_forward_not_allowed',
+            }
         if category == 'valuation_snapshot':
             latest_price_date = self._latest_price_bar_valuation_date(market_date_iso=market_date_iso, markets=markets)
             if latest_price_date is not None:
@@ -1135,7 +1350,7 @@ class PykrxEnrichmentService:
         market_date_iso: str,
         market_date_yyyymmdd: str,
         markets: Sequence[str],
-        symbol_filter: set[str],
+        symbol_filter: set[str] | None,
         symbol_meta: dict[str, dict[str, Any]],
         cache: dict[tuple[Any, ...], pd.DataFrame],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1145,18 +1360,55 @@ class PykrxEnrichmentService:
         for market in markets:
             if market not in SECTOR_SUPPORTED_MARKETS:
                 continue
+            reference_symbols: set[str] = set()
+            try:
+                membership_frame = self._fetch_frame(
+                    cache=cache,
+                    cache_key=('stock_universe_membership', market_date_yyyymmdd, market),
+                    operation='stock_universe_membership',
+                    func=_market_ticker_membership_frame,
+                    require_non_empty=True,
+                    date=market_date_yyyymmdd,
+                    market=market,
+                )
+                reference_symbols = {
+                    _normalize_symbol(ticker)
+                    for ticker in membership_frame.index.tolist()
+                    if _normalize_symbol(ticker)
+                }
+            except Exception as exc:
+                errors.append(
+                    {
+                        'market': market,
+                        'operation': 'stock_universe_membership',
+                        'error': str(exc),
+                    }
+                )
             try:
                 frame = self._fetch_frame(
                     cache=cache,
                     cache_key=('sector_classification', market_date_yyyymmdd, market),
                     operation='sector_classification',
                     func=stock.get_market_sector_classifications,
+                    require_non_empty=True,
                     date=market_date_yyyymmdd,
                     market=market,
                 )
             except Exception as exc:
-                errors.append({'market': market, 'error': str(exc)})
+                errors.append({'market': market, 'operation': 'sector_classification', 'error': str(exc)})
                 continue
+
+            frame_symbols = {
+                _normalize_symbol(ticker)
+                for ticker in frame.index.tolist()
+                if _normalize_symbol(ticker)
+            }
+            reference_count = len(reference_symbols) if reference_symbols else None
+            reference_sha256 = (
+                _symbol_membership_sha256(reference_symbols)
+                if reference_symbols
+                else None
+            )
 
             for ticker, record in frame.iterrows():
                 symbol = str(ticker).strip().upper().zfill(6) if str(ticker).strip().isdigit() else str(ticker).strip().upper()
@@ -1176,6 +1428,13 @@ class PykrxEnrichmentService:
                         'standard_code': symbol_info.get('standard_code'),
                         'payload': {
                             'market': market,
+                            'universe_market_complete': bool(
+                                reference_symbols and frame_symbols == reference_symbols
+                            ),
+                            'universe_market_row_count': len(frame.index),
+                            'universe_reference_source': 'pykrx_market_ticker_list',
+                            'universe_reference_count': reference_count,
+                            'universe_reference_sha256': reference_sha256,
                             'sector_name': record.get('업종명'),
                             'close_price': _to_int(record.get('종가')),
                             'change': _to_float(record.get('대비')),
@@ -1268,6 +1527,12 @@ class PykrxEnrichmentService:
                     cache_key=('investor_flow_market_value', market_date_yyyymmdd, market),
                     operation='investor_flow_market_value',
                     func=stock.get_market_trading_value_by_investor,
+                    require_non_empty=True,
+                    frame_validator=lambda frame: _frame_has_any_positive_metric(
+                        frame,
+                        '매도',
+                        '매수',
+                    ),
                     fromdate=market_date_yyyymmdd,
                     todate=market_date_yyyymmdd,
                     ticker=market,
@@ -1277,6 +1542,12 @@ class PykrxEnrichmentService:
                     cache_key=('investor_flow_market_volume', market_date_yyyymmdd, market),
                     operation='investor_flow_market_volume',
                     func=stock.get_market_trading_volume_by_investor,
+                    require_non_empty=True,
+                    frame_validator=lambda frame: _frame_has_any_positive_metric(
+                        frame,
+                        '매도',
+                        '매수',
+                    ),
                     fromdate=market_date_yyyymmdd,
                     todate=market_date_yyyymmdd,
                     ticker=market,
@@ -1285,8 +1556,18 @@ class PykrxEnrichmentService:
                 errors.append({'market': market, 'error': str(exc)})
                 continue
 
+            common_investors = set(value_frame.index.tolist()) & set(volume_frame.index.tolist())
+            if not set(SYMBOL_INVESTOR_GROUPS).issubset(common_investors):
+                errors.append(
+                    {
+                        'market': market,
+                        'error': 'required investor groups are incomplete across value/volume frames',
+                    }
+                )
+                continue
+
             investor_groups = []
-            for investor in sorted(set(value_frame.index.tolist()) | set(volume_frame.index.tolist())):
+            for investor in sorted(common_investors):
                 investor_groups.append(
                     {
                         'investor_type': str(investor),
@@ -1330,7 +1611,7 @@ class PykrxEnrichmentService:
         market_date_iso: str,
         market_date_yyyymmdd: str,
         markets: Sequence[str],
-        symbol_filter: set[str],
+        symbol_filter: set[str] | None,
         symbol_meta: dict[str, dict[str, Any]],
         cache: dict[tuple[Any, ...], pd.DataFrame],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1338,13 +1619,22 @@ class PykrxEnrichmentService:
         errors: list[dict[str, Any]] = []
         allowed_symbols = self._active_symbol_filter(symbol_filter=symbol_filter, symbol_meta=symbol_meta)
         for market in markets:
+            frames_by_investor: dict[str, pd.DataFrame] = {}
             for investor in SYMBOL_INVESTOR_GROUPS:
                 try:
-                    frame = self._fetch_frame(
+                    frames_by_investor[investor] = self._fetch_frame(
                         cache=cache,
                         cache_key=('investor_flow_symbol', market_date_yyyymmdd, market, investor),
                         operation='investor_flow_symbol',
                         func=stock.get_market_net_purchases_of_equities_by_ticker,
+                        require_non_empty=True,
+                        frame_validator=lambda frame: _frame_has_any_positive_metric(
+                            frame,
+                            '매도거래량',
+                            '매수거래량',
+                            '매도거래대금',
+                            '매수거래대금',
+                        ),
                         fromdate=market_date_yyyymmdd,
                         todate=market_date_yyyymmdd,
                         market=market,
@@ -1352,9 +1642,15 @@ class PykrxEnrichmentService:
                     )
                 except Exception as exc:
                     errors.append({'market': market, 'investor': investor, 'error': str(exc)})
-                    continue
+            if len(frames_by_investor) != len(SYMBOL_INVESTOR_GROUPS):
+                continue
 
-                for ticker, record in frame.iterrows():
+            common_tickers = set.intersection(
+                *(set(frame.index.tolist()) for frame in frames_by_investor.values())
+            )
+            for investor, frame in frames_by_investor.items():
+                for ticker in sorted(common_tickers):
+                    record = frame.loc[ticker]
                     symbol = str(ticker).strip().upper().zfill(6) if str(ticker).strip().isdigit() else str(ticker).strip().upper()
                     if allowed_symbols and symbol not in allowed_symbols:
                         continue
@@ -1402,7 +1698,7 @@ class PykrxEnrichmentService:
         market_date_iso: str,
         market_date_yyyymmdd: str,
         markets: Sequence[str],
-        symbol_filter: set[str],
+        symbol_filter: set[str] | None,
         symbol_meta: dict[str, dict[str, Any]],
         cache: dict[tuple[Any, ...], pd.DataFrame],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1418,34 +1714,57 @@ class PykrxEnrichmentService:
                     cache_key=('short_selling_volume', market_date_yyyymmdd, market),
                     operation='short_selling_volume',
                     func=stock.get_shorting_volume_by_ticker,
+                    require_non_empty=True,
+                    frame_validator=lambda frame: _frame_has_positive_metric(
+                        frame,
+                        ('거래량', '매수'),
+                        '매수',
+                    ),
                     date=market_date_yyyymmdd,
                     market=market,
                     include=['주식'],
                 )
+            except Exception as exc:
+                errors.append({'market': market, 'operation': 'short_selling_volume', 'error': str(exc)})
+                continue
+
+            try:
                 value_frame = self._fetch_frame(
                     cache=cache,
                     cache_key=('short_selling_value', market_date_yyyymmdd, market),
                     operation='short_selling_value',
                     func=stock.get_shorting_value_by_ticker,
+                    require_non_empty=True,
+                    frame_validator=lambda frame: _frame_has_positive_metric(
+                        frame,
+                        ('거래대금', '매수'),
+                        '매수',
+                    ),
                     date=market_date_yyyymmdd,
                     market=market,
                     include=['주식'],
                 )
+            except Exception as exc:
+                errors.append({'market': market, 'operation': 'short_selling_value', 'error': str(exc)})
+                value_frame = pd.DataFrame()
+
+            try:
                 balance_frame = self._fetch_frame(
                     cache=cache,
                     cache_key=('short_selling_balance', market_date_yyyymmdd, market),
                     operation='short_selling_balance',
                     func=stock.get_shorting_balance_by_ticker,
+                    require_non_empty=True,
                     date=market_date_yyyymmdd,
                     market=market,
                 )
             except Exception as exc:
-                errors.append({'market': market, 'error': str(exc)})
-                continue
+                errors.append({'market': market, 'operation': 'short_selling_balance', 'error': str(exc)})
+                balance_frame = pd.DataFrame()
 
             symbols_for_market = {
                 str(item).strip().upper().zfill(6) if str(item).strip().isdigit() else str(item).strip().upper()
-                for item in set(volume_frame.index.tolist()) | set(balance_frame.index.tolist())
+                for item in volume_frame.index.tolist()
             }
             for symbol in sorted(symbols_for_market):
                 if allowed_symbols and symbol not in allowed_symbols:
@@ -1490,6 +1809,14 @@ class PykrxEnrichmentService:
                         'short_balance_ratio_pct': _to_float(_frame_value(balance_frame, symbol, '비중')),
                     },
                 }
+                missing_fields: list[str] = []
+                if not _metric_group_complete(payload['short_volume'], SHORT_VOLUME_METRIC_KEYS):
+                    missing_fields.append('short_volume')
+                if not _metric_group_complete(payload['short_volume'], SHORT_VALUE_METRIC_KEYS):
+                    missing_fields.append('short_value')
+                if not _metric_group_complete(payload['short_balance'], SHORT_BALANCE_METRIC_KEYS):
+                    missing_fields.append('short_balance')
+                payload['missing_fields'] = missing_fields
                 rows.append(
                     {
                         'market_date': market_date_iso,
@@ -1678,15 +2005,25 @@ class PykrxEnrichmentService:
         normalized_symbol_set = set(normalized_symbols)
         symbol_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'symbol']
         market_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'market']
+        time_sensitive_categories = set(symbol_categories) & TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES
+        coverage_symbol_categories = list(symbol_categories)
+        if time_sensitive_categories and not normalized_symbols and 'sector_classification' not in coverage_symbol_categories:
+            coverage_symbol_categories.append('sector_classification')
+        if (
+            not normalized_symbols
+            and ('sector_classification' in coverage_symbol_categories or time_sensitive_categories)
+            and 'short_selling' not in coverage_symbol_categories
+        ):
+            coverage_symbol_categories.append('short_selling')
         rows: list[dict[str, Any]] = []
-        if symbol_categories:
+        if coverage_symbol_categories:
             rows.extend(
                 load_daily_pykrx_enrichment_rows(
                     market_date=market_date,
-                    categories=symbol_categories,
+                    categories=coverage_symbol_categories,
                     markets=normalized_markets or None,
                     symbols=normalized_symbols or None,
-                    limit=20000,
+                    limit=None,
                 )
             )
         if market_categories:
@@ -1695,8 +2032,106 @@ class PykrxEnrichmentService:
                     market_date=market_date,
                     categories=market_categories,
                     markets=normalized_markets or None,
-                    limit=20000,
+                    limit=None,
                 )
+            )
+
+        fresh_sector_rows = [
+            item
+            for item in rows
+            if item.get('category') == 'sector_classification'
+            and item.get('source') == 'pykrx'
+            and (item.get('symbol') or item.get('scope_key'))
+            and is_decision_usable_pykrx_enrichment_row(item)
+        ]
+        fresh_short_rows = [
+            item
+            for item in rows
+            if item.get('category') == 'short_selling'
+            and item.get('source') == 'pykrx'
+            and (item.get('symbol') or item.get('scope_key'))
+            and _metric_group_complete(
+                dict((item.get('payload') or {}).get('short_volume') or {}),
+                SHORT_VOLUME_METRIC_KEYS,
+            )
+        ]
+        requested_stock_markets = set(requested_markets) & SECTOR_SUPPORTED_MARKETS
+        complete_fresh_sector_markets: set[str] = set()
+        for market in requested_stock_markets:
+            market_rows = [item for item in fresh_sector_rows if _row_market(item) == market]
+            market_short_rows = [item for item in fresh_short_rows if _row_market(item) == market]
+            market_symbols = {
+                str(item.get('symbol') or item.get('scope_key') or '').strip().upper()
+                for item in market_rows
+                if str(item.get('symbol') or item.get('scope_key') or '').strip()
+            }
+            short_symbols = {
+                str(item.get('symbol') or item.get('scope_key') or '').strip().upper()
+                for item in fresh_short_rows
+                if _row_market(item) == market
+                and str(item.get('symbol') or item.get('scope_key') or '').strip()
+            }
+            reference_counts = {
+                int((item.get('payload') or {}).get('universe_reference_count') or 0)
+                for item in market_rows
+            }
+            reference_hashes = {
+                str((item.get('payload') or {}).get('universe_reference_sha256') or '').strip()
+                for item in market_rows
+            }
+            reference_sources = {
+                str((item.get('payload') or {}).get('universe_reference_source') or '').strip()
+                for item in market_rows
+            }
+            reference_matches_sector = bool(
+                market_symbols
+                and reference_counts == {len(market_symbols)}
+                and reference_hashes == {_symbol_membership_sha256(market_symbols)}
+                and reference_sources == {'pykrx_market_ticker_list'}
+            )
+            short_market_has_activity = any(
+                (_to_int(((item.get('payload') or {}).get('short_volume') or {}).get('total_volume')) or 0) > 0
+                for item in market_short_rows
+            )
+            if (
+                reference_matches_sector
+                and market_symbols == short_symbols
+                and short_market_has_activity
+            ):
+                complete_fresh_sector_markets.add(market)
+        fresh_stock_universe_available = bool(requested_stock_markets) and requested_stock_markets.issubset(
+            complete_fresh_sector_markets
+        )
+        fresh_stock_symbols = {
+            str(item.get('symbol') or item.get('scope_key') or '').strip().upper()
+            for item in fresh_sector_rows
+            if _row_market(item) in requested_stock_markets
+            if str(item.get('symbol') or item.get('scope_key') or '').strip()
+        }
+        positive_volume_stock_symbols: set[str] = set()
+        positive_volume_universe_available = False
+        if (
+            'investor_flow_symbol' in time_sensitive_categories
+            and fresh_stock_universe_available
+        ):
+            price_rows = self._daily_price_rows_for_fallback(
+                market_date_iso=market_date,
+                markets=normalized_markets,
+                symbol_filter=fresh_stock_symbols,
+            )
+            price_row_symbols = {
+                str(item.get('symbol') or '').strip().upper()
+                for item in price_rows
+                if str(item.get('symbol') or '').strip()
+            }
+            positive_volume_stock_symbols = {
+                str(item.get('symbol') or '').strip().upper()
+                for item in price_rows
+                if str(item.get('symbol') or '').strip()
+                and int(item.get('volume') or 0) > 0
+            } & fresh_stock_symbols
+            positive_volume_universe_available = bool(positive_volume_stock_symbols) and fresh_stock_symbols.issubset(
+                price_row_symbols
             )
 
         category_summaries: dict[str, dict[str, Any]] = {}
@@ -1707,12 +2142,16 @@ class PykrxEnrichmentService:
                 for item in rows
                 if item['category'] == category
                 and (supported_markets is None or _row_market(item) in supported_markets)
+                and is_decision_usable_pykrx_enrichment_row(item)
             ]
             present_scope_keys = {
                 item.get('symbol') or item['scope_key']
                 for item in category_rows
                 if (item.get('symbol') or item['scope_key'])
             }
+            expected_scope_keys: set[str] | None = None
+            expectation_status = 'available'
+            expected_universe_source = 'active_collection_universe'
             if CATEGORY_SCOPE_TYPE[category] == 'symbol':
                 expected_rows = expected_symbol_count
                 if supported_markets is not None:
@@ -1727,10 +2166,59 @@ class PykrxEnrichmentService:
                         expected_rows = max(len(normalized_symbols) - len(unsupported_known_symbols), 0)
                     else:
                         expected_rows = sum(1 for item in active_symbol_rows if _row_market(item) in supported_markets)
+                if normalized_symbols:
+                    expected_scope_keys = set(normalized_symbols)
+                    if supported_markets is not None:
+                        unsupported_known_symbols = {
+                            str(item.get('symbol') or '').strip().upper()
+                            for item in active_symbol_rows
+                            if str(item.get('symbol') or '').strip().upper() in normalized_symbol_set
+                            and _row_market(item)
+                            and _row_market(item) not in supported_markets
+                        }
+                        expected_scope_keys -= unsupported_known_symbols
+                    expected_rows = len(expected_scope_keys)
+                    expected_universe_source = 'explicit_requested_symbols'
+                elif category == 'sector_classification':
+                    if not fresh_stock_universe_available:
+                        expected_rows = None
+                        expectation_status = 'unavailable'
+                        expected_universe_source = 'fresh_pykrx_stock_universe_unavailable'
+                    else:
+                        expected_scope_keys = fresh_stock_symbols
+                        expected_rows = len(expected_scope_keys)
+                        expected_universe_source = 'fresh_pykrx_sector_classification'
+                elif category in TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES:
+                    if not fresh_stock_universe_available:
+                        expected_rows = None
+                        expectation_status = 'unavailable'
+                        expected_universe_source = 'fresh_pykrx_stock_universe_unavailable'
+                    elif (
+                        category == 'investor_flow_symbol'
+                        and not positive_volume_universe_available
+                    ):
+                        expected_rows = None
+                        expectation_status = 'unavailable'
+                        expected_universe_source = 'same_day_positive_volume_unavailable'
+                    elif category == 'investor_flow_symbol':
+                        expected_scope_keys = positive_volume_stock_symbols
+                        expected_rows = len(expected_scope_keys)
+                        expected_universe_source = 'fresh_pykrx_sector_positive_volume'
+                    else:
+                        expected_scope_keys = fresh_stock_symbols
+                        expected_rows = len(expected_scope_keys)
+                        expected_universe_source = 'fresh_pykrx_sector_classification'
             else:
                 expected_rows = expected_market_count
                 if supported_markets is not None:
                     expected_rows = sum(1 for market in requested_markets if market in supported_markets)
+                expected_universe_source = 'requested_markets'
+            eligible_present_scope_keys = (
+                present_scope_keys
+                if expected_scope_keys is None
+                else present_scope_keys & expected_scope_keys
+            )
+            present_rows = len(eligible_present_scope_keys)
             latest_captured_at = None
             latest_parsed = None
             for item in category_rows:
@@ -1740,13 +2228,24 @@ class PykrxEnrichmentService:
                     latest_captured_at = item.get('captured_at')
             category_summaries[category] = {
                 'scope_type': CATEGORY_SCOPE_TYPE[category],
-                'present_rows': len(present_scope_keys),
+                'present_rows': present_rows,
+                'raw_present_rows': len(present_scope_keys),
                 'expected_rows': expected_rows,
-                'coverage_ratio': round(len(present_scope_keys) / expected_rows, 6) if expected_rows > 0 else None,
-                'coverage_status': _coverage_status(
-                    present_rows=len(present_scope_keys),
-                    expected_rows=expected_rows,
+                'coverage_ratio': (
+                    round(present_rows / expected_rows, 6)
+                    if expected_rows is not None and expected_rows > 0
+                    else None
                 ),
+                'coverage_status': (
+                    'unavailable'
+                    if expectation_status == 'unavailable'
+                    else _coverage_status(
+                        present_rows=present_rows,
+                        expected_rows=expected_rows,
+                    )
+                ),
+                'expectation_status': expectation_status,
+                'expected_universe_source': expected_universe_source,
                 'sources': sorted({item['source'] for item in category_rows if item.get('source')}),
                 'markets': sorted({item['market'] for item in category_rows if item.get('market')}),
                 'latest_captured_at': latest_captured_at,

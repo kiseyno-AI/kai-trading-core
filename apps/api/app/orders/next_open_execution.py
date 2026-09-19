@@ -77,6 +77,7 @@ from app.db_models import (
     DartFundamentalsHighlight,
     DartFundamentalsRow,
     DartFundamentalsSnapshot,
+    EODCollectionRun,
     ExternalNewsItem,
     ExternalNewsItemClassification,
     ExternalNewsItemSymbol,
@@ -93,6 +94,7 @@ from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
     inspect_pykrx_enrichment_preflight,
 )
+from app.eod.pykrx_enrichment import is_decision_usable_pykrx_enrichment_row
 from app.market.clock import MarketState, async_get_market_state, get_market_state
 from app.market.session import (
     CALENDAR_SOURCE_EXCHANGE_CALENDARS,
@@ -480,6 +482,7 @@ def _lock_dispatch_authority_source_tables(session: Any) -> None:
             DartFundamentalsHighlight.__table__,
             DartFundamentalsRow.__table__,
             DartFundamentalsSnapshot.__table__,
+            EODCollectionRun.__table__,
             ExternalNewsItemClassification.__table__,
             ExternalNewsItemSymbol.__table__,
             ExternalNewsItem.__table__,
@@ -3096,12 +3099,25 @@ class SignalDeciderNextOpenExecutionService:
         actionable_short_term_symbols = [
             snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
         ]
-        inspect_candidate_pykrx = (
-            not force
-            and bool(actionable_short_term_symbols)
-            and _should_inspect_short_term_candidate_pykrx(enrichment_preflight)
+        actionable_signal_symbols = [
+            snapshot.symbol
+            for snapshot in snapshots
+            if _snapshot_agent_name(snapshot) == SIGNAL_DECIDER_AGENT_NAME
+            and _is_actionable_snapshot(snapshot)
+        ]
+        signal_candidate_enrichment_by_symbol = (
+            self._inspect_candidate_pykrx_enrichment(
+                source_market_date=source_market_date,
+                symbols=actionable_signal_symbols,
+                categories=(
+                    enrichment_preflight.get('required_categories')
+                    or list(REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES)
+                ),
+            )
+            if not force and actionable_signal_symbols
+            else {}
         )
-        candidate_enrichment_by_symbol = (
+        short_term_candidate_enrichment_by_symbol = (
             self._repair_and_inspect_candidate_pykrx_enrichment(
                 source_market_date=source_market_date,
                 symbols=actionable_short_term_symbols,
@@ -3110,9 +3126,13 @@ class SignalDeciderNextOpenExecutionService:
                     or list(REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES)
                 ),
             )
-            if inspect_candidate_pykrx
+            if not force and actionable_short_term_symbols
             else {}
         )
+        candidate_enrichment_by_symbol = {
+            **signal_candidate_enrichment_by_symbol,
+            **short_term_candidate_enrichment_by_symbol,
+        }
         price_cache: dict[str, int | None] = {}
         desired_keys: set[tuple[str, str, str]] = set()
         now = _utcnow()
@@ -3123,6 +3143,48 @@ class SignalDeciderNextOpenExecutionService:
                 target_trade_date=resolved_target_date,
             )
             _lock_dispatch_authority_source_tables(session)
+            if not force:
+                # Repairs must finish before these source-table locks are held,
+                # but their earlier reads cannot authorize a plan: a full-market
+                # replacement may have committed between that read and this lock.
+                # Re-read every PyKRX authority input from the locked generation.
+                enrichment_preflight = (
+                    self.inspect_source_market_enrichment_preflight(
+                        source_market_date=source_market_date,
+                        trigger=trigger,
+                    )
+                )
+                enrichment_preflight_blocked = not enrichment_preflight.get(
+                    'allowed'
+                )
+                locked_required_categories = (
+                    enrichment_preflight.get('required_categories')
+                    or list(
+                        REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES
+                    )
+                )
+                locked_signal_candidate_enrichment = (
+                    self._inspect_candidate_pykrx_enrichment(
+                        source_market_date=source_market_date,
+                        symbols=actionable_signal_symbols,
+                        categories=locked_required_categories,
+                    )
+                    if actionable_signal_symbols
+                    else {}
+                )
+                locked_short_term_candidate_enrichment = (
+                    self._inspect_candidate_pykrx_enrichment(
+                        source_market_date=source_market_date,
+                        symbols=actionable_short_term_symbols,
+                        categories=locked_required_categories,
+                    )
+                    if actionable_short_term_symbols
+                    else {}
+                )
+                candidate_enrichment_by_symbol = {
+                    **locked_signal_candidate_enrichment,
+                    **locked_short_term_candidate_enrichment,
+                }
             policy_authority_by_version = (
                 _load_signal_decider_policy_authority(
                     session,
@@ -4201,26 +4263,45 @@ class SignalDeciderNextOpenExecutionService:
             market_date=source_market_date,
             categories=ordered_categories,
             symbols=ordered_symbols,
-            limit=max(len(ordered_symbols) * len(ordered_categories), 1),
+            limit=None,
         )
         present_by_symbol: dict[str, set[str]] = {symbol: set() for symbol in ordered_symbols}
+        markets_by_symbol: dict[str, set[str]] = {symbol: set() for symbol in ordered_symbols}
         for row in rows:
+            if not is_decision_usable_pykrx_enrichment_row(row):
+                continue
             symbol = _normalize_optional_text(row.get('symbol'))
             category = _normalize_optional_text(row.get('category'))
             if symbol in present_by_symbol and category in ordered_categories:
                 present_by_symbol[symbol].add(category)
+                market = _normalize_optional_text(row.get('market'))
+                if market:
+                    markets_by_symbol[symbol].add(market.upper())
         result: dict[str, dict[str, Any]] = {}
         for symbol in ordered_symbols:
             present_categories = sorted(present_by_symbol.get(symbol) or set())
             missing_categories = [
                 category for category in ordered_categories if category not in set(present_categories)
             ]
+            candidate_markets = sorted(markets_by_symbol.get(symbol) or set())
+            market = candidate_markets[0] if len(candidate_markets) == 1 else None
+            reason = (
+                'ambiguous_decision_market'
+                if len(candidate_markets) > 1
+                else 'unsupported_decision_market'
+                if market and market not in {'KOSPI', 'KOSDAQ'}
+                else 'missing_required_categories'
+                if missing_categories
+                else None
+            )
             result[symbol] = {
                 'market_date': source_market_date.isoformat(),
+                'market': market,
                 'required_categories': ordered_categories,
                 'present_categories': present_categories,
                 'missing_categories': missing_categories,
-                'allowed': not missing_categories,
+                'allowed': reason is None,
+                'reason': reason,
                 'source': 'candidate_symbol_pykrx_enrichment',
             }
         return result
@@ -5894,7 +5975,7 @@ class SignalDeciderNextOpenExecutionService:
                     'Snapshot has specialist disagreement warnings.',
                 )
             )
-        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and candidate_enrichment is not None:
+        if candidate_enrichment is not None:
             missing_categories = (
                 _normalize_text_list(candidate_enrichment.get('missing_categories'))
                 if isinstance(candidate_enrichment, dict)
@@ -5905,7 +5986,7 @@ class SignalDeciderNextOpenExecutionService:
                     _reason(
                         'candidate_pykrx_enrichment_missing',
                         (
-                            'Short-term candidate is missing required symbol-level PyKRX enrichment categories: '
+                            'Candidate is missing required symbol-level PyKRX enrichment categories: '
                             f'{", ".join(str(item) for item in missing_categories)}.'
                         ),
                     )
@@ -5917,7 +5998,7 @@ class SignalDeciderNextOpenExecutionService:
                             'global_pykrx_enrichment_preflight_partial',
                             (
                                 'Global PyKRX enrichment coverage is partial, but required symbol-level enrichment '
-                                'is present for this short-term candidate.'
+                                'is present for this candidate.'
                             ),
                         )
                     )
@@ -5925,7 +6006,7 @@ class SignalDeciderNextOpenExecutionService:
                 blocking_reasons.append(
                     _reason(
                         'candidate_pykrx_enrichment_unavailable',
-                        'Could not verify required symbol-level PyKRX enrichment for this short-term candidate.',
+                        'Could not verify required symbol-level PyKRX enrichment for this candidate.',
                     )
                 )
         if enrichment_preflight is not None and not enrichment_preflight.get('allowed'):

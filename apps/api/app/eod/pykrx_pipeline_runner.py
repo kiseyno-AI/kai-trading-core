@@ -1875,6 +1875,7 @@ def run_market_data_pipeline(
                 'market_date': latest_trade_date,
                 'markets': markets,
                 'symbols': [item.symbol for item in symbols],
+                'use_full_market_coverage': True,
             }
             if point_in_time_recovery:
                 enrichment_kwargs['point_in_time_recovery'] = True
