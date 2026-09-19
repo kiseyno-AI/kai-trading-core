@@ -7,7 +7,7 @@ import hashlib
 import logging
 import math
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -18,6 +18,7 @@ from app.core.settings import settings
 from app.brokers.kis.provider import kis_real_client
 from app.db import session_scope
 from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
+from app.eod.market_membership import validate_market_membership_snapshot
 from app.eod.pykrx_import import import_pykrx_stock, pykrx_request_context
 from app.market_data_store import (
     load_daily_market_relative_contexts,
@@ -25,7 +26,7 @@ from app.market_data_store import (
     load_symbols,
     upsert_daily_pykrx_enrichment_rows,
 )
-from app.repositories.eod_run_repository import load_eod_run_persisted_symbols, load_latest_eod_collection_run
+from app.repositories.eod_run_repository import list_eod_collection_runs
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ SHORT_BALANCE_METRIC_KEYS = (
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
 PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 30_000
+PYKRX_COVERAGE_RUN_CANDIDATE_LIMIT = 50
 
 
 def _log_pykrx_enrichment_fetch(operation: str, status: str, **fields: Any) -> None:
@@ -235,6 +237,108 @@ def _normalize_markets(markets: Sequence[str] | None) -> list[str]:
         seen.add(market)
         normalized.append(market)
     return normalized
+
+
+def _exact_eod_membership_by_market(
+    run: Mapping[str, Any],
+    *,
+    market_date: str,
+    markets: Sequence[str],
+) -> dict[str, list[str]] | None:
+    metadata = (
+        run.get('run_metadata')
+        if isinstance(run.get('run_metadata'), Mapping)
+        else {}
+    )
+    universe = (
+        metadata.get('universe_snapshot')
+        if isinstance(metadata.get('universe_snapshot'), Mapping)
+        else {}
+    )
+    raw_requested_symbols = metadata.get('requested_symbols')
+    raw_metadata_markets = metadata.get('markets')
+    raw_universe_markets = universe.get('markets')
+    raw_unavailable_markets = universe.get('unavailable_markets')
+    if not all(
+        isinstance(value, list)
+        for value in (
+            raw_requested_symbols,
+            raw_metadata_markets,
+            raw_universe_markets,
+            raw_unavailable_markets,
+        )
+    ):
+        return None
+
+    requested_symbols = [
+        str(symbol).strip().upper()
+        for symbol in raw_requested_symbols
+        if str(symbol).strip()
+    ]
+    metadata_markets = _normalize_markets(raw_metadata_markets)
+    universe_markets = _normalize_markets(raw_universe_markets)
+    required_markets = set(_normalize_markets(markets))
+    numeric_proof_values = (
+        run.get('symbols_total'),
+        universe.get('symbol_count'),
+        universe.get('persisted_count'),
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in numeric_proof_values
+    ):
+        return None
+    symbols_total, universe_symbol_count, universe_persisted_count = (
+        numeric_proof_values
+    )
+    try:
+        run_trade_date = _normalize_iso_date(str(run.get('trade_date') or ''))
+        universe_trade_date = _normalize_iso_date(
+            str(universe.get('latest_trade_date') or '')
+        )
+        expected_trade_date = _normalize_iso_date(market_date)
+    except ValueError:
+        return None
+
+    historical_point_in_time_universe = bool(
+        universe.get('point_in_time') is True
+        and universe.get('current_universe_mutated') is False
+        and universe_persisted_count == 0
+    )
+    if not (
+        run.get('market') == 'KRX'
+        and run.get('source') == 'pykrx'
+        and run_trade_date == expected_trade_date
+        and universe_trade_date == expected_trade_date
+        and symbols_total > 0
+        and len(requested_symbols) == len(raw_requested_symbols)
+        and len(requested_symbols) == symbols_total
+        and len(set(requested_symbols)) == symbols_total
+        and metadata.get('limited_run') is False
+        and metadata.get('symbol') in (None, '')
+        and metadata_markets
+        and len(metadata_markets) == len(raw_metadata_markets)
+        and len(universe_markets) == len(raw_universe_markets)
+        and set(metadata_markets) == set(universe_markets)
+        and required_markets.issubset(metadata_markets)
+        and universe.get('complete') is True
+        and universe.get('source') == 'pykrx'
+        and universe.get('universe_source') != 'point_in_time_retry_scope'
+        and universe.get('membership_basis') == 'end_date_snapshot'
+        and not raw_unavailable_markets
+        and universe_symbol_count == symbols_total
+        and (
+            universe_persisted_count == symbols_total
+            or historical_point_in_time_universe
+        )
+    ):
+        return None
+
+    return validate_market_membership_snapshot(
+        universe.get('market_membership'),
+        requested_symbols=requested_symbols,
+        markets=metadata_markets,
+    )
 
 
 def _normalize_categories(categories: Sequence[str] | None) -> list[str]:
@@ -2307,22 +2411,22 @@ class PykrxEnrichmentService:
             'investor_flow_symbol' in time_sensitive_categories
             and fresh_stock_universe_available
         ):
-            # The historical sector endpoint can include inactive symbols
-            # outside the exact EOD collection. Coverage is actionable only
-            # for the independently collected, active price universe.
-            active_collection_stock_symbols = {
+            # The historical sector endpoint can include symbols outside the
+            # exact full-market EOD membership. Coverage is actionable only
+            # where both independently captured universes agree.
+            exact_collection_stock_symbols = {
                 str(item.get('symbol') or '').strip().upper()
                 for item in active_symbol_rows
                 if _row_market(item) in requested_stock_markets
                 and str(item.get('symbol') or '').strip()
             }
-            active_fresh_stock_symbols = (
-                fresh_stock_symbols & active_collection_stock_symbols
+            exact_fresh_stock_symbols = (
+                fresh_stock_symbols & exact_collection_stock_symbols
             )
             price_rows = self._daily_price_rows_for_fallback(
                 market_date_iso=market_date,
                 markets=normalized_markets,
-                symbol_filter=active_fresh_stock_symbols,
+                symbol_filter=exact_fresh_stock_symbols,
             )
             price_row_symbols = {
                 str(item.get('symbol') or '').strip().upper()
@@ -2334,10 +2438,10 @@ class PykrxEnrichmentService:
                 for item in price_rows
                 if str(item.get('symbol') or '').strip()
                 and int(item.get('volume') or 0) > 0
-            } & active_fresh_stock_symbols
+            } & exact_fresh_stock_symbols
             positive_volume_universe_available = (
                 bool(positive_volume_stock_symbols)
-                and active_fresh_stock_symbols.issubset(price_row_symbols)
+                and exact_fresh_stock_symbols.issubset(price_row_symbols)
             )
 
         category_summaries: dict[str, dict[str, Any]] = {}
@@ -2513,44 +2617,50 @@ class PykrxEnrichmentService:
                 symbols=list(symbols),
                 limit=max(len(symbols), 1),
             )
-        latest_run = load_latest_eod_collection_run(
+        candidate_runs = list_eod_collection_runs(
             market='KRX',
             trade_date=market_date,
             source='pykrx',
-            statuses=['completed'],
+            statuses=['running', 'completed', 'completed_with_errors'],
+            limit=PYKRX_COVERAGE_RUN_CANDIDATE_LIMIT,
             statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS,
         )
-        if latest_run is not None:
-            persisted_symbols = load_eod_run_persisted_symbols(
-                int(latest_run['id']),
-                statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS,
+        for candidate_run in candidate_runs:
+            membership_by_market = _exact_eod_membership_by_market(
+                candidate_run,
+                market_date=market_date,
+                markets=markets,
             )
-            if persisted_symbols:
-                return load_symbols(
-                    markets=list(markets) or None,
-                    symbols=persisted_symbols,
-                    limit=max(len(persisted_symbols), 1),
-                )
-        price_rows = self._daily_price_rows_for_fallback(
-            market_date_iso=market_date,
-            markets=markets,
-            symbol_filter=set(),
-        )
-        if price_rows:
-            return [
+            if membership_by_market is None:
+                continue
+            requested_markets = set(_normalize_markets(markets))
+            exact_symbols = sorted(
                 {
-                    'symbol': row['symbol'],
-                    'market': row['market'],
-                    'name_ko': row.get('name_ko'),
-                    'standard_code': row.get('standard_code'),
+                    symbol
+                    for market, market_symbols in membership_by_market.items()
+                    if not requested_markets or market in requested_markets
+                    for symbol in market_symbols
                 }
-                for row in price_rows
-            ]
-        return load_symbols(
-            is_active=True,
-            markets=list(markets) or None,
-            limit=5000,
-        )
+            )
+            if not exact_symbols:
+                continue
+            symbol_rows = load_symbols(
+                markets=list(markets) or None,
+                symbols=exact_symbols,
+                limit=len(exact_symbols),
+            )
+            loaded_symbols = {
+                str(row.get('symbol') or '').strip().upper()
+                for row in symbol_rows
+                if str(row.get('symbol') or '').strip()
+            }
+            if loaded_symbols == set(exact_symbols):
+                return symbol_rows
+
+        # A price table can contain a later subset backfill. Without an exact
+        # full-market membership proof, using those rows as the denominator
+        # would let global coverage fail open.
+        return []
 
 
 pykrx_enrichment_service = PykrxEnrichmentService()

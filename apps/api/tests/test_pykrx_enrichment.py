@@ -68,6 +68,77 @@ def _universe_reference_payload(symbols: list[str]) -> dict:
     }
 
 
+def _market_membership_payload(
+    symbols_by_market: dict[str, list[str]],
+) -> dict:
+    all_symbols = [
+        symbol
+        for market_symbols in symbols_by_market.values()
+        for symbol in market_symbols
+    ]
+    return {
+        'schema_version': 'pykrx_market_membership_v1',
+        'membership_basis': 'end_date_snapshot',
+        'symbol_count': len(all_symbols),
+        'markets': {
+            market: {
+                'symbols': sorted(market_symbols),
+                'symbol_count': len(market_symbols),
+                'membership_sha256': hashlib.sha256(
+                    '\n'.join(sorted(market_symbols)).encode('utf-8')
+                ).hexdigest(),
+            }
+            for market, market_symbols in symbols_by_market.items()
+        },
+    }
+
+
+def _exact_membership_run(
+    *,
+    run_id: int,
+    market_date: str,
+    symbols_by_market: dict[str, list[str]],
+    limited_run: bool = False,
+    symbol: str | None = None,
+) -> dict:
+    markets = list(symbols_by_market)
+    requested_symbols = [
+        symbol_code
+        for market_symbols in symbols_by_market.values()
+        for symbol_code in market_symbols
+    ]
+    return {
+        'id': run_id,
+        'market': 'KRX',
+        'trade_date': market_date,
+        'source': 'pykrx',
+        'status': 'completed',
+        'symbols_total': len(requested_symbols),
+        'run_metadata': {
+            'mode': 'daily_auto',
+            'markets': markets,
+            'symbol': symbol,
+            'limited_run': limited_run,
+            'requested_symbols': requested_symbols,
+            'universe_snapshot': {
+                'source': 'pykrx',
+                'markets': markets,
+                'symbol_count': len(requested_symbols),
+                'persisted_count': len(requested_symbols),
+                'latest_trade_date': market_date,
+                'membership_basis': 'end_date_snapshot',
+                'complete': True,
+                'unavailable_markets': [],
+                'point_in_time': False,
+                'current_universe_mutated': True,
+                'market_membership': _market_membership_payload(
+                    symbols_by_market
+                ),
+            },
+        },
+    }
+
+
 class PykrxEnrichmentServiceTests(unittest.TestCase):
     def test_large_price_fallback_filter_avoids_massive_sql_in_clause(self):
         captured_scope_kwargs: dict[str, object] = {}
@@ -2502,9 +2573,8 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(result['coverage']['categories']['investor_flow_symbol']['coverage_status'], 'missing')
         self.assertEqual(result['coverage']['categories']['investor_flow_symbol']['expected_rows'], 2)
 
-    @patch('app.eod.pykrx_enrichment.load_symbols')
-    def test_sector_classification_coverage_excludes_unsupported_konex_symbols(self, load_symbols_mock):
-        load_symbols_mock.return_value = [
+    def test_sector_classification_coverage_excludes_unsupported_konex_symbols(self):
+        active_symbol_rows = [
             {
                 'symbol': '005930',
                 'name_ko': '삼성전자',
@@ -2580,17 +2650,25 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             for market, symbol in (('KOSPI', '005930'), ('KOSDAQ', '035720'))
         ]
 
-        with patch(
-            'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
-            side_effect=lambda *, market_date, categories=None, markets=None, symbols=None, **kwargs: _filter_rows(
-                persisted_rows,
-                market_date=market_date,
-                categories=categories,
-                markets=markets,
-                symbols=symbols,
+        service = PykrxEnrichmentService()
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=active_symbol_rows,
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                side_effect=lambda *, market_date, categories=None, markets=None, symbols=None, **kwargs: _filter_rows(
+                    persisted_rows,
+                    market_date=market_date,
+                    categories=categories,
+                    markets=markets,
+                    symbols=symbols,
+                ),
             ),
         ):
-            result = PykrxEnrichmentService().inspect(
+            result = service.inspect(
                 market_date='2026-04-21',
                 markets=['KOSPI', 'KOSDAQ', 'KONEX'],
                 categories=['sector_classification'],
@@ -2604,87 +2682,138 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(coverage['coverage_ratio'], 1.0)
         self.assertEqual(coverage['coverage_status'], 'complete')
 
-    def test_inspect_does_not_treat_unqualified_eod_run_as_stock_universe(self):
-        persisted_rows = [
-            {
-                'market_date': '2026-04-21',
-                'market': 'KOSPI',
-                'category': 'short_selling',
-                'scope_type': 'symbol',
-                'scope_key': '005930',
-                'source': 'pykrx',
-                'symbol': '005930',
-                'payload': {},
-                'captured_at': '2026-04-21T15:10:00+09:00',
-            },
-            {
-                'market_date': '2026-04-21',
-                'market': 'KOSPI',
-                'category': 'short_selling',
-                'scope_type': 'symbol',
-                'scope_key': '000660',
-                'source': 'pykrx',
-                'symbol': '000660',
-                'payload': {},
-                'captured_at': '2026-04-21T15:10:00+09:00',
-            },
-        ]
+    def test_coverage_uses_prior_exact_membership_after_later_subset_run(self):
         symbol_rows = [
             {'symbol': '005930', 'name_ko': '삼성전자', 'market': 'KOSPI'},
             {'symbol': '000660', 'name_ko': 'SK하이닉스', 'market': 'KOSPI'},
         ]
+        subset_run = _exact_membership_run(
+            run_id=42,
+            market_date='2026-04-21',
+            symbols_by_market={'KOSPI': ['005930']},
+            limited_run=True,
+        )
+        full_run = _exact_membership_run(
+            run_id=41,
+            market_date='2026-04-21',
+            symbols_by_market={'KOSPI': ['005930', '000660']},
+        )
 
         with (
             patch(
-                'app.eod.pykrx_enrichment.load_latest_eod_collection_run',
-                return_value={'id': 42},
-            ) as latest_run_mock,
-            patch(
-                'app.eod.pykrx_enrichment.load_eod_run_persisted_symbols',
-                return_value=['005930', '000660'],
-            ) as persisted_symbols_mock,
+                'app.eod.pykrx_enrichment.list_eod_collection_runs',
+                return_value=[subset_run, full_run],
+            ) as list_runs_mock,
             patch('app.eod.pykrx_enrichment.load_symbols', return_value=symbol_rows) as load_symbols_mock,
-            patch(
-                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
-                side_effect=lambda *, market_date, categories=None, markets=None, symbols=None, **kwargs: _filter_rows(
-                    persisted_rows,
-                    market_date=market_date,
-                    categories=categories,
-                    markets=markets,
-                    symbols=symbols,
-                ),
-            ) as load_rows_mock,
         ):
-            result = PykrxEnrichmentService().inspect(
+            result = PykrxEnrichmentService()._load_coverage_symbol_rows(
                 market_date='2026-04-21',
-                markets=['KOSPI', 'KOSDAQ', 'KONEX'],
-                categories=['short_selling'],
-                limit=10,
+                markets=['KOSPI'],
+                symbols=[],
             )
 
+        self.assertEqual(result, symbol_rows)
         load_symbols_mock.assert_called_once_with(
-            markets=['KOSPI', 'KOSDAQ', 'KONEX'],
-            symbols=['005930', '000660'],
+            markets=['KOSPI'],
+            symbols=['000660', '005930'],
             limit=2,
         )
-        persisted_symbols_mock.assert_called_once_with(
-            42,
-            statement_timeout_ms=30_000,
-        )
-        latest_run_mock.assert_called_once_with(
+        list_runs_mock.assert_called_once_with(
             market='KRX',
             trade_date='2026-04-21',
             source='pykrx',
-            statuses=['completed'],
+            statuses=['running', 'completed', 'completed_with_errors'],
+            limit=50,
             statement_timeout_ms=30_000,
         )
-        coverage = result['coverage']['categories']['short_selling']
-        self.assertEqual(result['coverage']['requested_symbol_count'], 2)
-        self.assertIsNone(coverage['expected_rows'])
-        self.assertEqual(coverage['present_rows'], 0)
-        self.assertIsNone(coverage['coverage_ratio'])
-        self.assertEqual(coverage['coverage_status'], 'unavailable')
-        self.assertEqual(coverage['expectation_status'], 'unavailable')
+
+    def test_coverage_rejects_symbol_and_retry_subsets(self):
+        symbol_subset = _exact_membership_run(
+            run_id=42,
+            market_date='2026-04-21',
+            symbols_by_market={'KOSPI': ['005930']},
+            symbol='005930',
+        )
+        retry_subset = _exact_membership_run(
+            run_id=43,
+            market_date='2026-04-21',
+            symbols_by_market={'KOSPI': ['005930', '000660']},
+        )
+        retry_subset['symbols_total'] = 1
+        retry_subset['run_metadata']['requested_symbols'] = ['005930']
+        retry_scope_subset = _exact_membership_run(
+            run_id=44,
+            market_date='2026-04-21',
+            symbols_by_market={'KOSPI': ['005930']},
+        )
+        retry_scope_universe = retry_scope_subset['run_metadata'][
+            'universe_snapshot'
+        ]
+        retry_scope_universe.update(
+            {
+                'persisted_count': 0,
+                'universe_source': 'point_in_time_retry_scope',
+                'point_in_time': True,
+                'current_universe_mutated': False,
+            }
+        )
+
+        for case_name, candidate in (
+            ('symbol_subset', symbol_subset),
+            ('retry_subset', retry_subset),
+            ('self_consistent_retry_scope_subset', retry_scope_subset),
+        ):
+            with self.subTest(case=case_name):
+                with (
+                    patch(
+                        'app.eod.pykrx_enrichment.list_eod_collection_runs',
+                        return_value=[candidate],
+                    ),
+                    patch(
+                        'app.eod.pykrx_enrichment.load_symbols'
+                    ) as load_symbols_mock,
+                    patch.object(
+                        PykrxEnrichmentService,
+                        '_daily_price_rows_for_fallback',
+                    ) as price_fallback_mock,
+                ):
+                    result = PykrxEnrichmentService()._load_coverage_symbol_rows(
+                        market_date='2026-04-21',
+                        markets=['KOSPI'],
+                        symbols=[],
+                    )
+
+                self.assertEqual(result, [])
+                load_symbols_mock.assert_not_called()
+                price_fallback_mock.assert_not_called()
+
+    def test_coverage_rejects_wrong_loaded_membership_set(self):
+        full_run = _exact_membership_run(
+            run_id=41,
+            market_date='2026-04-21',
+            symbols_by_market={'KOSPI': ['005930', '000660']},
+        )
+        wrong_symbol_rows = [
+            {'symbol': '005930', 'name_ko': '삼성전자', 'market': 'KOSPI'},
+            {'symbol': '035720', 'name_ko': '카카오', 'market': 'KOSPI'},
+        ]
+        with (
+            patch(
+                'app.eod.pykrx_enrichment.list_eod_collection_runs',
+                return_value=[full_run],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_symbols',
+                return_value=wrong_symbol_rows,
+            ),
+        ):
+            result = PykrxEnrichmentService()._load_coverage_symbol_rows(
+                market_date='2026-04-21',
+                markets=['KOSPI'],
+                symbols=[],
+            )
+
+        self.assertEqual(result, [])
 
 
 class KisCandidateFallbackTests(unittest.TestCase):
