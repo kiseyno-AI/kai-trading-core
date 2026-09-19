@@ -1701,11 +1701,13 @@ class PykrxBackfillService:
             if isinstance(latest_eod_run.get('run_metadata'), dict)
             else {}
         )
+        lineage_markets = _point_in_time_source_markets(
+            latest_eod_metadata,
+            fallback=markets,
+        )
+        repair_markets = latest_eod_metadata.get('markets')
         recovery_markets = (
-            _point_in_time_source_markets(
-                latest_eod_metadata,
-                fallback=markets,
-            )
+            lineage_markets
             if point_in_time_recovery
             else tuple(markets)
         )
@@ -1961,12 +1963,13 @@ class PykrxBackfillService:
                 == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
                 and pipeline_run.get('trigger')
                 == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+                and isinstance(repair_markets, list)
                 and repair_checkpoint_after
             ):
                 repair_checkpoint = (
                     load_latest_pykrx_enrichment_repair_checkpoint(
                         trade_date=market_date,
-                        markets=recovery_markets,
+                        markets=tuple(repair_markets),
                         completed_after=repair_checkpoint_after,
                     )
                 )
