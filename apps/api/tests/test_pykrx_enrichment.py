@@ -1534,6 +1534,10 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             'investor_flow_symbol',
             'short_selling',
         ]
+        unsupported_categories = [
+            'sector_classification',
+            'investor_flow_symbol',
+        ]
 
         with (
             patch.object(
@@ -1553,7 +1557,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                 categories=required_categories,
             )
 
-        for category in required_categories:
+        for category in unsupported_categories:
             with self.subTest(category=category):
                 payload = coverage['categories'][category]
                 self.assertEqual(payload['expected_rows'], 0)
@@ -1566,20 +1570,25 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                     'not_applicable',
                 )
 
+        short_selling = coverage['categories']['short_selling']
+        self.assertIsNone(short_selling['expected_rows'])
+        self.assertEqual(short_selling['expectation_status'], 'unavailable')
+        self.assertEqual(short_selling['coverage_status'], 'unavailable')
+
         preflight = build_pykrx_enrichment_preflight(
             market_date='2026-09-18',
             coverage=coverage,
             categories=required_categories,
         )
-        self.assertEqual(preflight['status'], 'not_applicable')
-        self.assertTrue(preflight['allowed'])
-        self.assertEqual(preflight['failed_categories'], [])
+        self.assertEqual(preflight['status'], 'waiting')
+        self.assertFalse(preflight['allowed'])
+        self.assertEqual(preflight['failed_categories'], ['short_selling'])
         self.assertEqual(
             [
                 item['category']
                 for item in preflight['not_applicable_categories']
             ],
-            required_categories,
+            unsupported_categories,
         )
 
     def test_explicit_unsupported_symbols_are_not_applicable(self):

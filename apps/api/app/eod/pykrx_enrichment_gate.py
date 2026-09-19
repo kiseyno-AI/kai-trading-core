@@ -52,12 +52,23 @@ def _category_gate_item(
     coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
     missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
 
-    if missing_category_payload or expectation_status == 'unavailable':
-        gate_status = 'waiting'
-        reason = 'coverage_expectation_unavailable'
-    elif expected_rows is None or expected_rows <= 0:
+    if (
+        not missing_category_payload
+        and expectation_status == 'not_applicable'
+        and coverage_status == 'not_applicable'
+        and expected_rows is not None
+        and expected_rows <= 0
+    ):
         gate_status = 'not_applicable'
         reason = 'no_expected_rows_for_category'
+    elif (
+        missing_category_payload
+        or expectation_status == 'unavailable'
+        or expected_rows is None
+        or expected_rows <= 0
+    ):
+        gate_status = 'waiting'
+        reason = 'coverage_expectation_unavailable'
     elif present_rows <= 0 or coverage_status == 'missing':
         gate_status = 'blocked'
         reason = 'missing_required_pykrx_enrichment_category'

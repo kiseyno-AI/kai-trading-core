@@ -88,7 +88,7 @@ SHORTING_SUPPORTED_MARKETS = {'KOSPI', 'KOSDAQ', 'KONEX'}
 CATEGORY_SUPPORTED_MARKETS = {
     'sector_classification': SECTOR_SUPPORTED_MARKETS,
     'investor_flow_symbol': SECTOR_SUPPORTED_MARKETS,
-    'short_selling': SECTOR_SUPPORTED_MARKETS,
+    'short_selling': SHORTING_SUPPORTED_MARKETS,
 }
 SYMBOL_INVESTOR_GROUPS: tuple[str, ...] = ('개인', '외국인', '기관합계')
 INVESTOR_FLOW_METRIC_KEYS = (
