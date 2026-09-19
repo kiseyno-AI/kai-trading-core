@@ -4660,6 +4660,9 @@ def load_daily_pykrx_enrichment_rows(
     symbols: Sequence[str] | None = None,
     source: str | None = None,
     limit: int | None = 5000,
+    statement_timeout_ms: int | None = None,
+    order_results: bool = True,
+    include_symbol_metadata: bool = True,
 ) -> list[dict[str, Any]]:
     normalized_market_date = _normalize_trade_date(market_date)
     normalized_symbols = [
@@ -4671,24 +4674,37 @@ def load_daily_pykrx_enrichment_rows(
     normalized_scope_types = [str(item).strip().lower() for item in (scope_types or []) if str(item).strip()]
     normalized_markets = [str(item).strip().upper() for item in (markets or []) if str(item).strip()]
 
-    with session_scope() as session:
-        stmt = (
-            select(
-                DailyPykrxEnrichmentRow,
-                Symbol.symbol,
-                Symbol.name_ko,
-                Symbol.standard_code,
+    session_options = (
+        {'statement_timeout_ms': statement_timeout_ms}
+        if statement_timeout_ms is not None
+        else {}
+    )
+    with session_scope(**session_options) as session:
+        if include_symbol_metadata:
+            stmt = (
+                select(
+                    DailyPykrxEnrichmentRow,
+                    Symbol.symbol,
+                    Symbol.name_ko,
+                    Symbol.standard_code,
+                )
+                .select_from(DailyPykrxEnrichmentRow)
+                .outerjoin(Symbol, Symbol.id == DailyPykrxEnrichmentRow.symbol_id)
             )
-            .select_from(DailyPykrxEnrichmentRow)
-            .outerjoin(Symbol, Symbol.id == DailyPykrxEnrichmentRow.symbol_id)
-            .where(DailyPykrxEnrichmentRow.market_date == normalized_market_date)
-            .order_by(
+        else:
+            stmt = select(DailyPykrxEnrichmentRow).select_from(
+                DailyPykrxEnrichmentRow
+            )
+        stmt = stmt.where(
+            DailyPykrxEnrichmentRow.market_date == normalized_market_date
+        )
+        if order_results:
+            stmt = stmt.order_by(
                 DailyPykrxEnrichmentRow.category.asc(),
                 DailyPykrxEnrichmentRow.market.asc(),
                 DailyPykrxEnrichmentRow.scope_type.asc(),
                 DailyPykrxEnrichmentRow.scope_key.asc(),
             )
-        )
         if normalized_categories:
             stmt = stmt.where(DailyPykrxEnrichmentRow.category.in_(normalized_categories))
         if normalized_scope_types:
@@ -4696,12 +4712,33 @@ def load_daily_pykrx_enrichment_rows(
         if normalized_markets:
             stmt = stmt.where(DailyPykrxEnrichmentRow.market.in_(normalized_markets))
         if normalized_symbols:
-            stmt = stmt.where(Symbol.symbol.in_(normalized_symbols))
+            if include_symbol_metadata:
+                stmt = stmt.where(Symbol.symbol.in_(normalized_symbols))
+            else:
+                stmt = stmt.where(
+                    DailyPykrxEnrichmentRow.scope_type == 'symbol',
+                    DailyPykrxEnrichmentRow.scope_key.in_(normalized_symbols),
+                )
         if source:
             stmt = stmt.where(DailyPykrxEnrichmentRow.source == source)
         if limit:
             stmt = stmt.limit(limit)
-        rows = session.execute(stmt).all()
+        raw_rows = session.execute(stmt).all()
+        rows = (
+            raw_rows
+            if include_symbol_metadata
+            else [
+                (
+                    raw_row[0],
+                    raw_row[0].scope_key
+                    if raw_row[0].scope_type == 'symbol'
+                    else None,
+                    None,
+                    None,
+                )
+                for raw_row in raw_rows
+            ]
+        )
         items: list[dict[str, Any]] = []
         for row, symbol, name_ko, standard_code in rows:
             items.append(

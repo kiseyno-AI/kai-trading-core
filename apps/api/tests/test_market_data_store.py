@@ -56,6 +56,66 @@ def _market_membership(by_market: dict[str, list[str]]) -> dict:
     }
 
 
+class DailyPykrxEnrichmentReadTests(unittest.TestCase):
+    def test_bulk_read_uses_explicit_timeout_without_unneeded_ordering(self) -> None:
+        captured_scope_kwargs: dict[str, object] = {}
+        captured_statements = []
+        persisted_row = SimpleNamespace(
+            id=1,
+            market_date=date(2026, 9, 18),
+            market='KOSPI',
+            category='short_selling',
+            scope_type='symbol',
+            scope_key='005930',
+            source='pykrx',
+            payload={'short_volume': {'total_volume': 10}},
+            captured_at=None,
+        )
+
+        class _Result:
+            @staticmethod
+            def all():
+                return [(persisted_row,)]
+
+        class _Session:
+            @staticmethod
+            def execute(statement):
+                captured_statements.append(statement)
+                return _Result()
+
+        @contextmanager
+        def fake_session_scope(**kwargs):
+            captured_scope_kwargs.update(kwargs)
+            yield _Session()
+
+        with patch(
+            'app.market_data_store.session_scope',
+            new=fake_session_scope,
+        ):
+            rows = load_daily_pykrx_enrichment_rows(
+                market_date='2026-09-18',
+                categories=['sector_classification', 'short_selling'],
+                markets=['KOSPI', 'KOSDAQ'],
+                symbols=['005930'],
+                limit=None,
+                statement_timeout_ms=15_000,
+                order_results=False,
+                include_symbol_metadata=False,
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['symbol'], '005930')
+        self.assertIsNone(rows[0]['name_ko'])
+        self.assertEqual(rows[0]['payload'], persisted_row.payload)
+        self.assertEqual(
+            captured_scope_kwargs,
+            {'statement_timeout_ms': 15_000},
+        )
+        statement_text = str(captured_statements[0])
+        self.assertNotIn('ORDER BY', statement_text)
+        self.assertNotIn('JOIN symbols', statement_text)
+
+
 class HistoricalPriceBarPersistenceTests(unittest.TestCase):
     @staticmethod
     def _bar() -> dict:

@@ -1388,6 +1388,14 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(coverage['coverage_status'], 'missing')
         self.assertEqual(coverage['sources'], [])
         self.assertIsNone(load_rows_mock.call_args.kwargs['limit'])
+        self.assertEqual(
+            load_rows_mock.call_args.kwargs['statement_timeout_ms'],
+            15_000,
+        )
+        self.assertFalse(load_rows_mock.call_args.kwargs['order_results'])
+        self.assertFalse(
+            load_rows_mock.call_args.kwargs['include_symbol_metadata']
+        )
 
     def test_time_sensitive_coverage_uses_fresh_stock_eligible_universe(self):
         service = PykrxEnrichmentService()
