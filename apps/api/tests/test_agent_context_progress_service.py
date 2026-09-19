@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app.agent_context.progress_service import AgentContextProgressService
 from app.agent_context.runtime_state import RuntimeFeedbackRunState
+from app.eod.daily_pipeline_stages import DailyPipelineStageService
 
 
 class FakeExecuteResult:
@@ -725,6 +726,228 @@ class AgentContextProgressServiceTests(unittest.TestCase):
             result['result']['roles']['technical-summarizer'],
             {'requested_count': 2, 'completed_count': 1, 'error_count': 0},
         )
+
+    def test_feedback_progress_uses_terminal_runtime_role_scopes_for_heterogeneous_retry_cycle(self):
+        roles = ['eod-summarizer', 'technical-summarizer', 'fundamental-summarizer']
+        role_totals = {
+            'eod-summarizer': 200,
+            'technical-summarizer': 150,
+            'fundamental-summarizer': 120,
+        }
+
+        def build_role_progress(*, total: int, completed: int) -> dict[str, object]:
+            return {
+                'status': 'completed' if completed == total else 'partial',
+                'boundary_status': 'completed' if completed == total else 'partial',
+                'total_symbols': total,
+                'processed_symbols': completed,
+                'completed_symbols': completed,
+                'in_progress_symbols': 0,
+                'pending_symbols': max(0, total - completed),
+                'failed_items': 0,
+                'progress_ratio': completed / total,
+                'progress_percent': completed / total * 100,
+            }
+
+        runtime_summary = {
+            'run_id': 'retry-run-heterogeneous',
+            'run_status': 'completed',
+            'run_table_status': 'completed',
+            'is_live': False,
+            'current_role': None,
+            'completed_roles': roles,
+            'remaining_roles': [],
+            'cycle_mode': 'daily_retry_cycle_role_sequenced',
+            'cycle_status': 'completed',
+            'total_symbols': 200,
+            'processed_symbols': 200,
+            'completed_symbols': 200,
+            'in_progress_symbols': 0,
+            'pending_symbols': 0,
+            'failed_items': 0,
+            'completed_feedback_count': 470,
+            'computed_feedback_count': 450,
+            'reused_feedback_count': 20,
+            'stale_feedback_count': 0,
+            'expected_feedback_count': 470,
+            'role_symbol_counts': role_totals,
+            'role_progress': {
+                role: build_role_progress(total=total, completed=total)
+                for role, total in role_totals.items()
+            },
+        }
+        runtime_state = SimpleNamespace(
+            requested_symbols=[f'{index:06d}' for index in range(200)],
+            to_progress_summary=lambda: runtime_summary,
+        )
+        run_snapshot = {
+            'run_id': 'retry-run-heterogeneous',
+            'status': 'completed',
+            'symbols_total': 470,
+            'completed_count': 470,
+            'failed_count': 0,
+            'started_at': datetime(2026, 9, 18, 6, 0, tzinfo=timezone.utc),
+            'completed_at': datetime(2026, 9, 18, 8, 0, tzinfo=timezone.utc),
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'symbols': runtime_state.requested_symbols,
+                'roles': roles,
+            },
+            'summary_payload': {'progress_summary': runtime_summary},
+        }
+        inflated_persisted_progress = {
+            'result': {
+                'market_date': '2026-09-18',
+                'roles': {
+                    role: {
+                        'requested_count': 200,
+                        'completed_count': role_totals[role],
+                        'error_count': 0,
+                    }
+                    for role in roles
+                },
+            },
+            'summary': {
+                'run_id': None,
+                'run_status': 'partial',
+                'run_table_status': None,
+                'is_live': False,
+                'total_symbols': 200,
+                'processed_symbols': 200,
+                'completed_symbols': 120,
+                'in_progress_symbols': 0,
+                'partial_symbols': 80,
+                'pending_symbols': 0,
+                'failed_items': 1,
+                'completed_feedback_count': 469,
+                'computed_feedback_count': 469,
+                'reused_feedback_count': 0,
+                'stale_feedback_count': 2,
+                'expected_feedback_count': 600,
+                'role_progress': {
+                    role: build_role_progress(total=200, completed=role_totals[role])
+                    for role in roles
+                },
+            },
+        }
+
+        with patch(
+            'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
+            return_value=run_snapshot,
+        ):
+            with patch(
+                'app.agent_context.progress_service.runtime_feedback_state_store.get_run',
+                return_value=runtime_state,
+            ):
+                with patch.object(
+                    AgentContextProgressService,
+                    '_build_persisted_progress',
+                    return_value=inflated_persisted_progress,
+                ):
+                    result = AgentContextProgressService().get_feedback_progress(
+                        market_date='2026-09-18',
+                        symbols=None,
+                    )
+
+        self.assertEqual(result['summary']['expected_feedback_count'], 470)
+        self.assertEqual(result['summary']['completed_feedback_count'], 470)
+        self.assertEqual(result['summary']['computed_feedback_count'], 450)
+        self.assertEqual(result['summary']['reused_feedback_count'], 20)
+        self.assertEqual(result['summary']['stale_feedback_count'], 0)
+        self.assertEqual(result['summary']['failed_items'], 0)
+        self.assertEqual(
+            {
+                role: result['summary']['role_progress'][role]['total_symbols']
+                for role in roles
+            },
+            role_totals,
+        )
+        self.assertEqual(
+            {
+                role: result['result']['roles'][role]['requested_count']
+                for role in roles
+            },
+            role_totals,
+        )
+        stage_result = {'status': 'completed', 'progress': result}
+        self.assertEqual(
+            DailyPipelineStageService._extract_stage_counts(
+                stage_id='agent_feedback_summaries',
+                result=stage_result,
+            ),
+            {'processed': 470, 'total': 470, 'succeeded': 470, 'failed': 0},
+        )
+        self.assertEqual(
+            DailyPipelineStageService._resolve_result_status(stage_result),
+            'completed',
+        )
+
+    def test_terminal_retry_merge_keeps_partial_and_failed_aggregates_consistent(self):
+        service = AgentContextProgressService()
+        for run_status, role_status in (
+            ('partial', 'completed_with_failures'),
+            ('failed', 'failed'),
+        ):
+            with self.subTest(run_status=run_status):
+                runtime_summary = {
+                    'run_status': run_status,
+                    'run_table_status': run_status,
+                    'is_live': False,
+                    'expected_feedback_count': 2,
+                    'completed_feedback_count': 1,
+                    'computed_feedback_count': 1,
+                    'reused_feedback_count': 0,
+                    'stale_feedback_count': 0,
+                    'failed_items': 1,
+                    'role_progress': {
+                        'technical-summarizer': {
+                            'status': role_status,
+                            'boundary_status': role_status,
+                            'total_symbols': 2,
+                            'processed_symbols': 2,
+                            'completed_symbols': 1,
+                            'in_progress_symbols': 0,
+                            'pending_symbols': 0,
+                            'failed_items': 1,
+                        }
+                    },
+                }
+                merged = service._merge_live_retry_summary_with_persisted_progress(
+                    persisted_summary={
+                        'completed_feedback_count': 2,
+                        'computed_feedback_count': 2,
+                        'reused_feedback_count': 0,
+                        'stale_feedback_count': 1,
+                        'failed_items': 0,
+                        'role_progress': {
+                            'technical-summarizer': {
+                                'total_symbols': 200,
+                                'completed_symbols': 2,
+                                'failed_items': 0,
+                            }
+                        },
+                    },
+                    runtime_summary=runtime_summary,
+                    run_snapshot={
+                        'run_id': f'retry-run-{run_status}',
+                        'status': run_status,
+                        'started_at': None,
+                        'completed_at': datetime(2026, 9, 18, 8, 0, tzinfo=timezone.utc),
+                        'request_payload': {},
+                    },
+                )
+
+                self.assertEqual(merged['completed_feedback_count'], 1)
+                self.assertEqual(merged['failed_items'], 1)
+                self.assertEqual(merged['stale_feedback_count'], 0)
+                self.assertEqual(
+                    merged['role_progress']['technical-summarizer']['total_symbols'],
+                    2,
+                )
+                self.assertEqual(
+                    merged['role_progress']['technical-summarizer']['failed_items'],
+                    1,
+                )
 
     def test_feedback_progress_refreshes_live_run_snapshot_from_persisted_counts_without_runtime_state(self):
         fake_session = FakeProgressSession()

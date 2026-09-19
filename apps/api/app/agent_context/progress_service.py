@@ -407,6 +407,29 @@ class AgentContextProgressService:
             if isinstance(runtime_summary.get('role_progress'), dict)
             else {}
         )
+        if self._is_terminal_summary(runtime_summary) and runtime_role_progress:
+            # Final retry state is rebuilt from the parent lineage with exact
+            # per-role scopes. Keep its aggregate counts and role counts
+            # together instead of mixing them with the union-scope fallback.
+            for key in (
+                'completed_feedback_count',
+                'computed_feedback_count',
+                'reused_feedback_count',
+                'stale_feedback_count',
+                'failed_items',
+            ):
+                if runtime_summary.get(key) is not None:
+                    merged[key] = runtime_summary[key]
+            merged['role_progress'] = {
+                **role_progress,
+                **{
+                    role: dict(role_summary)
+                    for role, role_summary in runtime_role_progress.items()
+                    if isinstance(role_summary, dict)
+                },
+            }
+            return merged
+
         current_role_progress = runtime_role_progress.get(current_role)
         if current_role and isinstance(role_progress.get(current_role), dict):
             updated_role_progress = self._merge_live_retry_current_role_progress(
