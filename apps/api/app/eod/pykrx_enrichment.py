@@ -67,6 +67,13 @@ MARKET_ENRICHMENT_CATEGORIES = {
     'market_breadth',
     'investor_flow_market',
 }
+FULL_MARKET_COVERAGE_CATEGORIES = {
+    'sector_classification',
+    'market_breadth',
+    'investor_flow_market',
+    'investor_flow_symbol',
+    'short_selling',
+}
 CATEGORY_SCOPE_TYPE = {
     'sector_classification': 'symbol',
     'market_breadth': 'market',
@@ -81,7 +88,7 @@ SHORTING_SUPPORTED_MARKETS = {'KOSPI', 'KOSDAQ', 'KONEX'}
 CATEGORY_SUPPORTED_MARKETS = {
     'sector_classification': SECTOR_SUPPORTED_MARKETS,
     'investor_flow_symbol': SECTOR_SUPPORTED_MARKETS,
-    'short_selling': SECTOR_SUPPORTED_MARKETS,
+    'short_selling': SHORTING_SUPPORTED_MARKETS,
 }
 SYMBOL_INVESTOR_GROUPS: tuple[str, ...] = ('개인', '외국인', '기관합계')
 INVESTOR_FLOW_METRIC_KEYS = (
@@ -578,10 +585,14 @@ class PykrxEnrichmentService:
                 non_provider_rows = [
                     row for row in category_rows if row.get('source') != 'pykrx'
                 ]
+                supported_replace_markets = CATEGORY_SUPPORTED_MARKETS.get(
+                    category
+                )
                 replace_markets = [
                     market
                     for market in normalized_markets
-                    if market in SECTOR_SUPPORTED_MARKETS
+                    if supported_replace_markets is None
+                    or market in supported_replace_markets
                 ]
                 persisted_count = upsert_daily_pykrx_enrichment_rows(
                     rows=provider_rows,
@@ -645,12 +656,60 @@ class PykrxEnrichmentService:
                 categories_with_errors.append(category)
             category_results[category] = details
 
-        coverage = self._build_coverage_summary(
-            market_date=market_date_iso,
-            markets=normalized_markets,
-            symbols=None if use_full_market_coverage else normalized_symbols,
-            categories=resolved_categories,
-        )
+        full_market_coverage_categories = [
+            category
+            for category in resolved_categories
+            if use_full_market_coverage
+            and category in FULL_MARKET_COVERAGE_CATEGORIES
+        ]
+        requested_symbol_coverage_categories = [
+            category
+            for category in resolved_categories
+            if category not in full_market_coverage_categories
+        ]
+        coverage_parts: list[dict[str, Any]] = []
+        if full_market_coverage_categories:
+            coverage_parts.append(
+                self._build_coverage_summary(
+                    market_date=market_date_iso,
+                    markets=normalized_markets,
+                    symbols=None,
+                    categories=full_market_coverage_categories,
+                )
+            )
+        if requested_symbol_coverage_categories:
+            coverage_parts.append(
+                self._build_coverage_summary(
+                    market_date=market_date_iso,
+                    markets=normalized_markets,
+                    symbols=normalized_symbols,
+                    categories=requested_symbol_coverage_categories,
+                )
+            )
+        coverage = {
+            'market_date': market_date_iso,
+            'requested_symbol_count': max(
+                (
+                    int(part.get('requested_symbol_count') or 0)
+                    for part in coverage_parts
+                ),
+                default=0,
+            ),
+            'requested_market_count': max(
+                (
+                    int(part.get('requested_market_count') or 0)
+                    for part in coverage_parts
+                ),
+                default=0,
+            ),
+            'categories': {
+                category: payload
+                for part in coverage_parts
+                for category, payload in dict(
+                    part.get('categories') or {}
+                ).items()
+            },
+        }
         recovered_categories = [
             category
             for category, details in category_results.items()
@@ -678,7 +737,15 @@ class PykrxEnrichmentService:
             'point_in_time_recovery': point_in_time_recovery,
             'markets': normalized_markets,
             'symbols_requested': normalized_symbols or None,
-            'coverage_scope': 'full_market' if use_full_market_coverage else 'requested_symbols',
+            'coverage_scope': (
+                'mixed'
+                if full_market_coverage_categories
+                and requested_symbol_coverage_categories
+                and normalized_symbols
+                else 'full_market'
+                if full_market_coverage_categories
+                else 'requested_symbols'
+            ),
             'categories_requested': resolved_categories,
             'status': status,
             'categories': category_results,
@@ -1708,6 +1775,31 @@ class PykrxEnrichmentService:
         for market in markets:
             if market not in SHORTING_SUPPORTED_MARKETS:
                 continue
+            reference_symbols: set[str] = set()
+            if symbol_filter is None:
+                try:
+                    membership_frame = self._fetch_frame(
+                        cache=cache,
+                        cache_key=('stock_universe_membership', market_date_yyyymmdd, market),
+                        operation='stock_universe_membership',
+                        func=_market_ticker_membership_frame,
+                        require_non_empty=True,
+                        date=market_date_yyyymmdd,
+                        market=market,
+                    )
+                    reference_symbols = {
+                        _normalize_symbol(ticker)
+                        for ticker in membership_frame.index.tolist()
+                        if _normalize_symbol(ticker)
+                    }
+                except Exception as exc:
+                    errors.append(
+                        {
+                            'market': market,
+                            'operation': 'stock_universe_membership',
+                            'error': str(exc),
+                        }
+                    )
             try:
                 volume_frame = self._fetch_frame(
                     cache=cache,
@@ -1766,12 +1858,25 @@ class PykrxEnrichmentService:
                 str(item).strip().upper().zfill(6) if str(item).strip().isdigit() else str(item).strip().upper()
                 for item in volume_frame.index.tolist()
             }
+            reference_count = len(reference_symbols) if reference_symbols else None
+            reference_sha256 = (
+                _symbol_membership_sha256(reference_symbols)
+                if reference_symbols
+                else None
+            )
             for symbol in sorted(symbols_for_market):
                 if allowed_symbols and symbol not in allowed_symbols:
                     continue
                 symbol_info = symbol_meta.get(symbol) or {}
                 payload = {
                     'market': market,
+                    'universe_market_complete': bool(
+                        reference_symbols and symbols_for_market == reference_symbols
+                    ),
+                    'universe_market_row_count': len(volume_frame.index),
+                    'universe_reference_source': 'pykrx_market_ticker_list',
+                    'universe_reference_count': reference_count,
+                    'universe_reference_sha256': reference_sha256,
                     'short_volume': {
                         'short_volume': _to_int(
                             _frame_value_candidates(volume_frame, symbol, ('거래량', '공매도'), '공매도')
@@ -2108,6 +2213,64 @@ class PykrxEnrichmentService:
             if _row_market(item) in requested_stock_markets
             if str(item.get('symbol') or item.get('scope_key') or '').strip()
         }
+        requested_short_markets = set(requested_markets) & SHORTING_SUPPORTED_MARKETS
+        requested_non_sector_short_markets = (
+            requested_short_markets - SECTOR_SUPPORTED_MARKETS
+        )
+        complete_fresh_non_sector_short_markets: set[str] = set()
+        fresh_non_sector_short_symbols: set[str] = set()
+        for market in requested_non_sector_short_markets:
+            market_short_rows = [
+                item for item in fresh_short_rows if _row_market(item) == market
+            ]
+            market_short_symbols = {
+                str(item.get('symbol') or item.get('scope_key') or '').strip().upper()
+                for item in market_short_rows
+                if str(item.get('symbol') or item.get('scope_key') or '').strip()
+            }
+            reference_counts = {
+                int((item.get('payload') or {}).get('universe_reference_count') or 0)
+                for item in market_short_rows
+            }
+            reference_hashes = {
+                str((item.get('payload') or {}).get('universe_reference_sha256') or '').strip()
+                for item in market_short_rows
+            }
+            reference_sources = {
+                str((item.get('payload') or {}).get('universe_reference_source') or '').strip()
+                for item in market_short_rows
+            }
+            reported_market_row_counts = {
+                int((item.get('payload') or {}).get('universe_market_row_count') or 0)
+                for item in market_short_rows
+            }
+            completion_flags = {
+                bool((item.get('payload') or {}).get('universe_market_complete'))
+                for item in market_short_rows
+            }
+            reference_matches_short = bool(
+                market_short_symbols
+                and reference_counts == {len(market_short_symbols)}
+                and reference_hashes
+                == {_symbol_membership_sha256(market_short_symbols)}
+                and reference_sources == {'pykrx_market_ticker_list'}
+                and reported_market_row_counts == {len(market_short_symbols)}
+                and completion_flags == {True}
+            )
+            short_market_has_activity = any(
+                (_to_int(((item.get('payload') or {}).get('short_volume') or {}).get('total_volume')) or 0) > 0
+                for item in market_short_rows
+            )
+            if reference_matches_short and short_market_has_activity:
+                complete_fresh_non_sector_short_markets.add(market)
+                fresh_non_sector_short_symbols.update(market_short_symbols)
+        fresh_short_universe_available = (
+            (not requested_stock_markets or fresh_stock_universe_available)
+            and requested_non_sector_short_markets.issubset(
+                complete_fresh_non_sector_short_markets
+            )
+        )
+        fresh_short_symbols = fresh_stock_symbols | fresh_non_sector_short_symbols
         positive_volume_stock_symbols: set[str] = set()
         positive_volume_universe_available = False
         if (
@@ -2178,7 +2341,25 @@ class PykrxEnrichmentService:
                         }
                         expected_scope_keys -= unsupported_known_symbols
                     expected_rows = len(expected_scope_keys)
-                    expected_universe_source = 'explicit_requested_symbols'
+                    if (
+                        supported_markets is not None
+                        and unsupported_known_symbols == normalized_symbol_set
+                    ):
+                        expectation_status = 'not_applicable'
+                        expected_universe_source = (
+                            'explicit_requested_symbols_unsupported_markets'
+                        )
+                    else:
+                        expected_universe_source = 'explicit_requested_symbols'
+                elif (
+                    supported_markets is not None
+                    and requested_markets
+                    and not (set(requested_markets) & supported_markets)
+                ):
+                    expected_scope_keys = set()
+                    expected_rows = 0
+                    expectation_status = 'not_applicable'
+                    expected_universe_source = 'requested_markets'
                 elif category == 'sector_classification':
                     if not fresh_stock_universe_available:
                         expected_rows = None
@@ -2188,6 +2369,21 @@ class PykrxEnrichmentService:
                         expected_scope_keys = fresh_stock_symbols
                         expected_rows = len(expected_scope_keys)
                         expected_universe_source = 'fresh_pykrx_sector_classification'
+                elif category == 'short_selling':
+                    if not fresh_short_universe_available:
+                        expected_rows = None
+                        expectation_status = 'unavailable'
+                        expected_universe_source = (
+                            'fresh_pykrx_short_selling_universe_unavailable'
+                        )
+                    else:
+                        expected_scope_keys = fresh_short_symbols
+                        expected_rows = len(expected_scope_keys)
+                        expected_universe_source = (
+                            'fresh_pykrx_short_selling_universe'
+                            if requested_non_sector_short_markets
+                            else 'fresh_pykrx_sector_classification'
+                        )
                 elif category in TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES:
                     if not fresh_stock_universe_available:
                         expected_rows = None
@@ -2239,6 +2435,8 @@ class PykrxEnrichmentService:
                 'coverage_status': (
                     'unavailable'
                     if expectation_status == 'unavailable'
+                    else 'not_applicable'
+                    if expectation_status == 'not_applicable'
                     else _coverage_status(
                         present_rows=present_rows,
                         expected_rows=expected_rows,

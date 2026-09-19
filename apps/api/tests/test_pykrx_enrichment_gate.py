@@ -166,6 +166,34 @@ def test_pykrx_enrichment_preflight_waits_when_eligible_universe_is_unavailable(
     } == {'coverage_expectation_unavailable'}
 
 
+def test_pykrx_enrichment_preflight_waits_on_ambiguous_zero_row_expectation():
+    result = build_pykrx_enrichment_preflight(
+        market_date='2026-09-18',
+        coverage={
+            'categories': {
+                category: {
+                    'scope_type': 'symbol',
+                    'expected_rows': 0 if category == 'short_selling' else 2,
+                    'present_rows': 0 if category == 'short_selling' else 2,
+                    'coverage_ratio': None if category == 'short_selling' else 1.0,
+                    'coverage_status': 'missing' if category == 'short_selling' else 'complete',
+                    'expectation_status': 'available',
+                }
+                for category in (
+                    'sector_classification',
+                    'investor_flow_symbol',
+                    'short_selling',
+                )
+            },
+        },
+    )
+
+    assert result['status'] == 'waiting'
+    assert result['allowed'] is False
+    assert result['failed_categories'] == ['short_selling']
+    assert result['waiting_categories'][0]['reason'] == 'coverage_expectation_unavailable'
+
+
 def test_pykrx_enrichment_preflight_uses_row_counts_when_reported_ratio_is_stale():
     result = build_pykrx_enrichment_preflight(
         market_date='2026-04-29',

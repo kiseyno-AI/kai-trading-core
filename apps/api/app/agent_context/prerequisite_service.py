@@ -223,17 +223,34 @@ class AgentFeedbackPrerequisiteService:
         if expected_rows and expected_rows > 0:
             coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
         coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
+        expectation_status = str(
+            payload.get('expectation_status') or 'available'
+        ).strip().lower()
         missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
 
         provider_error = cls._has_pykrx_provider_error(payload)
 
-        if provider_degraded and present_rows <= 0 and (expected_rows is None or expected_rows <= 0):
+        if (
+            not missing_category_payload
+            and expectation_status == 'not_applicable'
+            and coverage_status == 'not_applicable'
+            and expected_rows is not None
+            and expected_rows <= 0
+        ):
+            gate_status = 'not_applicable'
+            reason = 'no_expected_rows_for_category'
+        elif provider_degraded and present_rows <= 0 and (expected_rows is None or expected_rows <= 0):
             gate_status = 'ready'
             reason = 'pykrx_provider_unavailable_optional_enrichment_degraded'
         elif provider_error and present_rows <= 0:
             gate_status = 'ready'
             reason = 'pykrx_provider_unavailable_optional_enrichment_degraded'
-        elif missing_category_payload or expected_rows is None or expected_rows <= 0:
+        elif (
+            missing_category_payload
+            or expectation_status == 'unavailable'
+            or expected_rows is None
+            or expected_rows <= 0
+        ):
             gate_status = 'waiting'
             reason = 'coverage_expectation_unavailable'
         elif present_rows <= 0 or coverage_status == 'missing':
@@ -400,6 +417,11 @@ class AgentFeedbackPrerequisiteService:
         ]
         blocked_categories = [item for item in gate_items if item['gate_status'] == 'blocked']
         waiting_categories = [item for item in gate_items if item['gate_status'] == 'waiting']
+        not_applicable_categories = [
+            item
+            for item in gate_items
+            if item['gate_status'] == 'not_applicable'
+        ]
         warning_categories = [
             item
             for item in gate_items
@@ -417,6 +439,7 @@ class AgentFeedbackPrerequisiteService:
             'decider_category_gates': gate_items,
             'decider_blocking_categories': blocked_categories,
             'decider_waiting_categories': waiting_categories,
+            'decider_not_applicable_categories': not_applicable_categories,
             'decider_warning_categories': warning_categories,
             'decider_category_gate_status': category_gate_status,
         }

@@ -2237,21 +2237,43 @@ class EODPipelineStatusService:
             candidate = item.get('latest_captured_at')
             if candidate and (latest_captured_at is None or str(candidate) > str(latest_captured_at)):
                 latest_captured_at = candidate
-        all_missing = bool(category_rows) and all(int(item.get('present_rows') or 0) <= 0 for item in category_rows.values())
+        applicable_category_rows = [
+            item
+            for item in category_rows.values()
+            if str(item.get('coverage_status') or '').strip().lower()
+            != 'not_applicable'
+        ]
+        all_missing = bool(applicable_category_rows) and all(
+            int(item.get('present_rows') or 0) <= 0
+            for item in applicable_category_rows
+        )
         present_count = sum(1 for item in category_rows.values() if int(item.get('present_rows') or 0) > 0)
+        not_applicable_categories = [
+            category
+            for category, item in category_rows.items()
+            if str(item.get('coverage_status') or '').strip().lower()
+            == 'not_applicable'
+        ]
+        satisfied_count = present_count + len(not_applicable_categories)
         missing_categories = [
             category
             for category, item in category_rows.items()
-            if str(item.get('coverage_status') or 'missing') == 'missing'
-            or int(item.get('present_rows') or 0) <= 0
+            if str(item.get('coverage_status') or '').strip().lower()
+            != 'not_applicable'
+            and (
+                str(item.get('coverage_status') or 'missing') == 'missing'
+                or int(item.get('present_rows') or 0) <= 0
+            )
         ]
         coverage_warning_categories = [
             category
             for category, item in category_rows.items()
-            if category not in missing_categories and str(item.get('coverage_status') or '') != 'complete'
+            if category not in missing_categories
+            and category not in not_applicable_categories
+            and str(item.get('coverage_status') or '') != 'complete'
         ]
         failed_count = len(missing_categories)
-        coverage_complete = bool(category_rows) and present_count >= total and failed_count == 0
+        coverage_complete = bool(category_rows) and satisfied_count >= total and failed_count == 0
         source_status = None
         if not category_rows or (all_missing and latest_captured_at is None):
             counts = build_stage_counts(total=total, succeeded=0, failed=0, processed=0)
@@ -2259,9 +2281,13 @@ class EODPipelineStatusService:
         else:
             counts = build_stage_counts(
                 total=total,
-                succeeded=total if coverage_complete else present_count,
+                succeeded=total if coverage_complete else satisfied_count,
                 failed=failed_count,
-                processed=total if coverage_complete else present_count + failed_count,
+                processed=(
+                    total
+                    if coverage_complete
+                    else min(satisfied_count + failed_count, total)
+                ),
             )
             if coverage_complete:
                 status = 'completed'
@@ -2326,6 +2352,7 @@ class EODPipelineStatusService:
                 'requested_market_count': coverage.get('requested_market_count'),
                 'categories': category_rows,
                 'missing_categories': missing_categories,
+                'not_applicable_categories': not_applicable_categories,
                 'coverage_warning_categories': coverage_warning_categories,
                 'progress_source': 'live_run_metadata' if progress else 'stored_rows',
                 **gate_details,

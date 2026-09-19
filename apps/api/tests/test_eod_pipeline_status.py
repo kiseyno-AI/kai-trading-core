@@ -236,6 +236,93 @@ def _incomplete_official_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_pykrx_stage_counts_not_applicable_categories_as_satisfied(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=1,
+            market_count=1,
+            updated_at='2026-09-18T15:40:00+09:00',
+        )
+        for category in (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        ):
+            coverage['categories'][category] = {
+                'scope_type': 'symbol',
+                'present_rows': 0,
+                'expected_rows': 0,
+                'coverage_ratio': None,
+                'coverage_status': 'not_applicable',
+                'expectation_status': 'not_applicable',
+                'latest_captured_at': None,
+            }
+
+        stage = EODPipelineStatusService()._build_pykrx_enrichment_stage(
+            market_date='2026-09-18',
+            coverage=coverage,
+        )
+
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['details']['missing_categories'], [])
+        self.assertEqual(stage['details']['coverage_warning_categories'], [])
+        gates = {
+            item['category']: item
+            for item in stage['details']['decider_category_gates']
+        }
+        for category in (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        ):
+            with self.subTest(category=category):
+                self.assertEqual(
+                    gates[category]['gate_status'],
+                    'not_applicable',
+                )
+
+    def test_pykrx_partial_stage_counts_not_applicable_categories_as_processed(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=1,
+            market_count=1,
+            updated_at='2026-09-18T15:40:00+09:00',
+        )
+        for category in (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        ):
+            coverage['categories'][category] = {
+                'scope_type': 'symbol',
+                'present_rows': 0,
+                'expected_rows': 0,
+                'coverage_ratio': None,
+                'coverage_status': 'not_applicable',
+                'expectation_status': 'not_applicable',
+                'latest_captured_at': None,
+            }
+        coverage['categories']['valuation_snapshot'] = {
+            'scope_type': 'symbol',
+            'present_rows': 0,
+            'expected_rows': 1,
+            'coverage_ratio': 0.0,
+            'coverage_status': 'missing',
+            'expectation_status': 'available',
+            'latest_captured_at': None,
+        }
+
+        stage = EODPipelineStatusService()._build_pykrx_enrichment_stage(
+            market_date='2026-09-18',
+            coverage=coverage,
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['total'], 7)
+        self.assertEqual(stage['succeeded'], 6)
+        self.assertEqual(stage['failed'], 1)
+        self.assertEqual(stage['processed'], 7)
+        self.assertEqual(stage['remaining'], 0)
+
     def test_official_completed_stage_with_failed_items_is_reported_partial(self):
         market_date = '2026-05-28'
         official_item = _completed_official_stage(
