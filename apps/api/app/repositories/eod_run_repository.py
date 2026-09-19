@@ -4,7 +4,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from sqlalchemy import func, select, text
 
@@ -36,6 +36,15 @@ _AUTO_DAILY_LEGACY_EOD_TRIGGERS = {
     'auto_close_scheduler',
 }
 _AUTO_DAILY_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
+_PYKRX_REPAIR_CHECKPOINT_TRIGGERS = {
+    'internal_ops_cli',
+    'manual_api',
+}
+_REQUIRED_PYKRX_REPAIR_CATEGORIES = {
+    'sector_classification',
+    'investor_flow_symbol',
+    'short_selling',
+}
 _MAX_AUTO_PRICE_RECOVERY_RUNS_PER_TRADE_DATE = 5
 # Mirrors the service admission limit without introducing a repository/service cycle.
 _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD = 5
@@ -84,6 +93,7 @@ class _PipelineRecoveryCandidate:
     status: str
     current_stage: str | None
     started_at: datetime
+    activity_at: datetime
     run_metadata: dict[str, Any]
 
 
@@ -554,6 +564,7 @@ def _load_eod_recovery_metadata(
             metadata['daily_pipeline_run_id'].as_integer().label(
                 'daily_pipeline_run_id'
             ),
+            metadata['markets'].label('markets'),
         ).where(EODCollectionRun.id.in_(tuple(candidate_by_id)))
     )
     for row in rows:
@@ -571,6 +582,7 @@ def _load_eod_recovery_metadata(
                     row.followup_recovery_required
                 ),
                 'daily_pipeline_run_id': row.daily_pipeline_run_id,
+                'markets': row.markets,
             }
         )
 
@@ -656,6 +668,11 @@ def _load_pipeline_recovery_candidates(
             DailyPipelineRun.status,
             DailyPipelineRun.current_stage,
             DailyPipelineRun.started_at,
+            func.coalesce(
+                DailyPipelineRun.completed_at,
+                DailyPipelineRun.updated_at,
+                DailyPipelineRun.started_at,
+            ).label('activity_at'),
             metadata['entrypoint'].as_string().label('entrypoint'),
             metadata['eod_collection_run_id'].as_integer().label(
                 'eod_collection_run_id'
@@ -681,6 +698,7 @@ def _load_pipeline_recovery_candidates(
             status=str(row.status or ''),
             current_stage=row.current_stage,
             started_at=row.started_at,
+            activity_at=row.activity_at,
             run_metadata={
                 'entrypoint': row.entrypoint,
                 'eod_collection_run_id': row.eod_collection_run_id,
@@ -825,6 +843,247 @@ def _followup_recovery_is_satisfied_for_convergence(
     )
 
 
+def _normalized_datetime(value: str | datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+    if not isinstance(parsed, datetime):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_market_scope(markets: Sequence[str]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                str(market).strip().upper()
+                for market in markets
+                if str(market).strip()
+            }
+        )
+    )
+
+
+def _pykrx_enrichment_repair_checkpoint_payload(
+    *,
+    pipeline_run: DailyPipelineRun,
+    stage_run: DailyPipelineStageRun,
+    trade_date: date,
+    markets: Sequence[str],
+    completed_after: datetime | None,
+) -> dict[str, Any] | None:
+    if (
+        str(pipeline_run.trigger or '').strip()
+        not in _PYKRX_REPAIR_CHECKPOINT_TRIGGERS
+        or str(pipeline_run.status or '').strip().lower() != 'completed'
+        or str(stage_run.status or '').strip().lower() != 'completed'
+        or pipeline_run.error_message is not None
+        or stage_run.error_message is not None
+        or any(
+            int(value or 0) < 0
+            for value in (
+                stage_run.processed,
+                stage_run.total,
+                stage_run.succeeded,
+                stage_run.failed,
+                stage_run.remaining,
+            )
+        )
+        or int(stage_run.total or 0) <= 0
+        or int(stage_run.processed or 0) != int(stage_run.total or 0)
+        or int(stage_run.succeeded or 0) + int(stage_run.failed or 0)
+        != int(stage_run.total or 0)
+        or int(stage_run.remaining or 0) != 0
+    ):
+        return None
+
+    run_metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, Mapping)
+        else {}
+    )
+    resolved_stages = run_metadata.get('resolved_stages')
+    if resolved_stages != ['pykrx_enrichment']:
+        return None
+
+    pipeline_completed_at = _normalized_datetime(pipeline_run.completed_at)
+    stage_completed_at = _normalized_datetime(stage_run.completed_at)
+    if (
+        pipeline_completed_at is None
+        or stage_completed_at is None
+        or completed_after is None
+        or pipeline_completed_at <= completed_after
+        or stage_completed_at <= completed_after
+        or stage_completed_at > pipeline_completed_at
+    ):
+        return None
+
+    details = (
+        stage_run.details
+        if isinstance(stage_run.details, Mapping)
+        else {}
+    )
+    result_summary = (
+        details.get('result_summary')
+        if isinstance(details.get('result_summary'), Mapping)
+        else {}
+    )
+    downstream_preflight = (
+        result_summary.get('downstream_preflight')
+        if isinstance(
+            result_summary.get('downstream_preflight'),
+            Mapping,
+        )
+        else {}
+    )
+    raw_required_categories = downstream_preflight.get(
+        'required_categories'
+    )
+    if not isinstance(raw_required_categories, list):
+        return None
+    required_categories = {
+        str(category).strip()
+        for category in raw_required_categories
+        if str(category).strip()
+    }
+    category_row_counts = (
+        downstream_preflight.get('category_row_counts')
+        if isinstance(
+            downstream_preflight.get('category_row_counts'),
+            Mapping,
+        )
+        else {}
+    )
+    expected_markets = _normalize_market_scope(markets)
+    result_markets = _normalize_market_scope(
+        result_summary.get('markets')
+        if isinstance(result_summary.get('markets'), list)
+        else ()
+    )
+    metadata_markets = _normalize_market_scope(
+        run_metadata.get('markets')
+        if isinstance(run_metadata.get('markets'), list)
+        else ()
+    )
+    if not expected_markets or not (
+        result_markets == metadata_markets == expected_markets
+    ):
+        return None
+    if (
+        str(result_summary.get('market_date') or '').strip()
+        != trade_date.isoformat()
+        or str(result_summary.get('status') or '').strip().lower()
+        != 'completed'
+        or result_summary.get('point_in_time_recovery') is not True
+        or str(result_summary.get('coverage_scope') or '').strip().lower()
+        != 'full_market'
+        or 'symbols_requested' not in result_summary
+        or result_summary.get('symbols_requested') is not None
+        or downstream_preflight.get('allowed') is not True
+        or str(downstream_preflight.get('status') or '').strip().lower()
+        != 'ready'
+        or str(downstream_preflight.get('market_date') or '').strip()
+        != trade_date.isoformat()
+        or required_categories != _REQUIRED_PYKRX_REPAIR_CATEGORIES
+        or any(
+            not _metadata_positive_int(
+                dict(category_row_counts),
+                category,
+            )
+            for category in _REQUIRED_PYKRX_REPAIR_CATEGORIES
+        )
+        or downstream_preflight.get('failed_categories') != []
+        or downstream_preflight.get('blocked_categories') != []
+        or downstream_preflight.get('waiting_categories') != []
+        or downstream_preflight.get('zero_coverage_categories') != []
+    ):
+        return None
+
+    return {
+        'pipeline_run_id': int(pipeline_run.id),
+        'stage_run_id': int(stage_run.id),
+        'market_date': trade_date.isoformat(),
+        'completed_at': stage_completed_at.isoformat(),
+        'markets': list(expected_markets),
+        'preflight_status': 'ready',
+    }
+
+
+def _load_latest_pykrx_enrichment_repair_checkpoint(
+    session: Any,
+    *,
+    trade_date: date,
+    markets: Sequence[str],
+    completed_after: str | datetime | None,
+) -> dict[str, Any] | None:
+    normalized_completed_after = _normalized_datetime(completed_after)
+    if normalized_completed_after is None:
+        return None
+    rows = session.execute(
+        select(DailyPipelineRun, DailyPipelineStageRun)
+        .join(
+            DailyPipelineStageRun,
+            DailyPipelineStageRun.pipeline_run_id == DailyPipelineRun.id,
+        )
+        .where(
+            DailyPipelineRun.market_date == trade_date,
+            DailyPipelineRun.trigger.in_(
+                sorted(_PYKRX_REPAIR_CHECKPOINT_TRIGGERS)
+            ),
+            DailyPipelineRun.status == 'completed',
+            DailyPipelineStageRun.market_date == trade_date,
+            DailyPipelineStageRun.stage_id == 'pykrx_enrichment',
+            DailyPipelineStageRun.status == 'completed',
+            DailyPipelineRun.completed_at > normalized_completed_after,
+            DailyPipelineStageRun.completed_at > normalized_completed_after,
+        )
+        .order_by(
+            DailyPipelineRun.completed_at.desc(),
+            DailyPipelineRun.id.desc(),
+        )
+    ).all()
+    for pipeline_run, stage_run in rows:
+        payload = _pykrx_enrichment_repair_checkpoint_payload(
+            pipeline_run=pipeline_run,
+            stage_run=stage_run,
+            trade_date=trade_date,
+            markets=markets,
+            completed_after=normalized_completed_after,
+        )
+        if payload is not None:
+            return payload
+    return None
+
+
+def load_latest_pykrx_enrichment_repair_checkpoint(
+    *,
+    trade_date: str | date,
+    markets: Sequence[str],
+    completed_after: str | datetime | None,
+) -> dict[str, Any] | None:
+    """Load one fresh full-market enrichment repair witness.
+
+    The witness only re-arms one exact automatic follow-up attempt. It is not
+    collection-lineage completion evidence and never clears price retry debt.
+    """
+
+    normalized_trade_date = _normalize_trade_date(trade_date)
+    with session_scope() as session:
+        return _load_latest_pykrx_enrichment_repair_checkpoint(
+            session,
+            trade_date=normalized_trade_date,
+            markets=markets,
+            completed_after=completed_after,
+        )
+
+
 def load_oldest_outstanding_auto_eod_recovery_target(
     *,
     on_or_after: str | date,
@@ -949,6 +1208,24 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                         session,
                         pipeline_run=latest_recovery,
                     )
+                ):
+                    return AutoEODRecoveryTarget(
+                        trade_date=eod_row.trade_date.isoformat(),
+                        eod_run_id=eod_row.id,
+                    )
+                repair_markets = eod_row.run_metadata.get('markets')
+                if (
+                    latest_recovery is not None
+                    and followup_attempts
+                    == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+                    and isinstance(repair_markets, list)
+                    and _load_latest_pykrx_enrichment_repair_checkpoint(
+                        session,
+                        trade_date=eod_row.trade_date,
+                        markets=repair_markets,
+                        completed_after=latest_recovery.activity_at,
+                    )
+                    is not None
                 ):
                     return AutoEODRecoveryTarget(
                         trade_date=eod_row.trade_date.isoformat(),
