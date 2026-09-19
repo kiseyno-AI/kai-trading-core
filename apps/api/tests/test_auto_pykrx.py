@@ -5521,6 +5521,11 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.count_runs',
                 return_value=5,
             ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ) as load_repair_checkpoint,
             patch('app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run') as resume_followups,
             patch.object(service, '_run_market_data_pipeline') as run_collection,
         ):
@@ -5532,8 +5537,226 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertFalse(result['triggered'])
         self.assertEqual(result['reason'], 'followup_recovery_limit_reached')
         self.assertEqual(result['followup_recovery']['attempts'], 5)
+        load_repair_checkpoint.assert_not_called()
         resume_followups.assert_not_called()
         run_collection.assert_not_called()
+
+    def test_fresh_ready_enrichment_repair_rearms_one_bounded_followup(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_eod_run = {
+            'id': 7,
+            'trade_date': '2026-04-03',
+            'status': 'failed',
+            'symbols_total': 3,
+            'symbols_succeeded': 2,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'failed_symbols': ['472220'],
+                'downstream_retry_symbols': ['005930', '000660'],
+                'downstream_retry_resume_from_stage': 'pykrx_enrichment',
+            },
+        }
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'failed',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'pykrx_enrichment',
+                    'technical_snapshots',
+                ],
+                'reused_eod_collection_run_id': 7,
+            },
+            'stages': {},
+        }
+        repair_checkpoint = {
+            'pipeline_run_id': 455,
+            'stage_run_id': 900,
+            'completed_at': '2026-04-03T09:00:00+00:00',
+            'markets': ['KOSPI'],
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=5,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=repair_checkpoint,
+            ) as load_repair_checkpoint,
+            patch.object(
+                service,
+                '_resolve_point_in_time_followup_membership',
+                return_value=(
+                    {'005930', '000660', '472220'},
+                    ('KOSPI',),
+                ),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                return_value={'status': 'completed', 'pipeline_run_id': 97},
+            ) as resume_followups,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 97,
+                    'status': 'completed',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+                return_value={
+                    'updated': True,
+                    'status': 'failed',
+                    'price_retry_pending': True,
+                },
+            ),
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                allow_safe_downstream_scope_with_price_failures=True,
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['reason'], 'incomplete_followups_resumed')
+        self.assertEqual(result['followup_recovery']['attempt'], 6)
+        self.assertEqual(
+            result['followup_recovery']['repair_checkpoint_pipeline_run_id'],
+            455,
+        )
+        recovery_call = resume_followups.call_args.kwargs
+        self.assertEqual(recovery_call['resume_from_stage'], 'pykrx_enrichment')
+        self.assertEqual(
+            recovery_call['stages'],
+            ['pykrx_enrichment', 'technical_snapshots'],
+        )
+        self.assertNotIn('price_collection', recovery_call['stages'])
+        self.assertEqual(recovery_call['symbols'], ['005930', '000660'])
+        self.assertEqual(recovery_call['reused_eod_collection_run_id'], 7)
+        self.assertTrue(recovery_call['point_in_time_recovery'])
+        load_repair_checkpoint.assert_called_once_with(
+            trade_date='2026-04-03',
+            markets=('KOSPI',),
+            completed_after='2026-04-03T08:00:00+00:00',
+        )
+
+    def test_same_day_repair_admission_uses_persisted_lineage_markets(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_eod_run = {
+            'id': 7,
+            'trade_date': '2026-04-03',
+            'status': 'failed',
+            'symbols_total': 3,
+            'symbols_succeeded': 2,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'failed_symbols': ['472220'],
+                'downstream_retry_symbols': ['005930', '000660'],
+                'downstream_retry_resume_from_stage': 'pykrx_enrichment',
+            },
+        }
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'failed',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'pykrx_enrichment',
+                    'technical_snapshots',
+                ],
+                'reused_eod_collection_run_id': 7,
+            },
+            'stages': {},
+        }
+        repair_checkpoint = {
+            'pipeline_run_id': 455,
+            'stage_run_id': 900,
+            'completed_at': '2026-04-03T09:00:00+00:00',
+            'markets': ['KOSPI'],
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=5,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=repair_checkpoint,
+            ) as load_repair_checkpoint,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                return_value={'status': 'completed', 'pipeline_run_id': 97},
+            ) as resume_followups,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 97,
+                    'status': 'completed',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+                return_value={
+                    'updated': True,
+                    'status': 'failed',
+                    'price_retry_pending': True,
+                },
+            ),
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSDAQ',),
+                allow_safe_downstream_scope_with_price_failures=True,
+                point_in_time_recovery=False,
+            )
+
+        self.assertTrue(result['triggered'])
+        load_repair_checkpoint.assert_called_once_with(
+            trade_date='2026-04-03',
+            markets=('KOSPI',),
+            completed_after='2026-04-03T08:00:00+00:00',
+        )
+        recovery_call = resume_followups.call_args.kwargs
+        self.assertEqual(recovery_call['markets'], ('KOSDAQ',))
+        self.assertNotIn('point_in_time_recovery', recovery_call)
 
     def test_old_eod_recovery_attempts_do_not_exhaust_new_eod_lineage(
         self,

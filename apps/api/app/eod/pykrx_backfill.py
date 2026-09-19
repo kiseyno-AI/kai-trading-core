@@ -64,6 +64,7 @@ from app.market_data_store import (
 from app.repositories.eod_run_repository import (
     load_automatic_daily_eod_collection_run_by_id,
     load_exact_automatic_daily_eod_collection_run,
+    load_latest_pykrx_enrichment_repair_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -1700,11 +1701,13 @@ class PykrxBackfillService:
             if isinstance(latest_eod_run.get('run_metadata'), dict)
             else {}
         )
+        lineage_markets = _point_in_time_source_markets(
+            latest_eod_metadata,
+            fallback=markets,
+        )
+        repair_markets = latest_eod_metadata.get('markets')
         recovery_markets = (
-            _point_in_time_source_markets(
-                latest_eod_metadata,
-                fallback=markets,
-            )
+            lineage_markets
             if point_in_time_recovery
             else tuple(markets)
         )
@@ -1949,8 +1952,32 @@ class PykrxBackfillService:
                 trigger=AUTO_FOLLOWUP_RECOVERY_TRIGGER,
                 reused_eod_collection_run_id=int(latest_eod_run['id']),
             )
+            repair_checkpoint: dict[str, Any] | None = None
+            repair_checkpoint_after = (
+                pipeline_run.get('completed_at')
+                or pipeline_run.get('updated_at')
+                or pipeline_run.get('started_at')
+            )
+            if (
+                recovery_attempts
+                == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                and pipeline_run.get('trigger')
+                == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+                and isinstance(repair_markets, list)
+                and repair_checkpoint_after
+            ):
+                repair_checkpoint = (
+                    load_latest_pykrx_enrichment_repair_checkpoint(
+                        trade_date=market_date,
+                        markets=tuple(repair_markets),
+                        completed_after=repair_checkpoint_after,
+                    )
+                )
         except Exception as exc:  # pragma: no cover - defensive production guard
-            logger.exception('Unable to count daily follow-up recovery attempts for %s', market_date)
+            logger.exception(
+                'Unable to inspect daily follow-up recovery admission for %s',
+                market_date,
+            )
             result = build_daily_skip_result(
                 reason='followup_recovery_state_unavailable',
                 market_date=market_date,
@@ -1963,7 +1990,11 @@ class PykrxBackfillService:
             }
             return result
 
-        if recovery_attempts >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE:
+        if (
+            recovery_attempts
+            >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+            and repair_checkpoint is None
+        ):
             result = build_daily_skip_result(
                 reason='followup_recovery_limit_reached',
                 market_date=market_date,
@@ -2183,7 +2214,10 @@ class PykrxBackfillService:
         recovery_result['source'] = 'pykrx'
         recovery_result['followup_recovery'] = {
             'attempt': recovery_attempts + 1,
-            'max_attempts': MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE,
+            'max_attempts': (
+                MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                + (1 if repair_checkpoint is not None else 0)
+            ),
             'resumed_from_pipeline_run_id': pipeline_run.get('id'),
             'reused_eod_collection_run_id': latest_eod_run.get('id'),
             'resume_from_stage': resume_from_stage,
@@ -2191,6 +2225,10 @@ class PykrxBackfillService:
             'symbols': recovery_symbols,
             'state_convergence': convergence,
         }
+        if repair_checkpoint is not None:
+            recovery_result['followup_recovery'][
+                'repair_checkpoint_pipeline_run_id'
+            ] = repair_checkpoint.get('pipeline_run_id')
         return recovery_result
 
     def _persist_successful_followup_recovery(

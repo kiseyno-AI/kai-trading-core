@@ -18,12 +18,45 @@ from app.repositories.eod_run_repository import (
     eod_collection_advisory_lock_keys,
     list_eod_collection_runs,
     load_latest_eod_collection_run,
+    load_latest_pykrx_enrichment_repair_checkpoint,
     load_automatic_daily_eod_collection_run_by_id,
     load_exact_automatic_daily_eod_collection_run,
     load_most_complete_eod_collection_run,
     load_oldest_outstanding_auto_eod_recovery_date,
     load_oldest_outstanding_auto_eod_recovery_target,
 )
+
+
+def _ready_pykrx_repair_details() -> dict:
+    return {
+        'result_summary': {
+            'market_date': '2026-09-18',
+            'status': 'completed',
+            'point_in_time_recovery': True,
+            'markets': ['KOSPI', 'KOSDAQ'],
+            'symbols_requested': None,
+            'coverage_scope': 'full_market',
+            'downstream_preflight': {
+                'market_date': '2026-09-18',
+                'status': 'ready',
+                'allowed': True,
+                'required_categories': [
+                    'sector_classification',
+                    'investor_flow_symbol',
+                    'short_selling',
+                ],
+                'category_row_counts': {
+                    'sector_classification': 2762,
+                    'investor_flow_symbol': 2565,
+                    'short_selling': 2762,
+                },
+                'failed_categories': [],
+                'blocked_categories': [],
+                'waiting_categories': [],
+                'zero_coverage_categories': [],
+            },
+        },
+    }
 
 
 class EODCollectionCoverageTests(unittest.TestCase):
@@ -1337,6 +1370,240 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
 
         self.assertEqual(convergence_result, '2026-09-08')
         self.assertEqual(failed_result, '2026-09-14')
+
+    def test_fresh_ready_enrichment_repair_rearms_one_exhausted_followup(
+        self,
+    ) -> None:
+        started_at = datetime(2026, 9, 18, tzinfo=timezone.utc)
+        with self.session_factory.begin() as session:
+            latest_eod_run = None
+            for attempt in range(5):
+                latest_eod_run = EODCollectionRun(
+                    market='KRX',
+                    trade_date=date(2026, 9, 18),
+                    source='pykrx',
+                    trigger='auto_close_scheduler',
+                    status='failed',
+                    symbols_total=5,
+                    symbols_succeeded=0,
+                    symbols_failed=5,
+                    started_at=started_at + timedelta(minutes=attempt),
+                    run_metadata={
+                        'mode': 'daily_auto',
+                        'markets': ['KOSPI', 'KOSDAQ'],
+                        'failed_symbols': [
+                            '006380',
+                            '121850',
+                            '465320',
+                            '465780',
+                            '472220',
+                        ],
+                        'downstream_retry_symbols': ['005930', '000660'],
+                        'downstream_retry_resume_from_stage': (
+                            'pykrx_enrichment'
+                        ),
+                    },
+                )
+                session.add(latest_eod_run)
+            session.flush()
+            latest_eod_run_id = int(latest_eod_run.id)
+
+            for attempt in range(5):
+                recovery_started_at = started_at + timedelta(
+                    minutes=10 + attempt
+                )
+                session.add(
+                    DailyPipelineRun(
+                        market_date=date(2026, 9, 18),
+                        trigger='auto_eod_followup_resume',
+                        status='failed',
+                        current_stage='pykrx_enrichment',
+                        started_at=recovery_started_at,
+                        completed_at=recovery_started_at + timedelta(seconds=30),
+                        run_metadata={
+                            'reused_eod_collection_run_id': latest_eod_run_id,
+                            'resolved_stages': ['pykrx_enrichment'],
+                        },
+                    )
+                )
+
+            repair_started_at = started_at + timedelta(minutes=20)
+            repair_run = DailyPipelineRun(
+                market_date=date(2026, 9, 18),
+                trigger='internal_ops_cli',
+                status='completed',
+                current_stage='pykrx_enrichment',
+                started_at=repair_started_at,
+                completed_at=repair_started_at + timedelta(minutes=1),
+                run_metadata={
+                    'resolved_stages': ['pykrx_enrichment'],
+                    'markets': ['KOSPI', 'KOSDAQ'],
+                    'point_in_time_recovery': True,
+                },
+            )
+            session.add(repair_run)
+            session.flush()
+            session.add(
+                DailyPipelineStageRun(
+                    pipeline_run_id=repair_run.id,
+                    market_date=date(2026, 9, 18),
+                    stage_id='pykrx_enrichment',
+                    status='completed',
+                    processed=7,
+                    total=7,
+                    succeeded=6,
+                    failed=1,
+                    started_at=repair_started_at,
+                    completed_at=repair_started_at + timedelta(minutes=1),
+                    details=_ready_pykrx_repair_details(),
+                )
+            )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after='2026-09-18',
+                on_or_before='2026-09-18',
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date='2026-09-18',
+                eod_run_id=latest_eod_run_id,
+            ),
+        )
+
+        with self.session_factory.begin() as session:
+            consumed_at = started_at + timedelta(minutes=22)
+            session.add(
+                DailyPipelineRun(
+                    market_date=date(2026, 9, 18),
+                    trigger='auto_eod_followup_resume',
+                    status='failed',
+                    current_stage='pykrx_enrichment',
+                    started_at=consumed_at,
+                    completed_at=consumed_at + timedelta(seconds=30),
+                    run_metadata={
+                        'reused_eod_collection_run_id': latest_eod_run_id,
+                        'resolved_stages': ['pykrx_enrichment'],
+                    },
+                )
+            )
+
+        with (
+            patch(
+                'app.repositories.eod_run_repository.session_scope',
+                self._session_scope,
+            ),
+            patch(
+                'app.repositories.eod_run_repository.'
+                '_load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value={'pipeline_run_id': 999},
+            ) as load_repair_checkpoint,
+        ):
+            consumed_target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after='2026-09-18',
+                on_or_before='2026-09-18',
+            )
+
+        self.assertIsNone(consumed_target)
+        load_repair_checkpoint.assert_not_called()
+
+    def test_repair_checkpoint_requires_fresh_stage_and_parent(self) -> None:
+        cutoff = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+        with self.session_factory.begin() as session:
+            repair_run = DailyPipelineRun(
+                market_date=date(2026, 9, 18),
+                trigger='internal_ops_cli',
+                status='completed',
+                current_stage='pykrx_enrichment',
+                started_at=cutoff - timedelta(minutes=10),
+                completed_at=cutoff + timedelta(minutes=10),
+                run_metadata={
+                    'resolved_stages': ['pykrx_enrichment'],
+                    'markets': ['KOSPI', 'KOSDAQ'],
+                    'point_in_time_recovery': True,
+                },
+            )
+            session.add(repair_run)
+            session.flush()
+            repair_stage = DailyPipelineStageRun(
+                pipeline_run_id=repair_run.id,
+                market_date=date(2026, 9, 18),
+                stage_id='pykrx_enrichment',
+                status='completed',
+                processed=7,
+                total=7,
+                succeeded=6,
+                failed=1,
+                started_at=cutoff - timedelta(minutes=10),
+                completed_at=cutoff - timedelta(minutes=1),
+                details=_ready_pykrx_repair_details(),
+            )
+            session.add(repair_stage)
+            session.flush()
+            repair_stage_id = int(repair_stage.id)
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            checkpoint = load_latest_pykrx_enrichment_repair_checkpoint(
+                trade_date='2026-09-18',
+                markets=('KOSPI', 'KOSDAQ'),
+                completed_after=cutoff,
+            )
+
+        self.assertIsNone(checkpoint)
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            invalid_cutoff_checkpoint = (
+                load_latest_pykrx_enrichment_repair_checkpoint(
+                    trade_date='2026-09-18',
+                    markets=('KOSPI', 'KOSDAQ'),
+                    completed_after='not-a-timestamp',
+                )
+            )
+
+        self.assertIsNone(invalid_cutoff_checkpoint)
+
+        with self.session_factory.begin() as session:
+            repair_stage = session.get(
+                DailyPipelineStageRun,
+                repair_stage_id,
+            )
+            repair_stage.completed_at = cutoff + timedelta(minutes=5)
+            malformed_details = dict(repair_stage.details or {})
+            malformed_summary = dict(
+                malformed_details.get('result_summary') or {}
+            )
+            malformed_preflight = dict(
+                malformed_summary.get('downstream_preflight') or {}
+            )
+            malformed_preflight['required_categories'] = None
+            malformed_summary['downstream_preflight'] = malformed_preflight
+            malformed_details['result_summary'] = malformed_summary
+            repair_stage.details = malformed_details
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            malformed_checkpoint = (
+                load_latest_pykrx_enrichment_repair_checkpoint(
+                    trade_date='2026-09-18',
+                    markets=('KOSPI', 'KOSDAQ'),
+                    completed_after=cutoff,
+                )
+            )
+
+        self.assertIsNone(malformed_checkpoint)
 
     def test_exhausted_satisfied_interrupted_or_running_followup_allows_convergence(
         self,
