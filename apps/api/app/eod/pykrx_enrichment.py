@@ -2496,6 +2496,7 @@ class PykrxEnrichmentService:
             trade_date=market_date,
             source='pykrx',
             statuses=['completed'],
+            statement_timeout_ms=PYKRX_ENRICHMENT_READ_TIMEOUT_MS,
         )
         if latest_run is not None:
             persisted_symbols = load_eod_run_persisted_symbols(

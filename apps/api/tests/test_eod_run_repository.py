@@ -17,6 +17,7 @@ from app.repositories.eod_run_repository import (
     create_eod_collection_run,
     eod_collection_advisory_lock_keys,
     list_eod_collection_runs,
+    load_latest_eod_collection_run,
     load_automatic_daily_eod_collection_run_by_id,
     load_exact_automatic_daily_eod_collection_run,
     load_most_complete_eod_collection_run,
@@ -26,6 +27,48 @@ from app.repositories.eod_run_repository import (
 
 
 class EODCollectionCoverageTests(unittest.TestCase):
+    def test_list_eod_runs_uses_explicit_statement_timeout(self):
+        session = MagicMock()
+        session.execute.return_value.scalars.return_value = []
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            return_value=session_context,
+        ) as session_scope_mock:
+            rows = list_eod_collection_runs(
+                market='KRX',
+                trade_date='2026-09-18',
+                statement_timeout_ms=15_000,
+            )
+
+        self.assertEqual(rows, [])
+        session_scope_mock.assert_called_once_with(statement_timeout_ms=15_000)
+
+    def test_latest_eod_run_forwards_explicit_statement_timeout(self):
+        with patch(
+            'app.repositories.eod_run_repository.list_eod_collection_runs',
+            return_value=[{'id': 522}],
+        ) as list_runs_mock:
+            result = load_latest_eod_collection_run(
+                market='KRX',
+                trade_date='2026-09-18',
+                source='pykrx',
+                statuses=['completed'],
+                statement_timeout_ms=15_000,
+            )
+
+        self.assertEqual(result, {'id': 522})
+        list_runs_mock.assert_called_once_with(
+            market='KRX',
+            trade_date='2026-09-18',
+            source='pykrx',
+            statuses=['completed'],
+            limit=1,
+            statement_timeout_ms=15_000,
+        )
+
     def test_persisted_symbol_count_is_distinct_and_trade_date_scoped(self):
         scalar_result = MagicMock()
         scalar_result.scalar_one.return_value = 3
