@@ -1368,6 +1368,7 @@ class DailyPipelineStageService:
                 'market_date': market_date,
                 'markets': markets,
                 'symbols': symbols,
+                'use_full_market_coverage': True,
             }
             if point_in_time_recovery:
                 enrichment_kwargs['point_in_time_recovery'] = True

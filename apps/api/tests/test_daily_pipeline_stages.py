@@ -573,6 +573,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             market_date='2026-09-11',
             markets=['KOSPI'],
             symbols=['099999'],
+            use_full_market_coverage=True,
             point_in_time_recovery=True,
         )
         self.assertEqual(price_derived_result['snapshots_persisted'], 1)
@@ -1924,6 +1925,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['technical_snapshots']['status'], 'partial')
         self.assertEqual(result['stages']['pykrx_enrichment']['status'], 'completed')
         enrichment_service.collect_for_market_date.assert_called_once()
+        self.assertTrue(
+            enrichment_service.collect_for_market_date.call_args.kwargs[
+                'use_full_market_coverage'
+            ]
+        )
 
     def test_grouped_price_context_failure_marks_technical_stage_partial(
         self,

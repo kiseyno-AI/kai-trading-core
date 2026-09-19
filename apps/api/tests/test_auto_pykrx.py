@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+import time
 from types import SimpleNamespace
 from contextlib import ExitStack, contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -17,8 +19,12 @@ from app.eod.pykrx_backfill import (
     PYKRX_STAGE_SEQUENCE,
     PykrxBackfillService,
     PykrxSymbol,
+    _call_pykrx,
 )
-from app.eod.pykrx_import import suppress_pykrx_login_env
+from app.eod.pykrx_import import (
+    pykrx_request_credentials_visible,
+    suppress_pykrx_login_env,
+)
 from app.eod.market_membership import (
     build_market_membership_snapshot,
     validate_market_membership_snapshot,
@@ -434,6 +440,201 @@ class _FakeDeduplicatingDailyPipelineRunStateService(_FakeDailyPipelineRunStateS
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_call_pykrx_applies_timeout_to_session_requests(self) -> None:
+        observed_timeouts: list[object] = []
+
+        def fake_request(_session, _method, _url, **kwargs):
+            observed_timeouts.append(kwargs.get('timeout'))
+            return SimpleNamespace()
+
+        def provider_call():
+            from pykrx.website.comm import webio as pykrx_webio
+
+            return pykrx_webio.requests.Session().get(
+                'https://example.test/pykrx'
+            )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.settings.eod_pykrx_request_timeout_seconds',
+                7,
+            ),
+            patch('requests.sessions.Session.request', new=fake_request),
+        ):
+            _call_pykrx(provider_call)
+
+        self.assertEqual(observed_timeouts, [7])
+
+    def test_call_pykrx_preserves_explicit_timeout_for_authenticated_post(self) -> None:
+        observed_timeouts: list[object] = []
+
+        class FakeSession:
+            def post(self, _url, **kwargs):
+                observed_timeouts.append(kwargs.get('timeout'))
+                return SimpleNamespace()
+
+        fake_krx_session = SimpleNamespace(
+            session=FakeSession(),
+            get_headers=lambda: {},
+        )
+        original_get_session = lambda: fake_krx_session
+        fake_webio = SimpleNamespace(
+            requests=SimpleNamespace(Session=lambda: FakeSession()),
+            get_session=original_get_session,
+        )
+
+        def provider_call():
+            return fake_webio.get_session().session.post(
+                'https://example.test/pykrx',
+                timeout=3,
+            )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.settings.eod_pykrx_request_timeout_seconds',
+                7,
+            ),
+            patch(
+                'app.eod.pykrx_import.import_pykrx_webio',
+                return_value=fake_webio,
+            ),
+        ):
+            _call_pykrx(provider_call)
+
+        self.assertEqual(observed_timeouts, [3])
+        self.assertIs(fake_webio.get_session, original_get_session)
+
+    def test_call_pykrx_applies_timeout_to_module_level_get_and_post(self) -> None:
+        observed_timeouts: list[object] = []
+
+        def record_request(_url, **kwargs):
+            observed_timeouts.append(kwargs.get('timeout'))
+            return SimpleNamespace()
+
+        original_requests = SimpleNamespace(
+            Session=lambda: SimpleNamespace(),
+            get=record_request,
+            post=record_request,
+        )
+        original_get_session = lambda: None
+        fake_webio = SimpleNamespace(
+            requests=original_requests,
+            get_session=original_get_session,
+        )
+
+        def provider_call():
+            fake_webio.requests.get('https://example.test/pykrx-get')
+            fake_webio.requests.post(
+                'https://example.test/pykrx-post',
+                timeout=3,
+            )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.settings.eod_pykrx_request_timeout_seconds',
+                7,
+            ),
+            patch(
+                'app.eod.pykrx_import.import_pykrx_webio',
+                return_value=fake_webio,
+            ),
+        ):
+            _call_pykrx(provider_call)
+
+        self.assertEqual(observed_timeouts, [7, 3])
+        self.assertIs(fake_webio.requests, original_requests)
+        self.assertIs(fake_webio.get_session, original_get_session)
+
+    def test_call_pykrx_supports_legacy_webio_without_get_session(self) -> None:
+        observed_timeouts: list[object] = []
+
+        def record_get(_url, **kwargs):
+            observed_timeouts.append(kwargs.get('timeout'))
+            return SimpleNamespace()
+
+        original_requests = SimpleNamespace(
+            Session=lambda: SimpleNamespace(),
+            get=record_get,
+            post=lambda *_args, **_kwargs: SimpleNamespace(),
+        )
+        fake_webio = SimpleNamespace(requests=original_requests)
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.settings.eod_pykrx_request_timeout_seconds',
+                7,
+            ),
+            patch(
+                'app.eod.pykrx_import.import_pykrx_webio',
+                return_value=fake_webio,
+            ),
+        ):
+            _call_pykrx(
+                lambda: fake_webio.requests.get(
+                    'https://example.test/legacy-pykrx'
+                )
+            )
+
+        self.assertEqual(observed_timeouts, [7])
+        self.assertIs(fake_webio.requests, original_requests)
+        self.assertFalse(hasattr(fake_webio, 'get_session'))
+
+    def test_pykrx_login_env_suppression_is_serialized_across_threads(self) -> None:
+        worker_count = 8
+        barrier = threading.Barrier(worker_count)
+
+        def worker() -> None:
+            barrier.wait()
+            with suppress_pykrx_login_env():
+                time.sleep(0.005)
+
+        with patch.dict(
+            os.environ,
+            {'KRX_ID': 'test-id', 'KRX_PW': 'test-password'},
+        ):
+            threads = [threading.Thread(target=worker) for _ in range(worker_count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(os.environ.get('KRX_ID'), 'test-id')
+            self.assertEqual(os.environ.get('KRX_PW'), 'test-password')
+
+    def test_provider_request_waits_for_import_suppression_to_restore_credentials(self) -> None:
+        suppression_entered = threading.Event()
+        provider_called = threading.Event()
+        observed_credentials: list[tuple[str | None, str | None]] = []
+
+        def suppressor() -> None:
+            with suppress_pykrx_login_env():
+                suppression_entered.set()
+                time.sleep(0.03)
+
+        def requester() -> None:
+            suppression_entered.wait(timeout=1)
+            with pykrx_request_credentials_visible():
+                observed_credentials.append(
+                    (os.environ.get('KRX_ID'), os.environ.get('KRX_PW'))
+                )
+                provider_called.set()
+
+        with patch.dict(
+            os.environ,
+            {'KRX_ID': 'test-id', 'KRX_PW': 'test-password'},
+        ):
+            suppress_thread = threading.Thread(target=suppressor)
+            request_thread = threading.Thread(target=requester)
+            suppress_thread.start()
+            request_thread.start()
+            suppression_entered.wait(timeout=1)
+            self.assertFalse(provider_called.wait(timeout=0.005))
+            suppress_thread.join(timeout=2)
+            request_thread.join(timeout=2)
+
+        self.assertEqual(observed_credentials, [('test-id', 'test-password')])
+
     def setUp(self) -> None:
         self.current_krx_date_patcher = patch(
             'app.eod.pykrx_backfill._current_krx_calendar_date',
@@ -500,6 +701,18 @@ class PykrxBackfillServiceTests(TestCase):
                 os.environ.pop('KRX_PW', None)
             else:
                 os.environ['KRX_PW'] = original_pw
+
+    def test_pykrx_requests_preserve_configured_krx_credentials(self) -> None:
+        def authenticated_provider():
+            return os.environ.get('KRX_ID'), os.environ.get('KRX_PW')
+
+        with patch.dict(
+            os.environ,
+            {'KRX_ID': 'test-id', 'KRX_PW': 'test-password'},
+        ):
+            result = _call_pykrx(authenticated_provider)
+
+        self.assertEqual(result, ('test-id', 'test-password'))
 
     def test_extract_result_counts_reads_agent_feedback_progress_summary(self) -> None:
         result = {
@@ -1181,6 +1394,7 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-09-11',
             markets=('KOSPI',),
             symbols=['099999'],
+            use_full_market_coverage=True,
             point_in_time_recovery=True,
         )
         rebuild_piotroski.assert_called_once_with(market_date='2026-09-11')
@@ -6977,6 +7191,7 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-04-03',
             markets=('KOSPI',),
             symbols=['005930'],
+            use_full_market_coverage=True,
         )
         price_contexts.assert_called_once_with(
             market_date='2026-04-03',

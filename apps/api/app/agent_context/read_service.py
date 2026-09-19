@@ -6222,11 +6222,32 @@ def _build_short_selling_context(
         }
 
     payload = _maybe_dict(short_row.get('payload'))
-    missing_fields: list[str] = []
-    if not _maybe_dict(payload.get('short_volume')):
-        missing_fields.append('short_volume')
-    if not _maybe_dict(payload.get('short_balance')):
-        missing_fields.append('short_balance')
+    short_volume = _maybe_dict(payload.get('short_volume'))
+    short_balance = _maybe_dict(payload.get('short_balance'))
+    missing_fields = [
+        str(item)
+        for item in (payload.get('missing_fields') or [])
+        if str(item).strip()
+    ]
+    metric_groups = (
+        ('short_volume', short_volume, ('short_volume', 'total_volume', 'short_volume_ratio_pct')),
+        ('short_value', short_volume, ('short_value', 'total_value', 'short_value_ratio_pct')),
+        (
+            'short_balance',
+            short_balance,
+            (
+                'short_balance_qty',
+                'listed_shares',
+                'short_balance_amount',
+                'market_cap',
+                'short_balance_ratio_pct',
+            ),
+        ),
+    )
+    for group_name, group_payload, required_keys in metric_groups:
+        if any(group_payload.get(key) is None for key in required_keys):
+            missing_fields.append(group_name)
+    missing_fields = list(dict.fromkeys(missing_fields))
     return {
         'status': 'available' if not missing_fields else 'partial',
         **payload,

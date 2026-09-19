@@ -126,6 +126,46 @@ def test_pykrx_enrichment_preflight_blocks_low_partial_required_category_coverag
     assert result['warning_categories'] == []
 
 
+def test_pykrx_enrichment_preflight_waits_when_eligible_universe_is_unavailable():
+    result = build_pykrx_enrichment_preflight(
+        market_date='2026-09-18',
+        coverage={
+            'categories': {
+                'sector_classification': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 2,
+                    'present_rows': 2,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
+                'investor_flow_symbol': {
+                    'scope_type': 'symbol',
+                    'expected_rows': None,
+                    'present_rows': 0,
+                    'coverage_ratio': None,
+                    'coverage_status': 'unavailable',
+                    'expectation_status': 'unavailable',
+                },
+                'short_selling': {
+                    'scope_type': 'symbol',
+                    'expected_rows': None,
+                    'present_rows': 0,
+                    'coverage_ratio': None,
+                    'coverage_status': 'unavailable',
+                    'expectation_status': 'unavailable',
+                },
+            },
+        },
+    )
+
+    assert result['status'] == 'waiting'
+    assert result['allowed'] is False
+    assert result['failed_categories'] == ['investor_flow_symbol', 'short_selling']
+    assert {
+        item['reason'] for item in result['waiting_categories']
+    } == {'coverage_expectation_unavailable'}
+
+
 def test_pykrx_enrichment_preflight_uses_row_counts_when_reported_ratio_is_stale():
     result = build_pykrx_enrichment_preflight(
         market_date='2026-04-29',

@@ -1135,6 +1135,102 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
             session.execute(delete(DailyPykrxEnrichmentRow).where(DailyPykrxEnrichmentRow.scope_key.in_(self.symbols)))
             session.execute(delete(Symbol).where(Symbol.symbol == '661503'))
 
+    def test_full_market_replace_removes_omitted_old_pykrx_rows_atomically(self) -> None:
+        def short_row(symbol: str, total_volume: int) -> dict:
+            return {
+                'market_date': '2026-09-18',
+                'market': 'KOSPI',
+                'category': 'short_selling',
+                'scope_type': 'symbol',
+                'scope_key': symbol,
+                'source': 'pykrx',
+                'symbol': symbol,
+                'name_ko': symbol,
+                'payload': {
+                    'short_volume': {
+                        'short_volume': 0,
+                        'total_volume': total_volume,
+                        'short_volume_ratio_pct': 0.0,
+                    }
+                },
+            }
+
+        upsert_daily_pykrx_enrichment_rows(
+            rows=[short_row('661501', 0), short_row('661502', 0)]
+        )
+
+        upsert_daily_pykrx_enrichment_rows(
+            rows=[short_row('661501', 10)],
+            replace_scopes=[
+                {
+                    'market_date': '2026-09-18',
+                    'market': 'KOSPI',
+                    'category': 'short_selling',
+                    'source': 'pykrx',
+                }
+            ],
+        )
+
+        rows = load_daily_pykrx_enrichment_rows(
+            market_date='2026-09-18',
+            categories=['short_selling'],
+            markets=['KOSPI'],
+            symbols=['661501', '661502'],
+            source='pykrx',
+            limit=None,
+        )
+        self.assertEqual([row['symbol'] for row in rows], ['661501'])
+
+    def test_full_market_replace_rolls_back_delete_when_insert_fails(self) -> None:
+        def short_row(symbol: str, total_volume: int) -> dict:
+            return {
+                'market_date': '2026-09-18',
+                'market': 'KOSPI',
+                'category': 'short_selling',
+                'scope_type': 'symbol',
+                'scope_key': symbol,
+                'source': 'pykrx',
+                'symbol': symbol,
+                'name_ko': symbol,
+                'payload': {
+                    'short_volume': {
+                        'short_volume': 0,
+                        'total_volume': total_volume,
+                        'short_volume_ratio_pct': 0.0,
+                    }
+                },
+            }
+
+        old_rows = [short_row('661501', 5), short_row('661502', 7)]
+        upsert_daily_pykrx_enrichment_rows(rows=old_rows)
+        duplicate = short_row('661501', 10)
+
+        with self.assertRaises(Exception):
+            upsert_daily_pykrx_enrichment_rows(
+                rows=[duplicate, duplicate],
+                replace_scopes=[
+                    {
+                        'market_date': '2026-09-18',
+                        'market': 'KOSPI',
+                        'category': 'short_selling',
+                        'source': 'pykrx',
+                    }
+                ],
+            )
+
+        rows = load_daily_pykrx_enrichment_rows(
+            market_date='2026-09-18',
+            categories=['short_selling'],
+            markets=['KOSPI'],
+            symbols=['661501', '661502'],
+            source='pykrx',
+            limit=None,
+        )
+        self.assertEqual(
+            {row['symbol']: row['payload']['short_volume']['total_volume'] for row in rows},
+            {'661501': 5, '661502': 7},
+        )
+
     def test_point_in_time_enrichment_preserves_inactive_current_symbol_state(
         self,
     ) -> None:

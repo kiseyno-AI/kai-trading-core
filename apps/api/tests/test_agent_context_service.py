@@ -24,6 +24,7 @@ from app.agent_context.read_service import (
     _build_quote_context,
     _build_quote_freshness_provenance,
     _build_recent_dart_events_context,
+    _build_short_selling_context,
     _build_recent_disclosures_freshness_provenance,
     _build_us_market_session_metadata,
     _historical_external_news_knowledge_cutoff_at,
@@ -38,6 +39,35 @@ EMPTY_LATEST_PRIOR_ROWS = {
     'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
     'signal_features': {},
 }
+
+
+class ShortSellingContextQualityTests(unittest.TestCase):
+    def test_empty_optional_metric_groups_remain_partial(self) -> None:
+        context = _build_short_selling_context(
+            {
+                'payload': {
+                    'short_volume': {
+                        'short_volume': 100,
+                        'total_volume': 1000,
+                        'short_volume_ratio_pct': 10.0,
+                        'short_value': None,
+                        'total_value': None,
+                        'short_value_ratio_pct': None,
+                    },
+                    'short_balance': {
+                        'short_balance_qty': None,
+                        'listed_shares': None,
+                        'short_balance_amount': None,
+                        'market_cap': None,
+                        'short_balance_ratio_pct': None,
+                    },
+                    'missing_fields': ['short_value', 'short_balance'],
+                }
+            }
+        )
+
+        self.assertEqual(context['status'], 'partial')
+        self.assertEqual(context['missing_fields'], ['short_value', 'short_balance'])
 
 
 def _fresh_provenance() -> dict[str, object]:
