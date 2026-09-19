@@ -159,6 +159,7 @@ def load_latest_eod_collection_run(
     trade_date: str,
     source: str | None = None,
     statuses: Sequence[str] | None = None,
+    statement_timeout_ms: int | None = None,
 ) -> dict | None:
     rows = list_eod_collection_runs(
         market=market,
@@ -166,6 +167,7 @@ def load_latest_eod_collection_run(
         source=source,
         statuses=statuses,
         limit=1,
+        statement_timeout_ms=statement_timeout_ms,
     )
     if not rows:
         return None
@@ -180,8 +182,14 @@ def list_eod_collection_runs(
     statuses: Sequence[str] | None = None,
     excluded_run_metadata_modes: Sequence[str] | None = None,
     limit: int = 10,
+    statement_timeout_ms: int | None = None,
 ) -> list[dict[str, Any]]:
-    with session_scope() as session:
+    session_options = (
+        {'statement_timeout_ms': statement_timeout_ms}
+        if statement_timeout_ms is not None
+        else {}
+    )
+    with session_scope(**session_options) as session:
         stmt = select(EODCollectionRun).where(
             EODCollectionRun.market == market,
             EODCollectionRun.trade_date == _parse_trade_date(trade_date),

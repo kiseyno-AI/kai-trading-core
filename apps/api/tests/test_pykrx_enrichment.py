@@ -2509,7 +2509,10 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         ]
 
         with (
-            patch('app.eod.pykrx_enrichment.load_latest_eod_collection_run', return_value={'id': 42}),
+            patch(
+                'app.eod.pykrx_enrichment.load_latest_eod_collection_run',
+                return_value={'id': 42},
+            ) as latest_run_mock,
             patch(
                 'app.eod.pykrx_enrichment.load_eod_run_persisted_symbols',
                 return_value=['005930', '000660'],
@@ -2540,6 +2543,13 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         )
         persisted_symbols_mock.assert_called_once_with(
             42,
+            statement_timeout_ms=15_000,
+        )
+        latest_run_mock.assert_called_once_with(
+            market='KRX',
+            trade_date='2026-04-21',
+            source='pykrx',
+            statuses=['completed'],
             statement_timeout_ms=15_000,
         )
         coverage = result['coverage']['categories']['short_selling']
