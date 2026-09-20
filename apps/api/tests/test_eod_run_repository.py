@@ -1261,6 +1261,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
     ) -> None:
         market_date = date(2026, 9, 18)
         started_at = datetime(2026, 9, 20, tzinfo=timezone.utc)
+        summary_child_run_id = 'feedback-cycle-2026-09-18-cafebabe00'
         child_run_id = 'feedback-cycle-2026-09-18-deadbeef01'
         lease_loss_error = (
             f'feedback retry lease ownership lost for {child_run_id} at '
@@ -1375,7 +1376,9 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         remaining=0,
                         started_at=started_at + timedelta(minutes=5),
                         completed_at=started_at + timedelta(minutes=5),
-                        source_run_ids={'run_id': 'summary-run'},
+                        source_run_ids={
+                            'agent_feedback_run_id': summary_child_run_id
+                        },
                         details={'result_summary': {'status': 'completed'}},
                     ),
                     DailyPipelineStageRun(
@@ -1416,6 +1419,60 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         for stage_id in suffix[2:]
                     ],
                 ]
+            )
+            session.add(
+                AgentContextFeedbackRun(
+                    run_id=summary_child_run_id,
+                    market_date=market_date,
+                    status='completed',
+                    symbols_total=3,
+                    completed_count=3,
+                    failed_count=0,
+                    request_payload={
+                        'market_date': market_date.isoformat(),
+                        'request_run_id': summary_child_run_id,
+                        'mode': 'daily_retry_cycle_role_sequenced',
+                        'roles': [
+                            'eod-summarizer',
+                            'technical-summarizer',
+                            'fundamental-summarizer',
+                        ],
+                        'requested_symbols': ['005930'],
+                        'feedback_scope_mode': (
+                            'broad_feedback_universe'
+                        ),
+                        'admission_scope_by_role': {
+                            'eod-summarizer': ['005930'],
+                            'technical-summarizer': ['005930'],
+                            'fundamental-summarizer': ['005930'],
+                        },
+                        'role_symbol_scopes': {
+                            'eod-summarizer': ['005930'],
+                            'technical-summarizer': ['005930'],
+                            'fundamental-summarizer': ['005930'],
+                        },
+                        'role_symbol_counts': {
+                            'eod-summarizer': 1,
+                            'technical-summarizer': 1,
+                            'fundamental-summarizer': 1,
+                        },
+                        'fs_div': 'CFS',
+                        'reuse_existing': True,
+                        'force_recompute': False,
+                        'knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                        'admission_knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                        'requested_knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                    },
+                    summary_payload={},
+                    started_at=started_at + timedelta(minutes=4),
+                    completed_at=started_at + timedelta(minutes=5),
+                )
             )
             session.add(
                 AgentContextFeedbackRun(
@@ -1720,6 +1777,34 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 eod_run_id=eod_run_id,
             ),
         )
+
+        with self.session_factory.begin() as session:
+            summary_child_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id
+                    == summary_child_run_id
+                )
+            ).scalar_one()
+            summary_child_run.failed_count = 1
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            invalid_recorded_child_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(invalid_recorded_child_target)
+        with self.session_factory.begin() as session:
+            summary_child_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id
+                    == summary_child_run_id
+                )
+            ).scalar_one()
+            summary_child_run.failed_count = 0
 
         advanced_interrupted_at = interrupted_at + timedelta(minutes=1)
         advanced_child_run_id = 'feedback-cycle-2026-09-18-feedface02'

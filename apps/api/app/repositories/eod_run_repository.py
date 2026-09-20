@@ -935,12 +935,11 @@ def _terminal_continuation_lease_loss_child_is_valid(
     ) is None
 
 
-def _terminal_continuation_advanced_prefix_evidence_is_valid(
+def _terminal_continuation_satisfied_prefix_evidence_is_valid(
     session: Any,
     *,
     pipeline_run: _PipelineRecoveryCandidate,
     satisfied_prefix: Sequence[str],
-    persisted_prefix_size: int,
     stage_rows_by_id: Mapping[str, DailyPipelineStageRun],
 ) -> bool:
     metadata = pipeline_run.run_metadata
@@ -958,7 +957,7 @@ def _terminal_continuation_advanced_prefix_evidence_is_valid(
         'agent_feedback_summaries',
         'signal_decider',
     }
-    for stage_id in satisfied_prefix[persisted_prefix_size:]:
+    for stage_id in satisfied_prefix:
         stage_row = stage_rows_by_id[stage_id]
         stage_status = str(stage_row.status or '').strip().lower()
         if stage_status == 'skipped':
@@ -1316,11 +1315,10 @@ def _followup_recovery_is_resumable_terminal_continuation(
         metadata_prefix_size += 1
     if metadata_prefix_size > len(satisfied_prefix):
         return False
-    if not _terminal_continuation_advanced_prefix_evidence_is_valid(
+    if not _terminal_continuation_satisfied_prefix_evidence_is_valid(
         session,
         pipeline_run=pipeline_run,
         satisfied_prefix=satisfied_prefix,
-        persisted_prefix_size=metadata_prefix_size,
         stage_rows_by_id=stage_rows_by_id,
     ):
         return False
