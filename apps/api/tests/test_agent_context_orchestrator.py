@@ -6094,6 +6094,220 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(market_context_builder.calls, ['2026-04-14'] * 3)
         self.assertEqual(result['summary']['completed'], 4)
 
+    def test_forced_short_term_redispatch_uses_stable_previous_decision_generation(self):
+        service = AgentFeedbackOrchestrator()
+        client = SignalDeciderBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+        market_context_builder = FakeMarketContextBuilder(
+            {
+                'status': 'ready',
+                'market_date': '2026-04-14',
+                'summary': {'market_bias': 'risk_on'},
+                'flows': {},
+                'missing_fields': [],
+            }
+        )
+        mutate_previous_context = False
+        decision_lookup_count = 0
+        decision_lookup_calls = []
+
+        def build_latest_decisions(**kwargs):
+            nonlocal decision_lookup_count
+            roles = tuple(kwargs['roles'])
+            if set(roles) == set(orchestrator_module.UPSTREAM_SUMMARY_ROLES):
+                return {
+                    '005930': {
+                        role: SimpleNamespace(
+                            should_dispatch=False,
+                            reason='reuse_latest_feedback',
+                            latest_feedback={
+                                'id': len(role),
+                                'market_date': '2026-04-14',
+                                'symbol': '005930',
+                                'agent_name': role,
+                                'run_id': f'upstream-{role}',
+                                'received_at': '2026-04-14T00:30:00+00:00',
+                                'feedback_payload': {
+                                    'role': role,
+                                    'summary': f'{role} summary',
+                                    'confidence': 0.7,
+                                    'risk_flags': [],
+                                    'details': {},
+                                    'improvement_notes': [],
+                                },
+                            },
+                        )
+                        for role in roles
+                    }
+                }
+            if roles == ('short-term-decider',):
+                decision_lookup_count += 1
+                decision_lookup_calls.append(dict(kwargs))
+                prior_feedback_id = (
+                    502
+                    if mutate_previous_context
+                    and decision_lookup_count > 1
+                    else 501
+                )
+                return {
+                    '005930': {
+                        'short-term-decider': SimpleNamespace(
+                            should_dispatch=True,
+                            reason='forced_recompute',
+                            latest_feedback={
+                                'id': prior_feedback_id,
+                                'market_date': '2026-04-13',
+                                'symbol': '005930',
+                                'agent_name': 'short-term-decider',
+                                'run_id': 'prior-short-term-run',
+                                'received_at': '2026-04-13T06:00:00+00:00',
+                                'feedback_payload': {
+                                    'role': 'short-term-decider',
+                                    'tactical_action': 'wait',
+                                    'preferred_action': 'wait',
+                                    'summary': 'Wait for a cleaner trigger.',
+                                    'confidence_score_10': 5,
+                                },
+                            },
+                        )
+                    }
+                }
+            return {}
+
+        reuse_service = SimpleNamespace(
+            build_latest_decisions=build_latest_decisions
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'agent_context_read_service',
+                DeciderReadyAgentContextReadService(),
+            ):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_reuse_service',
+                    reuse_service,
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_feedback_service',
+                        feedback_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_context_feedback_failure_service',
+                            failure_service,
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'agent_context_feedback_run_state_service',
+                                run_state_service,
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'agent_feedback_session_cleanup_service',
+                                    cleanup_service,
+                                ):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'signal_decider_market_context_builder',
+                                        market_context_builder,
+                                    ):
+                                        with _patch_feedback_eligibility(
+                                            '005930'
+                                        ):
+                                            with patch.object(
+                                                service,
+                                                '_load_post_decision_material_context_failures',
+                                                return_value={},
+                                            ):
+                                                result = service.dispatch_for_symbols(
+                                                    market_date='2026-04-14',
+                                                    symbols=['005930'],
+                                                    roles=['short-term-decider'],
+                                                    knowledge_cutoff_at=(
+                                                        '2026-04-14T08:00:00+00:00'
+                                                    ),
+                                                    reuse_existing=False,
+                                                )
+                                                stable_feedback_count = len(
+                                                    feedback_service.bulk_items
+                                                )
+                                                stable_failure_count = len(
+                                                    failure_service.recorded
+                                                )
+                                                mutate_previous_context = True
+                                                decision_lookup_count = 0
+                                                decision_lookup_calls.clear()
+                                                changed_result = (
+                                                    service.dispatch_for_symbols(
+                                                        market_date='2026-04-14',
+                                                        symbols=['005930'],
+                                                        roles=[
+                                                            'short-term-decider'
+                                                        ],
+                                                        knowledge_cutoff_at=(
+                                                            '2026-04-14T08:00:00+00:00'
+                                                        ),
+                                                        reuse_existing=False,
+                                                        request_run_id=(
+                                                            'symbol-run-2026-04-14-'
+                                                            'changed-prior'
+                                                        ),
+                                                    )
+                                                )
+                                                changed_lookup_calls = list(
+                                                    decision_lookup_calls
+                                                )
+
+        self.assertEqual(result['summary']['status'], 'completed')
+        self.assertEqual(result['summary']['completed'], 1)
+        self.assertEqual(result['summary']['failed'], 0)
+        self.assertEqual(stable_failure_count, 0)
+        self.assertEqual(
+            client.decider_payloads[0]['previous_decision_context'][
+                'feedback_id'
+            ],
+            501,
+        )
+        self.assertEqual(
+            changed_result['summary']['status'],
+            'failed',
+        )
+        self.assertEqual(changed_result['summary']['completed'], 0)
+        self.assertEqual(changed_result['summary']['failed'], 1)
+        self.assertEqual(
+            len(feedback_service.bulk_items),
+            stable_feedback_count,
+        )
+        changed_failure = failure_service.recorded[-1]
+        self.assertEqual(
+            changed_failure['failure_kind'],
+            'dependency_upstream_changed_during_dispatch',
+        )
+        self.assertEqual(
+            changed_failure['context']['input_generation_revalidation'][
+                'reasons'
+            ],
+            [{'code': 'previous_decision_context_changed'}],
+        )
+        self.assertGreaterEqual(len(changed_lookup_calls), 2)
+        self.assertTrue(
+            all(
+                call['force_recompute'] is False
+                for call in changed_lookup_calls
+            )
+        )
+
     def test_decider_response_is_rejected_when_source_context_changes_during_dispatch(self):
         service = AgentFeedbackOrchestrator()
         client = SignalDeciderBatchClient()
