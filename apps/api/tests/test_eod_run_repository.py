@@ -1722,6 +1722,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
         )
 
         advanced_interrupted_at = interrupted_at + timedelta(minutes=1)
+        advanced_child_run_id = 'feedback-cycle-2026-09-18-feedface02'
         with self.session_factory.begin() as session:
             terminal_run = session.get(DailyPipelineRun, terminal_run_id)
             terminal_run.current_stage = 'next_open_execution_plan'
@@ -1752,7 +1753,9 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             decider_stage.updated_at = advanced_interrupted_at
             decider_stage.completed_at = advanced_interrupted_at
             decider_stage.error_message = None
-            decider_stage.source_run_ids = {'run_id': 'decider-run'}
+            decider_stage.source_run_ids = {
+                'agent_feedback_run_id': advanced_child_run_id
+            }
             decider_stage.details = {
                 'result_summary': {'status': 'completed'}
             }
@@ -1766,6 +1769,56 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 'resumable': True,
                 'interrupted_reason': 'Core restarted.',
             }
+            session.add(
+                AgentContextFeedbackRun(
+                    run_id=advanced_child_run_id,
+                    market_date=market_date,
+                    status='completed',
+                    symbols_total=2,
+                    completed_count=2,
+                    failed_count=0,
+                    request_payload={
+                        'market_date': market_date.isoformat(),
+                        'request_run_id': advanced_child_run_id,
+                        'mode': 'daily_retry_cycle_role_sequenced',
+                        'roles': [
+                            'short-term-decider',
+                            'signal-decider',
+                        ],
+                        'requested_symbols': ['005930'],
+                        'feedback_scope_mode': (
+                            'decider_scope_fast_path'
+                        ),
+                        'admission_scope_by_role': {
+                            'short-term-decider': ['005930'],
+                            'signal-decider': ['005930'],
+                        },
+                        'role_symbol_scopes': {
+                            'short-term-decider': ['005930'],
+                            'signal-decider': ['005930'],
+                        },
+                        'role_symbol_counts': {
+                            'short-term-decider': 1,
+                            'signal-decider': 1,
+                        },
+                        'fs_div': 'CFS',
+                        'reuse_existing': True,
+                        'force_recompute': False,
+                        'knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                        'admission_knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                        'requested_knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                    },
+                    summary_payload={},
+                    started_at=interrupted_at,
+                    completed_at=advanced_interrupted_at,
+                )
+            )
 
         with patch(
             'app.repositories.eod_run_repository.session_scope',
@@ -1784,6 +1837,25 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 eod_run_id=eod_run_id,
             ),
         )
+
+        with self.session_factory.begin() as session:
+            session.execute(
+                delete(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id
+                    == advanced_child_run_id
+                )
+            )
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            invalid_advanced_child_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(invalid_advanced_child_target)
 
         with self.session_factory.begin() as session:
             terminal_run = session.get(DailyPipelineRun, terminal_run_id)

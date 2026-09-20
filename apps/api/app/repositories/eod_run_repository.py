@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 from sqlalchemy import func, select, text
 
 from app.agent_context.lease_loss_evidence import (
+    terminal_feedback_completed_run_evidence_error,
     terminal_feedback_lease_loss_evidence_error,
 )
 from app.db import engine, session_scope
@@ -26,6 +27,7 @@ from app.db_models import (
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_expired_decision_skip_evidence_is_valid,
     terminal_continuation_feedback_lease_loss_run_id,
     terminal_continuation_lease_loss_resume_lineage_is_valid,
     terminal_continuation_marker_is_valid,
@@ -933,6 +935,77 @@ def _terminal_continuation_lease_loss_child_is_valid(
     ) is None
 
 
+def _terminal_continuation_advanced_prefix_evidence_is_valid(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    satisfied_prefix: Sequence[str],
+    persisted_prefix_size: int,
+    stage_rows_by_id: Mapping[str, DailyPipelineStageRun],
+) -> bool:
+    metadata = pipeline_run.run_metadata
+    evidence = metadata.get('terminal_continuation_evidence')
+    summary_proof = (
+        evidence.get('summary_proof')
+        if isinstance(evidence, Mapping)
+        and isinstance(evidence.get('summary_proof'), Mapping)
+        else {}
+    )
+    knowledge_cutoff_at = _normalized_datetime(
+        summary_proof.get('knowledge_cutoff_at')
+    )
+    feedback_stage_ids = {
+        'agent_feedback_summaries',
+        'signal_decider',
+    }
+    for stage_id in satisfied_prefix[persisted_prefix_size:]:
+        stage_row = stage_rows_by_id[stage_id]
+        stage_status = str(stage_row.status or '').strip().lower()
+        if stage_status == 'skipped':
+            if not terminal_continuation_expired_decision_skip_evidence_is_valid(
+                stage_row=stage_row,
+                stage_id=stage_id,
+                market_date=pipeline_run.market_date,
+            ):
+                return False
+            continue
+        if stage_id not in feedback_stage_ids:
+            continue
+        if stage_status != 'completed' or knowledge_cutoff_at is None:
+            return False
+        source_run_ids = (
+            stage_row.source_run_ids
+            if isinstance(stage_row.source_run_ids, Mapping)
+            else {}
+        )
+        child_source_ids = {
+            str(source_run_ids.get(key) or '').strip()
+            for key in ('agent_feedback_run_id', 'run_id')
+            if str(source_run_ids.get(key) or '').strip()
+        }
+        if len(child_source_ids) != 1:
+            return False
+        child_run_id = next(iter(child_source_ids))
+        child_run = session.execute(
+            select(AgentContextFeedbackRun).where(
+                AgentContextFeedbackRun.run_id == child_run_id
+            )
+        ).scalar_one_or_none()
+        if (
+            terminal_feedback_completed_run_evidence_error(
+                child_run=child_run,
+                child_run_id=child_run_id,
+                stage_id=stage_id,
+                market_date=pipeline_run.market_date,
+                metadata=metadata,
+                knowledge_cutoff_at=knowledge_cutoff_at,
+            )
+            is not None
+        ):
+            return False
+    return True
+
+
 def _followup_recovery_is_reclaimable_feedback_lease_loss(
     session: Any,
     *,
@@ -1242,6 +1315,14 @@ def _followup_recovery_is_resumable_terminal_continuation(
             return False
         metadata_prefix_size += 1
     if metadata_prefix_size > len(satisfied_prefix):
+        return False
+    if not _terminal_continuation_advanced_prefix_evidence_is_valid(
+        session,
+        pipeline_run=pipeline_run,
+        satisfied_prefix=satisfied_prefix,
+        persisted_prefix_size=metadata_prefix_size,
+        stage_rows_by_id=stage_rows_by_id,
+    ):
         return False
 
     def untouched(stage: DailyPipelineStageRun) -> bool:

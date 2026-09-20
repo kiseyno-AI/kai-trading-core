@@ -3,9 +3,13 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any, Mapping
 
-from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
+from app.agent_context.roles import (
+    DECISION_SUPPORT_AGENT_NAMES,
+    SUMMARIZER_AGENT_NAMES,
+)
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
 
@@ -195,4 +199,126 @@ def terminal_feedback_lease_loss_evidence_error(
         and owner_fingerprint == owner_token_hash[:16]
     ):
         return 'admission_lease_loss'
+    return None
+
+
+def terminal_feedback_completed_run_evidence_error(
+    *,
+    child_run: object | None,
+    child_run_id: str,
+    stage_id: str,
+    market_date: date,
+    metadata: Mapping[str, Any],
+    knowledge_cutoff_at: datetime,
+) -> str | None:
+    """Validate a completed feedback child before resuming past its stage."""
+
+    expectations = {
+        'agent_feedback_summaries': (
+            list(SUMMARIZER_AGENT_NAMES),
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+        ),
+        'signal_decider': (
+            list(DECISION_SUPPORT_AGENT_NAMES),
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        ),
+    }
+    expectation = expectations.get(stage_id)
+    if expectation is None:
+        return 'stage_id'
+    if (
+        child_run is None
+        or str(_field(child_run, 'run_id') or '').strip() != child_run_id
+    ):
+        return 'child_run'
+    if _field(child_run, 'market_date') != market_date:
+        return 'market_date'
+    if str(_field(child_run, 'status') or '').strip().lower() != 'completed':
+        return 'status'
+    if _utc_datetime(_field(child_run, 'completed_at')) is None:
+        return 'completed_at'
+    if _integer(_field(child_run, 'failed_count')) != 0:
+        return 'failed_count'
+
+    raw_symbols = metadata.get('symbols')
+    if not (
+        isinstance(raw_symbols, list)
+        and raw_symbols
+        and all(
+            isinstance(symbol, str) and symbol.strip()
+            for symbol in raw_symbols
+        )
+        and len(raw_symbols) == len(set(raw_symbols))
+    ):
+        return 'request_context'
+    request_payload = _field(child_run, 'request_payload')
+    if not isinstance(request_payload, Mapping):
+        return 'request_context'
+    expected_roles, expected_scope_mode = expectation
+    expected_admission_scope = {
+        role: list(raw_symbols) for role in expected_roles
+    }
+    role_symbol_scopes = request_payload.get('role_symbol_scopes')
+    role_symbol_counts = request_payload.get('role_symbol_counts')
+    requested_symbol_set = set(raw_symbols)
+    if not (
+        isinstance(role_symbol_scopes, Mapping)
+        and isinstance(role_symbol_counts, Mapping)
+        and set(role_symbol_scopes) == set(expected_roles)
+        and set(role_symbol_counts) == set(expected_roles)
+        and all(
+            isinstance(role_symbol_scopes.get(role), list)
+            and len(role_symbol_scopes[role])
+            == len(set(role_symbol_scopes[role]))
+            and all(
+                isinstance(symbol, str)
+                and symbol in requested_symbol_set
+                for symbol in role_symbol_scopes[role]
+            )
+            and type(role_symbol_counts.get(role)) is int
+            and role_symbol_counts[role]
+            == len(role_symbol_scopes[role])
+            for role in expected_roles
+        )
+    ):
+        return 'role_scope'
+    scoped_symbol_total = sum(role_symbol_counts.values())
+    if not (
+        _integer(_field(child_run, 'symbols_total')) == scoped_symbol_total
+        and _integer(_field(child_run, 'completed_count'))
+        == scoped_symbol_total
+    ):
+        return 'counts'
+    expected_force_recompute = bool(
+        metadata.get('force')
+        and not metadata.get('reuse_existing_feedback')
+    )
+    if not (
+        request_payload.get('market_date') == market_date.isoformat()
+        and request_payload.get('request_run_id') == child_run_id
+        and request_payload.get('mode') == DAILY_RETRY_CYCLE_MODE
+        and request_payload.get('roles') == expected_roles
+        and request_payload.get('requested_symbols') == raw_symbols
+        and request_payload.get('feedback_scope_mode')
+        == expected_scope_mode
+        and request_payload.get('admission_scope_by_role')
+        == expected_admission_scope
+        and str(request_payload.get('fs_div') or '').strip().upper()
+        == str(metadata.get('fs_div') or '').strip().upper()
+        and request_payload.get('reuse_existing')
+        is metadata.get('reuse_existing_feedback')
+        and request_payload.get('force_recompute')
+        is expected_force_recompute
+        and _utc_datetime(request_payload.get('knowledge_cutoff_at'))
+        == knowledge_cutoff_at
+        and _utc_datetime(
+            request_payload.get('admission_knowledge_cutoff_at')
+        )
+        == knowledge_cutoff_at
+        and _utc_datetime(
+            request_payload.get('requested_knowledge_cutoff_at')
+        )
+        == knowledge_cutoff_at
+    ):
+        return 'request_context'
     return None
