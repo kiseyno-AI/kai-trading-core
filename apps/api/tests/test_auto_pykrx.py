@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import os
 import threading
@@ -5562,10 +5563,65 @@ class PykrxBackfillServiceTests(TestCase):
             prefix_stage_id: str,
             prefix_outcome: dict[str, object],
         ) -> dict[str, object]:
+            stages = {
+                prefix_stage_id: prefix_outcome,
+                'agent_feedback_summaries': {'status': 'completed'},
+                'signal_decider': {
+                    'status': 'failed',
+                    'details': {
+                        'result_summary': {
+                            'status': 'failed',
+                            'progress': {
+                                'summary': {
+                                    'failed_items': 1,
+                                    'failure_groups': {
+                                        'dependency/missing-upstream': {
+                                            'failure_status': (
+                                                'dependency/missing-upstream'
+                                            ),
+                                            'failure_category': 'dependency',
+                                            'count': 1,
+                                            'retryable_count': 1,
+                                            'failure_kinds': [
+                                                'dependency_missing_upstream'
+                                            ],
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': 'signal_decider_stage_incomplete',
+                            'upstream_status': 'failed',
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            }
             return {
+                'id': 96,
                 'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
                 'status': 'blocked',
+                'current_stage': 'signal_decider_evaluations',
                 'run_metadata': {
+                    'entrypoint': 'daily_pipeline_stage_service.run',
                     'resolved_stages': [
                         prefix_stage_id,
                         'agent_feedback_summaries',
@@ -5575,59 +5631,24 @@ class PykrxBackfillServiceTests(TestCase):
                     ],
                     'symbols': ['005930'],
                     'markets': ['KOSPI'],
-                },
-                'stages': {
-                    prefix_stage_id: prefix_outcome,
-                    'agent_feedback_summaries': {'status': 'completed'},
-                    'signal_decider': {
-                        'status': 'failed',
-                        'details': {
-                            'result_summary': {
-                                'status': 'failed',
-                                'progress': {
-                                    'summary': {
-                                        'failed_items': 1,
-                                        'failure_groups': {
-                                            'dependency/missing-upstream': {
-                                                'failure_status': (
-                                                    'dependency/missing-upstream'
-                                                ),
-                                                'failure_category': 'dependency',
-                                                'count': 1,
-                                                'retryable_count': 1,
-                                                'failure_kinds': [
-                                                    'dependency_missing_upstream'
-                                                ],
-                                            }
-                                        },
-                                    }
-                                },
-                            }
-                        },
-                    },
-                    'next_open_execution_plan': {
-                        'status': 'blocked',
-                        'details': {
-                            'result_summary': {
-                                'triggered': False,
-                                'status': 'blocked',
-                                'reason': 'signal_decider_stage_incomplete',
-                                'upstream_status': 'failed',
-                            }
-                        },
-                    },
-                    'signal_decider_evaluations': {
-                        'status': 'blocked',
-                        'details': {
-                            'result_summary': {
-                                'triggered': False,
-                                'status': 'blocked',
-                                'reason': 'declared_dependencies_incomplete',
-                                'incomplete_dependencies': ['signal_decider'],
-                            }
-                        },
+                    'force': False,
+                    'fs_div': 'CFS',
+                    'symbol_limit': None,
+                    'symbol_offset': 0,
+                    'capture_limit': 500,
+                    'retry_cycles': None,
+                    'feedback_max_cycles': 3,
+                    'feedback_outer_batch_size': 20,
+                    'reuse_existing_feedback': True,
+                    'bypass_prerequisite_gate': False,
+                    'point_in_time_recovery': True,
+                    'reused_eod_collection_run_id': 7,
+                    'stage_statuses': {
+                        stage_id: str(stage['status'])
+                        for stage_id, stage in stages.items()
                     },
                 },
+                'stages': stages,
             }
 
         cases = (
@@ -5688,6 +5709,7 @@ class PykrxBackfillServiceTests(TestCase):
             'updated_at': '2026-04-03T08:00:00+00:00',
             'completed_at': '2026-04-03T08:00:00+00:00',
             'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
                 'resolved_stages': [
                     'pykrx_enrichment',
                     'agent_feedback_summaries',
@@ -5697,8 +5719,25 @@ class PykrxBackfillServiceTests(TestCase):
                 ],
                 'symbols': ['005930', '000660'],
                 'markets': ['KOSPI'],
+                'force': False,
+                'fs_div': 'CFS',
+                'symbol_limit': None,
+                'symbol_offset': 0,
+                'capture_limit': 500,
+                'retry_cycles': None,
+                'feedback_max_cycles': 3,
+                'feedback_outer_batch_size': 20,
+                'reuse_existing_feedback': True,
+                'bypass_prerequisite_gate': False,
                 'point_in_time_recovery': True,
                 'reused_eod_collection_run_id': 7,
+                'stage_statuses': {
+                    'pykrx_enrichment': 'completed',
+                    'agent_feedback_summaries': 'completed',
+                    'signal_decider': 'failed',
+                    'next_open_execution_plan': 'blocked',
+                    'signal_decider_evaluations': 'blocked',
+                },
             },
             'stages': {
                 'pykrx_enrichment': {
@@ -6001,6 +6040,7 @@ class PykrxBackfillServiceTests(TestCase):
             'current_stage': 'agent_feedback_summaries',
             'updated_at': '2026-04-03T08:00:00+00:00',
             'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
                 'resolved_stages': [
                     'pykrx_enrichment',
                     'agent_feedback_summaries',
@@ -6010,6 +6050,17 @@ class PykrxBackfillServiceTests(TestCase):
                 ],
                 'symbols': ['005930'],
                 'markets': ['KOSPI'],
+                'force': False,
+                'fs_div': 'CFS',
+                'symbol_limit': None,
+                'symbol_offset': 0,
+                'capture_limit': 500,
+                'retry_cycles': None,
+                'feedback_max_cycles': 3,
+                'feedback_outer_batch_size': 20,
+                'reuse_existing_feedback': True,
+                'bypass_prerequisite_gate': False,
+                'point_in_time_recovery': True,
                 'reused_eod_collection_run_id': 7,
                 'resume_from_stage': 'agent_feedback_summaries',
                 'terminal_continuation_count': 1,
@@ -6020,6 +6071,13 @@ class PykrxBackfillServiceTests(TestCase):
                 'terminal_continuation_reason': (
                     'summary_knowledge_cutoff_repair'
                 ),
+                'stage_statuses': {
+                    'pykrx_enrichment': 'completed',
+                    'agent_feedback_summaries': 'pending',
+                    'signal_decider': 'pending',
+                    'next_open_execution_plan': 'pending',
+                    'signal_decider_evaluations': 'pending',
+                },
                 'terminal_continuation_evidence': {
                     'parent': {
                         'status': 'blocked',
@@ -6074,6 +6132,111 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertTrue(
             _is_terminal_followup_continuation_candidate(claimed_run)
+        )
+
+        duplicate_suffix = deepcopy(claimed_run)
+        duplicate_suffix['run_metadata']['resolved_stages'].insert(
+            -1,
+            'signal_decider',
+        )
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(duplicate_suffix)
+        )
+
+        misordered_suffix = deepcopy(claimed_run)
+        misordered_suffix['run_metadata']['resolved_stages'][-2:] = [
+            'signal_decider_evaluations',
+            'next_open_execution_plan',
+        ]
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(misordered_suffix)
+        )
+
+        interrupted_after_summary = deepcopy(claimed_run)
+        interrupted_after_summary['status'] = 'interrupted'
+        interrupted_after_summary['current_stage'] = 'signal_decider'
+        interrupted_after_summary['run_metadata'].update(
+            {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+                'interrupted_at': '2026-04-03T08:01:00+00:00',
+            }
+        )
+        interrupted_after_summary['stages']['agent_feedback_summaries'] = {
+            'status': 'completed',
+            'processed': 1,
+            'total': 1,
+            'succeeded': 1,
+            'failed': 0,
+            'completed_at': '2026-04-03T08:00:30+00:00',
+            'error_message': None,
+            'source_run_ids': {
+                'run_id': 'feedback-cycle-continued'
+            },
+            'details': {
+                'result_summary': {
+                    'status': 'completed',
+                    'run_id': 'feedback-cycle-continued',
+                }
+            },
+        }
+        interrupted_after_summary['stages']['signal_decider'] = {
+            'status': 'interrupted',
+            'processed': 0,
+            'total': 1,
+            'succeeded': 0,
+            'failed': 0,
+            'remaining': 1,
+            'current_step': 'core_restart_interrupted',
+            'completed_at': '2026-04-03T08:01:00+00:00',
+            'error_message': 'Core restarted.',
+            'source_run_ids': {},
+            'details': {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+            },
+        }
+        self.assertTrue(
+            _is_terminal_followup_continuation_candidate(
+                interrupted_after_summary
+            )
+        )
+
+        interrupted_between_stages = deepcopy(interrupted_after_summary)
+        interrupted_between_stages['current_stage'] = (
+            'agent_feedback_summaries'
+        )
+        interrupted_between_stages['stages']['signal_decider'] = deepcopy(
+            claimed_run['stages']['signal_decider']
+        )
+        self.assertTrue(
+            _is_terminal_followup_continuation_candidate(
+                interrupted_between_stages
+            )
+        )
+
+        noncontiguous_progress = deepcopy(interrupted_after_summary)
+        noncontiguous_progress['current_stage'] = (
+            'agent_feedback_summaries'
+        )
+        noncontiguous_progress['stages']['agent_feedback_summaries'] = {
+            **interrupted_after_summary['stages']['signal_decider'],
+        }
+        noncontiguous_progress['stages']['signal_decider'] = {
+            'status': 'completed',
+            'processed': 1,
+            'total': 1,
+            'succeeded': 1,
+            'failed': 0,
+            'completed_at': '2026-04-03T08:00:30+00:00',
+            'error_message': None,
+            'source_run_ids': {'run_id': 'decider-continued'},
+            'details': {'result_summary': {'status': 'completed'}},
+        }
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(
+                noncontiguous_progress
+            )
         )
 
     def test_sixth_non_dependency_failure_does_not_continue_same_row(
