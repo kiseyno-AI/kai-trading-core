@@ -138,13 +138,24 @@ class AutoPykrxEODScheduler:
             self._task = None
         self._state.active_task = False
 
-    async def schedule_daily_pipeline_if_due(self) -> None:
+    async def schedule_daily_pipeline_if_due(
+        self,
+        *,
+        expected_market_state: str | None = None,
+    ) -> None:
         self._state.enabled = settings.eod_auto_pykrx_enabled
         market = await async_get_market_state()
         self._state.last_checked_at = _utcnow()
         self._state.last_market_state = market.state
         current_market_date = market.server_time[:10]
         self._state.last_market_date = current_market_date
+
+        if expected_market_state is not None and market.state != expected_market_state:
+            self._state.last_status = 'idle'
+            self._state.last_reason = (
+                f'market_state_changed:{expected_market_state}->{market.state}'
+            )
+            return
 
         if not settings.eod_auto_pykrx_enabled:
             self._state.last_status = 'disabled'
@@ -240,6 +251,18 @@ class AutoPykrxEODScheduler:
             if datetime.now(KST) < eligible_at:
                 self._state.last_status = 'idle'
                 self._state.last_reason = f'waiting_until:{eligible_at.isoformat()}'
+                return
+
+        if expected_market_state is not None:
+            latest_market = await async_get_market_state()
+            self._state.last_market_state = latest_market.state
+            self._state.last_checked_at = _utcnow()
+            if latest_market.state != expected_market_state:
+                self._state.last_status = 'idle'
+                self._state.last_reason = (
+                    f'market_state_changed:{expected_market_state}'
+                    f'->{latest_market.state}'
+                )
                 return
 
         self._state.active_task = True
