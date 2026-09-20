@@ -8,6 +8,7 @@ from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundl
 from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARY_REUSE_REASON,
     AgentContextReuseService,
+    build_fundamental_input_fingerprint_payload_from_context,
     _extract_fingerprint_payload,
     _failure_supersedes_feedback,
 )
@@ -128,6 +129,116 @@ class _CutoffReuseSession:
         return next(self._results)
 
 
+class _FundamentalCutoffReuseSession:
+    def __init__(self):
+        fingerprint = 'sha256:cutoff-visible'
+        fingerprint_payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': fingerprint,
+            'input': {'symbol': '005930'},
+        }
+        feedback = SimpleNamespace(
+            id=7,
+            market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
+            symbol='005930',
+            agent_name='fundamental-summarizer',
+            run_id='fundamental-cutoff-reuse-run',
+            summary_payload={},
+            feedback_payload={'summary': 'reusable'},
+            context_payload={
+                'reuse_metadata': {
+                    'input_fingerprint': fingerprint_payload
+                }
+            },
+            received_at=datetime(2026, 4, 16, 6, 32, tzinfo=timezone.utc),
+        )
+        run = SimpleNamespace(
+            id=11,
+            run_id='fundamental-cutoff-reuse-run',
+            started_at=datetime(2026, 4, 16, 6, 31, tzinfo=timezone.utc),
+            request_payload={
+                'knowledge_cutoff_at': '2026-04-16T06:30:00+00:00'
+            },
+        )
+        self._results = iter(
+            (
+                _RowsResult([SimpleNamespace(id=101, symbol='005930')]),
+                _RowsResult([feedback]),
+                _RowsResult(),
+                _RowsResult([run]),
+            )
+        )
+
+    def execute(self, _statement):
+        return next(self._results)
+
+
+class _CrossDateFundamentalReuseSession:
+    def __init__(
+        self,
+        fingerprint_payload,
+        *,
+        feedback_market_date='2026-04-15',
+        knowledge_cutoff_at='2026-04-15T06:30:00+00:00',
+        source_updated_at=datetime(
+            2026,
+            4,
+            16,
+            7,
+            0,
+            tzinfo=timezone.utc,
+        ),
+    ):
+        resolved_feedback_market_date = (
+            __import__('datetime').date.fromisoformat(feedback_market_date)
+        )
+        feedback = SimpleNamespace(
+            id=8,
+            market_date=resolved_feedback_market_date,
+            symbol='CUTOFFTEST',
+            agent_name='fundamental-summarizer',
+            run_id='prior-fundamental-run',
+            summary_payload={},
+            feedback_payload={'summary': 'reusable fundamentals'},
+            context_payload={
+                'fundamental_summary_input_fingerprint': (
+                    fingerprint_payload
+                )
+            },
+            received_at=datetime.combine(
+                resolved_feedback_market_date,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            ).replace(hour=6, minute=32),
+        )
+        run = SimpleNamespace(
+            id=12,
+            run_id='prior-fundamental-run',
+            started_at=datetime.combine(
+                resolved_feedback_market_date,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            ).replace(hour=6, minute=31),
+            request_payload={
+                'knowledge_cutoff_at': knowledge_cutoff_at
+            },
+        )
+        self._results = iter(
+            (
+                _RowsResult(),
+                _RowsResult([feedback]),
+                _RowsResult(),
+                _RowsResult([run]),
+                _TimestampResult(source_updated_at),
+                _TimestampResult(None),
+            )
+        )
+
+    def execute(self, _statement):
+        return next(self._results)
+
+
 @contextmanager
 def _reuse_session_scope():
     yield _ReuseSession()
@@ -143,7 +254,284 @@ def _missing_cutoff_reuse_session_scope():
     yield _CutoffReuseSession(knowledge_cutoff_at=None)
 
 
+@contextmanager
+def _fundamental_cutoff_reuse_session_scope():
+    yield _FundamentalCutoffReuseSession()
+
+
 class FundamentalReuseServiceTests(unittest.TestCase):
+    def test_context_fingerprint_hashes_visible_context_not_filter_literals(self):
+        def build_context(
+            *,
+            fs_div: str,
+            disclosures: list[dict[str, str]],
+        ) -> dict[str, object]:
+            return {
+                'symbol': '005930',
+                'fundamentals': {
+                    'latest_snapshot': {
+                        'statement': {'fs_div': fs_div},
+                        'highlights': {
+                            'revenue': {'current_amount': 100}
+                        },
+                    },
+                    'history_summary': {'entries': 1},
+                },
+                'recent_disclosures': {'items': disclosures},
+                'recent_dart_events': {
+                    'status': 'available',
+                    'items': disclosures,
+                },
+                'valuation_context': {'status': 'available'},
+            }
+        context = build_context(
+            fs_div='CFS',
+            disclosures=[{'rcept_no': '202604140001'}],
+        )
+        base_kwargs = {
+            'market_date': '2026-04-14',
+            'symbol': '005930',
+            'context': context,
+            'knowledge_cutoff_at': '2026-04-14T06:30:00+00:00',
+        }
+
+        cfs = build_fundamental_input_fingerprint_payload_from_context(
+            **base_kwargs,
+            fs_div='cfs',
+            disclosures_limit=3,
+        )
+        ofs = build_fundamental_input_fingerprint_payload_from_context(
+            **base_kwargs,
+            fs_div='OFS',
+            disclosures_limit=3,
+        )
+        wider_disclosure_window = (
+            build_fundamental_input_fingerprint_payload_from_context(
+                **base_kwargs,
+                fs_div='CFS',
+                disclosures_limit=5,
+            )
+        )
+        later_cutoff = build_fundamental_input_fingerprint_payload_from_context(
+            **{
+                **base_kwargs,
+                'knowledge_cutoff_at': '2026-04-14T07:30:00+00:00',
+            },
+            fs_div='CFS',
+            disclosures_limit=3,
+        )
+        next_market_date = (
+            build_fundamental_input_fingerprint_payload_from_context(
+                **{
+                    **base_kwargs,
+                    'market_date': '2026-04-15',
+                },
+                fs_div='CFS',
+                disclosures_limit=3,
+            )
+        )
+        changed_fs_context = build_fundamental_input_fingerprint_payload_from_context(
+            **{
+                **base_kwargs,
+                'context': build_context(
+                    fs_div='OFS',
+                    disclosures=[{'rcept_no': '202604140001'}],
+                ),
+            },
+            fs_div='OFS',
+            disclosures_limit=3,
+        )
+        changed_disclosure_context = (
+            build_fundamental_input_fingerprint_payload_from_context(
+                **{
+                    **base_kwargs,
+                    'context': build_context(
+                        fs_div='CFS',
+                        disclosures=[
+                            {'rcept_no': '202604140001'},
+                            {'rcept_no': '202604130001'},
+                        ],
+                    ),
+                },
+                fs_div='CFS',
+                disclosures_limit=5,
+            )
+        )
+
+        self.assertEqual(
+            cfs['source_filters'],
+            {
+                'fs_div': 'CFS',
+                'knowledge_cutoff_at': '2026-04-14T06:30:00+00:00',
+                'disclosures_limit': 3,
+            },
+        )
+        self.assertEqual(cfs['fingerprint'], ofs['fingerprint'])
+        self.assertEqual(
+            cfs['fingerprint'],
+            wider_disclosure_window['fingerprint'],
+        )
+        self.assertEqual(cfs['fingerprint'], later_cutoff['fingerprint'])
+        self.assertNotEqual(
+            cfs['requested_market_date'],
+            next_market_date['requested_market_date'],
+        )
+        self.assertEqual(
+            cfs['fingerprint'],
+            next_market_date['fingerprint'],
+        )
+        self.assertNotEqual(
+            cfs['source_filters'],
+            later_cutoff['source_filters'],
+        )
+        self.assertNotEqual(
+            cfs['fingerprint'],
+            changed_fs_context['fingerprint'],
+        )
+        self.assertNotEqual(
+            cfs['fingerprint'],
+            changed_disclosure_context['fingerprint'],
+        )
+
+    def test_reuse_decision_uses_materialized_fingerprint_without_db_rebuild(self):
+        service = AgentContextReuseService()
+        payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': 'sha256:materialized',
+            'input': {'symbol': '005930'},
+        }
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _reuse_session_scope,
+        ):
+            with patch.object(
+                service,
+                '_build_fundamental_input_fingerprint_payload',
+                side_effect=AssertionError('unexpected DB fingerprint rebuild'),
+            ) as db_rebuild:
+                decision = service.build_latest_decisions(
+                    market_date='2026-04-16',
+                    symbols=['005930'],
+                    roles=['fundamental-summarizer'],
+                    fs_div='OFS',
+                    disclosures_limit=2,
+                    knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+                    fundamental_input_fingerprint_payloads={
+                        '005930': payload
+                    },
+                )['005930']['fundamental-summarizer']
+
+        self.assertEqual(decision.input_fingerprint_payload, payload)
+        self.assertEqual(decision.input_fingerprint, 'sha256:materialized')
+        db_rebuild.assert_not_called()
+
+    def test_same_day_matching_fingerprint_ignores_post_cutoff_source_update(
+        self,
+    ):
+        service = AgentContextReuseService()
+        post_cutoff_update = datetime(
+            2026,
+            4,
+            16,
+            7,
+            0,
+            tzinfo=timezone.utc,
+        )
+        payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': 'sha256:cutoff-visible',
+            'input': {'symbol': '005930'},
+        }
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _fundamental_cutoff_reuse_session_scope,
+        ):
+            with patch.object(
+                service,
+                '_get_latest_source_updated_at',
+                return_value=post_cutoff_update,
+            ):
+                decision = service.build_latest_decisions(
+                    market_date='2026-04-16',
+                    symbols=['005930'],
+                    roles=['fundamental-summarizer'],
+                    knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+                    fundamental_input_fingerprint_payloads={
+                        '005930': payload
+                    },
+                )['005930']['fundamental-summarizer']
+
+        self.assertFalse(decision.should_dispatch)
+        self.assertEqual(decision.reason, FUNDAMENTAL_SUMMARY_REUSE_REASON)
+        self.assertEqual(
+            decision.latest_source_updated_at,
+            post_cutoff_update.isoformat(),
+        )
+
+    def test_legacy_matching_hash_does_not_waive_source_update(self):
+        should_dispatch, reason = (
+            AgentContextReuseService._decide_fundamental_reuse(
+                force_recompute=False,
+                has_retryable_feedback_gap=False,
+                input_fingerprint='sha256:same',
+                stored_input_fingerprint='sha256:same',
+                latest_source_updated_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    7,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+                feedback_received_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    32,
+                    tzinfo=timezone.utc,
+                ),
+                materialized_fingerprint_match=False,
+            )
+        )
+
+        self.assertTrue(should_dispatch)
+        self.assertEqual(reason, 'source_updated')
+
+    def test_db_fingerprint_builder_defaults_to_configured_fs_div(self):
+        service = AgentContextReuseService()
+        payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': 'sha256:rebuilt',
+            'input': {'symbol': '005930'},
+        }
+
+        with patch(
+            'app.agent_context.reuse_service.settings',
+            SimpleNamespace(dart_fundamentals_default_fs_div='ofs'),
+        ):
+            with patch(
+                'app.agent_context.reuse_service.session_scope',
+                _reuse_session_scope,
+            ):
+                with patch.object(
+                    service,
+                    '_build_fundamental_input_fingerprint_payload',
+                    return_value=payload,
+                ) as db_rebuild:
+                    service.build_latest_decisions(
+                        market_date='2026-04-16',
+                        symbols=['005930'],
+                        roles=['fundamental-summarizer'],
+                    )
+
+        self.assertEqual(db_rebuild.call_args.kwargs['fs_div'], 'OFS')
+
     def test_feedback_reuse_requires_exact_effective_cutoff_instant(self):
         service = AgentContextReuseService()
         symbol = 'CUTOFFTEST'
@@ -290,12 +678,76 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             has_retryable_feedback_gap=False,
             input_fingerprint='sha256:same',
             stored_input_fingerprint='sha256:same',
-            latest_source_updated_at=None,
-            feedback_received_at=datetime(2026, 4, 15, 1, 0, tzinfo=timezone.utc),
         )
 
         self.assertFalse(should_dispatch)
         self.assertEqual(reason, FUNDAMENTAL_SUMMARY_REUSE_REASON)
+
+    def test_build_latest_decisions_reuses_matching_v2_fingerprint_across_cutoffs(
+        self,
+    ):
+        service = AgentContextReuseService()
+        payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': 'sha256:unchanged-materialized-context',
+            'input': {'symbol': 'CUTOFFTEST'},
+        }
+
+        @contextmanager
+        def cross_date_session_scope():
+            yield _CrossDateFundamentalReuseSession(payload)
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            cross_date_session_scope,
+        ):
+            decision = service.build_latest_decisions(
+                market_date='2026-04-16',
+                symbols=['CUTOFFTEST'],
+                roles=['fundamental-summarizer'],
+                knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+                fundamental_input_fingerprint_payloads={
+                    'CUTOFFTEST': payload
+                },
+            )['CUTOFFTEST']['fundamental-summarizer']
+
+        self.assertFalse(decision.should_dispatch)
+        self.assertEqual(decision.reason, FUNDAMENTAL_SUMMARY_REUSE_REASON)
+
+    def test_same_day_fundamental_reuse_still_requires_exact_cutoff(self):
+        service = AgentContextReuseService()
+        payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': 'sha256:unchanged-materialized-context',
+            'input': {'symbol': 'CUTOFFTEST'},
+        }
+
+        @contextmanager
+        def same_day_session_scope():
+            yield _CrossDateFundamentalReuseSession(
+                payload,
+                feedback_market_date='2026-04-16',
+                knowledge_cutoff_at='2026-04-16T05:30:00+00:00',
+            )
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            same_day_session_scope,
+        ):
+            decision = service.build_latest_decisions(
+                market_date='2026-04-16',
+                symbols=['CUTOFFTEST'],
+                roles=['fundamental-summarizer'],
+                knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+                fundamental_input_fingerprint_payloads={
+                    'CUTOFFTEST': payload
+                },
+            )['CUTOFFTEST']['fundamental-summarizer']
+
+        self.assertTrue(decision.should_dispatch)
+        self.assertEqual(decision.reason, 'knowledge_cutoff_mismatch')
 
     def test_fundamental_reuse_decision_dispatches_when_fingerprint_changed(self):
         should_dispatch, reason = AgentContextReuseService._decide_fundamental_reuse(
@@ -303,8 +755,6 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             has_retryable_feedback_gap=False,
             input_fingerprint='sha256:new',
             stored_input_fingerprint='sha256:old',
-            latest_source_updated_at=None,
-            feedback_received_at=datetime(2026, 4, 15, 1, 0, tzinfo=timezone.utc),
         )
 
         self.assertTrue(should_dispatch)
@@ -382,12 +832,19 @@ class FundamentalReuseServiceTests(unittest.TestCase):
                     market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
                     roles=('fundamental-summarizer',),
                     eligible_symbols=('005930',),
+                    fs_div='OFS',
                     knowledge_cutoff_at='2026-04-16T15:30:00+09:00',
                 )
 
         self.assertEqual(
             build_latest_decisions.call_args.kwargs['knowledge_cutoff_at'],
             '2026-04-16T15:30:00+09:00',
+        )
+        self.assertTrue(
+            all(
+                call.kwargs['fs_div'] == 'OFS'
+                for call in build_latest_decisions.call_args_list
+            )
         )
         role_state = snapshot.role_states['fundamental-summarizer']
         self.assertEqual(role_state.completed_symbols, ('005930',))

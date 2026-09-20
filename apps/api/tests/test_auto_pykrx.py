@@ -20,6 +20,7 @@ from app.eod.pykrx_backfill import (
     PykrxBackfillService,
     PykrxSymbol,
     _call_pykrx,
+    _is_terminal_followup_continuation_candidate,
 )
 from app.eod.pykrx_import import (
     pykrx_request_credentials_visible,
@@ -807,6 +808,14 @@ class PykrxBackfillServiceTests(TestCase):
         from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
 
         configs = []
+        shared_cutoff = datetime(
+            2026,
+            4,
+            3,
+            7,
+            15,
+            tzinfo=timezone.utc,
+        )
 
         def run_retry_cycles(*, config, **_kwargs):
             configs.append(config)
@@ -822,8 +831,16 @@ class PykrxBackfillServiceTests(TestCase):
                 side_effect=run_retry_cycles,
             ),
         ):
-            summary_result = _run_daily_feedback_followup(market_date='2026-04-03', enabled=True)
-            decider_result = _run_daily_signal_decider_followup(market_date='2026-04-03', enabled=True)
+            summary_result = _run_daily_feedback_followup(
+                market_date='2026-04-03',
+                enabled=True,
+                knowledge_cutoff_at=shared_cutoff,
+            )
+            decider_result = _run_daily_signal_decider_followup(
+                market_date='2026-04-03',
+                enabled=True,
+                knowledge_cutoff_at=shared_cutoff,
+            )
 
         self.assertEqual(summary_result['status'], 'completed')
         self.assertEqual(decider_result['status'], 'completed')
@@ -838,13 +855,10 @@ class PykrxBackfillServiceTests(TestCase):
                 FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
             ],
         )
-        for config in configs:
-            self.assertIsInstance(config.knowledge_cutoff_at, datetime)
-            self.assertIsNotNone(config.knowledge_cutoff_at.utcoffset())
-            self.assertLessEqual(
-                config.knowledge_cutoff_at,
-                datetime.now(timezone.utc),
-            )
+        self.assertEqual(
+            [config.knowledge_cutoff_at for config in configs],
+            [shared_cutoff, shared_cutoff],
+        )
 
     def test_auto_followup_order_matches_canonical_news_macro_feedback_dependencies(self) -> None:
         signal_index = AUTO_DAILY_FOLLOWUP_STAGE_ORDER.index('signal_features')
@@ -5541,6 +5555,622 @@ class PykrxBackfillServiceTests(TestCase):
         resume_followups.assert_not_called()
         run_collection.assert_not_called()
 
+    def test_terminal_continuation_prefix_uses_shared_outcome_semantics(
+        self,
+    ) -> None:
+        def pipeline_run(
+            prefix_stage_id: str,
+            prefix_outcome: dict[str, object],
+        ) -> dict[str, object]:
+            return {
+                'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+                'status': 'blocked',
+                'run_metadata': {
+                    'resolved_stages': [
+                        prefix_stage_id,
+                        'agent_feedback_summaries',
+                        'signal_decider',
+                        'next_open_execution_plan',
+                        'signal_decider_evaluations',
+                    ],
+                    'symbols': ['005930'],
+                    'markets': ['KOSPI'],
+                },
+                'stages': {
+                    prefix_stage_id: prefix_outcome,
+                    'agent_feedback_summaries': {'status': 'completed'},
+                    'signal_decider': {
+                        'status': 'failed',
+                        'details': {
+                            'result_summary': {
+                                'status': 'failed',
+                                'progress': {
+                                    'summary': {
+                                        'failed_items': 1,
+                                        'failure_groups': {
+                                            'dependency/missing-upstream': {
+                                                'failure_status': (
+                                                    'dependency/missing-upstream'
+                                                ),
+                                                'failure_category': 'dependency',
+                                                'count': 1,
+                                                'retryable_count': 1,
+                                                'failure_kinds': [
+                                                    'dependency_missing_upstream'
+                                                ],
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                    },
+                    'next_open_execution_plan': {
+                        'status': 'blocked',
+                        'details': {
+                            'result_summary': {
+                                'triggered': False,
+                                'status': 'blocked',
+                                'reason': 'signal_decider_stage_incomplete',
+                                'upstream_status': 'failed',
+                            }
+                        },
+                    },
+                    'signal_decider_evaluations': {
+                        'status': 'blocked',
+                        'details': {
+                            'result_summary': {
+                                'triggered': False,
+                                'status': 'blocked',
+                                'reason': 'declared_dependencies_incomplete',
+                                'incomplete_dependencies': ['signal_decider'],
+                            }
+                        },
+                    },
+                },
+            }
+
+        cases = (
+            (
+                'clean completed prefix',
+                'pykrx_enrichment',
+                {'status': 'completed'},
+                True,
+            ),
+            (
+                'allowlisted high-coverage partial prefix',
+                'technical_snapshots',
+                {
+                    'status': 'partial',
+                    'succeeded': 99,
+                    'failed': 1,
+                    'total': 100,
+                },
+                True,
+            ),
+            (
+                'allowlisted skipped prefix',
+                'external_news_collect',
+                {'status': 'skipped', 'reason': 'already_completed'},
+                True,
+            ),
+            (
+                'completed prefix with failure evidence',
+                'pykrx_enrichment',
+                {'status': 'completed', 'failed': 1},
+                False,
+            ),
+        )
+
+        for label, prefix_stage_id, prefix_outcome, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    _is_terminal_followup_continuation_candidate(
+                        pipeline_run(prefix_stage_id, prefix_outcome)
+                    ),
+                    expected,
+                )
+
+    def test_sixth_missing_upstream_failure_continues_same_pipeline_row_from_summaries(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_eod_run = {
+            'id': 7,
+            'status': 'completed',
+            'symbols_failed': 0,
+            'run_metadata': {'failed_symbols': []},
+        }
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'pykrx_enrichment',
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'symbols': ['005930', '000660'],
+                'markets': ['KOSPI'],
+                'point_in_time_recovery': True,
+                'reused_eod_collection_run_id': 7,
+            },
+            'stages': {
+                'pykrx_enrichment': {
+                    'status': 'completed',
+                },
+                'agent_feedback_summaries': {
+                    'status': 'completed',
+                    'processed': 2,
+                    'total': 2,
+                    'succeeded': 2,
+                    'failed': 0,
+                    'details': {
+                        'result_summary': {
+                            'status': 'completed',
+                            'run_id': 'feedback-cycle-summary',
+                        },
+                    },
+                },
+                'signal_decider': {
+                    'status': 'failed',
+                    'details': {
+                        'result_summary': {
+                            'status': 'failed',
+                            'progress': {
+                                'summary': {
+                                    'failed_items': 4,
+                                    'failure_groups': {
+                                        'dependency/missing-upstream': {
+                                            'failure_status': (
+                                                'dependency/missing-upstream'
+                                            ),
+                                            'failure_category': 'dependency',
+                                            'count': 4,
+                                            'retryable_count': 4,
+                                            'failure_kinds': [
+                                                'dependency_missing_upstream'
+                                            ],
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': 'signal_decider_stage_incomplete',
+                            'upstream_status': 'failed',
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                return_value={
+                    'triggered': True,
+                    'status': 'completed',
+                    'pipeline_run_id': 96,
+                },
+            ) as resume_followups,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': False,
+                    'pipeline_run_id': 96,
+                    'status': 'completed',
+                    'reason': 'already_non_resumable',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+                return_value={'updated': True, 'status': 'completed'},
+            ),
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI', 'KOSDAQ'),
+            )
+
+        expected_stages = [
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        self.assertTrue(result['triggered'])
+        self.assertEqual(
+            result['reason'],
+            'terminal_followup_continuation_resumed',
+        )
+        self.assertEqual(result['pipeline_run_id'], 96)
+        self.assertTrue(
+            result['followup_recovery']['terminal_continuation_in_place']
+        )
+        self.assertEqual(result['followup_recovery']['attempt'], 6)
+        self.assertNotIn('price_collection', expected_stages)
+        resume_followups.assert_called_once_with(
+            market_date='2026-04-03',
+            stages=expected_stages,
+            symbols=['005930', '000660'],
+            markets=('KOSPI',),
+            force=False,
+            reuse_existing_feedback=True,
+            resume_from_stage='agent_feedback_summaries',
+            trigger=AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            reused_eod_collection_run_id=7,
+            point_in_time_recovery=True,
+            existing_pipeline_run_id=96,
+        )
+
+    def test_terminal_continuation_marker_prevents_second_same_row_resume(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'symbols': ['005930'],
+                'markets': ['KOSPI'],
+                'reused_eod_collection_run_id': 7,
+                'terminal_continuation_count': 1,
+            },
+            'stages': {
+                'agent_feedback_summaries': {'status': 'completed'},
+                'signal_decider': {
+                    'status': 'failed',
+                    'details': {
+                        'result_summary': {
+                            'status': 'failed',
+                            'progress': {
+                                'summary': {
+                                    'failed_items': 1,
+                                    'failure_groups': {
+                                        'dependency/missing-upstream': {
+                                            'count': 1,
+                                            'retryable_count': 1,
+                                            'failure_kinds': [
+                                                'dependency_missing_upstream'
+                                            ],
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete'
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run'
+            ) as resume_followups,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+                markets=('KOSPI',),
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'followup_recovery_limit_reached')
+        resume_followups.assert_not_called()
+
+    def test_claimed_stale_terminal_continuation_is_resumable_in_place(
+        self,
+    ) -> None:
+        original_suffix = {
+            'agent_feedback_summaries': {
+                'status': 'completed',
+                'source_run_ids': {'run_id': 'feedback-cycle-summary'},
+            },
+            'signal_decider': {
+                'status': 'failed',
+                'details': {
+                    'result_summary': {
+                        'status': 'failed',
+                        'progress': {
+                            'summary': {
+                                'failed_items': 1,
+                                'failure_groups': {
+                                    'dependency/missing-upstream': {
+                                        'failure_status': (
+                                            'dependency/missing-upstream'
+                                        ),
+                                        'failure_category': 'dependency',
+                                        'count': 1,
+                                        'retryable_count': 1,
+                                        'failure_kinds': [
+                                            'dependency_missing_upstream'
+                                        ],
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            },
+            'next_open_execution_plan': {
+                'status': 'blocked',
+                'details': {
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'blocked',
+                        'reason': 'signal_decider_stage_incomplete',
+                        'upstream_status': 'failed',
+                    }
+                },
+            },
+            'signal_decider_evaluations': {
+                'status': 'blocked',
+                'details': {
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'blocked',
+                        'reason': 'declared_dependencies_incomplete',
+                        'incomplete_dependencies': ['signal_decider'],
+                    }
+                },
+            },
+        }
+        claimed_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'running',
+            'current_stage': 'agent_feedback_summaries',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'pykrx_enrichment',
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'symbols': ['005930'],
+                'markets': ['KOSPI'],
+                'reused_eod_collection_run_id': 7,
+                'resume_from_stage': 'agent_feedback_summaries',
+                'terminal_continuation_count': 1,
+                'terminal_continuation_version': 1,
+                'terminal_continuation_claimed_at': (
+                    '2026-04-03T08:00:00+00:00'
+                ),
+                'terminal_continuation_reason': (
+                    'summary_knowledge_cutoff_repair'
+                ),
+                'terminal_continuation_evidence': {
+                    'parent': {
+                        'status': 'blocked',
+                        'current_stage': 'signal_decider_evaluations',
+                    },
+                    'suffix_stages': original_suffix,
+                    'lineage': {
+                        'reused_eod_collection_run_id': 7,
+                        'expected_run_count': 6,
+                        'observed_run_count': 6,
+                        'ordered_pipeline_run_ids': [91, 92, 93, 94, 95, 96],
+                        'target_ordinal': 6,
+                        'latest_pipeline_run_id': 96,
+                    },
+                    'summary_proof': {
+                        'ready': True,
+                        'source_run_id': 'feedback-cycle-summary',
+                        'knowledge_cutoff_at': (
+                            '2026-04-03T06:30:00+00:00'
+                        ),
+                        'feedback_scope_mode': 'broad_feedback_universe',
+                        'requested_symbols': ['005930'],
+                        'requested_symbol_count': 1,
+                    },
+                },
+            },
+            'stages': {
+                'pykrx_enrichment': {'status': 'completed'},
+                **{
+                    stage_id: {
+                        'status': 'pending',
+                        'processed': 0,
+                        'total': 0,
+                        'succeeded': 0,
+                        'failed': 0,
+                        'remaining': 0,
+                        'current_step': 'terminal_continuation_pending',
+                        'completed_at': None,
+                        'error_message': None,
+                        'source_run_ids': {},
+                        'details': {},
+                    }
+                    for stage_id in (
+                        'agent_feedback_summaries',
+                        'signal_decider',
+                        'next_open_execution_plan',
+                        'signal_decider_evaluations',
+                    )
+                },
+            },
+        }
+
+        self.assertTrue(
+            _is_terminal_followup_continuation_candidate(claimed_run)
+        )
+
+    def test_sixth_non_dependency_failure_does_not_continue_same_row(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'symbols': ['005930'],
+                'markets': ['KOSPI'],
+                'reused_eod_collection_run_id': 7,
+            },
+            'stages': {
+                'agent_feedback_summaries': {'status': 'completed'},
+                'signal_decider': {
+                    'status': 'failed',
+                    'details': {
+                        'result_summary': {
+                            'status': 'failed',
+                            'progress': {
+                                'summary': {
+                                    'failed_items': 1,
+                                    'failure_groups': {
+                                        'transport/timeout': {
+                                            'count': 1,
+                                            'retryable_count': 1,
+                                            'failure_kinds': [
+                                                'openclaw_transport_timeout'
+                                            ],
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete'
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run'
+            ) as resume_followups,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+                markets=('KOSPI',),
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'followup_recovery_limit_reached')
+        resume_followups.assert_not_called()
+
     def test_fresh_ready_enrichment_repair_rearms_one_bounded_followup(
         self,
     ) -> None:
@@ -6776,11 +7406,13 @@ class PykrxBackfillServiceTests(TestCase):
         feedback_followup.assert_called_once_with(
             market_date='2026-04-03',
             enabled=False,
+            knowledge_cutoff_at=ANY,
             progress_callback=ANY,
         )
         signal_decider_followup.assert_called_once_with(
             market_date='2026-04-03',
             enabled=False,
+            knowledge_cutoff_at=ANY,
             progress_callback=ANY,
         )
         evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)

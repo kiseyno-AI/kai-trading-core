@@ -2081,6 +2081,128 @@ class DynamicFakeAgentContextReadService:
         return {'items': [{'symbol': symbol} for symbol in kwargs['symbols']]}
 
 
+def _fundamental_dispatch_context(
+    *,
+    symbol: str = '005930',
+    fs_div: str = 'CFS',
+    disclosures: list[dict] | None = None,
+    revenue: int = 100,
+) -> dict:
+    disclosure_items = list(disclosures or [])
+    latest_disclosure = disclosure_items[0] if disclosure_items else {}
+    return {
+        'symbol': symbol,
+        'market_date': '2026-04-14',
+        'fundamentals': {
+            'latest_snapshot': {
+                'filing': {
+                    'rcept_no': latest_disclosure.get('rcept_no'),
+                    'receipt_date': latest_disclosure.get('receipt_date'),
+                    'captured_at': '2026-04-14T05:00:00+00:00',
+                },
+                'period': {
+                    'business_year': 2025,
+                    'report_code': '11011',
+                },
+                'statement': {
+                    'fs_div': fs_div,
+                    'statement_type': 'consolidated'
+                    if fs_div == 'CFS'
+                    else 'separate',
+                    'row_count': 12,
+                },
+                'highlights': {
+                    'revenue': {'current_amount': revenue},
+                },
+                'fundamental_context': {
+                    'quality_summary': {'revenue': revenue},
+                },
+            },
+            'history_summary': {
+                'entries': 1,
+                'latest_receipt_date': latest_disclosure.get(
+                    'receipt_date'
+                ),
+                'recent_periods': [],
+            },
+        },
+        'recent_disclosures': {
+            'count': len(disclosure_items),
+            'items': disclosure_items,
+        },
+        'recent_dart_events': {
+            'status': 'available' if disclosure_items else 'empty',
+            'item_count': len(disclosure_items),
+            'items': [
+                {
+                    'rcept_no': item.get('rcept_no'),
+                    'receipt_date': item.get('receipt_date'),
+                    'report_nm': item.get('report_nm'),
+                }
+                for item in disclosure_items
+            ],
+        },
+        'valuation_context': {
+            'status': 'available',
+            'market': 'KOSPI',
+            'valuation_snapshot': {'per': 12.5, 'pbr': 1.2},
+            'foreign_ownership': {'ownership_ratio': 52.1},
+            'missing_fields': [],
+        },
+    }
+
+
+class FilteredFundamentalReadService:
+    def __init__(
+        self,
+        *,
+        disclosures: list[dict],
+        on_context_captured=None,
+    ):
+        self.disclosures = disclosures
+        self.on_context_captured = on_context_captured
+        self.calls = []
+
+    def get_symbol_day_context(self, **kwargs):
+        self.calls.append(kwargs)
+        raw_cutoff = kwargs['knowledge_cutoff_at']
+        cutoff = (
+            raw_cutoff
+            if isinstance(raw_cutoff, datetime)
+            else datetime.fromisoformat(
+                str(raw_cutoff).replace('Z', '+00:00')
+            )
+        )
+        visible = [
+            {
+                key: value
+                for key, value in item.items()
+                if key != 'created_at'
+            }
+            for item in self.disclosures
+            if item['created_at'] < cutoff
+        ][: int(kwargs['disclosures_limit'])]
+        item = _fundamental_dispatch_context(
+            symbol=kwargs['symbols'][0],
+            fs_div=(kwargs.get('fs_div') or 'CFS').upper(),
+            disclosures=visible,
+        )
+        if self.on_context_captured is not None:
+            self.on_context_captured()
+        return {
+            'request': {
+                'market_date': kwargs['market_date'].isoformat(),
+                'symbols': list(kwargs['symbols']),
+                'fs_div': (kwargs.get('fs_div') or 'CFS').upper(),
+                'disclosures_limit': int(kwargs['disclosures_limit']),
+                'knowledge_cutoff_at': cutoff.astimezone(
+                    timezone.utc
+                ).isoformat(),
+            },
+            'items': [item],
+        }
+
+
 class RecordingAgentContextReadService:
     def __init__(self):
         self.calls = []
@@ -2091,6 +2213,11 @@ class RecordingAgentContextReadService:
 
 
 class DeciderReadyAgentContextReadService:
+    def __init__(self):
+        self.disclosure_repository = SimpleNamespace(
+            list_recent_events_by_stock_codes=lambda **_kwargs: {},
+        )
+
     def get_symbol_day_context(self, **kwargs):
         return {
             'summary': {
@@ -2922,6 +3049,27 @@ def _patched_eligibility_split(*allowed_symbols: str):
 @contextmanager
 def _patch_feedback_eligibility(*symbols: str):
     split = _patched_eligibility_split(*symbols)
+    reuse_service = orchestrator_module.agent_context_reuse_service
+    fingerprint_patcher = None
+    if not callable(
+        getattr(
+            reuse_service,
+            'build_fundamental_input_fingerprint_payload',
+            None,
+        )
+    ):
+        fingerprint_patcher = patch.object(
+            reuse_service,
+            'build_fundamental_input_fingerprint_payload',
+            side_effect=lambda *, market_date, symbol: {
+                'schema_version': 'fundamental_summary_input_fingerprint_v1',
+                'reuse_policy_version': 'fundamental_summary_reuse_policy_v1',
+                'fingerprint': f'sha256:test-{market_date}-{symbol}',
+                'input': {'symbol': symbol},
+            },
+            create=True,
+        )
+        fingerprint_patcher.start()
 
     def load_records(*, market_date, requested_symbols=None, **_):
         scope = list(requested_symbols) if requested_symbols is not None else list(symbols)
@@ -2932,25 +3080,29 @@ def _patch_feedback_eligibility(*symbols: str):
             )[2]['records_by_symbol'].values()
         )
 
-    with patch.object(
-        orchestrator_module,
-        '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics',
-        side_effect=split,
-    ):
+    try:
         with patch.object(
             orchestrator_module,
-            'load_agent_feedback_eligibility_records',
-            side_effect=load_records,
+            '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics',
+            side_effect=split,
         ):
             with patch.object(
                 orchestrator_module,
-                '_split_requested_symbols_by_agent_feedback_eligibility',
-                side_effect=lambda market_date, requested_symbols: (
-                    [symbol for symbol in requested_symbols if symbol in set(symbols)],
-                    [symbol for symbol in requested_symbols if symbol not in set(symbols)],
-                ),
+                'load_agent_feedback_eligibility_records',
+                side_effect=load_records,
             ):
-                yield
+                with patch.object(
+                    orchestrator_module,
+                    '_split_requested_symbols_by_agent_feedback_eligibility',
+                    side_effect=lambda market_date, requested_symbols: (
+                        [symbol for symbol in requested_symbols if symbol in set(symbols)],
+                        [symbol for symbol in requested_symbols if symbol not in set(symbols)],
+                    ),
+                ):
+                    yield
+    finally:
+        if fingerprint_patcher is not None:
+            fingerprint_patcher.stop()
 
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
@@ -3963,8 +4115,8 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         service.client = client
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
-        failure_service = RecordingFailureService()
         run_state_service = RecordingRunStateService()
+        failure_service = RecordingFailureService()
         symbols = [f'{index:06d}' for index in range(1, 21)]
         reused_symbols = set(symbols[:15])
         missing_symbols = symbols[15:]
@@ -4117,6 +4269,342 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(cleanup_service.targets), 1)
         self.assertEqual(cleanup_service.targets[0].session_key, client.calls[0]['batch_items'][0]['session_key'])
         self.assertEqual(result['summary']['flushed_to_db'], 2)
+
+    def test_fundamental_dispatch_persists_the_exact_input_fingerprint(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        cutoff = '2026-04-14T06:30:00+00:00'
+        read_service = FilteredFundamentalReadService(
+            disclosures=[
+                {
+                    'rcept_no': '202604140001',
+                    'receipt_date': '2026-04-14',
+                    'report_nm': '사업보고서',
+                    'created_at': datetime(
+                        2026,
+                        4,
+                        14,
+                        6,
+                        0,
+                        tzinfo=timezone.utc,
+                    ),
+                }
+            ],
+        )
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module.agent_context_reuse_service,
+                'build_fundamental_input_fingerprint_payload',
+                side_effect=AssertionError('independent DB fingerprint read'),
+            ) as legacy_fingerprint_read:
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_feedback_run_state_service',
+                    run_state_service,
+                ):
+                    with patch.object(orchestrator_module, 'agent_context_read_service', read_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility('005930'):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930'],
+                                        roles=['fundamental-summarizer'],
+                                        fs_div='CFS',
+                                        disclosures_limit=3,
+                                        knowledge_cutoff_at=cutoff,
+                                        reuse_existing=True,
+                                        force_recompute=True,
+                                    )
+
+        self.assertEqual(result['summary']['completed'], 1)
+        self.assertEqual(result['summary']['failed'], 0)
+        self.assertEqual(len(feedback_service.bulk_items), 1)
+        stored = feedback_service.bulk_items[0]
+        dispatched_context = client.calls[0]['batch_items'][0]
+        fingerprint_payload = (
+            orchestrator_module
+            .build_fundamental_input_fingerprint_payload_from_context(
+                market_date='2026-04-14',
+                symbol='005930',
+                context=dispatched_context,
+                fs_div='CFS',
+                disclosures_limit=3,
+                knowledge_cutoff_at=cutoff,
+            )
+        )
+        self.assertEqual(
+            stored['summary']['fundamental_summary_input_fingerprint'],
+            fingerprint_payload,
+        )
+        self.assertEqual(
+            stored['context']['fundamental_summary_input_fingerprint'],
+            fingerprint_payload,
+        )
+        self.assertEqual(
+            stored['summary']['reuse_metadata']['input_fingerprint'],
+            fingerprint_payload,
+        )
+        self.assertEqual(
+            dispatched_context['fundamental_summary_input_fingerprint'],
+            fingerprint_payload,
+        )
+        self.assertEqual(len(read_service.calls), 1)
+        legacy_fingerprint_read.assert_not_called()
+
+    def test_fundamental_dispatch_fails_closed_when_input_fingerprint_is_unavailable(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'build_fundamental_input_fingerprint_payload_from_context',
+                return_value=None,
+            ):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility('005930'):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=['005930'],
+                                        roles=['fundamental-summarizer'],
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(feedback_service.bulk_items, [])
+        self.assertEqual(client.calls, [])
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertTrue(failure_service.recorded[0]['retryable'])
+        self.assertEqual(
+            failure_service.recorded[0]['failure_kind'],
+            'fundamental_input_fingerprint_unavailable',
+        )
+
+    def test_fundamental_fingerprint_excludes_post_cutoff_source_mutation(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        cutoff = '2026-04-14T06:30:00+00:00'
+        source_disclosures = [
+            {
+                'rcept_no': '202604140001',
+                'receipt_date': '2026-04-14',
+                'report_nm': '사업보고서',
+                'created_at': datetime(
+                    2026,
+                    4,
+                    14,
+                    6,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            }
+        ]
+
+        def append_post_cutoff_disclosure() -> None:
+            source_disclosures.append(
+                {
+                    'rcept_no': '202604140002',
+                    'receipt_date': '2026-04-14',
+                    'report_nm': '정정공시',
+                    'created_at': datetime(
+                        2026,
+                        4,
+                        14,
+                        6,
+                        45,
+                        tzinfo=timezone.utc,
+                    ),
+                }
+            )
+
+        read_service = FilteredFundamentalReadService(
+            disclosures=source_disclosures,
+            on_context_captured=append_post_cutoff_disclosure,
+        )
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'agent_context_read_service',
+                read_service,
+            ):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_feedback_service',
+                    feedback_service,
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_feedback_session_cleanup_service',
+                        cleanup_service,
+                    ):
+                        with _patch_feedback_eligibility('005930'):
+                            result = service.dispatch_for_symbols(
+                                market_date='2026-04-14',
+                                symbols=['005930'],
+                                roles=['fundamental-summarizer'],
+                                fs_div='CFS',
+                                disclosures_limit=5,
+                                knowledge_cutoff_at=cutoff,
+                                reuse_existing=False,
+                            )
+
+        self.assertEqual(result['summary']['completed'], 1)
+        self.assertEqual(len(source_disclosures), 2)
+        fingerprint_payload = feedback_service.bulk_items[0]['summary'][
+            'fundamental_summary_input_fingerprint'
+        ]
+        fingerprint_disclosures = fingerprint_payload['input'][
+            'finalized_dispatch_context'
+        ]['recent_disclosures']
+        self.assertEqual(
+            [item['rcept_no'] for item in fingerprint_disclosures],
+            ['202604140001'],
+        )
+        self.assertNotIn(
+            '202604140002',
+            json.dumps(fingerprint_payload, ensure_ascii=False),
+        )
+        self.assertEqual(
+            fingerprint_payload,
+            client.calls[0]['batch_items'][0][
+                'fundamental_summary_input_fingerprint'
+            ],
+        )
+
+    def test_materialized_fingerprint_overrides_stale_precomputed_decision(self):
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+        cutoff = '2026-04-14T06:30:00+00:00'
+        read_service = FilteredFundamentalReadService(
+            disclosures=[
+                {
+                    'rcept_no': '202604140001',
+                    'receipt_date': '2026-04-14',
+                    'report_nm': '사업보고서',
+                    'created_at': datetime(
+                        2026,
+                        4,
+                        14,
+                        6,
+                        0,
+                        tzinfo=timezone.utc,
+                    ),
+                }
+            ],
+        )
+
+        class StalePrecomputedReuseService:
+            def __init__(self):
+                self.calls = []
+
+            def build_latest_decisions(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    '005930': {
+                        'fundamental-summarizer': SimpleNamespace(
+                            should_dispatch=True,
+                            reason='fundamental_input_fingerprint_changed',
+                            agent_name='fundamental-summarizer',
+                            latest_feedback_id=7,
+                            latest_feedback_received_at=(
+                                '2026-04-13T06:00:00+00:00'
+                            ),
+                            latest_source_updated_at=None,
+                            input_fingerprint_payload={
+                                'fingerprint': 'sha256:stale-precomputed'
+                            },
+                        )
+                    }
+                }
+
+        reuse_service = StalePrecomputedReuseService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(
+                orchestrator_module,
+                'agent_context_reuse_service',
+                reuse_service,
+            ):
+                with patch.object(
+                    orchestrator_module,
+                    'agent_context_read_service',
+                    read_service,
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_feedback_service',
+                        feedback_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_feedback_session_cleanup_service',
+                            cleanup_service,
+                        ):
+                            with _patch_feedback_eligibility('005930'):
+                                result = service.dispatch_for_symbols(
+                                    market_date='2026-04-14',
+                                    symbols=['005930'],
+                                    roles=['fundamental-summarizer'],
+                                    fs_div='CFS',
+                                    disclosures_limit=2,
+                                    knowledge_cutoff_at=cutoff,
+                                    reuse_existing=True,
+                                )
+
+        self.assertEqual(result['summary']['completed'], 1)
+        materialized_payload = reuse_service.calls[0][
+            'fundamental_input_fingerprint_payloads'
+        ]['005930']
+        dispatched_payload = client.calls[0]['batch_items'][0][
+            'fundamental_summary_input_fingerprint'
+        ]
+        stored_payload = feedback_service.bulk_items[0]['summary'][
+            'fundamental_summary_input_fingerprint'
+        ]
+        self.assertEqual(dispatched_payload, materialized_payload)
+        self.assertEqual(stored_payload, materialized_payload)
+        self.assertNotEqual(
+            dispatched_payload['fingerprint'],
+            'sha256:stale-precomputed',
+        )
+        self.assertEqual(len(read_service.calls), 1)
 
     def test_symbol_dispatch_checkpoints_each_persisted_batch_and_leaves_final_flush_as_safety(self):
         service = AgentFeedbackOrchestrator()

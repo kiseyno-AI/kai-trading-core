@@ -104,6 +104,7 @@ from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
     FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
     agent_context_reuse_service,
+    build_fundamental_input_fingerprint_payload_from_context,
 )
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
 from app.agent_context.signal_decider_calibration_service import signal_decider_calibration_service
@@ -2396,6 +2397,20 @@ class AgentFeedbackOrchestrator:
                 for item in (refreshed_context.get('items') or [])
                 if isinstance(item, dict) and item.get('symbol')
             }
+            refreshed_request = refreshed_context.get('request')
+            if not isinstance(refreshed_request, dict):
+                refreshed_request = {}
+            refreshed_fs_div = refreshed_request.get('fs_div', fs_div)
+            refreshed_disclosures_limit = int(
+                refreshed_request.get(
+                    'disclosures_limit',
+                    disclosures_limit,
+                )
+            )
+            refreshed_knowledge_cutoff_at = refreshed_request.get(
+                'knowledge_cutoff_at',
+                source_knowledge_cutoff_at,
+            )
         except Exception as exc:  # noqa: BLE001
             for key in source_keys:
                 failures[key] = {
@@ -2484,13 +2499,34 @@ class AgentFeedbackOrchestrator:
         persisted_lookup_error: str | None = None
         if persisted_source_symbols:
             try:
+                refreshed_fundamental_fingerprints = {
+                    symbol: build_fundamental_input_fingerprint_payload_from_context(
+                        market_date=market_date,
+                        symbol=symbol,
+                        context=refreshed_by_symbol[symbol],
+                        fs_div=refreshed_fs_div,
+                        disclosures_limit=refreshed_disclosures_limit,
+                        knowledge_cutoff_at=refreshed_knowledge_cutoff_at,
+                    )
+                    for symbol in sorted(persisted_source_symbols)
+                    if symbol in refreshed_by_symbol
+                }
                 persisted_decisions = (
                     agent_context_reuse_service.build_latest_decisions(
                         market_date=market_date,
                         symbols=sorted(persisted_source_symbols),
                         roles=UPSTREAM_SUMMARY_ROLES,
                         force_recompute=False,
-                        knowledge_cutoff_at=source_knowledge_cutoff_at,
+                        knowledge_cutoff_at=(
+                            refreshed_knowledge_cutoff_at
+                        ),
+                        fs_div=refreshed_fs_div,
+                        disclosures_limit=refreshed_disclosures_limit,
+                        fundamental_input_fingerprint_payloads={
+                            symbol: refreshed_fundamental_fingerprints[symbol]
+                            for symbol in sorted(persisted_source_symbols)
+                            if symbol in refreshed_fundamental_fingerprints
+                        },
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -3534,7 +3570,90 @@ class AgentFeedbackOrchestrator:
             if decision is not None and not decision.should_dispatch:
                 continue
             if role not in DECISION_SUPPORT_AGENT_NAMES:
-                dispatch_items.append({**item})
+                dispatch_item = {**item}
+                if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME:
+                    fingerprint_error_type: str | None = None
+                    try:
+                        input_fingerprint_payload = (
+                            build_fundamental_input_fingerprint_payload_from_context(
+                                market_date=market_date,
+                                symbol=symbol,
+                                context=dispatch_item,
+                                fs_div=fs_div,
+                                disclosures_limit=disclosures_limit,
+                                knowledge_cutoff_at=(
+                                    source_knowledge_cutoff_at
+                                ),
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        input_fingerprint_payload = None
+                        fingerprint_error_type = type(exc).__name__
+                    fingerprint_value = (
+                        str(
+                            input_fingerprint_payload.get('fingerprint')
+                            or ''
+                        ).strip()
+                        if isinstance(input_fingerprint_payload, dict)
+                        else ''
+                    )
+                    if not fingerprint_value:
+                        failure_kind = (
+                            FeedbackFailureKind
+                            .FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE
+                            .value
+                        )
+                        failure_context = {
+                            'origin': (
+                                'fundamental_summary_dispatch_guard'
+                            ),
+                            'dependency_status': (
+                                'blocked_missing_input_fingerprint'
+                            ),
+                            'failure_status': (
+                                'dependency/'
+                                'fundamental-input-fingerprint-unavailable'
+                            ),
+                            'failure_kind': failure_kind,
+                            'fingerprint_error_type': (
+                                fingerprint_error_type
+                            ),
+                        }
+                        failure = _build_failed_dispatch_item(
+                            role=role,
+                            agent_name=role,
+                            symbol=symbol,
+                            error=failure_kind,
+                            retryable=True,
+                            failure_kind=failure_kind,
+                            context=failure_context,
+                        )
+                        all_failures.append(failure)
+                        buffer_failure(
+                            role,
+                            symbol,
+                            failure_kind,
+                            True,
+                            failure_kind=failure_kind,
+                            context=failure_context,
+                            agent_name=role,
+                        )
+                        log_agent_feedback_event(
+                            'fundamental_input_fingerprint_rejected',
+                            status='retryable_failure_buffered',
+                            market_date=market_date.isoformat(),
+                            request_run_id=request_run_id,
+                            role=role,
+                            agent_name=role,
+                            symbol=symbol,
+                            failure_kind=failure_kind,
+                            failure_context=failure_context,
+                        )
+                        continue
+                    dispatch_item[
+                        'fundamental_summary_input_fingerprint'
+                    ] = input_fingerprint_payload
+                dispatch_items.append(dispatch_item)
                 continue
 
             upstream_summaries, upstream_traceability, missing_roles = self._build_upstream_feedback_bundle(
@@ -5083,24 +5202,90 @@ class AgentFeedbackOrchestrator:
                     reuse_policy_version=getattr(decision, 'reuse_policy_version', None),
                 )
 
-        def buffer_success(role: str, symbol: str, context: dict[str, Any], response: dict[str, Any]) -> None:
+        def buffer_success(
+            role: str,
+            symbol: str,
+            context: dict[str, Any],
+            response: dict[str, Any],
+        ) -> bool:
             normalized_feedback = response.get('normalized_feedback')
             storage_context = context
             storage_response = response
-            decision = reuse_decisions.get(symbol, {}).get(role) if isinstance(reuse_decisions, dict) else None
-            input_fingerprint_payload = getattr(decision, 'input_fingerprint_payload', None)
-            if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME and not isinstance(input_fingerprint_payload, dict):
-                try:
-                    fingerprint_decision = agent_context_reuse_service.build_latest_decisions(
-                        market_date=normalized_market_date,
-                        symbols=[symbol],
-                        roles=[role],
-                        force_recompute=True,
-                        knowledge_cutoff_at=requested_knowledge_cutoff_at,
-                    ).get(symbol, {}).get(role)
-                    input_fingerprint_payload = getattr(fingerprint_decision, 'input_fingerprint_payload', None)
-                except Exception:  # noqa: BLE001
-                    input_fingerprint_payload = None
+            input_fingerprint_payload = context.get(
+                'fundamental_summary_input_fingerprint'
+            )
+            fingerprint_value = (
+                str(input_fingerprint_payload.get('fingerprint') or '').strip()
+                if isinstance(input_fingerprint_payload, dict)
+                else ''
+            )
+            if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME and not fingerprint_value:
+                failure_kind = (
+                    FeedbackFailureKind
+                    .FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE
+                    .value
+                )
+                failure_context = {
+                    'origin': 'fundamental_summary_persistence_guard',
+                    'dependency_status': 'blocked_missing_input_fingerprint',
+                    'failure_status': (
+                        'dependency/fundamental-input-fingerprint-unavailable'
+                    ),
+                    'failure_kind': failure_kind,
+                    'fingerprint_error_type': None,
+                }
+                batch_symbols = response.get('batch_symbols')
+                failure = _build_failed_dispatch_item(
+                    role=role,
+                    agent_name=role,
+                    symbol=symbol,
+                    error=failure_kind,
+                    retryable=True,
+                    failure_kind=failure_kind,
+                    context=failure_context,
+                    dispatch_id=response.get('dispatch_id'),
+                    attempt_id=response.get('attempt_id'),
+                    slot=response.get('slot'),
+                    session_key=response.get('session_key'),
+                    session_id=response.get('session_id'),
+                    response_id=response.get('response_id'),
+                    request_marker=response.get('request_marker'),
+                    batch_symbols=(
+                        batch_symbols if isinstance(batch_symbols, list) else [symbol]
+                    ),
+                )
+                all_failures.append(failure)
+                buffer_failure(
+                    role,
+                    symbol,
+                    failure_kind,
+                    True,
+                    failure_kind=failure_kind,
+                    context=failure_context,
+                    agent_name=role,
+                    dispatch_id=response.get('dispatch_id'),
+                    attempt_id=response.get('attempt_id'),
+                    slot=response.get('slot'),
+                    session_key=response.get('session_key'),
+                    session_id=response.get('session_id'),
+                    response_id=response.get('response_id'),
+                    request_marker=response.get('request_marker'),
+                    batch_symbols=(
+                        batch_symbols if isinstance(batch_symbols, list) else [symbol]
+                    ),
+                )
+                log_agent_feedback_event(
+                    'fundamental_input_fingerprint_rejected',
+                    status='retryable_failure_buffered',
+                    market_date=normalized_market_date.isoformat(),
+                    request_run_id=request_run_id,
+                    role=role,
+                    agent_name=role,
+                    symbol=symbol,
+                    failure_kind=failure_kind,
+                    failure_context=failure_context,
+                )
+                return False
             if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME and isinstance(input_fingerprint_payload, dict):
                 reuse_metadata = {
                     'status': 'computed',
@@ -5159,6 +5344,7 @@ class AgentFeedbackOrchestrator:
                     'completed_at': response.get('completed_at'),
                 },
             )
+            return True
 
         def buffer_failure(
             role: str,
@@ -5425,6 +5611,96 @@ class AgentFeedbackOrchestrator:
                     'failures': [],
                 }
             else:
+                source_knowledge_cutoff_at: str | None = (
+                    requested_knowledge_cutoff_at
+                )
+                source_fs_div = fs_div
+                source_disclosures_limit = disclosures_limit
+                context_materialized = False
+                fundamental_input_fingerprint_payloads: dict[
+                    str,
+                    dict[str, Any],
+                ] = {}
+                upstream_reuse_enabled = bool(
+                    getattr(
+                        settings,
+                        'openclaw_feedback_upstream_reuse_enabled',
+                        True,
+                    )
+                )
+                needs_fundamental_context_before_reuse = bool(
+                    not skip_terminal_reconciliation
+                    and (
+                        FUNDAMENTAL_SUMMARIZER_AGENT_NAME
+                        in requested_role_names
+                        or (
+                            upstream_reuse_enabled
+                            and any(
+                                spec.role in DECISION_SUPPORT_AGENT_NAMES
+                                for spec in specs
+                            )
+                        )
+                    )
+                )
+                if needs_fundamental_context_before_reuse:
+                    symbol_context = (
+                        agent_context_read_service.get_symbol_day_context(
+                            market_date=normalized_market_date,
+                            symbols=scoped_dispatch_symbols,
+                            fs_div=fs_div,
+                            disclosures_limit=disclosures_limit,
+                            knowledge_cutoff_at=(
+                                requested_knowledge_cutoff_at
+                            ),
+                        )
+                    )
+                    context_materialized = True
+                    _attach_agent_feedback_eligibility_context(
+                        items=symbol_context.get('items') or [],
+                        diagnostics=eligibility_diagnostics,
+                    )
+                    symbol_context_request = symbol_context.get('request')
+                    if isinstance(symbol_context_request, dict):
+                        source_fs_div = symbol_context_request.get(
+                            'fs_div',
+                            source_fs_div,
+                        )
+                        source_disclosures_limit = int(
+                            symbol_context_request.get(
+                                'disclosures_limit',
+                                source_disclosures_limit,
+                            )
+                        )
+                        raw_knowledge_cutoff = symbol_context_request.get(
+                            'knowledge_cutoff_at'
+                        )
+                        if (
+                            raw_knowledge_cutoff is not None
+                            and str(raw_knowledge_cutoff).strip()
+                        ):
+                            source_knowledge_cutoff_at = str(
+                                raw_knowledge_cutoff
+                            ).strip()
+                    for context_item in symbol_context.get('items') or []:
+                        symbol = str(
+                            context_item.get('symbol') or ''
+                        ).strip().upper()
+                        if not symbol:
+                            continue
+                        fundamental_input_fingerprint_payloads[symbol] = (
+                            build_fundamental_input_fingerprint_payload_from_context(
+                                market_date=normalized_market_date,
+                                symbol=symbol,
+                                context=context_item,
+                                fs_div=source_fs_div,
+                                disclosures_limit=(
+                                    source_disclosures_limit
+                                ),
+                                knowledge_cutoff_at=(
+                                    source_knowledge_cutoff_at
+                                ),
+                            )
+                        )
                 reuse_decisions = {}
                 if not skip_terminal_reconciliation and reuse_existing:
                     reuse_decisions = agent_context_reuse_service.build_latest_decisions(
@@ -5433,6 +5709,13 @@ class AgentFeedbackOrchestrator:
                         roles=requested_role_names,
                         force_recompute=force_recompute,
                         knowledge_cutoff_at=requested_knowledge_cutoff_at,
+                        fs_div=source_fs_div,
+                        disclosures_limit=source_disclosures_limit,
+                        fundamental_input_fingerprint_payloads=(
+                            fundamental_input_fingerprint_payloads
+                            if needs_fundamental_context_before_reuse
+                            else None
+                        ),
                     )
                     reuse_decisions = {
                         symbol: {
@@ -5462,7 +5745,7 @@ class AgentFeedbackOrchestrator:
                 upstream_reuse_decisions = {}
                 if (
                     not skip_terminal_reconciliation
-                    and bool(getattr(settings, 'openclaw_feedback_upstream_reuse_enabled', True))
+                    and upstream_reuse_enabled
                     and any(spec.role in DECISION_SUPPORT_AGENT_NAMES for spec in specs)
                 ):
                     upstream_reuse_decisions = agent_context_reuse_service.build_latest_decisions(
@@ -5471,6 +5754,11 @@ class AgentFeedbackOrchestrator:
                         roles=UPSTREAM_SUMMARY_ROLES,
                         force_recompute=False,
                         knowledge_cutoff_at=requested_knowledge_cutoff_at,
+                        fs_div=source_fs_div,
+                        disclosures_limit=source_disclosures_limit,
+                        fundamental_input_fingerprint_payloads=(
+                            fundamental_input_fingerprint_payloads
+                        ),
                     )
                     upstream_reuse_decisions = {
                         symbol: {
@@ -5499,8 +5787,7 @@ class AgentFeedbackOrchestrator:
                 source_context_scope_symbols_for_revalidation = list(
                     symbols_requiring_context
                 )
-                source_knowledge_cutoff_at: str | None = None
-                if symbols_requiring_context:
+                if symbols_requiring_context and not context_materialized:
                     symbol_context = agent_context_read_service.get_symbol_day_context(
                         market_date=normalized_market_date,
                         symbols=symbols_requiring_context,
@@ -5514,6 +5801,16 @@ class AgentFeedbackOrchestrator:
                     )
                     symbol_context_request = symbol_context.get('request')
                     if isinstance(symbol_context_request, dict):
+                        source_fs_div = symbol_context_request.get(
+                            'fs_div',
+                            source_fs_div,
+                        )
+                        source_disclosures_limit = int(
+                            symbol_context_request.get(
+                                'disclosures_limit',
+                                source_disclosures_limit,
+                            )
+                        )
                         raw_knowledge_cutoff = symbol_context_request.get(
                             'knowledge_cutoff_at'
                         )
@@ -5619,8 +5916,8 @@ class AgentFeedbackOrchestrator:
                         eligibility_scope_symbols=(
                             eligibility_scope_symbols_for_revalidation
                         ),
-                        fs_div=fs_div,
-                        disclosures_limit=disclosures_limit,
+                        fs_div=source_fs_div,
+                        disclosures_limit=source_disclosures_limit,
                         source_knowledge_cutoff_at=(
                             source_knowledge_cutoff_at
                         ),
@@ -6108,12 +6405,14 @@ class AgentFeedbackOrchestrator:
                                                 normalized_feedback=normalized_feedback,
                                                 collector_mode='role_sequential_runtime_buffered',
                                             )
-                                            buffer_success(
+                                            success_buffered = buffer_success(
                                                 spec.agent_name,
                                                 symbol,
                                                 source_item,
                                                 response_payload_item,
                                             )
+                                            if not success_buffered:
+                                                continue
                                             all_items.append(
                                                 _build_completed_dispatch_item(
                                                     role=role,

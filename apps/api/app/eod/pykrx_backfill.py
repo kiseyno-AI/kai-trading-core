@@ -88,6 +88,12 @@ MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE = 5
 AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
 AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
 AUTO_EOD_PIPELINE_ENTRYPOINT = 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+    'signal_decider_evaluations',
+)
 RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
 PYKRX_STAGE_SEQUENCE = (
     'price_collection',
@@ -234,6 +240,327 @@ def _dedupe_symbol_codes(symbols: Sequence[object]) -> list[str]:
             normalized = normalized.zfill(6)
         deduped.setdefault(normalized, None)
     return list(deduped.keys())
+
+
+def _stage_result_summary(stage: object) -> Mapping[str, Any]:
+    if not isinstance(stage, Mapping):
+        return {}
+    details = stage.get('details')
+    if not isinstance(details, Mapping):
+        return {}
+    result_summary = details.get('result_summary')
+    return result_summary if isinstance(result_summary, Mapping) else {}
+
+
+def _is_retryable_missing_upstream_decider_failure(stage: object) -> bool:
+    if not isinstance(stage, Mapping):
+        return False
+    if str(stage.get('status') or '').strip().lower() != 'failed':
+        return False
+    result_summary = _stage_result_summary(stage)
+    if str(result_summary.get('status') or '').strip().lower() != 'failed':
+        return False
+    progress = result_summary.get('progress')
+    summary = progress.get('summary') if isinstance(progress, Mapping) else None
+    if not isinstance(summary, Mapping):
+        return False
+    failure_groups = summary.get('failure_groups')
+    if not isinstance(failure_groups, Mapping) or len(failure_groups) != 1:
+        return False
+    try:
+        failed_items = int(summary.get('failed_items') or 0)
+    except (TypeError, ValueError):
+        return False
+    if failed_items <= 0:
+        return False
+
+    group = failure_groups.get('dependency/missing-upstream')
+    if not isinstance(group, Mapping):
+        return False
+    try:
+        group_count = int(group.get('count') or 0)
+        retryable_count = int(group.get('retryable_count') or 0)
+    except (TypeError, ValueError):
+        return False
+    failure_kinds = group.get('failure_kinds')
+    normalized_failure_kinds = {
+        str(item or '').strip().lower()
+        for item in failure_kinds
+        if str(item or '').strip()
+    } if isinstance(failure_kinds, (list, tuple, set)) else set()
+    return (
+        str(group.get('failure_status') or '').strip().lower()
+        == 'dependency/missing-upstream'
+        and str(group.get('failure_category') or '').strip().lower()
+        == 'dependency'
+        and group_count == failed_items
+        and retryable_count == failed_items
+        and normalized_failure_kinds == {'dependency_missing_upstream'}
+    )
+
+
+def _is_terminal_followup_continuation_candidate(
+    pipeline_run: object,
+) -> bool:
+    """Admit only the one narrow dependency-only terminal suffix retry."""
+
+    if not isinstance(pipeline_run, Mapping):
+        return False
+    if pipeline_run.get('trigger') != AUTO_FOLLOWUP_RECOVERY_TRIGGER:
+        return False
+    pipeline_status = str(
+        pipeline_run.get('status') or ''
+    ).strip().lower()
+    run_metadata = pipeline_run.get('run_metadata')
+    if not isinstance(run_metadata, Mapping):
+        return False
+    try:
+        continuation_count = int(
+            run_metadata.get('terminal_continuation_count') or 0
+        )
+    except (TypeError, ValueError):
+        return False
+
+    def evidence_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    terminal_evidence: Mapping[str, Any] | None = None
+    evidence_suffix: Mapping[str, Any] | None = None
+    if pipeline_status == 'blocked' and continuation_count == 0:
+        pass
+    elif (
+        pipeline_status in {'running', 'interrupted'}
+        and continuation_count == 1
+    ):
+        terminal_evidence = (
+            run_metadata.get('terminal_continuation_evidence')
+            if isinstance(
+                run_metadata.get('terminal_continuation_evidence'),
+                Mapping,
+            )
+            else None
+        )
+        evidence_suffix = (
+            terminal_evidence.get('suffix_stages')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('suffix_stages'), Mapping)
+            else None
+        )
+        parent_evidence = (
+            terminal_evidence.get('parent')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('parent'), Mapping)
+            else {}
+        )
+        lineage_evidence = (
+            terminal_evidence.get('lineage')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('lineage'), Mapping)
+            else {}
+        )
+        summary_proof = (
+            terminal_evidence.get('summary_proof')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('summary_proof'), Mapping)
+            else {}
+        )
+        ordered_run_ids = lineage_evidence.get(
+            'ordered_pipeline_run_ids'
+        )
+        if not (
+            run_metadata.get('terminal_continuation_version') == 1
+            and str(
+                run_metadata.get('terminal_continuation_reason') or ''
+            ).strip()
+            == 'summary_knowledge_cutoff_repair'
+            and str(run_metadata.get('resume_from_stage') or '').strip()
+            == TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            and _parse_activity_datetime(
+                run_metadata.get('terminal_continuation_claimed_at')
+            )
+            is not None
+            and str(pipeline_run.get('current_stage') or '').strip()
+            == TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            and str(parent_evidence.get('status') or '').strip().lower()
+            == 'blocked'
+            and str(parent_evidence.get('current_stage') or '').strip()
+            == 'signal_decider_evaluations'
+            and isinstance(evidence_suffix, Mapping)
+            and set(evidence_suffix)
+            == set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+            and evidence_int(
+                lineage_evidence.get('reused_eod_collection_run_id')
+            )
+            == evidence_int(
+                run_metadata.get('reused_eod_collection_run_id')
+            )
+            and evidence_int(lineage_evidence.get('expected_run_count'))
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(lineage_evidence.get('observed_run_count'))
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(lineage_evidence.get('target_ordinal'))
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(lineage_evidence.get('latest_pipeline_run_id'))
+            == evidence_int(pipeline_run.get('id'))
+            and isinstance(ordered_run_ids, (list, tuple))
+            and len(ordered_run_ids)
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(ordered_run_ids[-1])
+            == evidence_int(pipeline_run.get('id'))
+            and summary_proof.get('ready') is True
+            and str(summary_proof.get('source_run_id') or '').strip()
+            and _parse_activity_datetime(
+                summary_proof.get('knowledge_cutoff_at')
+            )
+            is not None
+            and str(
+                summary_proof.get('feedback_scope_mode') or ''
+            ).strip()
+            == 'broad_feedback_universe'
+            and evidence_int(
+                summary_proof.get('requested_symbol_count')
+            )
+            == len(_dedupe_symbol_codes(run_metadata.get('symbols') or []))
+            and summary_proof.get('requested_symbols')
+            == _dedupe_symbol_codes(run_metadata.get('symbols') or [])
+        ):
+            return False
+    else:
+        return False
+    persisted_symbols = run_metadata.get('symbols')
+    persisted_markets = run_metadata.get('markets')
+    if (
+        not isinstance(persisted_symbols, (list, tuple))
+        or not _dedupe_symbol_codes(persisted_symbols)
+        or not isinstance(persisted_markets, (list, tuple))
+        or not any(str(item or '').strip() for item in persisted_markets)
+    ):
+        return False
+
+    stages = pipeline_run.get('stages')
+    if not isinstance(stages, Mapping):
+        return False
+    resolved_stages = {
+        str(stage_id or '').strip()
+        for stage_id in (run_metadata.get('resolved_stages') or stages.keys())
+        if str(stage_id or '').strip()
+    }
+    if not set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES).issubset(
+        resolved_stages
+    ):
+        return False
+
+    if evidence_suffix is not None:
+        for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+            live_stage = stages.get(stage_id)
+            if not isinstance(live_stage, Mapping) or not (
+                str(live_stage.get('status') or '').strip().lower()
+                == 'pending'
+                and str(live_stage.get('current_step') or '').strip()
+                == 'terminal_continuation_pending'
+                and evidence_int(live_stage.get('processed') or 0) == 0
+                and evidence_int(live_stage.get('total') or 0) == 0
+                and evidence_int(live_stage.get('succeeded') or 0) == 0
+                and evidence_int(live_stage.get('failed') or 0) == 0
+                and evidence_int(live_stage.get('remaining') or 0) == 0
+                and live_stage.get('completed_at') is None
+                and not str(live_stage.get('error_message') or '').strip()
+                and isinstance(
+                    live_stage.get('source_run_ids'), Mapping
+                )
+                and not live_stage.get('source_run_ids')
+                and isinstance(live_stage.get('details'), Mapping)
+                and not live_stage.get('details')
+            ):
+                return False
+
+    terminal_stages = evidence_suffix or stages
+    summaries = terminal_stages.get('agent_feedback_summaries')
+    if evidence_suffix is not None:
+        summary_source_run_ids = (
+            summaries.get('source_run_ids')
+            if isinstance(summaries, Mapping)
+            and isinstance(summaries.get('source_run_ids'), Mapping)
+            else {}
+        )
+        summary_source_ids = {
+            str(summary_source_run_ids.get(key) or '').strip()
+            for key in ('agent_feedback_run_id', 'run_id')
+            if str(summary_source_run_ids.get(key) or '').strip()
+        }
+        if summary_source_ids != {
+            str(summary_proof.get('source_run_id') or '').strip()
+        }:
+            return False
+    if (
+        not isinstance(summaries, Mapping)
+        or str(summaries.get('status') or '').strip().lower()
+        != 'completed'
+        or not daily_pipeline_outcome_is_satisfied(
+            summaries if isinstance(summaries, Mapping) else {}
+        )
+    ):
+        return False
+    if not _is_retryable_missing_upstream_decider_failure(
+        terminal_stages.get('signal_decider')
+    ):
+        return False
+
+    plan = terminal_stages.get('next_open_execution_plan')
+    if not isinstance(plan, Mapping) or str(
+        plan.get('status') or ''
+    ).strip().lower() != 'blocked':
+        return False
+    plan_summary = _stage_result_summary(plan)
+    if (
+        str(plan_summary.get('reason') or '').strip()
+        != 'signal_decider_stage_incomplete'
+        or str(plan_summary.get('status') or '')
+        .strip()
+        .lower()
+        != 'blocked'
+        or plan_summary.get('triggered') is not False
+        or str(
+            plan_summary.get('upstream_status') or ''
+        ).strip().lower()
+        != 'failed'
+    ):
+        return False
+
+    evaluations = terminal_stages.get('signal_decider_evaluations')
+    if not isinstance(evaluations, Mapping) or str(
+        evaluations.get('status') or ''
+    ).strip().lower() != 'blocked':
+        return False
+    evaluation_summary = _stage_result_summary(evaluations)
+    if (
+        str(evaluation_summary.get('reason') or '').strip()
+        != 'declared_dependencies_incomplete'
+        or str(evaluation_summary.get('status') or '')
+        .strip()
+        .lower()
+        != 'blocked'
+        or evaluation_summary.get('triggered') is not False
+        or evaluation_summary.get('incomplete_dependencies')
+        != ['signal_decider']
+    ):
+        return False
+
+    allowed_incomplete = set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+    for stage_id in resolved_stages:
+        if stage_id in allowed_incomplete:
+            continue
+        stage = stages.get(stage_id)
+        if not isinstance(stage, Mapping):
+            return False
+        if not daily_pipeline_outcome_is_satisfied(
+            {**dict(stage), 'stage': stage_id}
+        ):
+            return False
+    return True
 
 
 def _point_in_time_source_markets(
@@ -1990,10 +2317,17 @@ class PykrxBackfillService:
             }
             return result
 
+        terminal_continuation_in_place = bool(
+            recovery_attempts
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and repair_checkpoint is None
+            and _is_terminal_followup_continuation_candidate(pipeline_run)
+        )
         if (
             recovery_attempts
             >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
             and repair_checkpoint is None
+            and not terminal_continuation_in_place
         ):
             result = build_daily_skip_result(
                 reason='followup_recovery_limit_reached',
@@ -2038,7 +2372,8 @@ class PykrxBackfillService:
                 return result
 
         current_price_scope_preflight_required = bool(
-            not point_in_time_recovery
+            not terminal_continuation_in_place
+            and not point_in_time_recovery
             and not price_retry_symbols
             and (
                 untracked_followup_parent
@@ -2086,7 +2421,11 @@ class PykrxBackfillService:
                     ),
                 )
 
-        if point_in_time_recovery and not point_in_time_membership_symbols:
+        if (
+            not terminal_continuation_in_place
+            and point_in_time_recovery
+            and not point_in_time_membership_symbols
+        ):
             (
                 point_in_time_membership_symbols,
                 recovery_markets,
@@ -2123,6 +2462,16 @@ class PykrxBackfillService:
         # Imported lazily because the stage orchestrator depends on this service.
         from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 
+        if terminal_continuation_in_place:
+            resume_from_stage = TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            recovery_stages = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+            persisted_markets = run_metadata.get('markets')
+            recovery_markets = tuple(
+                str(market or '').strip().upper()
+                for market in persisted_markets
+                if str(market or '').strip()
+            )
+
         recovery_kwargs: dict[str, Any] = {
             'market_date': market_date,
             'stages': recovery_stages,
@@ -2133,7 +2482,17 @@ class PykrxBackfillService:
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
             'reused_eod_collection_run_id': int(latest_eod_run['id']),
         }
-        if point_in_time_recovery:
+        if terminal_continuation_in_place:
+            recovery_kwargs['existing_pipeline_run_id'] = int(
+                pipeline_run['id']
+            )
+        persisted_point_in_time_recovery = bool(
+            run_metadata.get('point_in_time_recovery')
+        )
+        if point_in_time_recovery or (
+            terminal_continuation_in_place
+            and persisted_point_in_time_recovery
+        ):
             recovery_kwargs['point_in_time_recovery'] = True
         # A later follow-up can fail independently of the immediate PyKRX
         # stages, so a healthy collection resumes the full universe. When a
@@ -2143,7 +2502,11 @@ class PykrxBackfillService:
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in incomplete_stages
         )
-        if point_in_time_recovery and downstream_retry_symbols:
+        if terminal_continuation_in_place:
+            recovery_symbols = _dedupe_symbol_codes(
+                run_metadata.get('symbols') or []
+            )
+        elif point_in_time_recovery and downstream_retry_symbols:
             recovery_symbols = downstream_retry_symbols
         elif recovering_safe_downstream_scope:
             recovery_symbols = downstream_retry_symbols
@@ -2208,14 +2571,31 @@ class PykrxBackfillService:
             }
         convergence['pipeline_run'] = pipeline_convergence
         recovery_result.setdefault('triggered', True)
-        recovery_result.setdefault('reason', 'incomplete_followups_resumed')
+        recovery_result.setdefault(
+            'reason',
+            (
+                'terminal_followup_continuation_resumed'
+                if terminal_continuation_in_place
+                else 'incomplete_followups_resumed'
+            ),
+        )
         recovery_result.setdefault('market_date', market_date)
         recovery_result['latest_available_trade_date'] = latest_available_trade_date
         recovery_result['source'] = 'pykrx'
         recovery_result['followup_recovery'] = {
-            'attempt': recovery_attempts + 1,
+            'attempt': (
+                recovery_attempts
+                if terminal_continuation_in_place
+                else recovery_attempts + 1
+            ),
             'max_attempts': (
-                MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                max(
+                    recovery_attempts,
+                    MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                    + (1 if repair_checkpoint is not None else 0),
+                )
+                if terminal_continuation_in_place
+                else MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
                 + (1 if repair_checkpoint is not None else 0)
             ),
             'resumed_from_pipeline_run_id': pipeline_run.get('id'),
@@ -2225,6 +2605,10 @@ class PykrxBackfillService:
             'symbols': recovery_symbols,
             'state_convergence': convergence,
         }
+        if terminal_continuation_in_place:
+            recovery_result['followup_recovery'][
+                'terminal_continuation_in_place'
+            ] = True
         if repair_checkpoint is not None:
             recovery_result['followup_recovery'][
                 'repair_checkpoint_pipeline_run_id'

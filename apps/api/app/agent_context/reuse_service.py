@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func, or_, select
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
+from app.agent_context.orchestrator_helpers import trim_batch_item_for_prompt
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     DEFAULT_AGENT_NAMES,
     SIGNAL_DECIDER_AGENT_NAME,
 )
+from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
     AgentContextFeedback,
@@ -34,10 +37,10 @@ from app.db_models import (
 
 
 FUNDAMENTAL_SUMMARIZER_AGENT_NAME = 'fundamental-summarizer'
-FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION = 'fundamental_summary_input_fingerprint_v1'
+FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION = 'fundamental_summary_input_fingerprint_v2'
 FUNDAMENTAL_SUMMARY_PROMPT_VERSION = 'fundamental_summarizer_prompt_v1'
 FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION = 'agent_feedback_response_contract_v1'
-FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION = 'fundamental_summary_reuse_policy_v1'
+FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION = 'fundamental_summary_reuse_policy_v2'
 FUNDAMENTAL_SUMMARY_REUSE_REASON = 'reuse_unchanged_fundamental_inputs'
 FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE = 50
 
@@ -100,6 +103,157 @@ def _stable_hash(payload: dict[str, Any]) -> str:
         separators=(',', ':'),
     )
     return 'sha256:' + hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
+def _normalize_fingerprint_fs_div(fs_div: str | None) -> str | None:
+    if fs_div is None:
+        return None
+    normalized = str(fs_div).strip().upper()
+    if not normalized:
+        return None
+    if normalized not in {'CFS', 'OFS'}:
+        raise ValueError('fs_div must be one of CFS or OFS')
+    return normalized
+
+
+def _resolve_fingerprint_db_fs_div(fs_div: str | None) -> str:
+    """Match the configured fundamentals default for independent DB reads."""
+
+    return _normalize_fingerprint_fs_div(
+        fs_div or settings.dart_fundamentals_default_fs_div
+    ) or 'CFS'
+
+
+def _without_derived_fingerprint_fields(value: Any) -> Any:
+    """Remove request-wide freshness annotations from symbol-local lineage."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_derived_fingerprint_fields(item)
+            for key, item in value.items()
+            if str(key) not in {
+                'freshness_provenance',
+                'requested_symbol_coverage',
+            }
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _without_derived_fingerprint_fields(item)
+            for item in value
+        ]
+    return value
+
+
+def build_fundamental_input_fingerprint_payload_from_context(
+    *,
+    market_date: str | date,
+    symbol: str,
+    context: Mapping[str, Any],
+    fs_div: str | None,
+    disclosures_limit: int,
+    knowledge_cutoff_at: datetime | str | None,
+) -> dict[str, Any]:
+    """Hash finalized visible context and retain source filters for audit."""
+
+    normalized_market_date = _normalize_market_date(market_date)
+    normalized_symbols = _normalize_symbols([symbol])
+    if len(normalized_symbols) != 1:
+        raise ValueError('exactly one symbol is required')
+    normalized_symbol = normalized_symbols[0]
+    context_symbol = str(context.get('symbol') or '').strip().upper()
+    if context_symbol and context_symbol != normalized_symbol:
+        raise ValueError('context symbol does not match requested symbol')
+    normalized_fs_div = _normalize_fingerprint_fs_div(fs_div)
+    normalized_cutoff = (
+        _normalize_knowledge_cutoff_at(knowledge_cutoff_at)
+        if knowledge_cutoff_at is not None
+        else None
+    )
+    normalized_disclosures_limit = int(disclosures_limit)
+
+    visible_context = trim_batch_item_for_prompt(dict(context))
+
+    fundamentals = (
+        visible_context.get('fundamentals')
+        if isinstance(visible_context.get('fundamentals'), Mapping)
+        else {}
+    )
+    latest_snapshot = (
+        fundamentals.get('latest_snapshot')
+        if isinstance(fundamentals.get('latest_snapshot'), Mapping)
+        else None
+    )
+    history_summary = (
+        fundamentals.get('history_summary')
+        if isinstance(fundamentals.get('history_summary'), Mapping)
+        else {}
+    )
+    recent_disclosures = (
+        visible_context.get('recent_disclosures')
+        if isinstance(visible_context.get('recent_disclosures'), Mapping)
+        else {}
+    )
+    disclosure_items = recent_disclosures.get('items')
+    if not isinstance(disclosure_items, (list, tuple)):
+        disclosure_items = []
+    recent_dart_events = (
+        visible_context.get('recent_dart_events')
+        if isinstance(visible_context.get('recent_dart_events'), Mapping)
+        else {}
+    )
+    valuation_context = (
+        visible_context.get('valuation_context')
+        if isinstance(visible_context.get('valuation_context'), Mapping)
+        else {}
+    )
+
+    source_filters = {
+        'fs_div': normalized_fs_div,
+        'knowledge_cutoff_at': (
+            normalized_cutoff.isoformat()
+            if normalized_cutoff is not None
+            else None
+        ),
+        'disclosures_limit': normalized_disclosures_limit,
+    }
+    fingerprint_input = {
+        'schema_version': FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION,
+        'reuse_policy_version': FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
+        'agent_name': FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
+        'prompt_version': FUNDAMENTAL_SUMMARY_PROMPT_VERSION,
+        'response_schema_version': FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION,
+        'symbol': normalized_symbol,
+        'finalized_dispatch_context': {
+            'fundamentals': {
+                'latest_snapshot': _without_derived_fingerprint_fields(
+                    latest_snapshot
+                ),
+                'history_summary': _without_derived_fingerprint_fields(
+                    history_summary
+                ),
+            },
+            'recent_disclosures': _without_derived_fingerprint_fields(
+                list(disclosure_items)
+            ),
+            'recent_dart_events': _without_derived_fingerprint_fields(
+                recent_dart_events
+            ),
+            'valuation_context': _without_derived_fingerprint_fields(
+                valuation_context
+            ),
+        },
+    }
+    return {
+        'schema_version': FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION,
+        'reuse_policy_version': FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
+        'agent_name': FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
+        'prompt_version': FUNDAMENTAL_SUMMARY_PROMPT_VERSION,
+        'response_schema_version': FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION,
+        'requested_market_date': normalized_market_date.isoformat(),
+        'source_filters': source_filters,
+        'fingerprint': _stable_hash(fingerprint_input),
+        'input': fingerprint_input,
+    }
 
 
 def _extract_fingerprint_payload(payload: Any) -> dict[str, Any] | None:
@@ -211,6 +365,39 @@ def _failure_supersedes_feedback(
 
 
 class AgentContextReuseService:
+    def build_fundamental_input_fingerprint_payload(
+        self,
+        *,
+        market_date: str | date,
+        symbol: str,
+        fs_div: str | None = None,
+        disclosures_limit: int = 5,
+        knowledge_cutoff_at: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_symbols = _normalize_symbols([symbol])
+        if len(normalized_symbols) != 1:
+            raise ValueError('exactly one symbol is required')
+        normalized_symbol = normalized_symbols[0]
+
+        with session_scope() as session:
+            symbol_id = session.execute(
+                select(Symbol.id).where(Symbol.symbol == normalized_symbol)
+            ).scalar_one_or_none()
+            return self._build_fundamental_input_fingerprint_payload(
+                session=session,
+                market_date=normalized_market_date,
+                symbol=normalized_symbol,
+                symbol_id=int(symbol_id) if symbol_id is not None else None,
+                fs_div=_resolve_fingerprint_db_fs_div(fs_div),
+                disclosures_limit=int(disclosures_limit),
+                knowledge_cutoff_at=(
+                    _normalize_knowledge_cutoff_at(knowledge_cutoff_at)
+                    if knowledge_cutoff_at is not None
+                    else None
+                ),
+            )
+
     def build_latest_decisions(
         self,
         *,
@@ -219,6 +406,12 @@ class AgentContextReuseService:
         roles: Sequence[str],
         force_recompute: bool = False,
         knowledge_cutoff_at: datetime | str | None = None,
+        fs_div: str | None = None,
+        disclosures_limit: int = 5,
+        fundamental_input_fingerprint_payloads: Mapping[
+            str,
+            Mapping[str, Any],
+        ] | None = None,
     ) -> dict[str, dict[str, FeedbackReuseDecision]]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -228,6 +421,8 @@ class AgentContextReuseService:
             if knowledge_cutoff_at is not None
             else None
         )
+        normalized_fs_div = _resolve_fingerprint_db_fs_div(fs_div)
+        normalized_disclosures_limit = int(disclosures_limit)
 
         if not normalized_symbols:
             raise ValueError('symbols is required')
@@ -501,16 +696,34 @@ class AgentContextReuseService:
                         symbol=symbol,
                         symbol_id=symbol_id,
                     )
-                    input_fingerprint_payload = (
-                        self._build_fundamental_input_fingerprint_payload(
-                            session=session,
-                            market_date=normalized_market_date,
-                            symbol=symbol,
-                            symbol_id=symbol_id,
-                        )
-                        if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME
-                        else None
-                    )
+                    input_fingerprint_payload = None
+                    if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME:
+                        if fundamental_input_fingerprint_payloads is not None:
+                            supplied_payload = (
+                                fundamental_input_fingerprint_payloads.get(
+                                    symbol
+                                )
+                            )
+                            if isinstance(supplied_payload, Mapping):
+                                input_fingerprint_payload = dict(
+                                    supplied_payload
+                                )
+                        else:
+                            input_fingerprint_payload = (
+                                self._build_fundamental_input_fingerprint_payload(
+                                    session=session,
+                                    market_date=normalized_market_date,
+                                    symbol=symbol,
+                                    symbol_id=symbol_id,
+                                    fs_div=normalized_fs_div,
+                                    disclosures_limit=(
+                                        normalized_disclosures_limit
+                                    ),
+                                    knowledge_cutoff_at=(
+                                        normalized_knowledge_cutoff_at
+                                    ),
+                                )
+                            )
                     input_fingerprint = _fingerprint_value(input_fingerprint_payload)
 
                     if latest_feedback is None:
@@ -571,6 +784,35 @@ class AgentContextReuseService:
                         or _extract_fingerprint_payload(latest_feedback.summary_payload)
                     )
                     stored_input_fingerprint = _fingerprint_value(stored_input_fingerprint_payload)
+                    has_materialized_fundamental_match = bool(
+                        role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME
+                        and input_fingerprint
+                        and input_fingerprint == stored_input_fingerprint
+                        and isinstance(input_fingerprint_payload, Mapping)
+                        and isinstance(
+                            stored_input_fingerprint_payload,
+                            Mapping,
+                        )
+                        and input_fingerprint_payload.get('schema_version')
+                        == FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION
+                        and stored_input_fingerprint_payload.get(
+                            'schema_version'
+                        )
+                        == FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION
+                        and input_fingerprint_payload.get(
+                            'reuse_policy_version'
+                        )
+                        == FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION
+                        and stored_input_fingerprint_payload.get(
+                            'reuse_policy_version'
+                        )
+                        == FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION
+                    )
+                    has_prior_date_materialized_fundamental_match = bool(
+                        has_materialized_fundamental_match
+                        and isinstance(feedback_market_date, date)
+                        and feedback_market_date < normalized_market_date
+                    )
                     if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME:
                         should_dispatch, reason = self._decide_fundamental_reuse(
                             force_recompute=force_recompute,
@@ -579,6 +821,9 @@ class AgentContextReuseService:
                             stored_input_fingerprint=stored_input_fingerprint,
                             latest_source_updated_at=latest_source_updated_at,
                             feedback_received_at=feedback_received_at,
+                            materialized_fingerprint_match=(
+                                has_materialized_fundamental_match
+                            ),
                         )
                         if has_newer_failure:
                             reason = 'latest_failure_pending_retry'
@@ -599,6 +844,7 @@ class AgentContextReuseService:
                         has_knowledge_cutoff_mismatch
                         and not force_recompute
                         and not has_newer_failure
+                        and not has_prior_date_materialized_fundamental_match
                     ):
                         should_dispatch = True
                         reason = 'knowledge_cutoff_mismatch'
@@ -664,8 +910,9 @@ class AgentContextReuseService:
         has_retryable_feedback_gap: bool,
         input_fingerprint: str | None,
         stored_input_fingerprint: str | None,
-        latest_source_updated_at: datetime | None,
-        feedback_received_at: datetime | None,
+        latest_source_updated_at: datetime | None = None,
+        feedback_received_at: datetime | None = None,
+        materialized_fingerprint_match: bool = False,
     ) -> tuple[bool, str]:
         if force_recompute:
             return True, 'forced_recompute'
@@ -677,7 +924,12 @@ class AgentContextReuseService:
             return True, 'stored_fundamental_input_fingerprint_missing'
         if input_fingerprint != stored_input_fingerprint:
             return True, 'fundamental_input_fingerprint_changed'
-        if latest_source_updated_at is not None and feedback_received_at is not None and latest_source_updated_at > feedback_received_at:
+        if (
+            not materialized_fingerprint_match
+            and latest_source_updated_at is not None
+            and feedback_received_at is not None
+            and latest_source_updated_at > feedback_received_at
+        ):
             return True, 'source_updated'
         return False, FUNDAMENTAL_SUMMARY_REUSE_REASON
 
@@ -818,94 +1070,136 @@ class AgentContextReuseService:
         market_date: date,
         symbol: str,
         symbol_id: int | None,
+        fs_div: str | None,
+        disclosures_limit: int,
+        knowledge_cutoff_at: datetime | None,
     ) -> dict[str, Any]:
-        snapshot_pair = session.execute(
+        from app.agent_context.read_service import (
+            _build_fundamentals_summary,
+            _build_recent_dart_events_context,
+            _build_valuation_context,
+            _serialize_disclosure,
+        )
+        from app.dart.fundamentals_store import (
+            dart_fundamentals_repository,
+        )
+        from app.dart.store import _serialize_event
+
+        snapshot_statement = (
             select(DartFundamentalsSnapshot, DartDisclosureEvent)
-            .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
+            .join(
+                DartDisclosureEvent,
+                DartDisclosureEvent.id
+                == DartFundamentalsSnapshot.disclosure_event_id,
+            )
             .where(DartFundamentalsSnapshot.stock_code == symbol)
-            .where(or_(DartDisclosureEvent.receipt_date.is_(None), DartDisclosureEvent.receipt_date <= market_date))
-            .order_by(
+        )
+        if fs_div is not None:
+            snapshot_statement = snapshot_statement.where(
+                DartFundamentalsSnapshot.fs_div == fs_div
+            )
+        if knowledge_cutoff_at is not None:
+            snapshot_statement = snapshot_statement.where(
+                DartFundamentalsSnapshot.captured_at
+                < knowledge_cutoff_at
+            )
+        snapshot_pairs = session.execute(
+            snapshot_statement.order_by(
+                DartFundamentalsSnapshot.stock_code.asc(),
                 DartDisclosureEvent.receipt_date.desc(),
                 DartFundamentalsSnapshot.business_year.desc(),
                 DartFundamentalsSnapshot.report_code.desc(),
-                DartFundamentalsSnapshot.updated_at.desc(),
                 DartFundamentalsSnapshot.id.desc(),
             )
-            .limit(1)
-        ).first()
-        snapshot_payload: dict[str, Any] | None = None
-        if snapshot_pair is not None:
-            snapshot, event = snapshot_pair
-            row_stats = session.execute(
-                select(func.count(DartFundamentalsRow.id), func.max(DartFundamentalsRow.updated_at))
-                .where(DartFundamentalsRow.snapshot_id == snapshot.id)
-            ).one()
-            highlight_stats = session.execute(
-                select(func.count(DartFundamentalsHighlight.id), func.max(DartFundamentalsHighlight.updated_at))
-                .where(DartFundamentalsHighlight.snapshot_id == snapshot.id)
-            ).one()
-            snapshot_payload = {
-                'snapshot_id': snapshot.id,
-                'disclosure_event_id': snapshot.disclosure_event_id,
-                'rcept_no': snapshot.rcept_no,
-                'corp_code': snapshot.corp_code,
-                'stock_code': snapshot.stock_code,
-                'business_year': snapshot.business_year,
-                'report_code': snapshot.report_code,
-                'filing_category': snapshot.filing_category,
-                'fs_div': snapshot.fs_div,
-                'statement_type': snapshot.statement_type,
-                'period_type': snapshot.period_type,
-                'period_end_month': snapshot.period_end_month,
-                'currency': snapshot.currency,
-                'source_status': snapshot.source_status,
-                'source_message': snapshot.source_message,
-                'captured_at': _isoformat(snapshot.captured_at),
-                'created_at': _isoformat(snapshot.created_at),
-                'updated_at': _isoformat(snapshot.updated_at),
-                'statement_row_count': int(row_stats[0] or 0),
-                'statement_rows_updated_at': _isoformat(row_stats[1]),
-                'highlight_count': int(highlight_stats[0] or 0),
-                'highlights_updated_at': _isoformat(highlight_stats[1]),
-                'disclosure': {
-                    'rcept_no': event.rcept_no,
-                    'receipt_date': _isoformat(event.receipt_date),
-                    'report_nm': event.report_nm,
-                    'filing_category': event.filing_category,
-                    'is_financial_report': event.is_financial_report,
-                    'fundamentals_capture_status': event.fundamentals_capture_status,
-                    'fundamentals_last_success_at': _isoformat(event.fundamentals_last_success_at),
-                    'updated_at': _isoformat(event.updated_at),
-                },
+        ).all()
+        snapshot_ids = [int(snapshot.id) for snapshot, _ in snapshot_pairs]
+        highlights_by_snapshot: dict[int, list[dict[str, Any]]] = (
+            defaultdict(list)
+        )
+        row_count_by_snapshot: dict[int, int] = {}
+        if snapshot_ids:
+            highlight_rows = session.execute(
+                select(DartFundamentalsHighlight)
+                .where(
+                    DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids)
+                )
+                .order_by(
+                    DartFundamentalsHighlight.snapshot_id.asc(),
+                    DartFundamentalsHighlight.metric_key.asc(),
+                )
+            ).scalars().all()
+            for row in highlight_rows:
+                highlights_by_snapshot[int(row.snapshot_id)].append(
+                    dart_fundamentals_repository._serialize_highlight(row)
+                )
+            row_count_by_snapshot = {
+                int(snapshot_id): int(row_count)
+                for snapshot_id, row_count in session.execute(
+                    select(
+                        DartFundamentalsRow.snapshot_id,
+                        func.count(),
+                    )
+                    .where(
+                        DartFundamentalsRow.snapshot_id.in_(snapshot_ids)
+                    )
+                    .group_by(DartFundamentalsRow.snapshot_id)
+                ).all()
             }
+        fundamentals_items = [
+            {
+                **dart_fundamentals_repository._serialize_snapshot(snapshot),
+                'disclosure': (
+                    dart_fundamentals_repository._serialize_event(event)
+                ),
+                'highlights': highlights_by_snapshot.get(
+                    int(snapshot.id),
+                    [],
+                ),
+                'statement_rows': [],
+                'statement_row_count': row_count_by_snapshot.get(
+                    int(snapshot.id),
+                    0,
+                ),
+            }
+            for snapshot, event in snapshot_pairs
+        ]
+        fundamentals = _build_fundamentals_summary(
+            fundamentals_items,
+            market_date=market_date,
+        )
 
-        recent_disclosures = session.execute(
+        recent_disclosure_statement = (
             select(DartDisclosureEvent)
             .where(DartDisclosureEvent.stock_code == symbol)
-            .where(or_(DartDisclosureEvent.receipt_date.is_(None), DartDisclosureEvent.receipt_date <= market_date))
-            .order_by(
-                DartDisclosureEvent.receipt_date.desc(),
-                DartDisclosureEvent.updated_at.desc(),
-                DartDisclosureEvent.id.desc(),
+            .where(DartDisclosureEvent.receipt_date <= market_date)
+        )
+        if knowledge_cutoff_at is not None:
+            recent_disclosure_statement = (
+                recent_disclosure_statement.where(
+                    DartDisclosureEvent.created_at < knowledge_cutoff_at
+                )
             )
-            .limit(5)
-        ).scalars().all()
+        recent_disclosures = (
+            session.execute(
+                recent_disclosure_statement.order_by(
+                    DartDisclosureEvent.receipt_date.desc(),
+                    DartDisclosureEvent.rcept_no.desc(),
+                ).limit(disclosures_limit)
+            ).scalars().all()
+            if disclosures_limit > 0
+            else []
+        )
         disclosure_payloads = [
-            {
-                'id': row.id,
-                'rcept_no': row.rcept_no,
-                'receipt_date': _isoformat(row.receipt_date),
-                'report_nm': row.report_nm,
-                'filing_category': row.filing_category,
-                'is_financial_report': row.is_financial_report,
-                'fundamentals_capture_status': row.fundamentals_capture_status,
-                'fundamentals_last_success_at': _isoformat(row.fundamentals_last_success_at),
-                'updated_at': _isoformat(row.updated_at),
-            }
+            _serialize_disclosure(_serialize_event(row))
             for row in recent_disclosures
         ]
+        recent_dart_events = _build_recent_dart_events_context(
+            disclosures=disclosure_payloads,
+            fundamentals=fundamentals,
+            storage_unavailable=False,
+        )
 
-        valuation_payloads: list[dict[str, Any]] = []
+        valuation_rows_by_category: dict[str, dict[str, Any]] = {}
         if symbol_id is not None:
             valuation_rows = session.execute(
                 select(DailyPykrxEnrichmentRow)
@@ -914,42 +1208,38 @@ class AgentContextReuseService:
                 .where(DailyPykrxEnrichmentRow.category.in_(('valuation_snapshot', 'foreign_ownership')))
                 .order_by(DailyPykrxEnrichmentRow.category.asc(), DailyPykrxEnrichmentRow.source.asc())
             ).scalars().all()
-            valuation_payloads = [
-                {
-                    'id': row.id,
-                    'market_date': _isoformat(row.market_date),
+            valuation_rows_by_category = {
+                str(row.category): {
                     'market': row.market,
-                    'category': row.category,
-                    'scope_type': row.scope_type,
-                    'scope_key': row.scope_key,
-                    'source': row.source,
-                    'captured_at': _isoformat(row.captured_at),
-                    'payload': row.payload if isinstance(row.payload, dict) else {},
+                    'payload': (
+                        row.payload if isinstance(row.payload, dict) else {}
+                    ),
                 }
                 for row in valuation_rows
-            ]
+            }
+        valuation_context = _build_valuation_context(
+            valuation_row=valuation_rows_by_category.get(
+                'valuation_snapshot'
+            ),
+            foreign_ownership_row=valuation_rows_by_category.get(
+                'foreign_ownership'
+            ),
+        )
 
-        fingerprint_input = {
-            'schema_version': FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION,
-            'reuse_policy_version': FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
-            'agent_name': FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
-            'prompt_version': FUNDAMENTAL_SUMMARY_PROMPT_VERSION,
-            'response_schema_version': FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION,
-            'symbol': symbol,
-            'latest_fundamentals_snapshot': snapshot_payload,
-            'recent_disclosures': disclosure_payloads,
-            'valuation_inputs': valuation_payloads,
-        }
-        return {
-            'schema_version': FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION,
-            'reuse_policy_version': FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION,
-            'agent_name': FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
-            'prompt_version': FUNDAMENTAL_SUMMARY_PROMPT_VERSION,
-            'response_schema_version': FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION,
-            'requested_market_date': market_date.isoformat(),
-            'fingerprint': _stable_hash(fingerprint_input),
-            'input': fingerprint_input,
-        }
+        return build_fundamental_input_fingerprint_payload_from_context(
+            market_date=market_date,
+            symbol=symbol,
+            context={
+                'symbol': symbol,
+                'fundamentals': fundamentals,
+                'recent_disclosures': {'items': disclosure_payloads},
+                'recent_dart_events': recent_dart_events,
+                'valuation_context': valuation_context,
+            },
+            fs_div=fs_div,
+            disclosures_limit=disclosures_limit,
+            knowledge_cutoff_at=knowledge_cutoff_at,
+        )
 
 
 agent_context_reuse_service = AgentContextReuseService()

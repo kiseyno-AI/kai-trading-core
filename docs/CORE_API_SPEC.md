@@ -1597,6 +1597,7 @@ Content-Type: application/json
   "market_date": "2026-04-14",
   "symbols": ["005930"],
   "roles": ["technical-summarizer", "signal-decider"],
+  "fs_div": "CFS",
   "knowledge_cutoff_at": "2026-04-14T15:30:00+09:00",
   "feedback_scope_mode": "decider_scope_fast_path",
   "max_cycles": 2,
@@ -1643,6 +1644,7 @@ Content-Type: application/json
 
 ### Notes
 - The supplied cutoff instant is normalized to UTC, stored in the durable run request, and frozen across the role inputs identified by `run_id`.
+- `fs_div` is optional, accepts `CFS` or `OFS` case-insensitively, and defaults to the configured DART statement scope. Core stores the normalized value and keeps it unchanged across retry cycles and durable resume.
 - `status` may be `waiting` or `blocked` with `gated=true` and a `prerequisites` object when source stages are incomplete.
 - `feedback_scope_mode` is either `decider_scope_fast_path` or `broad_feedback_universe`.
 
@@ -1676,6 +1678,7 @@ Content-Type: application/json
   "market_date": "2026-04-14",
   "symbols": ["005930"],
   "roles": ["signal-decider"],
+  "fs_div": "CFS",
   "knowledge_cutoff_at": "2026-04-14T15:30:00+09:00",
   "feedback_scope_mode": "decider_scope_fast_path",
   "max_cycles": 1,
@@ -1719,6 +1722,10 @@ Content-Type: application/json
   }
 }
 ```
+
+`fs_div` follows the same optional `CFS`/`OFS` normalization and configured
+default as `/feedback/retry-cycles`; the normalized value is persisted through
+follow-up retries and continuation resume.
 
 ---
 

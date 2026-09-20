@@ -1284,6 +1284,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     'market_date': '2026-04-14',
                     'symbols': ['005930'],
                     'roles': ['technical-summarizer'],
+                    'fs_div': 'OFS',
                     'max_cycles': 2,
                     'outer_batch_size': 10,
                     'feedback_scope_mode': 'broad_feedback_universe',
@@ -1298,6 +1299,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.last_config.market_date.isoformat(), '2026-04-14')
         self.assertEqual(fake_service.last_config.symbols, ('005930',))
         self.assertEqual(fake_service.last_config.roles, ('technical-summarizer',))
+        self.assertEqual(fake_service.last_config.fs_div, 'OFS')
         self.assertEqual(fake_service.last_config.max_cycles, 2)
         self.assertEqual(fake_service.last_config.outer_batch_size, 10)
         self.assertEqual(fake_service.last_config.feedback_scope_mode, 'broad_feedback_universe')
@@ -1325,6 +1327,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     'market_date': '2026-04-14',
                     'symbols': ['005930'],
                     'roles': ['signal-decider'],
+                    'fs_div': 'OFS',
                     'knowledge_cutoff_at': '2026-04-14T15:30:00+09:00',
                     'max_cycles': 1,
                 },
@@ -1337,6 +1340,7 @@ class AgentContextRouteTests(unittest.TestCase):
             fake_service.last_config.knowledge_cutoff_at,
             datetime.fromisoformat('2026-04-14T15:30:00+09:00'),
         )
+        self.assertEqual(fake_service.last_config.fs_div, 'OFS')
         self.assertEqual(response.json()['requested_symbols'], ['005930'])
 
     def test_feedback_run_routes_reject_invalid_cutoff_before_admission(self):
