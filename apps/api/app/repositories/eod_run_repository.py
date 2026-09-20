@@ -1218,18 +1218,31 @@ def _followup_recovery_is_resumable_terminal_continuation(
     stage_statuses = metadata.get('stage_statuses')
     if not isinstance(stage_statuses, Mapping):
         return False
-    for index, stage_id in enumerate(continuation_suffix):
+    metadata_prefix_size = 0
+    metadata_pending_seen = False
+    for stage_id in continuation_suffix:
         persisted_status = str(
             stage_statuses.get(stage_id) or ''
         ).strip().lower()
+        if persisted_status == 'pending':
+            metadata_pending_seen = True
+            continue
+        if metadata_pending_seen:
+            return False
         live_status = str(
             stage_rows_by_id[stage_id].status or ''
         ).strip().lower()
-        if index < len(satisfied_prefix):
-            if persisted_status != live_status:
-                return False
-        elif persisted_status != 'pending':
+        if (
+            not persisted_status
+            or persisted_status != live_status
+            or not daily_pipeline_outcome_is_satisfied(
+                _pipeline_stage_outcome(stage_rows_by_id[stage_id])
+            )
+        ):
             return False
+        metadata_prefix_size += 1
+    if metadata_prefix_size > len(satisfied_prefix):
+        return False
 
     def untouched(stage: DailyPipelineStageRun) -> bool:
         return bool(
