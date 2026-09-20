@@ -28,7 +28,10 @@ from app.eod.pykrx_import import (
     pykrx_request_context,
 )
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
-from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
+from app.eod.daily_pipeline_state import (
+    _terminal_continuation_execution_context_error,
+    daily_pipeline_run_state_service,
+)
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.pykrx_pipeline_runner import (
@@ -382,8 +385,6 @@ def _is_terminal_followup_continuation_candidate(
                 run_metadata.get('terminal_continuation_claimed_at')
             )
             is not None
-            and str(pipeline_run.get('current_stage') or '').strip()
-            == TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
             and str(parent_evidence.get('status') or '').strip().lower()
             == 'blocked'
             and str(parent_evidence.get('current_stage') or '').strip()
@@ -430,52 +431,195 @@ def _is_terminal_followup_continuation_candidate(
             return False
     else:
         return False
-    persisted_symbols = run_metadata.get('symbols')
-    persisted_markets = run_metadata.get('markets')
+    reused_eod_collection_run_id = evidence_int(
+        run_metadata.get('reused_eod_collection_run_id')
+    )
     if (
-        not isinstance(persisted_symbols, (list, tuple))
-        or not _dedupe_symbol_codes(persisted_symbols)
-        or not isinstance(persisted_markets, (list, tuple))
-        or not any(str(item or '').strip() for item in persisted_markets)
+        reused_eod_collection_run_id is None
+        or reused_eod_collection_run_id <= 0
+        or _terminal_continuation_execution_context_error(
+            run_metadata,
+            reused_eod_collection_run_id=(
+                reused_eod_collection_run_id
+            ),
+        )
+        is not None
     ):
         return False
 
     stages = pipeline_run.get('stages')
     if not isinstance(stages, Mapping):
         return False
-    resolved_stages = {
+    raw_resolved_stages = run_metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return False
+    resolved_stages = [
         str(stage_id or '').strip()
-        for stage_id in (run_metadata.get('resolved_stages') or stages.keys())
+        for stage_id in raw_resolved_stages
         if str(stage_id or '').strip()
-    }
-    if not set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES).issubset(
-        resolved_stages
+    ]
+    if (
+        len(resolved_stages) != len(raw_resolved_stages)
+        or len(resolved_stages) != len(set(resolved_stages))
+        or tuple(
+            resolved_stages[-len(TERMINAL_FOLLOWUP_CONTINUATION_STAGES) :]
+        )
+        != TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+        or set(stages) != set(resolved_stages)
+    ):
+        return False
+    stage_statuses = run_metadata.get('stage_statuses')
+    if not isinstance(stage_statuses, Mapping):
+        return False
+    suffix_start_index = len(resolved_stages) - len(
+        TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+    )
+    if any(
+        str(stage_statuses.get(stage_id) or '').strip().lower()
+        != str(stages[stage_id].get('status') or '').strip().lower()
+        for stage_id in resolved_stages[:suffix_start_index]
+        if isinstance(stages[stage_id], Mapping)
+    ) or any(
+        not isinstance(stages[stage_id], Mapping)
+        for stage_id in resolved_stages[:suffix_start_index]
     ):
         return False
 
     if evidence_suffix is not None:
+        def untouched_claim_stage(stage: object) -> bool:
+            return bool(
+                isinstance(stage, Mapping)
+                and str(stage.get('status') or '').strip().lower()
+                == 'pending'
+                and str(stage.get('current_step') or '').strip()
+                == 'terminal_continuation_pending'
+                and evidence_int(stage.get('processed') or 0) == 0
+                and evidence_int(stage.get('total') or 0) == 0
+                and evidence_int(stage.get('succeeded') or 0) == 0
+                and evidence_int(stage.get('failed') or 0) == 0
+                and evidence_int(stage.get('remaining') or 0) == 0
+                and stage.get('completed_at') is None
+                and not str(stage.get('error_message') or '').strip()
+                and isinstance(stage.get('source_run_ids'), Mapping)
+                and not stage.get('source_run_ids')
+                and isinstance(stage.get('details'), Mapping)
+                and not stage.get('details')
+            )
+
+        satisfied_prefix: list[str] = []
         for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
             live_stage = stages.get(stage_id)
-            if not isinstance(live_stage, Mapping) or not (
-                str(live_stage.get('status') or '').strip().lower()
-                == 'pending'
-                and str(live_stage.get('current_step') or '').strip()
-                == 'terminal_continuation_pending'
-                and evidence_int(live_stage.get('processed') or 0) == 0
-                and evidence_int(live_stage.get('total') or 0) == 0
-                and evidence_int(live_stage.get('succeeded') or 0) == 0
-                and evidence_int(live_stage.get('failed') or 0) == 0
-                and evidence_int(live_stage.get('remaining') or 0) == 0
-                and live_stage.get('completed_at') is None
-                and not str(live_stage.get('error_message') or '').strip()
-                and isinstance(
-                    live_stage.get('source_run_ids'), Mapping
+            if not (
+                isinstance(live_stage, Mapping)
+                and daily_pipeline_outcome_is_satisfied(live_stage)
+                and _parse_activity_datetime(
+                    live_stage.get('completed_at')
                 )
-                and not live_stage.get('source_run_ids')
-                and isinstance(live_stage.get('details'), Mapping)
-                and not live_stage.get('details')
+                is not None
+                and not str(
+                    live_stage.get('error_message') or ''
+                ).strip()
+            ):
+                break
+            satisfied_prefix.append(stage_id)
+
+        if len(satisfied_prefix) == len(
+            TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+        ):
+            return False
+        metadata_prefix_size = 0
+        metadata_pending_seen = False
+        for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+            persisted_status = str(
+                stage_statuses.get(stage_id) or ''
+            ).strip().lower()
+            if persisted_status == 'pending':
+                metadata_pending_seen = True
+                continue
+            if metadata_pending_seen:
+                return False
+            live_stage = stages[stage_id]
+            if not (
+                isinstance(live_stage, Mapping)
+                and persisted_status
+                == str(live_stage.get('status') or '').strip().lower()
+                and daily_pipeline_outcome_is_satisfied(live_stage)
             ):
                 return False
+            metadata_prefix_size += 1
+        if metadata_prefix_size > len(satisfied_prefix):
+            return False
+        first_unfinished_index = len(satisfied_prefix)
+        first_unfinished_stage = TERMINAL_FOLLOWUP_CONTINUATION_STAGES[
+            first_unfinished_index
+        ]
+        first_unfinished = stages.get(first_unfinished_stage)
+        if not isinstance(first_unfinished, Mapping):
+            return False
+        first_status = str(
+            first_unfinished.get('status') or ''
+        ).strip().lower()
+        current_stage = str(
+            pipeline_run.get('current_stage') or ''
+        ).strip()
+        if first_status == 'pending':
+            expected_current_stages = {first_unfinished_stage}
+            if satisfied_prefix:
+                expected_current_stages.add(satisfied_prefix[-1])
+            first_unfinished_is_valid = bool(
+                untouched_claim_stage(first_unfinished)
+                and current_stage in expected_current_stages
+            )
+        elif first_status == 'running':
+            first_unfinished_is_valid = bool(
+                pipeline_status == 'running'
+                and current_stage == first_unfinished_stage
+                and first_unfinished.get('completed_at') is None
+                and not str(
+                    first_unfinished.get('error_message') or ''
+                ).strip()
+            )
+        elif first_status == 'interrupted':
+            interrupted_details = first_unfinished.get('details')
+            first_unfinished_is_valid = bool(
+                pipeline_status == 'interrupted'
+                and current_stage == first_unfinished_stage
+                and str(
+                    first_unfinished.get('current_step') or ''
+                ).strip()
+                == 'core_restart_interrupted'
+                and _parse_activity_datetime(
+                    first_unfinished.get('completed_at')
+                )
+                is not None
+                and str(
+                    first_unfinished.get('error_message') or ''
+                ).strip()
+                and isinstance(interrupted_details, Mapping)
+                and interrupted_details.get('resumable') is True
+                and str(
+                    interrupted_details.get('interrupted_reason') or ''
+                ).strip()
+            )
+        else:
+            first_unfinished_is_valid = False
+        if not first_unfinished_is_valid or any(
+            not untouched_claim_stage(stages.get(stage_id))
+            for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES[
+                first_unfinished_index + 1 :
+            ]
+        ):
+            return False
+    elif any(
+        str(stage_statuses.get(stage_id) or '').strip().lower()
+        != str(stages[stage_id].get('status') or '').strip().lower()
+        for stage_id in resolved_stages
+        if isinstance(stages[stage_id], Mapping)
+    ) or any(
+        not isinstance(stages[stage_id], Mapping)
+        for stage_id in resolved_stages
+    ):
+        return False
 
     terminal_stages = evidence_suffix or stages
     summaries = terminal_stages.get('agent_feedback_summaries')

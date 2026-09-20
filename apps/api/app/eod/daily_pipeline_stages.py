@@ -714,6 +714,82 @@ class DailyPipelineStageService:
             feedback_knowledge_cutoff_at = (
                 feedback_cutoff_resolution['knowledge_cutoff_at']
             )
+            raw_persisted_stage_outcomes = continuation_claim.get(
+                'persisted_stage_outcomes',
+                {},
+            )
+            if not isinstance(raw_persisted_stage_outcomes, dict):
+                self.run_state_service.finish_run(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    status='failed',
+                    error_message=(
+                        'terminal continuation claim returned invalid '
+                        'persisted stage outcomes'
+                    ),
+                )
+                raise RuntimeError(
+                    'terminal continuation claim returned invalid '
+                    'persisted stage outcomes'
+                )
+            persisted_stage_ids = list(raw_persisted_stage_outcomes)
+            if persisted_stage_ids != resolved_stages[
+                : len(persisted_stage_ids)
+            ]:
+                self.run_state_service.finish_run(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    status='failed',
+                    error_message=(
+                        'terminal continuation claim returned a '
+                        'noncontiguous persisted stage prefix'
+                    ),
+                )
+                raise RuntimeError(
+                    'terminal continuation claim returned a '
+                    'noncontiguous persisted stage prefix'
+                )
+            for stage_id in persisted_stage_ids:
+                persisted_outcome = raw_persisted_stage_outcomes[
+                    stage_id
+                ]
+                if not (
+                    isinstance(persisted_outcome, dict)
+                    and daily_pipeline_outcome_is_satisfied(
+                        persisted_outcome
+                    )
+                ):
+                    self.run_state_service.finish_run(
+                        pipeline_run_id=int(existing_pipeline_run_id),
+                        status='failed',
+                        error_message=(
+                            'terminal continuation claim returned an '
+                            'unsatisfied persisted stage outcome'
+                        ),
+                    )
+                    raise RuntimeError(
+                        'terminal continuation claim returned an '
+                        'unsatisfied persisted stage outcome'
+                    )
+                persisted_details = persisted_outcome.get('details')
+                persisted_result = (
+                    persisted_details.get('result_summary')
+                    if isinstance(persisted_details, dict)
+                    and isinstance(
+                        persisted_details.get('result_summary'),
+                        dict,
+                    )
+                    else {}
+                )
+                restored_outcome = self._build_stage_outcome(
+                    stage_id,
+                    {
+                        **persisted_result,
+                        'status': persisted_outcome['status'],
+                        'resumed_from_persisted_stage': True,
+                    },
+                )
+                restored_outcome['status'] = persisted_outcome['status']
+                stage_outcomes[stage_id] = restored_outcome
+                handled.add(stage_id)
         else:
             pipeline_run = self.run_state_service.start_run(
                 market_date=resolved_market_date,
@@ -1907,7 +1983,7 @@ class DailyPipelineStageService:
                 market=get_market_state(),
             )
             if expired_result is not None:
-                return expired_result
+                return {**expired_result, 'stage': stage_id}
             target_trade_date = (date.fromisoformat(market_date) + timedelta(days=1)).isoformat()
             return signal_decider_next_open_execution_service.refresh_plan_items(
                 target_trade_date=target_trade_date,
