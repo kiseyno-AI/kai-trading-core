@@ -1721,6 +1721,113 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             ),
         )
 
+        advanced_interrupted_at = interrupted_at + timedelta(minutes=1)
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.current_stage = 'next_open_execution_plan'
+            terminal_run.updated_at = advanced_interrupted_at
+            terminal_run.completed_at = advanced_interrupted_at
+            terminal_run.error_message = 'Core restarted.'
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'interrupted_at': advanced_interrupted_at.isoformat(),
+            }
+            stage_rows = {
+                stage.stage_id: stage
+                for stage in session.execute(
+                    select(DailyPipelineStageRun).where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == terminal_run_id
+                    )
+                ).scalars()
+            }
+            decider_stage = stage_rows['signal_decider']
+            decider_stage.status = 'completed'
+            decider_stage.processed = 160
+            decider_stage.total = 160
+            decider_stage.succeeded = 160
+            decider_stage.failed = 0
+            decider_stage.remaining = 0
+            decider_stage.current_step = 'signal_decider_completed'
+            decider_stage.updated_at = advanced_interrupted_at
+            decider_stage.completed_at = advanced_interrupted_at
+            decider_stage.error_message = None
+            decider_stage.source_run_ids = {'run_id': 'decider-run'}
+            decider_stage.details = {
+                'result_summary': {'status': 'completed'}
+            }
+            plan_stage = stage_rows['next_open_execution_plan']
+            plan_stage.status = 'interrupted'
+            plan_stage.current_step = 'core_restart_interrupted'
+            plan_stage.updated_at = advanced_interrupted_at
+            plan_stage.completed_at = advanced_interrupted_at
+            plan_stage.error_message = 'Core restarted.'
+            plan_stage.details = {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+            }
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            advanced_restart_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertEqual(
+            advanced_restart_target,
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=eod_run_id,
+            ),
+        )
+
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.current_stage = 'signal_decider'
+            terminal_run.updated_at = interrupted_at
+            terminal_run.completed_at = interrupted_at
+            terminal_run.error_message = 'Core restarted.'
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'interrupted_at': interrupted_at.isoformat(),
+            }
+            stage_rows = {
+                stage.stage_id: stage
+                for stage in session.execute(
+                    select(DailyPipelineStageRun).where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == terminal_run_id
+                    )
+                ).scalars()
+            }
+            decider_stage = stage_rows['signal_decider']
+            decider_stage.status = 'interrupted'
+            decider_stage.processed = 0
+            decider_stage.total = 0
+            decider_stage.succeeded = 0
+            decider_stage.failed = 0
+            decider_stage.remaining = 0
+            decider_stage.current_step = 'core_restart_interrupted'
+            decider_stage.updated_at = interrupted_at
+            decider_stage.completed_at = interrupted_at
+            decider_stage.error_message = 'Core restarted.'
+            decider_stage.source_run_ids = {}
+            decider_stage.details = {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+            }
+            plan_stage = stage_rows['next_open_execution_plan']
+            plan_stage.status = 'pending'
+            plan_stage.current_step = 'terminal_continuation_pending'
+            plan_stage.updated_at = interrupted_at
+            plan_stage.completed_at = None
+            plan_stage.error_message = None
+            plan_stage.details = {}
+
         for invalid_resume_count, invalid_origin in (
             (2, 'failed'),
             (1, 'running'),
