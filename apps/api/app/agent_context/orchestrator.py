@@ -6067,7 +6067,7 @@ class AgentFeedbackOrchestrator:
                             submit_next()
 
                         while future_map:
-                            done, _ = concurrent.futures.wait(
+                            done, not_done = concurrent.futures.wait(
                                 list(future_map.keys()),
                                 timeout=poll_seconds,
                                 return_when=concurrent.futures.FIRST_COMPLETED,
@@ -6076,7 +6076,11 @@ class AgentFeedbackOrchestrator:
                             timed_out = {
                                 future
                                 for future, started_at in future_started_at.items()
-                                if future in future_map and now_monotonic - started_at >= batch_timeout_seconds
+                                if (
+                                    future in future_map
+                                    and future in not_done
+                                    and now_monotonic - started_at >= batch_timeout_seconds
+                                )
                             }
                             done = set(done) | timed_out
                             for future in done:
