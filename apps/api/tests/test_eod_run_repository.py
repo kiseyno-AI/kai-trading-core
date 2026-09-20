@@ -59,6 +59,46 @@ def _ready_pykrx_repair_details() -> dict:
     }
 
 
+def _ready_pykrx_warning_details() -> dict:
+    categories = {
+        'sector_classification': {
+            'status': 'completed',
+            'rows_persisted': 10,
+            'errors': [],
+        },
+        'investor_flow_symbol': {
+            'status': 'completed',
+            'rows_persisted': 10,
+            'errors': [],
+        },
+        'short_selling': {
+            'status': 'partial',
+            'rows_persisted': 10,
+            'errors': ['empty provider frame'],
+        },
+    }
+    return {
+        'result_summary': {
+            'status': 'completed',
+            'point_in_time_recovery': True,
+            'categories_requested': list(categories),
+            'categories': categories,
+            'downstream_preflight': {
+                'status': 'ready',
+                'allowed': True,
+                'required_categories': list(categories),
+                'category_row_counts': {
+                    category: 10 for category in categories
+                },
+                'failed_categories': [],
+                'blocked_categories': [],
+                'waiting_categories': [],
+                'zero_coverage_categories': [],
+            },
+        },
+    }
+
+
 class EODCollectionCoverageTests(unittest.TestCase):
     def test_list_eod_runs_uses_explicit_statement_timeout(self):
         session = MagicMock()
@@ -1266,6 +1306,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             session.flush()
 
             for eod_run in (convergence_eod, exhausted_failed_eod):
+                prior_attempts = 5 if eod_run is convergence_eod else 4
                 session.add_all(
                     [
                         DailyPipelineRun(
@@ -1278,7 +1319,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                                 'reused_eod_collection_run_id': eod_run.id,
                             },
                         )
-                        for attempt in range(4)
+                        for attempt in range(prior_attempts)
                     ]
                 )
 
@@ -1292,9 +1333,19 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 run_metadata={
                     'reused_eod_collection_run_id': convergence_eod.id,
                     'resolved_stages': [
-                        'technical_snapshots',
+                        'pykrx_enrichment',
                         'next_open_execution_plan',
                     ],
+                    'terminal_continuation_count': 1,
+                    'terminal_continuation_version': 1,
+                    'terminal_continuation_reason': (
+                        'summary_knowledge_cutoff_repair'
+                    ),
+                    'terminal_continuation_claimed_at': (
+                        '2026-09-14T00:03:00+00:00'
+                    ),
+                    'terminal_continuation_evidence': {},
+                    'resume_from_stage': 'agent_feedback_summaries',
                 },
             )
             failed_recovery = DailyPipelineRun(
@@ -1316,14 +1367,16 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                     DailyPipelineStageRun(
                         pipeline_run_id=terminal_recovery.id,
                         market_date=convergence_eod.trade_date,
-                        stage_id='technical_snapshots',
+                        stage_id='pykrx_enrichment',
                         status='completed',
-                        processed=2,
-                        total=2,
+                        processed=3,
+                        total=3,
                         succeeded=2,
-                        failed=0,
+                        failed=1,
+                        remaining=0,
                         started_at=started_at + timedelta(minutes=4),
                         completed_at=started_at + timedelta(minutes=5),
+                        details=_ready_pykrx_warning_details(),
                     ),
                     DailyPipelineStageRun(
                         pipeline_run_id=terminal_recovery.id,

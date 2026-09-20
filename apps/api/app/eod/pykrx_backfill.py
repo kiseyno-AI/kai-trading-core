@@ -13,7 +13,11 @@ from zoneinfo import ZoneInfo
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
-from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_marker_is_valid,
+)
 from app.eod.master import get_master_symbols
 from app.eod.market_membership import (
     build_market_membership_snapshot,
@@ -700,7 +704,7 @@ def _is_terminal_followup_continuation_candidate(
         stage = stages.get(stage_id)
         if not isinstance(stage, Mapping):
             return False
-        if not daily_pipeline_outcome_is_satisfied(
+        if not daily_pipeline_prefix_outcome_is_satisfied(
             {**dict(stage), 'stage': stage_id}
         ):
             return False
@@ -2267,15 +2271,21 @@ class PykrxBackfillService:
         if not recovery_scope:
             return None
 
-        incomplete_stages = [
-            stage_id
-            for stage_id in recovery_scope
-            if not daily_pipeline_outcome_is_satisfied(
-                stage_rows.get(stage_id)
-                if isinstance(stage_rows.get(stage_id), Mapping)
+        outcome_is_satisfied = (
+            daily_pipeline_prefix_outcome_is_satisfied
+            if terminal_continuation_marker_is_valid(run_metadata)
+            else daily_pipeline_outcome_is_satisfied
+        )
+        incomplete_stages = []
+        for stage_id in recovery_scope:
+            stage = stage_rows.get(stage_id)
+            stage_outcome = (
+                {**dict(stage), 'stage': stage_id}
+                if isinstance(stage, Mapping)
                 else {}
             )
-        ]
+            if not outcome_is_satisfied(stage_outcome):
+                incomplete_stages.append(stage_id)
         pipeline_status = str(pipeline_run.get('status') or '').strip().lower()
         downstream_resume_from_stage = str(
             latest_eod_metadata.get('downstream_retry_resume_from_stage') or ''

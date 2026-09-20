@@ -24,7 +24,10 @@ from app.agent_context.signal_decider_loop_service import (
 from app.core.settings import settings
 from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
 from app.eod.action_summaries import daily_action_summary_service
-from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_outcome_is_satisfied,
+    pykrx_enrichment_preflight_is_ready,
+)
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -1372,19 +1375,37 @@ class DailyPipelineStageService:
         if stage_id == 'pykrx_enrichment':
             category_results = result.get('categories') if isinstance(result.get('categories'), dict) else {}
             categories_requested = result.get('categories_requested') or list(category_results)
-            failed_categories = {
-                category
-                for category, details in category_results.items()
-                if isinstance(details, dict) and details.get('errors')
-            }
             downstream_preflight = (
                 result.get('downstream_preflight')
                 if isinstance(result.get('downstream_preflight'), dict)
                 else {}
             )
-            failed_categories.update(
+            failed_categories = {
                 str(category)
                 for category in downstream_preflight.get('failed_categories') or []
+            }
+            preflight_ready = pykrx_enrichment_preflight_is_ready(
+                downstream_preflight
+            )
+            failed_categories.update(
+                category
+                for category, details in category_results.items()
+                if isinstance(details, dict)
+                and (
+                    str(details.get('status') or '').strip().lower()
+                    == 'failed'
+                    or (
+                        bool(details.get('errors'))
+                        and not (
+                            preflight_ready
+                            and int(details.get('rows_persisted') or 0) > 0
+                            and str(details.get('status') or '')
+                            .strip()
+                            .lower()
+                            in {'completed', 'partial'}
+                        )
+                    )
+                )
             )
             succeeded = sum(
                 1
@@ -1743,10 +1764,27 @@ class DailyPipelineStageService:
                 categories=REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
             )
             result['downstream_preflight'] = preflight
+            result_status = str(
+                result.get('status') or ''
+            ).strip().lower()
+            enrichment_counts = self._extract_stage_counts(
+                stage_id='pykrx_enrichment',
+                result=result,
+            )
             if (
+                result_status == 'partial'
+                and pykrx_enrichment_preflight_is_ready(preflight)
+                and enrichment_counts['total'] > 0
+                and enrichment_counts['processed']
+                == enrichment_counts['total']
+                and enrichment_counts['succeeded']
+                == enrichment_counts['total']
+                and enrichment_counts['failed'] == 0
+            ):
+                result['status'] = 'completed'
+            elif (
                 not preflight.get('allowed')
-                and str(result.get('status') or '').strip().lower()
-                not in {'failed', 'blocked', 'waiting'}
+                and result_status not in {'failed', 'blocked', 'waiting'}
             ):
                 result['status'] = 'partial'
             return result

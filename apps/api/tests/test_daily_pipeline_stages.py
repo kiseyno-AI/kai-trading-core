@@ -331,6 +331,41 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.market_state_patcher.start()
         self.addCleanup(self.market_state_patcher.stop)
 
+    def _execute_pykrx_enrichment(
+        self,
+        *,
+        collection_result: dict,
+        preflight: dict,
+    ) -> tuple[DailyPipelineStageService, dict]:
+        enrichment_service = MagicMock()
+        enrichment_service.collect_for_market_date.return_value = (
+            collection_result
+        )
+        service = DailyPipelineStageService(
+            pykrx_enrichment_service_ref=enrichment_service,
+        )
+        with patch(
+            'app.eod.daily_pipeline_stages.build_pykrx_enrichment_preflight',
+            return_value=preflight,
+        ):
+            result = service._execute_stage(
+                stage_id='pykrx_enrichment',
+                market_date='2026-04-14',
+                symbols=['005930'],
+                markets=['KOSPI'],
+                force=False,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+        return service, result
+
     def test_describe_returns_canonical_stage_order_and_default_sequence(self) -> None:
         service = DailyPipelineStageService()
 
@@ -1929,6 +1964,104 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
+    def test_extract_stage_counts_treats_ready_enrichment_warning_as_success(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='pykrx_enrichment',
+            result={
+                'categories_requested': [
+                    'sector_classification',
+                    'short_selling',
+                ],
+                'categories': {
+                    'sector_classification': {
+                        'status': 'completed',
+                        'rows_persisted': 10,
+                        'errors': [],
+                    },
+                    'short_selling': {
+                        'status': 'partial',
+                        'rows_persisted': 10,
+                        'errors': [
+                            {
+                                'operation': 'short_selling_balance',
+                                'error': 'empty provider frame',
+                            }
+                        ],
+                    },
+                },
+                'downstream_preflight': {
+                    'allowed': True,
+                    'status': 'ready',
+                    'required_categories': [
+                        'sector_classification',
+                        'investor_flow_symbol',
+                        'short_selling',
+                    ],
+                    'category_row_counts': {
+                        'sector_classification': 10,
+                        'investor_flow_symbol': 10,
+                        'short_selling': 10,
+                    },
+                    'failed_categories': [],
+                    'blocked_categories': [],
+                    'waiting_categories': [],
+                    'zero_coverage_categories': [],
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 2,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_keeps_preflight_failed_enrichment_failed(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='pykrx_enrichment',
+            result={
+                'categories_requested': [
+                    'sector_classification',
+                    'short_selling',
+                ],
+                'categories': {
+                    'sector_classification': {
+                        'status': 'completed',
+                        'rows_persisted': 10,
+                        'errors': [],
+                    },
+                    'short_selling': {
+                        'status': 'partial',
+                        'rows_persisted': 10,
+                        'errors': ['coverage incomplete'],
+                    },
+                },
+                'downstream_preflight': {
+                    'allowed': False,
+                    'status': 'blocked',
+                    'failed_categories': ['short_selling'],
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 1,
+                'failed': 1,
+            },
+        )
+
     def test_build_stage_run_details_marks_external_news_total_as_lower_bound(self) -> None:
         details = DailyPipelineStageService._build_stage_run_details(
             stage_id='external_news_enrich',
@@ -2481,6 +2614,190 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(
             set(result['downstream_preflight']['failed_categories']),
             set(required_categories),
+        )
+
+    def test_execute_pykrx_enrichment_completes_ready_provider_warning(
+        self,
+    ) -> None:
+        required_categories = (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        )
+        collection_result = {
+            'status': 'partial',
+            'categories_requested': list(required_categories),
+            'categories': {
+                'sector_classification': {
+                    'status': 'completed',
+                    'rows_persisted': 10,
+                    'errors': [],
+                },
+                'investor_flow_symbol': {
+                    'status': 'completed',
+                    'rows_persisted': 10,
+                    'errors': [],
+                },
+                'short_selling': {
+                    'status': 'partial',
+                    'rows_persisted': 10,
+                    'errors': ['empty provider frame'],
+                },
+            },
+            'coverage': {},
+        }
+        ready_preflight = {
+            'allowed': True,
+            'status': 'ready',
+            'required_categories': list(required_categories),
+            'category_row_counts': {
+                category: 10 for category in required_categories
+            },
+            'failed_categories': [],
+            'blocked_categories': [],
+            'waiting_categories': [],
+            'zero_coverage_categories': [],
+        }
+        service, result = self._execute_pykrx_enrichment(
+            collection_result=collection_result,
+            preflight=ready_preflight,
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        outcome = service._build_stage_outcome(
+            'pykrx_enrichment',
+            result,
+        )
+        self.assertEqual(outcome['status'], 'completed')
+        self.assertTrue(service._dependency_outcome_is_satisfied(outcome))
+        self.assertEqual(
+            service._extract_stage_counts(
+                stage_id='pykrx_enrichment',
+                result=result,
+            ),
+            {
+                'processed': 3,
+                'total': 3,
+                'succeeded': 3,
+                'failed': 0,
+            },
+        )
+
+    def test_execute_pykrx_enrichment_keeps_incomplete_optional_work_partial(
+        self,
+    ) -> None:
+        required_categories = (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        )
+        ready_preflight = {
+            'allowed': True,
+            'status': 'ready',
+            'required_categories': list(required_categories),
+            'category_row_counts': {
+                category: 10 for category in required_categories
+            },
+            'failed_categories': [],
+            'blocked_categories': [],
+            'waiting_categories': [],
+            'zero_coverage_categories': [],
+        }
+        required_results = {
+            category: {
+                'status': 'completed',
+                'rows_persisted': 10,
+                'errors': [],
+            }
+            for category in required_categories
+        }
+        cases = {
+            'failed_optional_category': (
+                {
+                    **required_results,
+                    'foreign_ownership': {
+                        'status': 'partial',
+                        'rows_persisted': 0,
+                        'errors': ['provider unavailable'],
+                    },
+                },
+                {'processed': 4, 'total': 4, 'succeeded': 3, 'failed': 1},
+            ),
+            'missing_optional_category': (
+                required_results,
+                {'processed': 3, 'total': 4, 'succeeded': 3, 'failed': 0},
+            ),
+        }
+
+        for case_name, (category_results, expected_counts) in cases.items():
+            with self.subTest(case=case_name):
+                collection_result = {
+                    'status': 'partial',
+                    'categories_requested': [
+                        *required_categories,
+                        'foreign_ownership',
+                    ],
+                    'categories': category_results,
+                    'coverage': {},
+                }
+                service, result = self._execute_pykrx_enrichment(
+                    collection_result=collection_result,
+                    preflight=ready_preflight,
+                )
+
+                self.assertEqual(result['status'], 'partial')
+                outcome = service._build_stage_outcome(
+                    'pykrx_enrichment',
+                    result,
+                )
+                self.assertEqual(outcome['status'], 'partial')
+                self.assertFalse(
+                    service._dependency_outcome_is_satisfied(outcome)
+                )
+                self.assertEqual(
+                    service._extract_stage_counts(
+                        stage_id='pykrx_enrichment',
+                        result=result,
+                    ),
+                    expected_counts,
+                )
+
+    def test_execute_pykrx_enrichment_keeps_unproven_warning_partial(
+        self,
+    ) -> None:
+        collection_result = {
+            'status': 'partial',
+            'categories_requested': ['short_selling'],
+            'categories': {
+                'short_selling': {
+                    'status': 'partial',
+                    'rows_persisted': 10,
+                    'errors': ['empty provider frame'],
+                },
+            },
+            'coverage': {},
+        }
+        service, result = self._execute_pykrx_enrichment(
+            collection_result=collection_result,
+            preflight={
+                'allowed': True,
+                'status': 'ready',
+                'required_categories': ['short_selling'],
+                'category_row_counts': {'short_selling': 10},
+                'failed_categories': [],
+                'blocked_categories': [],
+                'waiting_categories': [],
+                'zero_coverage_categories': [],
+            },
+        )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            service._build_stage_outcome(
+                'pykrx_enrichment',
+                result,
+            )['status'],
+            'partial',
         )
 
     def test_recovered_stage_status_is_terminal_completed(self) -> None:
