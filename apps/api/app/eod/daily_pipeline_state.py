@@ -5,17 +5,12 @@ from typing import Any, Mapping, Sequence
 
 from sqlalchemy import or_, select, text
 
-from app.agent_context.roles import (
-    DECISION_SUPPORT_AGENT_NAMES,
-    SUMMARIZER_AGENT_NAMES,
-)
 from app.agent_context.lease_loss_evidence import (
+    terminal_feedback_completed_run_evidence_error,
     terminal_feedback_lease_loss_evidence_error,
 )
 from app.agent_context.run_modes import (
-    DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
-    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
 from app.core.settings import settings
 from app.db import session_scope
@@ -30,6 +25,7 @@ from app.db_models import (
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_expired_decision_skip_evidence_is_valid,
     terminal_continuation_feedback_lease_loss_run_id,
     terminal_continuation_lease_loss_resume_lineage_is_valid,
     terminal_continuation_marker_is_valid,
@@ -37,6 +33,11 @@ from app.eod.daily_pipeline_outcomes import (
 )
 from app.repositories.eod_run_repository import (
     eod_collection_advisory_lock_keys,
+)
+
+
+_expired_decision_skip_evidence_is_valid = (
+    terminal_continuation_expired_decision_skip_evidence_is_valid
 )
 
 
@@ -259,99 +260,6 @@ def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
             else {}
         ),
     }
-
-
-def _expired_decision_skip_evidence_is_valid(
-    *,
-    stage_row: object,
-    stage_id: str,
-    market_date: date,
-) -> bool:
-    """Validate the exact no-child result emitted after an action window closes."""
-
-    details = getattr(stage_row, 'details', {})
-    result_summary = (
-        details.get('result_summary')
-        if isinstance(details, Mapping)
-        and isinstance(details.get('result_summary'), Mapping)
-        else {}
-    )
-    required_result = {
-        'triggered': False,
-        'status': 'skipped',
-        'reason': 'next_open_window_expired',
-        'market_date': market_date.isoformat(),
-        'stage': stage_id,
-    }
-    allowed_result_keys = {
-        *required_result,
-        'target_trade_date',
-        'current_market_date',
-        'market_state',
-        'completed_after_action_window',
-    }
-    completed_at = _as_utc_datetime(
-        getattr(stage_row, 'completed_at', None)
-    )
-    if not (
-        str(getattr(stage_row, 'status', '') or '').strip().lower()
-        == 'skipped'
-        and completed_at is not None
-        and not str(getattr(stage_row, 'error_message', '') or '').strip()
-        and str(getattr(stage_row, 'current_step', '') or '').strip()
-        == f'{stage_id}_skipped'
-        and all(
-            _as_int(getattr(stage_row, field, 0)) == 0
-            for field in (
-                'processed',
-                'total',
-                'succeeded',
-                'failed',
-                'remaining',
-            )
-        )
-        and isinstance(getattr(stage_row, 'source_run_ids', {}), Mapping)
-        and not getattr(stage_row, 'source_run_ids', {})
-        and set(result_summary).issubset(allowed_result_keys)
-        and all(
-            result_summary.get(key) == value
-            for key, value in required_result.items()
-        )
-        and (
-            result_summary.get('completed_after_action_window') is None
-            or result_summary.get('completed_after_action_window') is True
-        )
-    ):
-        return False
-
-    try:
-        target_trade_date = date.fromisoformat(
-            str(result_summary.get('target_trade_date') or '')
-        )
-        current_market_date = date.fromisoformat(
-            str(result_summary.get('current_market_date') or '')
-        )
-    except ValueError:
-        return False
-    market_state = str(
-        result_summary.get('market_state') or ''
-    ).strip().upper()
-    if not (
-        target_trade_date > market_date
-        and market_state
-        in {'PREOPEN', 'OPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}
-        and current_market_date
-        == completed_at.astimezone(
-            timezone(timedelta(hours=9))
-        ).date()
-        and (
-            target_trade_date < current_market_date
-            if market_state == 'PREOPEN'
-            else target_trade_date <= current_market_date
-        )
-    ):
-        return False
-    return True
 
 
 def _build_stage_duration_details(
@@ -2268,15 +2176,9 @@ class DailyPipelineRunStateService:
                     field=failed_child_error,
                 )
 
-        feedback_stage_expectations = {
-            'agent_feedback_summaries': (
-                list(SUMMARIZER_AGENT_NAMES),
-                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
-            ),
-            'signal_decider': (
-                list(DECISION_SUPPORT_AGENT_NAMES),
-                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
-            ),
+        feedback_stage_ids = {
+            'agent_feedback_summaries',
+            'signal_decider',
         }
         for stage_id in satisfied_prefix:
             stage_row = stage_rows_by_id[stage_id]
@@ -2293,8 +2195,7 @@ class DailyPipelineRunStateService:
                         field='safe_skip_context',
                     )
                 continue
-            expectation = feedback_stage_expectations.get(stage_id)
-            if expectation is None:
+            if stage_id not in feedback_stage_ids:
                 continue
             if stage_status != 'completed':
                 return reject(
@@ -2324,98 +2225,21 @@ class DailyPipelineRunStateService:
                 .where(AgentContextFeedbackRun.run_id == child_run_id)
                 .with_for_update()
             ).scalar_one_or_none()
-            request_payload = (
-                child_run.request_payload
-                if child_run is not None
-                and isinstance(child_run.request_payload, Mapping)
-                else {}
-            )
-            expected_roles, expected_scope_mode = expectation
-            expected_admission_scope = {
-                role: list(raw_symbols) for role in expected_roles
-            }
-            role_symbol_scopes = request_payload.get('role_symbol_scopes')
-            role_symbol_counts = request_payload.get('role_symbol_counts')
-            requested_symbol_set = set(raw_symbols)
-            role_scope_evidence_valid = bool(
-                isinstance(role_symbol_scopes, Mapping)
-                and isinstance(role_symbol_counts, Mapping)
-                and set(role_symbol_scopes) == set(expected_roles)
-                and set(role_symbol_counts) == set(expected_roles)
-                and all(
-                    isinstance(role_symbol_scopes.get(role), list)
-                    and len(role_symbol_scopes[role])
-                    == len(set(role_symbol_scopes[role]))
-                    and all(
-                        isinstance(symbol, str)
-                        and symbol in requested_symbol_set
-                        for symbol in role_symbol_scopes[role]
-                    )
-                    and isinstance(role_symbol_counts.get(role), int)
-                    and not isinstance(role_symbol_counts[role], bool)
-                    and role_symbol_counts[role]
-                    == len(role_symbol_scopes[role])
-                    for role in expected_roles
+            child_evidence_error = (
+                terminal_feedback_completed_run_evidence_error(
+                    child_run=child_run,
+                    child_run_id=child_run_id,
+                    stage_id=stage_id,
+                    market_date=normalized_market_date,
+                    metadata=metadata,
+                    knowledge_cutoff_at=persisted_cutoff,
                 )
             )
-            scoped_symbol_total = (
-                sum(role_symbol_counts.values())
-                if role_scope_evidence_valid
-                else -1
-            )
-            expected_force_recompute = bool(
-                metadata['force']
-                and not metadata['reuse_existing_feedback']
-            )
-            if not (
-                child_run is not None
-                and str(child_run.run_id or '').strip() == child_run_id
-                and child_run.market_date == normalized_market_date
-                and str(child_run.status or '').strip().lower()
-                == 'completed'
-                and child_run.completed_at is not None
-                and _as_int(child_run.failed_count) == 0
-                and role_scope_evidence_valid
-                and _as_int(child_run.symbols_total) == scoped_symbol_total
-                and _as_int(child_run.completed_count)
-                == scoped_symbol_total
-                and request_payload.get('market_date')
-                == normalized_market_date.isoformat()
-                and request_payload.get('request_run_id') == child_run_id
-                and request_payload.get('mode')
-                == DAILY_RETRY_CYCLE_MODE
-                and request_payload.get('roles') == expected_roles
-                and request_payload.get('requested_symbols')
-                == raw_symbols
-                and request_payload.get('feedback_scope_mode')
-                == expected_scope_mode
-                and request_payload.get('admission_scope_by_role')
-                == expected_admission_scope
-                and str(request_payload.get('fs_div') or '')
-                .strip()
-                .upper()
-                == str(metadata['fs_div']).strip().upper()
-                and request_payload.get('reuse_existing')
-                is metadata['reuse_existing_feedback']
-                and request_payload.get('force_recompute')
-                is expected_force_recompute
-                and _parse_utc_datetime(
-                    request_payload.get('knowledge_cutoff_at')
-                )
-                == persisted_cutoff
-                and _parse_utc_datetime(
-                    request_payload.get('admission_knowledge_cutoff_at')
-                )
-                == persisted_cutoff
-                and _parse_utc_datetime(
-                    request_payload.get('requested_knowledge_cutoff_at')
-                )
-                == persisted_cutoff
-            ):
+            if child_evidence_error is not None:
                 return reject(
                     'terminal_continuation_feedback_prefix_evidence_invalid',
                     stage_id=stage_id,
-                    field='child_run_context',
+                    field=child_evidence_error,
                 )
 
         resume_count = _as_int(

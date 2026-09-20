@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 
@@ -116,6 +116,106 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def terminal_continuation_expired_decision_skip_evidence_is_valid(
+    *,
+    stage_row: object,
+    stage_id: str,
+    market_date: date,
+) -> bool:
+    """Validate the exact no-child result emitted after an action window closes."""
+
+    def stage_int(value: Any) -> int:
+        try:
+            return int(value if value is not None else 0)
+        except (TypeError, ValueError):
+            return 0
+
+    details = getattr(stage_row, 'details', {})
+    result_summary = (
+        details.get('result_summary')
+        if isinstance(details, Mapping)
+        and isinstance(details.get('result_summary'), Mapping)
+        else {}
+    )
+    required_result = {
+        'triggered': False,
+        'status': 'skipped',
+        'reason': 'next_open_window_expired',
+        'market_date': market_date.isoformat(),
+        'stage': stage_id,
+    }
+    allowed_result_keys = {
+        *required_result,
+        'target_trade_date',
+        'current_market_date',
+        'market_state',
+        'completed_after_action_window',
+    }
+    completed_at = getattr(stage_row, 'completed_at', None)
+    if isinstance(completed_at, datetime):
+        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            completed_at = completed_at.replace(tzinfo=timezone.utc)
+        else:
+            completed_at = completed_at.astimezone(timezone.utc)
+    else:
+        completed_at = None
+    if not (
+        str(getattr(stage_row, 'status', '') or '').strip().lower()
+        == 'skipped'
+        and completed_at is not None
+        and not str(getattr(stage_row, 'error_message', '') or '').strip()
+        and str(getattr(stage_row, 'current_step', '') or '').strip()
+        == f'{stage_id}_skipped'
+        and all(
+            stage_int(getattr(stage_row, field, 0)) == 0
+            for field in (
+                'processed',
+                'total',
+                'succeeded',
+                'failed',
+                'remaining',
+            )
+        )
+        and isinstance(getattr(stage_row, 'source_run_ids', {}), Mapping)
+        and not getattr(stage_row, 'source_run_ids', {})
+        and set(result_summary).issubset(allowed_result_keys)
+        and all(
+            result_summary.get(key) == value
+            for key, value in required_result.items()
+        )
+        and (
+            result_summary.get('completed_after_action_window') is None
+            or result_summary.get('completed_after_action_window') is True
+        )
+    ):
+        return False
+
+    try:
+        target_trade_date = date.fromisoformat(
+            str(result_summary.get('target_trade_date') or '')
+        )
+        current_market_date = date.fromisoformat(
+            str(result_summary.get('current_market_date') or '')
+        )
+    except ValueError:
+        return False
+    market_state = str(
+        result_summary.get('market_state') or ''
+    ).strip().upper()
+    return bool(
+        target_trade_date > market_date
+        and market_state
+        in {'PREOPEN', 'OPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}
+        and current_market_date
+        == completed_at.astimezone(timezone(timedelta(hours=9))).date()
+        and (
+            target_trade_date < current_market_date
+            if market_state == 'PREOPEN'
+            else target_trade_date <= current_market_date
+        )
+    )
 
 
 def terminal_continuation_marker_is_valid(
