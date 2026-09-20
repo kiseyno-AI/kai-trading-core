@@ -33,6 +33,7 @@ from app.agent_context.retry_service import (
     _previous_run_matches_knowledge_cutoff,
     resolve_latest_completed_summary_knowledge_cutoff,
 )
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
 from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundle
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.agent_context.reuse_service import AgentContextReuseService
@@ -1775,6 +1776,283 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 (prior_parent, failed_symbol, role)
             ],
             (prior_child, 'failed'),
+        )
+
+    def test_exact_lease_loss_parent_reuses_only_persisted_child_success(
+        self,
+    ):
+        service = AgentFeedbackRetryService()
+        suffix = uuid4().hex[:10].upper()
+        success_symbol = f'S{suffix}'
+        failed_symbol = f'F{suffix}'
+        symbols = [success_symbol, failed_symbol]
+        role = 'short-term-decider'
+        market_date = date.fromisoformat('2026-04-16')
+        lease_parent = f'feedback-cycle-2026-04-16-{suffix.lower()}'
+        partial_child = f'symbol-run-2026-04-16-{suffix.lower()}'
+        current_parent = f'current-parent-{suffix}'
+        run_ids = [lease_parent, partial_child, current_parent]
+        cutoff = '2026-04-16T04:55:00+00:00'
+        lease_completed_at = datetime(
+            2026,
+            4,
+            16,
+            5,
+            2,
+            tzinfo=timezone.utc,
+        )
+        roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        role_scopes = {
+            decision_role: (
+                list(symbols) if decision_role == role else []
+            )
+            for decision_role in roles
+        }
+        role_counts = {
+            decision_role: len(role_scopes[decision_role])
+            for decision_role in roles
+        }
+        lease_parent_payload = {
+            'market_date': market_date.isoformat(),
+            'request_run_id': lease_parent,
+            'mode': 'daily_retry_cycle_role_sequenced',
+            'roles': roles,
+            'requested_symbols': symbols,
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'admission_scope_by_role': {
+                decision_role: list(symbols)
+                for decision_role in roles
+            },
+            'role_symbol_scopes': role_scopes,
+            'role_symbol_counts': role_counts,
+            'fs_div': 'CFS',
+            'reuse_existing': True,
+            'force_recompute': False,
+            'knowledge_cutoff_at': cutoff,
+            'admission_knowledge_cutoff_at': cutoff,
+            'requested_knowledge_cutoff_at': cutoff,
+            'retry_admission': {
+                'schema_version': 'agent_feedback_retry_admission_v1',
+                'claimed_at': '2026-04-16T05:00:00+00:00',
+                'owner_token_hash': 'a' * 64,
+            },
+        }
+        with session_scope() as session:
+            session.add_all(
+                [
+                    AgentContextFeedbackRun(
+                        run_id=lease_parent,
+                        market_date=market_date,
+                        status='abandoned',
+                        symbols_total=2,
+                        completed_count=0,
+                        failed_count=2,
+                        request_payload=lease_parent_payload,
+                        summary_payload={
+                            'admission_lease_loss': {
+                                'schema_version': (
+                                    'agent_feedback_retry_admission_lease_loss_v1'
+                                ),
+                                'detected_at': (
+                                    lease_completed_at.isoformat()
+                                ),
+                                'stage': (
+                                    'before_checkpoint:'
+                                    'role_batch_completed'
+                                ),
+                                'reason': (
+                                    'heartbeat_refresh_grace_exceeded'
+                                ),
+                                'owner_token_fingerprint': 'a' * 16,
+                            }
+                        },
+                        started_at=datetime(
+                            2026,
+                            4,
+                            16,
+                            5,
+                            0,
+                            tzinfo=timezone.utc,
+                        ),
+                        completed_at=lease_completed_at,
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=partial_child,
+                        market_date=market_date,
+                        status='partial',
+                        symbols_total=2,
+                        completed_count=1,
+                        failed_count=1,
+                        request_payload={
+                            'parent_run_id': lease_parent,
+                            'roles': [role],
+                            'requested_symbols': symbols,
+                            'role_symbol_scopes': {role: symbols},
+                        },
+                        summary_payload={
+                            'failed_symbols_by_role': {
+                                role: [failed_symbol]
+                            }
+                        },
+                        started_at=datetime(
+                            2026,
+                            4,
+                            16,
+                            5,
+                            1,
+                            tzinfo=timezone.utc,
+                        ),
+                        completed_at=lease_completed_at,
+                    ),
+                    AgentContextFeedbackRun(
+                        run_id=current_parent,
+                        market_date=market_date,
+                        status='running',
+                        symbols_total=2,
+                        completed_count=0,
+                        failed_count=0,
+                        request_payload={
+                            'mode': 'daily_retry_cycle_role_sequenced',
+                            'roles': [role],
+                            'requested_symbols': symbols,
+                            'role_symbol_scopes': {role: symbols},
+                        },
+                        summary_payload={},
+                        started_at=datetime(
+                            2026,
+                            4,
+                            16,
+                            6,
+                            0,
+                            tzinfo=timezone.utc,
+                        ),
+                    ),
+                ]
+            )
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(run_ids)
+                    )
+                )
+
+        self.addCleanup(cleanup)
+
+        reuse_decisions = {
+            success_symbol: {
+                role: _decision(
+                    should_dispatch=False,
+                    latest_feedback_id=81,
+                    latest_feedback={
+                        'id': 81,
+                        'run_id': partial_child,
+                        'received_at': (
+                            '2026-04-16T05:01:30+00:00'
+                        ),
+                    },
+                    latest_feedback_received_at=(
+                        '2026-04-16T05:01:30+00:00'
+                    ),
+                    latest_decision_snapshot_id=181,
+                    latest_decision_snapshot_fingerprint='snapshot-181',
+                    latest_decision_snapshot_observed_at=(
+                        '2026-04-16T05:01:20+00:00'
+                    ),
+                    reason='reuse_latest_feedback',
+                )
+            },
+            failed_symbol: {
+                role: _decision(
+                    should_dispatch=True,
+                    latest_feedback_received_at=(
+                        '2026-04-16T05:01:30+00:00'
+                    ),
+                    reason='latest_failure_pending_retry',
+                )
+            },
+        }
+
+        def build_snapshot():
+            with (
+                patch.object(
+                    service,
+                    '_load_same_day_terminal_symbols',
+                    return_value=({}, {}),
+                ),
+                patch(
+                    'app.agent_context.retry_service.'
+                    'agent_context_reuse_service.build_latest_decisions',
+                    return_value=reuse_decisions,
+                ),
+            ):
+                return service._build_role_sequence_snapshot(
+                    market_date=market_date,
+                    roles=(role,),
+                    eligible_symbols=tuple(symbols),
+                    role_symbol_scopes={role: tuple(symbols)},
+                    reuse_existing=True,
+                    parent_run_id=current_parent,
+                    parent_started_at=datetime(
+                        2026,
+                        4,
+                        16,
+                        6,
+                        0,
+                        tzinfo=timezone.utc,
+                    ),
+                    knowledge_cutoff_at=cutoff,
+                    fs_div='CFS',
+                )
+
+        snapshot = build_snapshot()
+        role_state = snapshot.role_states[role]
+        self.assertEqual(role_state.reused_symbols, (success_symbol,))
+        self.assertEqual(role_state.completed_symbols, (success_symbol,))
+        self.assertEqual(
+            role_state.boundary_pending_symbols,
+            (failed_symbol,),
+        )
+
+        with session_scope() as session:
+            parent = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == lease_parent
+                )
+            ).scalar_one()
+            parent.status = 'failed'
+
+        failed_parent_snapshot = build_snapshot()
+        failed_parent_role_state = failed_parent_snapshot.role_states[role]
+        self.assertEqual(failed_parent_role_state.reused_symbols, ())
+        self.assertEqual(failed_parent_role_state.completed_symbols, ())
+        self.assertEqual(
+            failed_parent_role_state.boundary_pending_symbols,
+            tuple(symbols),
+        )
+
+        with session_scope() as session:
+            parent = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == lease_parent
+                )
+            ).scalar_one()
+            parent.status = 'abandoned'
+            parent.summary_payload = {
+                'admission_lease_loss': {
+                    **parent.summary_payload['admission_lease_loss'],
+                    'owner_token_fingerprint': 'b' * 16,
+                }
+            }
+
+        malformed_snapshot = build_snapshot()
+        malformed_role_state = malformed_snapshot.role_states[role]
+        self.assertEqual(malformed_role_state.reused_symbols, ())
+        self.assertEqual(malformed_role_state.completed_symbols, ())
+        self.assertEqual(
+            malformed_role_state.boundary_pending_symbols,
+            tuple(symbols),
         )
 
     def test_newer_failed_child_overrides_older_sibling_success(self):

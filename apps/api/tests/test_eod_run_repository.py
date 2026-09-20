@@ -4,11 +4,16 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import create_engine, delete, event, text
+from sqlalchemy import create_engine, delete, event, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app.db import engine, session_scope
-from app.db_models import DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun
+from app.db_models import (
+    AgentContextFeedbackRun,
+    DailyPipelineRun,
+    DailyPipelineStageRun,
+    EODCollectionRun,
+)
 from app.repositories.eod_run_repository import (
     AutoEODRecoveryTarget,
     advisory_eod_collection_lock,
@@ -180,6 +185,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
         EODCollectionRun.__table__.create(self.sqlite_engine)
         DailyPipelineRun.__table__.create(self.sqlite_engine)
         DailyPipelineStageRun.__table__.create(self.sqlite_engine)
+        AgentContextFeedbackRun.__table__.create(self.sqlite_engine)
         self.session_factory = sessionmaker(bind=self.sqlite_engine, future=True)
 
     def tearDown(self) -> None:
@@ -1249,6 +1255,550 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
 
         self.assertEqual(exhausted_result, '2026-09-14')
         self.assertEqual(price_result, '2026-09-07')
+
+    def test_exhausted_feedback_lease_loss_continuation_remains_selectable(
+        self,
+    ) -> None:
+        market_date = date(2026, 9, 18)
+        started_at = datetime(2026, 9, 20, tzinfo=timezone.utc)
+        child_run_id = 'feedback-cycle-2026-09-18-deadbeef01'
+        lease_loss_error = (
+            f'feedback retry lease ownership lost for {child_run_id} at '
+            'before_parent_finalization: '
+            'heartbeat_refresh_grace_exceeded'
+        )
+        suffix = [
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        with self.session_factory.begin() as session:
+            eod_run = EODCollectionRun(
+                market='KRX',
+                trade_date=market_date,
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=1,
+                symbols_succeeded=1,
+                symbols_failed=0,
+                started_at=started_at,
+                run_metadata={
+                    'mode': 'daily_auto',
+                    'followup_recovery_required': True,
+                },
+            )
+            session.add(eod_run)
+            session.flush()
+            prior_runs = [
+                DailyPipelineRun(
+                    market_date=market_date,
+                    trigger='auto_eod_followup_resume',
+                    status='failed',
+                    current_stage='technical_snapshots',
+                    started_at=started_at + timedelta(minutes=attempt),
+                    completed_at=started_at + timedelta(minutes=attempt + 1),
+                    run_metadata={
+                        'reused_eod_collection_run_id': eod_run.id,
+                    },
+                )
+                for attempt in range(5)
+            ]
+            session.add_all(prior_runs)
+            session.flush()
+            terminal_run = DailyPipelineRun(
+                market_date=market_date,
+                trigger='auto_eod_followup_resume',
+                status='failed',
+                current_stage='signal_decider',
+                started_at=started_at + timedelta(minutes=5),
+                completed_at=started_at + timedelta(minutes=6),
+                error_message=lease_loss_error,
+                run_metadata={
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'reused_eod_collection_run_id': eod_run.id,
+                    'resolved_stages': suffix,
+                    'resume_from_stage': 'agent_feedback_summaries',
+                    'terminal_continuation_count': 1,
+                    'terminal_continuation_version': 1,
+                    'terminal_continuation_reason': (
+                        'summary_knowledge_cutoff_repair'
+                    ),
+                    'terminal_continuation_claimed_at': (
+                        '2026-09-20T00:05:00+00:00'
+                    ),
+                    'terminal_continuation_evidence': {},
+                    'symbols': ['005930'],
+                    'fs_div': 'CFS',
+                    'reuse_existing_feedback': True,
+                    'force': False,
+                    'stage_statuses': {
+                        stage_id: 'pending' for stage_id in suffix
+                    },
+                },
+            )
+            session.add(terminal_run)
+            session.flush()
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'terminal_continuation_evidence': {
+                    'lineage': {
+                        'expected_run_count': 6,
+                        'observed_run_count': 6,
+                        'ordered_pipeline_run_ids': [
+                            *(row.id for row in prior_runs),
+                            terminal_run.id,
+                        ],
+                        'target_ordinal': 6,
+                        'latest_pipeline_run_id': terminal_run.id,
+                        'reused_eod_collection_run_id': eod_run.id,
+                    },
+                    'summary_proof': {
+                        'knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                    },
+                },
+            }
+            session.add_all(
+                [
+                    DailyPipelineStageRun(
+                        pipeline_run_id=terminal_run.id,
+                        market_date=market_date,
+                        stage_id='agent_feedback_summaries',
+                        status='completed',
+                        processed=1,
+                        total=1,
+                        succeeded=1,
+                        failed=0,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=5),
+                        completed_at=started_at + timedelta(minutes=5),
+                        source_run_ids={'run_id': 'summary-run'},
+                        details={'result_summary': {'status': 'completed'}},
+                    ),
+                    DailyPipelineStageRun(
+                        pipeline_run_id=terminal_run.id,
+                        market_date=market_date,
+                        stage_id='signal_decider',
+                        status='failed',
+                        processed=20,
+                        total=160,
+                        succeeded=0,
+                        failed=20,
+                        remaining=140,
+                        current_step='signal_decider_failed',
+                        started_at=started_at + timedelta(minutes=5),
+                        completed_at=started_at + timedelta(minutes=6),
+                        error_message=lease_loss_error,
+                        source_run_ids={
+                            'agent_feedback_run_id': child_run_id
+                        },
+                        details={},
+                    ),
+                    *[
+                        DailyPipelineStageRun(
+                            pipeline_run_id=terminal_run.id,
+                            market_date=market_date,
+                            stage_id=stage_id,
+                            status='pending',
+                            processed=0,
+                            total=0,
+                            succeeded=0,
+                            failed=0,
+                            remaining=0,
+                            current_step='terminal_continuation_pending',
+                            started_at=started_at + timedelta(minutes=5),
+                            source_run_ids={},
+                            details={},
+                        )
+                        for stage_id in suffix[2:]
+                    ],
+                ]
+            )
+            session.add(
+                AgentContextFeedbackRun(
+                    run_id=child_run_id,
+                    market_date=market_date,
+                    status='abandoned',
+                    symbols_total=2,
+                    completed_count=0,
+                    failed_count=2,
+                    request_payload={
+                        'market_date': market_date.isoformat(),
+                        'request_run_id': child_run_id,
+                        'mode': 'daily_retry_cycle_role_sequenced',
+                        'roles': [
+                            'short-term-decider',
+                            'signal-decider',
+                        ],
+                        'requested_symbols': ['005930'],
+                        'feedback_scope_mode': (
+                            'decider_scope_fast_path'
+                        ),
+                        'admission_scope_by_role': {
+                            'short-term-decider': ['005930'],
+                            'signal-decider': ['005930'],
+                        },
+                        'role_symbol_scopes': {
+                            'short-term-decider': ['005930'],
+                            'signal-decider': ['005930'],
+                        },
+                        'role_symbol_counts': {
+                            'short-term-decider': 1,
+                            'signal-decider': 1,
+                        },
+                        'fs_div': 'CFS',
+                        'reuse_existing': True,
+                        'force_recompute': False,
+                        'knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                        'admission_knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                        'requested_knowledge_cutoff_at': (
+                            '2026-09-20T00:55:00+00:00'
+                        ),
+                        'retry_admission': {
+                            'schema_version': (
+                                'agent_feedback_retry_admission_v1'
+                            ),
+                            'claimed_at': (
+                                '2026-09-20T00:59:00+00:00'
+                            ),
+                            'owner_token_hash': 'a' * 64,
+                        },
+                    },
+                    summary_payload={
+                        'admission_lease_loss': {
+                            'schema_version': (
+                                'agent_feedback_retry_admission_lease_loss_v1'
+                            ),
+                            'detected_at': (
+                                '2026-09-20T00:06:00+00:00'
+                            ),
+                            'stage': (
+                                'before_checkpoint:role_batch_completed'
+                            ),
+                            'reason': 'heartbeat_refresh_grace_exceeded',
+                            'owner_token_fingerprint': 'a' * 16,
+                        }
+                    },
+                    started_at=started_at + timedelta(minutes=5),
+                    completed_at=started_at + timedelta(minutes=6),
+                )
+            )
+            eod_run_id = eod_run.id
+            terminal_run_id = terminal_run.id
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=market_date.isoformat(),
+                on_or_before=market_date.isoformat(),
+            )
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=eod_run_id,
+            ),
+        )
+
+        for adjacent_attempt_count in (5, 7):
+            with (
+                patch(
+                    'app.repositories.eod_run_repository.session_scope',
+                    self._session_scope,
+                ),
+                patch(
+                    'app.repositories.eod_run_repository.'
+                    '_count_auto_followup_recovery_attempts',
+                    return_value=adjacent_attempt_count,
+                ),
+            ):
+                adjacent_target = (
+                    load_oldest_outstanding_auto_eod_recovery_target(
+                        on_or_after=market_date.isoformat(),
+                        on_or_before=market_date.isoformat(),
+                    )
+                )
+            self.assertIsNone(adjacent_target)
+
+        for malformed_resume_count in (1, '0', 'corrupt', True):
+            with self.session_factory.begin() as session:
+                terminal_run = session.get(
+                    DailyPipelineRun,
+                    terminal_run_id,
+                )
+                terminal_run.run_metadata = {
+                    **terminal_run.run_metadata,
+                    'terminal_continuation_resume_count': (
+                        malformed_resume_count
+                    ),
+                }
+            with patch(
+                'app.repositories.eod_run_repository.session_scope',
+                self._session_scope,
+            ):
+                malformed_target = (
+                    load_oldest_outstanding_auto_eod_recovery_target(
+                        on_or_after=market_date.isoformat(),
+                        on_or_before=market_date.isoformat(),
+                    )
+                )
+            self.assertIsNone(malformed_target)
+
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            restored_metadata = dict(terminal_run.run_metadata)
+            restored_metadata.pop(
+                'terminal_continuation_resume_count',
+                None,
+            )
+            terminal_run.run_metadata = restored_metadata
+
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.error_message = 'upstream request failed'
+            decider_stage = session.execute(
+                select(DailyPipelineStageRun).where(
+                    DailyPipelineStageRun.pipeline_run_id
+                    == terminal_run_id,
+                    DailyPipelineStageRun.stage_id == 'signal_decider',
+                )
+            ).scalar_one()
+            decider_stage.error_message = 'upstream request failed'
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            rejected = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=market_date.isoformat(),
+                on_or_before=market_date.isoformat(),
+            )
+        self.assertIsNone(rejected)
+
+        stale_activity_at = datetime(
+            2026,
+            9,
+            20,
+            16,
+            0,
+            tzinfo=timezone.utc,
+        )
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.status = 'running'
+            terminal_run.current_stage = 'signal_decider'
+            terminal_run.updated_at = stale_activity_at
+            terminal_run.completed_at = None
+            terminal_run.error_message = None
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'terminal_continuation_resume_count': 1,
+                'terminal_continuation_resumed_from_status': 'failed',
+                'terminal_continuation_resume_stage': 'signal_decider',
+                'terminal_continuation_completed_prefix': [
+                    'agent_feedback_summaries'
+                ],
+                'terminal_continuation_feedback_lease_loss_run_id': (
+                    child_run_id
+                ),
+                'stage_statuses': {
+                    'agent_feedback_summaries': 'completed',
+                    'signal_decider': 'pending',
+                    'next_open_execution_plan': 'pending',
+                    'signal_decider_evaluations': 'pending',
+                },
+            }
+            decider_stage = session.execute(
+                select(DailyPipelineStageRun).where(
+                    DailyPipelineStageRun.pipeline_run_id
+                    == terminal_run_id,
+                    DailyPipelineStageRun.stage_id == 'signal_decider',
+                )
+            ).scalar_one()
+            decider_stage.status = 'running'
+            decider_stage.processed = 0
+            decider_stage.total = 0
+            decider_stage.succeeded = 0
+            decider_stage.failed = 0
+            decider_stage.remaining = 0
+            decider_stage.current_step = 'signal_decider_running'
+            decider_stage.updated_at = stale_activity_at
+            decider_stage.completed_at = None
+            decider_stage.error_message = None
+            decider_stage.source_run_ids = {}
+            decider_stage.details = {}
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            stale_running_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(stale_running_target)
+
+        interrupted_at = stale_activity_at + timedelta(minutes=1)
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.status = 'interrupted'
+            terminal_run.updated_at = interrupted_at
+            terminal_run.completed_at = interrupted_at
+            terminal_run.error_message = 'Core restarted.'
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+                'interrupted_at': interrupted_at.isoformat(),
+            }
+            decider_stage = session.execute(
+                select(DailyPipelineStageRun).where(
+                    DailyPipelineStageRun.pipeline_run_id
+                    == terminal_run_id,
+                    DailyPipelineStageRun.stage_id == 'signal_decider',
+                )
+            ).scalar_one()
+            decider_stage.status = 'interrupted'
+            decider_stage.current_step = 'core_restart_interrupted'
+            decider_stage.updated_at = interrupted_at
+            decider_stage.completed_at = interrupted_at
+            decider_stage.error_message = 'Core restarted.'
+            decider_stage.details = {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+            }
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            interrupted_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertEqual(
+            interrupted_target,
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=eod_run_id,
+            ),
+        )
+
+        for invalid_resume_count, invalid_origin in (
+            (2, 'failed'),
+            (1, 'running'),
+            (1, 'interrupted'),
+        ):
+            with self.session_factory.begin() as session:
+                terminal_run = session.get(
+                    DailyPipelineRun,
+                    terminal_run_id,
+                )
+                terminal_run.run_metadata = {
+                    **terminal_run.run_metadata,
+                    'terminal_continuation_resume_count': (
+                        invalid_resume_count
+                    ),
+                    'terminal_continuation_resumed_from_status': (
+                        invalid_origin
+                    ),
+                }
+            with patch(
+                'app.repositories.eod_run_repository.session_scope',
+                self._session_scope,
+            ):
+                invalid_resume_target = (
+                    load_oldest_outstanding_auto_eod_recovery_target(
+                        on_or_after=market_date.isoformat(),
+                        on_or_before=market_date.isoformat(),
+                    )
+                )
+            self.assertIsNone(invalid_resume_target)
+
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'terminal_continuation_resume_count': 1,
+                'terminal_continuation_resumed_from_status': 'failed',
+            }
+
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'resumable': False,
+            }
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            invalid_interrupted_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(invalid_interrupted_target)
+
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'resumable': True,
+            }
+            child_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == child_run_id
+                )
+            ).scalar_one()
+            child_run.summary_payload = {
+                'admission_lease_loss': {
+                    **child_run.summary_payload['admission_lease_loss'],
+                    'owner_token_fingerprint': 'b' * 16,
+                }
+            }
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            tampered_child_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(tampered_child_target)
+
+        with self.session_factory.begin() as session:
+            session.execute(
+                delete(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == child_run_id
+                )
+            )
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            missing_child_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(missing_child_target)
 
     def test_exhausted_terminal_satisfied_followup_remains_eligible_for_convergence(
         self,

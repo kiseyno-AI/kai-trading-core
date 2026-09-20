@@ -16,6 +16,7 @@ from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_feedback_lease_loss_run_id,
     terminal_continuation_marker_is_valid,
 )
 from app.eod.master import get_master_symbols
@@ -339,7 +340,7 @@ def _is_terminal_followup_continuation_candidate(
     if pipeline_status == 'blocked' and continuation_count == 0:
         pass
     elif (
-        pipeline_status in {'running', 'interrupted'}
+        pipeline_status in {'running', 'interrupted', 'failed'}
         and continuation_count == 1
     ):
         terminal_evidence = (
@@ -566,7 +567,15 @@ def _is_terminal_followup_continuation_candidate(
         current_stage = str(
             pipeline_run.get('current_stage') or ''
         ).strip()
-        if first_status == 'pending':
+        if pipeline_status == 'failed':
+            first_unfinished_is_valid = bool(
+                first_status == 'failed'
+                and terminal_continuation_feedback_lease_loss_run_id(
+                    pipeline_run=pipeline_run,
+                    stage=first_unfinished,
+                )
+            )
+        elif first_status == 'pending':
             expected_current_stages = {first_unfinished_stage}
             if satisfied_prefix:
                 expected_current_stages.add(satisfied_prefix[-1])
