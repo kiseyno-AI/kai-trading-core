@@ -165,6 +165,32 @@ def _parse_persisted_snapshot_json_object(
     return parsed, None
 
 
+def _can_reuse_decider_input_revalidation(
+    *,
+    snapshot: dict[str, Any] | None,
+    dispatch_started_monotonic: float,
+    dispatch_completed_monotonic: float | None,
+) -> bool:
+    if snapshot is None or dispatch_completed_monotonic is None:
+        return False
+    validation_started_monotonic = snapshot.get(
+        'validation_started_monotonic'
+    )
+    try:
+        validation_started_monotonic = float(
+            validation_started_monotonic
+        )
+        dispatch_completed_monotonic = float(
+            dispatch_completed_monotonic
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        dispatch_started_monotonic <= dispatch_completed_monotonic
+        < validation_started_monotonic
+    )
+
+
 class AgentDispatchError(RuntimeError):
     def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -5980,6 +6006,7 @@ class AgentFeedbackOrchestrator:
                         all_failures=all_failures,
                         buffer_failure=buffer_failure,
                     )
+                    input_revalidation_snapshot: dict[str, Any] | None = None
                     self._flush_and_checkpoint_pending_run_buffers(
                         market_date=normalized_market_date,
                         request_run_id=request_run_id,
@@ -6024,8 +6051,14 @@ class AgentFeedbackOrchestrator:
 
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=role_parallelism)
                     try:
-                        future_map: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, list[dict[str, Any]]]] = {}
-                        future_started_at: dict[concurrent.futures.Future[dict[str, Any]], float] = {}
+                        future_map: dict[
+                            concurrent.futures.Future[Any],
+                            tuple[int, list[dict[str, Any]]],
+                        ] = {}
+                        future_started_at: dict[
+                            concurrent.futures.Future[Any],
+                            float,
+                        ] = {}
                         client_batch_timeout = float(
                             getattr(
                                 self._get_client(),
@@ -6049,19 +6082,33 @@ class AgentFeedbackOrchestrator:
                         )
                         poll_seconds = max(0.25, float(getattr(settings, 'openclaw_agent_subtask_poll_seconds', 2.0) or 2.0))
 
+                        def dispatch_batch_with_completion(
+                            *,
+                            spec: AgentDispatchSpec,
+                            market_date: date,
+                            batch_items: list[dict[str, Any]],
+                        ) -> tuple[dict[str, Any], float]:
+                            result = self._get_client().dispatch_batch(
+                                spec=spec,
+                                market_date=market_date,
+                                batch_items=batch_items,
+                            )
+                            return result, time.monotonic()
+
                         def submit_next() -> None:
                             if not queue:
                                 return
                             slot, batch = queue.pop(0)
                             mark_activity(role, slot, [item['symbol'] for item in batch], done=False)
+                            submitted_at = time.monotonic()
                             future = executor.submit(
-                                self._get_client().dispatch_batch,
+                                dispatch_batch_with_completion,
                                 spec=spec,
                                 market_date=normalized_market_date,
                                 batch_items=batch,
                             )
                             future_map[future] = (slot, batch)
-                            future_started_at[future] = time.monotonic()
+                            future_started_at[future] = submitted_at
 
                         for _ in range(min(role_parallelism, len(queue))):
                             submit_next()
@@ -6086,6 +6133,7 @@ class AgentFeedbackOrchestrator:
                             for future in done:
                                 slot, batch = future_map.pop(future)
                                 started_at = future_started_at.pop(future, now_monotonic)
+                                completed_at: float | None = None
                                 should_submit_next = False
                                 staged_batch_outcomes = False
                                 try:
@@ -6100,7 +6148,18 @@ class AgentFeedbackOrchestrator:
                                                 'elapsed_seconds': round(now_monotonic - started_at, 3),
                                             },
                                         )
-                                    batch_result = future.result()
+                                    raw_future_result = future.result()
+                                    if (
+                                        isinstance(raw_future_result, tuple)
+                                        and len(raw_future_result) == 2
+                                        and isinstance(raw_future_result[0], dict)
+                                        and isinstance(raw_future_result[1], (int, float))
+                                        and not isinstance(raw_future_result[1], bool)
+                                    ):
+                                        batch_result = raw_future_result[0]
+                                        completed_at = float(raw_future_result[1])
+                                    else:
+                                        batch_result = raw_future_result
                                     decoded_items = batch_result.get('decoded', {}).get('items', [])
                                     by_symbol = {
                                         str(item['symbol']).strip().upper(): item
@@ -6193,27 +6252,55 @@ class AgentFeedbackOrchestrator:
                                         and role in DECISION_SUPPORT_AGENT_NAMES
                                         and staged_feedback
                                     ):
-                                        input_generation_failures = (
-                                            self._revalidate_decider_dispatch_inputs(
-                                                market_date=normalized_market_date,
-                                                request_run_id=request_run_id,
-                                                source_items=[
-                                                    source_item
-                                                    for source_item, _, _ in staged_feedback
-                                                ],
-                                                source_context_scope_symbols=(
-                                                    source_context_scope_symbols_for_revalidation
+                                        can_reuse_input_revalidation = (
+                                            _can_reuse_decider_input_revalidation(
+                                                snapshot=(
+                                                    input_revalidation_snapshot
                                                 ),
-                                                eligibility_scope_symbols=(
-                                                    eligibility_scope_symbols_for_revalidation
+                                                dispatch_started_monotonic=(
+                                                    started_at
                                                 ),
-                                                fs_div=fs_div,
-                                                disclosures_limit=disclosures_limit,
-                                                source_knowledge_cutoff_at=(
-                                                    source_knowledge_cutoff_at
+                                                dispatch_completed_monotonic=(
+                                                    completed_at
                                                 ),
                                             )
                                         )
+                                        if can_reuse_input_revalidation:
+                                            input_generation_failures = dict(
+                                                input_revalidation_snapshot[
+                                                    'failures'
+                                                ]
+                                            )
+                                        else:
+                                            validation_started_monotonic = (
+                                                time.monotonic()
+                                            )
+                                            input_generation_failures = (
+                                                self._revalidate_decider_dispatch_inputs(
+                                                    market_date=normalized_market_date,
+                                                    request_run_id=request_run_id,
+                                                    source_items=dispatch_items,
+                                                    source_context_scope_symbols=(
+                                                        source_context_scope_symbols_for_revalidation
+                                                    ),
+                                                    eligibility_scope_symbols=(
+                                                        eligibility_scope_symbols_for_revalidation
+                                                    ),
+                                                    fs_div=fs_div,
+                                                    disclosures_limit=disclosures_limit,
+                                                    source_knowledge_cutoff_at=(
+                                                        source_knowledge_cutoff_at
+                                                    ),
+                                                )
+                                            )
+                                            input_revalidation_snapshot = {
+                                                'validation_started_monotonic': (
+                                                    validation_started_monotonic
+                                                ),
+                                                'failures': dict(
+                                                    input_generation_failures
+                                                ),
+                                            }
 
                                     if contract_failure is not None:
                                         failure_class = (

@@ -2731,6 +2731,21 @@ class SignalDeciderBatchClient:
         }, expected_symbols=[item['symbol'] for item in batch_items])
 
 
+class ConcurrentCompletedSignalDeciderBatchClient(SignalDeciderBatchClient):
+    def __init__(self):
+        super().__init__()
+        self._decider_completion_barrier = threading.Barrier(2)
+
+    def dispatch_batch(self, **kwargs):
+        result = super().dispatch_batch(**kwargs)
+        if kwargs['spec'].role != 'short-term-decider':
+            return result
+        self._decider_completion_barrier.wait(timeout=5)
+        result['completed_at'] = datetime.now(timezone.utc).isoformat()
+        self._decider_completion_barrier.wait(timeout=5)
+        return result
+
+
 class FailingSignalDeciderBatchClient(SignalDeciderBatchClient):
     def dispatch_batch(self, **kwargs):
         spec = kwargs['spec']
@@ -3133,6 +3148,48 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             orchestrator_module.DEFAULT_OPENCLAW_AGENT_TIMEOUT_SECONDS,
         )
         self.assertEqual(client.http_timeout_seconds, client.timeout_seconds)
+
+    def test_decider_revalidation_snapshot_reuse_requires_response_before_validation_start(self):
+        snapshot = {
+            'validation_started_monotonic': 20.0,
+            'failures': {},
+        }
+
+        self.assertTrue(
+            orchestrator_module._can_reuse_decider_input_revalidation(
+                snapshot=snapshot,
+                dispatch_started_monotonic=19.0,
+                dispatch_completed_monotonic=19.9,
+            )
+        )
+        self.assertFalse(
+            orchestrator_module._can_reuse_decider_input_revalidation(
+                snapshot=snapshot,
+                dispatch_started_monotonic=19.0,
+                dispatch_completed_monotonic=20.0,
+            )
+        )
+        self.assertFalse(
+            orchestrator_module._can_reuse_decider_input_revalidation(
+                snapshot=snapshot,
+                dispatch_started_monotonic=19.0,
+                dispatch_completed_monotonic=20.1,
+            )
+        )
+        self.assertFalse(
+            orchestrator_module._can_reuse_decider_input_revalidation(
+                snapshot=snapshot,
+                dispatch_started_monotonic=20.1,
+                dispatch_completed_monotonic=20.2,
+            )
+        )
+        self.assertFalse(
+            orchestrator_module._can_reuse_decider_input_revalidation(
+                snapshot=snapshot,
+                dispatch_started_monotonic=19.0,
+                dispatch_completed_monotonic=None,
+            )
+        )
 
     def test_single_dispatch_persists_pre_and_post_runtime_contract_drift_proof(self):
         http_calls: list[dict] = []
@@ -5953,9 +6010,20 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
     def test_chunked_decider_revalidation_preserves_original_source_and_eligibility_scope(self):
         service = AgentFeedbackOrchestrator()
-        client = SignalDeciderBatchClient()
+        client = ConcurrentCompletedSignalDeciderBatchClient()
         service.client = client
+        original_revalidate = service._revalidate_decider_dispatch_inputs
+        revalidation_calls = []
+
+        def recording_revalidate(**kwargs):
+            revalidation_calls.append(kwargs)
+            return original_revalidate(**kwargs)
+
+        service._revalidate_decider_dispatch_inputs = recording_revalidate
+        service._load_post_decision_material_context_failures = lambda **_: {}
         feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
         symbols = ['005930', '000660']
         roles = [
             'eod-summarizer',
@@ -5965,7 +6033,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         ]
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
-            openclaw_agent_parallel_subtasks=1,
+            openclaw_agent_parallel_subtasks=2,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -5995,21 +6063,50 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     ):
                         with patch.object(
                             orchestrator_module,
-                            'agent_feedback_session_cleanup_service',
-                            FakeSessionCleanupService(),
+                            'agent_context_feedback_failure_service',
+                            failure_service,
                         ):
                             with patch.object(
                                 orchestrator_module,
-                                'signal_decider_market_context_builder',
-                                market_context_builder,
+                                'agent_context_feedback_run_state_service',
+                                run_state_service,
                             ):
-                                with _patch_feedback_eligibility(*symbols):
-                                    result = service.dispatch_for_symbols(
-                                        market_date='2026-04-14',
-                                        symbols=symbols,
-                                        roles=roles,
-                                        reuse_existing=False,
-                                    )
+                                with patch.object(
+                                    orchestrator_module,
+                                    'agent_feedback_session_cleanup_service',
+                                    FakeSessionCleanupService(),
+                                ):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'signal_decider_market_context_builder',
+                                        market_context_builder,
+                                    ):
+                                        with patch.object(
+                                            orchestrator_module,
+                                            'resolve_external_news_knowledge_cutoff_for_symbols',
+                                            return_value=(
+                                                datetime(
+                                                    2026,
+                                                    4,
+                                                    14,
+                                                    8,
+                                                    tzinfo=timezone.utc,
+                                                ),
+                                                'explicit',
+                                            ),
+                                        ):
+                                            with patch.object(
+                                                orchestrator_module,
+                                                '_can_reuse_decider_input_revalidation',
+                                                side_effect=lambda *, snapshot, **_: snapshot is not None,
+                                            ) as reuse_check:
+                                                with _patch_feedback_eligibility(*symbols):
+                                                    result = service.dispatch_for_symbols(
+                                                        market_date='2026-04-14',
+                                                        symbols=symbols,
+                                                        roles=roles,
+                                                        reuse_existing=False,
+                                                    )
 
         decider_calls = [
             call
@@ -6022,6 +6119,20 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(
             [[item['symbol'] for item in call['batch_items']] for call in decider_calls],
             [['005930'], ['000660']],
+        )
+        response_revalidation_calls = [
+            call
+            for call in revalidation_calls
+            if not call.get('revalidate_post_decision_material_context')
+        ]
+        self.assertEqual(reuse_check.call_count, 2)
+        self.assertEqual(len(response_revalidation_calls), 1)
+        self.assertEqual(
+            sorted(
+                str(item['symbol'])
+                for item in response_revalidation_calls[0]['source_items']
+            ),
+            sorted(symbols),
         )
 
     def test_precomputed_auto_scope_revalidation_preserves_missing_eligibility_context(self):
