@@ -38,6 +38,7 @@ TERMINAL_DAILY_PIPELINE_STATUSES = {
     'skipped',
 }
 SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS = 5 * 60 * 1000
+TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT = 6
 
 
 def _utcnow() -> datetime:
@@ -74,6 +75,31 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value if value is not None else default)
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_terminal_summary_knowledge_cutoff(
+    *,
+    market_date: date,
+    source_run_id: str,
+    requested_symbols: Sequence[str],
+) -> dict[str, Any]:
+    """Resolve immutable summary proof before spending the one-shot claim."""
+
+    from app.agent_context.retry_service import (
+        resolve_latest_completed_summary_knowledge_cutoff,
+    )
+    from app.agent_context.run_modes import (
+        FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    )
+
+    return resolve_latest_completed_summary_knowledge_cutoff(
+        market_date=market_date,
+        feedback_scope_mode=(
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+        ),
+        source_run_id=source_run_id,
+        requested_symbols=requested_symbols,
+    )
 
 
 def _build_counts(
@@ -682,6 +708,728 @@ class DailyPipelineRunStateService:
                 select(DailyPipelineRun.id).where(*filters)
             ).scalars()
             return sum(1 for _ in run_ids)
+
+    def claim_terminal_continuation(
+        self,
+        *,
+        pipeline_run_id: int,
+        market_date: str | date,
+        reused_eod_collection_run_id: int,
+        resume_from_stage: str = 'agent_feedback_summaries',
+        reason: str = 'summary_knowledge_cutoff_repair',
+    ) -> dict[str, Any]:
+        """Atomically claim the one safe terminal continuation shape.
+
+        This is deliberately narrower than a general-purpose retry. It only
+        reopens an automatic EOD follow-up whose summaries completed before a
+        decider-only missing-upstream failure, preserving the prior terminal
+        evidence before resetting the summary/decision suffix in place.
+        """
+
+        normalized_pipeline_run_id = int(pipeline_run_id)
+        normalized_eod_run_id = int(reused_eod_collection_run_id)
+        if normalized_pipeline_run_id <= 0:
+            raise ValueError('pipeline_run_id must be greater than zero')
+        if normalized_eod_run_id <= 0:
+            raise ValueError(
+                'reused_eod_collection_run_id must be greater than zero'
+            )
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_resume_stage = str(resume_from_stage or '').strip()
+        normalized_reason = str(reason or '').strip()
+
+        def reject(rejection_reason: str, **extra: Any) -> dict[str, Any]:
+            return {
+                'claimed': False,
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'reason': rejection_reason,
+                **extra,
+            }
+
+        if normalized_resume_stage != 'agent_feedback_summaries':
+            return reject('unsupported_terminal_continuation_stage')
+        if normalized_reason != 'summary_knowledge_cutoff_repair':
+            return reject('unsupported_terminal_continuation_reason')
+
+        continuation_suffix = (
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        )
+        now = _utcnow()
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
+        ) as session:
+            # Use the same market-date admission fence as start_run so a new
+            # run cannot race this in-place terminal continuation claim.
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                {
+                    'source_key': 20_001,
+                    'trade_key': int(
+                        normalized_market_date.strftime('%Y%m%d')
+                    ),
+                },
+            )
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == normalized_pipeline_run_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if run_row is None:
+                return reject('pipeline_run_not_found')
+
+            current_status = str(run_row.status or '').strip().lower()
+            if run_row.market_date != normalized_market_date:
+                return reject(
+                    'market_date_mismatch',
+                    status=current_status,
+                )
+            if str(run_row.trigger or '').strip() != 'auto_eod_followup_resume':
+                return reject(
+                    'trigger_mismatch',
+                    status=current_status,
+                )
+            if current_status != 'blocked':
+                return reject(
+                    'run_not_eligible_terminal_block',
+                    status=current_status,
+                )
+            if (
+                str(run_row.current_stage or '').strip()
+                != 'signal_decider_evaluations'
+            ):
+                return reject(
+                    'terminal_stage_mismatch',
+                    status=current_status,
+                )
+
+            metadata = (
+                dict(run_row.run_metadata)
+                if isinstance(run_row.run_metadata, Mapping)
+                else {}
+            )
+            continuation_marker_keys = {
+                'terminal_continuation_count',
+                'terminal_continuation_version',
+                'terminal_continuation_claimed_at',
+                'terminal_continuation_reason',
+                'terminal_continuation_evidence',
+            }
+            if continuation_marker_keys.intersection(metadata):
+                return reject(
+                    'terminal_continuation_already_claimed',
+                    status=current_status,
+                )
+            if (
+                str(metadata.get('entrypoint') or '').strip()
+                != 'daily_pipeline_stage_service.run'
+            ):
+                return reject(
+                    'entrypoint_mismatch',
+                    status=current_status,
+                )
+            if (
+                _as_int(metadata.get('reused_eod_collection_run_id'))
+                != normalized_eod_run_id
+            ):
+                return reject(
+                    'eod_lineage_mismatch',
+                    status=current_status,
+                )
+
+            raw_symbols = metadata.get('symbols')
+            if not isinstance(raw_symbols, list) or not all(
+                isinstance(symbol, str) and symbol.strip()
+                for symbol in raw_symbols
+            ) or not raw_symbols:
+                return reject(
+                    'terminal_continuation_execution_context_invalid',
+                    status=current_status,
+                    field='symbols',
+                )
+            raw_markets = metadata.get('markets')
+            if not isinstance(raw_markets, list) or not all(
+                isinstance(market, str) and market.strip()
+                for market in raw_markets
+            ) or not raw_markets:
+                return reject(
+                    'terminal_continuation_execution_context_invalid',
+                    status=current_status,
+                    field='markets',
+                )
+            if not str(metadata.get('fs_div') or '').strip():
+                return reject(
+                    'terminal_continuation_execution_context_invalid',
+                    status=current_status,
+                    field='fs_div',
+                )
+            for boolean_field in (
+                'force',
+                'bypass_prerequisite_gate',
+                'reuse_existing_feedback',
+                'point_in_time_recovery',
+            ):
+                if not isinstance(metadata.get(boolean_field), bool):
+                    return reject(
+                        'terminal_continuation_execution_context_invalid',
+                        status=current_status,
+                        field=boolean_field,
+                    )
+
+            integer_constraints = {
+                'symbol_limit': (1, True),
+                'symbol_offset': (0, False),
+                'capture_limit': (1, False),
+                'retry_cycles': (1, True),
+                'feedback_max_cycles': (1, True),
+                'feedback_outer_batch_size': (1, True),
+            }
+            for integer_field, (
+                minimum,
+                optional,
+            ) in integer_constraints.items():
+                raw_value = metadata.get(integer_field)
+                if raw_value is None:
+                    if optional or integer_field not in metadata:
+                        continue
+                    return reject(
+                        'terminal_continuation_execution_context_invalid',
+                        status=current_status,
+                        field=integer_field,
+                    )
+                if isinstance(raw_value, bool):
+                    return reject(
+                        'terminal_continuation_execution_context_invalid',
+                        status=current_status,
+                        field=integer_field,
+                    )
+                try:
+                    parsed_value = int(raw_value)
+                except (TypeError, ValueError):
+                    return reject(
+                        'terminal_continuation_execution_context_invalid',
+                        status=current_status,
+                        field=integer_field,
+                    )
+                if parsed_value < minimum:
+                    return reject(
+                        'terminal_continuation_execution_context_invalid',
+                        status=current_status,
+                        field=integer_field,
+                    )
+
+            eod_run = session.get(EODCollectionRun, normalized_eod_run_id)
+            if eod_run is None:
+                return reject(
+                    'eod_lineage_not_found',
+                    status=current_status,
+                )
+            if (
+                str(eod_run.market or '').strip().upper() != 'KRX'
+                or str(eod_run.source or '').strip().lower() != 'pykrx'
+                or eod_run.trade_date != normalized_market_date
+            ):
+                return reject(
+                    'eod_lineage_context_mismatch',
+                    status=current_status,
+                )
+
+            lineage_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.trigger
+                        == 'auto_eod_followup_resume',
+                        DailyPipelineRun.run_metadata[
+                            'reused_eod_collection_run_id'
+                        ].as_integer()
+                        == normalized_eod_run_id,
+                    )
+                    .order_by(
+                        DailyPipelineRun.started_at.asc(),
+                        DailyPipelineRun.id.asc(),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            lineage_run_ids = [int(item.id) for item in lineage_rows]
+            lineage_run_count = len(lineage_run_ids)
+            if (
+                lineage_run_count
+                != TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT
+            ):
+                return reject(
+                    'terminal_continuation_lineage_count_mismatch',
+                    status=current_status,
+                    expected_run_count=(
+                        TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT
+                    ),
+                    observed_run_count=lineage_run_count,
+                )
+            target_positions = [
+                index + 1
+                for index, run_id in enumerate(lineage_run_ids)
+                if run_id == normalized_pipeline_run_id
+            ]
+            if (
+                target_positions
+                != [TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT]
+                or lineage_run_ids[-1] != normalized_pipeline_run_id
+            ):
+                return reject(
+                    'terminal_continuation_target_not_sixth_latest',
+                    status=current_status,
+                    target_ordinal=(
+                        target_positions[0] if len(target_positions) == 1 else None
+                    ),
+                    latest_pipeline_run_id=lineage_run_ids[-1],
+                )
+
+            lineage_evidence: dict[str, Any] = {
+                'reused_eod_collection_run_id': normalized_eod_run_id,
+                'expected_run_count': (
+                    TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT
+                ),
+                'observed_run_count': lineage_run_count,
+                'ordered_pipeline_run_ids': lineage_run_ids,
+                'target_ordinal': target_positions[0],
+                'latest_pipeline_run_id': lineage_run_ids[-1],
+            }
+            raw_repair_checkpoint_run_id = metadata.get(
+                'repair_checkpoint_pipeline_run_id'
+            )
+            if raw_repair_checkpoint_run_id is not None:
+                repair_checkpoint_run_id = _as_int(
+                    raw_repair_checkpoint_run_id
+                )
+                if repair_checkpoint_run_id <= 0:
+                    return reject(
+                        'repair_checkpoint_provenance_invalid',
+                        status=current_status,
+                    )
+                lineage_evidence['repair_checkpoint_pipeline_run_id'] = (
+                    repair_checkpoint_run_id
+                )
+
+            active_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.status.in_(
+                            ACTIVE_DAILY_PIPELINE_STATUSES
+                        ),
+                        DailyPipelineRun.id != normalized_pipeline_run_id,
+                    )
+                    .order_by(
+                        DailyPipelineRun.started_at.desc(),
+                        DailyPipelineRun.id.desc(),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            if active_rows:
+                return reject(
+                    'overlapping_run_already_active',
+                    status=current_status,
+                    active_pipeline_run_ids=[
+                        int(active_row.id) for active_row in active_rows
+                    ],
+                )
+
+            raw_resolved_stages = metadata.get('resolved_stages')
+            if (
+                not isinstance(raw_resolved_stages, list)
+                or any(
+                    not isinstance(stage_id, str) or not stage_id.strip()
+                    for stage_id in raw_resolved_stages
+                )
+            ):
+                return reject(
+                    'resolved_stages_unavailable',
+                    status=current_status,
+                )
+            resolved_stages = [
+                str(stage_id).strip() for stage_id in raw_resolved_stages
+            ]
+            if (
+                len(resolved_stages) != len(set(resolved_stages))
+                or tuple(resolved_stages[-len(continuation_suffix) :])
+                != continuation_suffix
+            ):
+                return reject(
+                    'terminal_continuation_suffix_mismatch',
+                    status=current_status,
+                )
+
+            stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == normalized_pipeline_run_id
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            stage_rows_by_id: dict[str, DailyPipelineStageRun] = {}
+            for stage_row in stage_rows:
+                stage_id = str(stage_row.stage_id or '').strip()
+                if stage_id in stage_rows_by_id:
+                    return reject(
+                        'duplicate_stage_rows',
+                        status=current_status,
+                        duplicate_stage_id=stage_id,
+                    )
+                stage_rows_by_id[stage_id] = stage_row
+            if set(stage_rows_by_id) != set(resolved_stages):
+                return reject(
+                    'resolved_stage_rows_mismatch',
+                    status=current_status,
+                    missing_stage_ids=[
+                        stage_id
+                        for stage_id in resolved_stages
+                        if stage_id not in stage_rows_by_id
+                    ],
+                    unexpected_stage_ids=sorted(
+                        set(stage_rows_by_id).difference(resolved_stages)
+                    ),
+                )
+
+            prior_stage_statuses = metadata.get('stage_statuses')
+            if not isinstance(prior_stage_statuses, Mapping) or any(
+                str(prior_stage_statuses.get(stage_id) or '')
+                .strip()
+                .lower()
+                != str(stage_rows_by_id[stage_id].status or '')
+                .strip()
+                .lower()
+                for stage_id in resolved_stages
+            ):
+                return reject(
+                    'stage_status_evidence_mismatch',
+                    status=current_status,
+                )
+
+            resume_index = resolved_stages.index(normalized_resume_stage)
+            incomplete_prefix_stages = [
+                stage_id
+                for stage_id in resolved_stages[:resume_index]
+                if not daily_pipeline_outcome_is_satisfied(
+                    _stage_row_outcome(stage_rows_by_id[stage_id])
+                )
+            ]
+            if incomplete_prefix_stages:
+                return reject(
+                    'prefix_stages_not_satisfied',
+                    status=current_status,
+                    incomplete_stage_ids=incomplete_prefix_stages,
+                )
+
+            summary_stage = stage_rows_by_id['agent_feedback_summaries']
+            if (
+                str(summary_stage.status or '').strip().lower()
+                != 'completed'
+                or not daily_pipeline_outcome_is_satisfied(
+                    _stage_row_outcome(summary_stage)
+                )
+            ):
+                return reject(
+                    'summary_stage_not_completed',
+                    status=current_status,
+                )
+            summary_source_run_ids = (
+                summary_stage.source_run_ids
+                if isinstance(summary_stage.source_run_ids, Mapping)
+                else {}
+            )
+            summary_source_ids = {
+                str(summary_source_run_ids.get(key) or '').strip()
+                for key in ('agent_feedback_run_id', 'run_id')
+                if str(summary_source_run_ids.get(key) or '').strip()
+            }
+            if len(summary_source_ids) != 1:
+                return reject(
+                    'summary_source_run_id_unavailable',
+                    status=current_status,
+                )
+
+            decider_stage = stage_rows_by_id['signal_decider']
+            decider_details = (
+                decider_stage.details
+                if isinstance(decider_stage.details, Mapping)
+                else {}
+            )
+            decider_result = (
+                decider_details.get('result_summary')
+                if isinstance(
+                    decider_details.get('result_summary'), Mapping
+                )
+                else {}
+            )
+            decider_progress = (
+                decider_result.get('progress')
+                if isinstance(decider_result.get('progress'), Mapping)
+                else {}
+            )
+            decider_summary = (
+                decider_progress.get('summary')
+                if isinstance(decider_progress.get('summary'), Mapping)
+                else {}
+            )
+            failure_groups = decider_summary.get('failure_groups')
+            missing_upstream_group = (
+                failure_groups.get('dependency/missing-upstream')
+                if isinstance(failure_groups, Mapping)
+                and len(failure_groups) == 1
+                and isinstance(
+                    failure_groups.get('dependency/missing-upstream'),
+                    Mapping,
+                )
+                else {}
+            )
+            failure_count = _as_int(missing_upstream_group.get('count'))
+            retryable_count = _as_int(
+                missing_upstream_group.get('retryable_count')
+            )
+            failure_kinds = missing_upstream_group.get('failure_kinds')
+            decider_failure_is_safe = bool(
+                str(decider_stage.status or '').strip().lower() == 'failed'
+                and str(decider_result.get('status') or '')
+                .strip()
+                .lower()
+                == 'failed'
+                and isinstance(failure_groups, Mapping)
+                and len(failure_groups) == 1
+                and str(
+                    missing_upstream_group.get('failure_status') or ''
+                )
+                .strip()
+                .lower()
+                == 'dependency/missing-upstream'
+                and str(
+                    missing_upstream_group.get('failure_category') or ''
+                )
+                .strip()
+                .lower()
+                == 'dependency'
+                and failure_count > 0
+                and retryable_count == failure_count
+                and _as_int(decider_summary.get('failed_items'))
+                == failure_count
+                and isinstance(failure_kinds, list)
+                and failure_kinds == ['dependency_missing_upstream']
+            )
+            if not decider_failure_is_safe:
+                return reject(
+                    'signal_decider_failure_not_retryable_missing_upstream_only',
+                    status=current_status,
+                )
+
+            next_open_stage = stage_rows_by_id[
+                'next_open_execution_plan'
+            ]
+            next_open_details = (
+                next_open_stage.details
+                if isinstance(next_open_stage.details, Mapping)
+                else {}
+            )
+            next_open_result = (
+                next_open_details.get('result_summary')
+                if isinstance(
+                    next_open_details.get('result_summary'), Mapping
+                )
+                else {}
+            )
+            if not (
+                str(next_open_stage.status or '').strip().lower()
+                == 'blocked'
+                and str(next_open_result.get('status') or '')
+                .strip()
+                .lower()
+                == 'blocked'
+                and next_open_result.get('triggered') is False
+                and str(next_open_result.get('reason') or '').strip()
+                == 'signal_decider_stage_incomplete'
+                and str(next_open_result.get('upstream_status') or '')
+                .strip()
+                .lower()
+                == 'failed'
+            ):
+                return reject(
+                    'next_open_block_reason_mismatch',
+                    status=current_status,
+                )
+
+            evaluation_stage = stage_rows_by_id[
+                'signal_decider_evaluations'
+            ]
+            evaluation_details = (
+                evaluation_stage.details
+                if isinstance(evaluation_stage.details, Mapping)
+                else {}
+            )
+            evaluation_result = (
+                evaluation_details.get('result_summary')
+                if isinstance(
+                    evaluation_details.get('result_summary'), Mapping
+                )
+                else {}
+            )
+            if not (
+                str(evaluation_stage.status or '').strip().lower()
+                == 'blocked'
+                and str(evaluation_result.get('status') or '')
+                .strip()
+                .lower()
+                == 'blocked'
+                and evaluation_result.get('triggered') is False
+                and str(evaluation_result.get('reason') or '').strip()
+                == 'declared_dependencies_incomplete'
+                and evaluation_result.get('incomplete_dependencies')
+                == ['signal_decider']
+            ):
+                return reject(
+                    'evaluation_block_reason_mismatch',
+                    status=current_status,
+                )
+
+            summary_source_run_id = next(iter(summary_source_ids))
+            cutoff_resolution = (
+                _resolve_terminal_summary_knowledge_cutoff(
+                    market_date=normalized_market_date,
+                    source_run_id=summary_source_run_id,
+                    requested_symbols=raw_symbols,
+                )
+            )
+            compact_cutoff_resolution = {
+                'ready': bool(cutoff_resolution.get('ready')),
+                'reason': cutoff_resolution.get('reason'),
+                'knowledge_cutoff_at': cutoff_resolution.get(
+                    'knowledge_cutoff_at'
+                ),
+                'source_run_id': cutoff_resolution.get('source_run_id'),
+                'feedback_scope_mode': cutoff_resolution.get(
+                    'feedback_scope_mode'
+                ),
+            }
+            if not compact_cutoff_resolution['ready']:
+                return reject(
+                    'summary_knowledge_cutoff_unavailable',
+                    status=current_status,
+                    knowledge_cutoff_resolution={
+                        key: value
+                        for key, value in (
+                            compact_cutoff_resolution.items()
+                        )
+                        if key != 'knowledge_cutoff_at'
+                    },
+                )
+            if (
+                compact_cutoff_resolution['source_run_id']
+                != summary_source_run_id
+                or compact_cutoff_resolution['knowledge_cutoff_at'] is None
+            ):
+                return reject(
+                    'summary_knowledge_cutoff_proof_mismatch',
+                    status=current_status,
+                )
+            summary_proof = {
+                **compact_cutoff_resolution,
+                'knowledge_cutoff_at': _iso(
+                    compact_cutoff_resolution['knowledge_cutoff_at']
+                ),
+                'requested_symbol_count': len(raw_symbols),
+            }
+
+            suffix_stage_evidence = {
+                stage_id: self._serialize_stage(
+                    stage_rows_by_id[stage_id]
+                )
+                for stage_id in continuation_suffix
+            }
+            prior_resume_from_stage = metadata.get('resume_from_stage')
+            metadata.update(
+                {
+                    'resume_from_stage': normalized_resume_stage,
+                    'terminal_continuation_count': 1,
+                    'terminal_continuation_version': 1,
+                    'terminal_continuation_claimed_at': now.isoformat(),
+                    'terminal_continuation_reason': normalized_reason,
+                    'terminal_continuation_evidence': {
+                        'parent': {
+                            'status': current_status,
+                            'current_stage': run_row.current_stage,
+                            'started_at': _iso(run_row.started_at),
+                            'updated_at': _iso(run_row.updated_at),
+                            'completed_at': _iso(run_row.completed_at),
+                            'error_message': run_row.error_message,
+                            'resume_from_stage': prior_resume_from_stage,
+                            'stage_statuses': dict(
+                                prior_stage_statuses
+                            ),
+                        },
+                        'suffix_stages': suffix_stage_evidence,
+                        'lineage': lineage_evidence,
+                        'summary_proof': summary_proof,
+                    },
+                }
+            )
+            resumed_stage_statuses = dict(prior_stage_statuses)
+            resumed_stage_statuses.update(
+                {stage_id: 'pending' for stage_id in continuation_suffix}
+            )
+            metadata['stage_statuses'] = resumed_stage_statuses
+
+            for stage_id in continuation_suffix:
+                stage_row = stage_rows_by_id[stage_id]
+                stage_row.status = 'pending'
+                stage_row.processed = 0
+                stage_row.total = 0
+                stage_row.succeeded = 0
+                stage_row.failed = 0
+                stage_row.remaining = 0
+                stage_row.current_step = 'terminal_continuation_pending'
+                stage_row.current_activity = (
+                    'Pending terminal continuation from '
+                    f'{normalized_resume_stage}'
+                )
+                stage_row.current_symbol = None
+                stage_row.current_period = None
+                stage_row.started_at = now
+                stage_row.updated_at = now
+                stage_row.completed_at = None
+                stage_row.error_message = None
+                stage_row.source_run_ids = {}
+                stage_row.details = {}
+
+            run_row.status = 'running'
+            run_row.current_stage = normalized_resume_stage
+            run_row.updated_at = now
+            run_row.completed_at = None
+            run_row.error_message = None
+            run_row.run_metadata = metadata
+            session.flush()
+
+            pipeline_run = self._serialize_run(
+                run_row,
+                [stage_rows_by_id[stage_id] for stage_id in resolved_stages],
+            )
+            return {
+                'claimed': True,
+                'reason': normalized_reason,
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'pipeline_run': pipeline_run,
+                'knowledge_cutoff_resolution': (
+                    compact_cutoff_resolution
+                ),
+            }
 
     def converge_terminal_stages_run(
         self,

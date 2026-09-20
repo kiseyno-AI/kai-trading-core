@@ -6,7 +6,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
 from app.agent_context.derived_contexts import daily_price_context_service
-from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
+from app.agent_context.retry_service import (
+    FeedbackRetryCycleConfig,
+    agent_feedback_retry_service,
+    resolve_latest_completed_summary_knowledge_cutoff,
+)
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import (
@@ -124,6 +128,14 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'next_open_execution_plan',
     'signal_decider_evaluations',
 )
+TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER: tuple[str, ...] = (
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+    'signal_decider_evaluations',
+)
+DEFAULT_FEEDBACK_MAX_CYCLES = 3
+DEFAULT_FEEDBACK_OUTER_BATCH_SIZE = 20
 
 @dataclass(frozen=True)
 class DailyStageDefinition:
@@ -545,13 +557,16 @@ class DailyPipelineStageService:
         symbol_offset: int = 0,
         capture_limit: int = 500,
         retry_cycles: int | None = None,
-        feedback_max_cycles: int = 3,
-        feedback_outer_batch_size: int = 20,
+        feedback_max_cycles: int = DEFAULT_FEEDBACK_MAX_CYCLES,
+        feedback_outer_batch_size: int = (
+            DEFAULT_FEEDBACK_OUTER_BATCH_SIZE
+        ),
         reuse_existing_feedback: bool = True,
         resume_from_stage: str | None = None,
         trigger: str = 'stage_orchestrator',
         reused_eod_collection_run_id: int | None = None,
         point_in_time_recovery: bool = False,
+        existing_pipeline_run_id: int | None = None,
     ) -> dict[str, Any]:
         validated_request = self.validate_run_request(
             market_date=market_date,
@@ -577,35 +592,160 @@ class DailyPipelineStageService:
         resolved_symbols = self._normalize_symbols(symbols)
         resolved_markets = self._normalize_markets(markets)
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
+        feedback_knowledge_cutoff_at: datetime | None = None
+        feedback_cutoff_resolution: dict[str, Any] | None = None
+        terminal_summary_source_run_id: str | None = None
 
         stage_outcomes: dict[str, dict[str, Any]] = {}
         handled: set[str] = set()
-        pipeline_run = self.run_state_service.start_run(
-            market_date=resolved_market_date,
-            trigger=trigger,
-            requested_stages=requested_stages,
-            resolved_stages=resolved_stages,
-            run_metadata={
-                'entrypoint': 'daily_pipeline_stage_service.run',
-                'resume_from_stage': resume_from_stage,
-                'symbols': resolved_symbols,
-                'markets': resolved_markets,
-                'force': force,
-                'fs_div': resolved_fs_div,
-                'symbol_limit': symbol_limit,
-                'symbol_offset': symbol_offset,
-                'capture_limit': capture_limit,
-                'reuse_existing_feedback': reuse_existing_feedback,
-                'feedback_force_recompute': bool(force and not reuse_existing_feedback),
-                'bypass_prerequisite_gate': bypass_prerequisite_gate,
-                'reused_eod_collection_run_id': (
-                    int(reused_eod_collection_run_id)
-                    if reused_eod_collection_run_id is not None
-                    else None
-                ),
-                'point_in_time_recovery': point_in_time_recovery,
-            },
-        )
+        if existing_pipeline_run_id is not None:
+            if trigger != 'auto_eod_followup_resume':
+                raise ValueError(
+                    'existing_pipeline_run_id is restricted to auto EOD follow-up recovery'
+                )
+            if reused_eod_collection_run_id is None:
+                raise ValueError(
+                    'reused_eod_collection_run_id is required for terminal continuation'
+                )
+            if tuple(resolved_stages) != TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER:
+                raise ValueError(
+                    'terminal continuation must run the exact feedback suffix'
+                )
+            continuation_claim = (
+                self.run_state_service.claim_terminal_continuation(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    market_date=resolved_market_date,
+                    reused_eod_collection_run_id=int(
+                        reused_eod_collection_run_id
+                    ),
+                    resume_from_stage='agent_feedback_summaries',
+                    reason='summary_knowledge_cutoff_repair',
+                )
+            )
+            if not continuation_claim.get('claimed'):
+                return {
+                    'triggered': False,
+                    'reason': (
+                        continuation_claim.get('reason')
+                        or 'terminal_continuation_not_claimed'
+                    ),
+                    'pipeline_run_id': int(existing_pipeline_run_id),
+                    'pipeline_run': continuation_claim.get('pipeline_run'),
+                    'market_date': resolved_market_date,
+                    'requested_stages': requested_stages,
+                    'resolved_stages': resolved_stages,
+                    'status': 'blocked',
+                    'stages': {},
+                    'knowledge_cutoff_resolution': (
+                        continuation_claim.get(
+                            'knowledge_cutoff_resolution'
+                        )
+                    ),
+                }
+            pipeline_run = continuation_claim.get('pipeline_run')
+            if not isinstance(pipeline_run, dict):
+                raise RuntimeError(
+                    'terminal continuation claim did not return pipeline state'
+                )
+            try:
+                continuation_context = (
+                    self._terminal_continuation_execution_context(
+                        pipeline_run
+                    )
+                )
+            except Exception as exc:
+                self.run_state_service.finish_run(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    status='failed',
+                    error_message=str(exc),
+                )
+                raise
+            resolved_symbols = continuation_context['symbols']
+            resolved_markets = continuation_context['markets']
+            force = continuation_context['force']
+            bypass_prerequisite_gate = continuation_context[
+                'bypass_prerequisite_gate'
+            ]
+            resolved_fs_div = continuation_context['fs_div']
+            symbol_limit = continuation_context['symbol_limit']
+            symbol_offset = continuation_context['symbol_offset']
+            capture_limit = continuation_context['capture_limit']
+            retry_cycles = continuation_context['retry_cycles']
+            feedback_max_cycles = continuation_context[
+                'feedback_max_cycles'
+            ]
+            feedback_outer_batch_size = continuation_context[
+                'feedback_outer_batch_size'
+            ]
+            reuse_existing_feedback = continuation_context[
+                'reuse_existing_feedback'
+            ]
+            point_in_time_recovery = continuation_context[
+                'point_in_time_recovery'
+            ]
+            terminal_summary_source_run_id = continuation_context[
+                'summary_source_run_id'
+            ]
+            feedback_cutoff_resolution = continuation_claim.get(
+                'knowledge_cutoff_resolution'
+            )
+            if not (
+                isinstance(feedback_cutoff_resolution, dict)
+                and feedback_cutoff_resolution.get('ready')
+                and feedback_cutoff_resolution.get(
+                    'knowledge_cutoff_at'
+                )
+                is not None
+                and feedback_cutoff_resolution.get('source_run_id')
+                == terminal_summary_source_run_id
+            ):
+                self.run_state_service.finish_run(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    status='failed',
+                    error_message=(
+                        'terminal continuation claim returned invalid '
+                        'summary cutoff proof'
+                    ),
+                )
+                raise RuntimeError(
+                    'terminal continuation claim returned invalid '
+                    'summary cutoff proof'
+                )
+            feedback_knowledge_cutoff_at = (
+                feedback_cutoff_resolution['knowledge_cutoff_at']
+            )
+        else:
+            pipeline_run = self.run_state_service.start_run(
+                market_date=resolved_market_date,
+                trigger=trigger,
+                requested_stages=requested_stages,
+                resolved_stages=resolved_stages,
+                run_metadata={
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'resume_from_stage': resume_from_stage,
+                    'symbols': resolved_symbols,
+                    'markets': resolved_markets,
+                    'force': force,
+                    'fs_div': resolved_fs_div,
+                    'symbol_limit': symbol_limit,
+                    'symbol_offset': symbol_offset,
+                    'capture_limit': capture_limit,
+                    'retry_cycles': retry_cycles,
+                    'feedback_max_cycles': feedback_max_cycles,
+                    'feedback_outer_batch_size': (
+                        feedback_outer_batch_size
+                    ),
+                    'reuse_existing_feedback': reuse_existing_feedback,
+                    'feedback_force_recompute': bool(force and not reuse_existing_feedback),
+                    'bypass_prerequisite_gate': bypass_prerequisite_gate,
+                    'reused_eod_collection_run_id': (
+                        int(reused_eod_collection_run_id)
+                        if reused_eod_collection_run_id is not None
+                        else None
+                    ),
+                    'point_in_time_recovery': point_in_time_recovery,
+                },
+            )
         pipeline_run_id = int(pipeline_run['id'])
         if pipeline_run.get('deduplicated'):
             return {
@@ -717,29 +857,109 @@ class DailyPipelineStageService:
                     )
                     continue
             try:
-                stage_result = self._execute_stage(
-                    stage_id,
-                    market_date=resolved_market_date,
-                    symbols=resolved_symbols,
-                    markets=resolved_markets,
-                    force=force,
-                    bypass_prerequisite_gate=bypass_prerequisite_gate,
-                    fs_div=resolved_fs_div,
-                    symbol_limit=symbol_limit,
-                    symbol_offset=symbol_offset,
-                    capture_limit=capture_limit,
-                    retry_cycles=retry_cycles,
-                    feedback_max_cycles=feedback_max_cycles,
-                    feedback_outer_batch_size=feedback_outer_batch_size,
-                    reuse_existing_feedback=reuse_existing_feedback,
-                    point_in_time_recovery=point_in_time_recovery,
-                    run_id=reused_eod_collection_run_id,
-                    progress_callback=self._build_progress_callback(
-                        pipeline_run_id=pipeline_run_id,
-                        stage_id=stage_id,
+                if stage_id in {
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                } and feedback_knowledge_cutoff_at is None:
+                    if (
+                        stage_id == 'agent_feedback_summaries'
+                        and existing_pipeline_run_id is None
+                    ):
+                        feedback_knowledge_cutoff_at = datetime.now(
+                            timezone.utc
+                        )
+                        feedback_cutoff_resolution = {
+                            'ready': True,
+                            'reason': 'current_pipeline_feedback_boundary',
+                            'knowledge_cutoff_at': (
+                                feedback_knowledge_cutoff_at
+                            ),
+                            'source_run_id': None,
+                            'feedback_scope_mode': (
+                                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+                            ),
+                        }
+                    else:
+                        feedback_cutoff_resolution = (
+                            resolve_latest_completed_summary_knowledge_cutoff(
+                                market_date=date.fromisoformat(
+                                    resolved_market_date
+                                ),
+                                feedback_scope_mode=(
+                                    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+                                ),
+                                source_run_id=(
+                                    terminal_summary_source_run_id
+                                ),
+                                requested_symbols=(
+                                    resolved_symbols
+                                    if terminal_summary_source_run_id
+                                    is not None
+                                    else None
+                                ),
+                            )
+                        )
+                        if feedback_cutoff_resolution.get('ready'):
+                            feedback_knowledge_cutoff_at = (
+                                feedback_cutoff_resolution.get(
+                                    'knowledge_cutoff_at'
+                                )
+                            )
+                if (
+                    stage_id == 'agent_feedback_summaries'
+                    and isinstance(feedback_cutoff_resolution, dict)
+                    and not feedback_cutoff_resolution.get('ready')
+                ):
+                    stage_result = {
+                        'triggered': False,
+                        'status': 'blocked',
+                        'reason': 'summary_knowledge_cutoff_unavailable',
+                        'market_date': resolved_market_date,
+                        'stage': stage_id,
+                        'knowledge_cutoff_resolution': {
+                            key: value
+                            for key, value in (
+                                feedback_cutoff_resolution.items()
+                            )
+                            if key != 'knowledge_cutoff_at'
+                        },
+                    }
+                else:
+                    stage_result = self._execute_stage(
+                        stage_id,
                         market_date=resolved_market_date,
-                    ),
-                )
+                        symbols=resolved_symbols,
+                        markets=resolved_markets,
+                        force=force,
+                        bypass_prerequisite_gate=(
+                            bypass_prerequisite_gate
+                        ),
+                        fs_div=resolved_fs_div,
+                        symbol_limit=symbol_limit,
+                        symbol_offset=symbol_offset,
+                        capture_limit=capture_limit,
+                        retry_cycles=retry_cycles,
+                        feedback_max_cycles=feedback_max_cycles,
+                        feedback_outer_batch_size=(
+                            feedback_outer_batch_size
+                        ),
+                        reuse_existing_feedback=(
+                            reuse_existing_feedback
+                        ),
+                        feedback_knowledge_cutoff_at=(
+                            feedback_knowledge_cutoff_at
+                        ),
+                        feedback_cutoff_resolution=(
+                            feedback_cutoff_resolution
+                        ),
+                        point_in_time_recovery=point_in_time_recovery,
+                        run_id=reused_eod_collection_run_id,
+                        progress_callback=self._build_progress_callback(
+                            pipeline_run_id=pipeline_run_id,
+                            stage_id=stage_id,
+                            market_date=resolved_market_date,
+                        ),
+                    )
                 stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
                 self._finish_tracked_stage(
                     pipeline_run_id=pipeline_run_id,
@@ -762,15 +982,42 @@ class DailyPipelineStageService:
                     pipeline_run_id=pipeline_run_id,
                     status='failed',
                     error_message=str(exc),
+                    run_metadata=self._feedback_cutoff_run_metadata(
+                        feedback_knowledge_cutoff_at,
+                        feedback_cutoff_resolution,
+                    ),
                 )
                 raise
 
-        overall_status = self._resolve_overall_status(stage_outcomes.values())
-        run_metadata = {
-            'stage_statuses': {
+        existing_run_metadata = (
+            pipeline_run.get('run_metadata')
+            if isinstance(pipeline_run.get('run_metadata'), dict)
+            else {}
+        )
+        existing_stage_statuses = (
+            existing_run_metadata.get('stage_statuses')
+            if isinstance(existing_run_metadata.get('stage_statuses'), dict)
+            else {}
+        )
+        merged_stage_statuses = {
+            **existing_stage_statuses,
+            **{
                 stage_id: outcome.get('status')
                 for stage_id, outcome in stage_outcomes.items()
             },
+        }
+        overall_status = self._resolve_overall_status(
+            [
+                {'status': stage_status}
+                for stage_status in merged_stage_statuses.values()
+            ]
+        )
+        run_metadata = {
+            'stage_statuses': merged_stage_statuses,
+            **self._feedback_cutoff_run_metadata(
+                feedback_knowledge_cutoff_at,
+                feedback_cutoff_resolution,
+            ),
         }
         if overall_status == 'partial' and all(
             daily_pipeline_outcome_is_satisfied(outcome)
@@ -791,6 +1038,43 @@ class DailyPipelineStageService:
             'resolved_stages': resolved_stages,
             'status': overall_status,
             'stages': stage_outcomes,
+        }
+
+    @staticmethod
+    def _feedback_cutoff_run_metadata(
+        knowledge_cutoff_at: datetime | None,
+        resolution: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if knowledge_cutoff_at is None and not isinstance(resolution, dict):
+            return {}
+        return {
+            'feedback_knowledge_cutoff': {
+                'knowledge_cutoff_at': (
+                    knowledge_cutoff_at.isoformat()
+                    if knowledge_cutoff_at is not None
+                    else None
+                ),
+                'ready': bool(
+                    resolution.get('ready')
+                    if isinstance(resolution, dict)
+                    else knowledge_cutoff_at is not None
+                ),
+                'reason': (
+                    resolution.get('reason')
+                    if isinstance(resolution, dict)
+                    else None
+                ),
+                'source_run_id': (
+                    resolution.get('source_run_id')
+                    if isinstance(resolution, dict)
+                    else None
+                ),
+                'feedback_scope_mode': (
+                    resolution.get('feedback_scope_mode')
+                    if isinstance(resolution, dict)
+                    else None
+                ),
+            },
         }
 
     def _start_tracked_stage(
@@ -1326,6 +1610,8 @@ class DailyPipelineStageService:
         feedback_max_cycles: int,
         feedback_outer_batch_size: int,
         reuse_existing_feedback: bool,
+        feedback_knowledge_cutoff_at: datetime | None = None,
+        feedback_cutoff_resolution: dict[str, Any] | None = None,
         point_in_time_recovery: bool = False,
         run_id: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
@@ -1555,6 +1841,27 @@ class DailyPipelineStageService:
                 if stage_id == 'agent_feedback_summaries'
                 else DECISION_SUPPORT_AGENT_NAMES
             )
+            if (
+                stage_id == 'signal_decider'
+                and isinstance(feedback_cutoff_resolution, dict)
+                and not feedback_cutoff_resolution.get('ready')
+            ):
+                return {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'summary_knowledge_cutoff_unavailable',
+                    'market_date': market_date,
+                    'stage': stage_id,
+                    'knowledge_cutoff_resolution': {
+                        key: value
+                        for key, value in feedback_cutoff_resolution.items()
+                        if key != 'knowledge_cutoff_at'
+                    },
+                }
+            resolved_feedback_cutoff = (
+                feedback_knowledge_cutoff_at
+                or datetime.now(timezone.utc)
+            )
             result = self.feedback_retry_service.run_retry_cycles(
                 config=FeedbackRetryCycleConfig(
                     market_date=date.fromisoformat(market_date),
@@ -1563,7 +1870,7 @@ class DailyPipelineStageService:
                     # A production retry of a completed source day must see
                     # information collected after that session close. The
                     # resolved instant remains fixed for every child cycle.
-                    knowledge_cutoff_at=datetime.now(timezone.utc),
+                    knowledge_cutoff_at=resolved_feedback_cutoff,
                     feedback_scope_mode=(
                         FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
                         if stage_id == 'agent_feedback_summaries'
@@ -1793,6 +2100,171 @@ class DailyPipelineStageService:
             return normalized or list(DEFAULT_MARKETS)
         configured = [item.strip().upper() for item in settings.eod_auto_pykrx_markets.split(',') if item.strip()]
         return configured or list(DEFAULT_MARKETS)
+
+    def _terminal_continuation_execution_context(
+        self,
+        pipeline_run: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Restore the immutable execution inputs of a claimed continuation.
+
+        The scheduler request is only a wake-up signal. Once the existing row
+        is claimed, every input that can change feedback scope or decisions is
+        recovered from that row instead of trusting current settings or caller
+        arguments. Legacy rows predate persisted retry tuning, so those two
+        values use the historical fixed defaults rather than caller input.
+        """
+
+        metadata = pipeline_run.get('run_metadata')
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                'terminal continuation run metadata is unavailable'
+            )
+
+        raw_symbols = metadata.get('symbols')
+        if not isinstance(raw_symbols, (list, tuple)):
+            raise RuntimeError(
+                'terminal continuation symbol scope is unavailable'
+            )
+        resolved_symbols = self._normalize_symbols(raw_symbols)
+        if not resolved_symbols:
+            raise RuntimeError(
+                'terminal continuation symbol scope is empty'
+            )
+
+        raw_markets = metadata.get('markets')
+        if not isinstance(raw_markets, (list, tuple)):
+            raise RuntimeError(
+                'terminal continuation market scope is unavailable'
+            )
+        resolved_markets = list(
+            dict.fromkeys(
+                str(market or '').strip().upper()
+                for market in raw_markets
+                if str(market or '').strip()
+            )
+        )
+        if not resolved_markets:
+            raise RuntimeError(
+                'terminal continuation market scope is empty'
+            )
+
+        resolved_fs_div = str(metadata.get('fs_div') or '').strip().upper()
+        if not resolved_fs_div:
+            raise RuntimeError(
+                'terminal continuation fs_div is unavailable'
+            )
+
+        def required_bool(key: str) -> bool:
+            value = metadata.get(key)
+            if not isinstance(value, bool):
+                raise RuntimeError(
+                    f'terminal continuation {key} is unavailable'
+                )
+            return value
+
+        def optional_int(
+            key: str,
+            *,
+            default: int | None,
+            minimum: int,
+        ) -> int | None:
+            value = metadata.get(key, default)
+            if value is None and default is None:
+                return None
+            if isinstance(value, bool):
+                raise RuntimeError(
+                    f'terminal continuation {key} is invalid'
+                )
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f'terminal continuation {key} is invalid'
+                ) from exc
+            if parsed < minimum:
+                raise RuntimeError(
+                    f'terminal continuation {key} is invalid'
+                )
+            return parsed
+
+        evidence = metadata.get('terminal_continuation_evidence')
+        suffix_stages = (
+            evidence.get('suffix_stages')
+            if isinstance(evidence, dict)
+            and isinstance(evidence.get('suffix_stages'), dict)
+            else {}
+        )
+        summary_evidence = (
+            suffix_stages.get('agent_feedback_summaries')
+            if isinstance(
+                suffix_stages.get('agent_feedback_summaries'),
+                dict,
+            )
+            else {}
+        )
+        source_run_ids = (
+            summary_evidence.get('source_run_ids')
+            if isinstance(summary_evidence.get('source_run_ids'), dict)
+            else {}
+        )
+        summary_source_run_ids = {
+            str(source_run_ids.get(key) or '').strip()
+            for key in ('agent_feedback_run_id', 'run_id')
+            if str(source_run_ids.get(key) or '').strip()
+        }
+        if len(summary_source_run_ids) != 1:
+            raise RuntimeError(
+                'terminal continuation summary source run is unavailable'
+            )
+
+        return {
+            'symbols': resolved_symbols,
+            'markets': resolved_markets,
+            'force': required_bool('force'),
+            'bypass_prerequisite_gate': required_bool(
+                'bypass_prerequisite_gate'
+            ),
+            'fs_div': resolved_fs_div,
+            'symbol_limit': optional_int(
+                'symbol_limit',
+                default=None,
+                minimum=1,
+            ),
+            'symbol_offset': optional_int(
+                'symbol_offset',
+                default=0,
+                minimum=0,
+            ),
+            'capture_limit': optional_int(
+                'capture_limit',
+                default=500,
+                minimum=1,
+            ),
+            'retry_cycles': optional_int(
+                'retry_cycles',
+                default=None,
+                minimum=1,
+            ),
+            'feedback_max_cycles': optional_int(
+                'feedback_max_cycles',
+                default=DEFAULT_FEEDBACK_MAX_CYCLES,
+                minimum=1,
+            ),
+            'feedback_outer_batch_size': optional_int(
+                'feedback_outer_batch_size',
+                default=DEFAULT_FEEDBACK_OUTER_BATCH_SIZE,
+                minimum=1,
+            ),
+            'reuse_existing_feedback': required_bool(
+                'reuse_existing_feedback'
+            ),
+            'point_in_time_recovery': required_bool(
+                'point_in_time_recovery'
+            ),
+            'summary_source_run_id': next(
+                iter(summary_source_run_ids)
+            ),
+        }
 
     def _normalize_market_date(self, market_date: str | date | None) -> str:
         if market_date is None:

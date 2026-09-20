@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Sequence
 
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
@@ -963,6 +963,7 @@ def _run_daily_feedback_followup(
     *,
     market_date: str,
     enabled: bool,
+    knowledge_cutoff_at: datetime | str | None = None,
     progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
@@ -974,6 +975,7 @@ def _run_daily_feedback_followup(
         enabled=enabled,
         roles=SUMMARIZER_AGENT_NAMES,
         feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        knowledge_cutoff_at=knowledge_cutoff_at,
         progress_callback=progress_callback,
     )
 
@@ -982,6 +984,7 @@ def _run_daily_signal_decider_followup(
     *,
     market_date: str,
     enabled: bool,
+    knowledge_cutoff_at: datetime | str | None = None,
     progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
@@ -993,6 +996,7 @@ def _run_daily_signal_decider_followup(
         enabled=enabled,
         roles=DECISION_SUPPORT_AGENT_NAMES,
         feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        knowledge_cutoff_at=knowledge_cutoff_at,
         progress_callback=progress_callback,
     )
 
@@ -1029,6 +1033,7 @@ def _run_daily_agent_feedback_followup(
     enabled: bool,
     roles: tuple[str, ...],
     feedback_scope_mode: str,
+    knowledge_cutoff_at: datetime | str | None = None,
     progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     if not enabled:
@@ -1046,7 +1051,7 @@ def _run_daily_agent_feedback_followup(
     if expired_result is not None:
         return expired_result
 
-    from datetime import date, datetime, timezone
+    from datetime import date
 
     from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
     from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
@@ -1077,7 +1082,9 @@ def _run_daily_agent_feedback_followup(
         config=FeedbackRetryCycleConfig(
             market_date=date.fromisoformat(market_date),
             roles=roles,
-            knowledge_cutoff_at=datetime.now(timezone.utc),
+            knowledge_cutoff_at=(
+                knowledge_cutoff_at or datetime.now(timezone.utc)
+            ),
             feedback_scope_mode=feedback_scope_mode,
             max_cycles=settings.openclaw_feedback_retry_max_cycles,
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
@@ -1163,6 +1170,14 @@ def run_market_data_pipeline(
     track_daily_pipeline: bool = False,
     point_in_time_recovery: bool = False,
 ) -> dict:
+    feedback_knowledge_cutoff_at: datetime | None = None
+
+    def resolve_feedback_knowledge_cutoff() -> datetime:
+        nonlocal feedback_knowledge_cutoff_at
+        if feedback_knowledge_cutoff_at is None:
+            feedback_knowledge_cutoff_at = datetime.now(timezone.utc)
+        return feedback_knowledge_cutoff_at
+
     normalized_start = dependencies.normalize_yyyymmdd(start_date)
     normalized_end = dependencies.normalize_yyyymmdd(end_date)
     historical_backfill = mode == 'historical_backfill'
@@ -3123,6 +3138,9 @@ def run_market_data_pipeline(
                         enabled=bool(
                             dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh
                         ),
+                        knowledge_cutoff_at=(
+                            resolve_feedback_knowledge_cutoff()
+                        ),
                         progress_callback=feedback_progress_callback,
                     ),
                 )
@@ -3148,6 +3166,9 @@ def run_market_data_pipeline(
                         market_date=latest_trade_date,
                         enabled=bool(
                             dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh
+                        ),
+                        knowledge_cutoff_at=(
+                            resolve_feedback_knowledge_cutoff()
                         ),
                         progress_callback=signal_decider_progress_callback,
                     ),
@@ -3380,6 +3401,9 @@ def run_market_data_pipeline(
                     call=lambda: _run_daily_feedback_followup(
                         market_date=latest_trade_date,
                         enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                        knowledge_cutoff_at=(
+                            resolve_feedback_knowledge_cutoff()
+                        ),
                         progress_callback=feedback_progress_callback,
                     ),
                 )
@@ -3394,6 +3418,9 @@ def run_market_data_pipeline(
                         call=lambda: _run_daily_signal_decider_followup(
                             market_date=latest_trade_date,
                             enabled=bool(dependencies.settings.openclaw_feedback_trigger_after_fundamentals_refresh),
+                            knowledge_cutoff_at=(
+                                resolve_feedback_knowledge_cutoff()
+                            ),
                             progress_callback=signal_decider_progress_callback,
                         ),
                     )

@@ -16,6 +16,199 @@ from app.eod.daily_pipeline_state import (
 
 
 class DailyPipelineRunStateServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.terminal_cutoff = datetime(
+            2026,
+            9,
+            20,
+            0,
+            55,
+            tzinfo=timezone.utc,
+        )
+        self.terminal_cutoff_resolver = patch(
+            'app.eod.daily_pipeline_state.'
+            '_resolve_terminal_summary_knowledge_cutoff',
+            return_value={
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': self.terminal_cutoff,
+                'source_run_id': (
+                    'agent_feedback_summaries-prior'
+                ),
+                'feedback_scope_mode': 'broad_feedback_universe',
+            },
+        )
+        self.resolve_terminal_cutoff = (
+            self.terminal_cutoff_resolver.start()
+        )
+        self.addCleanup(self.terminal_cutoff_resolver.stop)
+
+    @staticmethod
+    def _terminal_continuation_stage(
+        *,
+        stage_id: str,
+        status: str,
+        details: dict | None = None,
+        stage_row_id: int = 1,
+    ) -> SimpleNamespace:
+        now = datetime(2026, 9, 20, 8, 45, tzinfo=timezone.utc)
+        completed = status in {'completed', 'failed', 'blocked'}
+        return SimpleNamespace(
+            id=stage_row_id,
+            pipeline_run_id=456,
+            market_date=date(2026, 9, 18),
+            stage_id=stage_id,
+            status=status,
+            processed=1 if completed else 0,
+            total=1 if completed else 0,
+            succeeded=1 if status == 'completed' else 0,
+            failed=0,
+            remaining=0,
+            current_step=f'{stage_id}_{status}',
+            current_activity=f'{stage_id} {status}',
+            current_symbol=None,
+            current_period=None,
+            started_at=now - timedelta(minutes=5),
+            updated_at=now,
+            completed_at=now if completed else None,
+            error_message=None,
+            source_run_ids={'run_id': f'{stage_id}-prior'},
+            details=dict(details or {}),
+        )
+
+    @classmethod
+    def _terminal_continuation_fixture(
+        cls,
+    ) -> tuple[SimpleNamespace, list[SimpleNamespace], SimpleNamespace]:
+        now = datetime(2026, 9, 20, 8, 45, tzinfo=timezone.utc)
+        resolved_stages = [
+            'pykrx_enrichment',
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        run = SimpleNamespace(
+            id=456,
+            market_date=date(2026, 9, 18),
+            trigger='auto_eod_followup_resume',
+            status='blocked',
+            current_stage='signal_decider_evaluations',
+            started_at=now - timedelta(hours=8),
+            updated_at=now,
+            completed_at=now,
+            error_message='Signal decider dependency was unavailable.',
+            run_metadata={
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'requested_stages': list(resolved_stages),
+                'resolved_stages': list(resolved_stages),
+                'resume_from_stage': 'pykrx_enrichment',
+                'reused_eod_collection_run_id': 546,
+                'symbols': ['005930'],
+                'markets': ['KOSPI'],
+                'force': False,
+                'fs_div': 'CFS',
+                'symbol_limit': None,
+                'symbol_offset': 0,
+                'capture_limit': 500,
+                'reuse_existing_feedback': True,
+                'bypass_prerequisite_gate': False,
+                'point_in_time_recovery': True,
+                'stage_statuses': {
+                    'pykrx_enrichment': 'completed',
+                    'agent_feedback_summaries': 'completed',
+                    'signal_decider': 'failed',
+                    'next_open_execution_plan': 'blocked',
+                    'signal_decider_evaluations': 'blocked',
+                },
+            },
+        )
+        stages = [
+            cls._terminal_continuation_stage(
+                stage_id='pykrx_enrichment',
+                status='completed',
+                stage_row_id=1,
+            ),
+            cls._terminal_continuation_stage(
+                stage_id='agent_feedback_summaries',
+                status='completed',
+                details={'result_summary': {'status': 'completed'}},
+                stage_row_id=2,
+            ),
+            cls._terminal_continuation_stage(
+                stage_id='signal_decider',
+                status='failed',
+                details={
+                    'result_summary': {
+                        'status': 'failed',
+                        'progress': {
+                            'summary': {
+                                'failed_items': 160,
+                                'failure_groups': {
+                                    'dependency/missing-upstream': {
+                                        'failure_status': 'dependency/missing-upstream',
+                                        'failure_category': 'dependency',
+                                        'count': 160,
+                                        'retryable_count': 160,
+                                        'failure_kinds': [
+                                            'dependency_missing_upstream'
+                                        ],
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+                stage_row_id=3,
+            ),
+            cls._terminal_continuation_stage(
+                stage_id='next_open_execution_plan',
+                status='blocked',
+                details={
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'blocked',
+                        'reason': 'signal_decider_stage_incomplete',
+                        'upstream_status': 'failed',
+                    }
+                },
+                stage_row_id=4,
+            ),
+            cls._terminal_continuation_stage(
+                stage_id='signal_decider_evaluations',
+                status='blocked',
+                details={
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'blocked',
+                        'reason': 'declared_dependencies_incomplete',
+                        'incomplete_dependencies': ['signal_decider'],
+                    }
+                },
+                stage_row_id=5,
+            ),
+        ]
+        eod_run = SimpleNamespace(
+            id=546,
+            market='KRX',
+            source='pykrx',
+            trade_date=date(2026, 9, 18),
+        )
+        return run, stages, eod_run
+
+    @staticmethod
+    def _terminal_continuation_lineage(
+        run_ids: tuple[int, ...] = (441, 442, 443, 444, 445, 456),
+    ) -> list[SimpleNamespace]:
+        started_at = datetime(2026, 9, 19, tzinfo=timezone.utc)
+        return [
+            SimpleNamespace(
+                id=run_id,
+                started_at=started_at + timedelta(minutes=index),
+            )
+            for index, run_id in enumerate(run_ids)
+        ]
+
     def test_startup_stage_adapter_preserves_safe_partial_evidence(self) -> None:
         stage = SimpleNamespace(
             stage_id='momentum_factors',
@@ -1894,6 +2087,672 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         compiled = statement.compile()
         self.assertIn('reused_eod_collection_run_id', compiled.params.values())
         self.assertIn(7, compiled.params.values())
+
+    def test_claim_terminal_continuation_reopens_same_run_and_archives_suffix(
+        self,
+    ) -> None:
+        claimed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        run.run_metadata['repair_checkpoint_pipeline_run_id'] = 440
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage()
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ) as session_scope_mock,
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=claimed_at,
+            ),
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        session_scope_mock.assert_called_once_with(
+            statement_timeout_ms=15_000,
+        )
+        lock_call = session.execute.call_args_list[0]
+        self.assertEqual(
+            str(lock_call.args[0]),
+            'SELECT pg_advisory_xact_lock(:source_key, :trade_key)',
+        )
+        self.assertEqual(
+            lock_call.args[1],
+            {'source_key': 20_001, 'trade_key': 20260918},
+        )
+        lineage_statement = session.execute.call_args_list[2].args[0]
+        lineage_compiled = lineage_statement.compile()
+        self.assertIn(
+            'reused_eod_collection_run_id',
+            lineage_compiled.params.values(),
+        )
+        self.assertIn(546, lineage_compiled.params.values())
+        self.assertIn(
+            'auto_eod_followup_resume',
+            lineage_compiled.params.values(),
+        )
+        self.assertIn('FOR UPDATE', str(lineage_statement))
+        self.assertTrue(result['claimed'])
+        self.resolve_terminal_cutoff.assert_called_once_with(
+            market_date=date(2026, 9, 18),
+            source_run_id='agent_feedback_summaries-prior',
+            requested_symbols=['005930'],
+        )
+        self.assertEqual(
+            result['knowledge_cutoff_resolution'][
+                'knowledge_cutoff_at'
+            ],
+            self.terminal_cutoff,
+        )
+        self.assertEqual(result['pipeline_run_id'], 456)
+        self.assertEqual(result['reason'], 'summary_knowledge_cutoff_repair')
+        self.assertEqual(result['pipeline_run']['id'], 456)
+        self.assertEqual(result['pipeline_run']['status'], 'running')
+        self.assertEqual(
+            result['pipeline_run']['current_stage'],
+            'agent_feedback_summaries',
+        )
+        self.assertEqual(run.status, 'running')
+        self.assertIsNone(run.completed_at)
+        self.assertIsNone(run.error_message)
+        self.assertEqual(run.started_at, datetime(2026, 9, 20, 0, 45, tzinfo=timezone.utc))
+
+        metadata = run.run_metadata
+        self.assertEqual(metadata['terminal_continuation_count'], 1)
+        self.assertEqual(metadata['terminal_continuation_version'], 1)
+        self.assertEqual(
+            metadata['terminal_continuation_claimed_at'],
+            claimed_at.isoformat(),
+        )
+        self.assertEqual(
+            metadata['terminal_continuation_reason'],
+            'summary_knowledge_cutoff_repair',
+        )
+        self.assertEqual(
+            metadata['resume_from_stage'],
+            'agent_feedback_summaries',
+        )
+        evidence = metadata['terminal_continuation_evidence']
+        self.assertEqual(evidence['parent']['status'], 'blocked')
+        self.assertEqual(
+            evidence['parent']['current_stage'],
+            'signal_decider_evaluations',
+        )
+        self.assertEqual(
+            evidence['parent']['resume_from_stage'],
+            'pykrx_enrichment',
+        )
+        self.assertEqual(
+            list(evidence['suffix_stages']),
+            [
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            ],
+        )
+        self.assertEqual(
+            evidence['suffix_stages']['signal_decider']['status'],
+            'failed',
+        )
+        self.assertEqual(
+            evidence['lineage'],
+            {
+                'reused_eod_collection_run_id': 546,
+                'expected_run_count': 6,
+                'observed_run_count': 6,
+                'ordered_pipeline_run_ids': [441, 442, 443, 444, 445, 456],
+                'target_ordinal': 6,
+                'latest_pipeline_run_id': 456,
+                'repair_checkpoint_pipeline_run_id': 440,
+            },
+        )
+        self.assertEqual(
+            evidence['summary_proof'],
+            {
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': (
+                    self.terminal_cutoff.isoformat()
+                ),
+                'source_run_id': (
+                    'agent_feedback_summaries-prior'
+                ),
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'requested_symbol_count': 1,
+            },
+        )
+        for stage in stages[1:]:
+            self.assertEqual(stage.status, 'pending')
+            self.assertEqual(stage.processed, 0)
+            self.assertEqual(stage.total, 0)
+            self.assertEqual(stage.succeeded, 0)
+            self.assertEqual(stage.failed, 0)
+            self.assertEqual(stage.remaining, 0)
+            self.assertIsNone(stage.completed_at)
+            self.assertIsNone(stage.error_message)
+            self.assertEqual(stage.source_run_ids, {})
+            self.assertEqual(stage.details, {})
+        self.assertEqual(stages[0].status, 'completed')
+        self.assertEqual(
+            metadata['stage_statuses'],
+            {
+                'pykrx_enrichment': 'completed',
+                'agent_feedback_summaries': 'pending',
+                'signal_decider': 'pending',
+                'next_open_execution_plan': 'pending',
+                'signal_decider_evaluations': 'pending',
+            },
+        )
+
+    def test_claim_terminal_continuation_is_one_shot(self) -> None:
+        run, _, _ = self._terminal_continuation_fixture()
+        run.run_metadata['terminal_continuation_count'] = 1
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        session = MagicMock()
+        session.execute.side_effect = [MagicMock(), run_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(result['reason'], 'terminal_continuation_already_claimed')
+        self.assertEqual(run.status, 'blocked')
+        self.assertEqual(session.execute.call_count, 2)
+
+    def test_claim_terminal_continuation_rejects_missing_execution_scope(
+        self,
+    ) -> None:
+        run, _, _ = self._terminal_continuation_fixture()
+        run.run_metadata['symbols'] = []
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        session = MagicMock()
+        session.execute.side_effect = [MagicMock(), run_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(
+            result['reason'],
+            'terminal_continuation_execution_context_invalid',
+        )
+        self.assertEqual(result['field'], 'symbols')
+        self.assertEqual(run.status, 'blocked')
+
+    def test_claim_terminal_continuation_requires_exact_summary_source_run(
+        self,
+    ) -> None:
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        stages[1].source_run_ids = {}
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage()
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(
+            result['reason'],
+            'summary_source_run_id_unavailable',
+        )
+        self.assertEqual(run.status, 'blocked')
+
+    def test_cutoff_proof_failure_does_not_spend_one_shot_claim(self) -> None:
+        run, stages, eod_run = self._terminal_continuation_fixture()
+
+        def build_session_context():
+            run_result = MagicMock()
+            run_result.scalar_one_or_none.return_value = run
+            lineage_result = MagicMock()
+            lineage_result.scalars.return_value = (
+                self._terminal_continuation_lineage()
+            )
+            active_result = MagicMock()
+            active_result.scalars.return_value = []
+            stages_result = MagicMock()
+            stages_result.scalars.return_value = stages
+            session = MagicMock()
+            session.execute.side_effect = [
+                MagicMock(),
+                run_result,
+                lineage_result,
+                active_result,
+                stages_result,
+            ]
+            session.get.return_value = eod_run
+            context = MagicMock()
+            context.__enter__.return_value = session
+            return context
+
+        unavailable_context = build_session_context()
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=unavailable_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state.'
+                '_resolve_terminal_summary_knowledge_cutoff',
+                return_value={
+                    'ready': False,
+                    'reason': 'summary_run_symbol_scope_mismatch',
+                    'knowledge_cutoff_at': None,
+                    'source_run_id': (
+                        'agent_feedback_summaries-prior'
+                    ),
+                    'feedback_scope_mode': (
+                        'broad_feedback_universe'
+                    ),
+                },
+            ),
+        ):
+            first = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(first['claimed'])
+        self.assertEqual(
+            first['reason'],
+            'summary_knowledge_cutoff_unavailable',
+        )
+        self.assertEqual(run.status, 'blocked')
+        self.assertNotIn(
+            'terminal_continuation_count',
+            run.run_metadata,
+        )
+        self.assertEqual(stages[1].status, 'completed')
+
+        retry_context = build_session_context()
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=retry_context,
+        ):
+            second = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(second['claimed'])
+        self.assertEqual(run.status, 'running')
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_count'],
+            1,
+        )
+
+    def test_cutoff_lookup_exception_leaves_terminal_claim_unchanged(
+        self,
+    ) -> None:
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage()
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state.'
+                '_resolve_terminal_summary_knowledge_cutoff',
+                side_effect=RuntimeError('transient cutoff timeout'),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'transient cutoff timeout',
+            ):
+                DailyPipelineRunStateService().claim_terminal_continuation(
+                    pipeline_run_id=456,
+                    market_date='2026-09-18',
+                    reused_eod_collection_run_id=546,
+                )
+
+        self.assertEqual(run.status, 'blocked')
+        self.assertNotIn(
+            'terminal_continuation_count',
+            run.run_metadata,
+        )
+        self.assertEqual(stages[1].status, 'completed')
+
+    def test_claim_terminal_continuation_rejects_overlapping_active_run(
+        self,
+    ) -> None:
+        run, _, eod_run = self._terminal_continuation_fixture()
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage()
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = [SimpleNamespace(id=457)]
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(result['reason'], 'overlapping_run_already_active')
+        self.assertEqual(result['active_pipeline_run_ids'], [457])
+        self.assertEqual(run.status, 'blocked')
+
+    def test_claim_terminal_continuation_rejects_wrong_eod_lineage(self) -> None:
+        run, _, _ = self._terminal_continuation_fixture()
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        session = MagicMock()
+        session.execute.side_effect = [MagicMock(), run_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=999,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(result['reason'], 'eod_lineage_mismatch')
+        self.assertEqual(run.status, 'blocked')
+        session.get.assert_not_called()
+
+    def test_claim_terminal_continuation_requires_exactly_six_lineage_runs(
+        self,
+    ) -> None:
+        for run_ids in (
+            (442, 443, 444, 445, 456),
+            (440, 441, 442, 443, 444, 445, 456),
+        ):
+            with self.subTest(run_count=len(run_ids)):
+                run, _, eod_run = self._terminal_continuation_fixture()
+                run_result = MagicMock()
+                run_result.scalar_one_or_none.return_value = run
+                lineage_result = MagicMock()
+                lineage_result.scalars.return_value = (
+                    self._terminal_continuation_lineage(run_ids)
+                )
+                session = MagicMock()
+                session.execute.side_effect = [
+                    MagicMock(),
+                    run_result,
+                    lineage_result,
+                ]
+                session.get.return_value = eod_run
+                session_context = MagicMock()
+                session_context.__enter__.return_value = session
+
+                with patch(
+                    'app.eod.daily_pipeline_state.session_scope',
+                    return_value=session_context,
+                ):
+                    result = (
+                        DailyPipelineRunStateService()
+                        .claim_terminal_continuation(
+                            pipeline_run_id=456,
+                            market_date='2026-09-18',
+                            reused_eod_collection_run_id=546,
+                        )
+                    )
+
+                self.assertFalse(result['claimed'])
+                self.assertEqual(
+                    result['reason'],
+                    'terminal_continuation_lineage_count_mismatch',
+                )
+                self.assertEqual(result['expected_run_count'], 6)
+                self.assertEqual(result['observed_run_count'], len(run_ids))
+                self.assertEqual(run.status, 'blocked')
+                self.assertEqual(session.execute.call_count, 3)
+
+    def test_claim_terminal_continuation_requires_target_to_be_sixth_latest(
+        self,
+    ) -> None:
+        run, _, eod_run = self._terminal_continuation_fixture()
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage(
+                (441, 442, 443, 444, 456, 457)
+            )
+        )
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(
+            result['reason'],
+            'terminal_continuation_target_not_sixth_latest',
+        )
+        self.assertEqual(result['target_ordinal'], 5)
+        self.assertEqual(result['latest_pipeline_run_id'], 457)
+        self.assertEqual(run.status, 'blocked')
+        self.assertEqual(session.execute.call_count, 3)
+
+    def test_claim_terminal_continuation_rejects_noncanonical_decider_failure(
+        self,
+    ) -> None:
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        failure_groups = stages[2].details['result_summary']['progress'][
+            'summary'
+        ]['failure_groups']
+        failure_groups['provider/overloaded'] = {
+            'failure_category': 'provider',
+            'count': 1,
+            'retryable_count': 1,
+            'failure_kinds': ['provider_overloaded'],
+        }
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage()
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(
+            result['reason'],
+            'signal_decider_failure_not_retryable_missing_upstream_only',
+        )
+        self.assertEqual(run.status, 'blocked')
+        self.assertEqual(stages[2].status, 'failed')
+
+    def test_claim_terminal_continuation_rejects_unexpected_blocked_suffix(
+        self,
+    ) -> None:
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        stages[3].details['result_summary']['reason'] = 'market_closed'
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage()
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(result['reason'], 'next_open_block_reason_mismatch')
+        self.assertEqual(run.status, 'blocked')
+        self.assertEqual(stages[3].status, 'blocked')
 
     def test_monitor_recovery_acquires_advisory_lock_before_deduplicating(self) -> None:
         now = datetime(2026, 8, 24, tzinfo=timezone.utc)
