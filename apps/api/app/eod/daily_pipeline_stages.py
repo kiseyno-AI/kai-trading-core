@@ -1767,9 +1767,19 @@ class DailyPipelineStageService:
             result_status = str(
                 result.get('status') or ''
             ).strip().lower()
+            enrichment_counts = self._extract_stage_counts(
+                stage_id='pykrx_enrichment',
+                result=result,
+            )
             if (
                 result_status == 'partial'
                 and pykrx_enrichment_preflight_is_ready(preflight)
+                and enrichment_counts['total'] > 0
+                and enrichment_counts['processed']
+                == enrichment_counts['total']
+                and enrichment_counts['succeeded']
+                == enrichment_counts['total']
+                and enrichment_counts['failed'] == 0
             ):
                 result['status'] = 'completed'
             elif (
