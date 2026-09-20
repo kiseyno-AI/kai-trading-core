@@ -800,6 +800,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'price_collection',
                 ],
                 symbols=['005930', '000660'],
+                fs_div='OFS',
             )
 
         self.assertEqual(
@@ -816,6 +817,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(pykrx_runner.calls[0]['symbols'], ['005930', '000660'])
         self.assertEqual(feedback_retry_service.calls[0]['config'].roles, SUMMARIZER_AGENT_NAMES)
         self.assertEqual(feedback_retry_service.calls[1]['config'].roles, DECISION_SUPPORT_AGENT_NAMES)
+        self.assertTrue(
+            all(
+                feedback_call['config'].fs_div == 'OFS'
+                for feedback_call in feedback_retry_service.calls
+            )
+        )
         self.assertEqual(
             [
                 feedback_call['config'].knowledge_cutoff_at

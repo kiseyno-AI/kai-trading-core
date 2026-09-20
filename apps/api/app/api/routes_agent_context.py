@@ -150,6 +150,7 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
+    fs_div: str | None = None
     knowledge_cutoff_at: datetime | None = Field(
         default=None,
         description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
@@ -177,6 +178,7 @@ class AgentFeedbackFollowupRequest(BaseModel):
     market_date: date
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     roles: list[str] | None = None
+    fs_div: str | None = None
     knowledge_cutoff_at: datetime | None = Field(
         default=None,
         description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
@@ -1004,6 +1006,7 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
+            fs_div=payload.fs_div,
             knowledge_cutoff_at=payload.knowledge_cutoff_at,
             feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,
@@ -1029,6 +1032,7 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
             market_date=payload.market_date,
             roles=tuple(payload.roles or EXPECTED_ROLES),
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
+            fs_div=payload.fs_div,
             knowledge_cutoff_at=payload.knowledge_cutoff_at,
             feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,

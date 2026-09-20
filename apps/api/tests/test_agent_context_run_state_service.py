@@ -2,7 +2,7 @@ import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.agent_context.run_state_service import AgentContextFeedbackRunStateService
 
@@ -54,6 +54,34 @@ def _build_run_row(
 
 
 class AgentContextFeedbackRunStateServiceTests(unittest.TestCase):
+    def test_get_run_can_lock_exact_row_in_caller_transaction(self):
+        service = AgentContextFeedbackRunStateService()
+        run_row = _build_run_row(
+            row_id=1,
+            run_id='locked-summary-run',
+            market_date=date(2026, 4, 14),
+            started_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+            request_payload={'roles': ['fundamental-summarizer']},
+        )
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = run_row
+        caller_session = MagicMock()
+        caller_session.execute.return_value = result
+
+        with patch(
+            'app.agent_context.run_state_service.session_scope'
+        ) as session_scope_mock:
+            snapshot = service.get_run(
+                run_id='locked-summary-run',
+                session=caller_session,
+                for_update=True,
+            )
+
+        session_scope_mock.assert_not_called()
+        statement = caller_session.execute.call_args.args[0]
+        self.assertIn('FOR UPDATE', str(statement))
+        self.assertEqual(snapshot['run_id'], 'locked-summary-run')
+
     def test_find_latest_run_matches_same_scope_when_symbol_and_role_order_differs(self):
         service = AgentContextFeedbackRunStateService()
         market_date = date.fromisoformat('2026-04-14')

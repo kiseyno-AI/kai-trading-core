@@ -223,7 +223,6 @@ def build_fundamental_input_fingerprint_payload_from_context(
         'prompt_version': FUNDAMENTAL_SUMMARY_PROMPT_VERSION,
         'response_schema_version': FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION,
         'symbol': normalized_symbol,
-        'market_date': normalized_market_date.isoformat(),
         'finalized_dispatch_context': {
             'fundamentals': {
                 'latest_snapshot': _without_derived_fingerprint_fields(
@@ -785,12 +784,43 @@ class AgentContextReuseService:
                         or _extract_fingerprint_payload(latest_feedback.summary_payload)
                     )
                     stored_input_fingerprint = _fingerprint_value(stored_input_fingerprint_payload)
+                    has_prior_date_materialized_fundamental_match = bool(
+                        role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME
+                        and isinstance(feedback_market_date, date)
+                        and feedback_market_date < normalized_market_date
+                        and input_fingerprint
+                        and input_fingerprint == stored_input_fingerprint
+                        and isinstance(input_fingerprint_payload, Mapping)
+                        and isinstance(
+                            stored_input_fingerprint_payload,
+                            Mapping,
+                        )
+                        and input_fingerprint_payload.get('schema_version')
+                        == FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION
+                        and stored_input_fingerprint_payload.get(
+                            'schema_version'
+                        )
+                        == FUNDAMENTAL_SUMMARY_INPUT_FINGERPRINT_SCHEMA_VERSION
+                        and input_fingerprint_payload.get(
+                            'reuse_policy_version'
+                        )
+                        == FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION
+                        and stored_input_fingerprint_payload.get(
+                            'reuse_policy_version'
+                        )
+                        == FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION
+                    )
                     if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME:
                         should_dispatch, reason = self._decide_fundamental_reuse(
                             force_recompute=force_recompute,
                             has_retryable_feedback_gap=has_retryable_feedback_gap,
                             input_fingerprint=input_fingerprint,
                             stored_input_fingerprint=stored_input_fingerprint,
+                            latest_source_updated_at=latest_source_updated_at,
+                            feedback_received_at=feedback_received_at,
+                            materialized_fingerprint_match=(
+                                has_prior_date_materialized_fundamental_match
+                            ),
                         )
                         if has_newer_failure:
                             reason = 'latest_failure_pending_retry'
@@ -811,6 +841,7 @@ class AgentContextReuseService:
                         has_knowledge_cutoff_mismatch
                         and not force_recompute
                         and not has_newer_failure
+                        and not has_prior_date_materialized_fundamental_match
                     ):
                         should_dispatch = True
                         reason = 'knowledge_cutoff_mismatch'
@@ -876,6 +907,9 @@ class AgentContextReuseService:
         has_retryable_feedback_gap: bool,
         input_fingerprint: str | None,
         stored_input_fingerprint: str | None,
+        latest_source_updated_at: datetime | None = None,
+        feedback_received_at: datetime | None = None,
+        materialized_fingerprint_match: bool = False,
     ) -> tuple[bool, str]:
         if force_recompute:
             return True, 'forced_recompute'
@@ -887,8 +921,13 @@ class AgentContextReuseService:
             return True, 'stored_fundamental_input_fingerprint_missing'
         if input_fingerprint != stored_input_fingerprint:
             return True, 'fundamental_input_fingerprint_changed'
-        # This hash represents the finalized cutoff-visible prompt input. Raw
-        # source timestamps may advance after that cutoff without changing it.
+        if (
+            not materialized_fingerprint_match
+            and latest_source_updated_at is not None
+            and feedback_received_at is not None
+            and latest_source_updated_at > feedback_received_at
+        ):
+            return True, 'source_updated'
         return False, FUNDAMENTAL_SUMMARY_REUSE_REASON
 
     def build_latest_feedback_bundle(

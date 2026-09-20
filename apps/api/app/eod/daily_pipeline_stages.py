@@ -1867,6 +1867,7 @@ class DailyPipelineStageService:
                     market_date=date.fromisoformat(market_date),
                     roles=roles,
                     symbols=tuple(symbols) if symbols else None,
+                    fs_div=fs_div,
                     # A production retry of a completed source day must see
                     # information collected after that session close. The
                     # resolved instant remains fixed for every child cycle.

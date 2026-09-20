@@ -394,14 +394,32 @@ class AgentContextFeedbackRunStateService:
             completed_at=datetime.now(timezone.utc),
         )
 
-    def get_run(self, *, run_id: str) -> dict[str, Any] | None:
-        with session_scope() as session:
-            row = session.execute(
-                select(AgentContextFeedbackRun).where(AgentContextFeedbackRun.run_id == run_id)
-            ).scalar_one_or_none()
+    def get_run(
+        self,
+        *,
+        run_id: str,
+        session: Any | None = None,
+        for_update: bool = False,
+    ) -> dict[str, Any] | None:
+        if for_update and session is None:
+            raise ValueError('for_update requires a caller-owned session')
+
+        statement = select(AgentContextFeedbackRun).where(
+            AgentContextFeedbackRun.run_id == run_id
+        )
+        if for_update:
+            statement = statement.with_for_update()
+
+        def load(active_session: Any) -> dict[str, Any] | None:
+            row = active_session.execute(statement).scalar_one_or_none()
             if row is None:
                 return None
             return self._serialize_run(row)
+
+        if session is not None:
+            return load(session)
+        with session_scope() as owned_session:
+            return load(owned_session)
 
     def find_latest_run(
         self,

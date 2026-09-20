@@ -82,8 +82,9 @@ def _resolve_terminal_summary_knowledge_cutoff(
     market_date: date,
     source_run_id: str,
     requested_symbols: Sequence[str],
+    source_run_session: Any,
 ) -> dict[str, Any]:
-    """Resolve immutable summary proof before spending the one-shot claim."""
+    """Lock and resolve summary proof before spending the one-shot claim."""
 
     from app.agent_context.retry_service import (
         resolve_latest_completed_summary_knowledge_cutoff,
@@ -99,6 +100,7 @@ def _resolve_terminal_summary_knowledge_cutoff(
         ),
         source_run_id=source_run_id,
         requested_symbols=requested_symbols,
+        source_run_session=source_run_session,
     )
 
 
@@ -1306,6 +1308,7 @@ class DailyPipelineRunStateService:
                     market_date=normalized_market_date,
                     source_run_id=summary_source_run_id,
                     requested_symbols=raw_symbols,
+                    source_run_session=session,
                 )
             )
             compact_cutoff_resolution = {

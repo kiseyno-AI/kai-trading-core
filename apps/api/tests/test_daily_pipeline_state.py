@@ -2161,6 +2161,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             market_date=date(2026, 9, 18),
             source_run_id='agent_feedback_summaries-prior',
             requested_symbols=['005930'],
+            source_run_session=session,
         )
         self.assertEqual(
             result['knowledge_cutoff_resolution'][

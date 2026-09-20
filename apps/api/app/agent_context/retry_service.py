@@ -148,6 +148,33 @@ def _previous_run_matches_knowledge_cutoff(
         return False
 
 
+def _normalize_feedback_fs_div(value: str | None) -> str:
+    normalized = str(
+        value or settings.dart_fundamentals_default_fs_div
+    ).strip().upper()
+    if normalized not in {'CFS', 'OFS'}:
+        raise ValueError('fs_div must be one of CFS or OFS')
+    return normalized
+
+
+def _previous_run_matches_fs_div(
+    previous_run: dict[str, Any] | None,
+    effective_fs_div: str,
+) -> bool:
+    if not isinstance(previous_run, dict):
+        return False
+    request_payload = previous_run.get('request_payload')
+    if not isinstance(request_payload, dict):
+        return False
+    prior_fs_div = request_payload.get('fs_div')
+    if prior_fs_div is None:
+        return False
+    try:
+        return _normalize_feedback_fs_div(prior_fs_div) == effective_fs_div
+    except ValueError:
+        return False
+
+
 def resolve_latest_completed_summary_knowledge_cutoff(
     *,
     market_date: date | str,
@@ -155,6 +182,7 @@ def resolve_latest_completed_summary_knowledge_cutoff(
     source_run_id: str | None = None,
     requested_symbols: Sequence[str] | None = None,
     now: datetime | None = None,
+    source_run_session: Any | None = None,
 ) -> dict[str, Any]:
     """Resolve the cutoff owned by a proven summary cycle.
 
@@ -187,9 +215,23 @@ def resolve_latest_completed_summary_knowledge_cutoff(
         if requested_symbols is not None
         else None
     )
+    if source_run_session is not None and normalized_source_run_id is None:
+        raise ValueError(
+            'source_run_session requires an exact source_run_id'
+        )
     if normalized_source_run_id is not None:
+        get_run_kwargs: dict[str, Any] = {
+            'run_id': normalized_source_run_id,
+        }
+        if source_run_session is not None:
+            get_run_kwargs.update(
+                {
+                    'session': source_run_session,
+                    'for_update': True,
+                }
+            )
         latest_run = agent_context_feedback_run_state_service.get_run(
-            run_id=normalized_source_run_id,
+            **get_run_kwargs
         )
     else:
         latest_run_kwargs: dict[str, Any] = {
@@ -510,6 +552,7 @@ def _claim_feedback_retry_run(
     run_id: str,
     started_at: datetime,
     admission_knowledge_cutoff_at: datetime | str | None = None,
+    fs_div: str | None = None,
 ) -> dict[str, Any]:
     """Atomically claim a durable retry scope without holding a pool slot."""
 
@@ -535,6 +578,7 @@ def _claim_feedback_retry_run(
             admission_knowledge_cutoff_at
         )
     )
+    normalized_fs_div = _normalize_feedback_fs_div(fs_div)
     requested_scope = _normalized_admission_scope(
         roles=normalized_roles,
         symbols=normalized_symbols,
@@ -631,6 +675,15 @@ def _claim_feedback_retry_run(
                 )
             except (TypeError, ValueError):
                 active_knowledge_cutoff_at = '__invalid_active_cutoff__'
+            raw_active_fs_div = payload.get('fs_div')
+            try:
+                active_fs_div = (
+                    _normalize_feedback_fs_div(raw_active_fs_div)
+                    if raw_active_fs_div is not None
+                    else '__missing_active_fs_div__'
+                )
+            except ValueError:
+                active_fs_div = '__invalid_active_fs_div__'
             return {
                 'acquired': False,
                 'run_id': None,
@@ -642,6 +695,7 @@ def _claim_feedback_retry_run(
                     == active_feedback_scope_mode
                     and normalized_admission_knowledge_cutoff_at
                     == active_knowledge_cutoff_at
+                    and normalized_fs_div == active_fs_div
                 ),
             }
 
@@ -671,6 +725,7 @@ def _claim_feedback_retry_run(
                         else None
                     ),
                     'feedback_scope_mode': normalized_feedback_scope_mode,
+                    'fs_div': normalized_fs_div,
                     'admission_knowledge_cutoff_at': (
                         normalized_admission_knowledge_cutoff_at
                     ),
@@ -1079,6 +1134,7 @@ class FeedbackRetryCycleConfig:
     roles: tuple[str, ...]
     symbols: tuple[str, ...] | None = None
     knowledge_cutoff_at: datetime | str | None = None
+    fs_div: str | None = None
     feedback_scope_mode: str = FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
     max_cycles: int = 3
     outer_batch_size: int = 20
@@ -1159,6 +1215,7 @@ class AgentFeedbackRetryService:
         force_recompute: bool = False,
         reuse_existing: bool = True,
         knowledge_cutoff_at: datetime | str | None = None,
+        fs_div: str | None = None,
     ) -> list[str]:
         expected_roles = tuple(roles)
         symbols = list(eligible_symbols) if eligible_symbols is not None else self._load_eligible_symbols(market_date=market_date)
@@ -1170,6 +1227,7 @@ class AgentFeedbackRetryService:
             'symbols': symbols,
             'roles': expected_roles,
             'force_recompute': force_recompute,
+            'fs_div': _normalize_feedback_fs_div(fs_div),
         }
         if knowledge_cutoff_at is not None:
             decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
@@ -1744,6 +1802,7 @@ class AgentFeedbackRetryService:
         market_date: date,
         symbols: Sequence[str],
         knowledge_cutoff_at: datetime | str | None = None,
+        fs_div: str | None = None,
     ) -> tuple[str, ...]:
         normalized_symbols = _normalize_optional_symbol_scope(symbols)
         if not normalized_symbols:
@@ -1754,6 +1813,7 @@ class AgentFeedbackRetryService:
             'symbols': normalized_symbols,
             'roles': SUMMARIZER_AGENT_NAMES,
             'force_recompute': False,
+            'fs_div': _normalize_feedback_fs_div(fs_div),
         }
         if knowledge_cutoff_at is not None:
             decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
@@ -1809,6 +1869,7 @@ class AgentFeedbackRetryService:
         parent_run_id: str | None = None,
         parent_started_at: datetime | None = None,
         knowledge_cutoff_at: datetime | str | None = None,
+        fs_div: str | None = None,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
@@ -1844,6 +1905,7 @@ class AgentFeedbackRetryService:
             'symbols': normalized_symbols,
             'roles': normalized_roles,
             'force_recompute': force_recompute,
+            'fs_div': _normalize_feedback_fs_div(fs_div),
         }
         if knowledge_cutoff_at is not None:
             decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
@@ -2039,6 +2101,7 @@ class AgentFeedbackRetryService:
                     force_recompute=force_recompute,
                     reuse_existing=reuse_existing,
                     knowledge_cutoff_at=knowledge_cutoff_at,
+                    fs_div=fs_div,
                 )
             )
             retry_pending_symbols = tuple(
@@ -2055,6 +2118,7 @@ class AgentFeedbackRetryService:
                     market_date=market_date,
                     symbols=failed_symbols,
                     knowledge_cutoff_at=knowledge_cutoff_at,
+                    fs_div=fs_div,
                 )
             role_states[role] = RoleSequenceRoleState(
                 role=role,
@@ -2550,6 +2614,9 @@ class AgentFeedbackRetryService:
         bypass_prerequisite_gate: bool = False,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
+        resolved_fs_div = _normalize_feedback_fs_div(
+            getattr(config, 'fs_div', None)
+        )
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
             tuple(_normalize_requested_symbols(raw_requested_symbols))
@@ -2577,6 +2644,7 @@ class AgentFeedbackRetryService:
         prerequisites = (
             agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                 market_date=config.market_date,
+                fs_div=resolved_fs_div,
             )
         )
         if not should_bypass_prerequisite_gate and not prerequisites['ready']:
@@ -2622,6 +2690,9 @@ class AgentFeedbackRetryService:
             if not _previous_run_matches_knowledge_cutoff(
                 previous_run,
                 effective_knowledge_cutoff_at,
+            ) or not _previous_run_matches_fs_div(
+                previous_run,
+                resolved_fs_div,
             ):
                 previous_run = None
         request_run_id = (
@@ -2639,6 +2710,7 @@ class AgentFeedbackRetryService:
             admission_knowledge_cutoff_at=(
                 effective_knowledge_cutoff_at.isoformat()
             ),
+            fs_div=resolved_fs_div,
         )
         if not admission['acquired']:
             active_run = admission.get('conflict_run')
@@ -2673,6 +2745,7 @@ class AgentFeedbackRetryService:
                 'force_recompute': bool(
                     force or getattr(config, 'force_recompute', False)
                 ),
+                'fs_div': resolved_fs_div,
                 'feedback_scope_mode': feedback_scope_mode,
                 'requested_symbols': (
                     list(requested_symbols)
@@ -2758,6 +2831,9 @@ class AgentFeedbackRetryService:
         requested_knowledge_cutoff_at: str | None = None,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
+        resolved_fs_div = _normalize_feedback_fs_div(
+            getattr(config, 'fs_div', None)
+        )
         progress_callback = getattr(config, 'progress_callback', None)
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
@@ -2771,6 +2847,7 @@ class AgentFeedbackRetryService:
         prerequisites = prerequisites or (
             agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                 market_date=config.market_date,
+                fs_div=resolved_fs_div,
             )
         )
         if not should_bypass_prerequisite_gate and not prerequisites['ready']:
@@ -2882,6 +2959,7 @@ class AgentFeedbackRetryService:
             parent_run_id=request_run_id,
             parent_started_at=parent_started_at,
             knowledge_cutoff_at=knowledge_cutoff_at,
+            fs_div=resolved_fs_div,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -2905,6 +2983,7 @@ class AgentFeedbackRetryService:
             'roles': list(roles),
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
+            'fs_div': resolved_fs_div,
             'knowledge_cutoff_at': knowledge_cutoff_at,
             'admission_knowledge_cutoff_at': knowledge_cutoff_at,
             'knowledge_cutoff_source': knowledge_cutoff_source,
@@ -3070,6 +3149,7 @@ class AgentFeedbackRetryService:
                         parent_run_id=request_run_id,
                         parent_started_at=parent_started_at,
                         knowledge_cutoff_at=knowledge_cutoff_at,
+                        fs_div=resolved_fs_div,
                     )
                     completed_roles_before = tuple(
                         list(active_plan.completed_roles) + list(active_plan.plan_roles[:index])
@@ -3143,7 +3223,7 @@ class AgentFeedbackRetryService:
                                     market_date=config.market_date,
                                     symbols=dispatch_chunk,
                                     roles=[role],
-                                    fs_div=settings.dart_fundamentals_default_fs_div,
+                                    fs_div=resolved_fs_div,
                                     knowledge_cutoff_at=knowledge_cutoff_at,
                                     parent_run_id=request_run_id,
                                     # The parent already resolved reuse for this exact
@@ -3187,6 +3267,7 @@ class AgentFeedbackRetryService:
                                     parent_run_id=request_run_id,
                                     parent_started_at=parent_started_at,
                                     knowledge_cutoff_at=knowledge_cutoff_at,
+                                    fs_div=resolved_fs_div,
                                 )
                                 self._sync_runtime_state(
                                     market_date=config.market_date,
@@ -3270,6 +3351,7 @@ class AgentFeedbackRetryService:
                         parent_run_id=request_run_id,
                         parent_started_at=parent_started_at,
                         knowledge_cutoff_at=knowledge_cutoff_at,
+                        fs_div=resolved_fs_div,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
                     role_boundary_complete = len(role_state_after.boundary_pending_symbols) == 0
@@ -3343,6 +3425,7 @@ class AgentFeedbackRetryService:
                     parent_run_id=request_run_id,
                     parent_started_at=parent_started_at,
                     knowledge_cutoff_at=knowledge_cutoff_at,
+                    fs_div=resolved_fs_div,
                 )
                 cycle_state = runtime_feedback_state_store.get_run(
                     config.market_date,
@@ -3398,6 +3481,7 @@ class AgentFeedbackRetryService:
                 parent_run_id=request_run_id,
                 parent_started_at=parent_started_at,
                 knowledge_cutoff_at=knowledge_cutoff_at,
+                fs_div=resolved_fs_div,
             )
             final_state_before_finish = runtime_feedback_state_store.get_run(
                 config.market_date,
@@ -3494,6 +3578,7 @@ class AgentFeedbackRetryService:
                 parent_run_id=request_run_id,
                 parent_started_at=parent_started_at,
                 knowledge_cutoff_at=knowledge_cutoff_at,
+                fs_div=resolved_fs_div,
             ),
             retry_attempted_symbols_by_role=(
                 final_state.retry_attempted_symbols_by_role

@@ -29,6 +29,7 @@ from app.agent_context.retry_service import (
     _FeedbackRetryClaimLease,
     _feedback_retry_admission_lock_key,
     _claim_feedback_retry_run,
+    _previous_run_matches_fs_div,
     _previous_run_matches_knowledge_cutoff,
     resolve_latest_completed_summary_knowledge_cutoff,
 )
@@ -185,6 +186,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
     ):
         cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
         source_run_id = 'feedback-cycle-2026-04-16-summary'
+        source_run_session = object()
         exact_run = {
             'run_id': source_run_id,
             'market_date': date(2026, 4, 16),
@@ -229,13 +231,18 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 source_run_id=source_run_id,
                 requested_symbols=['005930', '000660'],
                 now=cutoff + timedelta(minutes=5),
+                source_run_session=source_run_session,
             )
 
         self.assertTrue(result['ready'])
         self.assertEqual(result['knowledge_cutoff_at'], cutoff)
         self.assertEqual(result['source_run_id'], source_run_id)
         self.assertEqual(result['requested_symbols'], ['000660', '005930'])
-        get_run.assert_called_once_with(run_id=source_run_id)
+        get_run.assert_called_once_with(
+            run_id=source_run_id,
+            session=source_run_session,
+            for_update=True,
+        )
         find_latest_run.assert_not_called()
 
     def test_exact_summary_cutoff_rejects_symbol_scope_mismatch(self):
@@ -468,6 +475,15 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             )
         )
 
+    def test_prior_run_resume_requires_exact_fs_div(self):
+        previous_run = {'request_payload': {'fs_div': 'cfs'}}
+
+        self.assertTrue(_previous_run_matches_fs_div(previous_run, 'CFS'))
+        self.assertFalse(_previous_run_matches_fs_div(previous_run, 'OFS'))
+        self.assertFalse(
+            _previous_run_matches_fs_div({'request_payload': {}}, 'CFS')
+        )
+
     def test_run_retry_cycles_discards_prior_resume_when_cutoff_differs(self):
         service = AgentFeedbackRetryService()
         run_state_service = RecordingRunStateService()
@@ -617,7 +633,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(second['conflict_run']['run_id'], first_run_id)
         self.assertTrue(disjoint['acquired'])
 
-    def test_feedback_retry_admission_does_not_join_different_cutoff_or_scope_mode(self):
+    def test_feedback_retry_admission_does_not_join_different_context(self):
         suffix = uuid4().hex[:10].upper()
         market_date = date.fromisoformat('2040-01-05')
         symbol = f'A{suffix}'
@@ -625,11 +641,13 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         equivalent_run_id = f'claim-equivalent-{suffix}'
         cutoff_run_id = f'claim-cutoff-{suffix}'
         mode_run_id = f'claim-mode-{suffix}'
+        fs_div_run_id = f'claim-fs-div-{suffix}'
         run_ids = [
             first_run_id,
             equivalent_run_id,
             cutoff_run_id,
             mode_run_id,
+            fs_div_run_id,
         ]
 
         def cleanup():
@@ -651,25 +669,36 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             **common,
             feedback_scope_mode='decider_scope_fast_path',
             admission_knowledge_cutoff_at='2026-01-02T09:00:00+09:00',
+            fs_div='CFS',
             run_id=first_run_id,
         )
         equivalent = _claim_feedback_retry_run(
             **common,
             feedback_scope_mode='decider_scope_fast_path',
             admission_knowledge_cutoff_at='2026-01-02T00:00:00+00:00',
+            fs_div='CFS',
             run_id=equivalent_run_id,
         )
         different_cutoff = _claim_feedback_retry_run(
             **common,
             feedback_scope_mode='decider_scope_fast_path',
             admission_knowledge_cutoff_at='2026-01-02T01:00:00+00:00',
+            fs_div='CFS',
             run_id=cutoff_run_id,
         )
         different_mode = _claim_feedback_retry_run(
             **common,
             feedback_scope_mode='broad_feedback_universe',
             admission_knowledge_cutoff_at='2026-01-02T00:00:00+00:00',
+            fs_div='CFS',
             run_id=mode_run_id,
+        )
+        different_fs_div = _claim_feedback_retry_run(
+            **common,
+            feedback_scope_mode='decider_scope_fast_path',
+            admission_knowledge_cutoff_at='2026-01-02T00:00:00+00:00',
+            fs_div='OFS',
+            run_id=fs_div_run_id,
         )
 
         self.assertTrue(first['acquired'])
@@ -679,6 +708,8 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertFalse(different_cutoff['exact_scope'])
         self.assertFalse(different_mode['acquired'])
         self.assertFalse(different_mode['exact_scope'])
+        self.assertFalse(different_fs_div['acquired'])
+        self.assertFalse(different_fs_div['exact_scope'])
 
     def test_feedback_retry_admission_claim_recovers_stale_owner(self):
         suffix = uuid4().hex[:10].upper()
@@ -2791,6 +2822,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             symbols=['005930'],
             roles=EXPECTED_ROLES,
             force_recompute=False,
+            fs_div='CFS',
         )
         self.assertEqual(result, ['005930'])
 
@@ -3202,6 +3234,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                                 config=SimpleNamespace(
                                     market_date=date.fromisoformat('2040-04-16'),
                                     roles=roles,
+                                    fs_div='OFS',
                                     max_cycles=1,
                                     outer_batch_size=2,
                                     reuse_existing=True,
@@ -3253,6 +3286,13 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 == effective_knowledge_cutoff_at
                 for call in dispatch_calls
             )
+        )
+        self.assertEqual(
+            run_state_service.started[0]['request_payload']['fs_div'],
+            'OFS',
+        )
+        self.assertTrue(
+            all(call['fs_div'] == 'OFS' for call in dispatch_calls)
         )
         self.assertTrue(result['completed'])
         self.assertEqual(result['cycles'][0]['role_batches'][0]['summary']['chunks'], 3)
@@ -3869,6 +3909,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 'admission_knowledge_cutoff_at': (
                     '2026-04-16T06:30:00+00:00'
                 ),
+                'fs_div': 'CFS',
             },
             'summary_payload': {
                 'progress_summary': {
