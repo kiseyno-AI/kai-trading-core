@@ -791,8 +791,6 @@ class AgentContextReuseService:
                             has_retryable_feedback_gap=has_retryable_feedback_gap,
                             input_fingerprint=input_fingerprint,
                             stored_input_fingerprint=stored_input_fingerprint,
-                            latest_source_updated_at=latest_source_updated_at,
-                            feedback_received_at=feedback_received_at,
                         )
                         if has_newer_failure:
                             reason = 'latest_failure_pending_retry'
@@ -878,8 +876,6 @@ class AgentContextReuseService:
         has_retryable_feedback_gap: bool,
         input_fingerprint: str | None,
         stored_input_fingerprint: str | None,
-        latest_source_updated_at: datetime | None,
-        feedback_received_at: datetime | None,
     ) -> tuple[bool, str]:
         if force_recompute:
             return True, 'forced_recompute'
@@ -891,8 +887,8 @@ class AgentContextReuseService:
             return True, 'stored_fundamental_input_fingerprint_missing'
         if input_fingerprint != stored_input_fingerprint:
             return True, 'fundamental_input_fingerprint_changed'
-        if latest_source_updated_at is not None and feedback_received_at is not None and latest_source_updated_at > feedback_received_at:
-            return True, 'source_updated'
+        # This hash represents the finalized cutoff-visible prompt input. Raw
+        # source timestamps may advance after that cutoff without changing it.
         return False, FUNDAMENTAL_SUMMARY_REUSE_REASON
 
     def build_latest_feedback_bundle(

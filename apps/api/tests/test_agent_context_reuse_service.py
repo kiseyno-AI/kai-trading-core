@@ -129,6 +129,45 @@ class _CutoffReuseSession:
         return next(self._results)
 
 
+class _FundamentalCutoffReuseSession:
+    def __init__(self):
+        fingerprint = 'sha256:cutoff-visible'
+        feedback = SimpleNamespace(
+            id=7,
+            market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
+            symbol='005930',
+            agent_name='fundamental-summarizer',
+            run_id='fundamental-cutoff-reuse-run',
+            summary_payload={},
+            feedback_payload={'summary': 'reusable'},
+            context_payload={
+                'reuse_metadata': {
+                    'input_fingerprint': {'fingerprint': fingerprint}
+                }
+            },
+            received_at=datetime(2026, 4, 16, 6, 32, tzinfo=timezone.utc),
+        )
+        run = SimpleNamespace(
+            id=11,
+            run_id='fundamental-cutoff-reuse-run',
+            started_at=datetime(2026, 4, 16, 6, 31, tzinfo=timezone.utc),
+            request_payload={
+                'knowledge_cutoff_at': '2026-04-16T06:30:00+00:00'
+            },
+        )
+        self._results = iter(
+            (
+                _RowsResult([SimpleNamespace(id=101, symbol='005930')]),
+                _RowsResult([feedback]),
+                _RowsResult(),
+                _RowsResult([run]),
+            )
+        )
+
+    def execute(self, _statement):
+        return next(self._results)
+
+
 @contextmanager
 def _reuse_session_scope():
     yield _ReuseSession()
@@ -142,6 +181,11 @@ def _cutoff_reuse_session_scope():
 @contextmanager
 def _missing_cutoff_reuse_session_scope():
     yield _CutoffReuseSession(knowledge_cutoff_at=None)
+
+
+@contextmanager
+def _fundamental_cutoff_reuse_session_scope():
+    yield _FundamentalCutoffReuseSession()
 
 
 class FundamentalReuseServiceTests(unittest.TestCase):
@@ -293,6 +337,49 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         self.assertEqual(decision.input_fingerprint_payload, payload)
         self.assertEqual(decision.input_fingerprint, 'sha256:materialized')
         db_rebuild.assert_not_called()
+
+    def test_matching_fingerprint_ignores_post_cutoff_source_update(self):
+        service = AgentContextReuseService()
+        post_cutoff_update = datetime(
+            2026,
+            4,
+            16,
+            7,
+            0,
+            tzinfo=timezone.utc,
+        )
+        payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': 'sha256:cutoff-visible',
+            'input': {'symbol': '005930'},
+        }
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _fundamental_cutoff_reuse_session_scope,
+        ):
+            with patch.object(
+                service,
+                '_get_latest_source_updated_at',
+                return_value=post_cutoff_update,
+            ):
+                decision = service.build_latest_decisions(
+                    market_date='2026-04-16',
+                    symbols=['005930'],
+                    roles=['fundamental-summarizer'],
+                    knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+                    fundamental_input_fingerprint_payloads={
+                        '005930': payload
+                    },
+                )['005930']['fundamental-summarizer']
+
+        self.assertFalse(decision.should_dispatch)
+        self.assertEqual(decision.reason, FUNDAMENTAL_SUMMARY_REUSE_REASON)
+        self.assertEqual(
+            decision.latest_source_updated_at,
+            post_cutoff_update.isoformat(),
+        )
 
     def test_db_fingerprint_builder_defaults_to_configured_fs_div(self):
         service = AgentContextReuseService()
@@ -470,8 +557,6 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             has_retryable_feedback_gap=False,
             input_fingerprint='sha256:same',
             stored_input_fingerprint='sha256:same',
-            latest_source_updated_at=None,
-            feedback_received_at=datetime(2026, 4, 15, 1, 0, tzinfo=timezone.utc),
         )
 
         self.assertFalse(should_dispatch)
@@ -483,8 +568,6 @@ class FundamentalReuseServiceTests(unittest.TestCase):
             has_retryable_feedback_gap=False,
             input_fingerprint='sha256:new',
             stored_input_fingerprint='sha256:old',
-            latest_source_updated_at=None,
-            feedback_received_at=datetime(2026, 4, 15, 1, 0, tzinfo=timezone.utc),
         )
 
         self.assertTrue(should_dispatch)
