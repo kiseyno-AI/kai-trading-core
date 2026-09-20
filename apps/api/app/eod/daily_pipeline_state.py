@@ -27,6 +27,7 @@ from app.db_models import (
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_marker_is_valid,
 )
 from app.repositories.eod_run_repository import (
     eod_collection_advisory_lock_keys,
@@ -2531,10 +2532,15 @@ class DailyPipelineRunStateService:
                 stage_id: str(persisted_stage_outcomes[stage_id]['status'])
                 for stage_id in resolved_stages
             }
+            outcome_is_satisfied = (
+                daily_pipeline_prefix_outcome_is_satisfied
+                if terminal_continuation_marker_is_valid(metadata)
+                else daily_pipeline_outcome_is_satisfied
+            )
             incomplete_stages = {
                 stage_id: status
                 for stage_id, status in stage_statuses.items()
-                if not daily_pipeline_outcome_is_satisfied(
+                if not outcome_is_satisfied(
                     persisted_stage_outcomes[stage_id]
                 )
             }

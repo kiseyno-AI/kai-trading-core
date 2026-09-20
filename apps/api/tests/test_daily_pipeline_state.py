@@ -676,6 +676,187 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(run.updated_at, completed_at)
         self.assertEqual(run.run_metadata, metadata)
 
+    def test_converge_terminal_continuation_accepts_ready_enrichment_warning(
+        self,
+    ) -> None:
+        completed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+        finalized_at = completed_at + timedelta(seconds=1)
+        run = SimpleNamespace(
+            id=456,
+            status='completed',
+            error_message=None,
+            completed_at=completed_at,
+            updated_at=completed_at,
+            run_metadata={
+                'resolved_stages': [
+                    'pykrx_enrichment',
+                    'signal_decider',
+                ],
+                'resumable': True,
+                'terminal_continuation_count': 1,
+                'terminal_continuation_version': 1,
+                'terminal_continuation_reason': (
+                    'summary_knowledge_cutoff_repair'
+                ),
+                'terminal_continuation_claimed_at': (
+                    '2026-09-20T08:55:00+00:00'
+                ),
+                'terminal_continuation_evidence': {},
+                'resume_from_stage': 'agent_feedback_summaries',
+            },
+        )
+        enrichment = SimpleNamespace(
+            stage_id='pykrx_enrichment',
+            status='completed',
+            processed=3,
+            total=3,
+            succeeded=2,
+            failed=1,
+            remaining=0,
+            completed_at=completed_at - timedelta(minutes=1),
+            error_message=None,
+            details={
+                'result_summary': {
+                    'status': 'completed',
+                    'point_in_time_recovery': True,
+                    'categories_requested': [
+                        'sector_classification',
+                        'investor_flow_symbol',
+                        'short_selling',
+                    ],
+                    'categories': {
+                        'sector_classification': {
+                            'status': 'completed',
+                            'rows_persisted': 10,
+                            'errors': [],
+                        },
+                        'investor_flow_symbol': {
+                            'status': 'completed',
+                            'rows_persisted': 10,
+                            'errors': [],
+                        },
+                        'short_selling': {
+                            'status': 'partial',
+                            'rows_persisted': 10,
+                            'errors': ['empty provider frame'],
+                        },
+                    },
+                    'downstream_preflight': {
+                        'allowed': True,
+                        'status': 'ready',
+                        'required_categories': [
+                            'sector_classification',
+                            'investor_flow_symbol',
+                            'short_selling',
+                        ],
+                        'category_row_counts': {
+                            'sector_classification': 10,
+                            'investor_flow_symbol': 10,
+                            'short_selling': 10,
+                        },
+                        'failed_categories': [],
+                        'blocked_categories': [],
+                        'waiting_categories': [],
+                        'zero_coverage_categories': [],
+                    },
+                }
+            },
+        )
+        stages = [
+            enrichment,
+            SimpleNamespace(
+                stage_id='signal_decider',
+                status='completed',
+                processed=1,
+                total=1,
+                succeeded=1,
+                failed=0,
+                remaining=0,
+                completed_at=completed_at,
+                error_message=None,
+                details={'result_summary': {'status': 'completed'}},
+            ),
+        ]
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stages_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=finalized_at,
+            ),
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .converge_terminal_stages_run(
+                    pipeline_run_id=456,
+                    allow_satisfied_terminal=True,
+                )
+            )
+
+        self.assertTrue(result['updated'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertFalse(run.run_metadata['resumable'])
+        self.assertEqual(run.updated_at, finalized_at)
+
+        unmarked_run = SimpleNamespace(
+            id=457,
+            status='completed',
+            error_message=None,
+            completed_at=completed_at,
+            updated_at=completed_at,
+            run_metadata={
+                'resolved_stages': [
+                    'pykrx_enrichment',
+                    'signal_decider',
+                ],
+                'resumable': True,
+            },
+        )
+        unmarked_run_result = MagicMock()
+        unmarked_run_result.scalar_one_or_none.return_value = unmarked_run
+        unmarked_stages_result = MagicMock()
+        unmarked_stages_result.scalars.return_value = stages
+        unmarked_session = MagicMock()
+        unmarked_session.execute.side_effect = [
+            unmarked_run_result,
+            unmarked_stages_result,
+        ]
+        unmarked_context = MagicMock()
+        unmarked_context.__enter__.return_value = unmarked_session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=unmarked_context,
+        ):
+            unmarked_result = (
+                DailyPipelineRunStateService()
+                .converge_terminal_stages_run(
+                    pipeline_run_id=457,
+                    allow_satisfied_terminal=True,
+                )
+            )
+
+        self.assertFalse(unmarked_result['updated'])
+        self.assertEqual(
+            unmarked_result['reason'],
+            'resolved_stages_incomplete',
+        )
+        self.assertEqual(
+            unmarked_result['incomplete_stages'],
+            {'pykrx_enrichment': 'completed'},
+        )
+
     def test_converge_terminal_stages_run_derives_skipped_when_all_stages_skipped(
         self,
     ) -> None:

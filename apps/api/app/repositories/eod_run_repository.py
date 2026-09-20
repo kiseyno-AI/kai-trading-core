@@ -19,7 +19,11 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
-from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_marker_is_valid,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -682,6 +686,24 @@ def _load_pipeline_recovery_candidates(
             ),
             metadata['resumable'].as_boolean().label('resumable'),
             metadata['resolved_stages'].label('resolved_stages'),
+            metadata['terminal_continuation_count']
+            .as_integer()
+            .label('terminal_continuation_count'),
+            metadata['terminal_continuation_version']
+            .as_integer()
+            .label('terminal_continuation_version'),
+            metadata['terminal_continuation_reason']
+            .as_string()
+            .label('terminal_continuation_reason'),
+            metadata['terminal_continuation_claimed_at']
+            .as_string()
+            .label('terminal_continuation_claimed_at'),
+            metadata['terminal_continuation_evidence'].label(
+                'terminal_continuation_evidence'
+            ),
+            metadata['resume_from_stage']
+            .as_string()
+            .label('resume_from_stage'),
         )
         .where(DailyPipelineRun.market_date.in_(tuple(market_dates)))
         .order_by(
@@ -707,6 +729,22 @@ def _load_pipeline_recovery_candidates(
                 ),
                 'resumable': row.resumable,
                 'resolved_stages': row.resolved_stages,
+                'terminal_continuation_count': (
+                    row.terminal_continuation_count
+                ),
+                'terminal_continuation_version': (
+                    row.terminal_continuation_version
+                ),
+                'terminal_continuation_reason': (
+                    row.terminal_continuation_reason
+                ),
+                'terminal_continuation_claimed_at': (
+                    row.terminal_continuation_claimed_at
+                ),
+                'terminal_continuation_evidence': (
+                    row.terminal_continuation_evidence
+                ),
+                'resume_from_stage': row.resume_from_stage,
             },
         )
         for row in rows
@@ -785,6 +823,8 @@ def _pipeline_stage_outcome(stage_row: DailyPipelineStageRun) -> dict[str, Any]:
         'total': int(stage_row.total or 0),
         'succeeded': int(stage_row.succeeded or 0),
         'failed': int(stage_row.failed or 0),
+        'remaining': int(stage_row.remaining or 0),
+        'completed_at': stage_row.completed_at,
         'error_message': stage_row.error_message,
         'details': (
             stage_row.details if isinstance(stage_row.details, dict) else {}
@@ -835,8 +875,13 @@ def _followup_recovery_is_satisfied_for_convergence(
     }
     if any(stage_id not in stage_rows_by_id for stage_id in resolved_stages):
         return False
+    outcome_is_satisfied = (
+        daily_pipeline_prefix_outcome_is_satisfied
+        if terminal_continuation_marker_is_valid(metadata)
+        else daily_pipeline_outcome_is_satisfied
+    )
     return all(
-        daily_pipeline_outcome_is_satisfied(
+        outcome_is_satisfied(
             _pipeline_stage_outcome(stage_rows_by_id[stage_id])
         )
         for stage_id in resolved_stages

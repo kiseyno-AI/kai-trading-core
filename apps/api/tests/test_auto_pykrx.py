@@ -4564,6 +4564,62 @@ class PykrxBackfillServiceTests(TestCase):
             stage_id: {'status': 'completed'}
             for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
         }
+        stage_rows['pykrx_enrichment'] = {
+            'status': 'completed',
+            'processed': 3,
+            'total': 3,
+            'succeeded': 2,
+            'failed': 1,
+            'remaining': 0,
+            'completed_at': '2026-04-03T07:59:00+00:00',
+            'error_message': None,
+            'details': {
+                'result_summary': {
+                    'status': 'completed',
+                    'point_in_time_recovery': True,
+                    'categories_requested': [
+                        'sector_classification',
+                        'investor_flow_symbol',
+                        'short_selling',
+                    ],
+                    'categories': {
+                        'sector_classification': {
+                            'status': 'completed',
+                            'rows_persisted': 10,
+                            'errors': [],
+                        },
+                        'investor_flow_symbol': {
+                            'status': 'completed',
+                            'rows_persisted': 10,
+                            'errors': [],
+                        },
+                        'short_selling': {
+                            'status': 'partial',
+                            'rows_persisted': 10,
+                            'errors': ['empty provider frame'],
+                        },
+                    },
+                    'downstream_preflight': {
+                        'allowed': True,
+                        'status': 'ready',
+                        'required_categories': [
+                            'sector_classification',
+                            'investor_flow_symbol',
+                            'short_selling',
+                        ],
+                        'category_row_counts': {
+                            'sector_classification': 10,
+                            'investor_flow_symbol': 10,
+                            'short_selling': 10,
+                        },
+                        'failed_categories': [],
+                        'blocked_categories': [],
+                        'waiting_categories': [],
+                        'zero_coverage_categories': [],
+                    },
+                }
+            },
+        }
         latest_pipeline_run = {
             'id': 92,
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
@@ -4573,6 +4629,16 @@ class PykrxBackfillServiceTests(TestCase):
             'run_metadata': {
                 'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
                 'reused_eod_collection_run_id': 7,
+                'terminal_continuation_count': 1,
+                'terminal_continuation_version': 1,
+                'terminal_continuation_reason': (
+                    'summary_knowledge_cutoff_repair'
+                ),
+                'terminal_continuation_claimed_at': (
+                    '2026-04-03T07:30:00+00:00'
+                ),
+                'terminal_continuation_evidence': {},
+                'resume_from_stage': 'agent_feedback_summaries',
             },
             'stages': stage_rows,
         }

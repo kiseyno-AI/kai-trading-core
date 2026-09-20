@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 
@@ -108,6 +109,37 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def terminal_continuation_marker_is_valid(
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    """Recognize only the one-shot terminal continuation claim shape."""
+
+    if not isinstance(metadata, Mapping):
+        return False
+    claimed_at = metadata.get('terminal_continuation_claimed_at')
+    try:
+        parsed_claimed_at = datetime.fromisoformat(
+            str(claimed_at or '').strip().replace('Z', '+00:00')
+        )
+    except ValueError:
+        return False
+    if parsed_claimed_at.tzinfo is None:
+        parsed_claimed_at = parsed_claimed_at.replace(tzinfo=timezone.utc)
+    return bool(
+        _optional_int(metadata.get('terminal_continuation_count')) == 1
+        and _optional_int(metadata.get('terminal_continuation_version')) == 1
+        and str(metadata.get('terminal_continuation_reason') or '').strip()
+        == 'summary_knowledge_cutoff_repair'
+        and str(metadata.get('resume_from_stage') or '').strip()
+        == 'agent_feedback_summaries'
+        and parsed_claimed_at.tzinfo is not None
+        and isinstance(
+            metadata.get('terminal_continuation_evidence'),
+            Mapping,
+        )
+    )
 
 
 def _first_nonnegative_int(
