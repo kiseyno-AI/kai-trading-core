@@ -1764,10 +1764,17 @@ class DailyPipelineStageService:
                 categories=REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
             )
             result['downstream_preflight'] = preflight
+            result_status = str(
+                result.get('status') or ''
+            ).strip().lower()
             if (
+                result_status == 'partial'
+                and pykrx_enrichment_preflight_is_ready(preflight)
+            ):
+                result['status'] = 'completed'
+            elif (
                 not preflight.get('allowed')
-                and str(result.get('status') or '').strip().lower()
-                not in {'failed', 'blocked', 'waiting'}
+                and result_status not in {'failed', 'blocked', 'waiting'}
             ):
                 result['status'] = 'partial'
             return result
