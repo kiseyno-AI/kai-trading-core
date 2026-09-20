@@ -1696,6 +1696,31 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             ),
         )
 
+        with self.session_factory.begin() as session:
+            terminal_run = session.get(DailyPipelineRun, terminal_run_id)
+            terminal_run.run_metadata = {
+                **terminal_run.run_metadata,
+                'terminal_continuation_resume_count': 2,
+                'terminal_continuation_resumed_from_status': 'interrupted',
+            }
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            repeated_restart_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertEqual(
+            repeated_restart_target,
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=eod_run_id,
+            ),
+        )
+
         for invalid_resume_count, invalid_origin in (
             (2, 'failed'),
             (1, 'running'),

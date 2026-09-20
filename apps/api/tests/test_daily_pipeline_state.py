@@ -3471,6 +3471,60 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             2,
         )
 
+        second_interrupted_at = interrupted_at + timedelta(minutes=32)
+        run.status = 'interrupted'
+        run.current_stage = 'signal_decider'
+        run.updated_at = second_interrupted_at
+        run.completed_at = second_interrupted_at
+        run.error_message = 'Core restarted again.'
+        run.run_metadata.update(
+            {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted again.',
+                'interrupted_at': second_interrupted_at.isoformat(),
+            }
+        )
+        decider_stage.status = 'interrupted'
+        decider_stage.current_step = 'core_restart_interrupted'
+        decider_stage.updated_at = second_interrupted_at
+        decider_stage.completed_at = second_interrupted_at
+        decider_stage.error_message = 'Core restarted again.'
+        decider_stage.details = {
+            'resumable': True,
+            'interrupted_reason': 'Core restarted again.',
+        }
+        second_restart_session = build_resume_session(lease_child)
+        second_restart_context = MagicMock()
+        second_restart_context.__enter__.return_value = (
+            second_restart_session
+        )
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=second_restart_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=(
+                    second_interrupted_at + timedelta(minutes=31)
+                ),
+            ),
+        ):
+            second_restart_result = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertTrue(second_restart_result['claimed'])
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_resume_count'],
+            3,
+        )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_resumed_from_status'],
+            'interrupted',
+        )
+
         decider_stage.status = 'failed'
         decider_stage.processed = 2
         decider_stage.total = 2
