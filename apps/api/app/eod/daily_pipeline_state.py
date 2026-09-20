@@ -24,7 +24,10 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
-from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_prefix_outcome_is_satisfied,
+)
 from app.repositories.eod_run_repository import (
     eod_collection_advisory_lock_keys,
 )
@@ -240,6 +243,8 @@ def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
         'total': _as_int(getattr(stage_row, 'total', 0)),
         'succeeded': _as_int(getattr(stage_row, 'succeeded', 0)),
         'failed': _as_int(getattr(stage_row, 'failed', 0)),
+        'remaining': _as_int(getattr(stage_row, 'remaining', 0)),
+        'completed_at': getattr(stage_row, 'completed_at', None),
         'error_message': getattr(stage_row, 'error_message', None),
         'details': (
             getattr(stage_row, 'details', {})
@@ -1257,7 +1262,7 @@ class DailyPipelineRunStateService:
             incomplete_prefix_stages = [
                 stage_id
                 for stage_id in resolved_stages[:resume_index]
-                if not daily_pipeline_outcome_is_satisfied(
+                if not daily_pipeline_prefix_outcome_is_satisfied(
                     _stage_row_outcome(stage_rows_by_id[stage_id])
                 )
             ]
@@ -1786,7 +1791,7 @@ class DailyPipelineRunStateService:
 
         resume_index = resolved_stages.index(normalized_resume_stage)
         if any(
-            not daily_pipeline_outcome_is_satisfied(
+            not daily_pipeline_prefix_outcome_is_satisfied(
                 _stage_row_outcome(stage_rows_by_id[stage_id])
             )
             for stage_id in resolved_stages[:resume_index]

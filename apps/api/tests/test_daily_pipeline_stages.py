@@ -1929,6 +1929,104 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
+    def test_extract_stage_counts_treats_ready_enrichment_warning_as_success(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='pykrx_enrichment',
+            result={
+                'categories_requested': [
+                    'sector_classification',
+                    'short_selling',
+                ],
+                'categories': {
+                    'sector_classification': {
+                        'status': 'completed',
+                        'rows_persisted': 10,
+                        'errors': [],
+                    },
+                    'short_selling': {
+                        'status': 'partial',
+                        'rows_persisted': 10,
+                        'errors': [
+                            {
+                                'operation': 'short_selling_balance',
+                                'error': 'empty provider frame',
+                            }
+                        ],
+                    },
+                },
+                'downstream_preflight': {
+                    'allowed': True,
+                    'status': 'ready',
+                    'required_categories': [
+                        'sector_classification',
+                        'investor_flow_symbol',
+                        'short_selling',
+                    ],
+                    'category_row_counts': {
+                        'sector_classification': 10,
+                        'investor_flow_symbol': 10,
+                        'short_selling': 10,
+                    },
+                    'failed_categories': [],
+                    'blocked_categories': [],
+                    'waiting_categories': [],
+                    'zero_coverage_categories': [],
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 2,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_keeps_preflight_failed_enrichment_failed(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='pykrx_enrichment',
+            result={
+                'categories_requested': [
+                    'sector_classification',
+                    'short_selling',
+                ],
+                'categories': {
+                    'sector_classification': {
+                        'status': 'completed',
+                        'rows_persisted': 10,
+                        'errors': [],
+                    },
+                    'short_selling': {
+                        'status': 'partial',
+                        'rows_persisted': 10,
+                        'errors': ['coverage incomplete'],
+                    },
+                },
+                'downstream_preflight': {
+                    'allowed': False,
+                    'status': 'blocked',
+                    'failed_categories': ['short_selling'],
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 1,
+                'failed': 1,
+            },
+        )
+
     def test_build_stage_run_details_marks_external_news_total_as_lower_bound(self) -> None:
         details = DailyPipelineStageService._build_stage_run_details(
             stage_id='external_news_enrich',

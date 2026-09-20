@@ -2204,6 +2204,116 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertIn('reused_eod_collection_run_id', compiled.params.values())
         self.assertIn(7, compiled.params.values())
 
+    def test_claim_terminal_continuation_accepts_ready_enrichment_warning(
+        self,
+    ) -> None:
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        enrichment = stages[0]
+        enrichment.processed = 3
+        enrichment.total = 3
+        enrichment.succeeded = 2
+        enrichment.failed = 1
+        enrichment.details = {
+            'result_summary': {
+                'status': 'completed',
+                'point_in_time_recovery': True,
+                'categories_requested': [
+                    'sector_classification',
+                    'investor_flow_symbol',
+                    'short_selling',
+                ],
+                'categories': {
+                    'sector_classification': {
+                        'status': 'completed',
+                        'rows_persisted': 10,
+                        'errors': [],
+                    },
+                    'investor_flow_symbol': {
+                        'status': 'completed',
+                        'rows_persisted': 10,
+                        'errors': [],
+                    },
+                    'short_selling': {
+                        'status': 'partial',
+                        'rows_persisted': 10,
+                        'errors': ['empty provider frame'],
+                    },
+                },
+                'downstream_preflight': {
+                    'allowed': True,
+                    'status': 'ready',
+                    'required_categories': [
+                        'sector_classification',
+                        'investor_flow_symbol',
+                        'short_selling',
+                    ],
+                    'category_row_counts': {
+                        'sector_classification': 10,
+                        'investor_flow_symbol': 10,
+                        'short_selling': 10,
+                    },
+                    'failed_categories': [],
+                    'blocked_categories': [],
+                    'waiting_categories': [],
+                    'zero_coverage_categories': [],
+                },
+            }
+        }
+        run.run_metadata['repair_checkpoint_pipeline_run_id'] = 440
+
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = (
+            self._terminal_continuation_lineage()
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=datetime(
+                    2026,
+                    9,
+                    20,
+                    9,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            ),
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(result['claimed'])
+        self.assertEqual(result['pipeline_run_id'], 456)
+        self.assertEqual(run.status, 'running')
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_count'],
+            1,
+        )
+
     def test_claim_terminal_continuation_reopens_same_run_and_archives_suffix(
         self,
     ) -> None:

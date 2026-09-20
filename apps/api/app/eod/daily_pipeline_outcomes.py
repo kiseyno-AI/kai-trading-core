@@ -38,10 +38,48 @@ SATISFIED_DEPENDENCY_SKIP_REASONS: frozenset[str] = frozenset(
         'next_open_window_expired',
     }
 )
+PYKRX_ENRICHMENT_REQUIRED_CATEGORIES: frozenset[str] = frozenset(
+    {
+        'sector_classification',
+        'investor_flow_symbol',
+        'short_selling',
+    }
+)
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def pykrx_enrichment_preflight_is_ready(
+    preflight: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether persisted enrichment proves all required gates ready."""
+
+    if not isinstance(preflight, Mapping):
+        return False
+    required_categories = preflight.get('required_categories')
+    category_row_counts = preflight.get('category_row_counts')
+    return bool(
+        preflight.get('allowed') is True
+        and str(preflight.get('status') or '').strip().lower() == 'ready'
+        and isinstance(required_categories, list)
+        and all(
+            isinstance(category, str) and category.strip()
+            for category in required_categories
+        )
+        and set(required_categories)
+        == PYKRX_ENRICHMENT_REQUIRED_CATEGORIES
+        and isinstance(category_row_counts, Mapping)
+        and all(
+            (_optional_int(category_row_counts.get(category)) or 0) > 0
+            for category in PYKRX_ENRICHMENT_REQUIRED_CATEGORIES
+        )
+        and preflight.get('failed_categories') == []
+        and preflight.get('blocked_categories') == []
+        and preflight.get('waiting_categories') == []
+        and preflight.get('zero_coverage_categories') == []
+    )
 
 
 def _payloads(outcome: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
@@ -390,3 +428,98 @@ def daily_pipeline_outcome_is_satisfied(
         return True
     reasons = _skip_reasons(outcome)
     return bool(reasons) and reasons <= SATISFIED_DEPENDENCY_SKIP_REASONS
+
+
+def daily_pipeline_prefix_outcome_is_satisfied(
+    outcome: Mapping[str, Any] | None,
+) -> bool:
+    """Accept a ready enrichment warning only as terminal-prefix evidence.
+
+    Older enrichment rows counted a provider warning as ``failed=1`` even
+    when every required downstream category had positive, ready coverage.
+    Keep the generic outcome contract strict and admit only that fully
+    evidenced legacy shape while resuming a later terminal suffix.
+    """
+
+    if daily_pipeline_outcome_is_satisfied(outcome):
+        return True
+    if not isinstance(outcome, Mapping):
+        return False
+    payloads = _payloads(outcome)
+    if 'pykrx_enrichment' not in _stage_ids(payloads):
+        return False
+    if (
+        str(outcome.get('status') or '').strip().lower() != 'completed'
+        or str(outcome.get('error_message') or '').strip()
+        or not outcome.get('completed_at')
+    ):
+        return False
+
+    processed = _optional_int(outcome.get('processed'))
+    total = _optional_int(outcome.get('total'))
+    succeeded = _optional_int(outcome.get('succeeded'))
+    failed = _optional_int(outcome.get('failed'))
+    remaining = _optional_int(outcome.get('remaining'))
+    if not (
+        total is not None
+        and total > 0
+        and processed == total
+        and succeeded is not None
+        and failed is not None
+        and failed > 0
+        and succeeded + failed == total
+        and remaining == 0
+    ):
+        return False
+
+    result_summary = _mapping(
+        _mapping(outcome.get('details')).get('result_summary')
+    )
+    if (
+        str(result_summary.get('status') or '').strip().lower()
+        != 'completed'
+        or result_summary.get('point_in_time_recovery') is not True
+    ):
+        return False
+    requested = result_summary.get('categories_requested')
+    categories = result_summary.get('categories')
+    if (
+        not isinstance(requested, list)
+        or not requested
+        or not all(
+            isinstance(category, str) and category.strip()
+            for category in requested
+        )
+        or len(requested) != len(set(requested))
+        or not isinstance(categories, Mapping)
+        or set(requested) != set(categories)
+        or total != len(requested)
+    ):
+        return False
+
+    warning_categories: set[str] = set()
+    for category in requested:
+        details = categories.get(category)
+        if not isinstance(details, Mapping):
+            return False
+        category_status = str(details.get('status') or '').strip().lower()
+        rows_persisted = _optional_int(details.get('rows_persisted'))
+        if (
+            category_status not in {'completed', 'partial'}
+            or rows_persisted is None
+            or rows_persisted <= 0
+        ):
+            return False
+        errors = details.get('errors')
+        if isinstance(errors, (list, tuple)) and errors:
+            warning_categories.add(category)
+            if category_status != 'partial':
+                return False
+    if len(warning_categories) != failed:
+        return False
+
+    if not pykrx_enrichment_preflight_is_ready(
+        _mapping(result_summary.get('downstream_preflight'))
+    ):
+        return False
+    return True

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from unittest.mock import patch
 
 import pytest
 
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_prefix_outcome_is_satisfied,
 )
 from app.eod.pykrx_backfill import PykrxBackfillService
 
@@ -25,6 +27,57 @@ def _partial_outcome(
     }
 
 
+def _ready_enrichment_warning_outcome() -> dict:
+    categories = {
+        'sector_classification': {
+            'status': 'completed',
+            'rows_persisted': 10,
+            'errors': [],
+        },
+        'investor_flow_symbol': {
+            'status': 'completed',
+            'rows_persisted': 10,
+            'errors': [],
+        },
+        'short_selling': {
+            'status': 'partial',
+            'rows_persisted': 10,
+            'errors': ['empty provider frame'],
+        },
+    }
+    return {
+        'stage': 'pykrx_enrichment',
+        'status': 'completed',
+        'processed': 3,
+        'total': 3,
+        'succeeded': 2,
+        'failed': 1,
+        'remaining': 0,
+        'completed_at': '2026-04-03T08:00:00+00:00',
+        'error_message': None,
+        'details': {
+            'result_summary': {
+                'status': 'completed',
+                'point_in_time_recovery': True,
+                'categories_requested': list(categories),
+                'categories': categories,
+                'downstream_preflight': {
+                    'allowed': True,
+                    'status': 'ready',
+                    'required_categories': list(categories),
+                    'category_row_counts': {
+                        category: 10 for category in categories
+                    },
+                    'failed_categories': [],
+                    'blocked_categories': [],
+                    'waiting_categories': [],
+                    'zero_coverage_categories': [],
+                },
+            }
+        },
+    }
+
+
 def test_terminal_high_coverage_partial_is_satisfied() -> None:
     outcome = _partial_outcome(
         succeeded=999,
@@ -33,6 +86,44 @@ def test_terminal_high_coverage_partial_is_satisfied() -> None:
     )
 
     assert daily_pipeline_outcome_is_satisfied(outcome) is True
+
+
+def test_ready_enrichment_warning_is_only_satisfied_as_prefix_evidence(
+) -> None:
+    outcome = _ready_enrichment_warning_outcome()
+
+    assert daily_pipeline_outcome_is_satisfied(outcome) is False
+    assert daily_pipeline_prefix_outcome_is_satisfied(outcome) is True
+
+
+@pytest.mark.parametrize(
+    ('path', 'value'),
+    [
+        (('downstream_preflight', 'allowed'), False),
+        (('downstream_preflight', 'blocked_categories'), ['short_selling']),
+        (
+            ('downstream_preflight', 'category_row_counts'),
+            {
+                'sector_classification': 10,
+                'investor_flow_symbol': 10,
+                'short_selling': 0,
+            },
+        ),
+        (('downstream_preflight', 'required_categories'), []),
+        (('outcome', 'error_message'), 'provider failed'),
+    ],
+)
+def test_enrichment_warning_prefix_evidence_fails_closed(
+    path: tuple[str, str],
+    value: object,
+) -> None:
+    outcome = deepcopy(_ready_enrichment_warning_outcome())
+    if path[0] == 'outcome':
+        outcome[path[1]] = value
+    else:
+        outcome['details']['result_summary'][path[0]][path[1]] = value
+
+    assert daily_pipeline_prefix_outcome_is_satisfied(outcome) is False
 
 
 @pytest.mark.parametrize(

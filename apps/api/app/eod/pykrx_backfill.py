@@ -13,7 +13,10 @@ from zoneinfo import ZoneInfo
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
-from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_prefix_outcome_is_satisfied,
+)
 from app.eod.master import get_master_symbols
 from app.eod.market_membership import (
     build_market_membership_snapshot,
@@ -700,7 +703,7 @@ def _is_terminal_followup_continuation_candidate(
         stage = stages.get(stage_id)
         if not isinstance(stage, Mapping):
             return False
-        if not daily_pipeline_outcome_is_satisfied(
+        if not daily_pipeline_prefix_outcome_is_satisfied(
             {**dict(stage), 'stage': stage_id}
         ):
             return False

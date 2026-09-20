@@ -5681,6 +5681,73 @@ class PykrxBackfillServiceTests(TestCase):
                 {'status': 'completed', 'failed': 1},
                 False,
             ),
+            (
+                'completed enrichment with a nonfatal provider warning',
+                'pykrx_enrichment',
+                {
+                    'status': 'completed',
+                    'processed': 3,
+                    'total': 3,
+                    'succeeded': 2,
+                    'failed': 1,
+                    'remaining': 0,
+                    'completed_at': '2026-04-03T08:00:00+00:00',
+                    'details': {
+                        'result_summary': {
+                            'status': 'completed',
+                            'point_in_time_recovery': True,
+                            'categories_requested': [
+                                'sector_classification',
+                                'investor_flow_symbol',
+                                'short_selling',
+                            ],
+                            'categories': {
+                                'sector_classification': {
+                                    'status': 'completed',
+                                    'rows_persisted': 10,
+                                    'errors': [],
+                                },
+                                'investor_flow_symbol': {
+                                    'status': 'completed',
+                                    'rows_persisted': 10,
+                                    'errors': [],
+                                },
+                                'short_selling': {
+                                    'status': 'partial',
+                                    'rows_persisted': 10,
+                                    'errors': [
+                                        {
+                                            'operation': (
+                                                'short_selling_balance'
+                                            ),
+                                            'error': 'empty provider frame',
+                                        }
+                                    ],
+                                },
+                            },
+                            'downstream_preflight': {
+                                'allowed': True,
+                                'status': 'ready',
+                                'required_categories': [
+                                    'sector_classification',
+                                    'investor_flow_symbol',
+                                    'short_selling',
+                                ],
+                                'category_row_counts': {
+                                    'sector_classification': 10,
+                                    'investor_flow_symbol': 10,
+                                    'short_selling': 10,
+                                },
+                                'failed_categories': [],
+                                'blocked_categories': [],
+                                'waiting_categories': [],
+                                'zero_coverage_categories': [],
+                            },
+                        }
+                    },
+                },
+                True,
+            ),
         )
 
         for label, prefix_stage_id, prefix_outcome, expected in cases:
