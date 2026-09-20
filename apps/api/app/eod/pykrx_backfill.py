@@ -274,7 +274,7 @@ def _is_retryable_missing_upstream_decider_failure(stage: object) -> bool:
     if failed_items <= 0:
         return False
 
-    group = next(iter(failure_groups.values()))
+    group = failure_groups.get('dependency/missing-upstream')
     if not isinstance(group, Mapping):
         return False
     try:
@@ -289,7 +289,11 @@ def _is_retryable_missing_upstream_decider_failure(stage: object) -> bool:
         if str(item or '').strip()
     } if isinstance(failure_kinds, (list, tuple, set)) else set()
     return (
-        group_count == failed_items
+        str(group.get('failure_status') or '').strip().lower()
+        == 'dependency/missing-upstream'
+        and str(group.get('failure_category') or '').strip().lower()
+        == 'dependency'
+        and group_count == failed_items
         and retryable_count == failed_items
         and normalized_failure_kinds == {'dependency_missing_upstream'}
     )
@@ -304,8 +308,9 @@ def _is_terminal_followup_continuation_candidate(
         return False
     if pipeline_run.get('trigger') != AUTO_FOLLOWUP_RECOVERY_TRIGGER:
         return False
-    if str(pipeline_run.get('status') or '').strip().lower() != 'blocked':
-        return False
+    pipeline_status = str(
+        pipeline_run.get('status') or ''
+    ).strip().lower()
     run_metadata = pipeline_run.get('run_metadata')
     if not isinstance(run_metadata, Mapping):
         return False
@@ -315,7 +320,115 @@ def _is_terminal_followup_continuation_candidate(
         )
     except (TypeError, ValueError):
         return False
-    if continuation_count != 0:
+
+    def evidence_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    terminal_evidence: Mapping[str, Any] | None = None
+    evidence_suffix: Mapping[str, Any] | None = None
+    if pipeline_status == 'blocked' and continuation_count == 0:
+        pass
+    elif (
+        pipeline_status in {'running', 'interrupted'}
+        and continuation_count == 1
+    ):
+        terminal_evidence = (
+            run_metadata.get('terminal_continuation_evidence')
+            if isinstance(
+                run_metadata.get('terminal_continuation_evidence'),
+                Mapping,
+            )
+            else None
+        )
+        evidence_suffix = (
+            terminal_evidence.get('suffix_stages')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('suffix_stages'), Mapping)
+            else None
+        )
+        parent_evidence = (
+            terminal_evidence.get('parent')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('parent'), Mapping)
+            else {}
+        )
+        lineage_evidence = (
+            terminal_evidence.get('lineage')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('lineage'), Mapping)
+            else {}
+        )
+        summary_proof = (
+            terminal_evidence.get('summary_proof')
+            if isinstance(terminal_evidence, Mapping)
+            and isinstance(terminal_evidence.get('summary_proof'), Mapping)
+            else {}
+        )
+        ordered_run_ids = lineage_evidence.get(
+            'ordered_pipeline_run_ids'
+        )
+        if not (
+            run_metadata.get('terminal_continuation_version') == 1
+            and str(
+                run_metadata.get('terminal_continuation_reason') or ''
+            ).strip()
+            == 'summary_knowledge_cutoff_repair'
+            and str(run_metadata.get('resume_from_stage') or '').strip()
+            == TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            and _parse_activity_datetime(
+                run_metadata.get('terminal_continuation_claimed_at')
+            )
+            is not None
+            and str(pipeline_run.get('current_stage') or '').strip()
+            == TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            and str(parent_evidence.get('status') or '').strip().lower()
+            == 'blocked'
+            and str(parent_evidence.get('current_stage') or '').strip()
+            == 'signal_decider_evaluations'
+            and isinstance(evidence_suffix, Mapping)
+            and set(evidence_suffix)
+            == set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+            and evidence_int(
+                lineage_evidence.get('reused_eod_collection_run_id')
+            )
+            == evidence_int(
+                run_metadata.get('reused_eod_collection_run_id')
+            )
+            and evidence_int(lineage_evidence.get('expected_run_count'))
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(lineage_evidence.get('observed_run_count'))
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(lineage_evidence.get('target_ordinal'))
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(lineage_evidence.get('latest_pipeline_run_id'))
+            == evidence_int(pipeline_run.get('id'))
+            and isinstance(ordered_run_ids, (list, tuple))
+            and len(ordered_run_ids)
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and evidence_int(ordered_run_ids[-1])
+            == evidence_int(pipeline_run.get('id'))
+            and summary_proof.get('ready') is True
+            and str(summary_proof.get('source_run_id') or '').strip()
+            and _parse_activity_datetime(
+                summary_proof.get('knowledge_cutoff_at')
+            )
+            is not None
+            and str(
+                summary_proof.get('feedback_scope_mode') or ''
+            ).strip()
+            == 'broad_feedback_universe'
+            and evidence_int(
+                summary_proof.get('requested_symbol_count')
+            )
+            == len(_dedupe_symbol_codes(run_metadata.get('symbols') or []))
+            and summary_proof.get('requested_symbols')
+            == _dedupe_symbol_codes(run_metadata.get('symbols') or [])
+        ):
+            return False
+    else:
         return False
     persisted_symbols = run_metadata.get('symbols')
     persisted_markets = run_metadata.get('markets')
@@ -340,28 +453,84 @@ def _is_terminal_followup_continuation_candidate(
     ):
         return False
 
-    summaries = stages.get('agent_feedback_summaries')
-    if not daily_pipeline_outcome_is_satisfied(
-        summaries if isinstance(summaries, Mapping) else {}
+    if evidence_suffix is not None:
+        for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+            live_stage = stages.get(stage_id)
+            if not isinstance(live_stage, Mapping) or not (
+                str(live_stage.get('status') or '').strip().lower()
+                == 'pending'
+                and str(live_stage.get('current_step') or '').strip()
+                == 'terminal_continuation_pending'
+                and evidence_int(live_stage.get('processed') or 0) == 0
+                and evidence_int(live_stage.get('total') or 0) == 0
+                and evidence_int(live_stage.get('succeeded') or 0) == 0
+                and evidence_int(live_stage.get('failed') or 0) == 0
+                and evidence_int(live_stage.get('remaining') or 0) == 0
+                and live_stage.get('completed_at') is None
+                and not str(live_stage.get('error_message') or '').strip()
+                and isinstance(
+                    live_stage.get('source_run_ids'), Mapping
+                )
+                and not live_stage.get('source_run_ids')
+                and isinstance(live_stage.get('details'), Mapping)
+                and not live_stage.get('details')
+            ):
+                return False
+
+    terminal_stages = evidence_suffix or stages
+    summaries = terminal_stages.get('agent_feedback_summaries')
+    if evidence_suffix is not None:
+        summary_source_run_ids = (
+            summaries.get('source_run_ids')
+            if isinstance(summaries, Mapping)
+            and isinstance(summaries.get('source_run_ids'), Mapping)
+            else {}
+        )
+        summary_source_ids = {
+            str(summary_source_run_ids.get(key) or '').strip()
+            for key in ('agent_feedback_run_id', 'run_id')
+            if str(summary_source_run_ids.get(key) or '').strip()
+        }
+        if summary_source_ids != {
+            str(summary_proof.get('source_run_id') or '').strip()
+        }:
+            return False
+    if (
+        not isinstance(summaries, Mapping)
+        or str(summaries.get('status') or '').strip().lower()
+        != 'completed'
+        or not daily_pipeline_outcome_is_satisfied(
+            summaries if isinstance(summaries, Mapping) else {}
+        )
     ):
         return False
     if not _is_retryable_missing_upstream_decider_failure(
-        stages.get('signal_decider')
+        terminal_stages.get('signal_decider')
     ):
         return False
 
-    plan = stages.get('next_open_execution_plan')
+    plan = terminal_stages.get('next_open_execution_plan')
     if not isinstance(plan, Mapping) or str(
         plan.get('status') or ''
     ).strip().lower() != 'blocked':
         return False
+    plan_summary = _stage_result_summary(plan)
     if (
-        str(_stage_result_summary(plan).get('reason') or '').strip()
+        str(plan_summary.get('reason') or '').strip()
         != 'signal_decider_stage_incomplete'
+        or str(plan_summary.get('status') or '')
+        .strip()
+        .lower()
+        != 'blocked'
+        or plan_summary.get('triggered') is not False
+        or str(
+            plan_summary.get('upstream_status') or ''
+        ).strip().lower()
+        != 'failed'
     ):
         return False
 
-    evaluations = stages.get('signal_decider_evaluations')
+    evaluations = terminal_stages.get('signal_decider_evaluations')
     if not isinstance(evaluations, Mapping) or str(
         evaluations.get('status') or ''
     ).strip().lower() != 'blocked':
@@ -370,16 +539,17 @@ def _is_terminal_followup_continuation_candidate(
     if (
         str(evaluation_summary.get('reason') or '').strip()
         != 'declared_dependencies_incomplete'
+        or str(evaluation_summary.get('status') or '')
+        .strip()
+        .lower()
+        != 'blocked'
+        or evaluation_summary.get('triggered') is not False
         or evaluation_summary.get('incomplete_dependencies')
         != ['signal_decider']
     ):
         return False
 
-    allowed_incomplete = {
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
-    }
+    allowed_incomplete = set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
     for stage_id in resolved_stages:
         if stage_id in allowed_incomplete:
             continue

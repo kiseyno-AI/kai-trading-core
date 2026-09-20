@@ -132,6 +132,12 @@ class _CutoffReuseSession:
 class _FundamentalCutoffReuseSession:
     def __init__(self):
         fingerprint = 'sha256:cutoff-visible'
+        fingerprint_payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': fingerprint,
+            'input': {'symbol': '005930'},
+        }
         feedback = SimpleNamespace(
             id=7,
             market_date=__import__('datetime').date.fromisoformat('2026-04-16'),
@@ -142,7 +148,7 @@ class _FundamentalCutoffReuseSession:
             feedback_payload={'summary': 'reusable'},
             context_payload={
                 'reuse_metadata': {
-                    'input_fingerprint': {'fingerprint': fingerprint}
+                    'input_fingerprint': fingerprint_payload
                 }
             },
             received_at=datetime(2026, 4, 16, 6, 32, tzinfo=timezone.utc),
@@ -421,7 +427,9 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         self.assertEqual(decision.input_fingerprint, 'sha256:materialized')
         db_rebuild.assert_not_called()
 
-    def test_same_day_matching_fingerprint_still_checks_source_update(self):
+    def test_same_day_matching_fingerprint_ignores_post_cutoff_source_update(
+        self,
+    ):
         service = AgentContextReuseService()
         post_cutoff_update = datetime(
             2026,
@@ -457,12 +465,42 @@ class FundamentalReuseServiceTests(unittest.TestCase):
                     },
                 )['005930']['fundamental-summarizer']
 
-        self.assertTrue(decision.should_dispatch)
-        self.assertEqual(decision.reason, 'source_updated')
+        self.assertFalse(decision.should_dispatch)
+        self.assertEqual(decision.reason, FUNDAMENTAL_SUMMARY_REUSE_REASON)
         self.assertEqual(
             decision.latest_source_updated_at,
             post_cutoff_update.isoformat(),
         )
+
+    def test_legacy_matching_hash_does_not_waive_source_update(self):
+        should_dispatch, reason = (
+            AgentContextReuseService._decide_fundamental_reuse(
+                force_recompute=False,
+                has_retryable_feedback_gap=False,
+                input_fingerprint='sha256:same',
+                stored_input_fingerprint='sha256:same',
+                latest_source_updated_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    7,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+                feedback_received_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    32,
+                    tzinfo=timezone.utc,
+                ),
+                materialized_fingerprint_match=False,
+            )
+        )
+
+        self.assertTrue(should_dispatch)
+        self.assertEqual(reason, 'source_updated')
 
     def test_db_fingerprint_builder_defaults_to_configured_fs_div(self):
         service = AgentContextReuseService()

@@ -784,10 +784,8 @@ class AgentContextReuseService:
                         or _extract_fingerprint_payload(latest_feedback.summary_payload)
                     )
                     stored_input_fingerprint = _fingerprint_value(stored_input_fingerprint_payload)
-                    has_prior_date_materialized_fundamental_match = bool(
+                    has_materialized_fundamental_match = bool(
                         role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME
-                        and isinstance(feedback_market_date, date)
-                        and feedback_market_date < normalized_market_date
                         and input_fingerprint
                         and input_fingerprint == stored_input_fingerprint
                         and isinstance(input_fingerprint_payload, Mapping)
@@ -810,6 +808,11 @@ class AgentContextReuseService:
                         )
                         == FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION
                     )
+                    has_prior_date_materialized_fundamental_match = bool(
+                        has_materialized_fundamental_match
+                        and isinstance(feedback_market_date, date)
+                        and feedback_market_date < normalized_market_date
+                    )
                     if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME:
                         should_dispatch, reason = self._decide_fundamental_reuse(
                             force_recompute=force_recompute,
@@ -819,7 +822,7 @@ class AgentContextReuseService:
                             latest_source_updated_at=latest_source_updated_at,
                             feedback_received_at=feedback_received_at,
                             materialized_fingerprint_match=(
-                                has_prior_date_materialized_fundamental_match
+                                has_materialized_fundamental_match
                             ),
                         )
                         if has_newer_failure:
