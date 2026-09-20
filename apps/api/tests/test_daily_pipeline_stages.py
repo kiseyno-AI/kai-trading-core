@@ -169,10 +169,14 @@ class _FakeTerminalContinuationRunStateService(_FakePipelineRunStateService):
         *,
         claimed: bool = True,
         claim_error: Exception | None = None,
+        persisted_stage_outcomes: dict | None = None,
     ) -> None:
         super().__init__()
         self.claimed = claimed
         self.claim_error = claim_error
+        self.persisted_stage_outcomes = dict(
+            persisted_stage_outcomes or {}
+        )
         self.claim_calls: list[dict] = []
         self.start_run_calls: list[dict] = []
         self.finish_calls: list[dict] = []
@@ -195,6 +199,7 @@ class _FakeTerminalContinuationRunStateService(_FakePipelineRunStateService):
             'claimed': True,
             'reason': kwargs['reason'],
             'pipeline_run_id': kwargs['pipeline_run_id'],
+            'persisted_stage_outcomes': self.persisted_stage_outcomes,
             'knowledge_cutoff_resolution': {
                 'ready': True,
                 'reason': 'latest_completed_summary_cutoff',
@@ -1002,6 +1007,90 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(final_statuses['macro_context_refresh'], 'completed')
         self.assertEqual(final_statuses['signal_decider'], 'completed')
         self.assertEqual(result['status'], 'partial')
+
+    def test_terminal_continuation_skips_persisted_completed_prefix(self) -> None:
+        suffix_ids = [
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        for completed_prefix_size in range(1, len(suffix_ids)):
+            with self.subTest(completed_prefix_size=completed_prefix_size):
+                persisted_stage_outcomes = {
+                    stage_id: {
+                        'stage': stage_id,
+                        'stage_id': stage_id,
+                        'status': 'completed',
+                        'processed': 1,
+                        'total': 1,
+                        'succeeded': 1,
+                        'failed': 0,
+                        'error_message': None,
+                        'details': {
+                            'result_summary': {
+                                'status': 'completed',
+                                'run_id': f'{stage_id}-continued',
+                            }
+                        },
+                    }
+                    for stage_id in suffix_ids[:completed_prefix_size]
+                }
+                run_state_service = (
+                    _FakeTerminalContinuationRunStateService(
+                        persisted_stage_outcomes=(
+                            persisted_stage_outcomes
+                        ),
+                    )
+                )
+                service = DailyPipelineStageService(
+                    run_state_service=run_state_service,
+                )
+                executed: list[str] = []
+
+                def execute(stage_id, **_kwargs):
+                    executed.append(stage_id)
+                    return {
+                        'status': 'completed',
+                        'stage_id': stage_id,
+                    }
+
+                with (
+                    patch.object(
+                        service,
+                        '_normalize_market_date',
+                        return_value='2026-04-14',
+                    ),
+                    patch.object(
+                        service,
+                        '_execute_stage',
+                        side_effect=execute,
+                    ),
+                ):
+                    result = service.run(
+                        market_date='2026-04-14',
+                        stages=suffix_ids,
+                        trigger='auto_eod_followup_resume',
+                        reused_eod_collection_run_id=546,
+                        existing_pipeline_run_id=456,
+                    )
+
+                self.assertEqual(
+                    executed,
+                    suffix_ids[completed_prefix_size:],
+                )
+                started_stage_ids = [
+                    event['stage_id']
+                    for event in run_state_service.stage_events
+                    if event['event'] == 'start_stage'
+                ]
+                for stage_id in suffix_ids[:completed_prefix_size]:
+                    self.assertNotIn(stage_id, started_stage_ids)
+                    self.assertEqual(
+                        result['stages'][stage_id]['status'],
+                        'completed',
+                    )
+                self.assertEqual(result['status'], 'partial')
 
     def test_terminal_continuation_does_not_finalize_when_claim_proof_raises(
         self,
@@ -2098,6 +2187,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertFalse(result['triggered'])
         self.assertEqual(result['status'], 'skipped')
         self.assertEqual(result['reason'], 'next_open_window_expired')
+        self.assertEqual(result['stage'], 'next_open_execution_plan')
         refresh_plan.assert_not_called()
 
     def test_execute_stage_skips_expired_prior_date_decision_replay(
