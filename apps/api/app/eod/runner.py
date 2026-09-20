@@ -305,6 +305,14 @@ class EODBackgroundRunner:
                 market = await async_get_market_state()
                 runtime_background_enabled = settings.background_runner_enabled
                 open_snapshot_refreshed = False
+                if market.state in {'PREOPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}:
+                    await self._run_async_step(
+                        'auto_pykrx_schedule_daily_pipeline_if_due',
+                        auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(),
+                    )
+                    if auto_pykrx_eod_scheduler.state.active_task:
+                        await asyncio.sleep(self.interval_seconds)
+                        continue
                 if runtime_background_enabled and market.state == 'OPEN':
                     await self._run_buy_authority_critical_step(
                         name='refresh_master_if_due',
@@ -418,14 +426,6 @@ class EODBackgroundRunner:
                                 trigger='market_open_scheduler'
                             ),
                         )
-                if market.state in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
-                    await self._run_async_step(
-                        'auto_pykrx_schedule_daily_pipeline_if_due',
-                        auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(),
-                    )
-                    if auto_pykrx_eod_scheduler.state.active_task:
-                        await asyncio.sleep(self.interval_seconds)
-                        continue
                 if runtime_background_enabled:
                     await self._run_async_step(
                         'trading_order_reconciliation_periodic',

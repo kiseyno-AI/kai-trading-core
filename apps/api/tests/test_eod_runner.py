@@ -1068,6 +1068,75 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         schedule_daily.assert_not_awaited()
         reconcile.assert_not_awaited()
 
+    async def test_preopen_loop_prioritizes_outstanding_eod_recovery_before_plan_refresh(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-09-14T04:00:00+09:00',
+            session_open_at='2026-09-14T09:00:00+09:00',
+            session_close_at='2026-09-14T15:30:00+09:00',
+            latest_valid_trading_date='2026-09-11',
+        )
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        async def mark_pipeline_active() -> None:
+            from app.eod.runner import auto_pykrx_eod_scheduler
+
+            auto_pykrx_eod_scheduler.state.active_task = True
+
+        with (
+            patch('app.eod.runner.settings.background_runner_enabled', True),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
+            patch(
+                'app.eod.runner.auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due',
+                new=AsyncMock(side_effect=mark_pipeline_active),
+            ) as schedule_daily,
+            patch('app.eod.runner.refresh_master_if_due') as refresh_master,
+            patch(
+                'app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'
+            ) as refresh_plan,
+            patch(
+                'app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution',
+                return_value=False,
+            ),
+            patch(
+                'app.eod.runner.signal_decider_exec_integration_service.should_manage_delegated_authority',
+                return_value=False,
+            ),
+            patch(
+                'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                new=AsyncMock(),
+            ) as reconcile,
+            patch(
+                'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                new=AsyncMock(),
+            ),
+            patch(
+                'app.eod.runner.portfolio_summary_service.refresh_portfolio_summary_if_due',
+                new=AsyncMock(),
+            ),
+            patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+        ):
+            try:
+                runner._running = True
+                await runner._run_loop()
+            finally:
+                from app.eod.runner import auto_pykrx_eod_scheduler
+
+                auto_pykrx_eod_scheduler.state.active_task = False
+
+        schedule_daily.assert_awaited_once_with()
+        refresh_master.assert_not_called()
+        refresh_plan.assert_not_called()
+        reconcile.assert_not_awaited()
+
     async def test_weekend_loop_schedules_latest_session_recovery(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)
         market_state = MarketState(
