@@ -303,6 +303,9 @@ class EODBackgroundRunner:
             market: object | None = None
             try:
                 market = await async_get_market_state()
+                if auto_pykrx_eod_scheduler.state.active_task:
+                    await asyncio.sleep(self.interval_seconds)
+                    continue
                 runtime_background_enabled = settings.background_runner_enabled
                 open_snapshot_refreshed = False
                 if market.state in {'PREOPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}:
@@ -315,6 +318,7 @@ class EODBackgroundRunner:
                                 else {}
                             )
                         ),
+                        fail_closed=True,
                     )
                     if auto_pykrx_eod_scheduler.state.active_task:
                         await asyncio.sleep(self.interval_seconds)
