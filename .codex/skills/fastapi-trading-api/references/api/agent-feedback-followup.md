@@ -24,6 +24,13 @@ earlier, or later cutoff requires fresh work instead of reuse or resume.
 Omitted current/future cutoffs that resolve to different request-time instants
 do not exact-join.
 
+`fs_div` is an optional financial-statement selector with the same semantics
+as retry-cycles: `CFS` selects consolidated statements, `OFS` selects separate
+statements, values are normalized case-insensitively, and omission uses
+`DART_FUNDAMENTALS_DEFAULT_FS_DIV` (`CFS` by default). The selected slice is
+kept consistent across prerequisite checks, reuse, resume/admission identity,
+and dispatch.
+
 ## Example request
 
 ```http
@@ -34,6 +41,7 @@ Content-Type: application/json
   "market_date": "2026-04-16",
   "symbols": ["005930"],
   "roles": ["technical-summarizer", "signal-decider"],
+  "fs_div": "OFS",
   "knowledge_cutoff_at": "2026-04-16T15:30:00+09:00",
   "feedback_scope_mode": "decider_scope_fast_path",
   "max_cycles": 2,
