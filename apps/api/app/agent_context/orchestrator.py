@@ -3533,6 +3533,7 @@ class AgentFeedbackOrchestrator:
         disclosures_limit: int,
         source_knowledge_cutoff_at: str | None,
         reuse_decisions: dict[str, dict[str, Any]],
+        previous_decision_context_decisions: dict[str, dict[str, Any]],
         upstream_reuse_decisions: dict[str, dict[str, Any]],
         all_failures: list[dict[str, Any]],
         buffer_failure,
@@ -3699,9 +3700,17 @@ class AgentFeedbackOrchestrator:
                 continue
             if market_context is None:
                 market_context = signal_decider_market_context_builder.build(market_date=market_date)
+            previous_decision = previous_decision_context_decisions.get(
+                symbol,
+                {},
+            ).get(role)
             previous_decision_context = build_previous_decision_context(
                 role=role,
-                latest_feedback=getattr(decision, 'latest_feedback', None) if decision is not None else None,
+                latest_feedback=(
+                    getattr(previous_decision, 'latest_feedback', None)
+                    if previous_decision is not None
+                    else None
+                ),
             )
             payload = self._build_signal_decider_payload(
                 item=item,
@@ -5702,6 +5711,13 @@ class AgentFeedbackOrchestrator:
                             )
                         )
                 reuse_decisions = {}
+                previous_decision_context_decisions = {}
+                previous_decision_context_loaded = False
+                decision_context_roles = [
+                    role
+                    for role in requested_role_names
+                    if role in DECISION_SUPPORT_AGENT_NAMES
+                ]
                 if not skip_terminal_reconciliation and reuse_existing:
                     reuse_decisions = agent_context_reuse_service.build_latest_decisions(
                         market_date=normalized_market_date,
@@ -5717,6 +5733,20 @@ class AgentFeedbackOrchestrator:
                             else None
                         ),
                     )
+                    if (
+                        not force_recompute
+                        and source_knowledge_cutoff_at
+                        == requested_knowledge_cutoff_at
+                    ):
+                        previous_decision_context_decisions = {
+                            symbol: {
+                                role: decision
+                                for role, decision in decisions_by_role.items()
+                                if role in decision_context_roles
+                            }
+                            for symbol, decisions_by_role in reuse_decisions.items()
+                        }
+                        previous_decision_context_loaded = True
                     reuse_decisions = {
                         symbol: {
                             role: decision
@@ -5742,6 +5772,27 @@ class AgentFeedbackOrchestrator:
                         }
                         for symbol, decisions_by_role in reuse_decisions.items()
                     }
+                if (
+                    not skip_terminal_reconciliation
+                    and decision_context_roles
+                    and not previous_decision_context_loaded
+                ):
+                    previous_decision_context_decisions = (
+                        agent_context_reuse_service.build_latest_decisions(
+                            market_date=normalized_market_date,
+                            symbols=scoped_dispatch_symbols,
+                            roles=decision_context_roles,
+                            force_recompute=False,
+                            knowledge_cutoff_at=source_knowledge_cutoff_at,
+                            fs_div=source_fs_div,
+                            disclosures_limit=source_disclosures_limit,
+                            fundamental_input_fingerprint_payloads=(
+                                fundamental_input_fingerprint_payloads
+                                if needs_fundamental_context_before_reuse
+                                else None
+                            ),
+                        )
+                    )
                 upstream_reuse_decisions = {}
                 if (
                     not skip_terminal_reconciliation
@@ -5922,6 +5973,9 @@ class AgentFeedbackOrchestrator:
                             source_knowledge_cutoff_at
                         ),
                         reuse_decisions=reuse_decisions,
+                        previous_decision_context_decisions=(
+                            previous_decision_context_decisions
+                        ),
                         upstream_reuse_decisions=upstream_reuse_decisions,
                         all_failures=all_failures,
                         buffer_failure=buffer_failure,
