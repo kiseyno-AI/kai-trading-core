@@ -160,6 +160,25 @@ def terminal_continuation_resume_is_unconsumed(
     return value is None or (type(value) is int and value == 0)
 
 
+def terminal_continuation_lease_loss_resume_lineage_is_valid(
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    """Recognize repeated restart recovery of one claimed lease-loss suffix."""
+
+    if not isinstance(metadata, Mapping):
+        return False
+    resume_count = metadata.get('terminal_continuation_resume_count')
+    if type(resume_count) is not int or resume_count < 1:
+        return False
+    resumed_from_status = str(
+        metadata.get('terminal_continuation_resumed_from_status') or ''
+    ).strip().lower()
+    return bool(
+        (resume_count == 1 and resumed_from_status == 'failed')
+        or (resume_count >= 2 and resumed_from_status == 'interrupted')
+    )
+
+
 def terminal_continuation_feedback_lease_loss_run_id(
     *,
     pipeline_run: Mapping[str, Any] | None,

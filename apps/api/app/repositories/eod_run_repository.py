@@ -27,6 +27,7 @@ from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
     terminal_continuation_feedback_lease_loss_run_id,
+    terminal_continuation_lease_loss_resume_lineage_is_valid,
     terminal_continuation_marker_is_valid,
     terminal_continuation_resume_is_unconsumed,
 )
@@ -1075,16 +1076,12 @@ def _followup_recovery_is_resumable_terminal_continuation(
         else {}
     )
     status = str(pipeline_run.status or '').strip().lower()
-    resume_count = metadata.get('terminal_continuation_resume_count')
     if not (
         status == 'interrupted'
         and terminal_continuation_marker_is_valid(metadata)
-        and type(resume_count) is int
-        and resume_count == 1
-        and str(
-            metadata.get('terminal_continuation_resumed_from_status') or ''
-        ).strip().lower()
-        == 'failed'
+        and terminal_continuation_lease_loss_resume_lineage_is_valid(
+            metadata
+        )
     ):
         return False
 
