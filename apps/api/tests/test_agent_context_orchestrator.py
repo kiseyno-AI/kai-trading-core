@@ -5222,6 +5222,78 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(cleanup_service.targets), 1)
         self.assertEqual(result['summary']['failed'], 0)
 
+    def test_completed_future_is_not_timed_out_after_slow_sibling_postprocessing(self):
+        first_future = FakeFuture(result=_batch_result('005930'), cancel_result=True)
+        second_future = FakeFuture(result=_batch_result('000660'), cancel_result=True)
+        fake_executor = FakeThreadPoolExecutor([first_future, second_future])
+        clock = {'now': 0.0}
+        wait_calls = []
+
+        def fake_wait(active_futures, *, timeout=None, return_when):
+            wait_calls.append(list(active_futures))
+            if len(wait_calls) == 1:
+                self.assertEqual(list(active_futures), [first_future, second_future])
+                clock['now'] = 0.5
+                return {first_future}, {second_future}
+            if len(wait_calls) == 2:
+                self.assertEqual(list(active_futures), [second_future])
+                clock['now'] = 2.0
+                return {second_future}, set()
+            raise AssertionError('unexpected wait call')
+
+        service = AgentFeedbackOrchestrator()
+        service.client = FakeOpenClawClient()
+        runtime_store = RuntimeFeedbackStateStore()
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        run_state_service = RecordingRunStateService()
+        cleanup_service = FakeSessionCleanupService()
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=2,
+            openclaw_agent_timeout_seconds=1,
+            openclaw_agent_batch_timeout_seconds=1,
+            openclaw_agent_subtask_poll_seconds=0.25,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_retries=0,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'runtime_feedback_state_store', runtime_store):
+                with patch.object(orchestrator_module, 'agent_context_read_service', FakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                            with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                                with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                    with _patch_feedback_eligibility('005930', '000660'):
+                                        with patch(
+                                            'app.agent_context.orchestrator.concurrent.futures.ThreadPoolExecutor',
+                                            side_effect=lambda max_workers: fake_executor,
+                                        ):
+                                            with patch(
+                                                'app.agent_context.orchestrator.concurrent.futures.wait',
+                                                side_effect=fake_wait,
+                                            ):
+                                                with patch(
+                                                    'app.agent_context.orchestrator.time.monotonic',
+                                                    side_effect=lambda: clock['now'],
+                                                ):
+                                                    result = service.dispatch_for_symbols(
+                                                        market_date='2026-04-14',
+                                                        symbols=['005930', '000660'],
+                                                        roles=['eod-summarizer'],
+                                                        knowledge_cutoff_at='2026-04-14T06:30:00+00:00',
+                                                        reuse_existing=False,
+                                                    )
+
+        self.assertEqual(first_future.cancel_calls, 0)
+        self.assertEqual(second_future.cancel_calls, 0)
+        self.assertEqual(
+            [item['symbol'] for call in feedback_service.bulk_calls for item in call],
+            ['005930', '000660'],
+        )
+        self.assertEqual(result['summary']['failed'], 0)
+
     def test_dispatch_for_symbols_skips_hard_blocked_prefilter_symbols(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
