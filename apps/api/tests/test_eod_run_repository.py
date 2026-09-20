@@ -1924,6 +1924,44 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
         )
 
         with self.session_factory.begin() as session:
+            advanced_child_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id
+                    == advanced_child_run_id
+                )
+            ).scalar_one()
+            request_payload = dict(advanced_child_run.request_payload)
+            request_payload['role_symbol_scopes'] = {
+                **request_payload['role_symbol_scopes'],
+                'signal-decider': [['005930']],
+            }
+            advanced_child_run.request_payload = request_payload
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            malformed_advanced_child_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(malformed_advanced_child_target)
+        with self.session_factory.begin() as session:
+            advanced_child_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id
+                    == advanced_child_run_id
+                )
+            ).scalar_one()
+            request_payload = dict(advanced_child_run.request_payload)
+            request_payload['role_symbol_scopes'] = {
+                **request_payload['role_symbol_scopes'],
+                'signal-decider': ['005930'],
+            }
+            advanced_child_run.request_payload = request_payload
+
+        with self.session_factory.begin() as session:
             session.execute(
                 delete(AgentContextFeedbackRun).where(
                     AgentContextFeedbackRun.run_id
