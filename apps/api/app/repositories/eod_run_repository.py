@@ -8,8 +8,12 @@ from typing import Any, Mapping, Sequence
 
 from sqlalchemy import func, select, text
 
+from app.agent_context.lease_loss_evidence import (
+    terminal_feedback_lease_loss_evidence_error,
+)
 from app.db import engine, session_scope
 from app.db_models import (
+    AgentContextFeedbackRun,
     DailyActionSummary,
     DailyPipelineRun,
     DailyPipelineStageRun,
@@ -22,7 +26,9 @@ from app.db_models import (
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_feedback_lease_loss_run_id,
     terminal_continuation_marker_is_valid,
+    terminal_continuation_resume_is_unconsumed,
 )
 
 
@@ -98,6 +104,8 @@ class _PipelineRecoveryCandidate:
     current_stage: str | None
     started_at: datetime
     activity_at: datetime
+    completed_at: datetime | None
+    error_message: str | None
     run_metadata: dict[str, Any]
 
 
@@ -672,6 +680,8 @@ def _load_pipeline_recovery_candidates(
             DailyPipelineRun.status,
             DailyPipelineRun.current_stage,
             DailyPipelineRun.started_at,
+            DailyPipelineRun.completed_at,
+            DailyPipelineRun.error_message,
             func.coalesce(
                 DailyPipelineRun.completed_at,
                 DailyPipelineRun.updated_at,
@@ -701,6 +711,33 @@ def _load_pipeline_recovery_candidates(
             metadata['terminal_continuation_evidence'].label(
                 'terminal_continuation_evidence'
             ),
+            metadata['terminal_continuation_resume_count']
+            .label('terminal_continuation_resume_count'),
+            metadata['terminal_continuation_resumed_from_status']
+            .as_string()
+            .label('terminal_continuation_resumed_from_status'),
+            metadata['terminal_continuation_resume_stage']
+            .as_string()
+            .label('terminal_continuation_resume_stage'),
+            metadata['terminal_continuation_completed_prefix'].label(
+                'terminal_continuation_completed_prefix'
+            ),
+            metadata['interrupted_reason']
+            .as_string()
+            .label('interrupted_reason'),
+            metadata['interrupted_at']
+            .as_string()
+            .label('interrupted_at'),
+            metadata['stage_statuses'].label('stage_statuses'),
+            metadata['symbols'].label('symbols'),
+            metadata['fs_div'].as_string().label('fs_div'),
+            metadata['reuse_existing_feedback']
+            .as_boolean()
+            .label('reuse_existing_feedback'),
+            metadata['force'].as_boolean().label('force'),
+            metadata['terminal_continuation_feedback_lease_loss_run_id']
+            .as_string()
+            .label('terminal_continuation_feedback_lease_loss_run_id'),
             metadata['resume_from_stage']
             .as_string()
             .label('resume_from_stage'),
@@ -721,6 +758,8 @@ def _load_pipeline_recovery_candidates(
             current_stage=row.current_stage,
             started_at=row.started_at,
             activity_at=row.activity_at,
+            completed_at=row.completed_at,
+            error_message=row.error_message,
             run_metadata={
                 'entrypoint': row.entrypoint,
                 'eod_collection_run_id': row.eod_collection_run_id,
@@ -743,6 +782,28 @@ def _load_pipeline_recovery_candidates(
                 ),
                 'terminal_continuation_evidence': (
                     row.terminal_continuation_evidence
+                ),
+                'terminal_continuation_resume_count': (
+                    row.terminal_continuation_resume_count
+                ),
+                'terminal_continuation_resumed_from_status': (
+                    row.terminal_continuation_resumed_from_status
+                ),
+                'terminal_continuation_resume_stage': (
+                    row.terminal_continuation_resume_stage
+                ),
+                'terminal_continuation_completed_prefix': (
+                    row.terminal_continuation_completed_prefix
+                ),
+                'interrupted_reason': row.interrupted_reason,
+                'interrupted_at': row.interrupted_at,
+                'stage_statuses': row.stage_statuses,
+                'symbols': row.symbols,
+                'fs_div': row.fs_div,
+                'reuse_existing_feedback': row.reuse_existing_feedback,
+                'force': row.force,
+                'terminal_continuation_feedback_lease_loss_run_id': (
+                    row.terminal_continuation_feedback_lease_loss_run_id
                 ),
                 'resume_from_stage': row.resume_from_stage,
             },
@@ -824,12 +885,421 @@ def _pipeline_stage_outcome(stage_row: DailyPipelineStageRun) -> dict[str, Any]:
         'succeeded': int(stage_row.succeeded or 0),
         'failed': int(stage_row.failed or 0),
         'remaining': int(stage_row.remaining or 0),
+        'current_step': stage_row.current_step,
         'completed_at': stage_row.completed_at,
         'error_message': stage_row.error_message,
+        'source_run_ids': (
+            stage_row.source_run_ids
+            if isinstance(stage_row.source_run_ids, dict)
+            else {}
+        ),
         'details': (
             stage_row.details if isinstance(stage_row.details, dict) else {}
         ),
     }
+
+
+def _terminal_continuation_lease_loss_child_is_valid(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    child_run_id: str,
+) -> bool:
+    metadata = pipeline_run.run_metadata
+    evidence = metadata.get('terminal_continuation_evidence')
+    summary_proof = (
+        evidence.get('summary_proof')
+        if isinstance(evidence, Mapping)
+        and isinstance(evidence.get('summary_proof'), Mapping)
+        else {}
+    )
+    knowledge_cutoff_at = _normalized_datetime(
+        summary_proof.get('knowledge_cutoff_at')
+    )
+    if knowledge_cutoff_at is None:
+        return False
+    child_run = session.execute(
+        select(AgentContextFeedbackRun).where(
+            AgentContextFeedbackRun.run_id == child_run_id
+        )
+    ).scalar_one_or_none()
+    return terminal_feedback_lease_loss_evidence_error(
+        child_run=child_run,
+        child_run_id=child_run_id,
+        market_date=pipeline_run.market_date,
+        metadata=metadata,
+        knowledge_cutoff_at=knowledge_cutoff_at,
+    ) is None
+
+
+def _followup_recovery_is_reclaimable_feedback_lease_loss(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+) -> bool:
+    """Surface only the exact failed sixth continuation the runtime can reclaim."""
+
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, dict)
+        else {}
+    )
+    if not terminal_continuation_marker_is_valid(metadata):
+        return False
+    if not terminal_continuation_resume_is_unconsumed(metadata):
+        return False
+    evidence = metadata.get('terminal_continuation_evidence')
+    lineage = (
+        evidence.get('lineage')
+        if isinstance(evidence, Mapping)
+        and isinstance(evidence.get('lineage'), Mapping)
+        else {}
+    )
+    ordered_run_ids = lineage.get('ordered_pipeline_run_ids')
+    expected_run_count = _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD + 1
+    if not (
+        lineage.get('expected_run_count') == expected_run_count
+        and lineage.get('observed_run_count') == expected_run_count
+        and lineage.get('target_ordinal') == expected_run_count
+        and lineage.get('latest_pipeline_run_id') == pipeline_run.id
+        and lineage.get('reused_eod_collection_run_id')
+        == metadata.get('reused_eod_collection_run_id')
+        and isinstance(ordered_run_ids, list)
+        and len(ordered_run_ids) == expected_run_count
+        and ordered_run_ids[-1] == pipeline_run.id
+    ):
+        return False
+
+    raw_resolved_stages = metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return False
+    resolved_stages = [
+        str(stage_id or '').strip()
+        for stage_id in raw_resolved_stages
+        if str(stage_id or '').strip()
+    ]
+    continuation_suffix = (
+        'agent_feedback_summaries',
+        'signal_decider',
+        'next_open_execution_plan',
+        'signal_decider_evaluations',
+    )
+    if (
+        len(resolved_stages) != len(raw_resolved_stages)
+        or len(resolved_stages) != len(set(resolved_stages))
+        or tuple(resolved_stages[-len(continuation_suffix) :])
+        != continuation_suffix
+    ):
+        return False
+
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id == pipeline_run.id,
+                DailyPipelineStageRun.market_date == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(tuple(resolved_stages)),
+            )
+        ).scalars()
+    )
+    stage_rows_by_id = {
+        str(stage_row.stage_id or '').strip(): stage_row
+        for stage_row in stage_rows
+    }
+    if set(stage_rows_by_id) != set(resolved_stages):
+        return False
+    suffix_start_index = len(resolved_stages) - len(continuation_suffix)
+    if any(
+        not daily_pipeline_prefix_outcome_is_satisfied(
+            _pipeline_stage_outcome(stage_rows_by_id[stage_id])
+        )
+        for stage_id in resolved_stages[:suffix_start_index]
+    ):
+        return False
+
+    summary = stage_rows_by_id['agent_feedback_summaries']
+    if not (
+        daily_pipeline_outcome_is_satisfied(_pipeline_stage_outcome(summary))
+        and summary.completed_at is not None
+        and not str(summary.error_message or '').strip()
+    ):
+        return False
+    decider = stage_rows_by_id['signal_decider']
+    child_run_id = terminal_continuation_feedback_lease_loss_run_id(
+        pipeline_run={
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'market_date': pipeline_run.market_date,
+            'completed_at': pipeline_run.completed_at,
+            'error_message': pipeline_run.error_message,
+            'run_metadata': metadata,
+        },
+        stage=_pipeline_stage_outcome(decider),
+    )
+    if not child_run_id or not _terminal_continuation_lease_loss_child_is_valid(
+        session,
+        pipeline_run=pipeline_run,
+        child_run_id=child_run_id,
+    ):
+        return False
+
+    return all(
+        str(stage.status or '').strip().lower() == 'pending'
+        and str(stage.current_step or '').strip()
+        == 'terminal_continuation_pending'
+        and int(stage.processed or 0) == 0
+        and int(stage.total or 0) == 0
+        and int(stage.succeeded or 0) == 0
+        and int(stage.failed or 0) == 0
+        and int(stage.remaining or 0) == 0
+        and stage.completed_at is None
+        and not str(stage.error_message or '').strip()
+        and not (stage.source_run_ids or {})
+        and not (stage.details or {})
+        for stage in (
+            stage_rows_by_id['next_open_execution_plan'],
+            stage_rows_by_id['signal_decider_evaluations'],
+        )
+    )
+
+
+def _followup_recovery_is_resumable_terminal_continuation(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+) -> bool:
+    """Surface a previously reclaimed continuation after restart/stall."""
+
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, dict)
+        else {}
+    )
+    status = str(pipeline_run.status or '').strip().lower()
+    resume_count = metadata.get('terminal_continuation_resume_count')
+    if not (
+        status == 'interrupted'
+        and terminal_continuation_marker_is_valid(metadata)
+        and type(resume_count) is int
+        and resume_count == 1
+        and str(
+            metadata.get('terminal_continuation_resumed_from_status') or ''
+        ).strip().lower()
+        == 'failed'
+    ):
+        return False
+
+    interrupted_reason = str(
+        metadata.get('interrupted_reason') or ''
+    ).strip()
+    interrupted_at = _normalized_datetime(metadata.get('interrupted_at'))
+    completed_at = _normalized_datetime(pipeline_run.completed_at)
+    if not (
+        metadata.get('resumable') is True
+        and interrupted_reason
+        and interrupted_at is not None
+        and interrupted_at == completed_at
+        and interrupted_reason
+        == str(pipeline_run.error_message or '').strip()
+    ):
+        return False
+
+    lease_loss_child_run_id = str(
+        metadata.get(
+            'terminal_continuation_feedback_lease_loss_run_id'
+        )
+        or ''
+    ).strip()
+    if not (
+        lease_loss_child_run_id
+        and _terminal_continuation_lease_loss_child_is_valid(
+            session,
+            pipeline_run=pipeline_run,
+            child_run_id=lease_loss_child_run_id,
+        )
+    ):
+        return False
+
+    evidence = metadata.get('terminal_continuation_evidence')
+    lineage = (
+        evidence.get('lineage')
+        if isinstance(evidence, Mapping)
+        and isinstance(evidence.get('lineage'), Mapping)
+        else {}
+    )
+    ordered_run_ids = lineage.get('ordered_pipeline_run_ids')
+    expected_run_count = _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD + 1
+    if not (
+        lineage.get('expected_run_count') == expected_run_count
+        and lineage.get('observed_run_count') == expected_run_count
+        and lineage.get('target_ordinal') == expected_run_count
+        and lineage.get('latest_pipeline_run_id') == pipeline_run.id
+        and lineage.get('reused_eod_collection_run_id')
+        == metadata.get('reused_eod_collection_run_id')
+        and isinstance(ordered_run_ids, list)
+        and len(ordered_run_ids) == expected_run_count
+        and ordered_run_ids[-1] == pipeline_run.id
+    ):
+        return False
+
+    raw_resolved_stages = metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return False
+    resolved_stages = [
+        str(stage_id or '').strip()
+        for stage_id in raw_resolved_stages
+        if str(stage_id or '').strip()
+    ]
+    continuation_suffix = (
+        'agent_feedback_summaries',
+        'signal_decider',
+        'next_open_execution_plan',
+        'signal_decider_evaluations',
+    )
+    if (
+        len(resolved_stages) != len(raw_resolved_stages)
+        or len(resolved_stages) != len(set(resolved_stages))
+        or tuple(resolved_stages[-len(continuation_suffix) :])
+        != continuation_suffix
+    ):
+        return False
+
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id == pipeline_run.id,
+                DailyPipelineStageRun.market_date == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(tuple(resolved_stages)),
+            )
+        ).scalars()
+    )
+    stage_rows_by_id = {
+        str(stage_row.stage_id or '').strip(): stage_row
+        for stage_row in stage_rows
+    }
+    if set(stage_rows_by_id) != set(resolved_stages):
+        return False
+    suffix_start_index = len(resolved_stages) - len(continuation_suffix)
+    if any(
+        not daily_pipeline_prefix_outcome_is_satisfied(
+            _pipeline_stage_outcome(stage_rows_by_id[stage_id])
+        )
+        for stage_id in resolved_stages[:suffix_start_index]
+    ):
+        return False
+
+    satisfied_prefix: list[str] = []
+    for stage_id in continuation_suffix:
+        stage = stage_rows_by_id[stage_id]
+        if not (
+            daily_pipeline_outcome_is_satisfied(
+                _pipeline_stage_outcome(stage)
+            )
+            and stage.completed_at is not None
+            and not str(stage.error_message or '').strip()
+        ):
+            break
+        satisfied_prefix.append(stage_id)
+    if len(satisfied_prefix) == len(continuation_suffix):
+        return False
+
+    recorded_prefix = metadata.get('terminal_continuation_completed_prefix')
+    resumed_stage = str(
+        metadata.get('terminal_continuation_resume_stage') or ''
+    ).strip()
+    if not (
+        isinstance(recorded_prefix, list)
+        and recorded_prefix
+        and recorded_prefix == list(
+            continuation_suffix[: len(recorded_prefix)]
+        )
+        and len(recorded_prefix) <= len(satisfied_prefix)
+        and len(recorded_prefix) < len(continuation_suffix)
+        and resumed_stage == continuation_suffix[len(recorded_prefix)]
+    ):
+        return False
+
+    stage_statuses = metadata.get('stage_statuses')
+    if not isinstance(stage_statuses, Mapping):
+        return False
+    for index, stage_id in enumerate(continuation_suffix):
+        persisted_status = str(
+            stage_statuses.get(stage_id) or ''
+        ).strip().lower()
+        live_status = str(
+            stage_rows_by_id[stage_id].status or ''
+        ).strip().lower()
+        if index < len(satisfied_prefix):
+            if persisted_status != live_status:
+                return False
+        elif persisted_status != 'pending':
+            return False
+
+    def untouched(stage: DailyPipelineStageRun) -> bool:
+        return bool(
+            str(stage.status or '').strip().lower() == 'pending'
+            and str(stage.current_step or '').strip()
+            == 'terminal_continuation_pending'
+            and int(stage.processed or 0) == 0
+            and int(stage.total or 0) == 0
+            and int(stage.succeeded or 0) == 0
+            and int(stage.failed or 0) == 0
+            and int(stage.remaining or 0) == 0
+            and stage.completed_at is None
+            and not str(stage.error_message or '').strip()
+            and not (stage.source_run_ids or {})
+            and not (stage.details or {})
+        )
+
+    first_unfinished_index = len(satisfied_prefix)
+    first_unfinished_stage = continuation_suffix[first_unfinished_index]
+    first_unfinished = stage_rows_by_id[first_unfinished_stage]
+    first_status = str(first_unfinished.status or '').strip().lower()
+    current_stage = str(pipeline_run.current_stage or '').strip()
+    if first_status == 'pending':
+        expected_current_stages = {first_unfinished_stage}
+        if satisfied_prefix:
+            expected_current_stages.add(satisfied_prefix[-1])
+        first_unfinished_is_valid = bool(
+            untouched(first_unfinished)
+            and current_stage in expected_current_stages
+        )
+    elif first_status == 'running':
+        first_unfinished_is_valid = bool(
+            status == 'running'
+            and current_stage == first_unfinished_stage
+            and first_unfinished.completed_at is None
+            and not str(first_unfinished.error_message or '').strip()
+        )
+    elif first_status == 'interrupted':
+        details = (
+            first_unfinished.details
+            if isinstance(first_unfinished.details, Mapping)
+            else {}
+        )
+        first_unfinished_is_valid = bool(
+            status == 'interrupted'
+            and current_stage == first_unfinished_stage
+            and str(first_unfinished.current_step or '').strip()
+            == 'core_restart_interrupted'
+            and first_unfinished.completed_at is not None
+            and str(first_unfinished.error_message or '').strip()
+            and details.get('resumable') is True
+            and str(details.get('interrupted_reason') or '').strip()
+            == interrupted_reason
+            and str(first_unfinished.error_message or '').strip()
+            == interrupted_reason
+        )
+    else:
+        first_unfinished_is_valid = False
+    return bool(
+        first_unfinished_is_valid
+        and all(
+            untouched(stage_rows_by_id[stage_id])
+            for stage_id in continuation_suffix[
+                first_unfinished_index + 1 :
+            ]
+        )
+    )
 
 
 def _followup_recovery_is_satisfied_for_convergence(
@@ -1252,6 +1722,25 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                     and _followup_recovery_is_satisfied_for_convergence(
                         session,
                         pipeline_run=latest_recovery,
+                    )
+                ):
+                    return AutoEODRecoveryTarget(
+                        trade_date=eod_row.trade_date.isoformat(),
+                        eod_run_id=eod_row.id,
+                    )
+                if (
+                    latest_recovery is not None
+                    and followup_attempts
+                    == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD + 1
+                    and (
+                        _followup_recovery_is_reclaimable_feedback_lease_loss(
+                            session,
+                            pipeline_run=latest_recovery,
+                        )
+                        or _followup_recovery_is_resumable_terminal_continuation(
+                            session,
+                            pipeline_run=latest_recovery,
+                        )
                     )
                 ):
                     return AutoEODRecoveryTarget(

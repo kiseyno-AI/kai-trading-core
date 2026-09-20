@@ -9,6 +9,9 @@ from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     SUMMARIZER_AGENT_NAMES,
 )
+from app.agent_context.lease_loss_evidence import (
+    terminal_feedback_lease_loss_evidence_error,
+)
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
@@ -27,7 +30,9 @@ from app.db_models import (
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_feedback_lease_loss_run_id,
     terminal_continuation_marker_is_valid,
+    terminal_continuation_resume_is_unconsumed,
 )
 from app.repositories.eod_run_repository import (
     eod_collection_advisory_lock_keys,
@@ -1000,7 +1005,7 @@ class DailyPipelineRunStateService:
                 else {}
             )
             if (
-                current_status in {'running', 'interrupted'}
+                current_status in {'running', 'interrupted', 'failed'}
                 and _as_int(metadata.get('terminal_continuation_count')) == 1
             ):
                 return self._resume_claimed_terminal_continuation_locked(
@@ -1650,6 +1655,15 @@ class DailyPipelineRunStateService:
                 return reject(
                     'terminal_continuation_interruption_evidence_invalid'
                 )
+        elif current_status == 'failed':
+            if (
+                not terminal_continuation_resume_is_unconsumed(metadata)
+                or str(run_row.current_stage or '').strip()
+                != 'signal_decider'
+            ):
+                return reject(
+                    'terminal_continuation_failed_lease_loss_ineligible'
+                )
         else:
             return reject('run_not_eligible_terminal_continuation_resume')
 
@@ -1849,6 +1863,54 @@ class DailyPipelineRunStateService:
             first_unfinished_row.status or ''
         ).strip().lower()
         current_stage = str(run_row.current_stage or '').strip()
+        failed_lease_child_run_id: str | None = None
+        if current_status == 'failed':
+            failed_lease_child_run_id = (
+                terminal_continuation_feedback_lease_loss_run_id(
+                    pipeline_run={
+                        'status': run_row.status,
+                        'current_stage': run_row.current_stage,
+                        'market_date': run_row.market_date,
+                        'completed_at': run_row.completed_at,
+                        'error_message': run_row.error_message,
+                        'run_metadata': metadata,
+                    },
+                    stage=self._serialize_stage(first_unfinished_row),
+                )
+            )
+        elif current_status in {'running', 'interrupted'}:
+            persisted_lease_child_run_id = str(
+                metadata.get(
+                    'terminal_continuation_feedback_lease_loss_run_id'
+                )
+                or ''
+            ).strip()
+            exact_lease_resume_origin = bool(
+                type(
+                    metadata.get('terminal_continuation_resume_count')
+                )
+                is int
+                and metadata.get('terminal_continuation_resume_count')
+                == 1
+                and str(
+                    metadata.get(
+                        'terminal_continuation_resumed_from_status'
+                    )
+                    or ''
+                ).strip().lower()
+                == 'failed'
+            )
+            if persisted_lease_child_run_id and not exact_lease_resume_origin:
+                return reject(
+                    'terminal_continuation_failed_lease_loss_ineligible'
+                )
+            if exact_lease_resume_origin:
+                failed_lease_child_run_id = persisted_lease_child_run_id
+            if exact_lease_resume_origin and not failed_lease_child_run_id:
+                return reject(
+                    'terminal_continuation_failed_lease_loss_evidence_invalid',
+                    field='child_run_id',
+                )
 
         metadata_prefix_size = 0
         metadata_pending_seen = False
@@ -1877,7 +1939,12 @@ class DailyPipelineRunStateService:
             return reject('stage_status_evidence_mismatch')
 
         feedback_stage_activity_at: datetime | None = None
-        if first_unfinished_status == 'pending':
+        if current_status == 'failed':
+            first_unfinished_is_valid = bool(
+                first_unfinished_status == 'failed'
+                and failed_lease_child_run_id
+            )
+        elif first_unfinished_status == 'pending':
             expected_current_stages = {first_unfinished_stage}
             if satisfied_prefix:
                 expected_current_stages.add(satisfied_prefix[-1])
@@ -2186,6 +2253,30 @@ class DailyPipelineRunStateService:
         ):
             return reject('summary_knowledge_cutoff_proof_mismatch')
 
+        if failed_lease_child_run_id:
+            failed_child_run = session.execute(
+                select(AgentContextFeedbackRun)
+                .where(
+                    AgentContextFeedbackRun.run_id
+                    == failed_lease_child_run_id
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            failed_child_error = (
+                terminal_feedback_lease_loss_evidence_error(
+                    child_run=failed_child_run,
+                    child_run_id=failed_lease_child_run_id,
+                    market_date=normalized_market_date,
+                    metadata=metadata,
+                    knowledge_cutoff_at=persisted_cutoff,
+                )
+            )
+            if failed_child_error is not None:
+                return reject(
+                    'terminal_continuation_failed_lease_loss_evidence_invalid',
+                    field=failed_child_error,
+                )
+
         feedback_stage_expectations = {
             'agent_feedback_summaries': (
                 list(SUMMARIZER_AGENT_NAMES),
@@ -2376,6 +2467,10 @@ class DailyPipelineRunStateService:
                 'stage_statuses': resumed_stage_statuses,
             }
         )
+        if failed_lease_child_run_id:
+            metadata[
+                'terminal_continuation_feedback_lease_loss_run_id'
+            ] = failed_lease_child_run_id
         for stage_id in continuation_suffix[first_unfinished_index:]:
             stage_row = stage_rows_by_id[stage_id]
             stage_row.status = 'pending'

@@ -24,6 +24,11 @@ from app.agent_context.eligibility import (
     load_agent_feedback_eligibility_records,
     resolve_agent_feedback_scope,
 )
+from app.agent_context.lease_loss_evidence import (
+    RETRY_ADMISSION_LEASE_LOSS_SCHEMA_VERSION,
+    RETRY_ADMISSION_SCHEMA_VERSION,
+    terminal_feedback_lease_loss_evidence_error,
+)
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.read_service import (
@@ -54,11 +59,7 @@ from app.db_models import (
 EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
 CHILD_RUN_LINEAGE_SCHEMA_VERSION = 'agent_feedback_child_run_lineage_v1'
 REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION = 'agent_feedback_reuse_evidence_v1'
-RETRY_ADMISSION_SCHEMA_VERSION = 'agent_feedback_retry_admission_v1'
-RETRY_ADMISSION_LEASE_LOSS_SCHEMA_VERSION = (
-    'agent_feedback_retry_admission_lease_loss_v1'
-)
-
+_LEASE_LOSS_REUSABLE_PARENT_STATUS = 'abandoned_lease_loss_reusable'
 logger = logging.getLogger(__name__)
 
 
@@ -1626,6 +1627,9 @@ class AgentFeedbackRetryService:
                         else {}
                     ),
                     'status': str(row.status or '').strip().lower(),
+                    'market_date': row.market_date,
+                    'symbols_total': row.symbols_total,
+                    'completed_count': row.completed_count,
                     'failed_count': max(0, int(row.failed_count or 0)),
                     'summary_payload': (
                         dict(row.summary_payload)
@@ -1633,6 +1637,7 @@ class AgentFeedbackRetryService:
                         else {}
                     ),
                     'started_at': row.started_at,
+                    'completed_at': row.completed_at,
                 }
                 for row in persisted_rows
             ]
@@ -1662,6 +1667,39 @@ class AgentFeedbackRetryService:
                 for raw_role in raw_roles
                 if str(raw_role or '').strip().lower() in normalized_roles
             }
+
+        def lease_loss_parent_is_reusable(row: dict[str, Any]) -> bool:
+            payload = row.get('request_payload')
+            if not isinstance(payload, dict):
+                return False
+            raw_cutoff = payload.get('knowledge_cutoff_at')
+            try:
+                normalized_cutoff = _normalize_admission_knowledge_cutoff(
+                    raw_cutoff
+                )
+                knowledge_cutoff_at = (
+                    datetime.fromisoformat(normalized_cutoff)
+                    if normalized_cutoff is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                return False
+            if knowledge_cutoff_at is None:
+                return False
+            return terminal_feedback_lease_loss_evidence_error(
+                child_run=row,
+                child_run_id=str(row.get('run_id') or '').strip(),
+                market_date=market_date,
+                metadata={
+                    'symbols': payload.get('requested_symbols'),
+                    'fs_div': payload.get('fs_div'),
+                    'reuse_existing_feedback': payload.get(
+                        'reuse_existing'
+                    ),
+                    'force': payload.get('force_recompute'),
+                },
+                knowledge_cutoff_at=knowledge_cutoff_at,
+            ) is None
 
         parent_by_child_run_id: dict[str, str | None] = {}
         latest_parent_by_key: dict[tuple[str, str], tuple[str, str]] = {}
@@ -1779,15 +1817,20 @@ class AgentFeedbackRetryService:
                 row=row,
                 scopes=scopes,
             )
+            lease_loss_parent_reusable = lease_loss_parent_is_reusable(row)
             for role, scoped_symbols in scopes.items():
                 for symbol in scoped_symbols:
                     key = (symbol, role)
                     if symbol in normalized_symbols and key not in latest_parent_by_key:
                         latest_parent_by_key[key] = (
                             run_id,
-                            'failed'
-                            if key in failed_parent_scope_keys
-                            else status,
+                            _LEASE_LOSS_REUSABLE_PARENT_STATUS
+                            if lease_loss_parent_reusable
+                            else (
+                                'failed'
+                                if key in failed_parent_scope_keys
+                                else status
+                            ),
                         )
 
         return (
@@ -2021,6 +2064,7 @@ class AgentFeedbackRetryService:
                 'completed',
                 'completed_with_failures',
                 'partial',
+                _LEASE_LOSS_REUSABLE_PARENT_STATUS,
             }:
                 return False
             feedback_run_id = str(

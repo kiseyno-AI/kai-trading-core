@@ -8,6 +8,7 @@ import pytest
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    terminal_continuation_feedback_lease_loss_run_id,
 )
 from app.eod.pykrx_backfill import PykrxBackfillService
 
@@ -76,6 +77,55 @@ def _ready_enrichment_warning_outcome() -> dict:
             }
         },
     }
+
+
+@pytest.mark.parametrize('malformed_resume_count', ['0', 'corrupt', True])
+def test_feedback_lease_loss_reclaim_rejects_malformed_resume_count(
+    malformed_resume_count: object,
+) -> None:
+    child_run_id = 'feedback-cycle-2026-09-18-deadbeef01'
+    error = (
+        f'feedback retry lease ownership lost for {child_run_id} at '
+        'before_parent_finalization: heartbeat_refresh_grace_exceeded'
+    )
+    pipeline_run = {
+        'status': 'failed',
+        'current_stage': 'signal_decider',
+        'market_date': '2026-09-18',
+        'completed_at': '2026-09-20T01:01:00+00:00',
+        'error_message': error,
+        'run_metadata': {
+            'terminal_continuation_count': 1,
+            'terminal_continuation_version': 1,
+            'terminal_continuation_reason': (
+                'summary_knowledge_cutoff_repair'
+            ),
+            'resume_from_stage': 'agent_feedback_summaries',
+            'terminal_continuation_claimed_at': (
+                '2026-09-20T01:00:00+00:00'
+            ),
+            'terminal_continuation_evidence': {},
+            'terminal_continuation_resume_count': malformed_resume_count,
+        },
+    }
+    stage = {
+        'stage_id': 'signal_decider',
+        'status': 'failed',
+        'processed': 20,
+        'total': 160,
+        'succeeded': 0,
+        'failed': 20,
+        'remaining': 140,
+        'current_step': 'signal_decider_failed',
+        'completed_at': '2026-09-20T01:01:00+00:00',
+        'error_message': error,
+        'source_run_ids': {'agent_feedback_run_id': child_run_id},
+    }
+
+    assert terminal_continuation_feedback_lease_loss_run_id(
+        pipeline_run=pipeline_run,
+        stage=stage,
+    ) is None
 
 
 def test_terminal_high_coverage_partial_is_satisfied() -> None:

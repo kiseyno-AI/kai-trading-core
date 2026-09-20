@@ -2983,6 +2983,535 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'interrupted',
         )
 
+    def test_claim_terminal_continuation_reclaims_exact_feedback_lease_loss(
+        self,
+    ) -> None:
+        claimed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+        failed_at = claimed_at + timedelta(minutes=1)
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        service = DailyPipelineRunStateService()
+
+        first_session = self._terminal_continuation_session(
+            run=run,
+            stages=stages,
+            eod_run=eod_run,
+        )
+        first_context = MagicMock()
+        first_context.__enter__.return_value = first_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=first_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=claimed_at,
+            ),
+        ):
+            first = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertTrue(first['claimed'])
+
+        summary_stage = stages[1]
+        summary_stage.status = 'completed'
+        summary_stage.processed = 1
+        summary_stage.total = 1
+        summary_stage.succeeded = 1
+        summary_stage.failed = 0
+        summary_stage.remaining = 0
+        summary_stage.current_step = 'agent_feedback_summaries_completed'
+        summary_stage.completed_at = failed_at
+        summary_stage.updated_at = failed_at
+        summary_stage.error_message = None
+        summary_stage.source_run_ids = {
+            'run_id': 'agent_feedback_summaries-continued'
+        }
+        summary_stage.details = {
+            'result_summary': {
+                'status': 'completed',
+                'run_id': 'agent_feedback_summaries-continued',
+            }
+        }
+
+        lease_run_id = 'feedback-cycle-2026-09-18-deadbeef01'
+        lease_loss_error = (
+            f'feedback retry lease ownership lost for {lease_run_id} at '
+            'before_parent_finalization: '
+            'heartbeat_refresh_grace_exceeded'
+        )
+        decider_stage = stages[2]
+        decider_stage.status = 'failed'
+        decider_stage.processed = 2
+        decider_stage.total = 2
+        decider_stage.succeeded = 0
+        decider_stage.failed = 2
+        decider_stage.remaining = 0
+        decider_stage.current_step = 'signal_decider_failed'
+        decider_stage.completed_at = failed_at
+        decider_stage.updated_at = failed_at
+        decider_stage.error_message = lease_loss_error
+        decider_stage.source_run_ids = {
+            'agent_feedback_run_id': lease_run_id
+        }
+        decider_stage.details = {}
+        run.status = 'failed'
+        run.current_stage = 'signal_decider'
+        run.updated_at = failed_at
+        run.completed_at = failed_at
+        run.error_message = lease_loss_error
+
+        pending_run = deepcopy(run)
+        pending_stages = deepcopy(stages)
+        pending_decider = pending_stages[2]
+        pending_decider.status = 'pending'
+        pending_decider.processed = 0
+        pending_decider.total = 0
+        pending_decider.succeeded = 0
+        pending_decider.failed = 0
+        pending_decider.remaining = 0
+        pending_decider.current_step = 'terminal_continuation_pending'
+        pending_decider.completed_at = None
+        pending_decider.error_message = None
+        pending_decider.source_run_ids = {}
+        pending_decider.details = {}
+        pending_session = self._terminal_continuation_session(
+            run=pending_run,
+            stages=pending_stages,
+            eod_run=eod_run,
+        )
+        pending_context = MagicMock()
+        pending_context.__enter__.return_value = pending_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=pending_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=failed_at + timedelta(seconds=1),
+            ),
+        ):
+            pending_result = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertFalse(pending_result['claimed'])
+        self.assertEqual(
+            pending_result['reason'],
+            'terminal_continuation_stage_progress_invalid',
+        )
+
+        generic_run = deepcopy(run)
+        generic_stages = deepcopy(stages)
+        generic_run.error_message = 'upstream request failed'
+        generic_stages[2].error_message = 'upstream request failed'
+        generic_session = self._terminal_continuation_session(
+            run=generic_run,
+            stages=generic_stages,
+            eod_run=eod_run,
+        )
+        generic_context = MagicMock()
+        generic_context.__enter__.return_value = generic_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=generic_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=failed_at + timedelta(seconds=1),
+            ),
+        ):
+            generic_result = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertFalse(generic_result['claimed'])
+        self.assertEqual(
+            generic_result['reason'],
+            'terminal_continuation_stage_progress_invalid',
+        )
+
+        for malformed_resume_count in ('0', 'corrupt', True):
+            with self.subTest(
+                malformed_resume_count=malformed_resume_count,
+            ):
+                malformed_run = deepcopy(run)
+                malformed_run.run_metadata[
+                    'terminal_continuation_resume_count'
+                ] = malformed_resume_count
+                malformed_run_result = MagicMock()
+                malformed_run_result.scalar_one_or_none.return_value = (
+                    malformed_run
+                )
+                malformed_session = MagicMock()
+                malformed_session.execute.side_effect = [
+                    MagicMock(),
+                    malformed_run_result,
+                ]
+                malformed_context = MagicMock()
+                malformed_context.__enter__.return_value = (
+                    malformed_session
+                )
+                with patch(
+                    'app.eod.daily_pipeline_state.session_scope',
+                    return_value=malformed_context,
+                ):
+                    malformed_result = (
+                        service.claim_terminal_continuation(
+                            pipeline_run_id=456,
+                            market_date='2026-09-18',
+                            reused_eod_collection_run_id=546,
+                        )
+                    )
+                self.assertFalse(malformed_result['claimed'])
+                self.assertEqual(
+                    malformed_result['reason'],
+                    'terminal_continuation_failed_lease_loss_ineligible',
+                )
+                self.assertEqual(malformed_session.execute.call_count, 2)
+
+        lease_child = self._terminal_feedback_child_run(
+            stage_id='signal_decider',
+            run_id=lease_run_id,
+        )
+        lease_child.status = 'abandoned'
+        lease_child.completed_at = failed_at
+        lease_child.completed_count = 0
+        lease_child.failed_count = lease_child.symbols_total
+        lease_child.request_payload['retry_admission'] = {
+            'schema_version': 'agent_feedback_retry_admission_v1',
+            'claimed_at': claimed_at.isoformat(),
+            'owner_token_hash': 'a' * 64,
+        }
+        lease_child.summary_payload = {
+            'admission_lease_loss': {
+                'schema_version': (
+                    'agent_feedback_retry_admission_lease_loss_v1'
+                ),
+                'detected_at': failed_at.isoformat(),
+                'stage': 'before_checkpoint:role_batch_completed',
+                'reason': 'heartbeat_refresh_grace_exceeded',
+                'owner_token_fingerprint': 'a' * 16,
+            }
+        }
+        summary_child = self._terminal_feedback_child_run(
+            stage_id='agent_feedback_summaries',
+            run_id='agent_feedback_summaries-continued',
+        )
+
+        def build_resume_session(child: SimpleNamespace) -> MagicMock:
+            run_result = MagicMock()
+            run_result.scalar_one_or_none.return_value = run
+            lineage_result = MagicMock()
+            lineage_result.scalars.return_value = (
+                self._terminal_continuation_lineage()
+            )
+            active_result = MagicMock()
+            active_result.scalars.return_value = []
+            stages_result = MagicMock()
+            stages_result.scalars.return_value = stages
+            lease_child_result = MagicMock()
+            lease_child_result.scalar_one_or_none.return_value = child
+            summary_child_result = MagicMock()
+            summary_child_result.scalar_one_or_none.return_value = (
+                summary_child
+            )
+            session = MagicMock()
+            session.execute.side_effect = [
+                MagicMock(),
+                run_result,
+                lineage_result,
+                active_result,
+                stages_result,
+                lease_child_result,
+                summary_child_result,
+            ]
+            session.get.return_value = eod_run
+            return session
+
+        tampered_child = deepcopy(lease_child)
+        tampered_child.summary_payload['admission_lease_loss'][
+            'owner_token_fingerprint'
+        ] = 'b' * 16
+        tampered_context = MagicMock()
+        tampered_context.__enter__.return_value = build_resume_session(
+            tampered_child
+        )
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=tampered_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=failed_at + timedelta(seconds=1),
+            ),
+        ):
+            tampered_result = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertFalse(tampered_result['claimed'])
+        self.assertEqual(
+            tampered_result['reason'],
+            'terminal_continuation_failed_lease_loss_evidence_invalid',
+        )
+        self.assertEqual(tampered_result['field'], 'admission_lease_loss')
+        self.assertEqual(run.status, 'failed')
+        self.assertEqual(run.completed_at, failed_at)
+        self.assertEqual(run.error_message, lease_loss_error)
+        self.assertEqual(decider_stage.status, 'failed')
+        self.assertEqual(decider_stage.processed, 2)
+        self.assertEqual(
+            decider_stage.source_run_ids,
+            {'agent_feedback_run_id': lease_run_id},
+        )
+        self.assertNotIn(
+            'terminal_continuation_resume_count',
+            run.run_metadata,
+        )
+        tampered_context.__enter__.return_value.flush.assert_not_called()
+
+        resume_session = build_resume_session(lease_child)
+        resume_context = MagicMock()
+        resume_context.__enter__.return_value = resume_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=resume_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=failed_at + timedelta(seconds=1),
+            ),
+        ):
+            resumed = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(resumed['claimed'])
+        self.assertTrue(resumed['resumed'])
+        self.assertEqual(resumed['resume_from_stage'], 'signal_decider')
+        self.assertEqual(
+            list(resumed['persisted_stage_outcomes']),
+            ['agent_feedback_summaries'],
+        )
+        self.assertEqual(run.status, 'running')
+        self.assertEqual(run.current_stage, 'signal_decider')
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_resumed_from_status'],
+            'failed',
+        )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_resume_count'],
+            1,
+        )
+        self.assertEqual(
+            run.run_metadata[
+                'terminal_continuation_feedback_lease_loss_run_id'
+            ],
+            lease_run_id,
+        )
+        failed_child_statement = (
+            resume_session.execute.call_args_list[5].args[0]
+        )
+        failed_child_compiled = failed_child_statement.compile()
+        self.assertIn(
+            lease_run_id,
+            failed_child_compiled.params.values(),
+        )
+        self.assertIn(
+            'agent_context_feedback_runs',
+            str(failed_child_statement),
+        )
+        self.assertIn('FOR UPDATE', str(failed_child_statement))
+        self.assertEqual(summary_stage.status, 'completed')
+        for stage in stages[2:]:
+            self.assertEqual(stage.status, 'pending')
+            self.assertEqual(stage.processed, 0)
+            self.assertEqual(stage.details, {})
+
+        interrupted_at = failed_at + timedelta(minutes=1)
+        run.status = 'interrupted'
+        run.current_stage = 'signal_decider'
+        run.updated_at = interrupted_at
+        run.completed_at = interrupted_at
+        run.error_message = 'Core restarted.'
+        run.run_metadata.update(
+            {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+                'interrupted_at': interrupted_at.isoformat(),
+            }
+        )
+        for invalid_resume_count, invalid_resume_origin in (
+            (2, 'failed'),
+            (1, 'running'),
+        ):
+            with self.subTest(
+                invalid_resume_count=invalid_resume_count,
+                invalid_resume_origin=invalid_resume_origin,
+            ):
+                run.run_metadata[
+                    'terminal_continuation_resume_count'
+                ] = invalid_resume_count
+                run.run_metadata[
+                    'terminal_continuation_resumed_from_status'
+                ] = invalid_resume_origin
+                invalid_restart_session = build_resume_session(
+                    lease_child
+                )
+                invalid_restart_context = MagicMock()
+                invalid_restart_context.__enter__.return_value = (
+                    invalid_restart_session
+                )
+                with (
+                    patch(
+                        'app.eod.daily_pipeline_state.session_scope',
+                        return_value=invalid_restart_context,
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_state._utcnow',
+                        return_value=(
+                            interrupted_at + timedelta(minutes=31)
+                        ),
+                    ),
+                ):
+                    invalid_restart_result = (
+                        service.claim_terminal_continuation(
+                            pipeline_run_id=456,
+                            market_date='2026-09-18',
+                            reused_eod_collection_run_id=546,
+                        )
+                    )
+                self.assertFalse(invalid_restart_result['claimed'])
+                self.assertEqual(
+                    invalid_restart_result['reason'],
+                    'terminal_continuation_failed_lease_loss_ineligible',
+                )
+                invalid_restart_session.flush.assert_not_called()
+        run.run_metadata['terminal_continuation_resume_count'] = 1
+        run.run_metadata[
+            'terminal_continuation_resumed_from_status'
+        ] = 'failed'
+        tampered_restart_child = deepcopy(lease_child)
+        tampered_restart_child.summary_payload['admission_lease_loss'][
+            'owner_token_fingerprint'
+        ] = 'b' * 16
+        tampered_restart_session = build_resume_session(
+            tampered_restart_child
+        )
+        tampered_restart_context = MagicMock()
+        tampered_restart_context.__enter__.return_value = (
+            tampered_restart_session
+        )
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=tampered_restart_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=interrupted_at + timedelta(minutes=31),
+            ),
+        ):
+            tampered_restart_result = (
+                service.claim_terminal_continuation(
+                    pipeline_run_id=456,
+                    market_date='2026-09-18',
+                    reused_eod_collection_run_id=546,
+                )
+            )
+        self.assertFalse(tampered_restart_result['claimed'])
+        self.assertEqual(
+            tampered_restart_result['reason'],
+            'terminal_continuation_failed_lease_loss_evidence_invalid',
+        )
+        self.assertEqual(
+            tampered_restart_result['field'],
+            'admission_lease_loss',
+        )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_resume_count'],
+            1,
+        )
+
+        valid_restart_session = build_resume_session(lease_child)
+        valid_restart_context = MagicMock()
+        valid_restart_context.__enter__.return_value = (
+            valid_restart_session
+        )
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=valid_restart_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=interrupted_at + timedelta(minutes=31),
+            ),
+        ):
+            valid_restart_result = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertTrue(valid_restart_result['claimed'])
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_resume_count'],
+            2,
+        )
+
+        decider_stage.status = 'failed'
+        decider_stage.processed = 2
+        decider_stage.total = 2
+        decider_stage.succeeded = 0
+        decider_stage.failed = 2
+        decider_stage.remaining = 0
+        decider_stage.current_step = 'signal_decider_failed'
+        decider_stage.completed_at = failed_at + timedelta(minutes=1)
+        decider_stage.error_message = lease_loss_error
+        decider_stage.source_run_ids = {
+            'agent_feedback_run_id': lease_run_id
+        }
+        run.status = 'failed'
+        run.current_stage = 'signal_decider'
+        run.completed_at = decider_stage.completed_at
+        run.error_message = lease_loss_error
+        second_run_result = MagicMock()
+        second_run_result.scalar_one_or_none.return_value = run
+        second_session = MagicMock()
+        second_session.execute.side_effect = [
+            MagicMock(),
+            second_run_result,
+        ]
+        second_context = MagicMock()
+        second_context.__enter__.return_value = second_session
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=second_context,
+        ):
+            second_result = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertFalse(second_result['claimed'])
+        self.assertEqual(
+            second_result['reason'],
+            'terminal_continuation_failed_lease_loss_ineligible',
+        )
+        self.assertEqual(decider_stage.status, 'failed')
+
     def test_claim_terminal_continuation_resumes_from_first_unfinished_stage(
         self,
     ) -> None:

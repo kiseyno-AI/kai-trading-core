@@ -6168,6 +6168,7 @@ class PykrxBackfillServiceTests(TestCase):
         }
         claimed_run = {
             'id': 96,
+            'market_date': '2026-04-03',
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
             'status': 'running',
             'current_stage': 'agent_feedback_summaries',
@@ -6332,6 +6333,105 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertTrue(
             _is_terminal_followup_continuation_candidate(
                 interrupted_after_summary
+            )
+        )
+
+        lease_lost_after_summary = deepcopy(interrupted_after_summary)
+        lease_loss_error = (
+            'feedback retry lease ownership lost for '
+            'feedback-cycle-2026-04-03-deadbeef01 at '
+            'before_parent_finalization: '
+            'heartbeat_refresh_grace_exceeded'
+        )
+        lease_lost_after_summary['status'] = 'failed'
+        lease_lost_after_summary['current_stage'] = 'signal_decider'
+        lease_lost_after_summary['completed_at'] = (
+            '2026-04-03T08:01:00+00:00'
+        )
+        lease_lost_after_summary['error_message'] = lease_loss_error
+        lease_lost_after_summary['run_metadata'].pop('resumable', None)
+        lease_lost_after_summary['run_metadata'].pop(
+            'interrupted_reason',
+            None,
+        )
+        lease_lost_after_summary['run_metadata'].pop(
+            'interrupted_at',
+            None,
+        )
+        lease_lost_after_summary['stages']['signal_decider'] = {
+            'stage_id': 'signal_decider',
+            'status': 'failed',
+            'processed': 20,
+            'total': 160,
+            'succeeded': 0,
+            'failed': 20,
+            'remaining': 140,
+            'current_step': 'signal_decider_failed',
+            'completed_at': '2026-04-03T08:01:00+00:00',
+            'error_message': lease_loss_error,
+            'source_run_ids': {
+                'agent_feedback_run_id': (
+                    'feedback-cycle-2026-04-03-deadbeef01'
+                )
+            },
+            'details': {},
+        }
+        self.assertTrue(
+            _is_terminal_followup_continuation_candidate(
+                lease_lost_after_summary
+            )
+        )
+
+        generic_failure = deepcopy(lease_lost_after_summary)
+        generic_failure['error_message'] = 'upstream request failed'
+        generic_failure['stages']['signal_decider'][
+            'error_message'
+        ] = 'upstream request failed'
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(generic_failure)
+        )
+
+        mismatched_child = deepcopy(lease_lost_after_summary)
+        mismatched_child['stages']['signal_decider']['source_run_ids'] = {
+            'agent_feedback_run_id': (
+                'feedback-cycle-2026-04-03-cafebabe01'
+            )
+        }
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(mismatched_child)
+        )
+
+        consumed_reclaim = deepcopy(lease_lost_after_summary)
+        consumed_reclaim['run_metadata'][
+            'terminal_continuation_resume_count'
+        ] = 1
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(consumed_reclaim)
+        )
+
+        for malformed_resume_count in ('0', 'corrupt', True):
+            with self.subTest(
+                malformed_resume_count=malformed_resume_count,
+            ):
+                malformed_reclaim = deepcopy(lease_lost_after_summary)
+                malformed_reclaim['run_metadata'][
+                    'terminal_continuation_resume_count'
+                ] = malformed_resume_count
+                self.assertFalse(
+                    _is_terminal_followup_continuation_candidate(
+                        malformed_reclaim
+                    )
+                )
+
+        failed_parent_with_pending_stage = deepcopy(
+            lease_lost_after_summary
+        )
+        failed_parent_with_pending_stage['stages']['signal_decider'] = (
+            deepcopy(claimed_run['stages']['signal_decider'])
+        )
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(
+                failed_parent_with_pending_stage
             )
         )
 

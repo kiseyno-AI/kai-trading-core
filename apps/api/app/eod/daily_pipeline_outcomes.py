@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -45,6 +46,12 @@ PYKRX_ENRICHMENT_REQUIRED_CATEGORIES: frozenset[str] = frozenset(
         'investor_flow_symbol',
         'short_selling',
     }
+)
+_TERMINAL_FEEDBACK_LEASE_LOSS_ERROR = re.compile(
+    r'\Afeedback retry lease ownership lost for '
+    r'(?P<run_id>feedback-cycle-(?P<market_date>\d{4}-\d{2}-\d{2})-'
+    r'[0-9a-f]{10}) at before_parent_finalization: '
+    r'heartbeat_refresh_grace_exceeded\Z'
 )
 
 
@@ -140,6 +147,89 @@ def terminal_continuation_marker_is_valid(
             Mapping,
         )
     )
+
+
+def terminal_continuation_resume_is_unconsumed(
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    """Accept only a missing/null or exact integer-zero reclaim counter."""
+
+    if not isinstance(metadata, Mapping):
+        return False
+    value = metadata.get('terminal_continuation_resume_count')
+    return value is None or (type(value) is int and value == 0)
+
+
+def terminal_continuation_feedback_lease_loss_run_id(
+    *,
+    pipeline_run: Mapping[str, Any] | None,
+    stage: Mapping[str, Any] | None,
+) -> str | None:
+    """Return the child id only for the exact reclaimable lease-loss shape."""
+
+    if not isinstance(pipeline_run, Mapping) or not isinstance(stage, Mapping):
+        return None
+    metadata = pipeline_run.get('run_metadata')
+    if not terminal_continuation_marker_is_valid(
+        metadata if isinstance(metadata, Mapping) else None
+    ):
+        return None
+    if not terminal_continuation_resume_is_unconsumed(metadata):
+        return None
+    if not (
+        str(pipeline_run.get('status') or '').strip().lower() == 'failed'
+        and str(pipeline_run.get('current_stage') or '').strip()
+        == 'signal_decider'
+        and pipeline_run.get('completed_at') is not None
+        and str(stage.get('stage_id') or stage.get('stage') or '').strip()
+        == 'signal_decider'
+        and str(stage.get('status') or '').strip().lower() == 'failed'
+        and str(stage.get('current_step') or '').strip()
+        == 'signal_decider_failed'
+        and stage.get('completed_at') is not None
+    ):
+        return None
+
+    parent_error = str(pipeline_run.get('error_message') or '').strip()
+    stage_error = str(stage.get('error_message') or '').strip()
+    if not parent_error or parent_error != stage_error:
+        return None
+    error_match = _TERMINAL_FEEDBACK_LEASE_LOSS_ERROR.fullmatch(parent_error)
+    if error_match is None:
+        return None
+    if str(pipeline_run.get('market_date') or '')[:10] != error_match.group(
+        'market_date'
+    ):
+        return None
+
+    child_run_id = error_match.group('run_id')
+    source_run_ids = stage.get('source_run_ids')
+    if not (
+        isinstance(source_run_ids, Mapping)
+        and source_run_ids == {'agent_feedback_run_id': child_run_id}
+    ):
+        return None
+
+    counts = {
+        key: _optional_int(stage.get(key))
+        for key in ('processed', 'total', 'succeeded', 'failed', 'remaining')
+    }
+    if any(value is None or value < 0 for value in counts.values()):
+        return None
+    processed = counts['processed']
+    total = counts['total']
+    succeeded = counts['succeeded']
+    failed = counts['failed']
+    remaining = counts['remaining']
+    if not (
+        processed > 0
+        and total > 0
+        and failed > 0
+        and processed == succeeded + failed
+        and total == processed + remaining
+    ):
+        return None
+    return child_run_id
 
 
 def _first_nonnegative_int(
