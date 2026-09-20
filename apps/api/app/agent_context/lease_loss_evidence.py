@@ -144,12 +144,13 @@ def terminal_feedback_lease_loss_evidence_error(
     requested_symbol_set = set(raw_symbols)
     if not all(
         isinstance(role_symbol_scopes.get(role), list)
-        and len(role_symbol_scopes[role])
-        == len(set(role_symbol_scopes[role]))
         and all(
-            symbol in requested_symbol_set
+            isinstance(symbol, str)
+            and symbol in requested_symbol_set
             for symbol in role_symbol_scopes[role]
         )
+        and len(role_symbol_scopes[role])
+        == len(set(role_symbol_scopes[role]))
         and type(role_symbol_counts.get(role)) is int
         and role_symbol_counts[role] == len(role_symbol_scopes[role])
         for role in expected_roles
@@ -268,13 +269,13 @@ def terminal_feedback_completed_run_evidence_error(
         and set(role_symbol_counts) == set(expected_roles)
         and all(
             isinstance(role_symbol_scopes.get(role), list)
-            and len(role_symbol_scopes[role])
-            == len(set(role_symbol_scopes[role]))
             and all(
                 isinstance(symbol, str)
                 and symbol in requested_symbol_set
                 for symbol in role_symbol_scopes[role]
             )
+            and len(role_symbol_scopes[role])
+            == len(set(role_symbol_scopes[role]))
             and type(role_symbol_counts.get(role)) is int
             and role_symbol_counts[role]
             == len(role_symbol_scopes[role])
