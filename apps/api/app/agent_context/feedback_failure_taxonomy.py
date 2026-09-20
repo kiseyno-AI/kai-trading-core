@@ -6,6 +6,9 @@ from typing import Any, Iterable, Mapping
 
 
 class FeedbackFailureKind(str, Enum):
+    FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE = (
+        'fundamental_input_fingerprint_unavailable'
+    )
     DEPENDENCY_MISSING_UPSTREAM = 'dependency_missing_upstream'
     DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH = (
         'dependency_upstream_changed_during_dispatch'
@@ -22,6 +25,9 @@ class FeedbackFailureKind(str, Enum):
 
 
 class FeedbackFailureStatus(str, Enum):
+    FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE = (
+        'dependency/fundamental-input-fingerprint-unavailable'
+    )
     DEPENDENCY_MISSING_UPSTREAM = 'dependency/missing-upstream'
     DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH = (
         'dependency/upstream-changed-during-dispatch'
@@ -125,6 +131,24 @@ def classify_feedback_failure(
     context_payload = context if isinstance(context, Mapping) else {}
     summary_payload = summary if isinstance(summary, Mapping) else {}
     status_codes = set(_status_code_values(summary_payload, context_payload))
+
+    if (
+        'fundamental_input_fingerprint_unavailable' in haystack
+        or failure_kind
+        == FeedbackFailureKind.FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE.value
+        or failure_kind
+        == FeedbackFailureStatus.FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE.value
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=(
+                FeedbackFailureKind.FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE.value
+            ),
+            failure_status=(
+                FeedbackFailureStatus.FUNDAMENTAL_INPUT_FINGERPRINT_UNAVAILABLE.value
+            ),
+            failure_category='dependency',
+            reason='fundamental input fingerprint could not be computed for durable reuse',
+        )
 
     if (
         'dependency_upstream_changed_during_dispatch' in haystack

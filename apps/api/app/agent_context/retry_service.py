@@ -8,7 +8,7 @@ import hashlib
 import logging
 import threading
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from sqlalchemy import select, text
@@ -146,6 +146,246 @@ def _previous_run_matches_knowledge_cutoff(
         )
     except (TypeError, ValueError):
         return False
+
+
+def resolve_latest_completed_summary_knowledge_cutoff(
+    *,
+    market_date: date | str,
+    feedback_scope_mode: str,
+    source_run_id: str | None = None,
+    requested_symbols: Sequence[str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Resolve the cutoff owned by a proven summary cycle.
+
+    Decision-support retries must reuse the same point-in-time boundary as
+    their upstream summaries. Falling back to the current wall clock would
+    make valid persisted summaries look stale while the decider-only retry is
+    unable to refresh them. When ``source_run_id`` is provided, resolve only
+    that persisted run and require its requested-symbol scope when supplied.
+    """
+
+    normalized_market_date = (
+        market_date
+        if isinstance(market_date, date)
+        else date.fromisoformat(str(market_date).strip()[:10])
+    )
+    normalized_scope_mode = normalize_feedback_scope_mode(
+        feedback_scope_mode
+    )
+    normalized_source_run_id = (
+        str(source_run_id or '').strip()
+        if source_run_id is not None
+        else None
+    )
+    if source_run_id is not None and not normalized_source_run_id:
+        raise ValueError('source_run_id must be non-empty when provided')
+    if isinstance(requested_symbols, (str, bytes)):
+        raise ValueError('requested_symbols must be a sequence of symbols')
+    normalized_requested_symbols = (
+        sorted(_normalize_optional_symbol_scope(requested_symbols))
+        if requested_symbols is not None
+        else None
+    )
+    if normalized_source_run_id is not None:
+        latest_run = agent_context_feedback_run_state_service.get_run(
+            run_id=normalized_source_run_id,
+        )
+    else:
+        latest_run_kwargs: dict[str, Any] = {
+            'market_date': normalized_market_date,
+            'requested_roles': list(SUMMARIZER_AGENT_NAMES),
+            'request_modes': [DAILY_RETRY_CYCLE_MODE],
+            'feedback_scope_mode': normalized_scope_mode,
+        }
+        if normalized_requested_symbols is not None:
+            latest_run_kwargs['requested_symbols'] = list(
+                normalized_requested_symbols
+            )
+        latest_run = agent_context_feedback_run_state_service.find_latest_run(
+            **latest_run_kwargs
+        )
+    resolved_source_run_id = normalized_source_run_id
+    if resolved_source_run_id is None and isinstance(latest_run, dict):
+        resolved_source_run_id = str(
+            latest_run.get('run_id') or ''
+        ).strip()
+    base_result: dict[str, Any] = {
+        'ready': False,
+        'knowledge_cutoff_at': None,
+        'source_run_id': resolved_source_run_id,
+        'requested_symbols': normalized_requested_symbols,
+        'feedback_scope_mode': normalized_scope_mode,
+    }
+    if not isinstance(latest_run, dict):
+        return {**base_result, 'reason': 'summary_run_missing'}
+
+    request_payload = (
+        latest_run.get('request_payload')
+        if isinstance(latest_run.get('request_payload'), dict)
+        else {}
+    )
+    summary_payload = (
+        latest_run.get('summary_payload')
+        if isinstance(latest_run.get('summary_payload'), dict)
+        else {}
+    )
+    summary_request = (
+        summary_payload.get('request')
+        if isinstance(summary_payload.get('request'), dict)
+        else {}
+    )
+    represented_request_payloads = [
+        payload
+        for payload in (request_payload, summary_request)
+        if payload
+    ]
+    actual_source_run_id = str(latest_run.get('run_id') or '').strip()
+    if (
+        normalized_source_run_id is not None
+        and actual_source_run_id != normalized_source_run_id
+    ):
+        return {**base_result, 'reason': 'summary_source_run_id_mismatch'}
+
+    if normalized_source_run_id is not None:
+        raw_run_market_date = latest_run.get('market_date')
+        if raw_run_market_date is None:
+            raw_run_market_date = request_payload.get('market_date')
+        try:
+            run_market_date = (
+                raw_run_market_date.date()
+                if isinstance(raw_run_market_date, datetime)
+                else raw_run_market_date
+                if isinstance(raw_run_market_date, date)
+                else date.fromisoformat(
+                    str(raw_run_market_date or '').strip()[:10]
+                )
+            )
+        except (TypeError, ValueError):
+            run_market_date = None
+        if run_market_date != normalized_market_date:
+            return {**base_result, 'reason': 'summary_run_market_date_mismatch'}
+        if (
+            str(request_payload.get('mode') or '').strip()
+            != DAILY_RETRY_CYCLE_MODE
+        ):
+            return {**base_result, 'reason': 'summary_run_mode_mismatch'}
+        try:
+            persisted_scope_mode = normalize_feedback_scope_mode(
+                request_payload.get('feedback_scope_mode')
+            )
+        except ValueError:
+            persisted_scope_mode = None
+        if persisted_scope_mode != normalized_scope_mode:
+            return {
+                **base_result,
+                'reason': 'summary_run_feedback_scope_mode_mismatch',
+            }
+
+    run_roles = request_payload.get('roles')
+    if sorted(run_roles if isinstance(run_roles, list) else []) != sorted(
+        SUMMARIZER_AGENT_NAMES
+    ):
+        return {**base_result, 'reason': 'summary_run_roles_mismatch'}
+
+    if normalized_requested_symbols is not None:
+        represented_symbol_scopes: list[list[str]] = []
+        for payload in represented_request_payloads:
+            if 'requested_symbols' not in payload:
+                continue
+            raw_symbols = payload.get('requested_symbols')
+            if not isinstance(raw_symbols, (list, tuple, set)):
+                return {
+                    **base_result,
+                    'reason': 'summary_run_symbol_scope_unavailable',
+                }
+            represented_symbol_scopes.append(
+                sorted(_normalize_optional_symbol_scope(raw_symbols))
+            )
+        if not represented_symbol_scopes:
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_unavailable',
+            }
+        if any(
+            persisted_scope != normalized_requested_symbols
+            for persisted_scope in represented_symbol_scopes
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_mismatch',
+            }
+
+    if normalized_source_run_id is not None:
+        for payload in represented_request_payloads:
+            if (
+                payload.get('request_run_id') is not None
+                and str(payload.get('request_run_id') or '').strip()
+                != normalized_source_run_id
+            ):
+                return {
+                    **base_result,
+                    'reason': 'summary_run_lineage_mismatch',
+                }
+            if 'child_run_lineage' not in payload:
+                continue
+            raw_lineage = payload.get('child_run_lineage')
+            if not isinstance(raw_lineage, Mapping) or (
+                str(raw_lineage.get('schema_version') or '').strip()
+                != CHILD_RUN_LINEAGE_SCHEMA_VERSION
+                or str(raw_lineage.get('parent_run_id') or '').strip()
+                != normalized_source_run_id
+                or str(raw_lineage.get('child_link_field') or '').strip()
+                != 'parent_run_id'
+            ):
+                return {
+                    **base_result,
+                    'reason': 'summary_run_lineage_mismatch',
+                }
+
+    status = str(latest_run.get('status') or '').strip().lower()
+    completed_at = latest_run.get('completed_at')
+    if completed_at is None:
+        return {**base_result, 'reason': 'summary_run_not_finalized'}
+    try:
+        symbols_total = max(int(latest_run.get('symbols_total') or 0), 0)
+        completed_count = max(
+            int(latest_run.get('completed_count') or 0),
+            0,
+        )
+        failed_count = max(int(latest_run.get('failed_count') or 0), 0)
+    except (TypeError, ValueError):
+        return {**base_result, 'reason': 'summary_run_counts_invalid'}
+    if (
+        status != 'completed'
+        or failed_count != 0
+        or completed_count != symbols_total
+    ):
+        return {**base_result, 'reason': 'summary_run_incomplete'}
+
+    raw_cutoff = request_payload.get('admission_knowledge_cutoff_at')
+    if raw_cutoff is None:
+        raw_cutoff = request_payload.get('knowledge_cutoff_at')
+    try:
+        normalized_cutoff = _normalize_admission_knowledge_cutoff(raw_cutoff)
+        if normalized_cutoff is None:
+            raise ValueError('summary cutoff missing')
+        cutoff = datetime.fromisoformat(normalized_cutoff)
+    except (TypeError, ValueError):
+        return {**base_result, 'reason': 'summary_cutoff_invalid'}
+
+    resolved_now = now or datetime.now(timezone.utc)
+    if resolved_now.tzinfo is None or resolved_now.utcoffset() is None:
+        raise ValueError('now must include a timezone offset')
+    if cutoff > resolved_now.astimezone(timezone.utc):
+        return {**base_result, 'reason': 'summary_cutoff_in_future'}
+
+    return {
+        **base_result,
+        'ready': True,
+        'reason': 'latest_completed_summary_cutoff',
+        'knowledge_cutoff_at': cutoff,
+    }
 
 
 def _normalized_admission_scope(
@@ -2903,6 +3143,7 @@ class AgentFeedbackRetryService:
                                     market_date=config.market_date,
                                     symbols=dispatch_chunk,
                                     roles=[role],
+                                    fs_div=settings.dart_fundamentals_default_fs_div,
                                     knowledge_cutoff_at=knowledge_cutoff_at,
                                     parent_run_id=request_run_id,
                                     # The parent already resolved reuse for this exact

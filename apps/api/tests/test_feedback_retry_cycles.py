@@ -30,10 +30,12 @@ from app.agent_context.retry_service import (
     _feedback_retry_admission_lock_key,
     _claim_feedback_retry_run,
     _previous_run_matches_knowledge_cutoff,
+    resolve_latest_completed_summary_knowledge_cutoff,
 )
 from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundle
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.agent_context.reuse_service import AgentContextReuseService
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.runtime_state import RuntimeFeedbackRunState
 from scripts import run_feedback_retry_cycles
 
@@ -178,6 +180,266 @@ class RecordingRunStateService:
 
 
 class FeedbackRetryCycleTests(unittest.TestCase):
+    def test_resolves_completed_summary_cutoff_for_exact_source_and_symbol_scope(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-summary'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 6,
+            'completed_count': 6,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': [
+                    'eod-summarizer',
+                    'technical-summarizer',
+                    'fundamental-summarizer',
+                ],
+                'requested_symbols': ['000660', '005930'],
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'request_run_id': source_run_id,
+                'child_run_lineage': {
+                    'schema_version': 'agent_feedback_child_run_lineage_v1',
+                    'parent_run_id': source_run_id,
+                    'child_link_field': 'parent_run_id',
+                },
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with (
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=exact_run,
+            ) as get_run,
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_feedback_run_state_service.find_latest_run',
+            ) as find_latest_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                source_run_id=source_run_id,
+                requested_symbols=['005930', '000660'],
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['knowledge_cutoff_at'], cutoff)
+        self.assertEqual(result['source_run_id'], source_run_id)
+        self.assertEqual(result['requested_symbols'], ['000660', '005930'])
+        get_run.assert_called_once_with(run_id=source_run_id)
+        find_latest_run.assert_not_called()
+
+    def test_exact_summary_cutoff_rejects_symbol_scope_mismatch(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-summary'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 3,
+            'completed_count': 3,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(EXPECTED_ROLES[:3]),
+                'requested_symbols': ['005930'],
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'request_run_id': source_run_id,
+                'child_run_lineage': {
+                    'schema_version': 'agent_feedback_child_run_lineage_v1',
+                    'parent_run_id': source_run_id,
+                    'child_link_field': 'parent_run_id',
+                },
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                source_run_id=source_run_id,
+                requested_symbols=['000660'],
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['reason'], 'summary_run_symbol_scope_mismatch')
+        self.assertEqual(result['source_run_id'], source_run_id)
+
+    def test_exact_summary_cutoff_rejects_conflicting_self_lineage(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-summary'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 3,
+            'completed_count': 3,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(EXPECTED_ROLES[:3]),
+                'requested_symbols': ['005930'],
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'request_run_id': source_run_id,
+                'child_run_lineage': {
+                    'schema_version': 'agent_feedback_child_run_lineage_v1',
+                    'parent_run_id': 'different-parent',
+                    'child_link_field': 'parent_run_id',
+                },
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                source_run_id=source_run_id,
+                requested_symbols=['005930'],
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['reason'], 'summary_run_lineage_mismatch')
+        self.assertEqual(result['source_run_id'], source_run_id)
+
+    def test_resolves_latest_completed_summary_cutoff_for_decider_recovery(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        latest_run = {
+            'run_id': 'feedback-cycle-2026-04-16-summary',
+            'status': 'completed',
+            'symbols_total': 30,
+            'completed_count': 30,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'roles': [
+                    'eod-summarizer',
+                    'technical-summarizer',
+                    'fundamental-summarizer',
+                ],
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.find_latest_run',
+            return_value=latest_run,
+        ) as find_latest_run:
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['knowledge_cutoff_at'], cutoff)
+        self.assertEqual(result['source_run_id'], latest_run['run_id'])
+        find_latest_run.assert_called_once_with(
+            market_date=date(2026, 4, 16),
+            requested_roles=[
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+            ],
+            request_modes=[DAILY_RETRY_CYCLE_MODE],
+            feedback_scope_mode='broad_feedback_universe',
+        )
+
+    def test_rejects_unproven_summary_cutoff_for_decider_recovery(self):
+        now = datetime(2026, 4, 16, 7, 0, tzinfo=timezone.utc)
+        unsafe_runs = [
+            None,
+            {
+                'run_id': 'failed-summary',
+                'status': 'failed',
+                'symbols_total': 30,
+                'completed_count': 0,
+                'failed_count': 30,
+                'completed_at': now,
+                'request_payload': {
+                    'roles': list(EXPECTED_ROLES[:3]),
+                    'admission_knowledge_cutoff_at': now.isoformat(),
+                },
+            },
+            {
+                'run_id': 'partial-summary',
+                'status': 'completed',
+                'symbols_total': 30,
+                'completed_count': 29,
+                'failed_count': 0,
+                'completed_at': now,
+                'request_payload': {
+                    'roles': list(EXPECTED_ROLES[:3]),
+                    'admission_knowledge_cutoff_at': now.isoformat(),
+                },
+            },
+            {
+                'run_id': 'naive-cutoff',
+                'status': 'completed',
+                'symbols_total': 30,
+                'completed_count': 30,
+                'failed_count': 0,
+                'completed_at': now,
+                'request_payload': {
+                    'roles': list(EXPECTED_ROLES[:3]),
+                    'admission_knowledge_cutoff_at': '2026-04-16T06:45:00',
+                },
+            },
+            {
+                'run_id': 'future-cutoff',
+                'status': 'completed',
+                'symbols_total': 30,
+                'completed_count': 30,
+                'failed_count': 0,
+                'completed_at': now,
+                'request_payload': {
+                    'roles': list(EXPECTED_ROLES[:3]),
+                    'admission_knowledge_cutoff_at': (
+                        now + timedelta(seconds=1)
+                    ).isoformat(),
+                },
+            },
+        ]
+
+        for latest_run in unsafe_runs:
+            with self.subTest(run=latest_run and latest_run['run_id']):
+                with patch(
+                    'app.agent_context.retry_service.'
+                    'agent_context_feedback_run_state_service.find_latest_run',
+                    return_value=latest_run,
+                ):
+                    result = resolve_latest_completed_summary_knowledge_cutoff(
+                        market_date=date(2026, 4, 16),
+                        feedback_scope_mode='broad_feedback_universe',
+                        now=now,
+                    )
+
+                self.assertFalse(result['ready'])
+                self.assertIsNone(result['knowledge_cutoff_at'])
+
     def test_prior_run_resume_requires_exact_normalized_cutoff(self):
         previous_run = {
             'request_payload': {
