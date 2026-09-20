@@ -10749,6 +10749,60 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
         )
         self.assertEqual(scheduler.snapshot()['last_market_date'], '2026-09-11')
 
+    async def test_preopen_recovery_does_not_start_after_market_opens(self) -> None:
+        scheduler = AutoPykrxEODScheduler()
+        preopen = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-09-14T08:59:59+09:00',
+            session_open_at='2026-09-14T09:00:00+09:00',
+            session_close_at='2026-09-14T15:30:00+09:00',
+            latest_valid_trading_date='2026-09-11',
+        )
+        opened = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-09-14T09:00:01+09:00',
+            session_open_at='2026-09-14T09:00:00+09:00',
+            session_close_at='2026-09-14T15:30:00+09:00',
+            latest_valid_trading_date='2026-09-14',
+        )
+
+        with (
+            patch(
+                'app.eod.auto_pykrx.async_get_market_state',
+                side_effect=[preopen, opened],
+            ),
+            patch(
+                'app.eod.auto_pykrx.'
+                'load_oldest_outstanding_auto_eod_recovery_target',
+                return_value=AutoEODRecoveryTarget(
+                    trade_date='2026-09-11',
+                    eod_run_id=73,
+                ),
+            ),
+            patch.object(
+                scheduler,
+                '_run_scheduled_daily_pipeline',
+                new=AsyncMock(return_value=None),
+            ) as run_pipeline,
+        ):
+            await scheduler.schedule_daily_pipeline_if_due(
+                expected_market_state='PREOPEN'
+            )
+
+        self.assertIsNone(scheduler._task)
+        run_pipeline.assert_not_awaited()
+        self.assertEqual(scheduler.snapshot()['last_market_state'], 'OPEN')
+        self.assertEqual(
+            scheduler.snapshot()['last_reason'],
+            'market_state_changed:PREOPEN->OPEN',
+        )
+
     async def test_monday_closed_drains_friday_before_scheduling_monday(self) -> None:
         scheduler = AutoPykrxEODScheduler()
         market = MarketState(

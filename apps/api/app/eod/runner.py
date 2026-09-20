@@ -308,7 +308,13 @@ class EODBackgroundRunner:
                 if market.state in {'PREOPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}:
                     await self._run_async_step(
                         'auto_pykrx_schedule_daily_pipeline_if_due',
-                        auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(),
+                        auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(
+                            **(
+                                {'expected_market_state': 'PREOPEN'}
+                                if market.state == 'PREOPEN'
+                                else {}
+                            )
+                        ),
                     )
                     if auto_pykrx_eod_scheduler.state.active_task:
                         await asyncio.sleep(self.interval_seconds)

@@ -1086,7 +1086,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         async def stop_after_tick(_seconds: int) -> None:
             runner._running = False
 
-        async def mark_pipeline_active() -> None:
+        async def mark_pipeline_active(**_kwargs: object) -> None:
             from app.eod.runner import auto_pykrx_eod_scheduler
 
             auto_pykrx_eod_scheduler.state.active_task = True
@@ -1132,7 +1132,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
                 auto_pykrx_eod_scheduler.state.active_task = False
 
-        schedule_daily.assert_awaited_once_with()
+        schedule_daily.assert_awaited_once_with(expected_market_state='PREOPEN')
         refresh_master.assert_not_called()
         refresh_plan.assert_not_called()
         reconcile.assert_not_awaited()
