@@ -16,7 +16,7 @@ import time
 from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import defer
 
@@ -223,6 +223,174 @@ def _parse_aware_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed
+
+
+def _load_projected_decider_feedback_runs(
+    *,
+    session: Any,
+    market_date: date,
+) -> list[dict[str, Any]]:
+    """Load only run metadata needed to reconstruct decider authority.
+
+    Feedback run payloads also contain large diagnostics and model artifacts.
+    Next-open authority only consumes the bounded scope, lineage, failure, and
+    reuse fields projected below; fetching the full JSON documents amplifies DB
+    contention and JSON decoding during the market-open refresh path.
+    """
+
+    request_payload = AgentContextFeedbackRun.request_payload
+    summary_payload = AgentContextFeedbackRun.summary_payload
+    progress_summary = summary_payload['progress_summary']
+    summary_request = summary_payload['request']
+    rows = session.execute(
+        select(
+            AgentContextFeedbackRun.id,
+            AgentContextFeedbackRun.run_id,
+            AgentContextFeedbackRun.market_date,
+            AgentContextFeedbackRun.status,
+            AgentContextFeedbackRun.symbols_total,
+            AgentContextFeedbackRun.completed_count,
+            AgentContextFeedbackRun.failed_count,
+            AgentContextFeedbackRun.started_at,
+            AgentContextFeedbackRun.completed_at,
+            AgentContextFeedbackRun.created_at,
+            AgentContextFeedbackRun.updated_at,
+            request_payload['mode'].label('request_mode'),
+            request_payload['roles'].label('request_roles'),
+            request_payload['scope'].label('request_scope'),
+            request_payload['role_symbol_scopes'].label(
+                'request_role_symbol_scopes'
+            ),
+            request_payload['requested_symbols'].label(
+                'request_requested_symbols'
+            ),
+            request_payload['symbols'].label('request_symbols'),
+            request_payload['parent_run_id'].label(
+                'request_parent_run_id'
+            ),
+            request_payload['reuse_existing'].label(
+                'request_reuse_existing'
+            ),
+            request_payload['force_recompute'].label(
+                'request_force_recompute'
+            ),
+            request_payload['child_run_lineage'].label(
+                'request_child_run_lineage'
+            ),
+            func.json_typeof(request_payload['reuse_existing']).label(
+                'request_reuse_existing_json_type'
+            ),
+            summary_payload['failed_symbols_by_role'].label(
+                'summary_failed_symbols_by_role'
+            ),
+            summary_payload['reused_symbols_by_role'].label(
+                'summary_reused_symbols_by_role'
+            ),
+            summary_payload['reused_feedback_evidence_by_role'].label(
+                'summary_reused_feedback_evidence_by_role'
+            ),
+            progress_summary['failed_symbols_by_role'].label(
+                'progress_failed_symbols_by_role'
+            ),
+            progress_summary['reused_symbols_by_role'].label(
+                'progress_reused_symbols_by_role'
+            ),
+            progress_summary['reused_feedback_evidence_by_role'].label(
+                'progress_reused_feedback_evidence_by_role'
+            ),
+            summary_request['symbols'].label('summary_request_symbols'),
+            summary_request['requested_symbols'].label(
+                'summary_request_requested_symbols'
+            ),
+        )
+        .where(AgentContextFeedbackRun.market_date == market_date)
+        .order_by(
+            AgentContextFeedbackRun.started_at.desc(),
+            AgentContextFeedbackRun.id.desc(),
+        )
+    ).mappings().all()
+
+    request_fields = (
+        ('mode', 'request_mode'),
+        ('roles', 'request_roles'),
+        ('scope', 'request_scope'),
+        ('role_symbol_scopes', 'request_role_symbol_scopes'),
+        ('requested_symbols', 'request_requested_symbols'),
+        ('symbols', 'request_symbols'),
+        ('parent_run_id', 'request_parent_run_id'),
+        ('reuse_existing', 'request_reuse_existing'),
+        ('force_recompute', 'request_force_recompute'),
+        ('child_run_lineage', 'request_child_run_lineage'),
+    )
+    summary_fields = (
+        ('failed_symbols_by_role', 'summary_failed_symbols_by_role'),
+        ('reused_symbols_by_role', 'summary_reused_symbols_by_role'),
+        (
+            'reused_feedback_evidence_by_role',
+            'summary_reused_feedback_evidence_by_role',
+        ),
+    )
+    progress_fields = (
+        ('failed_symbols_by_role', 'progress_failed_symbols_by_role'),
+        ('reused_symbols_by_role', 'progress_reused_symbols_by_role'),
+        (
+            'reused_feedback_evidence_by_role',
+            'progress_reused_feedback_evidence_by_role',
+        ),
+    )
+    summary_request_fields = (
+        ('symbols', 'summary_request_symbols'),
+        ('requested_symbols', 'summary_request_requested_symbols'),
+    )
+
+    def projected_fields(
+        row: Any,
+        fields: Sequence[tuple[str, str]],
+    ) -> dict[str, Any]:
+        return {
+            key: row[label]
+            for key, label in fields
+            if row[label] is not None
+        }
+
+    projected_runs: list[dict[str, Any]] = []
+    for row in rows:
+        projected_request = projected_fields(row, request_fields)
+        if (
+            row['request_reuse_existing_json_type'] is not None
+            and 'reuse_existing' not in projected_request
+        ):
+            # Preserve explicit JSON null.  Omitting the key would incorrectly
+            # activate payload.get('reuse_existing', True)'s legacy default.
+            projected_request['reuse_existing'] = None
+        projected_summary = projected_fields(row, summary_fields)
+        projected_progress = projected_fields(row, progress_fields)
+        projected_summary_request = projected_fields(
+            row,
+            summary_request_fields,
+        )
+        if projected_progress:
+            projected_summary['progress_summary'] = projected_progress
+        if projected_summary_request:
+            projected_summary['request'] = projected_summary_request
+        projected_runs.append(
+            {
+                'id': row['id'],
+                'run_id': row['run_id'],
+                'market_date': row['market_date'],
+                'status': row['status'],
+                'symbols_total': row['symbols_total'],
+                'completed_count': row['completed_count'],
+                'failed_count': row['failed_count'],
+                'request_payload': projected_request,
+                'summary_payload': projected_summary,
+                'started_at': row['started_at'],
+                'completed_at': row['completed_at'],
+                'created_at': row['created_at'],
+                'updated_at': row['updated_at'],
+            }
+        )
+    return projected_runs
 
 
 def _normalize_date(value: str | date | None, *, default: date) -> date:
@@ -2100,6 +2268,7 @@ class SignalDeciderNextOpenExecutionService:
                 agent_feedback_orchestrator.revalidate_persisted_decider_snapshots(
                     market_date=source_market_date,
                     snapshots=raw_latest_snapshots,
+                    full_source_revalidation_actionable_only=True,
                 )
             )
             valid_snapshot_ids = {
@@ -3291,6 +3460,7 @@ class SignalDeciderNextOpenExecutionService:
                 .revalidate_persisted_decider_snapshots(
                     market_date=source_market_date,
                     snapshots=current_raw_snapshots,
+                    full_source_revalidation_actionable_only=True,
                 )
             )
             if (
@@ -4669,18 +4839,10 @@ class SignalDeciderNextOpenExecutionService:
                     SignalDeciderDecisionSnapshot.id.desc(),
                 )
             ).scalars().all()
-            run_rows = session.execute(
-                select(AgentContextFeedbackRun)
-                .where(AgentContextFeedbackRun.market_date == source_market_date)
-                .order_by(
-                    AgentContextFeedbackRun.started_at.desc(),
-                    AgentContextFeedbackRun.id.desc(),
-                )
-            ).scalars().all()
-            run_snapshots = [
-                agent_context_feedback_run_state_service._serialize_run(row)
-                for row in run_rows
-            ]
+            run_snapshots = _load_projected_decider_feedback_runs(
+                session=session,
+                market_date=source_market_date,
+            )
             failure_rows = session.execute(
                 select(
                     AgentContextFeedbackFailure.symbol,
@@ -5626,6 +5788,7 @@ class SignalDeciderNextOpenExecutionService:
             agent_feedback_orchestrator.revalidate_persisted_decider_snapshots(
                 market_date=source_market_date,
                 snapshots=raw_snapshots,
+                full_source_revalidation_actionable_only=True,
             )
         )
         valid_snapshot_ids = set(

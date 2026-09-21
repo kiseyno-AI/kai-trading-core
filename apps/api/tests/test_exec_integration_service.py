@@ -2519,7 +2519,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         }
 
     @staticmethod
-    def _valid_snapshot_generation_fixture(*, market_date, snapshots) -> dict:
+    def _valid_snapshot_generation_fixture(
+        *,
+        market_date,
+        snapshots,
+        full_source_revalidation_actionable_only=False,
+    ) -> dict:
         snapshot_ids = sorted(int(snapshot.id) for snapshot in snapshots)
         identity_by_id = {
             int(snapshot.id): {

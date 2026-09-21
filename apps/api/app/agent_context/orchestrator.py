@@ -3245,6 +3245,7 @@ class AgentFeedbackOrchestrator:
         *,
         market_date: str | date,
         snapshots: Sequence[Any],
+        full_source_revalidation_actionable_only: bool = False,
     ) -> dict[str, Any]:
         """Revalidate immutable decision inputs before next-open execution use.
 
@@ -3256,6 +3257,11 @@ class AgentFeedbackOrchestrator:
         data, eligibility, policy, prior decision, or exact upstream lineage no
         longer matches. Current-session quote/order-book context is intentionally
         delegated to the next-open live market authority gate.
+
+        Callers may limit the expensive durable source comparison to actionable
+        snapshots. Payload, fence, and durable metadata validation still applies
+        to every snapshot. The default retains full source revalidation for all
+        fenced snapshots.
         """
 
         normalized_market_date = (
@@ -3294,24 +3300,25 @@ class AgentFeedbackOrchestrator:
                 }
                 continue
 
+            action_values = {
+                str(value or '').strip().lower()
+                for value in (
+                    getattr(snapshot, 'decision_action', None),
+                    getattr(snapshot, 'next_day_open_action', None),
+                    response_payload.get('preferred_action'),
+                    response_payload.get('tactical_action'),
+                )
+            }
+            actionable_snapshot = bool(
+                action_values
+                & {'buy', 'scalp_buy_candidate', 'watch_for_trigger'}
+            )
+
             fence = request_payload.get('decision_input_generation_fence')
             if (
                 not isinstance(fence, dict)
                 or fence.get('enforcement') != 'required'
             ):
-                action_values = {
-                    str(value or '').strip().lower()
-                    for value in (
-                        getattr(snapshot, 'decision_action', None),
-                        getattr(snapshot, 'next_day_open_action', None),
-                        response_payload.get('preferred_action'),
-                        response_payload.get('tactical_action'),
-                    )
-                }
-                actionable_legacy = bool(
-                    action_values
-                    & {'buy', 'scalp_buy_candidate', 'watch_for_trigger'}
-                )
                 validation_by_snapshot_id[snapshot_id] = (
                     {
                         'status': 'invalid',
@@ -3319,7 +3326,7 @@ class AgentFeedbackOrchestrator:
                             'actionable_snapshot_missing_durable_generation_fence'
                         ),
                     }
-                    if actionable_legacy
+                    if actionable_snapshot
                     else {
                         'status': 'legacy_unenforced',
                         'reason': 'durable_generation_fence_not_present',
@@ -3415,6 +3422,15 @@ class AgentFeedbackOrchestrator:
             normalized_knowledge_cutoff = (
                 parsed_knowledge_cutoff.astimezone(timezone.utc).isoformat()
             )
+            if (
+                full_source_revalidation_actionable_only
+                and not actionable_snapshot
+            ):
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'valid',
+                    'reason': 'non_actionable_durable_metadata_valid',
+                }
+                continue
             group_material = {
                 'decision_run_id': decision_run_id,
                 'fs_div': revalidation_request.get('fs_div'),

@@ -29,16 +29,21 @@ from app.agent_context.lease_loss_evidence import (
     RETRY_ADMISSION_SCHEMA_VERSION,
     terminal_feedback_lease_loss_evidence_error,
 )
+from app.agent_context.orchestrator_helpers import (
+    build_upstream_feedback_bundle as _build_upstream_feedback_bundle,
+)
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.progress_service import agent_context_progress_service
 from app.agent_context.read_service import (
     resolve_external_news_knowledge_cutoff_for_symbols,
 )
-from app.agent_context.reuse_service import agent_context_reuse_service
+from app.agent_context.reuse_service import (
+    FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
+    agent_context_reuse_service,
+)
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     DEFAULT_AGENT_NAMES,
-    SIGNAL_DECIDER_AGENT_NAME,
     SUMMARIZER_AGENT_NAMES,
 )
 from app.agent_context.run_modes import (
@@ -1269,6 +1274,7 @@ class AgentFeedbackRetryService:
         roles: Sequence[str],
         symbols: Sequence[str],
         required_parent_run_id: str | None = None,
+        knowledge_cutoff_at: datetime | str | None = None,
     ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
         completed_by_role: dict[str, set[str]] = defaultdict(set)
         failed_by_role: dict[str, set[str]] = defaultdict(set)
@@ -1331,6 +1337,51 @@ class AgentFeedbackRetryService:
                 }
                 for row in persisted_failure_rows
             ]
+            if knowledge_cutoff_at is not None:
+                evidence_run_ids = {
+                    row['run_id']
+                    for row in (*feedback_rows, *failure_rows)
+                    if row['run_id']
+                }
+                matching_run_ids: set[str] = set()
+                if evidence_run_ids:
+                    cutoff_run_rows = session.execute(
+                        select(
+                            AgentContextFeedbackRun.run_id,
+                            AgentContextFeedbackRun.request_payload,
+                        ).where(
+                            AgentContextFeedbackRun.run_id.in_(
+                                evidence_run_ids
+                            )
+                        )
+                    ).all()
+                    matching_run_ids = {
+                        str(row.run_id)
+                        for row in cutoff_run_rows
+                        if _previous_run_matches_knowledge_cutoff(
+                            {
+                                'request_payload': (
+                                    dict(row.request_payload)
+                                    if isinstance(
+                                        row.request_payload,
+                                        dict,
+                                    )
+                                    else {}
+                                )
+                            },
+                            knowledge_cutoff_at,
+                        )
+                    }
+                feedback_rows = [
+                    row
+                    for row in feedback_rows
+                    if row['run_id'] in matching_run_ids
+                ]
+                failure_rows = [
+                    row
+                    for row in failure_rows
+                    if row['run_id'] in matching_run_ids
+                ]
             child_run_rows: list[dict[str, Any]] = []
             if required_parent_run_id:
                 persisted_child_run_rows = session.execute(
@@ -1865,22 +1916,72 @@ class AgentFeedbackRetryService:
         )
         ready_symbols: list[str] = []
         for symbol in normalized_symbols:
-            symbol_decisions = upstream_decisions.get(symbol, {})
-            upstream_ready = True
-            for role in SUMMARIZER_AGENT_NAMES:
-                decision = symbol_decisions.get(role)
-                latest_feedback = getattr(decision, 'latest_feedback', None) if decision is not None else None
-                has_reusable_feedback = (
-                    decision is not None
-                    and not bool(getattr(decision, 'should_dispatch', True))
-                    and isinstance(latest_feedback, dict)
-                )
-                if not has_reusable_feedback:
-                    upstream_ready = False
-                    break
-            if upstream_ready:
+            _, _, missing_roles = _build_upstream_feedback_bundle(
+                symbol=symbol,
+                market_date=market_date,
+                buffered_lookup={},
+                upstream_reuse_decisions=upstream_decisions,
+                upstream_summary_roles=SUMMARIZER_AGENT_NAMES,
+            )
+            if not missing_roles:
                 ready_symbols.append(symbol)
         return tuple(ready_symbols)
+
+    def _filter_automatic_decider_upstream_ready_symbols(
+        self,
+        *,
+        market_date: date,
+        symbols: Sequence[str],
+        knowledge_cutoff_at: datetime | str | None = None,
+        fs_div: str | None = None,
+    ) -> tuple[str, ...]:
+        normalized_symbols = _normalize_optional_symbol_scope(symbols)
+        if not normalized_symbols:
+            return ()
+
+        completed_by_role, _ = self._load_same_day_terminal_symbols(
+            market_date=market_date,
+            roles=SUMMARIZER_AGENT_NAMES,
+            symbols=normalized_symbols,
+            knowledge_cutoff_at=knowledge_cutoff_at,
+        )
+        non_fundamental_roles = tuple(
+            role
+            for role in SUMMARIZER_AGENT_NAMES
+            if role != FUNDAMENTAL_SUMMARIZER_AGENT_NAME
+        )
+        same_day_ready = {
+            symbol
+            for symbol in normalized_symbols
+            if all(
+                symbol in completed_by_role.get(role, set())
+                for role in SUMMARIZER_AGENT_NAMES
+            )
+        }
+        fundamental_reuse_candidates = tuple(
+            symbol
+            for symbol in normalized_symbols
+            if symbol not in same_day_ready
+            and all(
+                symbol in completed_by_role.get(role, set())
+                for role in non_fundamental_roles
+            )
+        )
+        prior_day_reusable = set()
+        if fundamental_reuse_candidates:
+            prior_day_reusable.update(
+                self._filter_decider_retry_ready_symbols(
+                    market_date=market_date,
+                    symbols=fundamental_reuse_candidates,
+                    knowledge_cutoff_at=knowledge_cutoff_at,
+                    fs_div=fs_div,
+                )
+            )
+        return tuple(
+            symbol
+            for symbol in normalized_symbols
+            if symbol in same_day_ready or symbol in prior_day_reusable
+        )
 
     @staticmethod
     def _classify_role_boundary_status(
@@ -2157,7 +2258,10 @@ class AgentFeedbackRetryService:
                     or symbol in current_failed_symbols
                 )
             )
-            if role == SIGNAL_DECIDER_AGENT_NAME and not boundary_pending_symbols:
+            if (
+                role in DECISION_SUPPORT_AGENT_NAMES
+                and not boundary_pending_symbols
+            ):
                 retry_pending_symbols = self._filter_decider_retry_ready_symbols(
                     market_date=market_date,
                     symbols=failed_symbols,
@@ -2534,7 +2638,10 @@ class AgentFeedbackRetryService:
         attempted_symbols: set[str] | None = None,
     ) -> tuple[str, ...]:
         attempted = attempted_symbols or set()
-        if role_state.role == SIGNAL_DECIDER_AGENT_NAME and not role_state.boundary_pending_symbols:
+        if (
+            role_state.role in DECISION_SUPPORT_AGENT_NAMES
+            and not role_state.boundary_pending_symbols
+        ):
             retry_ready = set(role_state.retry_pending_symbols)
             return tuple(
                 symbol for symbol in role_state.failed_symbols
@@ -2949,10 +3056,6 @@ class AgentFeedbackRetryService:
             for role, symbols in role_funnel.get('role_symbols', {}).items()
             if isinstance(symbols, list)
         }
-        scoped_role_symbol_total = sum(
-            len(role_symbol_scopes.get(role, ()))
-            for role in roles
-        )
         scoped_feedback_symbols = _ordered_symbol_union(
             [role_symbol_scopes.get(role, ()) for role in roles]
         ) or list(eligible_symbols)
@@ -2980,6 +3083,110 @@ class AgentFeedbackRetryService:
                 else None
             )
         knowledge_cutoff_at = effective_knowledge_cutoff_at.isoformat()
+        decider_scope_symbols = _ordered_symbol_union(
+            [
+                role_symbol_scopes.get(role, ())
+                for role in roles
+                if role in DECISION_SUPPORT_AGENT_NAMES
+            ]
+        )
+        decider_only_fast_path = bool(roles) and (
+            feedback_scope_mode
+            == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            and set(roles).issubset(set(DECISION_SUPPORT_AGENT_NAMES))
+        )
+        automatic_scope = requested_symbols is None
+        decider_upstream_admission: dict[str, Any] = {
+            'applied': False,
+            'candidate_count': len(decider_scope_symbols),
+            'ready_count': None,
+            'excluded_count': 0,
+            'excluded_symbols': [],
+            'scope_preserved': bool(
+                decider_only_fast_path and not automatic_scope
+            ),
+            'fallback_reason': (
+                'requested_scope'
+                if decider_only_fast_path and not automatic_scope
+                else 'not_decider_only_fast_path'
+                if not decider_only_fast_path
+                else None
+            ),
+        }
+        if decider_only_fast_path and automatic_scope:
+            ready_symbols = self._filter_automatic_decider_upstream_ready_symbols(
+                market_date=config.market_date,
+                symbols=tuple(decider_scope_symbols),
+                knowledge_cutoff_at=effective_knowledge_cutoff_at,
+                fs_div=resolved_fs_div,
+            )
+            ready_symbol_set = set(ready_symbols)
+            excluded_symbols = [
+                symbol
+                for symbol in decider_scope_symbols
+                if symbol not in ready_symbol_set
+            ]
+            decider_upstream_admission.update(
+                {
+                    'applied': bool(ready_symbols) or not decider_scope_symbols,
+                    'ready_count': len(ready_symbols),
+                    'excluded_count': len(excluded_symbols),
+                    'excluded_symbols': excluded_symbols,
+                    'scope_preserved': bool(
+                        decider_scope_symbols and not ready_symbols
+                    ),
+                    'fallback_reason': (
+                        None
+                        if ready_symbols or not decider_scope_symbols
+                        else 'no_upstream_ready_symbols'
+                    ),
+                }
+            )
+            # Preserve the selected/ranked scope and only remove unavailable
+            # dependencies when at least one candidate remains. If none are
+            # ready, keep the original scope so the orchestrator emits the
+            # existing retryable missing-upstream failure evidence.
+            if decider_upstream_admission['applied']:
+                for role in roles:
+                    filtered_symbols = [
+                        symbol
+                        for symbol in role_symbol_scopes.get(role, ())
+                        if symbol in ready_symbol_set
+                    ]
+                    role_symbol_scopes[role] = tuple(filtered_symbols)
+                    role_funnel['role_symbols'][role] = filtered_symbols
+                    role_funnel['role_symbol_counts'][role] = len(
+                        filtered_symbols
+                    )
+                    role_diagnostics = role_funnel.get(
+                        'role_diagnostics', {}
+                    ).get(role)
+                    if isinstance(role_diagnostics, dict):
+                        role_diagnostics['symbols'] = filtered_symbols
+                        role_diagnostics[
+                            'decider_upstream_admission'
+                        ] = dict(decider_upstream_admission)
+                        scope_alignment = role_diagnostics.get(
+                            'scope_alignment'
+                        )
+                        if isinstance(scope_alignment, dict):
+                            scope_alignment[
+                                'decider_scope_symbol_count'
+                            ] = len(filtered_symbols)
+                decider_scope = role_funnel.get('decider_scope')
+                if isinstance(decider_scope, dict):
+                    decider_scope['symbols'] = list(ready_symbols)
+                    decider_scope['symbol_count'] = len(ready_symbols)
+                scoped_feedback_symbols = _ordered_symbol_union(
+                    [role_symbol_scopes.get(role, ()) for role in roles]
+                )
+        role_funnel['decider_upstream_admission'] = dict(
+            decider_upstream_admission
+        )
+        scoped_role_symbol_total = sum(
+            len(role_symbol_scopes.get(role, ()))
+            for role in roles
+        )
         if scoped_role_symbol_total <= 0:
             scoped_role_symbol_total = len(scoped_feedback_symbols) * max(1, len(roles))
         skipped_symbols = (
@@ -3043,6 +3250,7 @@ class AgentFeedbackRetryService:
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'eligibility_diagnostics': eligibility_diagnostics,
             'funnel_diagnostics': role_funnel,
+            'decider_upstream_admission': decider_upstream_admission,
             'role_symbol_scopes': {
                 role: list(symbols)
                 for role, symbols in role_symbol_scopes.items()
@@ -3548,7 +3756,6 @@ class AgentFeedbackRetryService:
                 retry_pending_symbols=final_retry_pending_symbols,
                 boundary_pending_roles=final_boundary_pending_roles,
             )
-
             resume_plan = self._resolve_cycle_plan(
                 snapshot=final_snapshot,
                 max_cycles=max(config.max_cycles, completed_cycles + 1),
