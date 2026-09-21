@@ -1318,7 +1318,12 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.agent_context_from_state_patcher.start()
         self.addCleanup(self.agent_context_from_state_patcher.stop)
-        def valid_snapshot_generations(*, market_date, snapshots):
+        def valid_snapshot_generations(
+            *,
+            market_date,
+            snapshots,
+            full_source_revalidation_actionable_only=False,
+        ):
             snapshot_ids = sorted(int(snapshot.id) for snapshot in snapshots)
             identity_by_id = {
                 int(snapshot.id): {
@@ -2362,6 +2367,16 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'data_quality_warnings_present',
         )
         self.assertNotIn('035420', items_by_symbol)
+        self.assertTrue(self.snapshot_generation_mock.call_args_list)
+        self.assertTrue(
+            all(
+                call.kwargs.get(
+                    'full_source_revalidation_actionable_only'
+                )
+                is True
+                for call in self.snapshot_generation_mock.call_args_list
+            )
+        )
 
     def test_refresh_revokes_decision_observed_at_target_session_open(
         self,
@@ -4402,6 +4417,116 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             expected_snapshot_id,
         )
 
+    def test_scope_state_projects_only_authority_run_metadata(self) -> None:
+        parent_run_id = f'projected-parent-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_run_id,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == parent_run_id
+                )
+            ).scalar_one()
+            row.request_payload = {
+                **dict(row.request_payload or {}),
+                'large_unrelated_request_context': 'x' * 100_000,
+            }
+            row.summary_payload = {
+                **dict(row.summary_payload or {}),
+                'failed_symbols_by_role': {},
+                'progress_summary': {
+                    'failed_symbols_by_role': {},
+                    'reused_symbols_by_role': {},
+                    'reused_feedback_evidence_by_role': {},
+                    'large_unrelated_progress_context': 'y' * 100_000,
+                },
+                'request': {
+                    'symbols': ['005930'],
+                    'requested_symbols': ['005930'],
+                    'large_unrelated_summary_request_context': 'z' * 100_000,
+                },
+                'large_unrelated_summary_context': 'w' * 100_000,
+            }
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        projected = next(
+            run
+            for run in state['run_snapshots']
+            if run['run_id'] == parent_run_id
+        )
+        self.assertEqual(
+            projected['request_payload']['child_run_lineage'][
+                'parent_run_id'
+            ],
+            parent_run_id,
+        )
+        self.assertNotIn(
+            'large_unrelated_request_context',
+            projected['request_payload'],
+        )
+        self.assertNotIn(
+            'large_unrelated_summary_context',
+            projected['summary_payload'],
+        )
+        self.assertNotIn(
+            'large_unrelated_progress_context',
+            projected['summary_payload']['progress_summary'],
+        )
+        self.assertNotIn(
+            'large_unrelated_summary_request_context',
+            projected['summary_payload']['request'],
+        )
+
+    def test_scope_state_preserves_legacy_summary_request_scope_fallback(
+        self,
+    ) -> None:
+        parent_run_id = f'legacy-summary-scope-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=parent_run_id,
+            symbols=['005930'],
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+        )
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == parent_run_id
+                )
+            ).scalar_one()
+            request_payload = dict(row.request_payload or {})
+            request_payload.pop('role_symbol_scopes', None)
+            request_payload.pop('symbols', None)
+            request_payload.pop('requested_symbols', None)
+            row.request_payload = request_payload
+            row.summary_payload = {
+                'request': {
+                    'symbols': ['005930'],
+                    'requested_symbols': ['005930'],
+                }
+            }
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(
+            state['source_role_symbol_scopes'],
+            {
+                'short-term-decider': ['005930'],
+                'signal-decider': ['005930'],
+            },
+        )
+
     def test_targeted_parent_overlays_only_its_symbols_on_latest_full_cohort(self) -> None:
         base_parent = f'base-parent-{uuid4().hex[:8]}'
         base_short = f'base-short-{uuid4().hex[:8]}'
@@ -4946,6 +5071,15 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 decision_snapshot_id=expected_snapshot_id,
             ),
         )
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == reuse_child
+                )
+            ).scalar_one()
+            request_payload = dict(row.request_payload or {})
+            request_payload.pop('reuse_existing', None)
+            row.request_payload = request_payload
 
         state = self._service()._load_latest_decider_scope_state(
             source_market_date=self.market_date,
@@ -8415,6 +8549,12 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'decision_input_generation_changed',
         )
         self.assertFalse(generation['replacement_actionable'])
+        self.assertIs(
+            self.snapshot_generation_mock.call_args.kwargs.get(
+                'full_source_revalidation_actionable_only'
+            ),
+            True,
+        )
 
     def test_dispatch_generation_rejects_snapshot_observed_at_target_open(
         self,

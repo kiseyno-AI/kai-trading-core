@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from app.eod.runner import (
     BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
     EODBackgroundRunner,
+    NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
     is_preopen_exec_dispatch_due,
 )
 from app.market.clock import MarketState
@@ -426,6 +427,73 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                     *runner._blocking_step_tasks.values(),
                     return_exceptions=True,
                 )
+
+    async def test_open_plan_refresh_reuses_preopen_single_flight(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        open_market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T09:00:10+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        release_plan = asyncio.Event()
+        preopen_plan_task = asyncio.create_task(release_plan.wait())
+        runner._blocking_step_tasks[NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY] = (
+            preopen_plan_task
+        )
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        try:
+            with (
+                patch('app.eod.runner.settings.background_runner_enabled', True),
+                patch('app.eod.runner.async_get_market_state', return_value=open_market),
+                patch('app.eod.runner.refresh_master_if_due'),
+                patch(
+                    'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                    new=AsyncMock(),
+                ),
+                patch(
+                    'app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'
+                ) as refresh_plan,
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution',
+                    return_value=True,
+                ),
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.dispatch_next_open_plan',
+                    new=AsyncMock(),
+                ) as dispatch_plan,
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.'
+                    'revoke_delegated_buys_for_unavailable_market_evidence',
+                    new=AsyncMock(),
+                ) as revoke_delegated_buys,
+                patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+            ):
+                runner._running = True
+                await runner._run_loop()
+
+            refresh_plan.assert_not_called()
+            dispatch_plan.assert_not_awaited()
+            revoke_delegated_buys.assert_awaited_once_with(
+                target_trade_date='2026-04-30',
+                trigger=(
+                    'background_runner:'
+                    'signal_decider_open_execution_refresh_plan_if_due_failed'
+                ),
+            )
+        finally:
+            release_plan.set()
+            await preopen_plan_task
+            runner._blocking_step_tasks.pop(
+                NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
+                None,
+            )
 
     async def test_preopen_loop_refreshes_master_and_next_open_plan(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)

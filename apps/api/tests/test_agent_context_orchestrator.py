@@ -688,6 +688,175 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
             '2026-04-23T06:30:00+00:00',
         )
 
+    def test_actionable_only_revalidation_still_validates_every_snapshot_payload_and_metadata(
+        self,
+    ):
+        durable_request = {
+            'durable_decision_input_generation': {
+                'schema_version': 'durable_decider_input_generation_v1',
+                'durable_reuse_eligible': True,
+                'non_durable_reasons': [],
+            },
+            'decision_input_generation_fence': {'enforcement': 'required'},
+            'source_revalidation_request': {
+                'source_context_scope_symbols': ['005930', '000660'],
+                'eligibility_scope_symbols': ['005930', '000660'],
+                'fs_div': 'CFS',
+                'disclosures_limit': 5,
+                'knowledge_cutoff_at': '2026-04-23T06:30:00+00:00',
+            },
+        }
+        actionable = SimpleNamespace(
+            id=110,
+            request_payload=durable_request,
+            response_payload={'preferred_action': 'buy'},
+            decision_run_id='selective-fenced-run',
+            agent_name='signal-decider',
+            symbol='005930',
+            decision_action='buy',
+            next_day_open_action='buy',
+        )
+        non_actionable = SimpleNamespace(
+            id=111,
+            request_payload=durable_request,
+            response_payload={'preferred_action': 'wait'},
+            decision_run_id='selective-fenced-run',
+            agent_name='signal-decider',
+            symbol='000660',
+            decision_action='wait',
+            next_day_open_action='wait',
+        )
+        malformed_payload = SimpleNamespace(
+            id=112,
+            request_payload=durable_request,
+            response_payload='{"preferred_action":',
+            decision_run_id='selective-fenced-run',
+            agent_name='signal-decider',
+            symbol='035420',
+            decision_action='wait',
+            next_day_open_action='wait',
+        )
+        missing_metadata = SimpleNamespace(
+            id=113,
+            request_payload={
+                'decision_input_generation_fence': {
+                    'enforcement': 'required'
+                },
+            },
+            response_payload={'preferred_action': 'reject'},
+            decision_run_id='selective-fenced-run',
+            agent_name='signal-decider',
+            symbol='051910',
+            decision_action='reject',
+            next_day_open_action='reject',
+        )
+        service = AgentFeedbackOrchestrator()
+
+        with patch.object(
+            service,
+            '_revalidate_decider_dispatch_inputs',
+            return_value={},
+        ) as revalidate:
+            result = service.revalidate_persisted_decider_snapshots(
+                market_date='2026-04-23',
+                snapshots=[
+                    actionable,
+                    non_actionable,
+                    malformed_payload,
+                    missing_metadata,
+                ],
+                full_source_revalidation_actionable_only=True,
+            )
+
+        revalidate.assert_called_once()
+        self.assertEqual(
+            revalidate.call_args.kwargs['source_items'],
+            [durable_request],
+        )
+        self.assertEqual(
+            revalidate.call_args.kwargs['source_context_scope_symbols'],
+            ['005930', '000660'],
+        )
+        self.assertEqual(
+            revalidate.call_args.kwargs['eligibility_scope_symbols'],
+            ['005930', '000660'],
+        )
+        self.assertEqual(result['valid_snapshot_ids'], [110, 111])
+        self.assertEqual(result['invalid_snapshot_ids'], [112, 113])
+        validations = {
+            row['snapshot_id']: row for row in result['validations']
+        }
+        self.assertEqual(
+            validations[110]['reason'],
+            'durable_decider_inputs_unchanged',
+        )
+        self.assertEqual(
+            validations[111]['reason'],
+            'non_actionable_durable_metadata_valid',
+        )
+        self.assertEqual(
+            validations[112]['reason'],
+            'persisted_snapshot_payload_invalid',
+        )
+        self.assertEqual(
+            validations[113]['reason'],
+            'durable_generation_metadata_missing',
+        )
+
+    def test_actionable_only_revalidation_skips_source_reads_for_wait_and_reject(
+        self,
+    ):
+        durable_request = {
+            'durable_decision_input_generation': {
+                'schema_version': 'durable_decider_input_generation_v1',
+                'durable_reuse_eligible': True,
+                'non_durable_reasons': [],
+            },
+            'decision_input_generation_fence': {'enforcement': 'required'},
+            'source_revalidation_request': {
+                'source_context_scope_symbols': ['005930', '000660'],
+                'eligibility_scope_symbols': ['005930', '000660'],
+                'fs_div': 'CFS',
+                'disclosures_limit': 5,
+                'knowledge_cutoff_at': '2026-04-23T06:30:00+00:00',
+            },
+        }
+        snapshots = [
+            SimpleNamespace(
+                id=snapshot_id,
+                request_payload=durable_request,
+                response_payload={'preferred_action': action},
+                decision_run_id='non-actionable-fenced-run',
+                agent_name='signal-decider',
+                symbol=symbol,
+                decision_action=action,
+                next_day_open_action=action,
+            )
+            for snapshot_id, symbol, action in (
+                (114, '005930', 'wait'),
+                (115, '000660', 'reject'),
+            )
+        ]
+        service = AgentFeedbackOrchestrator()
+
+        with patch.object(
+            service,
+            '_revalidate_decider_dispatch_inputs',
+        ) as revalidate:
+            result = service.revalidate_persisted_decider_snapshots(
+                market_date='2026-04-23',
+                snapshots=snapshots,
+                full_source_revalidation_actionable_only=True,
+            )
+
+        revalidate.assert_not_called()
+        self.assertEqual(result['valid_snapshot_ids'], [114, 115])
+        self.assertEqual(result['invalid_snapshot_ids'], [])
+        self.assertEqual(
+            {row['reason'] for row in result['validations']},
+            {'non_actionable_durable_metadata_valid'},
+        )
+
 
 class ResponseIntegrityGuardTests(unittest.TestCase):
     def test_missing_batch_response_correlation_fails_closed(self):

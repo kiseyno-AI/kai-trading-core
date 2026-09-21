@@ -23,6 +23,7 @@ BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS = 45
 BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS = 600
 MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(9, 0)
 MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(14, 31)
+NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY = 'signal_decider_next_open_execution_refresh_plan_if_due'
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
@@ -361,7 +362,7 @@ class EODBackgroundRunner:
                         name='signal_decider_next_open_execution_refresh_plan_if_due',
                         market=market,
                         awaitable=self._run_blocking_step(
-                            'signal_decider_next_open_execution_refresh_plan_if_due',
+                            NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
                             signal_decider_next_open_execution_service.refresh_plan_if_due,
                             fail_closed=True,
                         ),
@@ -393,7 +394,7 @@ class EODBackgroundRunner:
                             name='signal_decider_open_execution_refresh_plan_if_due',
                             market=market,
                             awaitable=self._run_blocking_step(
-                                'signal_decider_open_execution_refresh_plan_if_due',
+                                NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
                                 lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
                                     target_trade_date=market.server_time[:10]
                                 ),
