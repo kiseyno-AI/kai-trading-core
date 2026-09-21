@@ -70,6 +70,7 @@ from app.orders.next_open_execution import (
     NextOpenAccountTarget,
     _PlanRefreshRevisionConflict,
     _acquire_plan_refresh_advisory_lock,
+    _actionable_signal_policy_versions,
     _delegate_short_term_watch_entry_quality_blocks_to_warnings,
     _execution_plan_row_authority_fingerprint,
     _is_canonical_closed_market_cost_absence,
@@ -255,7 +256,33 @@ def test_plan_refresh_retries_transient_revision_conflicts_with_backoff() -> Non
 
     assert result == expected
     assert refresh_once.call_count == 3
+    assert all(
+        call.kwargs['_compact_response'] is False
+        for call in refresh_once.call_args_list
+    )
     assert [entry.args[0] for entry in sleep.call_args_list] == [0.025, 0.05]
+
+
+def test_scheduler_refresh_requests_compact_response() -> None:
+    service = SignalDeciderNextOpenExecutionService()
+    expected = {'summary': {'items_total': 0}, 'items': []}
+
+    with patch.object(
+        service,
+        '_refresh_plan_items_once',
+        return_value=expected,
+    ) as refresh_plan_items_once:
+        result = service.refresh_plan_if_due(
+            target_trade_date='2026-04-30'
+        )
+
+    assert result == expected
+    refresh_plan_items_once.assert_called_once_with(
+        target_trade_date='2026-04-30',
+        trigger='preopen_scheduler',
+        force=False,
+        _compact_response=True,
+    )
 
 
 def test_plan_refresh_fails_closed_after_bounded_revision_conflicts() -> None:
@@ -999,6 +1026,80 @@ class FakeCalendarClient:
     async def fetch_krx_holiday_calendar(self, **kwargs):
         self.calls.append(kwargs)
         return {'output': list(self.rows)}
+
+
+class NextOpenRefreshUnitTests(unittest.TestCase):
+    def test_policy_context_versions_include_only_actionable_signals(self) -> None:
+        def snapshot(action: str, policy_version: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                agent_name='signal-decider',
+                policy_version=policy_version,
+                next_day_open_action=action,
+                decision_action=action,
+                request_payload={
+                    'symbol_day_context': {'market': 'KOSPI'},
+                },
+            )
+
+        self.assertEqual(
+            _actionable_signal_policy_versions(
+                [
+                    snapshot('wait', 'wait-policy'),
+                    snapshot('reject', 'reject-policy'),
+                    snapshot('buy', 'buy-policy'),
+                ]
+            ),
+            ['buy-policy'],
+        )
+
+    def test_compact_refresh_response_skips_detailed_serialization(self) -> None:
+        target_trade_date = date(2026, 4, 30)
+        rows = [SimpleNamespace(id=1)]
+        service = SignalDeciderNextOpenExecutionService()
+
+        with (
+            patch.object(
+                service,
+                '_load_plan_rows',
+                return_value=rows,
+            ) as load_plan_rows,
+            patch.object(
+                service,
+                '_serialize_row',
+                return_value={'plan_item_id': 1},
+            ) as serialize_row,
+        ):
+            compact_rows, compact_items = (
+                service._load_plan_refresh_response(
+                    target_trade_date=target_trade_date,
+                    compact_response=True,
+                )
+            )
+            load_plan_rows.assert_called_once_with(
+                target_trade_date=target_trade_date,
+                account_reference=None,
+                include_payloads=False,
+                include_validation_payload=True,
+            )
+            serialize_row.assert_not_called()
+
+            load_plan_rows.reset_mock()
+            detailed_rows, detailed_items = (
+                service._load_plan_refresh_response(
+                    target_trade_date=target_trade_date,
+                    compact_response=False,
+                )
+            )
+
+        self.assertIs(compact_rows, rows)
+        self.assertEqual(compact_items, [])
+        self.assertIs(detailed_rows, rows)
+        self.assertEqual(detailed_items, [{'plan_item_id': 1}])
+        load_plan_rows.assert_called_once_with(
+            target_trade_date=target_trade_date,
+            account_reference=None,
+        )
+        serialize_row.assert_called_once_with(rows[0])
 
 
 class AgentContextCompletenessUnitTests(unittest.TestCase):
@@ -2376,6 +2477,43 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 is True
                 for call in self.snapshot_generation_mock.call_args_list
             )
+        )
+
+    def test_scheduler_refresh_reuses_initial_scope_state_before_locked_reread(
+        self,
+    ) -> None:
+        self.agent_context_completeness_patcher.stop()
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with (
+            patch.object(
+                service,
+                '_load_latest_decider_scope_state',
+                wraps=service._load_latest_decider_scope_state,
+            ) as load_scope_state,
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[
+                    {'trade_date': '2026-04-29', 'close_price': 50000}
+                ],
+            ),
+        ):
+            result = service.refresh_plan_if_due(
+                target_trade_date=self.target_trade_date,
+            )
+
+        self.assertIn('summary', result)
+        self.assertEqual(result['items'], [])
+        self.assertEqual(load_scope_state.call_count, 2)
+        self.assertIsNone(
+            load_scope_state.call_args_list[0].kwargs.get('_session')
+        )
+        self.assertIsNotNone(
+            load_scope_state.call_args_list[1].kwargs.get('_session')
         )
 
     def test_refresh_revokes_decision_observed_at_target_session_open(

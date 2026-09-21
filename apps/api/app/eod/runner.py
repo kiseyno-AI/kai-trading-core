@@ -24,6 +24,7 @@ BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS = 600
 MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(9, 0)
 MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(14, 31)
 NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY = 'signal_decider_next_open_execution_refresh_plan_if_due'
+OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY = 'signal_decider_exec_dispatch_open_plan'
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
@@ -196,7 +197,7 @@ class EODBackgroundRunner:
         awaitable,
         *,
         fail_closed: bool = False,
-    ) -> None:
+    ) -> bool:
         running_task = self._async_step_tasks.get(name)
         if running_task is not None and not running_task.done():
             with suppress(Exception):
@@ -204,7 +205,7 @@ class EODBackgroundRunner:
             logger.info('Background runner async step already in flight: %s', name)
             if fail_closed:
                 raise RuntimeError(f'async step still in flight: {name}')
-            return
+            return False
         if running_task is not None:
             self._finalize_async_step(name, running_task)
         if self._step_in_timeout_cooldown(name):
@@ -212,7 +213,7 @@ class EODBackgroundRunner:
                 awaitable.close()
             if fail_closed:
                 raise RuntimeError(f'async step is in timeout cooldown: {name}')
-            return
+            return False
         task = asyncio.create_task(awaitable, name=f'eod-background-async:{name}')
         self._async_step_tasks[name] = task
         task.add_done_callback(
@@ -238,6 +239,8 @@ class EODBackgroundRunner:
             )
             if fail_closed:
                 raise RuntimeError(f'async step timed out: {name}')
+            return False
+        return True
 
     def _finalize_async_step(self, name: str, task: asyncio.Task) -> None:
         if self._async_step_tasks.get(name) is task:
@@ -390,29 +393,39 @@ class EODBackgroundRunner:
                         )
                 elif runtime_background_enabled and market.state == 'OPEN':
                     if signal_decider_exec_integration_service.should_delegate_execution():
-                        await self._run_buy_authority_critical_step(
-                            name='signal_decider_open_execution_refresh_plan_if_due',
-                            market=market,
-                            awaitable=self._run_blocking_step(
-                                NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
-                                lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
-                                    target_trade_date=market.server_time[:10]
+                        open_dispatch_task = self._async_step_tasks.get(
+                            OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY
+                        )
+                        if open_dispatch_task is not None and not open_dispatch_task.done():
+                            logger.info(
+                                'Background runner skipping OPEN exec cycle while prior '
+                                'dispatch is still in flight'
+                            )
+                        else:
+                            await self._run_buy_authority_critical_step(
+                                name='signal_decider_open_execution_refresh_plan_if_due',
+                                market=market,
+                                awaitable=self._run_blocking_step(
+                                    NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
+                                    lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
+                                        target_trade_date=market.server_time[:10]
+                                    ),
+                                    fail_closed=True,
                                 ),
-                                fail_closed=True,
-                            ),
-                        )
-                        await self._run_async_step(
-                            'signal_decider_exec_dispatch_open_plan',
-                            signal_decider_exec_integration_service.dispatch_next_open_plan(
-                                target_trade_date=market.server_time[:10],
-                                refresh_plan=False,
-                                trigger='market_open_exec_dispatch',
-                            ),
-                        )
-                        self._schedule_exec_readback_refresh(
-                            target_trade_date=market.server_time[:10],
-                            trigger='market_open_scheduler',
-                        )
+                            )
+                            dispatch_completed = await self._run_async_step(
+                                OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY,
+                                signal_decider_exec_integration_service.dispatch_next_open_plan(
+                                    target_trade_date=market.server_time[:10],
+                                    refresh_plan=False,
+                                    trigger='market_open_exec_dispatch',
+                                ),
+                            )
+                            if dispatch_completed:
+                                self._schedule_exec_readback_refresh(
+                                    target_trade_date=market.server_time[:10],
+                                    trigger='market_open_scheduler',
+                                )
                     elif signal_decider_exec_integration_service.should_manage_delegated_authority(
                         target_trade_date=market.server_time[:10],
                     ):
