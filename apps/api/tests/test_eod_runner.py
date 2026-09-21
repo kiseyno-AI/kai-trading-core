@@ -6,6 +6,7 @@ from app.eod.runner import (
     BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
     EODBackgroundRunner,
     NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
+    OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY,
     is_preopen_exec_dispatch_due,
 )
 from app.market.clock import MarketState
@@ -939,6 +940,212 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             trigger='market_open_scheduler',
             timeout_seconds=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
         )
+
+    async def test_open_loop_defers_readback_until_shielded_dispatch_completes(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T09:05:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        release_dispatch = asyncio.Event()
+        dispatch_started = asyncio.Event()
+
+        async def dispatch_plan(**_kwargs: object) -> dict[str, dict[str, bool]]:
+            dispatch_started.set()
+            await release_dispatch.wait()
+            return {'summary': {'delegated_to_exec': True}}
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        try:
+            with (
+                patch('app.eod.runner.settings.background_runner_enabled', True),
+                patch('app.eod.runner.BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS', 0.01),
+                patch('app.eod.runner.async_get_market_state', return_value=market_state),
+                patch('app.eod.runner.refresh_master_if_due'),
+                patch(
+                    'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                    new=AsyncMock(),
+                ),
+                patch(
+                    'app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'
+                ) as refresh_plan,
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution',
+                    return_value=True,
+                ),
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.dispatch_next_open_plan',
+                    new=AsyncMock(side_effect=dispatch_plan),
+                ) as dispatch_exec,
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.'
+                    'schedule_signal_decider_exec_readback_refresh',
+                    return_value={'request': {}, 'refresh': {}},
+                ) as schedule_refresh,
+                patch(
+                    'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                    new=AsyncMock(),
+                ),
+                patch(
+                    'app.eod.runner.portfolio_summary_service.refresh_portfolio_summary_if_due',
+                    new=AsyncMock(),
+                ),
+            ):
+                with patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick):
+                    runner._running = True
+                    await runner._run_loop()
+
+                await asyncio.wait_for(dispatch_started.wait(), timeout=0.25)
+                in_flight_dispatch = runner._async_step_tasks[
+                    OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY
+                ]
+                refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+                self.assertEqual(dispatch_exec.await_count, 1)
+                schedule_refresh.assert_not_called()
+                self.assertFalse(in_flight_dispatch.done())
+                self.assertFalse(in_flight_dispatch.cancelled())
+
+                with patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick):
+                    runner._running = True
+                    await runner._run_loop()
+
+                refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+                self.assertEqual(dispatch_exec.await_count, 1)
+                schedule_refresh.assert_not_called()
+                self.assertFalse(in_flight_dispatch.done())
+                self.assertFalse(in_flight_dispatch.cancelled())
+
+                release_dispatch.set()
+                await asyncio.wait_for(in_flight_dispatch, timeout=0.25)
+                await asyncio.sleep(0)
+
+                with patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick):
+                    runner._running = True
+                    await runner._run_loop()
+
+                self.assertEqual(refresh_plan.call_count, 2)
+                self.assertEqual(dispatch_exec.await_count, 2)
+                schedule_refresh.assert_called_once_with(
+                    target_trade_date='2026-04-30',
+                    trigger='market_open_scheduler',
+                    timeout_seconds=0.01,
+                )
+        finally:
+            release_dispatch.set()
+            if runner._async_step_tasks:
+                await asyncio.gather(
+                    *runner._async_step_tasks.values(),
+                    return_exceptions=True,
+                )
+
+    async def test_open_loop_skips_readback_when_dispatch_retry_is_in_cooldown(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T09:05:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        release_dispatch = asyncio.Event()
+
+        async def failed_dispatch(**_kwargs: object) -> None:
+            await release_dispatch.wait()
+            raise RuntimeError('dispatch failed after timeout')
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        try:
+            with (
+                patch('app.eod.runner.settings.background_runner_enabled', True),
+                patch('app.eod.runner.BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS', 0.01),
+                patch('app.eod.runner.async_get_market_state', return_value=market_state),
+                patch('app.eod.runner.refresh_master_if_due'),
+                patch(
+                    'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                    new=AsyncMock(),
+                ),
+                patch(
+                    'app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'
+                ) as refresh_plan,
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution',
+                    return_value=True,
+                ),
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.dispatch_next_open_plan',
+                    new=AsyncMock(side_effect=failed_dispatch),
+                ) as dispatch_exec,
+                patch(
+                    'app.eod.runner.signal_decider_exec_integration_service.'
+                    'schedule_signal_decider_exec_readback_refresh',
+                    return_value={'request': {}, 'refresh': {}},
+                ) as schedule_refresh,
+                patch(
+                    'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                    new=AsyncMock(),
+                ),
+                patch(
+                    'app.eod.runner.portfolio_summary_service.refresh_portfolio_summary_if_due',
+                    new=AsyncMock(),
+                ),
+            ):
+                await runner._run_async_step(
+                    OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY,
+                    dispatch_exec(
+                        target_trade_date='2026-04-30',
+                        refresh_plan=False,
+                        trigger='market_open_exec_dispatch',
+                    ),
+                )
+                in_flight_dispatch = runner._async_step_tasks[
+                    OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY
+                ]
+                self.assertFalse(in_flight_dispatch.cancelled())
+
+                release_dispatch.set()
+                with self.assertRaisesRegex(RuntimeError, 'dispatch failed after timeout'):
+                    await in_flight_dispatch
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+                self.assertNotIn(
+                    OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY,
+                    runner._async_step_tasks,
+                )
+                self.assertIn(
+                    OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY,
+                    runner._step_timeout_cooldowns,
+                )
+
+                with patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick):
+                    runner._running = True
+                    await runner._run_loop()
+
+                refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+                self.assertEqual(dispatch_exec.await_count, 1)
+                schedule_refresh.assert_not_called()
+        finally:
+            release_dispatch.set()
+            if runner._async_step_tasks:
+                await asyncio.gather(
+                    *runner._async_step_tasks.values(),
+                    return_exceptions=True,
+                )
 
     async def test_open_loop_schedules_slow_exec_readback_without_blocking_cycle(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)

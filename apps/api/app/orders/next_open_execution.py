@@ -1380,6 +1380,19 @@ def _is_actionable_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
     return False
 
 
+def _actionable_signal_policy_versions(
+    snapshots: Sequence[SignalDeciderDecisionSnapshot],
+) -> list[str]:
+    return sorted(
+        {
+            snapshot.policy_version
+            for snapshot in snapshots
+            if _snapshot_agent_name(snapshot) == SIGNAL_DECIDER_AGENT_NAME
+            and _is_actionable_snapshot(snapshot)
+        }
+    )
+
+
 def _is_actionable_short_term_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
     return _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME and _is_actionable_snapshot(snapshot)
 
@@ -2742,6 +2755,7 @@ class SignalDeciderNextOpenExecutionService:
         *,
         source_market_date: date,
         candidate_symbols: Sequence[str] | None = None,
+        scope_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_symbols = sorted(
             {
@@ -2755,9 +2769,10 @@ class SignalDeciderNextOpenExecutionService:
             SIGNAL_DECIDER_AGENT_NAME,
         ]
         try:
-            scope_state = self._load_latest_decider_scope_state(
-                source_market_date=source_market_date
-            )
+            if scope_state is None:
+                scope_state = self._load_latest_decider_scope_state(
+                    source_market_date=source_market_date
+                )
             if 'source_run' in scope_state:
                 source_run = scope_state.get('source_run')
             else:
@@ -3132,6 +3147,7 @@ class SignalDeciderNextOpenExecutionService:
         return self.refresh_plan_items(
             target_trade_date=target_trade_date,
             trigger='preopen_scheduler',
+            _compact_response=True,
         )
 
     def refresh_plan_items(
@@ -3140,6 +3156,7 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: str | date | None = None,
         trigger: str = 'manual',
         force: bool = False,
+        _compact_response: bool = False,
     ) -> dict[str, Any]:
         for attempt in range(PLAN_REFRESH_REVISION_RETRY_ATTEMPTS):
             try:
@@ -3147,6 +3164,7 @@ class SignalDeciderNextOpenExecutionService:
                     target_trade_date=target_trade_date,
                     trigger=trigger,
                     force=force,
+                    _compact_response=_compact_response,
                 )
             except _PlanRefreshRevisionConflict:
                 if attempt + 1 >= PLAN_REFRESH_REVISION_RETRY_ATTEMPTS:
@@ -3168,6 +3186,7 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: str | date | None = None,
         trigger: str = 'manual',
         force: bool = False,
+        _compact_response: bool = False,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
@@ -3210,14 +3229,7 @@ class SignalDeciderNextOpenExecutionService:
             settings.signal_decider_next_open_account_targets.strip()
         )
         plan_policy_fingerprint = _next_open_policy_fingerprint(account_targets)
-        signal_policy_versions = sorted(
-            {
-                snapshot.policy_version
-                for snapshot in snapshots
-                if _snapshot_agent_name(snapshot)
-                == SIGNAL_DECIDER_AGENT_NAME
-            }
-        )
+        signal_policy_versions = _actionable_signal_policy_versions(snapshots)
         policy_cache = {
             policy_version: (
                 signal_decider_loop_service.get_policy_prompt_context(
@@ -3247,6 +3259,7 @@ class SignalDeciderNextOpenExecutionService:
                 snapshot.symbol
                 for snapshot in snapshot_generation_state['raw_snapshots']
             ],
+            scope_state=snapshot_generation_state['scope_state'],
         )
         base_agent_context_authority = str(
             agent_context_completeness.get('authority_fingerprint') or ''
@@ -4012,7 +4025,10 @@ class SignalDeciderNextOpenExecutionService:
         signal_decider_execution_outcome_service.sync_for_target_trade_date(
             target_trade_date=resolved_target_date,
         )
-        rows = self._load_plan_rows(target_trade_date=resolved_target_date, account_reference=None)
+        rows, response_items = self._load_plan_refresh_response(
+            target_trade_date=resolved_target_date,
+            compact_response=_compact_response,
+        )
         return {
             'request': {
                 'target_trade_date': resolved_target_date.isoformat(),
@@ -4029,7 +4045,7 @@ class SignalDeciderNextOpenExecutionService:
                 reason='pykrx_enrichment_preflight_blocked' if enrichment_preflight_blocked else None,
             ),
             'enrichment_preflight': enrichment_preflight,
-            'items': [self._serialize_row(row) for row in rows],
+            'items': response_items,
         }
 
     async def run_market_open_execution_if_due(
@@ -5795,6 +5811,7 @@ class SignalDeciderNextOpenExecutionService:
             generation_validation.get('valid_snapshot_ids') or []
         )
         return {
+            'scope_state': scope_state,
             'snapshots': [
                 snapshot
                 for snapshot in raw_snapshots
@@ -5999,6 +6016,26 @@ class SignalDeciderNextOpenExecutionService:
             for row in rows:
                 session.expunge(row)
             return rows
+
+    def _load_plan_refresh_response(
+        self,
+        *,
+        target_trade_date: date,
+        compact_response: bool,
+    ) -> tuple[list[SignalDeciderExecutionPlanItem], list[dict[str, Any]]]:
+        if compact_response:
+            rows = self._load_plan_rows(
+                target_trade_date=target_trade_date,
+                account_reference=None,
+                include_payloads=False,
+                include_validation_payload=True,
+            )
+            return rows, []
+        rows = self._load_plan_rows(
+            target_trade_date=target_trade_date,
+            account_reference=None,
+        )
+        return rows, [self._serialize_row(row) for row in rows]
 
     def _build_validation_payload(
         self,
