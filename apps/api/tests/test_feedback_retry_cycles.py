@@ -3186,7 +3186,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(completed['eod-summarizer'], {'005930'})
         self.assertEqual(failed['eod-summarizer'], set())
 
-    def test_automatic_decider_filter_checks_only_prior_day_fundamental_candidates(self):
+    def test_automatic_decider_filter_revalidates_same_day_and_prior_day_fundamentals(self):
         service = AgentFeedbackRetryService()
         completed_by_role = {
             'eod-summarizer': {'005930', '000660'},
@@ -3203,7 +3203,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 service,
                 '_filter_decider_retry_ready_symbols',
                 return_value=('000660',),
-            ) as filter_prior_day,
+            ) as filter_upstream,
         ):
             result = (
                 service._filter_automatic_decider_upstream_ready_symbols(
@@ -3214,18 +3214,84 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(result, ('005930', '000660'))
+        self.assertEqual(result, ('000660',))
         load_terminal.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
             roles=SUMMARIZER_AGENT_NAMES,
             symbols=['005930', '000660', '035420'],
             knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
         )
-        filter_prior_day.assert_called_once_with(
+        filter_upstream.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
-            symbols=('000660',),
+            symbols=('005930', '000660'),
             knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
             fs_div='CFS',
+        )
+
+    def test_automatic_decider_filter_revalidates_same_day_fundamental_fingerprint(self):
+        service = AgentFeedbackRetryService()
+        market_date = date.fromisoformat('2026-04-16')
+        symbol = '289040'
+        completed_by_role = {
+            role: {symbol}
+            for role in SUMMARIZER_AGENT_NAMES
+        }
+        decisions = {
+            symbol: {
+                'eod-summarizer': _decision(
+                    should_dispatch=False,
+                    latest_feedback={
+                        'market_date': market_date.isoformat(),
+                        'feedback_payload': {'summary': 'ready'},
+                    },
+                ),
+                'technical-summarizer': _decision(
+                    should_dispatch=False,
+                    latest_feedback={
+                        'market_date': market_date.isoformat(),
+                        'feedback_payload': {'summary': 'ready'},
+                    },
+                ),
+                'fundamental-summarizer': _decision(
+                    should_dispatch=True,
+                    latest_feedback={
+                        'market_date': market_date.isoformat(),
+                        'feedback_payload': {'summary': 'legacy summary'},
+                    },
+                    reason='stored_fundamental_input_fingerprint_missing',
+                ),
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                return_value=(completed_by_role, {}),
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_reuse_service.build_latest_decisions',
+                return_value=decisions,
+            ) as build_latest_decisions,
+        ):
+            result = (
+                service._filter_automatic_decider_upstream_ready_symbols(
+                    market_date=market_date,
+                    symbols=(symbol,),
+                    knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+                    fs_div='CFS',
+                )
+            )
+
+        self.assertEqual(result, ())
+        build_latest_decisions.assert_called_once_with(
+            market_date=market_date,
+            symbols=[symbol],
+            roles=SUMMARIZER_AGENT_NAMES,
+            force_recompute=False,
+            fs_div='CFS',
+            knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
         )
 
     def test_load_incomplete_symbols_uses_feedback_eligible_universe(self):
@@ -3618,24 +3684,29 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             '000660',
             '035420',
         )
-        snapshot_symbols = upstream_ready_symbols or eligible_symbols[:2]
-        snapshot = _snapshot(
-            symbols=snapshot_symbols,
-            role_states={
-                role: _role_state(
-                    role=role,
-                    symbols=snapshot_symbols,
-                    completed=upstream_ready_symbols,
-                    reused=upstream_ready_symbols,
-                    failed=(
-                        ()
-                        if upstream_ready_symbols
-                        else snapshot_symbols
-                    ),
-                )
-                for role in roles
-            },
-        )
+
+        def build_completed_snapshot(**kwargs):
+            role_scopes = kwargs['role_symbol_scopes']
+            snapshot_roles = tuple(kwargs['roles'])
+            snapshot_symbols = tuple(kwargs['eligible_symbols'])
+            return RoleSequenceSnapshot(
+                market_date=kwargs['market_date'],
+                symbols=snapshot_symbols,
+                roles=snapshot_roles,
+                role_states={
+                    role: _role_state(
+                        role=role,
+                        symbols=tuple(role_scopes.get(role, snapshot_symbols)),
+                        completed=tuple(role_scopes.get(role, snapshot_symbols)),
+                        reused=tuple(role_scopes.get(role, snapshot_symbols)),
+                    )
+                    for role in snapshot_roles
+                },
+                role_symbol_scopes={
+                    role: tuple(role_scopes.get(role, snapshot_symbols))
+                    for role in snapshot_roles
+                },
+            )
         eligibility_records = [
             {
                 'symbol': symbol,
@@ -3665,7 +3736,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             patch.object(
                 service,
                 '_build_role_sequence_snapshot',
-                return_value=snapshot,
+                side_effect=build_completed_snapshot,
             ),
             patch(
                 'app.agent_context.retry_service.agent_context_feedback_run_state_service',
@@ -3711,7 +3782,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
         return result, run_state_service, filter_ready
 
-    def test_auto_decider_scope_excludes_selected_symbols_without_all_upstream_summaries(self):
+    def test_auto_decider_scope_promotes_unready_symbol_to_full_role_repair(self):
         upstream_ready_symbols = ('005930',)
         result, run_state_service, filter_ready = (
             self._run_decider_scope_case(
@@ -3733,11 +3804,15 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             fs_div='CFS',
         )
         request_payload = run_state_service.started[0]['request_payload']
+        self.assertEqual(request_payload['roles'], list(EXPECTED_ROLES))
         self.assertEqual(
             request_payload['role_symbol_scopes'],
             {
-                role: list(upstream_ready_symbols)
-                for role in DECISION_SUPPORT_AGENT_NAMES
+                'eod-summarizer': ['000660'],
+                'technical-summarizer': ['000660'],
+                'fundamental-summarizer': ['000660'],
+                'short-term-decider': ['005930', '000660'],
+                'signal-decider': ['005930', '000660'],
             },
         )
         self.assertEqual(
@@ -3746,15 +3821,18 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 'applied': True,
                 'candidate_count': 2,
                 'ready_count': 1,
-                'excluded_count': 1,
-                'excluded_symbols': ['000660'],
-                'scope_preserved': False,
-                'fallback_reason': None,
+                'excluded_count': 0,
+                'excluded_symbols': [],
+                'scope_preserved': True,
+                'fallback_reason': 'full_role_repair',
+                'repair_count': 1,
+                'repair_symbols': ['000660'],
+                'repair_roles': list(EXPECTED_ROLES[:3]),
             },
         )
         self.assertTrue(result['completed'])
 
-    def test_auto_decider_scope_preserves_retryable_failure_scope_when_none_are_ready(self):
+    def test_auto_decider_scope_repairs_every_symbol_when_none_are_ready(self):
         result, run_state_service, filter_ready = (
             self._run_decider_scope_case(
                 upstream_ready_symbols=(),
@@ -3763,40 +3841,30 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
         filter_ready.assert_called_once()
         request_payload = run_state_service.started[0]['request_payload']
+        self.assertEqual(request_payload['roles'], list(EXPECTED_ROLES))
         self.assertEqual(
             request_payload['role_symbol_scopes'],
             {
                 role: ['005930', '000660']
-                for role in DECISION_SUPPORT_AGENT_NAMES
+                for role in EXPECTED_ROLES
             },
         )
         self.assertEqual(
             request_payload['decider_upstream_admission'],
             {
-                'applied': False,
+                'applied': True,
                 'candidate_count': 2,
                 'ready_count': 0,
-                'excluded_count': 2,
-                'excluded_symbols': ['005930', '000660'],
+                'excluded_count': 0,
+                'excluded_symbols': [],
                 'scope_preserved': True,
-                'fallback_reason': 'no_upstream_ready_symbols',
+                'fallback_reason': 'full_role_repair',
+                'repair_count': 2,
+                'repair_symbols': ['005930', '000660'],
+                'repair_roles': list(EXPECTED_ROLES[:3]),
             },
         )
-        self.assertEqual(result['status'], 'failed')
-        self.assertFalse(result['completed'])
-        self.assertEqual(result['cycles'], [])
-        final_summary = run_state_service.finished[0]['summary_payload']
-        self.assertEqual(
-            final_summary['progress_summary']['run_status'],
-            'failed',
-        )
-        self.assertEqual(
-            final_summary['role_statuses'],
-            {
-                role: 'failed'
-                for role in DECISION_SUPPORT_AGENT_NAMES
-            },
-        )
+        self.assertTrue(result['completed'])
 
     def test_explicit_decider_scope_is_not_silently_filtered(self):
         symbol = '005930'

@@ -1950,29 +1950,20 @@ class AgentFeedbackRetryService:
             for role in SUMMARIZER_AGENT_NAMES
             if role != FUNDAMENTAL_SUMMARIZER_AGENT_NAME
         )
-        same_day_ready = {
+        upstream_revalidation_candidates = tuple(
             symbol
             for symbol in normalized_symbols
             if all(
                 symbol in completed_by_role.get(role, set())
-                for role in SUMMARIZER_AGENT_NAMES
-            )
-        }
-        fundamental_reuse_candidates = tuple(
-            symbol
-            for symbol in normalized_symbols
-            if symbol not in same_day_ready
-            and all(
-                symbol in completed_by_role.get(role, set())
                 for role in non_fundamental_roles
             )
         )
-        prior_day_reusable = set()
-        if fundamental_reuse_candidates:
-            prior_day_reusable.update(
+        upstream_ready = set()
+        if upstream_revalidation_candidates:
+            upstream_ready.update(
                 self._filter_decider_retry_ready_symbols(
                     market_date=market_date,
-                    symbols=fundamental_reuse_candidates,
+                    symbols=upstream_revalidation_candidates,
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=fs_div,
                 )
@@ -1980,7 +1971,7 @@ class AgentFeedbackRetryService:
         return tuple(
             symbol
             for symbol in normalized_symbols
-            if symbol in same_day_ready or symbol in prior_day_reusable
+            if symbol in upstream_ready
         )
 
     @staticmethod
@@ -3121,32 +3112,86 @@ class AgentFeedbackRetryService:
                 fs_div=resolved_fs_div,
             )
             ready_symbol_set = set(ready_symbols)
-            excluded_symbols = [
+            repair_symbols = [
                 symbol
                 for symbol in decider_scope_symbols
                 if symbol not in ready_symbol_set
             ]
-            decider_upstream_admission.update(
-                {
-                    'applied': bool(ready_symbols) or not decider_scope_symbols,
-                    'ready_count': len(ready_symbols),
-                    'excluded_count': len(excluded_symbols),
-                    'excluded_symbols': excluded_symbols,
-                    'scope_preserved': bool(
-                        decider_scope_symbols and not ready_symbols
-                    ),
-                    'fallback_reason': (
-                        None
-                        if ready_symbols or not decider_scope_symbols
-                        else 'no_upstream_ready_symbols'
-                    ),
+            if repair_symbols:
+                # A decider rerun cannot repair invalid upstream provenance.
+                # Re-enter the existing role sequence for only those symbols.
+                roles = tuple(
+                    dict.fromkeys((*SUMMARIZER_AGENT_NAMES, *roles))
+                )
+                role_funnel = build_agent_feedback_role_funnel(
+                    records=eligibility_records,
+                    roles=roles,
+                    requested_symbols=requested_symbols,
+                    candidate_symbols=eligible_symbols,
+                    feedback_scope_mode=feedback_scope_mode,
+                )
+                role_symbol_scopes = {
+                    role: tuple(symbols)
+                    for role, symbols in role_funnel.get(
+                        'role_symbols', {}
+                    ).items()
+                    if isinstance(symbols, list)
                 }
-            )
-            # Preserve the selected/ranked scope and only remove unavailable
-            # dependencies when at least one candidate remains. If none are
-            # ready, keep the original scope so the orchestrator emits the
-            # existing retryable missing-upstream failure evidence.
-            if decider_upstream_admission['applied']:
+                decider_upstream_admission.update(
+                    {
+                        'applied': True,
+                        'ready_count': len(ready_symbols),
+                        'excluded_count': 0,
+                        'excluded_symbols': [],
+                        'scope_preserved': True,
+                        'fallback_reason': 'full_role_repair',
+                        'repair_count': len(repair_symbols),
+                        'repair_symbols': repair_symbols,
+                        'repair_roles': list(SUMMARIZER_AGENT_NAMES),
+                    }
+                )
+                for role in roles:
+                    effective_symbols = (
+                        repair_symbols
+                        if role in SUMMARIZER_AGENT_NAMES
+                        else list(decider_scope_symbols)
+                    )
+                    role_symbol_scopes[role] = tuple(effective_symbols)
+                    role_funnel['role_symbols'][role] = effective_symbols
+                    role_funnel['role_symbol_counts'][role] = len(
+                        effective_symbols
+                    )
+                    role_diagnostics = role_funnel.get(
+                        'role_diagnostics', {}
+                    ).get(role)
+                    if isinstance(role_diagnostics, dict):
+                        role_diagnostics['symbols'] = effective_symbols
+                        role_diagnostics[
+                            'decider_upstream_admission'
+                        ] = dict(decider_upstream_admission)
+                        scope_alignment = role_diagnostics.get(
+                            'scope_alignment'
+                        )
+                        if isinstance(scope_alignment, dict):
+                            scope_alignment[
+                                'decider_scope_symbol_count'
+                            ] = len(effective_symbols)
+                decider_scope = role_funnel.get('decider_scope')
+                if isinstance(decider_scope, dict):
+                    decider_scope['symbols'] = list(decider_scope_symbols)
+                    decider_scope['symbol_count'] = len(
+                        decider_scope_symbols
+                    )
+                scoped_feedback_symbols = list(decider_scope_symbols)
+            else:
+                decider_upstream_admission.update(
+                    {
+                        'applied': True,
+                        'ready_count': len(ready_symbols),
+                        'scope_preserved': False,
+                        'fallback_reason': None,
+                    }
+                )
                 for role in roles:
                     filtered_symbols = [
                         symbol
