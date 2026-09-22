@@ -245,7 +245,61 @@ class DailyUnifiedValueFactorServiceTests(unittest.TestCase):
             persisted['factor_payload']['audit']['valuation_source'],
             'pykrx_valuation_snapshot',
         )
+        self.assertEqual(
+            persisted['factor_payload']['audit']['valuation_metric_sources'],
+            {
+                'per': 'pykrx_valuation_snapshot',
+                'pbr': 'pykrx_valuation_snapshot',
+                'dividend_yield': 'pykrx_valuation_snapshot',
+            },
+        )
         self.assertEqual(result['summary']['scored_count'], 1)
+
+    def test_tracks_mixed_sources_and_prefers_snapshot_values(self) -> None:
+        service = DailyUnifiedValueFactorService()
+        market_date = date(2026, 4, 24)
+        inputs = [
+            _input(
+                '005930',
+                market_date,
+                per=18.0,
+                pbr=0.95,
+                dividend_yield=0.02,
+                market_cap=2_000_000,
+                valuation_snapshot={'per': 7.0},
+                snapshot=_snapshot(
+                    '005930',
+                    total_equity=1000,
+                    total_liabilities=300,
+                    operating_income=100,
+                    operating_cash_flow=220,
+                    cash=100,
+                    capex_ppe=-60,
+                    depreciation_and_amortization=40,
+                    snapshot_id=1,
+                ),
+            ),
+        ]
+
+        with (
+            patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
+            patch('app.signals.unified_value_factor.upsert_daily_unified_value_factor_result') as upsert,
+        ):
+            service.rebuild_for_market_date(market_date=market_date)
+
+        persisted = upsert.call_args.args[0]
+        self.assertEqual(persisted['per'], 7.0)
+        self.assertEqual(persisted['pbr'], 0.95)
+        self.assertEqual(persisted['dividend_yield'], 0.02)
+        self.assertEqual(persisted['factor_payload']['audit']['valuation_source'], 'mixed')
+        self.assertEqual(
+            persisted['factor_payload']['audit']['valuation_metric_sources'],
+            {
+                'per': 'pykrx_valuation_snapshot',
+                'pbr': 'daily_price_bars',
+                'dividend_yield': 'daily_price_bars',
+            },
+        )
 
     def test_observed_market_cap_keeps_advanced_metrics_without_pbr(self) -> None:
         service = DailyUnifiedValueFactorService()

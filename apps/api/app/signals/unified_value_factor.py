@@ -369,15 +369,32 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
 
         valuation_snapshot = input_row.valuation_snapshot or {}
 
-        def valuation_metric(key: str) -> float | None:
+        def valuation_metric(key: str) -> tuple[float | None, str | None]:
             raw_value = valuation_snapshot.get(key)
-            if raw_value is None and current_bar is not None:
-                raw_value = current_bar.get(key)
-            return _round(float(raw_value), 6) if raw_value is not None else None
+            if raw_value is not None:
+                return _round(float(raw_value), 6), 'pykrx_valuation_snapshot'
+            if current_bar is not None and current_bar.get(key) is not None:
+                return _round(float(current_bar[key]), 6), 'daily_price_bars'
+            return None, None
 
-        per = valuation_metric('per')
-        pbr = valuation_metric('pbr')
-        dividend_yield = valuation_metric('dividend_yield')
+        per, per_source = valuation_metric('per')
+        pbr, pbr_source = valuation_metric('pbr')
+        dividend_yield, dividend_yield_source = valuation_metric('dividend_yield')
+        valuation_metric_sources = {
+            'per': per_source,
+            'pbr': pbr_source,
+            'dividend_yield': dividend_yield_source,
+        }
+        resolved_valuation_sources = {
+            metric_source
+            for metric_source in valuation_metric_sources.values()
+            if metric_source is not None
+        }
+        valuation_source = (
+            'mixed'
+            if len(resolved_valuation_sources) > 1
+            else next(iter(resolved_valuation_sources), None)
+        )
         per_status = _positive_only_metric_status(per) if current_bar is not None else METRIC_STATUS_MISSING
         pbr_status = _positive_only_metric_status(pbr) if current_bar is not None else METRIC_STATUS_MISSING
         dividend_yield_status = _non_negative_metric_status(dividend_yield) if current_bar is not None else METRIC_STATUS_MISSING
@@ -495,11 +512,8 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             '_annual_snapshot_available': annual_fundamentals is not None,
             '_price_bar_source': current_bar.get('source') if current_bar is not None else None,
             '_price_bar_captured_at': current_bar.get('captured_at') if current_bar is not None else None,
-            '_valuation_source': (
-                'pykrx_valuation_snapshot'
-                if input_row.valuation_snapshot is not None
-                else 'daily_price_bars'
-            ),
+            '_valuation_source': valuation_source,
+            '_valuation_metric_sources': valuation_metric_sources,
             '_fundamentals_audit_payload': financial_context.get('audit') if financial_context else None,
             '_observed_market_cap': observed_market_cap,
             '_market_cap_source': market_cap_source,
@@ -735,6 +749,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                     'captured_at': item.get('_price_bar_captured_at'),
                 },
                 'valuation_source': item.get('_valuation_source'),
+                'valuation_metric_sources': item.get('_valuation_metric_sources'),
                 'market_cap': {
                     'source_type': item.get('_market_cap_source'),
                     'observed_market_cap': item.get('_observed_market_cap'),
@@ -803,6 +818,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             '_price_bar_source',
             '_price_bar_captured_at',
             '_valuation_source',
+            '_valuation_metric_sources',
             '_fundamentals_audit_payload',
             '_observed_market_cap',
             '_market_cap_source',

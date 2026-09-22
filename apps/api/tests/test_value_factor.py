@@ -160,7 +160,57 @@ class DailyValueFactorServiceTests(unittest.TestCase):
             persisted['factor_payload']['audit']['valuation_source'],
             'pykrx_valuation_snapshot',
         )
+        self.assertEqual(
+            persisted['factor_payload']['audit']['valuation_metric_sources'],
+            {
+                'per': 'pykrx_valuation_snapshot',
+                'pbr': 'pykrx_valuation_snapshot',
+                'dividend_yield': 'pykrx_valuation_snapshot',
+            },
+        )
         self.assertEqual(result['summary']['scored_count'], 1)
+
+    def test_rebuild_tracks_mixed_sources_and_prefers_snapshot_values(self) -> None:
+        service = DailyValueFactorService()
+        market_date = date(2026, 4, 24)
+        inputs = [
+            ValueFactorInput(
+                symbol='005930',
+                name_ko='Samsung Electronics',
+                market='KOSPI',
+                bars=[
+                    {
+                        'trade_date': market_date.isoformat(),
+                        'close_price': 100000,
+                        'per': 18.0,
+                        'pbr': 0.95,
+                        'dividend_yield': 0.02,
+                        'source': 'pykrx',
+                    }
+                ],
+                valuation_snapshot={'per': 7.0},
+            )
+        ]
+
+        with (
+            patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
+            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+        ):
+            service.rebuild_for_market_date(market_date=market_date)
+
+        persisted = upsert.call_args.args[0]
+        self.assertEqual(persisted['per'], 7.0)
+        self.assertEqual(persisted['pbr'], 0.95)
+        self.assertEqual(persisted['dividend_yield'], 0.02)
+        self.assertEqual(persisted['factor_payload']['audit']['valuation_source'], 'mixed')
+        self.assertEqual(
+            persisted['factor_payload']['audit']['valuation_metric_sources'],
+            {
+                'per': 'pykrx_valuation_snapshot',
+                'pbr': 'daily_price_bars',
+                'dividend_yield': 'daily_price_bars',
+            },
+        )
 
     def test_load_inputs_attaches_same_day_pykrx_valuation_snapshot(self) -> None:
         service = DailyValueFactorService()
