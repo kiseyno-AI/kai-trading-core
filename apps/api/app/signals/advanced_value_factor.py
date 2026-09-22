@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE = 25
 ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE = 100
-ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS = 500
 ADVANCED_VALUE_FUNDAMENTALS_STATEMENT_TIMEOUT_SECONDS = 180
 ADVANCED_VALUE_FUNDAMENTALS_FS_DIV = 'CFS'
 ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE = '11011'
@@ -537,8 +536,12 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         flow=True,
     )
 
-    cash_row = _find_statement_row(rows, CASH_AND_CASH_EQUIVALENTS_MATCHER)
-    cash_and_cash_equivalents, cash_amount_field = _statement_amount(cash_row, flow=False)
+    cash_and_cash_equivalents, cash_and_cash_equivalents_source = _extract_metric_with_fallback(
+        highlight_row=highlights.get('cash_and_cash_equivalents'),
+        rows=rows,
+        matcher=CASH_AND_CASH_EQUIVALENTS_MATCHER,
+        flow=False,
+    )
 
     capex_ppe_row = _find_statement_row(rows, CAPEX_PPE_MATCHER)
     capex_ppe, capex_ppe_amount_field = _statement_amount(capex_ppe_row, flow=True, absolute=True)
@@ -603,11 +606,7 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
                 'total_liabilities': total_liabilities_source,
                 'operating_income': operating_income_source,
                 'operating_cash_flow': operating_cash_flow_source,
-                'cash_and_cash_equivalents': _build_source_metadata(
-                    source_type='statement_row',
-                    row=cash_row,
-                    amount_field=cash_amount_field,
-                ),
+                'cash_and_cash_equivalents': cash_and_cash_equivalents_source,
                 'capex_ppe': _build_source_metadata(
                     source_type='statement_row',
                     row=capex_ppe_row,
@@ -981,23 +980,22 @@ class DailyAdvancedValueFactorService:
                 ).scalars()
                 for row in highlight_rows:
                     highlights_by_snapshot[row.snapshot_id][row.metric_key] = _serialize_highlight_row(row)
-            if len(snapshot_ids) <= ADVANCED_VALUE_FUNDAMENTALS_ROW_FALLBACK_MAX_SNAPSHOTS:
-                for start in range(0, len(snapshot_ids), ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE):
-                    snapshot_id_chunk = snapshot_ids[start:start + ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE]
-                    statement_rows = session.execute(
-                        select(DartFundamentalsRow)
-                        .where(
-                            DartFundamentalsRow.snapshot_id.in_(snapshot_id_chunk),
-                            _fallback_statement_row_filter(),
-                        )
-                        .order_by(
-                            DartFundamentalsRow.snapshot_id.asc(),
-                            DartFundamentalsRow.row_order.asc(),
-                            DartFundamentalsRow.id.asc(),
-                        )
-                    ).scalars()
-                    for row in statement_rows:
-                        rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
+            for start in range(0, len(snapshot_ids), ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE):
+                snapshot_id_chunk = snapshot_ids[start:start + ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE]
+                statement_rows = session.execute(
+                    select(DartFundamentalsRow)
+                    .where(
+                        DartFundamentalsRow.snapshot_id.in_(snapshot_id_chunk),
+                        _fallback_statement_row_filter(),
+                    )
+                    .order_by(
+                        DartFundamentalsRow.snapshot_id.asc(),
+                        DartFundamentalsRow.row_order.asc(),
+                        DartFundamentalsRow.id.asc(),
+                    )
+                ).scalars()
+                for row in statement_rows:
+                    rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
 
             result: dict[str, AnnualFundamentalsSnapshot] = {}
             for symbol, snapshot_id in snapshot_id_by_symbol.items():
