@@ -2442,6 +2442,9 @@ def compute_and_persist_daily_trending_ranks(
         'market_date': normalized_market_date.isoformat(),
         'source': source,
         'periods': period_results,
+        'periods_persisted': len(period_results),
+        'periods_failed': 0,
+        'periods_total': len(deduped_periods),
         'trending_ranks_persisted': total_persisted,
     }
 

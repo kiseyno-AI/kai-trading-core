@@ -297,6 +297,37 @@ def _classify_pykrx_enrichment_categories(
     }
 
 
+def _partition_pykrx_enrichment_category_gaps(
+    *,
+    failed_categories: Sequence[str],
+    preflight: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    required_categories = {
+        str(category)
+        for category in preflight.get('required_categories') or []
+    }
+    category_gates = {
+        str(item.get('category')): item
+        for item in preflight.get('category_gates') or []
+        if isinstance(item, dict) and item.get('category')
+    }
+    blocking: list[str] = []
+    tolerated: list[str] = []
+    for category in failed_categories:
+        if category not in required_categories:
+            tolerated.append(category)
+            continue
+        gate = category_gates.get(category)
+        if gate is None:
+            blocking.append(category)
+            continue
+        if gate.get('gate_status') in {'ready', 'not_applicable'}:
+            tolerated.append(category)
+        else:
+            blocking.append(category)
+    return blocking, tolerated
+
+
 def _resolve_requested_stages(
     *,
     mode: str,
@@ -894,6 +925,34 @@ def _to_int_or_none(value: Any) -> int | None:
     return converted if converted > 0 else None
 
 
+def _summarize_turnover_coverage(counters: Mapping[str, Any]) -> dict[str, Any]:
+    total_bars = int(counters.get('total_bars') or 0)
+    zero_volume_bars = int(counters.get('zero_volume_bars') or 0)
+    eligible_bars = max(total_bars - zero_volume_bars, 0)
+    provider_turnover_bars = int(counters.get('provider_turnover_bars') or 0)
+    invalid_turnover_bars = int(counters.get('invalid_turnover_bars') or 0)
+    market_fetch_failures = int(counters.get('market_fetch_failures') or 0)
+    return {
+        'status': (
+            'partial'
+            if invalid_turnover_bars > 0 or market_fetch_failures > 0
+            else 'complete'
+        ),
+        'total_bars': total_bars,
+        'eligible_bars': eligible_bars,
+        'provider_turnover_bars': provider_turnover_bars,
+        'zero_volume_bars': zero_volume_bars,
+        'invalid_turnover_bars': invalid_turnover_bars,
+        'market_fetch_attempts': int(counters.get('market_fetch_attempts') or 0),
+        'market_fetch_failures': market_fetch_failures,
+        'coverage_ratio': (
+            round(provider_turnover_bars / eligible_bars, 6)
+            if eligible_bars
+            else 1.0
+        ),
+    }
+
+
 def _enrich_bars_with_market_turnover(
     *,
     bars: list[dict[str, Any]],
@@ -901,21 +960,39 @@ def _enrich_bars_with_market_turnover(
     market: str,
     dependencies: PykrxPipelineDependencies,
     market_turnover_cache: dict[tuple[str, str], Any],
+    turnover_coverage: dict[str, int] | None = None,
     run_id: int | None,
 ) -> list[dict[str, Any]]:
+    coverage = turnover_coverage
+    if coverage is not None:
+        for key in (
+            'total_bars',
+            'provider_turnover_bars',
+            'zero_volume_bars',
+            'invalid_turnover_bars',
+            'market_fetch_attempts',
+            'market_fetch_failures',
+        ):
+            coverage.setdefault(key, 0)
     getter = dependencies.get_market_ohlcv_by_ticker
-    if getter is None or not bars:
+    if not bars:
         return bars
     enriched: list[dict[str, Any]] = []
     for bar in bars:
+        if coverage is not None:
+            coverage['total_bars'] += 1
         trade_date = str(bar.get('trade_date'))
         pykrx_date = trade_date.replace('-', '')
         cache_key = (pykrx_date, market)
-        if cache_key not in market_turnover_cache:
+        if getter is not None and cache_key not in market_turnover_cache:
+            if coverage is not None:
+                coverage['market_fetch_attempts'] += 1
             try:
                 market_turnover_cache[cache_key] = getter(pykrx_date, market)
             except Exception as exc:
                 market_turnover_cache[cache_key] = None
+                if coverage is not None:
+                    coverage['market_fetch_failures'] += 1
                 dependencies.log_fetch(
                     'fetch_market_ohlcv_turnover',
                     'failed',
@@ -926,12 +1003,25 @@ def _enrich_bars_with_market_turnover(
                     error_message=str(exc),
                 )
         provider_turnover = _to_int_or_none(_frame_value(market_turnover_cache.get(cache_key), symbol, '거래대금'))
+        updated = dict(bar)
         if provider_turnover is not None:
-            updated = dict(bar)
             updated['turnover'] = provider_turnover
+            if coverage is not None:
+                coverage['provider_turnover_bars'] += 1
             enriched.append(updated)
             continue
-        enriched.append(bar)
+        updated['turnover'] = 0
+        raw_volume = bar.get('volume')
+        try:
+            volume = int(raw_volume) if raw_volume is not None else None
+        except (TypeError, ValueError):
+            volume = None
+        if coverage is not None:
+            if volume == 0:
+                coverage['zero_volume_bars'] += 1
+            else:
+                coverage['invalid_turnover_bars'] += 1
+        enriched.append(updated)
     return enriched
 
 
@@ -1566,6 +1656,8 @@ def run_market_data_pipeline(
 
     try:
         market_turnover_cache: dict[tuple[str, str], Any] = {}
+        turnover_coverage_counters: dict[str, int] = {}
+        turnover_invalid_symbols: list[str] = []
         for index, item in enumerate(symbols):
             symbol_started_at = time.perf_counter()
             try:
@@ -1580,14 +1672,23 @@ def run_market_data_pipeline(
                         end_date=normalized_end,
                     )
                 bars = service._map_symbol_bars(frame, fundamentals_frame=fundamentals_frame)
+                invalid_turnover_before = int(
+                    turnover_coverage_counters.get('invalid_turnover_bars') or 0
+                )
                 bars = _enrich_bars_with_market_turnover(
                     bars=bars,
                     symbol=item.symbol,
                     market=item.market,
                     dependencies=dependencies,
                     market_turnover_cache=market_turnover_cache,
+                    turnover_coverage=turnover_coverage_counters,
                     run_id=run_id,
                 )
+                if (
+                    int(turnover_coverage_counters.get('invalid_turnover_bars') or 0)
+                    > invalid_turnover_before
+                ):
+                    turnover_invalid_symbols.append(item.symbol)
                 persisted_count = dependencies.persist_daily_price_bars(
                     item.symbol,
                     bars,
@@ -1667,11 +1768,18 @@ def run_market_data_pipeline(
             )
             try:
                 next_symbol = symbols[index + 1].symbol if index + 1 < len(symbols) else None
+                turnover_coverage = _summarize_turnover_coverage(
+                    turnover_coverage_counters
+                )
                 persist_stage_progress(
                     stage='price_collection',
                     status='running'
                     if next_symbol is not None
-                    else _completion_status_for_gap(failed=symbols_failed, total=len(symbols)),
+                    else (
+                        'partial'
+                        if turnover_coverage['status'] == 'partial'
+                        else _completion_status_for_gap(failed=symbols_failed, total=len(symbols))
+                    ),
                     current_step='fetch_symbol_ohlcv' if next_symbol is not None else 'price_collection_completed',
                     current_activity=(
                         f'Collecting pykrx daily prices for {next_symbol}'
@@ -1685,6 +1793,7 @@ def run_market_data_pipeline(
                     current_symbol=next_symbol,
                     extra={
                         'bars_upserted': bars_upserted,
+                        'turnover_coverage': turnover_coverage,
                         **_gap_policy_details(failed=symbols_failed, total=len(symbols)),
                     },
                 )
@@ -1745,6 +1854,9 @@ def run_market_data_pipeline(
         daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
         raise
 
+    turnover_coverage = _summarize_turnover_coverage(
+        turnover_coverage_counters
+    )
     if mode == 'daily_auto' and symbols_succeeded == 0 and symbols_failed > 0:
         error_message = (
             'PyKRX daily price collection failed for every requested symbol; '
@@ -1808,6 +1920,9 @@ def run_market_data_pipeline(
             'unattempted_symbols': unattempted_symbols[:50],
             'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
+            'turnover_coverage': turnover_coverage,
+            'turnover_invalid_symbols': turnover_invalid_symbols[:50],
+            'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
             'error_type': 'PykrxProviderUnavailable',
             'error_message': error_message,
             'refresh_universe': effective_refresh_universe,
@@ -1930,36 +2045,30 @@ def run_market_data_pipeline(
             pykrx_enrichment_result['provider_error_categories'] = provider_error_categories
             pykrx_enrichment_result['recovered_categories'] = recovered_categories
             pykrx_enrichment_result['unresolved_categories'] = failed_categories
-            blocking_failed_categories: list[str] = []
-            tolerated_failed_categories: list[str] = []
-            for category in failed_categories:
-                coverage_payload = (
-                    dict(coverage_categories.get(category))
-                    if isinstance(coverage_categories.get(category), dict)
-                    else {}
-                )
-                expected_rows = int(coverage_payload.get('expected_rows') or 0)
-                present_rows = int(coverage_payload.get('present_rows') or 0)
-                missing_rows = max(expected_rows - present_rows, 0)
-                if (
-                    expected_rows > 0
-                    and missing_rows > 0
-                    and _is_non_blocking_gap(failed=missing_rows, total=expected_rows)
-                    and preflight.get('allowed')
-                ):
-                    tolerated_failed_categories.append(category)
-                else:
-                    blocking_failed_categories.append(category)
+            (
+                blocking_failed_categories,
+                tolerated_failed_categories,
+            ) = _partition_pykrx_enrichment_category_gaps(
+                failed_categories=failed_categories,
+                preflight=preflight,
+            )
+            pykrx_enrichment_result['blocking_failed_categories'] = (
+                blocking_failed_categories
+            )
+            pykrx_enrichment_result['tolerated_failed_categories'] = (
+                tolerated_failed_categories
+            )
             stage_status = (
                 'completed'
-                if preflight.get('allowed') and not failed_categories
+                if preflight.get('allowed') and not blocking_failed_categories
                 else 'partial'
             )
-            enrichment_failed_count = len(failed_categories)
+            enrichment_failed_count = len(blocking_failed_categories)
             if stage_status != 'completed':
                 pykrx_enrichment_error_message = (
-                    'PyKRX enrichment incomplete for categories: ' + ','.join(failed_categories)
-                    if failed_categories
+                    'PyKRX enrichment incomplete for categories: '
+                    + ','.join(blocking_failed_categories)
+                    if blocking_failed_categories
                     else 'PyKRX enrichment did not complete successfully'
                 )
                 # Category/market failures do not always identify exact symbols.
@@ -2611,6 +2720,12 @@ def run_market_data_pipeline(
     run_errors: list[str] = []
     if failed_symbols:
         run_errors.append(f'Failed symbols: {",".join(failed_symbols[:20])}')
+    if turnover_coverage['status'] == 'partial':
+        run_errors.append(
+            'Turnover coverage incomplete: '
+            f"{turnover_coverage['invalid_turnover_bars']} invalid bars and "
+            f"{turnover_coverage['market_fetch_failures']} failed market fetches."
+        )
     append_stage_error(
         run_errors,
         direct_error=price_context_error_message,
@@ -2672,6 +2787,12 @@ def run_market_data_pipeline(
         run_metadata,
         downstream_retry_symbol_codes,
     )
+    run_metadata['turnover_invalid_symbols'] = list(
+        dict.fromkeys(turnover_invalid_symbols)
+    )
+    run_metadata['turnover_invalid_symbols_count'] = len(
+        run_metadata['turnover_invalid_symbols']
+    )
     dependencies.complete_eod_collection_run(
         run_id,
         status=status,
@@ -2700,6 +2821,9 @@ def run_market_data_pipeline(
         'downstream_retry_symbols': downstream_retry_symbol_codes[:50],
         'downstream_retry_symbols_count': len(downstream_retry_symbol_codes),
         'bars_upserted': bars_upserted,
+        'turnover_coverage': turnover_coverage,
+        'turnover_invalid_symbols': turnover_invalid_symbols[:50],
+        'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
         'price_contexts': price_context_result,
         'pykrx_enrichment': pykrx_enrichment_result,
         'technical_snapshots': technical_snapshot_result,

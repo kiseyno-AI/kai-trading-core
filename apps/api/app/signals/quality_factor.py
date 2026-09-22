@@ -420,12 +420,14 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
 
         net_income_row = highlights.get('net_income')
         total_assets_row = highlights.get('total_assets')
-        gross_margin_row = highlights.get(INDEX_GROSS_MARGIN)
-        asset_turnover_row = highlights.get(INDEX_ASSET_TURNOVER)
-        debt_ratio_row = highlights.get(INDEX_DEBT_RATIO)
+        gross_profit_row = highlights.get('gross_profit')
+        gross_margin_row = highlights.get('gross_margin') or highlights.get(INDEX_GROSS_MARGIN)
+        asset_turnover_row = highlights.get('asset_turnover') or highlights.get(INDEX_ASSET_TURNOVER)
+        debt_ratio_row = highlights.get('debt_ratio') or highlights.get(INDEX_DEBT_RATIO)
 
         net_income, net_income_amount_field = _highlight_amount(net_income_row, flow=True)
         total_assets, total_assets_amount_field = _highlight_amount(total_assets_row, flow=False)
+        gross_profit, gross_profit_amount_field = _highlight_amount(gross_profit_row, flow=True)
         gross_margin = _highlight_ratio(gross_margin_row)
         asset_turnover = _highlight_ratio(asset_turnover_row)
         debt_ratio = _highlight_ratio(debt_ratio_row)
@@ -457,9 +459,31 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
         )
         gross_profit_to_assets, gross_profit_to_assets_status = self._compute_gross_profit_to_assets(
             blocked_status=blocked_status,
+            gross_profit=gross_profit,
+            total_assets=total_assets,
             gross_margin=gross_margin,
             asset_turnover=asset_turnover,
         )
+        if gross_profit is not None and total_assets not in (None, 0):
+            gross_profit_to_assets_source = {
+                'source_type': 'derived_formula',
+                'formula': 'gross_profit / total_assets',
+                'gross_profit': _highlight_audit_payload(
+                    gross_profit_row,
+                    amount_field=gross_profit_amount_field,
+                ),
+                'total_assets': _highlight_audit_payload(
+                    total_assets_row,
+                    amount_field=total_assets_amount_field,
+                ),
+            }
+        else:
+            gross_profit_to_assets_source = {
+                'source_type': 'derived_formula',
+                'formula': 'gross_margin * asset_turnover',
+                'gross_margin': _highlight_audit_payload(gross_margin_row, ratio_source=True),
+                'asset_turnover': _highlight_audit_payload(asset_turnover_row, ratio_source=True),
+            }
         operating_cash_flow_to_net_income, operating_cash_flow_to_net_income_status = (
             self._compute_operating_cash_flow_to_net_income(
                 blocked_status=blocked_status,
@@ -470,6 +494,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
         debt_ratio_value, debt_ratio_status = self._compute_debt_ratio(
             blocked_status=blocked_status,
             debt_ratio=debt_ratio,
+            total_equity=total_equity,
         )
         accruals_ratio, accruals_ratio_status = self._compute_accruals_ratio(
             blocked_status=blocked_status,
@@ -524,6 +549,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
             '_fundamentals_audit_payload': financial_context.get('audit') if financial_context else None,
             '_net_income': net_income,
             '_total_assets': total_assets,
+            '_gross_profit': gross_profit,
             '_total_equity': total_equity,
             '_total_liabilities': total_liabilities,
             '_operating_cash_flow': operating_cash_flow,
@@ -537,6 +563,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
                 total_assets_row,
                 amount_field=total_assets_amount_field,
             ),
+            '_gross_profit_to_assets_source': gross_profit_to_assets_source,
             '_gross_margin_source': _highlight_audit_payload(gross_margin_row, ratio_source=True),
             '_asset_turnover_source': _highlight_audit_payload(asset_turnover_row, ratio_source=True),
             '_debt_ratio_source': debt_ratio_source,
@@ -694,7 +721,11 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
                     'report_code': ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
                     'period_type': ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
                     'fs_div': ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
-                    'selection_rule': 'latest_receipt_on_or_before_market_date',
+                    'fs_div_priority': ['CFS', 'OFS'],
+                    'selection_rule': (
+                        'latest_business_year_then_latest_filing_then_cfs_'
+                        'preferred_within_same_filing_on_or_before_market_date'
+                    ),
                 },
                 'score_method': 'equal_weight_mean_of_available_component_percentiles',
                 'score_requirement': 'at_least_one_component_required',
@@ -711,9 +742,14 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
                 'component_formulas': {
                     'roe': 'net_income / total_equity',
                     'roa': 'net_income / total_assets',
-                    'gross_profit_to_assets': 'gross_margin * asset_turnover',
+                    'gross_profit_to_assets': (
+                        'gross_profit / total_assets; fallback gross_margin * asset_turnover'
+                    ),
                     'operating_cash_flow_to_net_income': 'operating_cash_flow / net_income',
-                    'debt_ratio': 'stored_debt_ratio',
+                    'debt_ratio': (
+                        'stored_debt_ratio; fallback total_liabilities / total_equity; '
+                        'positive_total_equity_required'
+                    ),
                     'accruals_ratio': '(net_income - operating_cash_flow) / total_assets',
                 },
                 'tie_breaker': 'symbol_asc',
@@ -763,6 +799,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
             'inputs': {
                 'net_income': item.get('_net_income'),
                 'total_assets': item.get('_total_assets'),
+                'gross_profit': item.get('_gross_profit'),
                 'total_equity': item.get('_total_equity'),
                 'total_liabilities': item.get('_total_liabilities'),
                 'operating_cash_flow': item.get('_operating_cash_flow'),
@@ -782,6 +819,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
                 'matched_highlights': {
                     'net_income': item.get('_net_income_source'),
                     'total_assets': item.get('_total_assets_source'),
+                    'gross_profit_to_assets': item.get('_gross_profit_to_assets_source'),
                     'gross_margin': item.get('_gross_margin_source'),
                     'asset_turnover': item.get('_asset_turnover_source'),
                     'debt_ratio': item.get('_debt_ratio_source'),
@@ -889,11 +927,19 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
     def _compute_gross_profit_to_assets(
         *,
         blocked_status: str | None,
+        gross_profit: float | None,
+        total_assets: float | None,
         gross_margin: float | None,
         asset_turnover: float | None,
     ) -> tuple[float | None, str]:
         if blocked_status is not None:
             return None, blocked_status
+        if gross_profit is not None:
+            if total_assets is None:
+                return None, COMPONENT_STATUS_MISSING_TOTAL_ASSETS
+            if total_assets <= 0:
+                return None, COMPONENT_STATUS_INVALID_ASSETS
+            return _round(gross_profit / total_assets, 6), COMPONENT_STATUS_AVAILABLE
         if gross_margin is None:
             return None, COMPONENT_STATUS_MISSING_GROSS_MARGIN
         if asset_turnover is None:
@@ -922,9 +968,14 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
         *,
         blocked_status: str | None,
         debt_ratio: float | None,
+        total_equity: float | None,
     ) -> tuple[float | None, str]:
         if blocked_status is not None:
             return None, blocked_status
+        if total_equity is None:
+            return None, COMPONENT_STATUS_MISSING_TOTAL_EQUITY
+        if total_equity <= 0:
+            return None, COMPONENT_STATUS_INVALID_EQUITY
         if debt_ratio is None:
             return None, COMPONENT_STATUS_MISSING_DEBT_RATIO
         return debt_ratio, COMPONENT_STATUS_AVAILABLE
@@ -959,6 +1010,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
             '_fundamentals_audit_payload',
             '_net_income',
             '_total_assets',
+            '_gross_profit',
             '_total_equity',
             '_total_liabilities',
             '_operating_cash_flow',
@@ -966,6 +1018,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
             '_asset_turnover',
             '_net_income_source',
             '_total_assets_source',
+            '_gross_profit_to_assets_source',
             '_gross_margin_source',
             '_asset_turnover_source',
             '_debt_ratio_source',

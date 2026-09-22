@@ -233,7 +233,7 @@ Key layers:
 
 1. **Collection:** KIS and pykrx market data, DART disclosures/fundamentals, SEC facts, BOK/ECOS, Korea Exim FX, news, crypto, and US-equity sources.
 2. **Persistence:** symbol master, quote/market snapshots, EOD bars, factor snapshots, disclosure/fundamental history, agent feedback, decision/evaluation history, plans, and order handoff/readback state.
-3. **Deterministic computation:** technical snapshots, action summaries, momentum/value/low-risk/composite factors, market-risk context, and screening.
+3. **Deterministic computation:** technical snapshots, action summaries, momentum/value/low-risk/beta/advanced-value/unified-value/quality/composite factors, market-risk context, and screening.
 4. **Decision support:** symbol-day context, role-specific feedback, signal-decider diagnostics/calibration/policies, replay, and execution-plan generation.
 5. **Execution integration:** Core plans and observes; `kai-trading-exec` owns the long-running broker lifecycle. Core's direct KIS paths remain implemented for compatibility and guarded operations.
 
@@ -387,6 +387,22 @@ python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market
 Use `RUNBOOK.md` for the full command catalog, stage dependencies, overnight runners, and recovery procedures.
 
 The automatic close pipeline records price collection and every downstream stage separately. Once price collection is terminal, a failed fundamentals, factor, news, feedback, decider, plan, or evaluation stage is resumed from the first incomplete follow-up without downloading prices again. Follow-up recovery waits at least five minutes between attempts and stops after five attempts for the trade date; the skip reason and recovery metadata remain visible in the run result.
+
+The default daily stage order is:
+
+```text
+master_refresh -> pykrx_universe_refresh -> price_collection -> pykrx_enrichment
+-> technical_snapshots -> action_summaries -> trending_ranks -> market_risk_filter
+-> fundamentals_daily_refresh -> piotroski_filter -> momentum_factors -> value_factors
+-> low_risk_factors -> beta_factors -> advanced_value_factors -> unified_value_factors
+-> quality_factors -> composite_factors -> signal_features -> external_news_collect
+-> external_news_enrich -> macro_context_refresh -> agent_feedback_summaries
+-> signal_decider -> next_open_execution_plan -> signal_decider_evaluations
+```
+
+Consumers must read `/eod/pipeline/stages` rather than hard-code this list. The PyKRX decision preflight requires same-day `sector_classification`, `investor_flow_symbol`, `short_selling`, and direct `valuation_snapshot` coverage; valuation must cover at least 95% of the fresh PyKRX KOSPI/KOSDAQ stock universe (excluding active-universe ETFs outside that feed), and the other required categories at least 99%.
+
+Successful annual DART fundamentals capture extracts and persists the filing's audit opinion before writing the financial snapshot or marking the disclosure event captured. Missing or unparseable audit evidence keeps that event retryable and the refresh visibly incomplete. Piotroski reads only captured-event snapshots and accepts audit evidence with the exact same `rcept_no`, so it cannot silently reuse an older clean opinion.
 
 ### Agent feedback and decisions
 

@@ -13,7 +13,7 @@ from app.macro_context.service import (
     MacroContextService,
     WORLD_BANK_SOURCE,
 )
-from app.macro_context.store import MacroContextObservationStore
+from app.macro_context.store import MacroContextObservationRecord, MacroContextObservationStore
 
 
 class FakeWorldBankClient:
@@ -263,3 +263,164 @@ class MacroContextServiceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class _InMemoryMacroStore:
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, str], MacroContextObservationRecord] = {}
+
+    def latest_fetched_at(self):
+        return max((record.fetched_at for record in self.records.values()), default=None)
+
+    def load_latest_by_series(self, *, series_keys, as_of_date=None, fetched_at_before=None):
+        return {
+            key: self.records[key]
+            for key in series_keys
+            if key in self.records
+            and (as_of_date is None or self.records[key].observation_date <= as_of_date)
+            and (fetched_at_before is None or self.records[key].fetched_at < fetched_at_before)
+        }
+
+    def upsert_observation(self, **values):
+        observation_date = values['observation_date']
+        if isinstance(observation_date, str):
+            observation_date = date.fromisoformat(observation_date)
+        record = MacroContextObservationRecord(
+            id=len(self.records) + 1,
+            source=values['source'],
+            series_id=values['series_id'],
+            series_name=values.get('series_name'),
+            country_code=values.get('country_code'),
+            observation_period=values['observation_period'],
+            observation_date=observation_date,
+            value=float(values['value']),
+            unit=values.get('unit'),
+            frequency=values.get('frequency'),
+            fetched_at=values['fetched_at'],
+            source_status=values['source_status'],
+            status_detail=values.get('status_detail'),
+            payload=values.get('payload'),
+            created_at=None,
+            updated_at=None,
+        )
+        self.records[(record.source, record.series_id)] = record
+        return record
+
+    def mark_refresh_failure(self, *, source, series_id, failed_at, reason):
+        key = (source, series_id)
+        record = self.records.get(key)
+        if record is None:
+            return False
+        if record.fetched_at >= failed_at:
+            return False
+        self.records[key] = MacroContextObservationRecord(
+            **{
+                **record.__dict__,
+                'status_detail': (
+                    f'refresh_failed_at={failed_at.isoformat()}; {reason}'
+                ),
+            }
+        )
+        return True
+
+
+class _OnceFailingWorldBankClient(FakeWorldBankClient):
+    def __init__(self, failed_series_id: str) -> None:
+        super().__init__()
+        self.failed_series_id = failed_series_id
+        self.failed_once = False
+
+    async def fetch_indicator(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs['indicator'] == self.failed_series_id and not self.failed_once:
+            self.failed_once = True
+            raise RuntimeError('temporary provider error')
+        indicator = kwargs['indicator']
+        return {
+            'metadata': {'source': 'fake-world-bank'},
+            'rows': [{'date': '2024', 'value': str(self.values[indicator])}],
+            'raw': {},
+        }
+
+
+def test_partial_refresh_retries_only_missing_series_inside_global_cooldown() -> None:
+    failed_series_id = 'FP.CPI.TOTL.ZG'
+    store = _InMemoryMacroStore()
+    world_bank = _OnceFailingWorldBankClient(failed_series_id)
+    service = MacroContextService(
+        store=store,
+        world_bank_client=world_bank,
+        fred_client=FailingFredClient(),
+    )
+    first_now = datetime(2026, 6, 20, 9, tzinfo=timezone.utc)
+    second_now = first_now + timedelta(hours=1)
+
+    with (
+        patch.object(settings, 'macro_context_enabled', True),
+        patch.object(settings, 'macro_context_refresh_min_interval_hours', 24),
+        patch.object(settings, 'macro_context_stale_after_hours', 72),
+        patch.object(settings, 'macro_context_world_bank_enabled', True),
+        patch.object(
+            settings,
+            'macro_context_world_bank_series',
+            'NY.GDP.MKTP.KD.ZG,FP.CPI.TOTL.ZG,SL.UEM.TOTL.ZS',
+        ),
+        patch.object(settings, 'macro_context_fred_enabled', False),
+        patch('app.macro_context.service._utcnow', side_effect=[first_now, second_now]),
+    ):
+        first = service.refresh_context(force=True, trigger='unit_test')
+        calls_after_first = len(world_bank.calls)
+        second = service.refresh_context(force=False, trigger='unit_test')
+
+    self_retry_calls = world_bank.calls[calls_after_first:]
+    assert first['status'] == 'partial'
+    assert second['status'] == 'completed'
+    assert second['retry_scope']['missing_or_due_series'] == [[WORLD_BANK_SOURCE, failed_series_id]]
+    assert [call['indicator'] for call in self_retry_calls] == [failed_series_id]
+
+
+def test_partial_refresh_retries_failed_series_with_prior_success_inside_cooldown() -> None:
+    failed_series_id = 'FP.CPI.TOTL.ZG'
+    store = _InMemoryMacroStore()
+    world_bank = _OnceFailingWorldBankClient(failed_series_id)
+    world_bank.failed_once = True
+    service = MacroContextService(
+        store=store,
+        world_bank_client=world_bank,
+        fred_client=FailingFredClient(),
+    )
+    first_now = datetime(2026, 6, 20, 9, tzinfo=timezone.utc)
+    failed_now = first_now + timedelta(hours=1)
+    retry_now = failed_now + timedelta(hours=1)
+
+    with (
+        patch.object(settings, 'macro_context_enabled', True),
+        patch.object(settings, 'macro_context_refresh_min_interval_hours', 24),
+        patch.object(settings, 'macro_context_stale_after_hours', 72),
+        patch.object(settings, 'macro_context_world_bank_enabled', True),
+        patch.object(
+            settings,
+            'macro_context_world_bank_series',
+            'NY.GDP.MKTP.KD.ZG,FP.CPI.TOTL.ZG,SL.UEM.TOTL.ZS',
+        ),
+        patch.object(settings, 'macro_context_fred_enabled', False),
+        patch(
+            'app.macro_context.service._utcnow',
+            side_effect=[first_now, failed_now, retry_now],
+        ),
+    ):
+        baseline = service.refresh_context(force=True, trigger='unit_test')
+        world_bank.failed_once = False
+        partial = service.refresh_context(force=True, trigger='unit_test')
+        calls_after_partial = len(world_bank.calls)
+        retry = service.refresh_context(force=False, trigger='unit_test')
+
+    retry_calls = world_bank.calls[calls_after_partial:]
+    assert baseline['status'] == 'completed'
+    assert partial['status'] == 'partial'
+    assert retry['status'] == 'completed'
+    assert retry['retry_scope']['missing_or_due_series'] == [
+        [WORLD_BANK_SOURCE, failed_series_id]
+    ]
+    assert [call['indicator'] for call in retry_calls] == [failed_series_id]
+    assert store.records[(WORLD_BANK_SOURCE, failed_series_id)].status_detail is None

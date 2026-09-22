@@ -45,13 +45,18 @@ def _ready_enrichment_warning_outcome() -> dict:
             'rows_persisted': 10,
             'errors': ['empty provider frame'],
         },
+        'valuation_snapshot': {
+            'status': 'completed',
+            'rows_persisted': 10,
+            'errors': [],
+        },
     }
     return {
         'stage': 'pykrx_enrichment',
         'status': 'completed',
-        'processed': 3,
-        'total': 3,
-        'succeeded': 2,
+        'processed': 4,
+        'total': 4,
+        'succeeded': 3,
         'failed': 1,
         'remaining': 0,
         'completed_at': '2026-04-03T08:00:00+00:00',

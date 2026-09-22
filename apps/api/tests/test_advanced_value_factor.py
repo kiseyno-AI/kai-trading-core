@@ -343,6 +343,63 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
 
 
 class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
+    def test_observed_market_cap_keeps_advanced_metrics_available_without_pbr(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        market_date = date(2026, 4, 24)
+        input_row = AdvancedValueFactorInput(
+            symbol='005930',
+            name_ko='삼성전자',
+            market='KOSPI',
+            bars=_bars(market_date, pbr=None),
+            annual_fundamentals=_snapshot(
+                '005930',
+                total_equity=1000,
+                total_liabilities=300,
+                operating_income=100,
+                operating_cash_flow=220,
+                cash=100,
+                capex_ppe=-60,
+                depreciation_and_amortization=40,
+                snapshot_id=1,
+            ),
+            market_cap=2000,
+        )
+
+        result = service._build_symbol_result(
+            input_row=input_row,
+            market_date=market_date,
+            source=ADVANCED_VALUE_FACTOR_VERSION,
+        )
+        result['factor_payload'] = service._build_factor_payload(
+            item=result,
+            source=ADVANCED_VALUE_FACTOR_VERSION,
+            universe_counts={
+                'fcf_yield': 1,
+                'ev_to_ebitda': 1,
+                'advanced_value_score': 1,
+            },
+        )
+
+        self.assertEqual(result['market_cap_proxy'], 2000.0)
+        self.assertEqual(result['fcf_yield_status'], METRIC_STATUS_AVAILABLE)
+        self.assertEqual(result['ev_to_ebitda_status'], METRIC_STATUS_AVAILABLE)
+        self.assertEqual(
+            result['factor_payload']['audit']['market_cap']['source_type'],
+            'pykrx_valuation_snapshot',
+        )
+        self.assertEqual(
+            result['factor_payload']['methodology']['enterprise_value_policy'][
+                'market_cap_proxy_formula'
+            ],
+            'observed_market_cap, else pbr * total_equity',
+        )
+        self.assertEqual(
+            result['factor_payload']['methodology']['financial_snapshot_policy'][
+                'fs_div_priority'
+            ],
+            ['CFS', 'OFS'],
+        )
+
     def test_rebuild_scores_higher_fcf_yield_and_lower_ev_to_ebitda_as_better(self) -> None:
         service = DailyAdvancedValueFactorService()
         market_date = date(2026, 4, 24)
@@ -543,6 +600,128 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertIsNone(persisted['advanced_value_score'])
         self.assertFalse(persisted['is_advanced_value_eligible'])
         self.assertEqual(result['summary']['insufficient_fundamentals_count'], 1)
+
+    def test_load_inputs_attaches_positive_same_day_observed_market_cap(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        market_date = date(2026, 4, 24)
+        symbol_rows = [{'symbol': '005930', 'name_ko': '삼성전자', 'market': 'KOSPI'}]
+        snapshot = _snapshot(
+            '005930',
+            total_equity=1000,
+            total_liabilities=300,
+            operating_income=100,
+            operating_cash_flow=220,
+            cash=100,
+            capex_ppe=-60,
+            depreciation_and_amortization=40,
+            snapshot_id=1,
+        )
+
+        with (
+            patch('app.signals.advanced_value_factor.load_symbols', return_value=symbol_rows),
+            patch(
+                'app.signals.advanced_value_factor.load_recent_price_bars_by_symbol',
+                return_value={'005930': _bars(market_date, pbr=None)},
+            ),
+            patch.object(
+                service,
+                '_load_latest_annual_fundamentals',
+                return_value={'005930': snapshot},
+            ),
+            patch(
+                'app.signals.advanced_value_factor.load_daily_pykrx_enrichment_rows',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'source': 'daily_price_bars_reconstructed',
+                        'payload': {'market_cap': None},
+                    },
+                    {
+                        'symbol': '005930',
+                        'source': 'pykrx',
+                        'payload': {'market_cap': 2_000_000},
+                    },
+                ],
+            ) as load_enrichment,
+        ):
+            inputs, matched, missing = service._load_inputs(
+                market_date=market_date,
+                symbols=['005930'],
+            )
+
+        self.assertEqual(matched, ['005930'])
+        self.assertEqual(missing, [])
+        self.assertEqual(inputs[0].market_cap, 2_000_000)
+        load_enrichment.assert_called_once_with(
+            market_date=market_date,
+            categories=['valuation_snapshot'],
+            scope_types=['symbol'],
+            symbols=['005930'],
+            limit=None,
+        )
+
+    def test_latest_annual_snapshot_query_excludes_unsuccessful_dart_payloads(self) -> None:
+        class RecordingSession:
+            def __init__(self) -> None:
+                self.statements = []
+
+            def execute(self, statement):
+                self.statements.append(statement)
+                if len(self.statements) == 1:
+                    return None
+                return _FakeLoaderResult([])
+
+        session = RecordingSession()
+        with patch(
+            'app.signals.advanced_value_factor.session_scope',
+            return_value=_FakeSessionScope(session),
+        ):
+            rows = DailyAdvancedValueFactorService._query_latest_annual_snapshot_chunk(
+                market_date=date(2026, 4, 24),
+                symbols=['005930'],
+            )
+
+        self.assertEqual(rows, [])
+        compiled_params = session.statements[-1].compile().params
+        self.assertIn('000', compiled_params.values())
+
+    def test_latest_annual_snapshot_query_prefers_latest_filing_then_cfs_within_filing(self) -> None:
+        class RecordingSession:
+            def __init__(self) -> None:
+                self.statements = []
+
+            def execute(self, statement):
+                self.statements.append(statement)
+                if len(self.statements) == 1:
+                    return None
+                return _FakeLoaderResult([])
+
+        session = RecordingSession()
+        with patch(
+            'app.signals.advanced_value_factor.session_scope',
+            return_value=_FakeSessionScope(session),
+        ):
+            DailyAdvancedValueFactorService._query_latest_annual_snapshot_chunk(
+                market_date=date(2026, 4, 24),
+                symbols=['005930'],
+            )
+
+        compiled = session.statements[-1].compile()
+        self.assertIn(['CFS', 'OFS'], compiled.params.values())
+        compiled_sql = str(compiled)
+        order_by_sql = compiled_sql.split('ORDER BY ', 1)[1]
+        self.assertLess(
+            order_by_sql.index('business_year DESC'),
+            order_by_sql.index('receipt_date DESC'),
+        )
+        self.assertLess(
+            order_by_sql.index('receipt_date DESC'),
+            order_by_sql.index('rcept_no DESC'),
+        )
+        self.assertLess(
+            order_by_sql.index('rcept_no DESC'),
+            order_by_sql.index('CASE'),
+        )
 
     def test_subset_rerun_uses_full_universe_rankings(self) -> None:
         service = DailyAdvancedValueFactorService()

@@ -11,6 +11,7 @@ from app.signals.low_risk_factor import (
     LOW_RISK_WATCHLIST_SCORE,
     DailyLowRiskFactorService,
     LowRiskFactorInput,
+    build_turnover_series_from_bars,
     compute_average_trading_value,
     compute_max_drawdown,
     compute_realized_volatility,
@@ -83,8 +84,56 @@ class LowRiskFactorMathTests(unittest.TestCase):
 
         self.assertEqual(result, 190.5)
 
+    def test_compute_average_trading_value_uses_exact_latest_window(self) -> None:
+        result = compute_average_trading_value(
+            [100.0, 80.0, -20.0, 60.0, 40.0],
+            lookback_bars=3,
+        )
+
+        self.assertIsNone(result)
+
+    def test_compute_average_trading_value_counts_true_no_trade_bar_as_zero(self) -> None:
+        result = compute_average_trading_value(
+            [100.0, 0.0, 80.0],
+            lookback_bars=3,
+        )
+
+        self.assertEqual(result, 60.0)
+
+    def test_turnover_series_marks_positive_volume_zero_turnover_invalid(self) -> None:
+        result = build_turnover_series_from_bars(
+            [
+                {'volume': 10, 'turnover': 0},
+                {'volume': 0, 'turnover': 0},
+            ]
+        )
+
+        self.assertTrue(math.isnan(result[0]))
+        self.assertEqual(result[1], 0.0)
+
 
 class DailyLowRiskFactorServiceTests(unittest.TestCase):
+    def test_zero_trading_value_is_not_ranked_as_liquid(self) -> None:
+        service = DailyLowRiskFactorService()
+        items = [
+            {'symbol': '000001', 'avg_trading_value_20d': 0.0},
+            {'symbol': '000002', 'avg_trading_value_20d': 1_000_000.0},
+        ]
+
+        count = service._assign_metric_rankings(
+            items,
+            value_key='avg_trading_value_20d',
+            rank_key='liquidity_rank',
+            percentile_key='liquidity_percentile',
+            best='higher',
+            positive_only=True,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIsNone(items[0].get('liquidity_rank'))
+        self.assertIsNone(items[0].get('liquidity_percentile'))
+        self.assertEqual(items[1]['liquidity_rank'], 1)
+
     def test_rebuild_assigns_percentiles_and_combined_classification(self) -> None:
         service = DailyLowRiskFactorService()
         market_date = date(2026, 4, 23)

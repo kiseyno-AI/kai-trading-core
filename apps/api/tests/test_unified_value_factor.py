@@ -184,6 +184,7 @@ def _input(
     pbr: float | None,
     dividend_yield: float | None,
     snapshot: AnnualFundamentalsSnapshot | None,
+    market_cap: float | None = None,
 ) -> AdvancedValueFactorInput:
     return AdvancedValueFactorInput(
         symbol=symbol,
@@ -191,10 +192,51 @@ def _input(
         market='KOSPI',
         bars=_bars(market_date, per=per, pbr=pbr, dividend_yield=dividend_yield),
         annual_fundamentals=snapshot,
+        market_cap=market_cap,
     )
 
 
 class DailyUnifiedValueFactorServiceTests(unittest.TestCase):
+    def test_observed_market_cap_keeps_advanced_metrics_without_pbr(self) -> None:
+        service = DailyUnifiedValueFactorService()
+        market_date = date(2026, 4, 24)
+        inputs = [
+            _input(
+                '005930',
+                market_date,
+                per=8.0,
+                pbr=None,
+                dividend_yield=0.03,
+                market_cap=2_000_000,
+                snapshot=_snapshot(
+                    '005930',
+                    total_equity=1000,
+                    total_liabilities=300,
+                    operating_income=100,
+                    operating_cash_flow=220,
+                    cash=100,
+                    capex_ppe=-60,
+                    depreciation_and_amortization=40,
+                    snapshot_id=1,
+                ),
+            ),
+        ]
+
+        with (
+            patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
+            patch('app.signals.unified_value_factor.upsert_daily_unified_value_factor_result') as upsert,
+        ):
+            service.rebuild_for_market_date(market_date=market_date)
+
+        persisted = upsert.call_args.args[0]
+        self.assertEqual(persisted['fcf_yield_status'], 'available')
+        self.assertEqual(persisted['ev_to_ebitda_status'], 'available')
+        self.assertEqual(persisted['factor_payload']['inputs']['market_cap_proxy'], 2_000_000)
+        self.assertEqual(
+            persisted['factor_payload']['audit']['market_cap']['source_type'],
+            'pykrx_valuation_snapshot',
+        )
+
     def test_rebuild_scores_all_five_component_percentiles(self) -> None:
         service = DailyUnifiedValueFactorService()
         market_date = date(2026, 4, 24)

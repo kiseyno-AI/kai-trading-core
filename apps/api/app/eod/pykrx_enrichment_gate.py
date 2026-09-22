@@ -9,8 +9,15 @@ REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'sector_classification',
     'investor_flow_symbol',
     'short_selling',
+    'valuation_snapshot',
 )
 REQUIRED_CATEGORY_MIN_COVERAGE_RATIO = 0.99
+REQUIRED_CATEGORY_MIN_COVERAGE_RATIOS = {
+    # PyKRX valuation excludes a small, stable subset of the broader KRX
+    # universe. Direct same-day rows remain mandatory; 95% of the supported
+    # stock universe is the explicit readiness floor.
+    'valuation_snapshot': 0.95,
+}
 
 
 def _normalize_iso_date(value: str | date) -> str:
@@ -51,6 +58,10 @@ def _category_gate_item(
         coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
     coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
     missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
+    minimum_coverage_ratio = REQUIRED_CATEGORY_MIN_COVERAGE_RATIOS.get(
+        category,
+        REQUIRED_CATEGORY_MIN_COVERAGE_RATIO,
+    )
 
     if (
         not missing_category_payload
@@ -72,7 +83,7 @@ def _category_gate_item(
     elif present_rows <= 0 or coverage_status == 'missing':
         gate_status = 'blocked'
         reason = 'missing_required_pykrx_enrichment_category'
-    elif coverage_ratio is None or coverage_ratio < REQUIRED_CATEGORY_MIN_COVERAGE_RATIO:
+    elif coverage_ratio is None or coverage_ratio < minimum_coverage_ratio:
         gate_status = 'blocked'
         reason = 'required_pykrx_enrichment_category_below_min_coverage'
     else:
@@ -89,6 +100,12 @@ def _category_gate_item(
         'present_rows': present_rows,
         'missing_rows': missing_rows,
         'coverage_ratio': coverage_ratio,
+        'minimum_coverage_ratio': minimum_coverage_ratio,
+        'complete_present_rows': _coerce_optional_int(payload.get('complete_present_rows')),
+        'completeness_ratio': _coerce_optional_float(payload.get('completeness_ratio')),
+        'completeness_status': str(
+            payload.get('completeness_status') or coverage_status
+        ).strip().lower(),
         'reason': reason,
     }
 
@@ -119,7 +136,11 @@ def build_pykrx_enrichment_preflight(
     warning_categories = [
         item
         for item in gate_items
-        if item['gate_status'] == 'ready' and item.get('coverage_status') != 'complete'
+        if item['gate_status'] == 'ready'
+        and (
+            item.get('coverage_status') != 'complete'
+            or item.get('completeness_status') != 'complete'
+        )
     ]
     if blocked_categories:
         status = 'blocked'

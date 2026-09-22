@@ -428,7 +428,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             unified_value_stage['depends_on'],
-            ['price_collection', 'fundamentals_daily_refresh'],
+            ['price_collection', 'pykrx_enrichment', 'fundamentals_daily_refresh'],
         )
         quality_stage = next(
             stage
@@ -447,7 +447,21 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             advanced_value_stage['depends_on'],
-            ['price_collection', 'fundamentals_daily_refresh'],
+            ['price_collection', 'pykrx_enrichment', 'fundamentals_daily_refresh'],
+        )
+        piotroski_stage = next(
+            stage for stage in payload['stages'] if stage['id'] == 'piotroski_filter'
+        )
+        self.assertEqual(
+            piotroski_stage['depends_on'],
+            ['fundamentals_daily_refresh', 'pykrx_enrichment'],
+        )
+        value_stage = next(
+            stage for stage in payload['stages'] if stage['id'] == 'value_factors'
+        )
+        self.assertEqual(
+            value_stage['depends_on'],
+            ['price_collection', 'pykrx_enrichment'],
         )
         composite_stage = next(
             stage
@@ -1896,6 +1910,25 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
+    def test_extract_stage_counts_keeps_trending_progress_in_period_units(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='trending_ranks',
+            result={
+                'trending_ranks_persisted': 6,
+                'periods_persisted': 3,
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 3,
+                'total': 3,
+                'succeeded': 3,
+                'failed': 0,
+            },
+        )
+
     def test_extract_stage_counts_preserves_explicit_zero_eligible_news_scope(self) -> None:
         counts = DailyPipelineStageService._extract_stage_counts(
             stage_id='external_news_collect',
@@ -1998,11 +2031,13 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                         'sector_classification',
                         'investor_flow_symbol',
                         'short_selling',
+                        'valuation_snapshot',
                     ],
                     'category_row_counts': {
                         'sector_classification': 10,
                         'investor_flow_symbol': 10,
                         'short_selling': 10,
+                        'valuation_snapshot': 10,
                     },
                     'failed_categories': [],
                     'blocked_categories': [],
@@ -2565,6 +2600,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'sector_classification',
             'investor_flow_symbol',
             'short_selling',
+            'valuation_snapshot',
         )
         collection_result = {
             'status': 'completed',
@@ -2623,6 +2659,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'sector_classification',
             'investor_flow_symbol',
             'short_selling',
+            'valuation_snapshot',
         )
         collection_result = {
             'status': 'partial',
@@ -2642,6 +2679,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'status': 'partial',
                     'rows_persisted': 10,
                     'errors': ['empty provider frame'],
+                },
+                'valuation_snapshot': {
+                    'status': 'completed',
+                    'rows_persisted': 10,
+                    'errors': [],
                 },
             },
             'coverage': {},
@@ -2676,9 +2718,9 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 result=result,
             ),
             {
-                'processed': 3,
-                'total': 3,
-                'succeeded': 3,
+                'processed': 4,
+                'total': 4,
+                'succeeded': 4,
                 'failed': 0,
             },
         )

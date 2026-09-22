@@ -195,6 +195,42 @@ class MacroContextObservationStore:
                     loaded[(source, series_id)] = self._to_record(row)
         return loaded
 
+    def mark_refresh_failure(
+        self,
+        *,
+        source: str,
+        series_id: str,
+        failed_at: datetime | str,
+        reason: str,
+    ) -> bool:
+        normalized_failed_at = _normalize_datetime(failed_at)
+        with session_scope() as session:
+            row = session.execute(
+                select(MacroContextObservation)
+                .where(
+                    MacroContextObservation.source == str(source),
+                    MacroContextObservation.series_id == str(series_id),
+                )
+                .order_by(
+                    MacroContextObservation.observation_date.desc(),
+                    MacroContextObservation.fetched_at.desc(),
+                    MacroContextObservation.id.desc(),
+                )
+                .with_for_update()
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            if _normalize_datetime(row.fetched_at) >= normalized_failed_at:
+                return False
+            normalized_reason = ' '.join(str(reason).split())[:500]
+            row.status_detail = (
+                f'refresh_failed_at={normalized_failed_at.isoformat()}; '
+                f'{normalized_reason}'
+            )
+            session.flush()
+            return True
+
     def latest_fetched_at(self) -> datetime | None:
         with session_scope() as session:
             value = session.execute(select(func.max(MacroContextObservation.fetched_at))).scalar_one()

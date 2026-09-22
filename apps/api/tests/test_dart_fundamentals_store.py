@@ -1,8 +1,14 @@
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import patch
 from uuid import uuid4
 
-from app.dart.fundamentals_store import DartFundamentalsRepository
+from app.dart.fundamentals_store import (
+    DartFundamentalsRepository,
+    eligible_fundamentals_fs_divs,
+    is_usable_fundamentals_source_status,
+)
 from app.db import session_scope
 from app.db_models import (
     DartDisclosureEvent,
@@ -11,6 +17,58 @@ from app.db_models import (
     DartFundamentalsSnapshot,
 )
 from sqlalchemy import delete, select
+
+
+class FundamentalsSourceStatusTests(unittest.TestCase):
+    def test_only_success_status_is_eligible_for_factor_inputs(self):
+        self.assertTrue(is_usable_fundamentals_source_status('000'))
+        self.assertFalse(is_usable_fundamentals_source_status('013'))
+        self.assertFalse(is_usable_fundamentals_source_status(None))
+
+    def test_cfs_reads_allow_ofs_fallback_without_weakening_explicit_ofs_reads(self):
+        self.assertEqual(eligible_fundamentals_fs_divs('CFS'), ('CFS', 'OFS'))
+        self.assertEqual(eligible_fundamentals_fs_divs('OFS'), ('OFS',))
+
+    def test_default_stored_read_query_requires_successful_captured_cfs_or_ofs(self):
+        statements = []
+
+        class EmptyResult:
+            def all(self):
+                return []
+
+        class RecordingSession:
+            def execute(self, statement):
+                statements.append(statement)
+                return EmptyResult()
+
+        @contextmanager
+        def fake_session_scope():
+            yield RecordingSession()
+
+        repository = DartFundamentalsRepository()
+        with patch('app.dart.fundamentals_store.session_scope', fake_session_scope):
+            self.assertEqual(
+                repository.list_stored_fundamentals_summary(stock_codes=['005930']),
+                [],
+            )
+
+        self.assertEqual(len(statements), 1)
+        compiled = statements[0].compile()
+        parameter_values = list(compiled.params.values())
+        self.assertIn(['CFS', 'OFS'], parameter_values)
+        self.assertIn('000', parameter_values)
+        self.assertIn('captured', parameter_values)
+        compiled_sql = str(compiled)
+        self.assertIn('CASE WHEN', compiled_sql)
+        order_by_sql = compiled_sql.split(' ORDER BY ', 1)[1]
+        self.assertLess(
+            order_by_sql.index('receipt_date DESC'),
+            order_by_sql.index('rcept_no DESC'),
+        )
+        self.assertLess(
+            order_by_sql.index('rcept_no DESC'),
+            order_by_sql.index('CASE WHEN'),
+        )
 
 
 class DartFundamentalsRepositoryTests(unittest.TestCase):
@@ -83,32 +141,43 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         business_year: int,
         report_code: str = '11011',
         fs_div: str = 'CFS',
+        source_status: str | None = '000',
+        rcept_no: str | None = None,
+        disclosure_event_id: int | None = None,
     ) -> tuple[int, int]:
         suffix = uuid4().hex[:16]
-        rcept_no = f'T{suffix}'
+        resolved_rcept_no = rcept_no or f'T{suffix}'
         corp_code = f'C{suffix[:8]}'
         with session_scope() as session:
-            event = DartDisclosureEvent(
-                rcept_no=rcept_no,
-                corp_code=corp_code,
-                corp_name=f'Test Corp {stock_code}',
-                stock_code=stock_code,
-                corp_cls='Y',
-                report_nm='Annual Report (2025.12)',
-                filing_category='annual_report',
-                is_financial_report=True,
-                receipt_date=receipt_date,
-                payload={'rcept_no': rcept_no},
-                fundamentals_capture_status=capture_status,
-            )
-            session.add(event)
-            session.flush()
+            if disclosure_event_id is None:
+                event = DartDisclosureEvent(
+                    rcept_no=resolved_rcept_no,
+                    corp_code=corp_code,
+                    corp_name=f'Test Corp {stock_code}',
+                    stock_code=stock_code,
+                    corp_cls='Y',
+                    report_nm='Annual Report (2025.12)',
+                    filing_category='annual_report',
+                    is_financial_report=True,
+                    receipt_date=receipt_date,
+                    payload={'rcept_no': resolved_rcept_no},
+                    fundamentals_capture_status=capture_status,
+                )
+                session.add(event)
+                session.flush()
+                self.created_event_ids.append(event.id)
+            else:
+                event = session.get(DartDisclosureEvent, disclosure_event_id)
+                if event is None:
+                    raise AssertionError(
+                        f'Missing test disclosure event {disclosure_event_id}'
+                    )
 
             snapshot = DartFundamentalsSnapshot(
                 disclosure_event_id=event.id,
                 capture_run_id=None,
-                rcept_no=rcept_no,
-                corp_code=corp_code,
+                rcept_no=event.rcept_no,
+                corp_code=event.corp_code,
                 stock_code=stock_code,
                 corp_name=f'Test Corp {stock_code}',
                 business_year=business_year,
@@ -119,7 +188,7 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
                 period_type='annual',
                 period_end_month=12,
                 currency='KRW',
-                source_status='000',
+                source_status=source_status,
                 source_message='OK',
                 request_payload={},
                 response_payload={},
@@ -130,7 +199,6 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             event_id = event.id
             snapshot_id = snapshot.id
 
-        self.created_event_ids.append(event_id)
         self.created_snapshot_ids.append(snapshot_id)
         return event_id, snapshot_id
 
@@ -204,6 +272,88 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             [row['id'] for row in rows],
             [before_snapshot_id],
         )
+
+    def test_default_stored_fundamentals_read_prefers_successful_cfs_and_falls_back_to_ofs(self):
+        cfs_preferred_stock_code = f'T{uuid4().hex[:10]}'
+        fallback_stock_code = f'T{uuid4().hex[:10]}'
+        preferred_event_id, preferred_cfs_id = self._create_event_snapshot(
+            stock_code=cfs_preferred_stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2025,
+            fs_div='CFS',
+        )
+        self._create_event_snapshot(
+            stock_code=cfs_preferred_stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2025,
+            fs_div='OFS',
+            disclosure_event_id=preferred_event_id,
+        )
+        self._create_event_snapshot(
+            stock_code=fallback_stock_code,
+            receipt_date=date(2026, 4, 8),
+            capture_status='captured',
+            business_year=2025,
+            fs_div='CFS',
+            source_status='013',
+        )
+        _, fallback_ofs_id = self._create_event_snapshot(
+            stock_code=fallback_stock_code,
+            receipt_date=date(2026, 4, 8),
+            capture_status='captured',
+            business_year=2025,
+            fs_div='OFS',
+        )
+        self._create_event_snapshot(
+            stock_code=fallback_stock_code,
+            receipt_date=date(2026, 4, 9),
+            capture_status='failed',
+            business_year=2026,
+            fs_div='CFS',
+        )
+
+        rows = self.repository.list_stored_fundamentals_summary(
+            stock_codes=[cfs_preferred_stock_code, fallback_stock_code],
+        )
+
+        self.assertEqual(
+            {row['id'] for row in rows},
+            {preferred_cfs_id, fallback_ofs_id},
+        )
+        self.assertEqual({row['source_status'] for row in rows}, {'000'})
+        self.assertEqual(
+            {row['disclosure']['fundamentals_capture_status'] for row in rows},
+            {'captured'},
+        )
+
+    def test_default_stored_read_prefers_newer_same_day_correction_before_cfs(self):
+        stock_code = f'T{uuid4().hex[:10]}'
+        self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2025,
+            fs_div='CFS',
+            rcept_no='20260407000001',
+        )
+        _, corrected_ofs_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2025,
+            fs_div='OFS',
+            rcept_no='20260407000002',
+        )
+
+        rows = self.repository.list_stored_fundamentals_summary(
+            stock_codes=[stock_code],
+            fs_div='CFS',
+        )
+
+        self.assertEqual([row['id'] for row in rows], [corrected_ofs_id])
+        self.assertEqual(rows[0]['fs_div'], 'OFS')
 
     def test_fail_stale_capture_runs_uses_last_progress_at_when_present(self):
         now = datetime.now(timezone.utc)

@@ -699,7 +699,11 @@ def _build_highlights(items: list[dict[str, Any]]) -> dict[str, Any]:
         'net_margin': _safe_ratio(net_income, revenue),
         'return_on_assets': _safe_ratio(net_income, total_assets),
         'return_on_equity': _safe_ratio(net_income, equity),
-        'debt_ratio': _safe_ratio(liabilities, equity),
+        'debt_ratio': (
+            _safe_ratio(liabilities, equity)
+            if equity is not None and equity > 0
+            else None
+        ),
         'liabilities_to_assets': _safe_ratio(liabilities, total_assets),
         'current_ratio': _safe_ratio(current_assets, current_liabilities),
         'cash_ratio': _safe_ratio(cash, current_liabilities),

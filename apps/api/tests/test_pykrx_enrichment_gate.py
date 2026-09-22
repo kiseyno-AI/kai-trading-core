@@ -29,6 +29,13 @@ def test_pykrx_enrichment_preflight_allows_required_complete_categories():
                     'coverage_ratio': 1.0,
                     'coverage_status': 'complete',
                 },
+                'valuation_snapshot': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 2,
+                    'present_rows': 2,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
             },
         },
     )
@@ -40,6 +47,7 @@ def test_pykrx_enrichment_preflight_allows_required_complete_categories():
         'sector_classification': 2,
         'investor_flow_symbol': 2,
         'short_selling': 2,
+        'valuation_snapshot': 2,
     }
 
 
@@ -63,6 +71,13 @@ def test_pykrx_enrichment_preflight_blocks_zero_required_category_coverage():
                     'present_rows': 0,
                     'coverage_ratio': 0.0,
                     'coverage_status': 'missing',
+                },
+                'valuation_snapshot': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 2,
+                    'present_rows': 2,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
                 },
                 'short_selling': {
                     'scope_type': 'symbol',
@@ -101,6 +116,13 @@ def test_pykrx_enrichment_preflight_blocks_low_partial_required_category_coverag
                     'present_rows': 3,
                     'coverage_ratio': 0.03,
                     'coverage_status': 'partial',
+                },
+                'valuation_snapshot': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 100,
+                    'present_rows': 100,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
                 },
                 'short_selling': {
                     'scope_type': 'symbol',
@@ -146,6 +168,13 @@ def test_pykrx_enrichment_preflight_waits_when_eligible_universe_is_unavailable(
                     'coverage_status': 'unavailable',
                     'expectation_status': 'unavailable',
                 },
+                'valuation_snapshot': {
+                    'scope_type': 'symbol',
+                    'expected_rows': 2,
+                    'present_rows': 2,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
                 'short_selling': {
                     'scope_type': 'symbol',
                     'expected_rows': None,
@@ -183,6 +212,7 @@ def test_pykrx_enrichment_preflight_waits_on_ambiguous_zero_row_expectation():
                     'sector_classification',
                     'investor_flow_symbol',
                     'short_selling',
+                    'valuation_snapshot',
                 )
             },
         },
@@ -210,6 +240,7 @@ def test_pykrx_enrichment_preflight_uses_row_counts_when_reported_ratio_is_stale
                     'sector_classification',
                     'investor_flow_symbol',
                     'short_selling',
+                    'valuation_snapshot',
                 )
             },
         },
@@ -237,6 +268,7 @@ def test_pykrx_enrichment_preflight_allows_partial_coverage_at_minimum_threshold
                     'sector_classification',
                     'investor_flow_symbol',
                     'short_selling',
+                    'valuation_snapshot',
                 )
             },
         },
@@ -249,4 +281,63 @@ def test_pykrx_enrichment_preflight_allows_partial_coverage_at_minimum_threshold
         'sector_classification',
         'investor_flow_symbol',
         'short_selling',
+        'valuation_snapshot',
     ]
+
+
+def test_pykrx_enrichment_preflight_warns_on_partial_short_components_without_hiding_core_rows():
+    categories = {
+        category: {
+            'scope_type': 'symbol',
+            'expected_rows': 100,
+            'present_rows': 100,
+            'coverage_ratio': 1.0,
+            'coverage_status': 'complete',
+            'complete_present_rows': 0 if category == 'short_selling' else 100,
+            'completeness_ratio': 0.0 if category == 'short_selling' else 1.0,
+            'completeness_status': 'missing' if category == 'short_selling' else 'complete',
+        }
+        for category in (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+            'valuation_snapshot',
+        )
+    }
+
+    result = build_pykrx_enrichment_preflight(
+        market_date='2026-09-18',
+        coverage={'categories': categories},
+    )
+
+    assert result['status'] == 'ready'
+    assert result['allowed'] is True
+    assert [item['category'] for item in result['warning_categories']] == ['short_selling']
+    assert result['warning_categories'][0]['completeness_status'] == 'missing'
+
+
+def test_valuation_gate_accepts_documented_provider_universe_coverage() -> None:
+    categories = {
+        category: {
+            'scope_type': 'symbol',
+            'expected_rows': 100,
+            'present_rows': 96 if category == 'valuation_snapshot' else 100,
+            'coverage_ratio': 0.96 if category == 'valuation_snapshot' else 1.0,
+            'coverage_status': 'partial' if category == 'valuation_snapshot' else 'complete',
+        }
+        for category in (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+            'valuation_snapshot',
+        )
+    }
+
+    result = build_pykrx_enrichment_preflight(
+        market_date='2026-09-18',
+        coverage={'categories': categories},
+    )
+
+    assert result['status'] == 'ready'
+    assert result['allowed'] is True
+    assert [item['category'] for item in result['warning_categories']] == ['valuation_snapshot']

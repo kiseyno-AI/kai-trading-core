@@ -7,7 +7,7 @@ import logging
 import re
 from typing import Any, Sequence
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.exc import OperationalError
 
 from app.db import session_scope
@@ -20,6 +20,7 @@ from app.db_models import (
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_advanced_value_factor_results,
+    load_daily_pykrx_enrichment_rows,
     load_recent_price_bars_by_symbol,
     load_symbols,
     upsert_daily_advanced_value_factor_result,
@@ -34,6 +35,7 @@ ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE = 25
 ADVANCED_VALUE_FUNDAMENTALS_ROW_CHUNK_SIZE = 100
 ADVANCED_VALUE_FUNDAMENTALS_STATEMENT_TIMEOUT_SECONDS = 180
 ADVANCED_VALUE_FUNDAMENTALS_FS_DIV = 'CFS'
+ADVANCED_VALUE_FUNDAMENTALS_FS_DIVS = ('CFS', 'OFS')
 ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE = '11011'
 ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE = 'annual'
 ADVANCED_VALUE_MIN_COMPONENTS = 2
@@ -505,6 +507,7 @@ class AdvancedValueFactorInput:
     market: str | None
     bars: list[dict[str, Any]]
     annual_fundamentals: AnnualFundamentalsSnapshot | None
+    market_cap: float | None = None
 
 
 def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dict[str, Any]:
@@ -907,6 +910,24 @@ class DailyAdvancedValueFactorService:
             market_date=market_date,
             symbols=matched_symbols,
         )
+        observed_market_cap_by_symbol: dict[str, float] = {}
+        for item in load_daily_pykrx_enrichment_rows(
+            market_date=market_date,
+            categories=['valuation_snapshot'],
+            scope_types=['symbol'],
+            symbols=matched_symbols,
+            limit=None,
+        ):
+            if item.get('source') != 'pykrx':
+                continue
+            symbol = str(item.get('symbol') or item.get('scope_key') or '').strip().upper()
+            raw_market_cap = (item.get('payload') or {}).get('market_cap')
+            try:
+                market_cap = float(raw_market_cap)
+            except (TypeError, ValueError):
+                continue
+            if symbol and market_cap > 0:
+                observed_market_cap_by_symbol[symbol] = market_cap
         inputs = [
             AdvancedValueFactorInput(
                 symbol=row['symbol'],
@@ -914,6 +935,7 @@ class DailyAdvancedValueFactorService:
                 market=row.get('market'),
                 bars=bars_by_symbol.get(row['symbol'], []),
                 annual_fundamentals=fundamentals_by_symbol.get(row['symbol']),
+                market_cap=observed_market_cap_by_symbol.get(row['symbol']),
             )
             for row in symbol_rows
         ]
@@ -1067,6 +1089,11 @@ class DailyAdvancedValueFactorService:
             order_by=(
                 DartFundamentalsSnapshot.business_year.desc(),
                 DartDisclosureEvent.receipt_date.desc().nullslast(),
+                DartDisclosureEvent.rcept_no.desc(),
+                case(
+                    (DartFundamentalsSnapshot.fs_div == ADVANCED_VALUE_FUNDAMENTALS_FS_DIV, 0),
+                    else_=1,
+                ).asc(),
                 DartFundamentalsSnapshot.id.desc(),
             ),
         ).label('row_rank')
@@ -1088,9 +1115,10 @@ class DailyAdvancedValueFactorService:
             .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
             .where(
                 DartFundamentalsSnapshot.stock_code.in_(symbols),
-                DartFundamentalsSnapshot.fs_div == ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
+                DartFundamentalsSnapshot.fs_div.in_(ADVANCED_VALUE_FUNDAMENTALS_FS_DIVS),
                 DartFundamentalsSnapshot.report_code == ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
                 DartFundamentalsSnapshot.period_type == ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
+                DartFundamentalsSnapshot.source_status == '000',
                 DartFundamentalsSnapshot.business_year <= market_date.year,
                 DartDisclosureEvent.receipt_date <= market_date,
             )
@@ -1132,7 +1160,17 @@ class DailyAdvancedValueFactorService:
             financial_context.get('depreciation_and_amortization') if financial_context else None
         )
 
-        market_cap_proxy = compute_market_cap_proxy(pbr=pbr, total_equity=total_equity)
+        observed_market_cap = (
+            _round(float(input_row.market_cap), 4)
+            if input_row.market_cap is not None and float(input_row.market_cap) > 0
+            else None
+        )
+        if observed_market_cap is not None:
+            market_cap_proxy = observed_market_cap
+            market_cap_source = 'pykrx_valuation_snapshot'
+        else:
+            market_cap_proxy = compute_market_cap_proxy(pbr=pbr, total_equity=total_equity)
+            market_cap_source = 'pbr_times_total_equity' if market_cap_proxy is not None else None
         free_cash_flow = compute_free_cash_flow(
             operating_cash_flow=operating_cash_flow,
             capital_expenditure=capital_expenditure,
@@ -1224,6 +1262,8 @@ class DailyAdvancedValueFactorService:
             '_price_bar_captured_at': current_bar.get('captured_at') if current_bar is not None else None,
             '_audit_payload': financial_context.get('audit') if financial_context else None,
             '_pbr': pbr,
+            '_observed_market_cap': observed_market_cap,
+            '_market_cap_source': market_cap_source,
             '_total_equity': total_equity,
             '_total_liabilities': total_liabilities,
             '_operating_income': operating_income,
@@ -1340,7 +1380,11 @@ class DailyAdvancedValueFactorService:
                     'report_code': ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
                     'period_type': ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
                     'fs_div': ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
-                    'selection_rule': 'latest_receipt_on_or_before_market_date',
+                    'fs_div_priority': list(ADVANCED_VALUE_FUNDAMENTALS_FS_DIVS),
+                    'selection_rule': (
+                        'latest_business_year_then_latest_filing_then_cfs_'
+                        'preferred_within_same_filing_on_or_before_market_date'
+                    ),
                 },
                 'field_policies': {
                     'flow_amount_preference': 'current_amount_then_current_cumulative_amount',
@@ -1358,7 +1402,7 @@ class DailyAdvancedValueFactorService:
                     'yield_denominator': 'market_cap_proxy',
                 },
                 'enterprise_value_policy': {
-                    'market_cap_proxy_formula': 'pbr * total_equity',
+                    'market_cap_proxy_formula': 'observed_market_cap, else pbr * total_equity',
                     'debt_proxy_formula': 'total_liabilities',
                     'cash_formula': 'cash_and_cash_equivalents',
                     'enterprise_value_formula': 'market_cap_proxy + total_liabilities - cash_and_cash_equivalents',
@@ -1420,6 +1464,11 @@ class DailyAdvancedValueFactorService:
                 'price_bar': {
                     'source': item.get('_price_bar_source'),
                     'captured_at': item.get('_price_bar_captured_at'),
+                },
+                'market_cap': {
+                    'source_type': item.get('_market_cap_source'),
+                    'observed_market_cap': item.get('_observed_market_cap'),
+                    'resolved_market_cap': item.get('market_cap_proxy'),
                 },
                 'fundamentals': item.get('_audit_payload'),
             },
