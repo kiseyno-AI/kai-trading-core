@@ -508,6 +508,7 @@ class AdvancedValueFactorInput:
     bars: list[dict[str, Any]]
     annual_fundamentals: AnnualFundamentalsSnapshot | None
     market_cap: float | None = None
+    valuation_snapshot: dict[str, Any] | None = None
 
 
 def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dict[str, Any]:
@@ -911,6 +912,7 @@ class DailyAdvancedValueFactorService:
             symbols=matched_symbols,
         )
         observed_market_cap_by_symbol: dict[str, float] = {}
+        valuation_snapshot_by_symbol: dict[str, dict[str, Any]] = {}
         for item in load_daily_pykrx_enrichment_rows(
             market_date=market_date,
             categories=['valuation_snapshot'],
@@ -921,7 +923,10 @@ class DailyAdvancedValueFactorService:
             if item.get('source') != 'pykrx':
                 continue
             symbol = str(item.get('symbol') or item.get('scope_key') or '').strip().upper()
-            raw_market_cap = (item.get('payload') or {}).get('market_cap')
+            payload = dict(item.get('payload') or {})
+            if symbol:
+                valuation_snapshot_by_symbol[symbol] = payload
+            raw_market_cap = payload.get('market_cap')
             try:
                 market_cap = float(raw_market_cap)
             except (TypeError, ValueError):
@@ -936,6 +941,7 @@ class DailyAdvancedValueFactorService:
                 bars=bars_by_symbol.get(row['symbol'], []),
                 annual_fundamentals=fundamentals_by_symbol.get(row['symbol']),
                 market_cap=observed_market_cap_by_symbol.get(row['symbol']),
+                valuation_snapshot=valuation_snapshot_by_symbol.get(row['symbol']),
             )
             for row in symbol_rows
         ]

@@ -594,7 +594,16 @@ def persist_daily_price_bars(
                     'low_price': statement.excluded.low_price,
                     'close_price': statement.excluded.close_price,
                     'volume': statement.excluded.volume,
-                    'turnover': statement.excluded.turnover,
+                    'turnover': case(
+                        (
+                            and_(
+                                statement.excluded.volume > 0,
+                                statement.excluded.turnover <= 0,
+                            ),
+                            DailyPriceBar.turnover,
+                        ),
+                        else_=statement.excluded.turnover,
+                    ),
                     'per': statement.excluded.per,
                     'pbr': statement.excluded.pbr,
                     'bps': statement.excluded.bps,

@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db_models import (
     DailyPriceBar,
+    DailyPykrxEnrichmentRow,
     DailyTechnicalSnapshot,
     DartAuditSignal,
     DartDilutionSignal,
@@ -473,6 +474,7 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         tables = (
             Symbol.__table__,
             DailyPriceBar.__table__,
+            DailyPykrxEnrichmentRow.__table__,
             DailyTechnicalSnapshot.__table__,
             DartDisclosureEvent.__table__,
             DartFundamentalsSnapshot.__table__,
@@ -496,6 +498,7 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
                 DartAuditSignal,
                 DartDilutionSignal,
                 DailyTechnicalSnapshot,
+                DailyPykrxEnrichmentRow,
                 DailyPriceBar,
                 Symbol,
             ):
@@ -526,7 +529,7 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
             session.commit()
             return row.id
 
-    def _add_price_bar(self, *, symbol_id: int, trade_date: date, pbr: float = 1.0) -> None:
+    def _add_price_bar(self, *, symbol_id: int, trade_date: date, pbr: float | None = 1.0) -> None:
         with Session(self.engine) as session:
             session.add(
                 DailyPriceBar(
@@ -540,6 +543,29 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
                     turnover=105_000,
                     pbr=pbr,
                     source='test',
+                )
+            )
+            session.commit()
+
+    def _add_valuation_snapshot(
+        self,
+        *,
+        symbol_id: int,
+        symbol: str,
+        market_date: date,
+        pbr: float,
+    ) -> None:
+        with Session(self.engine) as session:
+            session.add(
+                DailyPykrxEnrichmentRow(
+                    symbol_id=symbol_id,
+                    market_date=market_date,
+                    market='KOSPI',
+                    category='valuation_snapshot',
+                    scope_type='symbol',
+                    scope_key=symbol,
+                    source='pykrx',
+                    payload={'pbr': pbr, 'market_cap': 1_000_000},
                 )
             )
             session.commit()
@@ -702,6 +728,29 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
 
         self.assertEqual([item.symbol for item in inputs], ['099999'])
         self.assertEqual(inputs[0].pbr, 0.8)
+
+    def test_load_inputs_prefers_same_day_valuation_snapshot_pbr(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(
+            symbol_id=symbol_id,
+            trade_date=market_date,
+            pbr=None,
+        )
+        self._add_valuation_snapshot(
+            symbol_id=symbol_id,
+            symbol=symbol,
+            market_date=market_date,
+            pbr=0.75,
+        )
+
+        with patch('app.signals.piotroski_filter.session_scope', self._session_scope):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(inputs[0].pbr, 0.75)
+        self.assertEqual(inputs[0].valuation_source, 'pykrx_valuation_snapshot')
 
     def test_load_inputs_selects_latest_annual_snapshot_available_as_of_market_date(self) -> None:
         market_date = date(2026, 4, 14)

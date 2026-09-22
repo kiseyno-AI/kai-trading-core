@@ -119,6 +119,105 @@ class DailyValueFactorServiceTests(unittest.TestCase):
         self.assertIsNone(persisted['value_score'])
         self.assertEqual(result['summary']['missing_metric_count'], 1)
 
+    def test_rebuild_prefers_same_day_valuation_snapshot_when_bar_metrics_are_null(self) -> None:
+        service = DailyValueFactorService()
+        market_date = date(2026, 4, 24)
+        inputs = [
+            ValueFactorInput(
+                symbol='005930',
+                name_ko='Samsung Electronics',
+                market='KOSPI',
+                bars=[
+                    {
+                        'trade_date': market_date.isoformat(),
+                        'close_price': 100000,
+                        'per': None,
+                        'pbr': None,
+                        'dividend_yield': None,
+                        'source': 'pykrx',
+                    }
+                ],
+                valuation_snapshot={
+                    'per': 8.0,
+                    'pbr': 0.9,
+                    'dividend_yield': 0.03,
+                },
+            )
+        ]
+
+        with (
+            patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
+            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+        ):
+            result = service.rebuild_for_market_date(market_date=market_date)
+
+        persisted = upsert.call_args.args[0]
+        self.assertEqual(persisted['value_status'], VALUE_STATUS_SCORED)
+        self.assertEqual(persisted['per'], 8.0)
+        self.assertEqual(persisted['pbr'], 0.9)
+        self.assertEqual(persisted['dividend_yield'], 0.03)
+        self.assertEqual(
+            persisted['factor_payload']['audit']['valuation_source'],
+            'pykrx_valuation_snapshot',
+        )
+        self.assertEqual(result['summary']['scored_count'], 1)
+
+    def test_load_inputs_attaches_same_day_pykrx_valuation_snapshot(self) -> None:
+        service = DailyValueFactorService()
+        market_date = date(2026, 4, 24)
+        valuation_snapshot = {
+            'per': 8.0,
+            'pbr': 0.9,
+            'dividend_yield': 0.03,
+        }
+
+        with (
+            patch(
+                'app.signals.value_factor.list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ),
+            patch(
+                'app.signals.value_factor.load_symbols',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'name_ko': 'Samsung Electronics',
+                        'market': 'KOSPI',
+                    }
+                ],
+            ),
+            patch(
+                'app.signals.value_factor.load_recent_price_bars_by_symbol',
+                return_value={'005930': []},
+            ),
+            patch(
+                'app.signals.value_factor.load_daily_pykrx_enrichment_rows',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'source': 'pykrx',
+                        'payload': valuation_snapshot,
+                    }
+                ],
+            ) as load_enrichment,
+        ):
+            inputs, matched, missing = service._load_inputs(
+                market_date=market_date,
+                symbols=None,
+            )
+
+        self.assertEqual(matched, ['005930'])
+        self.assertEqual(missing, [])
+        self.assertEqual(inputs[0].valuation_snapshot, valuation_snapshot)
+        load_enrichment.assert_called_once_with(
+            market_date=market_date,
+            categories=['valuation_snapshot'],
+            scope_types=['symbol'],
+            symbols=['005930'],
+            source='pykrx',
+            limit=None,
+        )
+
     def test_subset_rerun_uses_full_universe_rankings(self) -> None:
         service = DailyValueFactorService()
         market_date = date(2026, 4, 24)

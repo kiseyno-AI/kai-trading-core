@@ -9,6 +9,7 @@ from sqlalchemy import and_, case, func, select
 from app.db import session_scope
 from app.db_models import (
     DailyPriceBar,
+    DailyPykrxEnrichmentRow,
     DailyTechnicalSnapshot,
     DartAuditSignal,
     DartDilutionSignal,
@@ -81,6 +82,7 @@ class PiotroskiInputs:
     fundamentals_provenance: dict[int, dict[str, Any]] = field(default_factory=dict)
     audit_provenance: dict[str, Any] | None = None
     dilution_provenance: dict[str, Any] | None = None
+    valuation_source: str = 'daily_price_bars'
 
 
 @dataclass(slots=True)
@@ -327,6 +329,7 @@ class DailyPiotroskiFilterService:
                     'valuation': {
                         'available': valuation_available,
                         'source_status': valuation_source_status,
+                        'source': item.valuation_source,
                         'excluded_from_filter_universe': not valuation_available,
                     },
                     'inputs': {
@@ -474,6 +477,30 @@ class DailyPiotroskiFilterService:
             symbols = [row.symbol for row in base_rows]
             if not symbols:
                 return []
+
+            valuation_pbr_by_symbol: dict[str, float] = {}
+            valuation_rows = session.execute(
+                select(
+                    Symbol.symbol,
+                    DailyPykrxEnrichmentRow.payload,
+                )
+                .join(
+                    DailyPykrxEnrichmentRow,
+                    DailyPykrxEnrichmentRow.symbol_id == Symbol.id,
+                )
+                .where(
+                    Symbol.symbol.in_(symbols),
+                    DailyPykrxEnrichmentRow.market_date == market_date,
+                    DailyPykrxEnrichmentRow.category == 'valuation_snapshot',
+                    DailyPykrxEnrichmentRow.scope_type == 'symbol',
+                    DailyPykrxEnrichmentRow.source == 'pykrx',
+                )
+            ).all()
+            for valuation_row in valuation_rows:
+                payload = dict(valuation_row.payload or {})
+                pbr = _as_float(payload.get('pbr'))
+                if pbr is not None:
+                    valuation_pbr_by_symbol[str(valuation_row.symbol)] = pbr
 
             metric_keys = {
                 'total_equity',
@@ -705,7 +732,11 @@ class DailyPiotroskiFilterService:
                     symbol=symbol,
                     name_ko=row.name_ko,
                     market_date=market_date,
-                    pbr=_as_float(row.pbr),
+                    pbr=(
+                        valuation_pbr_by_symbol[symbol]
+                        if symbol in valuation_pbr_by_symbol
+                        else _as_float(row.pbr)
+                    ),
                     return_20d=_as_float(row.return_20d),
                     total_equity=_mapped_float(
                         highlights_by_symbol,
@@ -812,6 +843,11 @@ class DailyPiotroskiFilterService:
                     fundamentals_provenance=provenance,
                     audit_provenance=audit_provenance_by_symbol.get(symbol),
                     dilution_provenance=dilution_provenance_by_symbol.get(symbol),
+                    valuation_source=(
+                        'pykrx_valuation_snapshot'
+                        if symbol in valuation_pbr_by_symbol
+                        else 'daily_price_bars'
+                    ),
                 )
             )
         return inputs

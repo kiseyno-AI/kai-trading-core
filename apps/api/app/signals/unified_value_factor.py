@@ -367,13 +367,17 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
         annual_fundamentals = input_row.annual_fundamentals
         financial_context = derive_annual_financial_context(annual_fundamentals) if annual_fundamentals is not None else None
 
-        per = _round(float(current_bar['per']), 6) if current_bar and current_bar.get('per') is not None else None
-        pbr = _round(float(current_bar['pbr']), 6) if current_bar and current_bar.get('pbr') is not None else None
-        dividend_yield = (
-            _round(float(current_bar['dividend_yield']), 6)
-            if current_bar and current_bar.get('dividend_yield') is not None
-            else None
-        )
+        valuation_snapshot = input_row.valuation_snapshot or {}
+
+        def valuation_metric(key: str) -> float | None:
+            raw_value = valuation_snapshot.get(key)
+            if raw_value is None and current_bar is not None:
+                raw_value = current_bar.get(key)
+            return _round(float(raw_value), 6) if raw_value is not None else None
+
+        per = valuation_metric('per')
+        pbr = valuation_metric('pbr')
+        dividend_yield = valuation_metric('dividend_yield')
         per_status = _positive_only_metric_status(per) if current_bar is not None else METRIC_STATUS_MISSING
         pbr_status = _positive_only_metric_status(pbr) if current_bar is not None else METRIC_STATUS_MISSING
         dividend_yield_status = _non_negative_metric_status(dividend_yield) if current_bar is not None else METRIC_STATUS_MISSING
@@ -491,6 +495,11 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             '_annual_snapshot_available': annual_fundamentals is not None,
             '_price_bar_source': current_bar.get('source') if current_bar is not None else None,
             '_price_bar_captured_at': current_bar.get('captured_at') if current_bar is not None else None,
+            '_valuation_source': (
+                'pykrx_valuation_snapshot'
+                if input_row.valuation_snapshot is not None
+                else 'daily_price_bars'
+            ),
             '_fundamentals_audit_payload': financial_context.get('audit') if financial_context else None,
             '_observed_market_cap': observed_market_cap,
             '_market_cap_source': market_cap_source,
@@ -725,6 +734,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                     'source': item.get('_price_bar_source'),
                     'captured_at': item.get('_price_bar_captured_at'),
                 },
+                'valuation_source': item.get('_valuation_source'),
                 'market_cap': {
                     'source_type': item.get('_market_cap_source'),
                     'observed_market_cap': item.get('_observed_market_cap'),
@@ -792,6 +802,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             '_annual_snapshot_available',
             '_price_bar_source',
             '_price_bar_captured_at',
+            '_valuation_source',
             '_fundamentals_audit_payload',
             '_observed_market_cap',
             '_market_cap_source',

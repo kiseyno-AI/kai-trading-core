@@ -49,11 +49,13 @@ def _ready_pykrx_repair_details() -> dict:
                     'sector_classification',
                     'investor_flow_symbol',
                     'short_selling',
+                    'valuation_snapshot',
                 ],
                 'category_row_counts': {
                     'sector_classification': 2762,
                     'investor_flow_symbol': 2565,
                     'short_selling': 2762,
+                    'valuation_snapshot': 2630,
                 },
                 'failed_categories': [],
                 'blocked_categories': [],
@@ -80,6 +82,11 @@ def _ready_pykrx_warning_details() -> dict:
             'status': 'partial',
             'rows_persisted': 10,
             'errors': ['empty provider frame'],
+        },
+        'valuation_snapshot': {
+            'status': 'completed',
+            'rows_persisted': 10,
+            'errors': [],
         },
     }
     return {
@@ -2246,9 +2253,9 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         market_date=convergence_eod.trade_date,
                         stage_id='pykrx_enrichment',
                         status='completed',
-                        processed=3,
-                        total=3,
-                        succeeded=2,
+                        processed=4,
+                        total=4,
+                        succeeded=3,
                         failed=1,
                         remaining=0,
                         started_at=started_at + timedelta(minutes=4),

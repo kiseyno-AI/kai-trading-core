@@ -639,7 +639,12 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
                     {
                         'symbol': '005930',
                         'source': 'pykrx',
-                        'payload': {'market_cap': 2_000_000},
+                        'payload': {
+                            'market_cap': 2_000_000,
+                            'per': 9.5,
+                            'pbr': 1.25,
+                            'dividend_yield': 2.4,
+                        },
                     },
                 ],
             ) as load_enrichment,
@@ -652,6 +657,15 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(matched, ['005930'])
         self.assertEqual(missing, [])
         self.assertEqual(inputs[0].market_cap, 2_000_000)
+        self.assertEqual(
+            inputs[0].valuation_snapshot,
+            {
+                'market_cap': 2_000_000,
+                'per': 9.5,
+                'pbr': 1.25,
+                'dividend_yield': 2.4,
+            },
+        )
         load_enrichment.assert_called_once_with(
             market_date=market_date,
             categories=['valuation_snapshot'],
