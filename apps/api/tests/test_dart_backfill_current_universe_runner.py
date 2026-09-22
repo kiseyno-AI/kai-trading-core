@@ -74,6 +74,51 @@ class DartBackfillCurrentUniverseRunnerTests(unittest.TestCase):
             self.assertEqual(log_lines[-1]['event'], 'batch_failed')
             self.assertEqual(log_lines[-1]['current_offset'], 25)
 
+    def test_runner_does_not_advance_past_incomplete_batch(self):
+        incomplete_result = {
+            'status': 'partial',
+            'failed_stock_codes': ['000660'],
+            'active_symbols_total': 12,
+            'symbols_selected': 5,
+            'symbols_resolved': 5,
+            'sync': {'run_id': 11, 'status': 'partial', 'events_inserted': 7},
+            'capture': {'run_id': 21, 'status': 'completed', 'events_captured': 4, 'events_failed': 0},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / 'runner.log'
+            with (
+                patch(
+                    'app.dart.backfill_current_universe_runner.dart_fundamentals_capture_service.backfill_current_universe_fundamentals',
+                    new=AsyncMock(return_value=incomplete_result),
+                ) as backfill_mock,
+                patch('sys.stdout.write') as stdout_write,
+            ):
+                exit_code = main(
+                    [
+                        '--start-offset',
+                        '25',
+                        '--batch-size',
+                        '5',
+                        '--capture-limit',
+                        '20',
+                        '--log-file',
+                        str(log_file),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(backfill_mock.await_count, 1)
+            payload = json.loads(''.join(call.args[0] for call in stdout_write.call_args_list))
+            self.assertEqual(payload['status'], 'partial')
+            self.assertEqual(payload['reason'], 'incomplete_batch')
+            self.assertEqual(payload['last_offset'], 25)
+            self.assertEqual(payload['next_offset'], 25)
+            self.assertEqual(payload['batches_completed'], 0)
+            self.assertEqual(payload['failed_stock_codes'], ['000660'])
+            log_lines = [json.loads(line) for line in log_file.read_text(encoding='utf-8').splitlines()]
+            self.assertEqual(log_lines[-1]['event'], 'runner_incomplete')
+            self.assertEqual(log_lines[-1]['next_offset'], 25)
+
     def test_runner_rejects_invalid_bounds(self):
         with self.assertRaises(SystemExit):
             main(['--batch-size', '0'])

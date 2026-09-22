@@ -708,9 +708,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         enrichment = SimpleNamespace(
             stage_id='pykrx_enrichment',
             status='completed',
-            processed=3,
-            total=3,
-            succeeded=2,
+            processed=4,
+            total=4,
+            succeeded=3,
             failed=1,
             remaining=0,
             completed_at=completed_at - timedelta(minutes=1),
@@ -723,6 +723,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                         'sector_classification',
                         'investor_flow_symbol',
                         'short_selling',
+                        'valuation_snapshot',
                     ],
                     'categories': {
                         'sector_classification': {
@@ -740,6 +741,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                             'rows_persisted': 10,
                             'errors': ['empty provider frame'],
                         },
+                        'valuation_snapshot': {
+                            'status': 'completed',
+                            'rows_persisted': 10,
+                            'errors': [],
+                        },
                     },
                     'downstream_preflight': {
                         'allowed': True,
@@ -748,11 +754,13 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                             'sector_classification',
                             'investor_flow_symbol',
                             'short_selling',
+                            'valuation_snapshot',
                         ],
                         'category_row_counts': {
                             'sector_classification': 10,
                             'investor_flow_symbol': 10,
                             'short_selling': 10,
+                            'valuation_snapshot': 10,
                         },
                         'failed_categories': [],
                         'blocked_categories': [],
@@ -2390,9 +2398,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
     ) -> None:
         run, stages, eod_run = self._terminal_continuation_fixture()
         enrichment = stages[0]
-        enrichment.processed = 3
-        enrichment.total = 3
-        enrichment.succeeded = 2
+        enrichment.processed = 4
+        enrichment.total = 4
+        enrichment.succeeded = 3
         enrichment.failed = 1
         enrichment.details = {
             'result_summary': {
@@ -2402,6 +2410,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     'sector_classification',
                     'investor_flow_symbol',
                     'short_selling',
+                    'valuation_snapshot',
                 ],
                 'categories': {
                     'sector_classification': {
@@ -2419,6 +2428,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                         'rows_persisted': 10,
                         'errors': ['empty provider frame'],
                     },
+                    'valuation_snapshot': {
+                        'status': 'completed',
+                        'rows_persisted': 10,
+                        'errors': [],
+                    },
                 },
                 'downstream_preflight': {
                     'allowed': True,
@@ -2427,11 +2441,13 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                         'sector_classification',
                         'investor_flow_symbol',
                         'short_selling',
+                        'valuation_snapshot',
                     ],
                     'category_row_counts': {
                         'sector_classification': 10,
                         'investor_flow_symbol': 10,
                         'short_selling': 10,
+                        'valuation_snapshot': 10,
                     },
                     'failed_categories': [],
                     'blocked_categories': [],

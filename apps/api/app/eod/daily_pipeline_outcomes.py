@@ -45,6 +45,7 @@ PYKRX_ENRICHMENT_REQUIRED_CATEGORIES: frozenset[str] = frozenset(
         'sector_classification',
         'investor_flow_symbol',
         'short_selling',
+        'valuation_snapshot',
     }
 )
 _TERMINAL_FEEDBACK_LEASE_LOSS_ERROR = re.compile(

@@ -311,7 +311,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertIsNone(build_coverage_mock.call_args.kwargs['symbols'])
 
     @patch('app.eod.pykrx_enrichment.load_symbols')
-    def test_full_market_collection_keeps_optional_coverage_batch_scoped(
+    def test_full_market_collection_uses_provider_universe_for_required_valuation(
         self,
         load_symbols_mock,
     ):
@@ -365,7 +365,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                         'errors': [],
                     },
                 ),
-            ),
+            ) as collect_valuation_mock,
             patch.object(
                 PykrxEnrichmentService,
                 '_collect_foreign_ownership_rows',
@@ -412,12 +412,15 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                 for call in build_coverage_mock.call_args_list
             ],
             [
-                (None, ['market_breadth']),
+                (None, ['market_breadth', 'valuation_snapshot']),
                 (
                     ['005930'],
-                    ['valuation_snapshot', 'foreign_ownership'],
+                    ['foreign_ownership'],
                 ),
             ],
+        )
+        self.assertIsNone(
+            collect_valuation_mock.call_args.kwargs['symbol_filter']
         )
         self.assertEqual(
             result['coverage']['categories']['market_breadth'][
@@ -429,7 +432,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             result['coverage']['categories']['valuation_snapshot'][
                 'expected_rows'
             ],
-            1,
+            2,
         )
         self.assertEqual(
             result['coverage']['categories']['foreign_ownership'][
@@ -1286,6 +1289,130 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
 
         self.assertFalse(is_decision_usable_pykrx_enrichment_row(row))
 
+    def test_coverage_completeness_rejects_partial_short_selling_payload(self):
+        from app.eod.pykrx_enrichment import is_complete_pykrx_enrichment_row
+
+        row = {
+            'category': 'short_selling',
+            'source': 'pykrx',
+            'payload': {
+                'short_volume': {
+                    'short_volume': 10,
+                    'total_volume': 100,
+                    'short_volume_ratio_pct': 10.0,
+                    'short_value': 1000,
+                    'total_value': 10000,
+                    'short_value_ratio_pct': 10.0,
+                },
+                'short_balance': {},
+            },
+        }
+
+        self.assertFalse(is_complete_pykrx_enrichment_row(row))
+
+    def test_coverage_completeness_requires_observed_valuation_market_cap(self):
+        from app.eod.pykrx_enrichment import is_complete_pykrx_enrichment_row
+
+        reconstructed = {
+            'category': 'valuation_snapshot',
+            'source': 'daily_price_bars_reconstructed',
+            'payload': {'per': 8.0, 'pbr': 1.1, 'dividend_yield': 2.0, 'market_cap': None},
+        }
+        observed = {
+            'category': 'valuation_snapshot',
+            'source': 'pykrx',
+            'payload': {'per': None, 'pbr': 1.1, 'dividend_yield': 0.0, 'market_cap': 2_000_000},
+        }
+
+        self.assertFalse(is_complete_pykrx_enrichment_row(reconstructed))
+        self.assertTrue(is_complete_pykrx_enrichment_row(observed))
+
+    def test_short_coverage_exposes_partial_component_completeness(self):
+        service = PykrxEnrichmentService()
+        row = {
+            'category': 'short_selling',
+            'market': 'KOSPI',
+            'scope_key': '005930',
+            'symbol': '005930',
+            'source': 'pykrx',
+            'payload': {
+                'short_volume': {
+                    'short_volume': 10,
+                    'total_volume': 100,
+                    'short_volume_ratio_pct': 10.0,
+                    'short_value': 1000,
+                    'total_value': 10000,
+                    'short_value_ratio_pct': 10.0,
+                },
+                'short_balance': {},
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '005930', 'market': 'KOSPI'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[row],
+            ),
+        ):
+            result = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=['short_selling'],
+            )
+
+        coverage = result['categories']['short_selling']
+        self.assertEqual(coverage['present_rows'], 1)
+        self.assertEqual(coverage['coverage_status'], 'complete')
+        self.assertEqual(coverage['complete_present_rows'], 0)
+        self.assertEqual(coverage['completeness_status'], 'missing')
+
+    def test_valuation_coverage_exposes_incomplete_observation_without_counting_it_ready(self):
+        service = PykrxEnrichmentService()
+        row = {
+            'category': 'valuation_snapshot',
+            'market': 'KOSPI',
+            'scope_key': '005930',
+            'symbol': '005930',
+            'source': 'daily_price_bars_reconstructed',
+            'payload': {
+                'per': 8.0,
+                'pbr': 1.1,
+                'dividend_yield': 2.0,
+                'market_cap': None,
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '005930', 'market': 'KOSPI'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[row],
+            ),
+        ):
+            result = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=['valuation_snapshot'],
+            )
+
+        coverage = result['categories']['valuation_snapshot']
+        self.assertEqual(coverage['present_rows'], 0)
+        self.assertEqual(coverage['raw_present_rows'], 1)
+        self.assertEqual(coverage['complete_present_rows'], 0)
+        self.assertEqual(coverage['missing_component_rows'], 1)
+        self.assertEqual(coverage['coverage_status'], 'missing')
+
     @patch('app.eod.pykrx_enrichment.stock.get_market_net_purchases_of_equities_by_ticker')
     def test_symbol_investor_rows_zero_fill_absent_investor_activity(
         self,
@@ -1587,9 +1714,107 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         preflight = build_pykrx_enrichment_preflight(
             market_date='2026-09-18',
             coverage=result,
+            categories=(
+                'sector_classification',
+                'investor_flow_symbol',
+                'short_selling',
+            ),
         )
         self.assertTrue(preflight['allowed'])
         self.assertEqual(preflight['status'], 'ready')
+
+    def test_valuation_coverage_uses_fresh_stock_universe_not_active_etf_scope(self):
+        service = PykrxEnrichmentService()
+        stock_symbols = ['005930', '000660']
+        active_rows = [
+            {'symbol': '005930', 'market': 'KOSPI'},
+            {'symbol': '000660', 'market': 'KOSPI'},
+            {'symbol': '069500', 'market': 'KOSPI'},
+        ]
+        sector_rows = [
+            {
+                'category': 'sector_classification',
+                'market': 'KOSPI',
+                'scope_key': symbol,
+                'symbol': symbol,
+                'source': 'pykrx',
+                'payload': {
+                    **_universe_reference_payload(stock_symbols),
+                    'sector_name': '반도체',
+                },
+            }
+            for symbol in stock_symbols
+        ]
+        short_rows = [
+            {
+                'category': 'short_selling',
+                'market': 'KOSPI',
+                'scope_key': symbol,
+                'symbol': symbol,
+                'source': 'pykrx',
+                'payload': {
+                    'short_volume': {
+                        'short_volume': 1,
+                        'total_volume': 10,
+                        'short_volume_ratio_pct': 10.0,
+                    }
+                },
+            }
+            for symbol in stock_symbols
+        ]
+        valuation_rows = [
+            {
+                'category': 'valuation_snapshot',
+                'market': 'KOSPI',
+                'scope_key': symbol,
+                'symbol': symbol,
+                'source': 'pykrx',
+                'payload': {
+                    'market_cap': 1_000_000,
+                    'per': 8.0,
+                    'pbr': 1.0,
+                    'dividend_yield': 2.0,
+                },
+            }
+            for symbol in stock_symbols
+        ]
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=active_rows,
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[*sector_rows, *short_rows, *valuation_rows],
+            ) as load_rows_mock,
+        ):
+            result = service._build_coverage_summary(
+                market_date='2026-09-18',
+                markets=['KOSPI'],
+                symbols=None,
+                categories=['valuation_snapshot'],
+            )
+
+        requested_categories = set(load_rows_mock.call_args.kwargs['categories'])
+        self.assertEqual(
+            requested_categories,
+            {'sector_classification', 'short_selling', 'valuation_snapshot'},
+        )
+        coverage = result['categories']['valuation_snapshot']
+        self.assertEqual(coverage['expected_rows'], 2)
+        self.assertEqual(coverage['present_rows'], 2)
+        self.assertEqual(
+            coverage['expected_universe_source'],
+            'fresh_pykrx_sector_classification',
+        )
+        preflight = build_pykrx_enrichment_preflight(
+            market_date='2026-09-18',
+            coverage=result,
+            categories=('valuation_snapshot',),
+        )
+        self.assertTrue(preflight['allowed'])
 
     def test_investor_coverage_remains_partial_for_missing_positive_volume_stock(self):
         service = PykrxEnrichmentService()
@@ -1929,6 +2154,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                     {'symbol': '900001', 'market': 'KONEX'},
                 ],
             ),
+            patch.object(service, '_daily_price_rows_for_fallback', return_value=[]),
             patch(
                 'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
                 return_value=[kospi_sector, kospi_short],

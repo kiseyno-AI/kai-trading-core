@@ -87,6 +87,30 @@ async def _run_batches(args: argparse.Namespace, *, log_path: Path) -> dict[str,
         sync_result = result.get('sync') if isinstance(result.get('sync'), dict) else {}
         capture_result = result.get('capture') if isinstance(result.get('capture'), dict) else {}
         next_offset = current_offset + symbols_selected
+        batch_status = str(result.get('status') or 'completed')
+        if batch_status != 'completed':
+            summary = {
+                'status': batch_status if batch_status in {'partial', 'failed'} else 'failed',
+                'reason': 'incomplete_batch',
+                'batches_completed': batches_completed,
+                'start_offset': args.start_offset,
+                'last_offset': current_offset,
+                'next_offset': current_offset,
+                'active_symbols_total': active_symbols_total,
+                'total_symbols_resolved': total_symbols_resolved,
+                'total_events_inserted': total_events_inserted,
+                'total_events_captured': total_events_captured,
+                'total_events_failed': total_events_failed,
+                'failed_stock_codes': list(result.get('failed_stock_codes') or []),
+                'log_file': str(log_path),
+                'last_result': result,
+            }
+            _append_log(
+                log_path,
+                event='runner_incomplete',
+                **summary,
+            )
+            return summary
         total_events_inserted += int(sync_result.get('events_inserted') or 0)
         total_events_captured += int(capture_result.get('events_captured') or 0)
         total_events_failed += int(capture_result.get('events_failed') or 0)
@@ -175,7 +199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     print(json.dumps(result, ensure_ascii=False))
-    return 0
+    return 1 if result.get('reason') == 'incomplete_batch' else 0
 
 
 if __name__ == '__main__':

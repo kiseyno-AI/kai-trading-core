@@ -149,7 +149,7 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['financial_report_events'], 2)
         self.assertEqual(sum(len(batch) for _, batch in repository.upserted_batches), 2)
 
-    async def test_sync_disclosures_for_corporations_propagates_upstream_failures(self):
+    async def test_sync_disclosures_for_corporations_reports_upstream_failures_as_retryable_run_failure(self):
         class FailingClient(FakeSyncClient):
             async def fetch_disclosure_list(self, **kwargs):
                 raise DartAPIError('DART upstream unavailable')
@@ -157,15 +157,221 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         repository = FakeSyncRepository()
         service = DartDisclosureSyncService(client=FailingClient(), repository=repository)
 
-        with self.assertRaisesRegex(DartAPIError, 'unavailable'):
-            await service.sync_disclosures_for_corporations(
-                corporations=[{'corp_code': '00126380', 'stock_code': '005930'}],
-                start_date=date(2025, 1, 1),
-                end_date=date(2026, 4, 7),
-                trigger='active_test',
-            )
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[{'corp_code': '00126380', 'stock_code': '005930'}],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
 
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['corporations_failed'], 1)
+        self.assertIn('unavailable', result['corporation_errors'][0]['error'])
         self.assertEqual(repository.completed_runs[-1][1]['status'], 'failed')
+
+    async def test_sync_disclosures_for_corporations_marks_mixed_company_failures_partial(self):
+        class PartiallyFailingClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                if kwargs['corp_code'] == 'broken-corp':
+                    raise RuntimeError('company lookup failed')
+                return await super().fetch_disclosure_list(**kwargs)
+
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=PartiallyFailingClient(), repository=repository)
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[
+                {'corp_code': '00126380', 'stock_code': '005930'},
+                {'corp_code': 'broken-corp', 'stock_code': '999999'},
+            ],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['corporations_processed'], 1)
+        self.assertEqual(result['corporations_failed'], 1)
+        self.assertEqual(result['corporation_errors'][0]['stock_code'], '999999')
+        self.assertEqual(result['failed_stock_codes'], ['999999'])
+        self.assertEqual(repository.completed_runs[-1][1]['status'], 'partial')
+
+    async def test_sync_disclosures_for_corporations_marks_all_company_failures_failed(self):
+        class FailingCompanyClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                raise RuntimeError(f"company lookup failed: {kwargs['corp_code']}")
+
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=FailingCompanyClient(), repository=repository)
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[
+                {'corp_code': 'broken-a', 'stock_code': '999998'},
+                {'corp_code': 'broken-b', 'stock_code': '999999'},
+            ],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['corporations_processed'], 0)
+        self.assertEqual(result['corporations_failed'], 2)
+        self.assertEqual(repository.completed_runs[-1][1]['status'], 'failed')
+
+    async def test_sync_disclosures_for_corporations_isolates_one_company_upstream_failure(self):
+        class PartiallyUnavailableClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                if kwargs['corp_code'] == 'unavailable-corp':
+                    raise DartAPIError('DART company unavailable')
+                return await super().fetch_disclosure_list(**kwargs)
+
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=PartiallyUnavailableClient(), repository=repository)
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[
+                {'corp_code': '00126380', 'stock_code': '005930'},
+                {'corp_code': 'unavailable-corp', 'stock_code': '999999'},
+            ],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['corporations_processed'], 1)
+        self.assertEqual(result['corporations_failed'], 1)
+        self.assertEqual(repository.completed_runs[-1][1]['status'], 'partial')
+
+    async def test_sync_disclosures_for_corporations_continues_after_one_intermittent_provider_failure(self):
+        class IntermittentlyUnavailableClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                if kwargs['corp_code'] == 'unavailable-corp':
+                    raise DartAPIError('DART company unavailable')
+                return await super().fetch_disclosure_list(**kwargs)
+
+        client = IntermittentlyUnavailableClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=client, repository=repository)
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[
+                {'corp_code': 'unavailable-corp', 'stock_code': '999999'},
+                {'corp_code': '00126380', 'stock_code': '005930'},
+            ],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['corporations_attempted'], 2)
+        self.assertEqual(result['corporations_processed'], 1)
+        self.assertEqual(result['corporations_failed'], 1)
+        self.assertEqual(result['corporations_unattempted'], 0)
+        self.assertEqual(result['failed_stock_codes'], ['999999'])
+        self.assertEqual(result['unattempted_stock_codes'], [])
+
+    async def test_sync_disclosures_for_corporations_stops_after_three_consecutive_provider_failures(self):
+        class SystemicallyUnavailableClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                self.calls.append(kwargs)
+                raise DartAPIError('DART provider unavailable')
+
+        client = SystemicallyUnavailableClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=client, repository=repository)
+        corporations = [
+            {'corp_code': f'broken-{index}', 'stock_code': f'{index:06d}'}
+            for index in range(1, 6)
+        ]
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=corporations,
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['corporations_attempted'], 3)
+        self.assertEqual(result['corporations_failed'], 3)
+        self.assertEqual(result['corporations_unattempted'], 2)
+        self.assertEqual(result['failed_stock_codes'], ['000001', '000002', '000003'])
+        self.assertEqual(result['unattempted_stock_codes'], ['000004', '000005'])
+        self.assertEqual(
+            result['incomplete_stock_codes'],
+            ['000001', '000002', '000003', '000004', '000005'],
+        )
+        completed = repository.completed_runs[-1][1]
+        self.assertEqual(completed['status'], 'failed')
+        self.assertEqual(completed['run_metadata']['circuit_breaker']['threshold'], 3)
+        self.assertTrue(completed['run_metadata']['circuit_breaker']['tripped'])
+
+    async def test_sync_disclosures_for_corporations_does_not_trip_breaker_for_corp_specific_errors(self):
+        class CorpSpecificFailureClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs['corp_code'].startswith('broken-'):
+                    raise DartAPIError(
+                        'DART request failed [014]: File does not exist'
+                    )
+                return {
+                    'status': '000',
+                    'total_count': '0',
+                    'page_no': '1',
+                    'page_count': '0',
+                    'list': [],
+                }
+
+        client = CorpSpecificFailureClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=client, repository=repository)
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[
+                {'corp_code': 'broken-1', 'stock_code': '000001'},
+                {'corp_code': 'broken-2', 'stock_code': '000002'},
+                {'corp_code': 'broken-3', 'stock_code': '000003'},
+                {'corp_code': 'healthy', 'stock_code': '005930'},
+            ],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
+
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(result['corporations_processed'], 1)
+        self.assertEqual(result['corporations_failed'], 3)
+        self.assertEqual(result['corporations_unattempted'], 0)
+        self.assertFalse(result['circuit_breaker']['tripped'])
+
+    async def test_sync_disclosures_for_corporations_trips_breaker_for_transport_timeouts(self):
+        class TimeoutClient(FakeSyncClient):
+            async def fetch_disclosure_list(self, **kwargs):
+                self.calls.append(kwargs)
+                raise TimeoutError('DART request timed out')
+
+        client = TimeoutClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(client=client, repository=repository)
+        corporations = [
+            {'corp_code': f'corp-{index}', 'stock_code': f'{index:06d}'}
+            for index in range(1, 5)
+        ]
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=corporations,
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+        )
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertTrue(result['circuit_breaker']['tripped'])
+        self.assertEqual(result['corporations_unattempted'], 1)
 
     async def test_inspect_sync_returns_repository_views(self):
         service = DartDisclosureSyncService(client=FakeSyncClient(), repository=FakeSyncRepository())

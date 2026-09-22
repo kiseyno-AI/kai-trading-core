@@ -367,12 +367,33 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
         annual_fundamentals = input_row.annual_fundamentals
         financial_context = derive_annual_financial_context(annual_fundamentals) if annual_fundamentals is not None else None
 
-        per = _round(float(current_bar['per']), 6) if current_bar and current_bar.get('per') is not None else None
-        pbr = _round(float(current_bar['pbr']), 6) if current_bar and current_bar.get('pbr') is not None else None
-        dividend_yield = (
-            _round(float(current_bar['dividend_yield']), 6)
-            if current_bar and current_bar.get('dividend_yield') is not None
-            else None
+        valuation_snapshot = input_row.valuation_snapshot or {}
+
+        def valuation_metric(key: str) -> tuple[float | None, str | None]:
+            raw_value = valuation_snapshot.get(key)
+            if raw_value is not None:
+                return _round(float(raw_value), 6), 'pykrx_valuation_snapshot'
+            if current_bar is not None and current_bar.get(key) is not None:
+                return _round(float(current_bar[key]), 6), 'daily_price_bars'
+            return None, None
+
+        per, per_source = valuation_metric('per')
+        pbr, pbr_source = valuation_metric('pbr')
+        dividend_yield, dividend_yield_source = valuation_metric('dividend_yield')
+        valuation_metric_sources = {
+            'per': per_source,
+            'pbr': pbr_source,
+            'dividend_yield': dividend_yield_source,
+        }
+        resolved_valuation_sources = {
+            metric_source
+            for metric_source in valuation_metric_sources.values()
+            if metric_source is not None
+        }
+        valuation_source = (
+            'mixed'
+            if len(resolved_valuation_sources) > 1
+            else next(iter(resolved_valuation_sources), None)
         )
         per_status = _positive_only_metric_status(per) if current_bar is not None else METRIC_STATUS_MISSING
         pbr_status = _positive_only_metric_status(pbr) if current_bar is not None else METRIC_STATUS_MISSING
@@ -388,7 +409,17 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             financial_context.get('depreciation_and_amortization') if financial_context else None
         )
 
-        market_cap_proxy = compute_market_cap_proxy(pbr=pbr, total_equity=total_equity)
+        observed_market_cap = (
+            _round(float(input_row.market_cap), 4)
+            if input_row.market_cap is not None and float(input_row.market_cap) > 0
+            else None
+        )
+        if observed_market_cap is not None:
+            market_cap_proxy = observed_market_cap
+            market_cap_source = 'pykrx_valuation_snapshot'
+        else:
+            market_cap_proxy = compute_market_cap_proxy(pbr=pbr, total_equity=total_equity)
+            market_cap_source = 'pbr_times_total_equity' if market_cap_proxy is not None else None
         free_cash_flow = compute_free_cash_flow(
             operating_cash_flow=operating_cash_flow,
             capital_expenditure=capital_expenditure,
@@ -481,7 +512,11 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             '_annual_snapshot_available': annual_fundamentals is not None,
             '_price_bar_source': current_bar.get('source') if current_bar is not None else None,
             '_price_bar_captured_at': current_bar.get('captured_at') if current_bar is not None else None,
+            '_valuation_source': valuation_source,
+            '_valuation_metric_sources': valuation_metric_sources,
             '_fundamentals_audit_payload': financial_context.get('audit') if financial_context else None,
+            '_observed_market_cap': observed_market_cap,
+            '_market_cap_source': market_cap_source,
             '_market_cap_proxy': market_cap_proxy,
             '_enterprise_value': enterprise_value,
             '_ebitda': ebitda,
@@ -619,6 +654,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             'methodology': {
                 'input_tables': {
                     'price_bars': 'daily_price_bars',
+                    'valuation_snapshots': 'daily_pykrx_enrichment_rows',
                     'fundamentals_snapshots': 'dart_fundamentals_snapshots',
                     'fundamentals_rows': 'dart_fundamentals_rows',
                     'fundamentals_highlights': 'dart_fundamentals_highlights',
@@ -627,7 +663,11 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                     'report_code': ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
                     'period_type': ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
                     'fs_div': ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
-                    'selection_rule': 'latest_receipt_on_or_before_market_date',
+                    'fs_div_priority': ['CFS', 'OFS'],
+                    'selection_rule': (
+                        'latest_business_year_then_latest_filing_then_cfs_'
+                        'preferred_within_same_filing_on_or_before_market_date'
+                    ),
                 },
                 'score_method': 'equal_weight_mean_of_five_component_percentiles',
                 'score_requirement': 'all_five_components_required',
@@ -643,7 +683,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                 'advanced_value_formulas': {
                     'free_cash_flow': 'operating_cash_flow - capital_expenditure',
                     'fcf_yield': 'free_cash_flow / market_cap_proxy',
-                    'market_cap_proxy': 'pbr * total_equity',
+                    'market_cap_proxy': 'observed_market_cap, else pbr * total_equity',
                     'enterprise_value': 'market_cap_proxy + total_liabilities - cash_and_cash_equivalents',
                     'ebitda': 'operating_income + depreciation_and_amortization',
                     'ev_to_ebitda': 'enterprise_value / ebitda',
@@ -708,6 +748,13 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                     'source': item.get('_price_bar_source'),
                     'captured_at': item.get('_price_bar_captured_at'),
                 },
+                'valuation_source': item.get('_valuation_source'),
+                'valuation_metric_sources': item.get('_valuation_metric_sources'),
+                'market_cap': {
+                    'source_type': item.get('_market_cap_source'),
+                    'observed_market_cap': item.get('_observed_market_cap'),
+                    'resolved_market_cap': item.get('_market_cap_proxy'),
+                },
                 'fundamentals': item.get('_fundamentals_audit_payload'),
             },
         }
@@ -770,7 +817,11 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             '_annual_snapshot_available',
             '_price_bar_source',
             '_price_bar_captured_at',
+            '_valuation_source',
+            '_valuation_metric_sources',
             '_fundamentals_audit_payload',
+            '_observed_market_cap',
+            '_market_cap_source',
             '_market_cap_proxy',
             '_enterprise_value',
             '_ebitda',

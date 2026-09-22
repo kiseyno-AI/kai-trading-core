@@ -1777,6 +1777,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: None,
             factor_stage_counts_loader=lambda **_: factor_stage_counts,
+            pykrx_enrichment_loader=lambda **_: _full_pykrx_enrichment_coverage(
+                symbol_count=3,
+                market_count=2,
+                updated_at='2026-04-21T10:00:00+00:00',
+            ),
         )
 
         result = service.read()
@@ -1949,6 +1954,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 updated_at='2026-05-06T07:15:00+00:00',
             ),
             price_bar_count_loader=lambda **_: 2810,
+            pykrx_enrichment_loader=lambda **_: _full_pykrx_enrichment_coverage(
+                symbol_count=2810,
+                market_count=2,
+                updated_at='2026-05-06T07:15:00+00:00',
+            ),
         )
 
         result = service.read(market_date='2026-05-06')

@@ -16,6 +16,17 @@ from app.macro_context.store import MacroContextObservationRecord, MacroContextO
 WORLD_BANK_SOURCE = 'world_bank'
 FRED_SOURCE = 'fred'
 MACRO_CONTEXT_SCHEMA_VERSION = 'macro_context_v1'
+REFRESH_FAILURE_STATUS_PREFIX = 'refresh_failed_at='
+
+
+def _has_pending_refresh_failure(
+    record: MacroContextObservationRecord | None,
+) -> bool:
+    if record is None:
+        return False
+    return str(record.status_detail or '').startswith(
+        REFRESH_FAILURE_STATUS_PREFIX
+    )
 
 
 @dataclass(frozen=True)
@@ -354,35 +365,62 @@ class MacroContextService:
 
         latest_fetched_at = self.store.latest_fetched_at()
         min_interval = timedelta(hours=max(0, int(settings.macro_context_refresh_min_interval_hours or 0)))
+        retry_series_keys: set[tuple[str, str]] | None = None
+        retry_scope: dict[str, Any] | None = None
         if not force and latest_fetched_at is not None and min_interval.total_seconds() > 0:
             comparable = latest_fetched_at if latest_fetched_at.tzinfo else latest_fetched_at.replace(tzinfo=timezone.utc)
             if now - comparable.astimezone(timezone.utc) < min_interval:
-                return {
-                    'status': 'skipped',
-                    'reason': 'macro_context_refresh_not_due',
-                    'trigger': trigger,
-                    'latest_fetched_at': latest_fetched_at.isoformat(),
-                    'next_due_at': (comparable.astimezone(timezone.utc) + min_interval).isoformat(),
-                    'observations_upserted': 0,
-                    'observations_failed': 0,
-                    'source_statuses': self._configured_source_statuses(),
-                    'context': self.get_context(now=now),
+                refresh_configs = self._enabled_refresh_series()
+                latest_by_series = self.store.load_latest_by_series(
+                    series_keys=[(config.source, config.series_id) for config in refresh_configs],
+                    as_of_date=now.date(),
+                )
+                cutoff = now - min_interval
+                retry_series_keys = {
+                    (config.source, config.series_id)
+                    for config in refresh_configs
+                    if (
+                        (record := latest_by_series.get((config.source, config.series_id))) is None
+                        or _has_pending_refresh_failure(record)
+                        or (
+                            record.fetched_at
+                            if record.fetched_at.tzinfo is not None
+                            else record.fetched_at.replace(tzinfo=timezone.utc)
+                        ).astimezone(timezone.utc)
+                        <= cutoff
+                    )
+                }
+                if not retry_series_keys:
+                    return {
+                        'status': 'skipped',
+                        'reason': 'macro_context_refresh_not_due',
+                        'trigger': trigger,
+                        'latest_fetched_at': latest_fetched_at.isoformat(),
+                        'next_due_at': (comparable.astimezone(timezone.utc) + min_interval).isoformat(),
+                        'observations_upserted': 0,
+                        'observations_failed': 0,
+                        'source_statuses': self._configured_source_statuses(),
+                        'context': self.get_context(now=now),
+                    }
+                retry_scope = {
+                    'mode': 'missing_or_due_series',
+                    'missing_or_due_series': [list(key) for key in sorted(retry_series_keys)],
+                    'recent_series_skipped': len(refresh_configs) - len(retry_series_keys),
                 }
 
-        source_result = _run_coroutine(self._refresh_sources(now=now))
+        source_result = _run_coroutine(
+            self._refresh_sources(now=now, only_series_keys=retry_series_keys)
+        )
         observations_upserted = int(source_result.get('observations_upserted') or 0)
         observations_failed = int(source_result.get('observations_failed') or 0)
-        required_world_bank_count = len(self._world_bank_series())
-        world_bank_upserted = int(
-            dict(source_result.get('source_statuses', {}).get(WORLD_BANK_SOURCE, {})).get('observations_upserted') or 0
-        )
-        if world_bank_upserted >= min(required_world_bank_count, 3) and observations_failed == 0:
+        context = self.get_context(now=now)
+        if observations_failed == 0 and context.get('status') == 'available':
             status = 'completed'
-        elif observations_upserted > 0:
+        elif observations_upserted > 0 or context.get('status') in {'partial', 'stale'}:
             status = 'partial'
         else:
             status = 'unavailable'
-        return {
+        result = {
             'status': status,
             'trigger': trigger,
             'fetched_at': now.isoformat(),
@@ -390,8 +428,11 @@ class MacroContextService:
             'observations_failed': observations_failed,
             'source_statuses': source_result.get('source_statuses') or {},
             'series_statuses': source_result.get('series_statuses') or [],
-            'context': self.get_context(now=now),
+            'context': context,
         }
+        if retry_scope is not None:
+            result['retry_scope'] = retry_scope
+        return result
 
     def get_context(
         self,
@@ -482,19 +523,38 @@ class MacroContextService:
             fetched_at_before=knowledge_cutoff_at,
         )
 
-    async def _refresh_sources(self, *, now: datetime) -> dict[str, Any]:
+    async def _refresh_sources(
+        self,
+        *,
+        now: datetime,
+        only_series_keys: set[tuple[str, str]] | None = None,
+    ) -> dict[str, Any]:
         source_statuses: dict[str, dict[str, Any]] = {}
         series_statuses: list[dict[str, Any]] = []
         observations_upserted = 0
         observations_failed = 0
 
-        world_bank_result = await self._refresh_world_bank(now=now)
+        world_bank_configs = self._world_bank_series()
+        fred_configs = self._fred_series()
+        if only_series_keys is not None:
+            world_bank_configs = [
+                config
+                for config in world_bank_configs
+                if (config.source, config.series_id) in only_series_keys
+            ]
+            fred_configs = [
+                config
+                for config in fred_configs
+                if (config.source, config.series_id) in only_series_keys
+            ]
+
+        world_bank_result = await self._refresh_world_bank(now=now, configs=world_bank_configs)
         source_statuses[WORLD_BANK_SOURCE] = world_bank_result['source_status']
         series_statuses.extend(world_bank_result['series_statuses'])
         observations_upserted += int(world_bank_result['observations_upserted'])
         observations_failed += int(world_bank_result['observations_failed'])
 
-        fred_result = await self._refresh_fred(now=now)
+        fred_result = await self._refresh_fred(now=now, configs=fred_configs)
         source_statuses[FRED_SOURCE] = fred_result['source_status']
         series_statuses.extend(fred_result['series_statuses'])
         observations_upserted += int(fred_result['observations_upserted'])
@@ -507,8 +567,13 @@ class MacroContextService:
             'observations_failed': observations_failed,
         }
 
-    async def _refresh_world_bank(self, *, now: datetime) -> dict[str, Any]:
-        configs = self._world_bank_series()
+    async def _refresh_world_bank(
+        self,
+        *,
+        now: datetime,
+        configs: Sequence[MacroSeriesConfig] | None = None,
+    ) -> dict[str, Any]:
+        configs = list(self._world_bank_series() if configs is None else configs)
         if not settings.macro_context_world_bank_enabled:
             return {
                 'source_status': {
@@ -573,6 +638,15 @@ class MacroContextService:
                 )
             except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
                 observations_failed += 1
+                try:
+                    self.store.mark_refresh_failure(
+                        source=WORLD_BANK_SOURCE,
+                        series_id=config.series_id,
+                        failed_at=now,
+                        reason=str(exc),
+                    )
+                except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
+                    pass
                 series_statuses.append(
                     {
                         'source': WORLD_BANK_SOURCE,
@@ -600,8 +674,13 @@ class MacroContextService:
             'observations_failed': observations_failed,
         }
 
-    async def _refresh_fred(self, *, now: datetime) -> dict[str, Any]:
-        configs = self._fred_series()
+    async def _refresh_fred(
+        self,
+        *,
+        now: datetime,
+        configs: Sequence[MacroSeriesConfig] | None = None,
+    ) -> dict[str, Any]:
+        configs = list(self._fred_series() if configs is None else configs)
         if not settings.macro_context_fred_enabled:
             return self._fred_disabled_result(status='disabled', reason='MACRO_CONTEXT_FRED_ENABLED=false')
         if not settings.fred_api_key.strip():
@@ -653,6 +732,15 @@ class MacroContextService:
                 return self._fred_disabled_result(status='disabled_missing_api_key', reason=str(exc))
             except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
                 observations_failed += 1
+                try:
+                    self.store.mark_refresh_failure(
+                        source=FRED_SOURCE,
+                        series_id=config.series_id,
+                        failed_at=now,
+                        reason=str(exc),
+                    )
+                except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
+                    pass
                 series_statuses.append(
                     {
                         'source': FRED_SOURCE,
@@ -740,6 +828,14 @@ class MacroContextService:
 
     def _context_series(self) -> list[MacroSeriesConfig]:
         configs = self._world_bank_series()
+        if settings.macro_context_fred_enabled and settings.fred_api_key.strip():
+            configs.extend(self._fred_series())
+        return configs
+
+    def _enabled_refresh_series(self) -> list[MacroSeriesConfig]:
+        configs: list[MacroSeriesConfig] = []
+        if settings.macro_context_world_bank_enabled:
+            configs.extend(self._world_bank_series())
         if settings.macro_context_fred_enabled and settings.fred_api_key.strip():
             configs.extend(self._fred_series())
         return configs

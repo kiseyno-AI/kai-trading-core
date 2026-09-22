@@ -1282,6 +1282,49 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
         )
         self.assertEqual([row['symbol'] for row in rows], ['661501'])
 
+    def test_incomplete_turnover_retry_preserves_valid_durable_value(self) -> None:
+        trade_date = '2026-09-18'
+        valid_bar = {
+            'trade_date': trade_date,
+            'open_price': 100,
+            'high_price': 110,
+            'low_price': 90,
+            'close_price': 105,
+            'volume': 1_000,
+            'turnover': 105_000,
+        }
+        persist_daily_price_bars(
+            '661501',
+            [valid_bar],
+            market='KOSPI',
+            source='pykrx',
+        )
+
+        persist_daily_price_bars(
+            '661501',
+            [
+                {
+                    **valid_bar,
+                    'close_price': 106,
+                    'turnover': 0,
+                }
+            ],
+            market='KOSPI',
+            source='pykrx',
+        )
+
+        with session_scope() as session:
+            row = session.execute(
+                select(DailyPriceBar)
+                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .where(
+                    Symbol.symbol == '661501',
+                    DailyPriceBar.trade_date == date.fromisoformat(trade_date),
+                )
+            ).scalar_one()
+            self.assertEqual(row.close_price, 106)
+            self.assertEqual(row.turnover, 105_000)
+
     def test_full_market_replace_rolls_back_delete_when_insert_fails(self) -> None:
         def short_row(symbol: str, total_volume: int) -> dict:
             return {

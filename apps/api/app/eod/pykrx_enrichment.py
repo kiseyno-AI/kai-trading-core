@@ -74,6 +74,7 @@ FULL_MARKET_COVERAGE_CATEGORIES = {
     'investor_flow_market',
     'investor_flow_symbol',
     'short_selling',
+    'valuation_snapshot',
 }
 CATEGORY_SCOPE_TYPE = {
     'sector_classification': 'symbol',
@@ -90,6 +91,7 @@ CATEGORY_SUPPORTED_MARKETS = {
     'sector_classification': SECTOR_SUPPORTED_MARKETS,
     'investor_flow_symbol': SECTOR_SUPPORTED_MARKETS,
     'short_selling': SHORTING_SUPPORTED_MARKETS,
+    'valuation_snapshot': SECTOR_SUPPORTED_MARKETS,
 }
 SYMBOL_INVESTOR_GROUPS: tuple[str, ...] = ('개인', '외국인', '기관합계')
 INVESTOR_FLOW_METRIC_KEYS = (
@@ -188,6 +190,39 @@ def is_decision_usable_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
 
 def _metric_group_complete(payload: dict[str, Any], keys: Sequence[str]) -> bool:
     return all(_to_float(payload.get(key)) is not None for key in keys)
+
+
+def is_complete_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
+    """Return whether a persisted row is complete enough to count as coverage.
+
+    Partial rows remain available to downstream readers with their explicit
+    ``missing_fields`` metadata. Required gates may accept explicitly
+    configured near-complete coverage, while completeness remains visible as
+    a warning for operators.
+    """
+
+    if not is_decision_usable_pykrx_enrichment_row(row):
+        return False
+    category = row.get('category')
+    payload = dict(row.get('payload') or {})
+    if category == 'short_selling':
+        short_volume = dict(payload.get('short_volume') or {})
+        return (
+            _metric_group_complete(short_volume, SHORT_VOLUME_METRIC_KEYS)
+            and _metric_group_complete(short_volume, SHORT_VALUE_METRIC_KEYS)
+            and _metric_group_complete(
+                dict(payload.get('short_balance') or {}),
+                SHORT_BALANCE_METRIC_KEYS,
+            )
+        )
+    if category == 'valuation_snapshot':
+        market_cap = _to_float(payload.get('market_cap'))
+        has_valuation_metric = any(
+            _to_float(payload.get(key)) is not None
+            for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
+        )
+        return row.get('source') == 'pykrx' and market_cap is not None and market_cap > 0 and has_valuation_metric
+    return True
 
 
 def _decision_source_priority(row: dict[str, Any]) -> tuple[int, str]:
@@ -633,7 +668,7 @@ class PykrxEnrichmentService:
                     market_date_iso=market_date_iso,
                     market_date_yyyymmdd=market_date_yyyymmdd,
                     markets=normalized_markets,
-                    symbol_filter=symbol_filter,
+                    symbol_filter=required_collection_symbol_filter,
                     symbol_meta=symbol_meta,
                     cache=cache,
                 )
@@ -683,6 +718,7 @@ class PykrxEnrichmentService:
                     'investor_flow_market',
                     'investor_flow_symbol',
                     'short_selling',
+                    'valuation_snapshot',
                 }
             ):
                 provider_rows = [
@@ -2239,12 +2275,22 @@ class PykrxEnrichmentService:
         symbol_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'symbol']
         market_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'market']
         time_sensitive_categories = set(symbol_categories) & TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES
+        fresh_stock_universe_categories = set(time_sensitive_categories)
+        if 'valuation_snapshot' in symbol_categories:
+            fresh_stock_universe_categories.add('valuation_snapshot')
         coverage_symbol_categories = list(symbol_categories)
-        if time_sensitive_categories and not normalized_symbols and 'sector_classification' not in coverage_symbol_categories:
+        if (
+            fresh_stock_universe_categories
+            and not normalized_symbols
+            and 'sector_classification' not in coverage_symbol_categories
+        ):
             coverage_symbol_categories.append('sector_classification')
         if (
             not normalized_symbols
-            and ('sector_classification' in coverage_symbol_categories or time_sensitive_categories)
+            and (
+                'sector_classification' in coverage_symbol_categories
+                or fresh_stock_universe_categories
+            )
             and 'short_selling' not in coverage_symbol_categories
         ):
             coverage_symbol_categories.append('short_selling')
@@ -2447,16 +2493,32 @@ class PykrxEnrichmentService:
         category_summaries: dict[str, dict[str, Any]] = {}
         for category in categories:
             supported_markets = CATEGORY_SUPPORTED_MARKETS.get(category)
-            category_rows = [
+            decision_usable_rows = [
                 item
                 for item in rows
                 if item['category'] == category
                 and (supported_markets is None or _row_market(item) in supported_markets)
                 and is_decision_usable_pykrx_enrichment_row(item)
             ]
+            complete_rows = [
+                item
+                for item in decision_usable_rows
+                if is_complete_pykrx_enrichment_row(item)
+            ]
+            category_rows = complete_rows if category == 'valuation_snapshot' else decision_usable_rows
+            decision_usable_scope_keys = {
+                item.get('symbol') or item['scope_key']
+                for item in decision_usable_rows
+                if (item.get('symbol') or item['scope_key'])
+            }
             present_scope_keys = {
                 item.get('symbol') or item['scope_key']
                 for item in category_rows
+                if (item.get('symbol') or item['scope_key'])
+            }
+            complete_scope_keys = {
+                item.get('symbol') or item['scope_key']
+                for item in complete_rows
                 if (item.get('symbol') or item['scope_key'])
             }
             expected_scope_keys: set[str] | None = None
@@ -2531,6 +2593,19 @@ class PykrxEnrichmentService:
                             if requested_non_sector_short_markets
                             else 'fresh_pykrx_sector_classification'
                         )
+                elif category == 'valuation_snapshot':
+                    if not fresh_stock_universe_available:
+                        expected_rows = None
+                        expectation_status = 'unavailable'
+                        expected_universe_source = (
+                            'fresh_pykrx_stock_universe_unavailable'
+                        )
+                    else:
+                        expected_scope_keys = fresh_stock_symbols
+                        expected_rows = len(expected_scope_keys)
+                        expected_universe_source = (
+                            'fresh_pykrx_sector_classification'
+                        )
                 elif category in TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES:
                     if not fresh_stock_universe_available:
                         expected_rows = None
@@ -2561,7 +2636,18 @@ class PykrxEnrichmentService:
                 if expected_scope_keys is None
                 else present_scope_keys & expected_scope_keys
             )
+            eligible_complete_scope_keys = (
+                complete_scope_keys
+                if expected_scope_keys is None
+                else complete_scope_keys & expected_scope_keys
+            )
+            eligible_decision_usable_scope_keys = (
+                decision_usable_scope_keys
+                if expected_scope_keys is None
+                else decision_usable_scope_keys & expected_scope_keys
+            )
             present_rows = len(eligible_present_scope_keys)
+            complete_present_rows = len(eligible_complete_scope_keys)
             latest_captured_at = None
             latest_parsed = None
             for item in category_rows:
@@ -2572,7 +2658,12 @@ class PykrxEnrichmentService:
             category_summaries[category] = {
                 'scope_type': CATEGORY_SCOPE_TYPE[category],
                 'present_rows': present_rows,
-                'raw_present_rows': len(present_scope_keys),
+                'raw_present_rows': len(decision_usable_scope_keys),
+                'complete_present_rows': complete_present_rows,
+                'missing_component_rows': max(
+                    len(eligible_decision_usable_scope_keys) - complete_present_rows,
+                    0,
+                ),
                 'expected_rows': expected_rows,
                 'coverage_ratio': (
                     round(present_rows / expected_rows, 6)
@@ -2586,6 +2677,21 @@ class PykrxEnrichmentService:
                     if expectation_status == 'not_applicable'
                     else _coverage_status(
                         present_rows=present_rows,
+                        expected_rows=expected_rows,
+                    )
+                ),
+                'completeness_ratio': (
+                    round(complete_present_rows / expected_rows, 6)
+                    if expected_rows is not None and expected_rows > 0
+                    else None
+                ),
+                'completeness_status': (
+                    'unavailable'
+                    if expectation_status == 'unavailable'
+                    else 'not_applicable'
+                    if expectation_status == 'not_applicable'
+                    else _coverage_status(
+                        present_rows=complete_present_rows,
                         expected_rows=expected_rows,
                     )
                 ),

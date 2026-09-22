@@ -5,6 +5,8 @@ import re
 from datetime import date, timedelta
 from typing import Any
 
+import httpx
+
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.dart.store import DartSyncRepository, dart_sync_repository
@@ -20,6 +22,52 @@ _FINANCIAL_REPORT_PREFIXES = (
     ('반기보고서', _SEMIANNUAL_REPORT),
     ('분기보고서', _QUARTERLY_REPORT),
 )
+
+_CONSECUTIVE_PROVIDER_FAILURE_LIMIT = 3
+_SYSTEMIC_DART_STATUS_CODES = {
+    '010',  # unregistered API key
+    '011',  # disabled API key
+    '012',  # disallowed IP
+    '020',  # request limit
+    '100',  # invalid request shape
+    '800',  # provider system maintenance/error
+    '900',  # provider-defined system error
+}
+_SYSTEMIC_DART_MESSAGE_MARKERS = (
+    'api key',
+    'api_key',
+    'connection',
+    'provider unavailable',
+    'rate limit',
+    'request limit',
+    'service unavailable',
+    'temporarily unavailable',
+    'timed out',
+    'timeout',
+    'upstream unavailable',
+)
+
+
+def _is_systemic_provider_failure(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError)):
+        return True
+    if not isinstance(exc, DartAPIError):
+        return False
+
+    message = str(exc).strip().lower()
+    status_match = re.search(r'\[(\d{3})\]', message)
+    if status_match:
+        status = status_match.group(1)
+        if status in _SYSTEMIC_DART_STATUS_CODES:
+            return True
+        if int(status) >= 400:
+            return True
+        return False
+    if any(marker in message for marker in _SYSTEMIC_DART_MESSAGE_MARKERS):
+        return True
+
+    cause = exc.__cause__
+    return isinstance(cause, Exception) and _is_systemic_provider_failure(cause)
 
 
 def _normalize_report_name(report_name: str) -> str:
@@ -233,9 +281,12 @@ class DartDisclosureSyncService:
         corporations_processed = 0
         corporations_failed = 0
         corporation_errors: list[dict[str, str]] = []
+        consecutive_provider_failures = 0
+        circuit_breaker_tripped = False
+        unattempted_corporations: list[dict[str, str]] = []
 
         try:
-            for corporation in corporations:
+            for corporation_index, corporation in enumerate(corporations):
                 processed_rcept_nos: set[str] = set()
                 try:
                     page_no = 1
@@ -272,8 +323,7 @@ class DartDisclosureSyncService:
                         page_no += 1
 
                     corporations_processed += 1
-                except DartAPIError:
-                    raise
+                    consecutive_provider_failures = 0
                 except Exception as exc:
                     corporations_failed += 1
                     corporation_errors.append(
@@ -283,17 +333,55 @@ class DartDisclosureSyncService:
                             'error': str(exc),
                         }
                     )
+                    if _is_systemic_provider_failure(exc):
+                        consecutive_provider_failures += 1
+                    else:
+                        consecutive_provider_failures = 0
+                    if consecutive_provider_failures >= _CONSECUTIVE_PROVIDER_FAILURE_LIMIT:
+                        circuit_breaker_tripped = True
+                        unattempted_corporations = corporations[corporation_index + 1 :]
+                        break
 
+            failed_stock_codes = [
+                item['stock_code']
+                for item in corporation_errors
+                if item.get('stock_code')
+            ]
+            unattempted_stock_codes = [
+                str(item.get('stock_code') or '').strip()
+                for item in unattempted_corporations
+                if str(item.get('stock_code') or '').strip()
+            ]
+            incomplete_stock_codes = list(
+                dict.fromkeys([*failed_stock_codes, *unattempted_stock_codes])
+            )
+            corporations_attempted = corporations_processed + corporations_failed
+            corporations_incomplete = corporations_failed + len(unattempted_corporations)
             run_metadata = {
                 'scope': 'current_active_universe',
                 'requested_corporations': len(corporations),
+                'corporations_attempted': corporations_attempted,
                 'corporations_processed': corporations_processed,
                 'corporations_failed': corporations_failed,
+                'corporations_unattempted': len(unattempted_corporations),
                 'corporation_errors': corporation_errors[:25],
+                'failed_stock_codes_sample': failed_stock_codes[:100],
+                'unattempted_stock_codes_sample': unattempted_stock_codes[:100],
+                'circuit_breaker': {
+                    'tripped': circuit_breaker_tripped,
+                    'threshold': _CONSECUTIVE_PROVIDER_FAILURE_LIMIT,
+                    'consecutive_provider_failures': consecutive_provider_failures,
+                },
             }
+            if corporations and corporations_processed == 0 and corporations_incomplete:
+                status = 'failed'
+            elif corporations_incomplete:
+                status = 'partial'
+            else:
+                status = 'completed'
             result = {
                 'run_id': run_id,
-                'status': 'completed',
+                'status': status,
                 'window_start': start_date.isoformat(),
                 'window_end': end_date.isoformat(),
                 'page_size': page_size,
@@ -303,13 +391,19 @@ class DartDisclosureSyncService:
                 'events_updated': events_updated,
                 'financial_report_events': financial_report_events,
                 'corporations_requested': len(corporations),
+                'corporations_attempted': corporations_attempted,
                 'corporations_processed': corporations_processed,
                 'corporations_failed': corporations_failed,
+                'corporations_unattempted': len(unattempted_corporations),
                 'corporation_errors': corporation_errors[:25],
+                'failed_stock_codes': failed_stock_codes,
+                'unattempted_stock_codes': unattempted_stock_codes,
+                'incomplete_stock_codes': incomplete_stock_codes,
+                'circuit_breaker': run_metadata['circuit_breaker'],
             }
             self.repository.complete_sync_run(
                 run_id,
-                status='completed',
+                status=status,
                 pages_fetched=pages_fetched,
                 events_seen=events_seen,
                 events_inserted=events_inserted,

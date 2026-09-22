@@ -133,6 +133,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Its counts are refresh-run metrics, not same-day snapshot-activity counts:
   `symbols_succeeded = symbols_fresh + symbols_refreshed`, and totals prefer `run_metadata.symbols_selected`.
 - Its activity text should prefer the current metadata-driven refresh stage while running, but once the refresh run is failed, the run `error_message` overrides the running-style activity text.
+- Per-corporation DART sync failures are retained in the refresh result and make the stage `partial` (or `failed` when every selected corporation fails); they are never normalized into a completed run. Missing-fundamentals probes are deliberately bounded and rotate by market date, so deferred symbols are not evidence of successful coverage.
 
 ### factor stages
 
@@ -146,7 +147,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Factor stages can currently surface `pending`, `partial`, or `completed`.
   They do not expose a live `running` state because the repo does not persist standalone run-progress rows for those factor families.
 - If a factor stage depends on fundamentals or earlier factor slices and those prerequisites are not yet completed, the factor stage stays `pending` and its activity text reports the blocking stages.
-- `advanced_value_factors`, `unified_value_factors`, and `quality_factors` depend on both same-day price collection and same-day DART fundamentals refresh.
+- `value_factors` depends on same-day price collection and PyKRX enrichment. `advanced_value_factors` and `unified_value_factors` additionally depend on the same-day DART fundamentals refresh; `quality_factors` depends on price collection and fundamentals. `piotroski_filter` depends on both fundamentals and PyKRX enrichment.
 - `composite_factors` depends on the component slices `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, and `advanced_value_factors`.
 
 ### agent feedback stage
@@ -160,6 +161,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - `signal_features` can be inferred as `completed` from same-date `daily_signal_features` rows.
 - `external_news_collect` can be inferred as `completed` from same-date `external_news_items` collected rows.
 - `external_news_enrich` is based on the current material/noise/source-status contract in stored news rows: fully contract-classified rows are `completed`, partially contract-classified rows are `partial`, and rows that only have legacy or missing classifier payloads keep the enrich stage `pending` with reason metadata. Status details include contract-classified and legacy-classified counts.
+- `macro_context_refresh` evaluates cooldown per enabled series. Inside the global interval it refreshes only missing or individually due series and exposes them under `retry_scope`; `reason=macro_context_refresh_not_due` is satisfied only when every enabled series is still recent.
 - `signal_decider` can be inferred as `completed` from same-date `agent_context_feedback` rows for `agent_name=signal-decider` and/or same-date `signal_decider_decision_snapshots`.
 - These persisted-output inferences are storage availability signals. They do not silently relax prerequisite gates.
 - A late decision snapshot whose canonical observation time is at or after its target KRX open is not valid persisted authority. It is a tombstone for next-open, replay, evaluation, calibration, eligibility, and policy-candidate consumers; readers must not fall back to an older snapshot for the same source date.
@@ -170,6 +172,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Stages that expose downstream readiness include stage-level `gate_status`, `severity`, and `blocking_status` where applicable.
 - The top-level `gate_summary` aggregates those gate statuses separately from physical stage execution/storage status.
 - `pykrx_enrichment.status` can be `completed` while `pykrx_enrichment.gate_status` and `gate_summary.status` are `blocked` when required decider categories are below the minimum coverage ratio. Blocking category details remain visible under `details.decider_blocking_categories`.
+- The exact required categories are `sector_classification`, `investor_flow_symbol`, `short_selling`, and `valuation_snapshot`. The first three use a minimum coverage ratio of `0.99`; valuation uses `0.95` over the fresh PyKRX KOSPI/KOSDAQ stock universe and counts only direct PyKRX rows with positive market cap and at least one usable valuation metric. Component-level incompleteness remains visible through completeness fields and warning categories even when the category coverage gate is ready. Optional-category gaps are tolerated warnings rather than blockers or full-universe retry debt.
 
 ### overall status
 

@@ -72,7 +72,25 @@ def build_close_series_from_bars(bars: Sequence[dict]) -> list[float]:
 
 
 def build_turnover_series_from_bars(bars: Sequence[dict]) -> list[float]:
-    return [float(bar['turnover']) for bar in bars]
+    turnovers: list[float] = []
+    for bar in bars:
+        try:
+            turnover = float(bar['turnover'])
+            volume = float(bar['volume'])
+        except (KeyError, TypeError, ValueError):
+            turnovers.append(math.nan)
+            continue
+        if (
+            not math.isfinite(turnover)
+            or not math.isfinite(volume)
+            or turnover < 0
+            or volume < 0
+            or (volume > 0 and turnover == 0)
+        ):
+            turnovers.append(math.nan)
+            continue
+        turnovers.append(turnover)
+    return turnovers
 
 
 def compute_realized_volatility(
@@ -116,9 +134,21 @@ def compute_max_drawdown(close_prices: Sequence[float], *, lookback_bars: int) -
 
 
 def compute_average_trading_value(turnovers: Sequence[float], *, lookback_bars: int) -> float | None:
-    if len(turnovers) < lookback_bars:
+    if lookback_bars <= 0:
         return None
-    return _round(sum(turnovers[:lookback_bars]) / lookback_bars, 4)
+    window = list(turnovers[:lookback_bars])
+    if len(window) < lookback_bars:
+        return None
+    normalized_turnovers: list[float] = []
+    for turnover in window:
+        try:
+            normalized_turnover = float(turnover)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(normalized_turnover) or normalized_turnover < 0:
+            return None
+        normalized_turnovers.append(normalized_turnover)
+    return _round(sum(normalized_turnovers) / lookback_bars, 4)
 
 
 @dataclass(slots=True)
@@ -390,6 +420,7 @@ class DailyLowRiskFactorService:
                 rank_key='liquidity_rank',
                 percentile_key='liquidity_percentile',
                 best='higher',
+                positive_only=True,
             ),
         }
         universe_counts['combined_score'] = sum(
@@ -415,8 +446,17 @@ class DailyLowRiskFactorService:
         rank_key: str,
         percentile_key: str,
         best: str,
+        positive_only: bool = False,
     ) -> int:
-        candidates = [item for item in items if item.get(value_key) is not None]
+        candidates = [
+            item
+            for item in items
+            if item.get(value_key) is not None
+            and (
+                not positive_only
+                or float(item[value_key]) > 0
+            )
+        ]
         if best == 'lower':
             ordered = sorted(candidates, key=lambda item: (float(item[value_key]), item['symbol']))
         elif best == 'higher':

@@ -4,11 +4,12 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, select
 
 from app.db import session_scope
 from app.db_models import (
     DailyPriceBar,
+    DailyPykrxEnrichmentRow,
     DailyTechnicalSnapshot,
     DartAuditSignal,
     DartDilutionSignal,
@@ -27,6 +28,18 @@ FILTER_SOURCE = 'strategy_piotroski_v1'
 LOW_PBR_PERCENTILE = 0.30
 BOTTOM_MOMENTUM_PERCENTILE = 0.30
 PIOTROSKI_PASS_SCORE = 7
+PIOTROSKI_SIGNAL_COUNT = 9
+PIOTROSKI_OPTIONAL_EVENT_SIGNAL_NAMES = ('no_new_share_issuance',)
+PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES = (
+    'positive_roa',
+    'positive_operating_cash_flow',
+    'improving_roa',
+    'accrual_quality',
+    'lower_leverage',
+    'improving_current_ratio',
+    'improving_gross_margin',
+    'improving_asset_turnover',
+)
 LATEST_FALLBACK_POLICY = 'latest_on_or_before_requested_market_date'
 PIOTROSKI_INPUT_QUERY_CHUNK_SIZE = 500
 
@@ -34,6 +47,11 @@ INDEX_GROSS_MARGIN = 'M211300'
 INDEX_CURRENT_RATIO = 'M221200'
 INDEX_ASSET_TURNOVER = 'M241000'
 INDEX_DEBT_RATIO = 'M221100'
+
+CANONICAL_GROSS_MARGIN = 'gross_margin'
+CANONICAL_CURRENT_RATIO = 'current_ratio'
+CANONICAL_ASSET_TURNOVER = 'asset_turnover'
+CANONICAL_DEBT_RATIO = 'debt_ratio'
 
 
 @dataclass(slots=True)
@@ -57,11 +75,14 @@ class PiotroskiInputs:
     prior_gross_margin: float | None
     asset_turnover: float | None
     prior_asset_turnover: float | None
-    has_audit_issue: bool
+    has_audit_issue: bool | None
     has_dilution_signal: bool | None
+    annual_year: int | None = None
+    prior_annual_year: int | None = None
     fundamentals_provenance: dict[int, dict[str, Any]] = field(default_factory=dict)
     audit_provenance: dict[str, Any] | None = None
     dilution_provenance: dict[str, Any] | None = None
+    valuation_source: str = 'daily_price_bars'
 
 
 @dataclass(slots=True)
@@ -96,6 +117,63 @@ def _chunks(items: list[str], size: int) -> list[list[str]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
 
 
+def _mapped_float(
+    values_by_symbol: dict[str, dict[tuple[str, int], Any]],
+    *,
+    symbol: str,
+    business_year: int | None,
+    metric_keys: tuple[str, ...],
+) -> float | None:
+    if business_year is None:
+        return None
+    symbol_values = values_by_symbol.get(symbol, {})
+    for metric_key in metric_keys:
+        value = _as_float(symbol_values.get((metric_key, business_year)))
+        if value is not None:
+            return value
+    return None
+
+
+def _ratio_or_derived(
+    *,
+    symbol: str,
+    business_year: int | None,
+    ratios_by_symbol: dict[str, dict[tuple[str, int], Any]],
+    highlights_by_symbol: dict[str, dict[tuple[str, int], Any]],
+    ratio_metric_keys: tuple[str, ...],
+    numerator_metric_key: str,
+    denominator_metric_key: str,
+    require_positive_denominator: bool = False,
+) -> float | None:
+    denominator = _mapped_float(
+        highlights_by_symbol,
+        symbol=symbol,
+        business_year=business_year,
+        metric_keys=(denominator_metric_key,),
+    )
+    if require_positive_denominator and (
+        denominator is None or denominator <= 0
+    ):
+        return None
+    stored_ratio = _mapped_float(
+        ratios_by_symbol,
+        symbol=symbol,
+        business_year=business_year,
+        metric_keys=ratio_metric_keys,
+    )
+    if stored_ratio is not None:
+        return stored_ratio
+    numerator = _mapped_float(
+        highlights_by_symbol,
+        symbol=symbol,
+        business_year=business_year,
+        metric_keys=(numerator_metric_key,),
+    )
+    if numerator is None or denominator in (None, 0):
+        return None
+    return numerator / denominator
+
+
 def _compute_signals(item: PiotroskiInputs) -> tuple[dict[str, PiotroskiSignalResult], int, int]:
     roa = (item.net_income / item.total_assets) if item.net_income is not None and item.total_assets not in (None, 0) else None
     prior_roa = None
@@ -122,9 +200,9 @@ def _compute_signals(item: PiotroskiInputs) -> tuple[dict[str, PiotroskiSignalRe
 class DailyPiotroskiFilterService:
     def rebuild_for_market_date(self, *, market_date: str | date) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(market_date) if isinstance(market_date, str) else market_date
-        annual_year = normalized_market_date.year - 1
-        prior_annual_year = annual_year - 1
-        inputs = self._load_inputs(normalized_market_date, annual_year=annual_year, prior_annual_year=prior_annual_year)
+        default_annual_year = normalized_market_date.year - 1
+        default_prior_annual_year = default_annual_year - 1
+        inputs = self._load_inputs(normalized_market_date)
         pbr_values = [item.pbr for item in inputs if item.pbr is not None and item.pbr > 0]
         momentum_values = [item.return_20d for item in inputs if item.return_20d is not None]
         passed_count = 0
@@ -133,17 +211,43 @@ class DailyPiotroskiFilterService:
         failed_symbol_errors: list[dict[str, str]] = []
 
         for item in inputs:
+            annual_year = item.annual_year if item.annual_year is not None else default_annual_year
+            prior_annual_year = (
+                item.prior_annual_year
+                if item.prior_annual_year is not None
+                else default_prior_annual_year
+            )
             valuation_available = item.pbr is not None and item.pbr > 0
             valuation_source_status = 'available' if valuation_available else 'missing_pbr'
             pbr_rank = _percentile_rank(pbr_values, item.pbr, ascending=True) if item.pbr in pbr_values else None
             momentum_rank = _percentile_rank(momentum_values, item.return_20d, ascending=True) if item.return_20d in momentum_values else None
             signals, score, available_signal_count = _compute_signals(item)
+            required_financial_signals_available = sum(
+                1
+                for signal_name in PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES
+                if signals[signal_name].available
+            )
+            missing_optional_signal_names = [
+                signal_name
+                for signal_name in PIOTROSKI_OPTIONAL_EVENT_SIGNAL_NAMES
+                if not signals[signal_name].available
+            ]
             is_low_pbr = pbr_rank is not None and pbr_rank <= LOW_PBR_PERCENTILE
             has_profitability_issue = item.net_income is None or item.net_income <= 0
             has_capital_impairment = item.total_equity is None or item.total_equity <= 0
-            has_audit_issue = item.has_audit_issue
-            score_ratio = (score / available_signal_count) if available_signal_count else 0.0
-            passes_piotroski_score = available_signal_count > 0 and score_ratio >= (PIOTROSKI_PASS_SCORE / 9.0)
+            audit_evidence_status = (
+                'unknown'
+                if item.has_audit_issue is None
+                else ('issue' if item.has_audit_issue else 'clean')
+            )
+            has_audit_issue = item.has_audit_issue is not False
+            score_ratio = score / PIOTROSKI_SIGNAL_COUNT
+            signal_coverage_ratio = available_signal_count / PIOTROSKI_SIGNAL_COUNT
+            passes_piotroski_score = (
+                required_financial_signals_available
+                == len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
+                and score >= PIOTROSKI_PASS_SCORE
+            )
             is_bottom_momentum = momentum_rank is not None and momentum_rank <= BOTTOM_MOMENTUM_PERCENTILE
             passed_filter = valuation_available and all([
                 is_low_pbr,
@@ -180,7 +284,24 @@ class DailyPiotroskiFilterService:
                         'score': score,
                         'available_signal_count': available_signal_count,
                         'score_ratio': score_ratio,
-                        'normalized_pass_ratio': PIOTROSKI_PASS_SCORE / 9.0,
+                        'signal_coverage_ratio': signal_coverage_ratio,
+                        'full_signal_coverage_required': False,
+                        'required_financial_signal_count': len(
+                            PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES
+                        ),
+                        'required_financial_signals_available': (
+                            required_financial_signals_available
+                        ),
+                        'required_financial_signal_coverage_ratio': (
+                            required_financial_signals_available
+                            / len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
+                        ),
+                        'missing_optional_signal_names': (
+                            missing_optional_signal_names
+                        ),
+                        'normalized_pass_ratio': (
+                            PIOTROSKI_PASS_SCORE / PIOTROSKI_SIGNAL_COUNT
+                        ),
                     },
                     'thresholds': {
                         'low_pbr_percentile': LOW_PBR_PERCENTILE,
@@ -193,18 +314,22 @@ class DailyPiotroskiFilterService:
                         'as_of_market_date': normalized_market_date.isoformat(),
                         'universe_policy': 'exact_market_date_daily_price_bar',
                         'fundamentals_selection_policy': (
-                            'latest_receipt_on_or_before_market_date_per_business_year'
+                            'latest_two_available_annual_years_as_of_market_date; '
+                            'latest_filing_per_year; CFS_preferred_within_same_filing_'
+                            'with_OFS_fallback'
                         ),
                         'fundamentals_by_business_year': {
                             str(year): dict(metadata)
                             for year, metadata in sorted(item.fundamentals_provenance.items())
                         },
                         'audit_signal': item.audit_provenance,
+                        'audit_evidence_status': audit_evidence_status,
                         'dilution_signal': item.dilution_provenance,
                     },
                     'valuation': {
                         'available': valuation_available,
                         'source_status': valuation_source_status,
+                        'source': item.valuation_source,
                         'excluded_from_filter_universe': not valuation_available,
                     },
                     'inputs': {
@@ -328,7 +453,7 @@ class DailyPiotroskiFilterService:
             normalized = normalized.zfill(6)
         return normalized
 
-    def _load_inputs(self, market_date: date, *, annual_year: int, prior_annual_year: int) -> list[PiotroskiInputs]:
+    def _load_inputs(self, market_date: date) -> list[PiotroskiInputs]:
         with session_scope() as session:
             base_rows = session.execute(
                 select(
@@ -353,11 +478,44 @@ class DailyPiotroskiFilterService:
             if not symbols:
                 return []
 
+            valuation_pbr_by_symbol: dict[str, float] = {}
+            valuation_rows = session.execute(
+                select(
+                    Symbol.symbol,
+                    DailyPykrxEnrichmentRow.payload,
+                )
+                .join(
+                    DailyPykrxEnrichmentRow,
+                    DailyPykrxEnrichmentRow.symbol_id == Symbol.id,
+                )
+                .where(
+                    Symbol.symbol.in_(symbols),
+                    DailyPykrxEnrichmentRow.market_date == market_date,
+                    DailyPykrxEnrichmentRow.category == 'valuation_snapshot',
+                    DailyPykrxEnrichmentRow.scope_type == 'symbol',
+                    DailyPykrxEnrichmentRow.source == 'pykrx',
+                )
+            ).all()
+            for valuation_row in valuation_rows:
+                payload = dict(valuation_row.payload or {})
+                pbr = _as_float(payload.get('pbr'))
+                if pbr is not None:
+                    valuation_pbr_by_symbol[str(valuation_row.symbol)] = pbr
+
             metric_keys = {
                 'total_equity',
                 'net_income',
                 'operating_cash_flow',
                 'total_assets',
+                'total_liabilities',
+                'current_assets',
+                'current_liabilities',
+                'gross_profit',
+                'revenue',
+                CANONICAL_DEBT_RATIO,
+                CANONICAL_CURRENT_RATIO,
+                CANONICAL_GROSS_MARGIN,
+                CANONICAL_ASSET_TURNOVER,
                 INDEX_DEBT_RATIO,
                 INDEX_CURRENT_RATIO,
                 INDEX_GROSS_MARGIN,
@@ -374,6 +532,11 @@ class DailyPiotroskiFilterService:
                     ),
                     order_by=(
                         DartDisclosureEvent.receipt_date.desc(),
+                        DartDisclosureEvent.rcept_no.desc(),
+                        case(
+                            (DartFundamentalsSnapshot.fs_div == 'CFS', 0),
+                            else_=1,
+                        ).asc(),
                         DartFundamentalsSnapshot.id.desc(),
                     ),
                 ).label('row_rank')
@@ -396,9 +559,11 @@ class DailyPiotroskiFilterService:
                     )
                     .where(
                         DartFundamentalsSnapshot.stock_code.in_(symbol_chunk),
-                        DartFundamentalsSnapshot.business_year.in_([annual_year, prior_annual_year]),
+                        DartFundamentalsSnapshot.business_year <= market_date.year,
                         DartFundamentalsSnapshot.report_code == '11011',
-                        DartFundamentalsSnapshot.fs_div == 'CFS',
+                        DartFundamentalsSnapshot.fs_div.in_(['CFS', 'OFS']),
+                        DartFundamentalsSnapshot.source_status == '000',
+                        DartDisclosureEvent.fundamentals_capture_status == 'captured',
                         DartDisclosureEvent.receipt_date.is_not(None),
                         DartDisclosureEvent.receipt_date <= market_date,
                     )
@@ -407,6 +572,18 @@ class DailyPiotroskiFilterService:
                 selected_snapshots = session.execute(
                     select(ranked_snapshots).where(ranked_snapshots.c.row_rank == 1)
                 ).mappings().all()
+                latest_two_by_symbol: dict[str, list[Any]] = {}
+                for row in selected_snapshots:
+                    latest_two_by_symbol.setdefault(str(row['symbol']), []).append(row)
+                selected_snapshots = [
+                    row
+                    for rows in latest_two_by_symbol.values()
+                    for row in sorted(
+                        rows,
+                        key=lambda candidate: int(candidate['business_year']),
+                        reverse=True,
+                    )[:2]
+                ]
                 snapshot_metadata_by_id = {
                     int(row['snapshot_id']): dict(row)
                     for row in selected_snapshots
@@ -419,6 +596,9 @@ class DailyPiotroskiFilterService:
                         DartFundamentalsHighlight.snapshot_id.label('snapshot_id'),
                         DartFundamentalsHighlight.metric_key.label('metric_key'),
                         DartFundamentalsHighlight.current_amount.label('current_amount'),
+                        DartFundamentalsHighlight.current_cumulative_amount.label(
+                            'current_cumulative_amount'
+                        ),
                         DartFundamentalsHighlight.ratio_value.label('ratio_value'),
                     )
                     .where(
@@ -430,9 +610,10 @@ class DailyPiotroskiFilterService:
                     metadata = snapshot_metadata_by_id[int(row['snapshot_id'])]
                     symbol = str(metadata['symbol'])
                     business_year = int(metadata['business_year'])
-                    highlights_by_symbol.setdefault(symbol, {})[(row['metric_key'], business_year)] = row[
-                        'current_amount'
-                    ]
+                    current_amount = row['current_amount']
+                    if current_amount is None:
+                        current_amount = row['current_cumulative_amount']
+                    highlights_by_symbol.setdefault(symbol, {})[(row['metric_key'], business_year)] = current_amount
                     ratios_by_symbol.setdefault(symbol, {})[(row['metric_key'], business_year)] = row['ratio_value']
                 for metadata in snapshot_metadata_by_id.values():
                     symbol = str(metadata['symbol'])
@@ -452,41 +633,47 @@ class DailyPiotroskiFilterService:
                         ),
                     }
 
+            selected_audit_rcept_by_symbol: dict[str, str] = {}
+            for symbol, provenance in fundamentals_provenance_by_symbol.items():
+                if not provenance:
+                    continue
+                selected_year = max(provenance)
+                rcept_no = str(provenance[selected_year].get('rcept_no') or '').strip()
+                if rcept_no:
+                    selected_audit_rcept_by_symbol[symbol] = rcept_no
+
             latest_audit: dict[str, Any] = {}
             audit_provenance_by_symbol: dict[str, dict[str, Any]] = {}
-            for symbol_chunk in _chunks(symbols, PIOTROSKI_INPUT_QUERY_CHUNK_SIZE):
-                latest_rank = func.row_number().over(
-                    partition_by=DartAuditSignal.stock_code,
-                    order_by=(
-                        DartAuditSignal.receipt_date.desc(),
-                        DartAuditSignal.id.desc(),
-                    ),
-                ).label('row_rank')
-                ranked_audit_signals = (
+            expected_symbol_by_audit_rcept = {
+                rcept_no: symbol
+                for symbol, rcept_no in selected_audit_rcept_by_symbol.items()
+            }
+            for rcept_chunk in _chunks(
+                list(expected_symbol_by_audit_rcept),
+                PIOTROSKI_INPUT_QUERY_CHUNK_SIZE,
+            ):
+                audit_rows = session.execute(
                     select(
                         DartAuditSignal.id.label('id'),
                         DartAuditSignal.stock_code.label('symbol'),
                         DartAuditSignal.rcept_no.label('rcept_no'),
                         DartAuditSignal.receipt_date.label('receipt_date'),
                         DartAuditSignal.has_audit_issue.label('has_audit_issue'),
-                        latest_rank,
-                    )
-                    .where(
-                        DartAuditSignal.stock_code.in_(symbol_chunk),
+                    ).where(
+                        DartAuditSignal.rcept_no.in_(rcept_chunk),
                         DartAuditSignal.receipt_date.is_not(None),
                         DartAuditSignal.receipt_date <= market_date,
                     )
-                    .subquery()
-                )
-                audit_rows = session.execute(
-                    select(ranked_audit_signals).where(ranked_audit_signals.c.row_rank == 1)
                 ).mappings().all()
                 for row in audit_rows:
-                    symbol = str(row['symbol'])
+                    rcept_no = str(row['rcept_no'])
+                    symbol = expected_symbol_by_audit_rcept.get(rcept_no)
+                    if symbol is None or str(row['symbol']) != symbol:
+                        continue
                     latest_audit[symbol] = row['has_audit_issue']
                     audit_provenance_by_symbol[symbol] = {
                         'id': int(row['id']),
-                        'rcept_no': str(row['rcept_no']),
+                        'rcept_no': rcept_no,
                         'receipt_date': row['receipt_date'].isoformat(),
                     }
 
@@ -528,53 +715,142 @@ class DailyPiotroskiFilterService:
                         'receipt_date': row['receipt_date'].isoformat(),
                     }
 
-        return [
-            PiotroskiInputs(
-                symbol=row.symbol,
-                name_ko=row.name_ko,
-                market_date=market_date,
-                pbr=_as_float(row.pbr),
-                return_20d=_as_float(row.return_20d),
-                total_equity=_as_float(highlights_by_symbol.get(row.symbol, {}).get(('total_equity', annual_year))),
-                net_income=_as_float(highlights_by_symbol.get(row.symbol, {}).get(('net_income', annual_year))),
-                prior_net_income=_as_float(
-                    highlights_by_symbol.get(row.symbol, {}).get(('net_income', prior_annual_year))
-                ),
-                operating_cash_flow=_as_float(
-                    highlights_by_symbol.get(row.symbol, {}).get(('operating_cash_flow', annual_year))
-                ),
-                total_assets=_as_float(highlights_by_symbol.get(row.symbol, {}).get(('total_assets', annual_year))),
-                prior_total_assets=_as_float(
-                    highlights_by_symbol.get(row.symbol, {}).get(('total_assets', prior_annual_year))
-                ),
-                debt_ratio=_as_float(ratios_by_symbol.get(row.symbol, {}).get((INDEX_DEBT_RATIO, annual_year))),
-                prior_debt_ratio=_as_float(
-                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_DEBT_RATIO, prior_annual_year))
-                ),
-                current_ratio=_as_float(ratios_by_symbol.get(row.symbol, {}).get((INDEX_CURRENT_RATIO, annual_year))),
-                prior_current_ratio=_as_float(
-                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_CURRENT_RATIO, prior_annual_year))
-                ),
-                gross_margin=_as_float(ratios_by_symbol.get(row.symbol, {}).get((INDEX_GROSS_MARGIN, annual_year))),
-                prior_gross_margin=_as_float(
-                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_GROSS_MARGIN, prior_annual_year))
-                ),
-                asset_turnover=_as_float(
-                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_ASSET_TURNOVER, annual_year))
-                ),
-                prior_asset_turnover=_as_float(
-                    ratios_by_symbol.get(row.symbol, {}).get((INDEX_ASSET_TURNOVER, prior_annual_year))
-                ),
-                has_audit_issue=bool(latest_audit.get(row.symbol)),
-                has_dilution_signal=(
-                    None if row.symbol not in latest_dilution else bool(latest_dilution.get(row.symbol))
-                ),
-                fundamentals_provenance=fundamentals_provenance_by_symbol.get(row.symbol, {}),
-                audit_provenance=audit_provenance_by_symbol.get(row.symbol),
-                dilution_provenance=dilution_provenance_by_symbol.get(row.symbol),
+        inputs: list[PiotroskiInputs] = []
+        for row in base_rows:
+            symbol = str(row.symbol)
+            provenance = fundamentals_provenance_by_symbol.get(symbol, {})
+            available_years = sorted(provenance, reverse=True)
+            selected_annual_year = available_years[0] if available_years else None
+            selected_prior_annual_year = available_years[1] if len(available_years) > 1 else None
+            ratio_arguments = {
+                'symbol': symbol,
+                'ratios_by_symbol': ratios_by_symbol,
+                'highlights_by_symbol': highlights_by_symbol,
+            }
+            inputs.append(
+                PiotroskiInputs(
+                    symbol=symbol,
+                    name_ko=row.name_ko,
+                    market_date=market_date,
+                    pbr=(
+                        valuation_pbr_by_symbol[symbol]
+                        if symbol in valuation_pbr_by_symbol
+                        else _as_float(row.pbr)
+                    ),
+                    return_20d=_as_float(row.return_20d),
+                    total_equity=_mapped_float(
+                        highlights_by_symbol,
+                        symbol=symbol,
+                        business_year=selected_annual_year,
+                        metric_keys=('total_equity',),
+                    ),
+                    net_income=_mapped_float(
+                        highlights_by_symbol,
+                        symbol=symbol,
+                        business_year=selected_annual_year,
+                        metric_keys=('net_income',),
+                    ),
+                    prior_net_income=_mapped_float(
+                        highlights_by_symbol,
+                        symbol=symbol,
+                        business_year=selected_prior_annual_year,
+                        metric_keys=('net_income',),
+                    ),
+                    operating_cash_flow=_mapped_float(
+                        highlights_by_symbol,
+                        symbol=symbol,
+                        business_year=selected_annual_year,
+                        metric_keys=('operating_cash_flow',),
+                    ),
+                    total_assets=_mapped_float(
+                        highlights_by_symbol,
+                        symbol=symbol,
+                        business_year=selected_annual_year,
+                        metric_keys=('total_assets',),
+                    ),
+                    prior_total_assets=_mapped_float(
+                        highlights_by_symbol,
+                        symbol=symbol,
+                        business_year=selected_prior_annual_year,
+                        metric_keys=('total_assets',),
+                    ),
+                    debt_ratio=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_annual_year,
+                        ratio_metric_keys=(CANONICAL_DEBT_RATIO, INDEX_DEBT_RATIO),
+                        numerator_metric_key='total_liabilities',
+                        denominator_metric_key='total_equity',
+                        require_positive_denominator=True,
+                    ),
+                    prior_debt_ratio=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_prior_annual_year,
+                        ratio_metric_keys=(CANONICAL_DEBT_RATIO, INDEX_DEBT_RATIO),
+                        numerator_metric_key='total_liabilities',
+                        denominator_metric_key='total_equity',
+                        require_positive_denominator=True,
+                    ),
+                    current_ratio=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_annual_year,
+                        ratio_metric_keys=(CANONICAL_CURRENT_RATIO, INDEX_CURRENT_RATIO),
+                        numerator_metric_key='current_assets',
+                        denominator_metric_key='current_liabilities',
+                    ),
+                    prior_current_ratio=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_prior_annual_year,
+                        ratio_metric_keys=(CANONICAL_CURRENT_RATIO, INDEX_CURRENT_RATIO),
+                        numerator_metric_key='current_assets',
+                        denominator_metric_key='current_liabilities',
+                    ),
+                    gross_margin=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_annual_year,
+                        ratio_metric_keys=(CANONICAL_GROSS_MARGIN, INDEX_GROSS_MARGIN),
+                        numerator_metric_key='gross_profit',
+                        denominator_metric_key='revenue',
+                    ),
+                    prior_gross_margin=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_prior_annual_year,
+                        ratio_metric_keys=(CANONICAL_GROSS_MARGIN, INDEX_GROSS_MARGIN),
+                        numerator_metric_key='gross_profit',
+                        denominator_metric_key='revenue',
+                    ),
+                    asset_turnover=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_annual_year,
+                        ratio_metric_keys=(CANONICAL_ASSET_TURNOVER, INDEX_ASSET_TURNOVER),
+                        numerator_metric_key='revenue',
+                        denominator_metric_key='total_assets',
+                    ),
+                    prior_asset_turnover=_ratio_or_derived(
+                        **ratio_arguments,
+                        business_year=selected_prior_annual_year,
+                        ratio_metric_keys=(CANONICAL_ASSET_TURNOVER, INDEX_ASSET_TURNOVER),
+                        numerator_metric_key='revenue',
+                        denominator_metric_key='total_assets',
+                    ),
+                    has_audit_issue=(
+                        None if symbol not in latest_audit else bool(latest_audit.get(symbol))
+                    ),
+                    has_dilution_signal=(
+                        None if symbol not in latest_dilution else bool(latest_dilution.get(symbol))
+                    ),
+                    annual_year=selected_annual_year,
+                    prior_annual_year=selected_prior_annual_year,
+                    fundamentals_provenance=provenance,
+                    audit_provenance=audit_provenance_by_symbol.get(symbol),
+                    dilution_provenance=dilution_provenance_by_symbol.get(symbol),
+                    valuation_source=(
+                        'pykrx_valuation_snapshot'
+                        if symbol in valuation_pbr_by_symbol
+                        else 'daily_price_bars'
+                    ),
+                )
             )
-            for row in base_rows
-        ]
+        return inputs
 
 
 daily_piotroski_filter_service = DailyPiotroskiFilterService()

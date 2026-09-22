@@ -275,6 +275,34 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
         self.assertIsNone(context['capital_expenditure'])
         self.assertIsNone(context['audit']['matched_inputs']['capex_ppe'])
 
+    def test_derive_annual_financial_context_prefers_canonical_cash_highlight(self) -> None:
+        snapshot = _snapshot(
+            '005930',
+            total_equity=1000,
+            total_liabilities=400,
+            operating_income=120,
+            operating_cash_flow=260,
+            cash=150,
+            capex_ppe=-80,
+            depreciation_and_amortization=35,
+        )
+        snapshot.statement_rows = [row for row in snapshot.statement_rows if row['row_key'] != 'cash']
+        snapshot.highlights_by_key['cash_and_cash_equivalents'] = _highlight_row(
+            'cash_and_cash_equivalents',
+            account_id='ifrs-full_CashAndCashEquivalents',
+            account_name='현금및현금성자산',
+            amount=175,
+            statement_type='BS',
+        )
+
+        context = derive_annual_financial_context(snapshot)
+
+        self.assertEqual(context['cash_and_cash_equivalents'], 175.0)
+        self.assertEqual(
+            context['audit']['matched_inputs']['cash_and_cash_equivalents']['source_type'],
+            'highlight',
+        )
+
     def test_derive_annual_financial_context_sums_separate_depreciation_and_amortization_rows(self) -> None:
         snapshot = _snapshot(
             '000660',
@@ -315,6 +343,63 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
 
 
 class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
+    def test_observed_market_cap_keeps_advanced_metrics_available_without_pbr(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        market_date = date(2026, 4, 24)
+        input_row = AdvancedValueFactorInput(
+            symbol='005930',
+            name_ko='삼성전자',
+            market='KOSPI',
+            bars=_bars(market_date, pbr=None),
+            annual_fundamentals=_snapshot(
+                '005930',
+                total_equity=1000,
+                total_liabilities=300,
+                operating_income=100,
+                operating_cash_flow=220,
+                cash=100,
+                capex_ppe=-60,
+                depreciation_and_amortization=40,
+                snapshot_id=1,
+            ),
+            market_cap=2000,
+        )
+
+        result = service._build_symbol_result(
+            input_row=input_row,
+            market_date=market_date,
+            source=ADVANCED_VALUE_FACTOR_VERSION,
+        )
+        result['factor_payload'] = service._build_factor_payload(
+            item=result,
+            source=ADVANCED_VALUE_FACTOR_VERSION,
+            universe_counts={
+                'fcf_yield': 1,
+                'ev_to_ebitda': 1,
+                'advanced_value_score': 1,
+            },
+        )
+
+        self.assertEqual(result['market_cap_proxy'], 2000.0)
+        self.assertEqual(result['fcf_yield_status'], METRIC_STATUS_AVAILABLE)
+        self.assertEqual(result['ev_to_ebitda_status'], METRIC_STATUS_AVAILABLE)
+        self.assertEqual(
+            result['factor_payload']['audit']['market_cap']['source_type'],
+            'pykrx_valuation_snapshot',
+        )
+        self.assertEqual(
+            result['factor_payload']['methodology']['enterprise_value_policy'][
+                'market_cap_proxy_formula'
+            ],
+            'observed_market_cap, else pbr * total_equity',
+        )
+        self.assertEqual(
+            result['factor_payload']['methodology']['financial_snapshot_policy'][
+                'fs_div_priority'
+            ],
+            ['CFS', 'OFS'],
+        )
+
     def test_rebuild_scores_higher_fcf_yield_and_lower_ev_to_ebitda_as_better(self) -> None:
         service = DailyAdvancedValueFactorService()
         market_date = date(2026, 4, 24)
@@ -515,6 +600,142 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertIsNone(persisted['advanced_value_score'])
         self.assertFalse(persisted['is_advanced_value_eligible'])
         self.assertEqual(result['summary']['insufficient_fundamentals_count'], 1)
+
+    def test_load_inputs_attaches_positive_same_day_observed_market_cap(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        market_date = date(2026, 4, 24)
+        symbol_rows = [{'symbol': '005930', 'name_ko': '삼성전자', 'market': 'KOSPI'}]
+        snapshot = _snapshot(
+            '005930',
+            total_equity=1000,
+            total_liabilities=300,
+            operating_income=100,
+            operating_cash_flow=220,
+            cash=100,
+            capex_ppe=-60,
+            depreciation_and_amortization=40,
+            snapshot_id=1,
+        )
+
+        with (
+            patch('app.signals.advanced_value_factor.load_symbols', return_value=symbol_rows),
+            patch(
+                'app.signals.advanced_value_factor.load_recent_price_bars_by_symbol',
+                return_value={'005930': _bars(market_date, pbr=None)},
+            ),
+            patch.object(
+                service,
+                '_load_latest_annual_fundamentals',
+                return_value={'005930': snapshot},
+            ),
+            patch(
+                'app.signals.advanced_value_factor.load_daily_pykrx_enrichment_rows',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'source': 'daily_price_bars_reconstructed',
+                        'payload': {'market_cap': None},
+                    },
+                    {
+                        'symbol': '005930',
+                        'source': 'pykrx',
+                        'payload': {
+                            'market_cap': 2_000_000,
+                            'per': 9.5,
+                            'pbr': 1.25,
+                            'dividend_yield': 2.4,
+                        },
+                    },
+                ],
+            ) as load_enrichment,
+        ):
+            inputs, matched, missing = service._load_inputs(
+                market_date=market_date,
+                symbols=['005930'],
+            )
+
+        self.assertEqual(matched, ['005930'])
+        self.assertEqual(missing, [])
+        self.assertEqual(inputs[0].market_cap, 2_000_000)
+        self.assertEqual(
+            inputs[0].valuation_snapshot,
+            {
+                'market_cap': 2_000_000,
+                'per': 9.5,
+                'pbr': 1.25,
+                'dividend_yield': 2.4,
+            },
+        )
+        load_enrichment.assert_called_once_with(
+            market_date=market_date,
+            categories=['valuation_snapshot'],
+            scope_types=['symbol'],
+            symbols=['005930'],
+            limit=None,
+        )
+
+    def test_latest_annual_snapshot_query_excludes_unsuccessful_dart_payloads(self) -> None:
+        class RecordingSession:
+            def __init__(self) -> None:
+                self.statements = []
+
+            def execute(self, statement):
+                self.statements.append(statement)
+                if len(self.statements) == 1:
+                    return None
+                return _FakeLoaderResult([])
+
+        session = RecordingSession()
+        with patch(
+            'app.signals.advanced_value_factor.session_scope',
+            return_value=_FakeSessionScope(session),
+        ):
+            rows = DailyAdvancedValueFactorService._query_latest_annual_snapshot_chunk(
+                market_date=date(2026, 4, 24),
+                symbols=['005930'],
+            )
+
+        self.assertEqual(rows, [])
+        compiled_params = session.statements[-1].compile().params
+        self.assertIn('000', compiled_params.values())
+
+    def test_latest_annual_snapshot_query_prefers_latest_filing_then_cfs_within_filing(self) -> None:
+        class RecordingSession:
+            def __init__(self) -> None:
+                self.statements = []
+
+            def execute(self, statement):
+                self.statements.append(statement)
+                if len(self.statements) == 1:
+                    return None
+                return _FakeLoaderResult([])
+
+        session = RecordingSession()
+        with patch(
+            'app.signals.advanced_value_factor.session_scope',
+            return_value=_FakeSessionScope(session),
+        ):
+            DailyAdvancedValueFactorService._query_latest_annual_snapshot_chunk(
+                market_date=date(2026, 4, 24),
+                symbols=['005930'],
+            )
+
+        compiled = session.statements[-1].compile()
+        self.assertIn(['CFS', 'OFS'], compiled.params.values())
+        compiled_sql = str(compiled)
+        order_by_sql = compiled_sql.split('ORDER BY ', 1)[1]
+        self.assertLess(
+            order_by_sql.index('business_year DESC'),
+            order_by_sql.index('receipt_date DESC'),
+        )
+        self.assertLess(
+            order_by_sql.index('receipt_date DESC'),
+            order_by_sql.index('rcept_no DESC'),
+        )
+        self.assertLess(
+            order_by_sql.index('rcept_no DESC'),
+            order_by_sql.index('CASE'),
+        )
 
     def test_subset_rerun_uses_full_universe_rankings(self) -> None:
         service = DailyAdvancedValueFactorService()
@@ -743,22 +964,71 @@ class _FakeFundamentalsLoaderSession:
                     [
                         SimpleNamespace(
                             snapshot_id=snapshot_id,
-                            metric_key='total_equity',
-                            metric_type='balance',
-                            statement_type='BS',
+                            metric_key=metric_key,
+                            metric_type=metric_type,
+                            statement_type=statement_type,
                             statement_name='financial_statement',
-                            account_id='ifrs-full_Equity',
-                            account_name='자본총계',
-                            current_amount=1000 + snapshot_id,
+                            account_id=account_id,
+                            account_name=account_name,
+                            current_amount=amount,
                             current_cumulative_amount=None,
                             ratio_value=None,
                             currency='KRW',
                         )
                         for snapshot_id in snapshot_ids
+                        for metric_key, metric_type, statement_type, account_id, account_name, amount in (
+                            ('total_equity', 'balance', 'BS', 'ifrs-full_Equity', '자본총계', 1000 + snapshot_id),
+                            ('total_liabilities', 'balance', 'BS', 'ifrs-full_Liabilities', '부채총계', 400),
+                            (
+                                'operating_income',
+                                'flow',
+                                'CIS',
+                                'dart_OperatingIncomeLoss',
+                                '영업이익',
+                                120,
+                            ),
+                            (
+                                'operating_cash_flow',
+                                'flow',
+                                'CF',
+                                'ifrs-full_CashFlowsFromUsedInOperatingActivities',
+                                '영업활동순현금흐름',
+                                260,
+                            ),
+                        )
                     ]
                 )
             self.statement_row_chunks.append(list(snapshot_ids))
-            return _FakeLoaderResult([])
+            return _FakeLoaderResult(
+                [
+                    SimpleNamespace(
+                        snapshot_id=snapshot_id,
+                        row_key=row_key,
+                        statement_type=statement_type,
+                        statement_name='financial_statement',
+                        account_id=account_id,
+                        account_name=account_name,
+                        account_detail=None,
+                        current_amount=amount,
+                        current_cumulative_amount=None,
+                        row_order=row_order,
+                        currency='KRW',
+                    )
+                    for snapshot_id in snapshot_ids
+                    for row_key, statement_type, account_id, account_name, amount, row_order in (
+                        ('cash', 'BS', 'ifrs-full_CashAndCashEquivalents', '현금및현금성자산', 150, 1),
+                        (
+                            'capex_ppe',
+                            'CF',
+                            'ifrs-full_PurchaseOfPropertyPlantAndEquipment',
+                            '유형자산의 취득',
+                            -80,
+                            2,
+                        ),
+                        ('da', 'CF', None, '감가상각비및상각비', 35, 3),
+                    )
+                ]
+            )
 
         return _FakeLoaderResult([])
 
@@ -810,7 +1080,7 @@ class DailyAdvancedValueFactorFundamentalsLoaderTests(unittest.TestCase):
 
         loader.assert_called_once()
 
-    def test_load_latest_annual_fundamentals_loads_highlights_for_large_universe_without_rows(self) -> None:
+    def test_load_latest_annual_fundamentals_loads_rows_for_large_universe_in_chunks(self) -> None:
         service = DailyAdvancedValueFactorService()
         symbols = [f'TAVH{index:04d}' for index in range(501)]
         fake_session = _FakeFundamentalsLoaderSession(symbols)
@@ -826,10 +1096,30 @@ class DailyAdvancedValueFactorFundamentalsLoaderTests(unittest.TestCase):
 
         self.assertEqual(len(result), len(symbols))
         self.assertEqual([len(chunk) for chunk in fake_session.highlight_chunks], [100, 100, 100, 100, 100, 1])
-        self.assertEqual(fake_session.statement_row_chunks, [])
+        self.assertEqual(
+            [len(chunk) for chunk in fake_session.statement_row_chunks],
+            [100, 100, 100, 100, 100, 1],
+        )
         self.assertEqual(result[symbols[0]].highlights_by_key['total_equity']['current_amount'], 1001)
         self.assertEqual(result[symbols[-1]].highlights_by_key['total_equity']['current_amount'], 1501)
-        self.assertEqual(result[symbols[0]].statement_rows, [])
+        first_context = derive_annual_financial_context(result[symbols[0]])
+        self.assertEqual(first_context['cash_and_cash_equivalents'], 150.0)
+        self.assertEqual(first_context['capital_expenditure'], 80.0)
+        self.assertEqual(first_context['depreciation_and_amortization'], 35.0)
+
+        first_factor = service._build_symbol_result(
+            input_row=_input(symbols[0], date(2026, 4, 24), pbr=1.0, snapshot=result[symbols[0]]),
+            market_date=date(2026, 4, 24),
+            source=ADVANCED_VALUE_FACTOR_VERSION,
+        )
+        self.assertEqual(first_factor['fcf_yield_status'], METRIC_STATUS_AVAILABLE)
+        self.assertEqual(first_factor['ev_to_ebitda_status'], METRIC_STATUS_AVAILABLE)
+        self.assertIsNotNone(first_factor['fcf_yield'])
+        self.assertIsNotNone(first_factor['ev_to_ebitda'])
+
+        last_context = derive_annual_financial_context(result[symbols[-1]])
+        self.assertEqual(last_context['capital_expenditure'], 80.0)
+        self.assertEqual(last_context['depreciation_and_amortization'], 35.0)
 
 
 class DailyAdvancedValueFactorFundamentalsLoaderIntegrationTests(unittest.TestCase):

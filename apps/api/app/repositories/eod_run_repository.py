@@ -57,6 +57,7 @@ _REQUIRED_PYKRX_REPAIR_CATEGORIES = {
     'sector_classification',
     'investor_flow_symbol',
     'short_selling',
+    'valuation_snapshot',
 }
 _MAX_AUTO_PRICE_RECOVERY_RUNS_PER_TRADE_DATE = 5
 # Mirrors the service admission limit without introducing a repository/service cycle.

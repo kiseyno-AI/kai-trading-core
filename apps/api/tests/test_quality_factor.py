@@ -164,6 +164,75 @@ def _input(
 
 
 class DailyQualityFactorServiceTests(unittest.TestCase):
+    def test_negative_equity_cannot_rank_as_low_leverage(self) -> None:
+        service = DailyQualityFactorService()
+        market_date = date(2026, 4, 24)
+        snapshot = _snapshot(
+            '005930',
+            total_equity=-100,
+            total_liabilities=200,
+            net_income=20,
+            total_assets=100,
+            operating_cash_flow=30,
+            gross_margin=0.4,
+            asset_turnover=1.0,
+            debt_ratio=-2.0,
+        )
+
+        result = service._build_symbol_result(
+            input_row=_input('005930', market_date, snapshot=snapshot),
+            market_date=market_date,
+            source=QUALITY_FACTOR_VERSION,
+        )
+
+        self.assertIsNone(result['debt_ratio'])
+        self.assertEqual(result['debt_ratio_status'], 'invalid_equity')
+
+    def test_rebuild_derives_gross_profit_to_assets_from_canonical_raw_facts_with_provenance(self) -> None:
+        service = DailyQualityFactorService()
+        market_date = date(2026, 4, 24)
+        snapshot = _snapshot(
+            '005930',
+            total_equity=800,
+            total_liabilities=160,
+            net_income=240,
+            total_assets=1_000,
+            operating_cash_flow=300,
+            gross_margin=None,
+            asset_turnover=None,
+            debt_ratio=None,
+        )
+        snapshot.highlights_by_key['gross_profit'] = _highlight_row(
+            'gross_profit',
+            statement_type='CIS',
+            account_id='ifrs-full_GrossProfit',
+            account_name='매출총이익',
+            amount=250,
+        )
+        snapshot.highlights_by_key['debt_ratio'] = _highlight_row(
+            'debt_ratio',
+            statement_type='RATIO',
+            account_id=None,
+            account_name='부채비율',
+            ratio_value=0.2,
+        )
+        inputs = [_input('005930', market_date, snapshot=snapshot)]
+
+        with (
+            patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
+            patch('app.signals.quality_factor.upsert_daily_quality_factor_result') as upsert,
+        ):
+            service.rebuild_for_market_date(market_date=market_date)
+
+        persisted = upsert.call_args.args[0]
+        self.assertEqual(persisted['gross_profit_to_assets'], 0.25)
+        self.assertEqual(persisted['debt_ratio'], 0.2)
+        gross_profit_audit = persisted['factor_payload']['audit']['matched_highlights']['gross_profit_to_assets']
+        self.assertEqual(gross_profit_audit['source_type'], 'derived_formula')
+        self.assertEqual(gross_profit_audit['formula'], 'gross_profit / total_assets')
+        self.assertEqual(gross_profit_audit['gross_profit']['metric_key'], 'gross_profit')
+        self.assertEqual(gross_profit_audit['total_assets']['metric_key'], 'total_assets')
+
     def test_rebuild_scores_complete_universe_and_uses_required_accruals_formula(self) -> None:
         service = DailyQualityFactorService()
         market_date = date(2026, 4, 24)

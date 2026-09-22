@@ -307,8 +307,11 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         id='piotroski_filter',
         label='Piotroski filter compute',
         group='fundamentals',
-        description='Rebuild persisted daily Piotroski filter results from stored fundamentals.',
-        depends_on=('fundamentals_daily_refresh',),
+        description=(
+            'Rebuild persisted daily Piotroski results from stored DART fundamentals, '
+            'PyKRX PBR, and price momentum.'
+        ),
+        depends_on=('fundamentals_daily_refresh', 'pykrx_enrichment'),
         inspect_routes=('/eod/piotroski-filter-results',),
         output_tables=('daily_piotroski_filter_results',),
         default_selected=True,
@@ -328,8 +331,10 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         id='value_factors',
         label='value factor compute',
         group='factors',
-        description='Rebuild persisted daily value factor rows from stored price bars.',
-        depends_on=('price_collection',),
+        description=(
+            'Rebuild persisted daily value factor rows from same-day PyKRX valuation snapshots.'
+        ),
+        depends_on=('price_collection', 'pykrx_enrichment'),
         supports_symbols=True,
         inspect_routes=('/eod/value-factors',),
         output_tables=('daily_value_factor_results',),
@@ -361,8 +366,11 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         id='advanced_value_factors',
         label='advanced value factor compute',
         group='factors',
-        description='Rebuild persisted daily advanced value factor rows from stored price bars and annual fundamentals.',
-        depends_on=('price_collection', 'fundamentals_daily_refresh'),
+        description=(
+            'Rebuild persisted daily advanced value rows from price bars, same-day PyKRX '
+            'market caps, and annual DART fundamentals.'
+        ),
+        depends_on=('price_collection', 'pykrx_enrichment', 'fundamentals_daily_refresh'),
         supports_symbols=True,
         inspect_routes=('/eod/advanced-value-factors',),
         output_tables=('daily_advanced_value_factor_results',),
@@ -372,8 +380,11 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         id='unified_value_factors',
         label='unified value factor compute',
         group='factors',
-        description='Rebuild persisted full-universe unified value factor rows from stored price bars and annual fundamentals.',
-        depends_on=('price_collection', 'fundamentals_daily_refresh'),
+        description=(
+            'Rebuild persisted full-universe value rows from price bars, same-day PyKRX '
+            'valuation, and annual DART fundamentals.'
+        ),
+        depends_on=('price_collection', 'pykrx_enrichment', 'fundamentals_daily_refresh'),
         supports_symbols=True,
         inspect_routes=('/eod/unified-value-factors', '/eod/screening-results'),
         output_tables=('daily_unified_value_factor_results',),
@@ -1480,10 +1491,21 @@ class DailyPipelineStageService:
                 'succeeded': counts.succeeded,
                 'failed': counts.failed,
             }
+        if stage_id == 'trending_ranks' and 'periods_persisted' in result:
+            succeeded = _int(result.get('periods_persisted'))
+            failed = _int(result.get('periods_failed'))
+            total = _int(result.get('periods_total')) or succeeded + failed
+            return {
+                'processed': succeeded + failed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+            }
 
         count_pairs = (
             ('snapshots_persisted', 'snapshots_failed'),
             ('action_summaries_persisted', 'action_summaries_failed'),
+            ('trending_ranks_persisted', 'trending_ranks_failed'),
             ('features_persisted', 'features_failed'),
             ('results_persisted', 'results_failed'),
             ('symbols_refreshed', 'symbols_failed'),

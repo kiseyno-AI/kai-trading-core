@@ -5,6 +5,7 @@ from datetime import date
 from typing import Any, Sequence
 
 from app.market_data_store import (
+    load_daily_pykrx_enrichment_rows,
     list_symbols_with_daily_bar_on_date,
     load_daily_value_factor_results,
     load_recent_price_bars_by_symbol,
@@ -102,6 +103,7 @@ class ValueFactorInput:
     name_ko: str | None
     market: str | None
     bars: list[dict[str, Any]]
+    valuation_snapshot: dict[str, Any] | None = None
 
 
 class DailyValueFactorService:
@@ -295,12 +297,27 @@ class DailyValueFactorService:
             symbols=matched_symbols,
             history_days=1,
         )
+        valuation_snapshot_by_symbol = {
+            str(item.get('symbol') or item.get('scope_key') or '').strip().upper(): dict(
+                item.get('payload') or {}
+            )
+            for item in load_daily_pykrx_enrichment_rows(
+                market_date=market_date,
+                categories=['valuation_snapshot'],
+                scope_types=['symbol'],
+                symbols=matched_symbols,
+                source='pykrx',
+                limit=None,
+            )
+            if str(item.get('symbol') or item.get('scope_key') or '').strip()
+        }
         inputs = [
             ValueFactorInput(
                 symbol=row['symbol'],
                 name_ko=row.get('name_ko'),
                 market=row.get('market'),
                 bars=bars_by_symbol.get(row['symbol'], []),
+                valuation_snapshot=valuation_snapshot_by_symbol.get(row['symbol']),
             )
             for row in symbol_rows
         ]
@@ -315,12 +332,33 @@ class DailyValueFactorService:
     ) -> dict[str, Any]:
         market_date_iso = market_date.isoformat()
         current_bar = input_row.bars[0] if input_row.bars and input_row.bars[0].get('trade_date') == market_date_iso else None
-        per = _round(float(current_bar['per']), 6) if current_bar and current_bar.get('per') is not None else None
-        pbr = _round(float(current_bar['pbr']), 6) if current_bar and current_bar.get('pbr') is not None else None
-        dividend_yield = (
-            _round(float(current_bar['dividend_yield']), 6)
-            if current_bar and current_bar.get('dividend_yield') is not None
-            else None
+        valuation_snapshot = input_row.valuation_snapshot or {}
+
+        def valuation_metric(key: str) -> tuple[float | None, str | None]:
+            raw_value = valuation_snapshot.get(key)
+            if raw_value is not None:
+                return _round(float(raw_value), 6), 'pykrx_valuation_snapshot'
+            if current_bar is not None and current_bar.get(key) is not None:
+                return _round(float(current_bar[key]), 6), 'daily_price_bars'
+            return None, None
+
+        per, per_source = valuation_metric('per')
+        pbr, pbr_source = valuation_metric('pbr')
+        dividend_yield, dividend_yield_source = valuation_metric('dividend_yield')
+        valuation_metric_sources = {
+            'per': per_source,
+            'pbr': pbr_source,
+            'dividend_yield': dividend_yield_source,
+        }
+        resolved_valuation_sources = {
+            metric_source
+            for metric_source in valuation_metric_sources.values()
+            if metric_source is not None
+        }
+        valuation_source = (
+            'mixed'
+            if len(resolved_valuation_sources) > 1
+            else next(iter(resolved_valuation_sources), None)
         )
         per_status = _positive_only_metric_status(per) if current_bar is not None else METRIC_STATUS_MISSING
         pbr_status = _positive_only_metric_status(pbr) if current_bar is not None else METRIC_STATUS_MISSING
@@ -351,6 +389,8 @@ class DailyValueFactorService:
             '_current_bar_available': current_bar is not None,
             '_bar_source': current_bar.get('source') if current_bar is not None else None,
             '_bar_captured_at': current_bar.get('captured_at') if current_bar is not None else None,
+            '_valuation_source': valuation_source,
+            '_valuation_metric_sources': valuation_metric_sources,
             '_pbr_status': pbr_status,
             '_dividend_yield_status': dividend_yield_status,
         }
@@ -464,7 +504,10 @@ class DailyValueFactorService:
         return {
             'feature_version': source,
             'methodology': {
-                'input_table': 'daily_price_bars',
+                'input_tables': [
+                    'daily_price_bars',
+                    'daily_pykrx_enrichment_rows',
+                ],
                 'score_method': 'equal_weight_mean_of_component_percentiles',
                 'ranking_directions': {
                     'per': 'lower_better_positive_only',
@@ -496,6 +539,8 @@ class DailyValueFactorService:
                 'market': item.get('market'),
                 'bar_source': item.get('_bar_source'),
                 'bar_captured_at': item.get('_bar_captured_at'),
+                'valuation_source': item.get('_valuation_source'),
+                'valuation_metric_sources': item.get('_valuation_metric_sources'),
             },
         }
 
@@ -528,6 +573,8 @@ class DailyValueFactorService:
             '_current_bar_available',
             '_bar_source',
             '_bar_captured_at',
+            '_valuation_source',
+            '_valuation_metric_sources',
             '_pbr_status',
             '_dividend_yield_status',
         ):

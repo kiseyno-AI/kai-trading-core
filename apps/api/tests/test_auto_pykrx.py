@@ -38,9 +38,11 @@ from app.eod.pykrx_pipeline_runner import (
     HISTORICAL_BACKFILL_STAGE_ORDER,
     _OfficialDailyPipelineTracker,
     _classify_pykrx_enrichment_categories,
+    _enrich_bars_with_market_turnover,
     _extract_result_counts,
     _merge_inherited_downstream_scope,
     _normalize_stage_status,
+    _partition_pykrx_enrichment_category_gaps,
     _resolve_result_status,
     _run_daily_external_news_enrichment_followup,
     _run_daily_feedback_followup,
@@ -51,6 +53,22 @@ from app.eod.pykrx_pipeline_runner import (
 )
 from app.market.clock import KST, MarketState
 from app.repositories.eod_run_repository import AutoEODRecoveryTarget
+
+
+class _AnySymbolTurnoverFrame:
+    empty = False
+    columns = {'거래대금'}
+
+    class _Index:
+        def __contains__(self, _symbol: object) -> bool:
+            return True
+
+    class _Loc:
+        def __getitem__(self, _key: object) -> int:
+            return 1_000_000
+
+    index = _Index()
+    loc = _Loc()
 
 
 class PykrxPipelineResultStatusTests(TestCase):
@@ -95,6 +113,82 @@ class PykrxPipelineResultStatusTests(TestCase):
         self.assertEqual(classification['recovered_categories'], ['sector_classification'])
         self.assertEqual(classification['coverage_gap_categories'], ['foreign_ownership'])
         self.assertEqual(classification['unresolved_categories'], ['foreign_ownership'])
+
+    def test_enrichment_gap_partition_uses_required_category_gate_threshold(self) -> None:
+        blocking, tolerated = _partition_pykrx_enrichment_category_gaps(
+            failed_categories=['valuation_snapshot'],
+            preflight={
+                'allowed': True,
+                'required_categories': ['valuation_snapshot'],
+                'category_gates': [
+                    {
+                        'category': 'valuation_snapshot',
+                        'gate_status': 'ready',
+                        'minimum_coverage_ratio': 0.95,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(blocking, [])
+        self.assertEqual(tolerated, ['valuation_snapshot'])
+
+        blocking, tolerated = _partition_pykrx_enrichment_category_gaps(
+            failed_categories=['valuation_snapshot'],
+            preflight={
+                'allowed': False,
+                'required_categories': ['valuation_snapshot'],
+                'category_gates': [
+                    {
+                        'category': 'valuation_snapshot',
+                        'gate_status': 'blocked',
+                        'minimum_coverage_ratio': 0.95,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(blocking, ['valuation_snapshot'])
+        self.assertEqual(tolerated, [])
+
+        blocking, tolerated = _partition_pykrx_enrichment_category_gaps(
+            failed_categories=['foreign_ownership'],
+            preflight={
+                'allowed': True,
+                'required_categories': ['valuation_snapshot'],
+                'category_gates': [],
+            },
+        )
+
+        self.assertEqual(blocking, [])
+        self.assertEqual(tolerated, ['foreign_ownership'])
+
+        blocking, tolerated = _partition_pykrx_enrichment_category_gaps(
+            failed_categories=[
+                'valuation_snapshot',
+                'investor_flow_symbol',
+            ],
+            preflight={
+                'allowed': False,
+                'required_categories': [
+                    'valuation_snapshot',
+                    'investor_flow_symbol',
+                ],
+                'category_gates': [
+                    {
+                        'category': 'valuation_snapshot',
+                        'gate_status': 'ready',
+                    },
+                    {
+                        'category': 'investor_flow_symbol',
+                        'gate_status': 'blocked',
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(blocking, ['investor_flow_symbol'])
+        self.assertEqual(tolerated, ['valuation_snapshot'])
 
     def test_retry_run_carries_new_price_success_when_inherited_scope_remains(
         self,
@@ -442,6 +536,43 @@ class _FakeDeduplicatingDailyPipelineRunStateService(_FakeDailyPipelineRunStateS
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_market_turnover_enrichment_rejects_invalid_turnover_but_preserves_zero_volume_bar(self) -> None:
+        frames = {
+            '20260402': pd.DataFrame({'거래대금': [0]}, index=['005930']),
+            '20260403': pd.DataFrame({'거래대금': [0]}, index=['005930']),
+        }
+        coverage: dict[str, int] = {}
+        dependencies = SimpleNamespace(
+            get_market_ohlcv_by_ticker=lambda trade_date, _market: frames[trade_date],
+            log_fetch=lambda *_args, **_kwargs: None,
+        )
+
+        result = _enrich_bars_with_market_turnover(
+            bars=[
+                {'trade_date': '2026-04-02', 'volume': 100, 'turnover': 999},
+                {'trade_date': '2026-04-03', 'volume': 0, 'turnover': 0},
+            ],
+            symbol='005930',
+            market='KOSPI',
+            dependencies=dependencies,
+            market_turnover_cache={},
+            turnover_coverage=coverage,
+            run_id=12,
+        )
+
+        self.assertEqual([bar['turnover'] for bar in result], [0, 0])
+        self.assertEqual(
+            coverage,
+            {
+                'total_bars': 2,
+                'provider_turnover_bars': 0,
+                'zero_volume_bars': 1,
+                'invalid_turnover_bars': 1,
+                'market_fetch_attempts': 2,
+                'market_fetch_failures': 0,
+            },
+        )
+
     def test_call_pykrx_applies_timeout_to_session_requests(self) -> None:
         observed_timeouts: list[object] = []
 
@@ -653,6 +784,12 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.market_state_patcher.start()
         self.addCleanup(self.market_state_patcher.stop)
+        self.market_turnover_patcher = patch(
+            'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+            return_value=_AnySymbolTurnoverFrame(),
+        )
+        self.market_turnover_patcher.start()
+        self.addCleanup(self.market_turnover_patcher.stop)
         self.next_open_plan_patcher = patch(
             'app.eod.pykrx_pipeline_runner._run_daily_next_open_execution_plan_followup',
             return_value={
@@ -1318,7 +1455,7 @@ class PykrxBackfillServiceTests(TestCase):
             ),
             patch(
                 'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
-                return_value=SimpleNamespace(empty=True),
+                return_value=_AnySymbolTurnoverFrame(),
             ),
             patch(
                 'app.eod.pykrx_backfill.persist_daily_price_bars',
@@ -1337,38 +1474,9 @@ class PykrxBackfillServiceTests(TestCase):
             patch(
                 'app.eod.pykrx_backfill.pykrx_enrichment_service.'
                 'collect_for_market_date',
-                return_value={
-                    'status': 'completed',
-                    'categories_requested': [
-                        'sector_classification',
-                        'investor_flow_symbol',
-                        'short_selling',
-                    ],
-                    'categories': {
-                        category: {'rows_persisted': 1, 'errors': []}
-                        for category in (
-                            'sector_classification',
-                            'investor_flow_symbol',
-                            'short_selling',
-                        )
-                    },
-                    'coverage': {
-                        'categories': {
-                            category: {
-                                'scope_type': 'symbol',
-                                'expected_rows': 1,
-                                'present_rows': 1,
-                                'coverage_ratio': 1.0,
-                                'coverage_status': 'complete',
-                            }
-                            for category in (
-                                'sector_classification',
-                                'investor_flow_symbol',
-                                'short_selling',
-                            )
-                        }
-                    },
-                },
+                return_value=_ready_pykrx_enrichment_result(
+                    market_date='2026-09-11'
+                ),
             ) as collect_enrichment,
             patch(
                 'app.eod.pykrx_pipeline_runner.'
@@ -4566,9 +4674,9 @@ class PykrxBackfillServiceTests(TestCase):
         }
         stage_rows['pykrx_enrichment'] = {
             'status': 'completed',
-            'processed': 3,
-            'total': 3,
-            'succeeded': 2,
+            'processed': 4,
+            'total': 4,
+            'succeeded': 3,
             'failed': 1,
             'remaining': 0,
             'completed_at': '2026-04-03T07:59:00+00:00',
@@ -4581,6 +4689,7 @@ class PykrxBackfillServiceTests(TestCase):
                         'sector_classification',
                         'investor_flow_symbol',
                         'short_selling',
+                        'valuation_snapshot',
                     ],
                     'categories': {
                         'sector_classification': {
@@ -4598,6 +4707,11 @@ class PykrxBackfillServiceTests(TestCase):
                             'rows_persisted': 10,
                             'errors': ['empty provider frame'],
                         },
+                        'valuation_snapshot': {
+                            'status': 'completed',
+                            'rows_persisted': 10,
+                            'errors': [],
+                        },
                     },
                     'downstream_preflight': {
                         'allowed': True,
@@ -4606,11 +4720,13 @@ class PykrxBackfillServiceTests(TestCase):
                             'sector_classification',
                             'investor_flow_symbol',
                             'short_selling',
+                            'valuation_snapshot',
                         ],
                         'category_row_counts': {
                             'sector_classification': 10,
                             'investor_flow_symbol': 10,
                             'short_selling': 10,
+                            'valuation_snapshot': 10,
                         },
                         'failed_categories': [],
                         'blocked_categories': [],
@@ -5752,9 +5868,9 @@ class PykrxBackfillServiceTests(TestCase):
                 'pykrx_enrichment',
                 {
                     'status': 'completed',
-                    'processed': 3,
-                    'total': 3,
-                    'succeeded': 2,
+                    'processed': 4,
+                    'total': 4,
+                    'succeeded': 3,
                     'failed': 1,
                     'remaining': 0,
                     'completed_at': '2026-04-03T08:00:00+00:00',
@@ -5766,6 +5882,7 @@ class PykrxBackfillServiceTests(TestCase):
                                 'sector_classification',
                                 'investor_flow_symbol',
                                 'short_selling',
+                                'valuation_snapshot',
                             ],
                             'categories': {
                                 'sector_classification': {
@@ -5790,6 +5907,11 @@ class PykrxBackfillServiceTests(TestCase):
                                         }
                                     ],
                                 },
+                                'valuation_snapshot': {
+                                    'status': 'completed',
+                                    'rows_persisted': 10,
+                                    'errors': [],
+                                },
                             },
                             'downstream_preflight': {
                                 'allowed': True,
@@ -5798,11 +5920,13 @@ class PykrxBackfillServiceTests(TestCase):
                                     'sector_classification',
                                     'investor_flow_symbol',
                                     'short_selling',
+                                    'valuation_snapshot',
                                 ],
                                 'category_row_counts': {
                                     'sector_classification': 10,
                                     'investor_flow_symbol': 10,
                                     'short_selling': 10,
+                                    'valuation_snapshot': 10,
                                 },
                                 'failed_categories': [],
                                 'blocked_categories': [],
@@ -8385,6 +8509,15 @@ class PykrxBackfillServiceTests(TestCase):
             patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
             patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
             patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'contexts_persisted': 1,
+                    'contexts_failed': 0,
+                    'failed_symbols': [],
+                },
+            ),
+            patch(
                 'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
                 return_value={'contexts_persisted': 1, 'contexts_failed': 0},
             ) as price_contexts,
@@ -8435,6 +8568,7 @@ class PykrxBackfillServiceTests(TestCase):
                 'sector_classification': 1,
                 'investor_flow_symbol': 1,
                 'short_selling': 1,
+                'valuation_snapshot': 1,
             },
         )
         self.assertEqual(result['price_contexts']['contexts_persisted'], 1)
@@ -8451,6 +8585,128 @@ class PykrxBackfillServiceTests(TestCase):
             run_id=12,
             include_retry_metadata=True,
         )
+
+    def test_grouped_enrichment_accepts_gate_ready_valuation_gap_without_retry(self) -> None:
+        service = PykrxBackfillService()
+        enrichment_result = _ready_pykrx_enrichment_result()
+        enrichment_result['status'] = 'partial'
+        enrichment_result['categories']['valuation_snapshot']['rows_persisted'] = 96
+        for category in (
+            'sector_classification',
+            'investor_flow_symbol',
+            'short_selling',
+        ):
+            enrichment_result['coverage']['categories'][category].update(
+                {
+                    'expected_rows': 100,
+                    'present_rows': 100,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                }
+            )
+        enrichment_result['coverage']['categories']['valuation_snapshot'].update(
+            {
+                'expected_rows': 100,
+                'present_rows': 96,
+                'coverage_ratio': 0.96,
+                'coverage_status': 'partial',
+                'complete_present_rows': 96,
+                'completeness_ratio': 0.96,
+                'completeness_status': 'partial',
+            }
+        )
+        enrichment_result['categories']['foreign_ownership'].update(
+            {
+                'rows_persisted': 0,
+                'errors': [{'error': 'provider unavailable'}],
+            }
+        )
+        enrichment_result['coverage']['categories']['foreign_ownership'].update(
+            {
+                'expected_rows': 100,
+                'present_rows': 0,
+                'coverage_ratio': 0.0,
+                'coverage_status': 'missing',
+            }
+        )
+
+        with (
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[
+                    PykrxSymbol(
+                        symbol='005930',
+                        market='KOSPI',
+                        name_ko='Samsung Electronics',
+                    )
+                ],
+            ),
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
+            patch.object(service, '_load_symbol_fundamentals', return_value=None),
+            patch.object(
+                service,
+                '_map_symbol_bars',
+                return_value=[{
+                    'trade_date': '2026-04-03',
+                    'open_price': 1,
+                    'high_price': 2,
+                    'low_price': 1,
+                    'close_price': 2,
+                    'volume': 3,
+                    'turnover': 4,
+                }],
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                return_value=SimpleNamespace(empty=False),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                return_value=12,
+            ),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'contexts_persisted': 1,
+                    'contexts_failed': 0,
+                    'failed_symbols': [],
+                },
+            ),
+            patch(
+                'app.eod.pykrx_backfill.pykrx_enrichment_service.collect_for_market_date',
+                return_value=enrichment_result,
+            ),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service.run_daily_pipeline_stages(
+                market_date='2026-04-03',
+                stages=('price_collection', 'pykrx_enrichment'),
+                markets=('KOSPI',),
+                trigger='auto_close_scheduler',
+                refresh_universe=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(result['pykrx_enrichment']['downstream_preflight']['allowed'])
+        self.assertEqual(
+            result['pykrx_enrichment']['tolerated_failed_categories'],
+            ['foreign_ownership', 'valuation_snapshot'],
+        )
+        self.assertEqual(result['pykrx_enrichment']['blocking_failed_categories'], [])
+        self.assertNotIn('_retry_metadata', result['pykrx_enrichment'])
+        self.assertIsNone(complete_run.call_args.kwargs['error_message'])
 
     def test_point_in_time_grouped_stage_rejects_missing_requested_membership(
         self,
@@ -9247,6 +9503,10 @@ class PykrxBackfillServiceTests(TestCase):
             ),
             patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
             patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', return_value=SimpleNamespace(empty=False)),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=pd.DataFrame({'거래대금': [6]}, index=['005930']),
+            ),
             patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=2),
             patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
             patch(
@@ -9286,6 +9546,20 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['symbols_succeeded'], 1)
         self.assertEqual(result['symbols_failed'], 0)
         self.assertEqual(result['bars_upserted'], 2)
+        self.assertEqual(
+            result['turnover_coverage'],
+            {
+                'status': 'complete',
+                'total_bars': 2,
+                'eligible_bars': 2,
+                'provider_turnover_bars': 2,
+                'zero_volume_bars': 0,
+                'invalid_turnover_bars': 0,
+                'market_fetch_attempts': 2,
+                'market_fetch_failures': 0,
+                'coverage_ratio': 1.0,
+            },
+        )
         complete_run.assert_called_once_with(
             12,
             status='completed',
@@ -9293,6 +9567,74 @@ class PykrxBackfillServiceTests(TestCase):
             symbols_failed=0,
             error_message=None,
             run_metadata=ANY,
+        )
+
+    def test_run_market_data_pipeline_marks_and_exposes_invalid_turnover(self) -> None:
+        service = PykrxBackfillService()
+        service.symbol_pause_seconds = 0
+        symbol = PykrxSymbol(
+            symbol='005930',
+            market='KOSPI',
+            name_ko='Samsung Electronics',
+        )
+
+        with (
+            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch.object(
+                service,
+                '_map_symbol_bars',
+                return_value=[{
+                    'trade_date': '2026-04-03',
+                    'open_price': 1,
+                    'high_price': 2,
+                    'low_price': 1,
+                    'close_price': 2,
+                    'volume': 3,
+                    'turnover': 6,
+                }],
+            ),
+            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                return_value=SimpleNamespace(empty=False),
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=pd.DataFrame({'거래대금': [0]}, index=['005930']),
+            ),
+            patch('app.eod.pykrx_backfill.persist_daily_price_bars', return_value=1),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                return_value={
+                    'requested_symbols': 1,
+                    'contexts_persisted': 1,
+                    'contexts_failed': 0,
+                    '_retry_metadata': {'failed_symbols': []},
+                },
+            ),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete_run,
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='manual_api_stage',
+                refresh_universe=False,
+                mode='daily_stage_run',
+                symbols_override=[symbol],
+                selected_stages=('price_collection',),
+                chain_fundamentals_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertEqual(result['turnover_coverage']['status'], 'partial')
+        self.assertEqual(result['turnover_coverage']['invalid_turnover_bars'], 1)
+        self.assertEqual(result['turnover_invalid_symbols'], ['005930'])
+        self.assertEqual(result['price_retry_symbols'], [])
+        self.assertIn(
+            'Turnover coverage incomplete',
+            complete_run.call_args.kwargs['error_message'],
         )
 
     def test_recovery_target_reloads_exact_automatic_lineage_inside_lock(
@@ -9847,6 +10189,30 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(retry_codes, ['000001', '000002', '000003', '000004'])
         persisted.assert_called_once_with(7, trade_date='2026-04-03')
+
+    def test_retry_scope_keeps_invalid_turnover_symbols_even_when_price_bar_persisted(self) -> None:
+        service = PykrxBackfillService()
+        run = {
+            'id': 7,
+            'trade_date': '2026-04-03',
+            'status': 'completed_with_errors',
+            'symbols_failed': 0,
+            'run_metadata': {
+                'requested_symbols': ['005930'],
+                'turnover_invalid_symbols': ['005930'],
+            },
+        }
+
+        with patch(
+            'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+            return_value=['005930'],
+        ):
+            retry_codes = service._failed_symbol_codes_for_run(
+                run,
+                markets=('KOSPI',),
+            )
+
+        self.assertEqual(retry_codes, ['005930'])
 
     def test_auto_daily_retries_only_minor_symbol_gap(self) -> None:
         service = PykrxBackfillService()

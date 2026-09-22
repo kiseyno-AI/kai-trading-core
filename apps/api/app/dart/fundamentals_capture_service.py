@@ -30,6 +30,7 @@ from app.dart.service import (
     REPORT_CODE_METADATA,
     build_fundamentals_dataset,
 )
+from app.dart.signals_service import DartSignalsService, dart_signals_service
 from app.integrations.dart.client import DartClient, dart_client
 from app.market_data_store import load_symbols
 from app.signals.piotroski_filter import daily_piotroski_filter_service
@@ -71,6 +72,20 @@ class DartFundamentalsMappingError(TerminalFundamentalsCaptureError):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _bounded_missing_probe_codes(
+    candidates: list[str],
+    *,
+    probe_limit: int,
+    market_date: date,
+) -> list[str]:
+    if not candidates or probe_limit <= 0:
+        return []
+    resolved_limit = min(int(probe_limit), len(candidates))
+    rotation_start = (market_date.toordinal() * resolved_limit) % len(candidates)
+    rotated = candidates[rotation_start:] + candidates[:rotation_start]
+    return rotated[:resolved_limit]
 
 
 def _debug_refresh_log(stage: str, **payload: Any) -> None:
@@ -664,11 +679,13 @@ class DartFundamentalsCaptureService:
         *,
         client: DartClient | None = None,
         repository: DartFundamentalsRepository | None = None,
+        signals_service: DartSignalsService | None = None,
         active_symbol_loader: Callable[[], list[dict[str, Any]]] | None = None,
         daily_price_bar_bounds_loader: Callable[[], tuple[date | None, date | None]] | None = None,
     ) -> None:
         self.client = client or dart_client
         self.repository = repository or dart_fundamentals_repository
+        self.signals_service = signals_service or dart_signals_service
         self.active_symbol_loader = active_symbol_loader or _load_active_symbols
         self.daily_price_bar_bounds_loader = daily_price_bar_bounds_loader or _load_daily_price_bar_bounds
         self.event_timeout_seconds = settings.dart_fundamentals_event_timeout_seconds
@@ -786,6 +803,23 @@ class DartFundamentalsCaptureService:
                     timeout_seconds=self.event_timeout_seconds,
                 )
                 try:
+                    audit_signal_status = 'not_required'
+                    if (
+                        event.get('filing_category') == 'annual_report'
+                        and '사업보고서' in str(event.get('report_nm') or '')
+                    ):
+                        signal_result = await asyncio.wait_for(
+                            self.signals_service.capture_signals_for_event(
+                                rcept_no=event['rcept_no'],
+                            ),
+                            timeout=self.event_timeout_seconds,
+                        )
+                        if not signal_result.get('audit_signal'):
+                            raise RuntimeError(
+                                'DART annual filing audit evidence was not found; '
+                                f'keeping event retryable: rcept_no={event["rcept_no"]}'
+                            )
+                        audit_signal_status = 'captured'
                     request, dataset = await asyncio.wait_for(
                         self._capture_event(
                             event=event,
@@ -825,7 +859,7 @@ class DartFundamentalsCaptureService:
                         stock_code=event['stock_code'],
                         business_year=request['business_year'],
                         report_code=request['report_code'],
-                        fs_div=resolved_fs_div,
+                        fs_div=request['fs_div'],
                         row_count=len(dataset['items']),
                     )
                     results.append(
@@ -836,8 +870,9 @@ class DartFundamentalsCaptureService:
                             'status': 'captured',
                             'business_year': request['business_year'],
                             'report_code': request['report_code'],
-                            'fs_div': resolved_fs_div,
+                            'fs_div': request['fs_div'],
                             'row_count': len(dataset['items']),
+                            'audit_signal_status': audit_signal_status,
                         }
                     )
                 except asyncio.TimeoutError:
@@ -1128,6 +1163,43 @@ class DartFundamentalsCaptureService:
             reprt_code=request['report_code'],
             fs_div=fs_div,
         )
+        requested_fs_div = fs_div
+        fallback_from_status = None
+        fallback_from_message = None
+        if source_payload.get('status') == DART_NO_DATA_STATUS and fs_div == 'CFS':
+            fallback_from_status = DART_NO_DATA_STATUS
+            fallback_from_message = source_payload.get('message')
+            request = infer_fundamentals_request(
+                event,
+                fs_div='OFS',
+                fiscal_year_end_month=company_overview.get('acc_mt'),
+            )
+            source_payload = await self.client.fetch_financial_statements(
+                corp_code=event['corp_code'],
+                bsns_year=str(request['business_year']),
+                reprt_code=request['report_code'],
+                fs_div='OFS',
+            )
+        if source_payload.get('status') == DART_NO_DATA_STATUS:
+            fallback_prefix = (
+                f'CFS [{fallback_from_status}] {fallback_from_message}; OFS '
+                if fallback_from_status
+                else 'DART fundamentals returned '
+            )
+            raise DartFundamentalsNoDataError(
+                f"{fallback_prefix}[{source_payload.get('status')}]: {source_payload.get('message')}"
+            )
+        if source_payload.get('status') != '000':
+            fallback_prefix = (
+                f'CFS [{fallback_from_status}] {fallback_from_message}; OFS '
+                if fallback_from_status
+                else 'DART fundamentals returned '
+            )
+            raise RuntimeError(
+                f"{fallback_prefix}[{source_payload.get('status')}]: {source_payload.get('message')}"
+            )
+        if not source_payload.get('list'):
+            raise RuntimeError('DART fundamentals returned success with no statement rows')
         dataset = build_fundamentals_dataset(source_payload)
         self.repository.replace_snapshot_dataset(
             event_id=event['id'],
@@ -1140,7 +1212,7 @@ class DartFundamentalsCaptureService:
                 'business_year': request['business_year'],
                 'report_code': request['report_code'],
                 'filing_category': event['filing_category'],
-                'fs_div': fs_div,
+                'fs_div': request['fs_div'],
                 'statement_type': request['statement_type'],
                 'period_type': request['period_type'],
                 'period_end_month': request['period_end_month'],
@@ -1151,7 +1223,10 @@ class DartFundamentalsCaptureService:
                     'corp_code': event['corp_code'],
                     'business_year': request['business_year'],
                     'report_code': request['report_code'],
-                    'fs_div': fs_div,
+                    'fs_div': request['fs_div'],
+                    'requested_fs_div': requested_fs_div,
+                    'fallback_from_status': fallback_from_status,
+                    'fallback_from_message': fallback_from_message,
                     'rcept_no': event['rcept_no'],
                     'fiscal_year_end_month': company_overview.get('acc_mt'),
                 },
@@ -1160,14 +1235,6 @@ class DartFundamentalsCaptureService:
             row_payloads=build_row_payloads(dataset['items']),
             highlight_payloads=build_highlight_payloads(dataset['highlights']),
         )
-        if source_payload.get('status') == DART_NO_DATA_STATUS:
-            raise DartFundamentalsNoDataError(
-                f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}"
-            )
-        if source_payload.get('status') != '000':
-            raise RuntimeError(
-                f"DART fundamentals returned [{source_payload.get('status')}]: {source_payload.get('message')}"
-            )
         return request, dataset
 
     async def backfill_current_universe_fundamentals(
@@ -1212,13 +1279,24 @@ class DartFundamentalsCaptureService:
             end_date=resolved_end_date,
             trigger='manual_active_universe_backfill',
         )
-        if corp_records:
+        sync_incomplete_stock_codes = {
+            str(stock_code or '').strip()
+            for key in ('failed_stock_codes', 'unattempted_stock_codes')
+            for stock_code in sync_result.get(key) or []
+            if str(stock_code or '').strip()
+        }
+        capture_stock_codes = [
+            corp['stock_code']
+            for corp in corp_records
+            if corp['stock_code'] not in sync_incomplete_stock_codes
+        ]
+        if capture_stock_codes:
             capture_result = await self.capture_recent_fundamentals(
-                limit=capture_limit,
+                limit=None if force else capture_limit,
                 force=force,
                 trigger='manual_active_universe_backfill',
                 fs_div=fs_div,
-                stock_codes=[corp['stock_code'] for corp in corp_records],
+                stock_codes=capture_stock_codes,
                 receipt_date_from=effective_start_date,
                 receipt_date_to=resolved_end_date,
             )
@@ -1233,6 +1311,26 @@ class DartFundamentalsCaptureService:
                 'events_skipped': 0,
                 'results': [],
             }
+        remaining_retryable_events = 0
+        if capture_stock_codes:
+            remaining_retryable_events = len(
+                self.repository.list_capture_candidates(
+                    limit=None,
+                    force=False,
+                    stock_codes=capture_stock_codes,
+                    receipt_date_from=effective_start_date,
+                    receipt_date_to=resolved_end_date,
+                )
+            )
+        capture_operator_buckets = dict(capture_result.get('operator_buckets') or {})
+        capture_operator_buckets['remaining_retryable_events'] = {
+            'count': remaining_retryable_events,
+        }
+        capture_result = {
+            **capture_result,
+            'remaining_retryable_events': remaining_retryable_events,
+            'operator_buckets': capture_operator_buckets,
+        }
         terminal_lookup_statuses = [
             item for item in symbol_lookup_errors if item.get('terminal') and item.get('status') == CAPTURE_STATUS_MAPPING_FAILED
         ]
@@ -1242,8 +1340,54 @@ class DartFundamentalsCaptureService:
             if item.get('stock_code')
         }
         retryable_lookup_errors = [item for item in symbol_lookup_errors if not item.get('terminal')]
+        capture_failed_stock_codes = {
+            str(item.get('stock_code') or '').strip()
+            for item in capture_result.get('results') or []
+            if item.get('status') == 'failed' and str(item.get('stock_code') or '').strip()
+        }
+        lookup_failed_stock_codes = {
+            str(item.get('stock_code') or '').strip()
+            for item in retryable_lookup_errors
+            if str(item.get('stock_code') or '').strip()
+        }
+        failed_stock_codes = sorted(
+            sync_incomplete_stock_codes
+            | capture_failed_stock_codes
+            | lookup_failed_stock_codes
+        )
+        sync_status = str(sync_result.get('status') or 'completed')
+        capture_status = str(capture_result.get('status') or 'completed')
+        capture_events_seen = int(capture_result.get('events_seen') or 0)
+        capture_events_failed = int(capture_result.get('events_failed') or 0)
+        all_capture_events_failed = (
+            capture_events_seen > 0 and capture_events_failed >= capture_events_seen
+        )
+        all_selected_lookups_failed = (
+            bool(selected_symbols)
+            and not corp_records
+            and len(retryable_lookup_errors) == len(selected_symbols)
+        )
+        if (
+            sync_status == 'failed'
+            or capture_status == 'failed'
+            or all_capture_events_failed
+            or all_selected_lookups_failed
+        ):
+            status = 'failed'
+        elif (
+            sync_status == 'partial'
+            or capture_status == 'partial'
+            or capture_events_failed > 0
+            or retryable_lookup_errors
+            or failed_stock_codes
+            or remaining_retryable_events > 0
+        ):
+            status = 'partial'
+        else:
+            status = 'completed'
         return {
             'scope': 'current_active_universe',
+            'status': status,
             'active_symbols_total': len(active_symbols),
             'symbol_offset': symbol_offset,
             'symbol_limit': symbol_limit,
@@ -1259,12 +1403,15 @@ class DartFundamentalsCaptureService:
             'daily_price_bar_min_trade_date': min_trade_date.isoformat() if min_trade_date else None,
             'daily_price_bar_max_trade_date': max_trade_date.isoformat() if max_trade_date else None,
             'dart_min_start_date': DART_FUNDAMENTALS_MIN_START_DATE.isoformat(),
+            'failed_stock_codes': failed_stock_codes,
+            'remaining_retryable_events': remaining_retryable_events,
             'sync': sync_result,
             'capture': capture_result,
             'operator_buckets': _build_operator_buckets(
                 lookup_errors=retryable_lookup_errors,
                 capture_results=capture_result.get('results', []),
                 terminal_resolved_symbols=terminal_lookup_symbols,
+                remaining_retryable_events=remaining_retryable_events,
             ),
         }
 
@@ -1398,6 +1545,28 @@ class DartFundamentalsCaptureService:
             int(getattr(settings, 'dart_fundamentals_daily_incremental_lookback_days', 45) or 45),
         )
         daily_incremental_min_start_date = resolved_market_date - timedelta(days=daily_incremental_lookback_days)
+        initial_backfill_enabled = bool(
+            getattr(settings, 'dart_fundamentals_daily_initial_backfill_enabled', False)
+        )
+        missing_probe_limit = max(
+            0,
+            int(getattr(settings, 'dart_fundamentals_daily_missing_symbol_probe_limit', 100) or 0),
+        )
+        missing_probe_candidates = [
+            stock_code
+            for stock_code in selected_stock_codes
+            if not (states.get(stock_code) or {}).get('latest_resolved_fundamentals_receipt_date')
+            and not (states.get(stock_code) or {}).get('latest_fundamentals_receipt_date')
+        ]
+        bounded_missing_probe_codes = set(
+            _bounded_missing_probe_codes(
+                missing_probe_candidates,
+                probe_limit=missing_probe_limit,
+                market_date=resolved_market_date,
+            )
+            if not initial_backfill_enabled
+            else []
+        )
         run_metadata: dict[str, Any] = {
             'scope': 'daily_incremental_fundamentals_refresh',
             'market_date': resolved_market_date.isoformat(),
@@ -1409,6 +1578,9 @@ class DartFundamentalsCaptureService:
             'capture_limit': capture_limit,
             'daily_incremental_lookback_days': daily_incremental_lookback_days,
             'daily_incremental_min_start_date': daily_incremental_min_start_date.isoformat(),
+            'bounded_missing_symbol_probe_limit': missing_probe_limit,
+            'bounded_missing_symbol_probe_count': len(bounded_missing_probe_codes),
+            'bounded_missing_symbol_probe_sample': _limited_sample(sorted(bounded_missing_probe_codes)),
             'retry_cycles_requested': resolved_retry_cycles,
             'selected_symbols_sample': _limited_sample(selected_stock_codes),
             'stale_refresh_run_ids_failed': stale_refresh_run_ids,
@@ -1435,6 +1607,8 @@ class DartFundamentalsCaptureService:
         events_captured = 0
         events_failed = 0
         sync_results: list[dict[str, Any]] = []
+        sync_failed_symbols: set[str] = set()
+        sync_incomplete = False
         symbol_results: dict[str, dict[str, Any]] = {}
         lookup_errors: list[dict[str, str]] = []
         lookup_failed_symbols: set[str] = set()
@@ -1463,6 +1637,7 @@ class DartFundamentalsCaptureService:
                     'stale_incremental_backfill_deferred',
                     'missing',
                     'missing_initial_backfill_deferred',
+                    'missing_recent_probe_deferred',
                     'lookup_failed',
                     'terminal_no_newer_events',
                     'missing_no_newer_events',
@@ -1569,11 +1744,12 @@ class DartFundamentalsCaptureService:
                     and latest_terminal_status in TERMINAL_CAPTURE_STATUSES
                 ):
                     terminal_resolved_symbols[stock_code] = latest_terminal_status
-                check_start_date = (
-                    _date_after(latest_resolved_date)
-                    if latest_resolved_date is not None
-                    else DART_FUNDAMENTALS_MIN_START_DATE
-                )
+                if latest_resolved_date is not None:
+                    check_start_date = _date_after(latest_resolved_date)
+                elif initial_backfill_enabled:
+                    check_start_date = DART_FUNDAMENTALS_MIN_START_DATE
+                else:
+                    check_start_date = daily_incremental_min_start_date
                 symbol_result = {
                     'stock_code': stock_code,
                     'has_fundamentals': latest_fundamentals_date is not None,
@@ -1593,9 +1769,11 @@ class DartFundamentalsCaptureService:
                     symbols_missing += 1
                 if (
                     latest_resolved_date is None
-                    and not bool(getattr(settings, 'dart_fundamentals_daily_initial_backfill_enabled', False))
+                    and not initial_backfill_enabled
+                    and stock_code not in bounded_missing_probe_codes
                 ):
-                    symbol_result['state'] = 'missing_initial_backfill_deferred'
+                    symbol_result['state'] = 'missing_recent_probe_deferred'
+                    symbol_result['deferred_until_bounded_probe'] = True
                     continue
                 if check_start_date < daily_incremental_min_start_date:
                     symbol_result['state'] = 'stale_incremental_backfill_deferred'
@@ -1691,6 +1869,25 @@ class DartFundamentalsCaptureService:
                         'corporation_count': len(corporations),
                     }
                 )
+                if sync_result.get('status') != 'completed' or int(sync_result.get('corporations_failed') or 0) > 0:
+                    sync_incomplete = True
+                incomplete_sync_stock_codes = list(sync_result.get('failed_stock_codes') or [])
+                incomplete_sync_stock_codes.extend(sync_result.get('unattempted_stock_codes') or [])
+                for failed_stock_code_value in incomplete_sync_stock_codes:
+                    failed_stock_code = str(failed_stock_code_value or '').strip()
+                    if not failed_stock_code:
+                        continue
+                    sync_failed_symbols.add(failed_stock_code)
+                    if failed_stock_code in symbol_results:
+                        symbol_results[failed_stock_code]['state'] = 'sync_failed'
+                for corporation_error in sync_result.get('corporation_errors') or []:
+                    failed_stock_code = str(corporation_error.get('stock_code') or '').strip()
+                    if not failed_stock_code:
+                        continue
+                    sync_failed_symbols.add(failed_stock_code)
+                    if failed_stock_code in symbol_results:
+                        symbol_results[failed_stock_code]['state'] = 'sync_failed'
+                        symbol_results[failed_stock_code]['error'] = corporation_error.get('error')
                 update_refresh_progress(
                     stage='sync_group_completed',
                     extra_metadata={
@@ -1722,7 +1919,11 @@ class DartFundamentalsCaptureService:
                 sync_result_count=len(sync_results),
                 check_start_symbol_count=len(check_start_by_symbol),
             )
-            sync_stock_codes = list(check_start_by_symbol.keys())
+            sync_stock_codes = [
+                stock_code
+                for stock_code in check_start_by_symbol
+                if stock_code not in sync_failed_symbols
+            ]
             candidate_events: list[dict[str, Any]] = []
             if sync_stock_codes:
                 update_refresh_progress(
@@ -1965,13 +2166,17 @@ class DartFundamentalsCaptureService:
             refreshed_symbols = {
                 item['stock_code']
                 for item in capture_result.get('results', [])
-                if item.get('status') == 'captured' and item.get('stock_code')
+                if (
+                    item.get('status') == 'captured'
+                    and item.get('stock_code')
+                    and item['stock_code'] not in sync_failed_symbols
+                )
             }
             failed_symbols = {
                 item['stock_code']
                 for item in capture_result.get('results', [])
                 if item.get('status') == 'failed' and item.get('stock_code')
-            }
+            } | sync_failed_symbols | lookup_failed_symbols
             terminal_symbols_by_status: dict[str, set[str]] = defaultdict(set)
             for item in capture_result.get('results', []):
                 status_value = item.get('status')
@@ -2009,6 +2214,8 @@ class DartFundamentalsCaptureService:
             )
 
             partial_reasons: list[str] = []
+            if sync_incomplete:
+                partial_reasons.append('sync_failures')
             if symbols_failed:
                 partial_reasons.append('symbol_failures')
             if events_failed:
@@ -2016,7 +2223,18 @@ class DartFundamentalsCaptureService:
             if remaining_candidate_events:
                 partial_reasons.append('remaining_retryable_events')
 
-            status = 'partial' if partial_reasons else 'completed'
+            all_sync_groups_failed = bool(sync_results) and all(
+                item.get('status') == 'failed' for item in sync_results
+            )
+            all_selected_lookups_failed = (
+                bool(selected_stock_codes)
+                and lookup_failed_symbols == set(selected_stock_codes)
+            )
+            status = (
+                'failed'
+                if all_sync_groups_failed or all_selected_lookups_failed
+                else ('partial' if partial_reasons else 'completed')
+            )
 
             piotroski_filter_followup = None
             piotroski_filter_followup_error = None

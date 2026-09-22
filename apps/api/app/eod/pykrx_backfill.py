@@ -3915,6 +3915,7 @@ class PykrxBackfillService:
             [
                 *(metadata.get('failed_symbols') or []),
                 *(metadata.get('unattempted_symbols') or []),
+                *(metadata.get('turnover_invalid_symbols') or []),
             ]
         )
 
@@ -4135,6 +4136,11 @@ class PykrxBackfillService:
         requested_symbols = _dedupe_symbol_codes(
             metadata.get('requested_symbols') or []
         )
+        turnover_retry_symbols = set(
+            _dedupe_symbol_codes(
+                metadata.get('turnover_invalid_symbols') or []
+            )
+        )
         metadata_retry_symbols = self._metadata_retry_symbol_codes(run)
         scoped_retry_symbols = (
             requested_symbols or metadata_retry_symbols
@@ -4143,6 +4149,7 @@ class PykrxBackfillService:
             symbol
             for symbol in scoped_retry_symbols
             if symbol not in persisted_symbols
+            or symbol in turnover_retry_symbols
         ]
         point_in_time_required = bool(
             point_in_time_recovery

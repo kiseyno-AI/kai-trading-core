@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -33,6 +33,15 @@ TERMINAL_CAPTURE_STATUSES = (
     CAPTURE_STATUS_NO_DATA,
     CAPTURE_STATUS_MAPPING_FAILED,
 )
+USABLE_FUNDAMENTALS_SOURCE_STATUS = '000'
+
+
+def is_usable_fundamentals_source_status(source_status: str | None) -> bool:
+    return source_status == USABLE_FUNDAMENTALS_SOURCE_STATUS
+
+
+def eligible_fundamentals_fs_divs(requested_fs_div: str) -> tuple[str, ...]:
+    return ('CFS', 'OFS') if requested_fs_div == 'CFS' else (requested_fs_div,)
 
 
 def _utcnow() -> datetime:
@@ -478,6 +487,7 @@ class DartFundamentalsRepository:
         fs_div: str,
     ) -> dict[str, dict[str, Any]]:
         normalized_codes = [code for code in dict.fromkeys(stock_codes) if code]
+        requested_fs_div = fs_div.strip().upper()
         if len(normalized_codes) > 500:
             merged: dict[str, dict[str, Any]] = {}
             for index in range(0, len(normalized_codes), 500):
@@ -503,10 +513,12 @@ class DartFundamentalsRepository:
             return states
 
         with session_scope() as session:
+            eligible_fs_divs = eligible_fundamentals_fs_divs(requested_fs_div)
             latest_snapshot_rank = func.row_number().over(
                 partition_by=DartFundamentalsSnapshot.stock_code,
                 order_by=(
                     DartDisclosureEvent.receipt_date.desc().nullslast(),
+                    case((DartFundamentalsSnapshot.fs_div == requested_fs_div, 0), else_=1),
                     DartFundamentalsSnapshot.business_year.desc(),
                     DartFundamentalsSnapshot.report_code.desc(),
                     DartFundamentalsSnapshot.id.desc(),
@@ -531,7 +543,8 @@ class DartFundamentalsRepository:
                 .join(DartDisclosureEvent, DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id)
                 .where(
                     DartFundamentalsSnapshot.stock_code.in_(normalized_codes),
-                    DartFundamentalsSnapshot.fs_div == fs_div,
+                    DartFundamentalsSnapshot.fs_div.in_(eligible_fs_divs),
+                    DartFundamentalsSnapshot.source_status == USABLE_FUNDAMENTALS_SOURCE_STATUS,
                     DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED,
                 )
                 .subquery()
@@ -813,16 +826,21 @@ class DartFundamentalsRepository:
             return []
 
         with session_scope() as session:
+            requested_fs_div = (fs_div or 'CFS').strip().upper()
+            eligible_fs_divs = eligible_fundamentals_fs_divs(requested_fs_div)
             stmt = (
                 select(DartFundamentalsSnapshot, DartDisclosureEvent)
                 .join(
                     DartDisclosureEvent,
                     DartDisclosureEvent.id == DartFundamentalsSnapshot.disclosure_event_id,
                 )
-                .where(DartFundamentalsSnapshot.stock_code.in_(stock_codes))
+                .where(
+                    DartFundamentalsSnapshot.stock_code.in_(stock_codes),
+                    DartFundamentalsSnapshot.fs_div.in_(eligible_fs_divs),
+                    DartFundamentalsSnapshot.source_status == USABLE_FUNDAMENTALS_SOURCE_STATUS,
+                    DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED,
+                )
             )
-            if fs_div:
-                stmt = stmt.where(DartFundamentalsSnapshot.fs_div == fs_div)
             if captured_before is not None:
                 stmt = stmt.where(
                     DartFundamentalsSnapshot.captured_at
@@ -833,6 +851,11 @@ class DartFundamentalsRepository:
                 stmt.order_by(
                     DartFundamentalsSnapshot.stock_code.asc(),
                     DartDisclosureEvent.receipt_date.desc(),
+                    DartDisclosureEvent.rcept_no.desc(),
+                    case(
+                        (DartFundamentalsSnapshot.fs_div == requested_fs_div, 0),
+                        else_=1,
+                    ),
                     DartFundamentalsSnapshot.business_year.desc(),
                     DartFundamentalsSnapshot.report_code.desc(),
                     DartFundamentalsSnapshot.id.desc(),
@@ -840,6 +863,20 @@ class DartFundamentalsRepository:
             ).all()
             if not snapshot_rows:
                 return []
+
+            selected_snapshot_rows = []
+            selected_periods: set[tuple[str | None, int, str]] = set()
+            for snapshot, event in snapshot_rows:
+                period_key = (
+                    snapshot.stock_code,
+                    snapshot.business_year,
+                    snapshot.report_code,
+                )
+                if period_key in selected_periods:
+                    continue
+                selected_periods.add(period_key)
+                selected_snapshot_rows.append((snapshot, event))
+            snapshot_rows = selected_snapshot_rows
 
             snapshot_ids = [snapshot.id for snapshot, _event in snapshot_rows]
             highlight_rows = session.execute(
