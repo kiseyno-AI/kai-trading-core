@@ -1474,38 +1474,9 @@ class PykrxBackfillServiceTests(TestCase):
             patch(
                 'app.eod.pykrx_backfill.pykrx_enrichment_service.'
                 'collect_for_market_date',
-                return_value={
-                    'status': 'completed',
-                    'categories_requested': [
-                        'sector_classification',
-                        'investor_flow_symbol',
-                        'short_selling',
-                    ],
-                    'categories': {
-                        category: {'rows_persisted': 1, 'errors': []}
-                        for category in (
-                            'sector_classification',
-                            'investor_flow_symbol',
-                            'short_selling',
-                        )
-                    },
-                    'coverage': {
-                        'categories': {
-                            category: {
-                                'scope_type': 'symbol',
-                                'expected_rows': 1,
-                                'present_rows': 1,
-                                'coverage_ratio': 1.0,
-                                'coverage_status': 'complete',
-                            }
-                            for category in (
-                                'sector_classification',
-                                'investor_flow_symbol',
-                                'short_selling',
-                            )
-                        }
-                    },
-                },
+                return_value=_ready_pykrx_enrichment_result(
+                    market_date='2026-09-11'
+                ),
             ) as collect_enrichment,
             patch(
                 'app.eod.pykrx_pipeline_runner.'
@@ -4703,9 +4674,9 @@ class PykrxBackfillServiceTests(TestCase):
         }
         stage_rows['pykrx_enrichment'] = {
             'status': 'completed',
-            'processed': 3,
-            'total': 3,
-            'succeeded': 2,
+            'processed': 4,
+            'total': 4,
+            'succeeded': 3,
             'failed': 1,
             'remaining': 0,
             'completed_at': '2026-04-03T07:59:00+00:00',
@@ -4718,6 +4689,7 @@ class PykrxBackfillServiceTests(TestCase):
                         'sector_classification',
                         'investor_flow_symbol',
                         'short_selling',
+                        'valuation_snapshot',
                     ],
                     'categories': {
                         'sector_classification': {
@@ -4735,6 +4707,11 @@ class PykrxBackfillServiceTests(TestCase):
                             'rows_persisted': 10,
                             'errors': ['empty provider frame'],
                         },
+                        'valuation_snapshot': {
+                            'status': 'completed',
+                            'rows_persisted': 10,
+                            'errors': [],
+                        },
                     },
                     'downstream_preflight': {
                         'allowed': True,
@@ -4743,11 +4720,13 @@ class PykrxBackfillServiceTests(TestCase):
                             'sector_classification',
                             'investor_flow_symbol',
                             'short_selling',
+                            'valuation_snapshot',
                         ],
                         'category_row_counts': {
                             'sector_classification': 10,
                             'investor_flow_symbol': 10,
                             'short_selling': 10,
+                            'valuation_snapshot': 10,
                         },
                         'failed_categories': [],
                         'blocked_categories': [],
