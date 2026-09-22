@@ -100,6 +100,8 @@ class ExecutionRuntimeStatusPayload(_ContractModel):
     monthly_pnl: dict[str, Any] | None = None
     pnl_coverage: dict[str, ExecutionPnlCoveragePayload] | None = None
     actionable_alerts: dict[str, Any] | None = None
+    active_monitoring_items: list[dict[str, Any]] = Field(default_factory=list)
+    active_monitoring_facts_complete: bool = False
     issues: list[dict[str, Any]] = Field(default_factory=list)
     core_integration_mode: str | None = None
     delegate_execution: bool | None = None

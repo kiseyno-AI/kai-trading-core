@@ -1648,6 +1648,138 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
         self.assertTrue(result['monitoring_alive'])
         self.assertEqual(result['last_heartbeat_at'], '2026-08-29T00:06:53+00:00')
 
+    def test_exposes_active_monitoring_facts_from_exec_last_cycle(self) -> None:
+        payload = self._current_exec_payload()
+        payload['liveness']['autonomous']['monitoring']['last_cycle'] = {
+            'triggered_at': '2026-08-29T00:06:52+00:00',
+            'items': [
+                {
+                    'symbol': '027710',
+                    'intent': 'target_sell',
+                    'status': 'target_sell_monitoring',
+                    'trigger_price': '1154.1479',
+                    'observed_price': '1126',
+                    'outcome': 'waiting',
+                    'internal_note': 'must not cross the Core contract',
+                },
+                {
+                    'symbol': '027710',
+                    'intent': 'stop_sell',
+                    'status': 'stop_sell_monitoring',
+                    'trigger_price': '1097.8480',
+                    'observed_price': '1126',
+                    'outcome': 'waiting',
+                },
+            ],
+        }
+
+        result = self.service._build_dashboard_runtime_status(
+            integration=self.integration,
+            runtime={'status': 'ok', 'payload': payload, 'error': None},
+        )
+
+        self.assertTrue(result['active_monitoring_facts_complete'])
+        self.assertEqual(
+            result['active_monitoring_items'],
+            [
+                {
+                    'symbol': '027710',
+                    'intent': 'target_sell',
+                    'status': 'target_sell_monitoring',
+                    'trigger_price': '1154.1479',
+                    'observed_price': '1126',
+                    'outcome': 'waiting',
+                    'observed_at': '2026-08-29T00:06:52+00:00',
+                },
+                {
+                    'symbol': '027710',
+                    'intent': 'stop_sell',
+                    'status': 'stop_sell_monitoring',
+                    'trigger_price': '1097.8480',
+                    'observed_price': '1126',
+                    'outcome': 'waiting',
+                    'observed_at': '2026-08-29T00:06:52+00:00',
+                },
+            ],
+        )
+
+    def test_live_exec_monitoring_facts_override_stale_core_triggers(self) -> None:
+        result = self.service._apply_live_exec_monitoring_truth(
+            item={
+                'symbol': '027710',
+                'exec_monitoring_active': True,
+                'target_price': 1260,
+                'stop_loss_price': 1165,
+                'trigger_price': 1200,
+                'current_price': 1121,
+                'price_as_of': '2026-08-28T00:00:00+00:00',
+                'price_received_at': '2026-08-28T00:00:00+00:00',
+                'price_source': 'core_historical',
+                'price_status': 'available',
+                'display_price_available': True,
+                'monitoring_state': 'watching_fill',
+                'monitoring_statuses': ['runtime_membership_active'],
+                'last_event_at': '2026-08-28T00:00:00+00:00',
+            },
+            facts=[
+                {
+                    'symbol': '027710',
+                    'intent': 'target_sell',
+                    'status': 'target_sell_monitoring',
+                    'trigger_price': '1154.1479',
+                    'observed_price': '1126',
+                    'outcome': 'waiting',
+                    'observed_at': '2026-08-29T00:06:52+00:00',
+                },
+                {
+                    'symbol': '027710',
+                    'intent': 'stop_sell',
+                    'status': 'stop_sell_monitoring',
+                    'trigger_price': '1097.8480',
+                    'observed_price': '1126',
+                    'outcome': 'waiting',
+                    'observed_at': '2026-08-29T00:06:52+00:00',
+                },
+            ],
+            facts_complete=True,
+        )
+
+        self.assertEqual(result['target_price'], '1154.1479')
+        self.assertEqual(result['stop_loss_price'], '1097.8480')
+        self.assertIsNone(result['trigger_price'])
+        self.assertEqual(result['current_price'], 1126)
+        self.assertEqual(result['monitoring_state'], 'watching_target_stop')
+        self.assertEqual(result['last_event_at'], '2026-08-29T00:06:52+00:00')
+        self.assertEqual(result['price_source'], 'exec_runtime_monitoring')
+        self.assertIn('target_sell_monitoring', result['monitoring_statuses'])
+        self.assertIn('stop_sell_monitoring', result['monitoring_statuses'])
+
+    def test_complete_exec_monitoring_facts_do_not_present_stale_triggers(self) -> None:
+        result = self.service._apply_live_exec_monitoring_truth(
+            item={
+                'symbol': '027710',
+                'exec_monitoring_active': True,
+                'target_price': 1260,
+                'stop_loss_price': 1165,
+                'trigger_price': 1200,
+                'monitoring_state': 'watching_target_stop',
+                'monitoring_statuses': ['runtime_membership_active'],
+                'last_event_at': '2026-08-28T00:00:00+00:00',
+            },
+            facts=[],
+            facts_complete=True,
+        )
+
+        self.assertIsNone(result['target_price'])
+        self.assertIsNone(result['stop_loss_price'])
+        self.assertIsNone(result['trigger_price'])
+        self.assertEqual(result['monitoring_state'], 'reconciling')
+        self.assertIsNone(result['last_event_at'])
+        self.assertIn(
+            'runtime_monitoring_facts_unavailable',
+            result['monitoring_statuses'],
+        )
+
     def test_exposes_missing_pnl_coverage_reasons(self) -> None:
         result = self.service._build_dashboard_runtime_status(
             integration=self.integration,
@@ -12229,16 +12361,24 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'status': 'running',
                         'last_success_at': '2026-04-30T00:00:00+00:00',
                         'last_cycle': {
+                            'triggered_at': '2026-04-30T00:00:00+00:00',
                             'items': [
                                 {
                                     'symbol': self.symbol,
-                                    'intent': EXEC_INTENT_NEXT_OPEN_BUY,
-                                    'status': 'watch_monitoring_active',
-                                    'source_identity': {
-                                        'source_plan_id': f'live-watch-{self.target_trade_date:%Y%m%d}',
-                                        'strategy_run_id': f'core:{self.target_trade_date.isoformat()}:runtime',
-                                    },
-                                }
+                                    'intent': 'target_sell',
+                                    'status': 'target_sell_monitoring',
+                                    'trigger_price': '1154.1479',
+                                    'observed_price': '1126',
+                                    'outcome': 'waiting',
+                                },
+                                {
+                                    'symbol': self.symbol,
+                                    'intent': 'stop_sell',
+                                    'status': 'stop_sell_monitoring',
+                                    'trigger_price': '1097.8480',
+                                    'observed_price': '1126',
+                                    'outcome': 'waiting',
+                                },
                             ]
                         }
                     }
@@ -12304,6 +12444,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(item['exec_runtime_exclusion_reason'])
         self.assertIn('runtime_membership_active', item['monitoring_statuses'])
+        self.assertEqual(item['target_price'], '1154.1479')
+        self.assertEqual(item['stop_loss_price'], '1097.8480')
+        self.assertEqual(item['current_price'], 1126)
+        self.assertEqual(item['monitoring_state'], 'watching_target_stop')
+        self.assertEqual(item['price_source'], 'exec_runtime_monitoring')
 
     async def test_scheduled_exec_readback_refresh_reuses_dashboard_background_state(self) -> None:
         await self.service.dispatch_next_open_plan(

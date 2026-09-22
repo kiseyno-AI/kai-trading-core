@@ -6545,6 +6545,27 @@ class SignalDeciderExecIntegrationService:
             ranking_groups
         )
         items = [item_by_symbol[symbol] for symbol in realtime_symbols]
+        monitoring_facts_by_symbol: dict[
+            str,
+            list[dict[str, Any]],
+        ] = defaultdict(list)
+        for fact in board['runtime'].get('active_monitoring_items') or []:
+            if not isinstance(fact, dict):
+                continue
+            symbol = _normalize_optional_text(fact.get('symbol'))
+            if symbol:
+                monitoring_facts_by_symbol[symbol].append(fact)
+        monitoring_facts_complete = bool(
+            board['runtime'].get('active_monitoring_facts_complete')
+        )
+        items = [
+            self._apply_live_exec_monitoring_truth(
+                item=item,
+                facts=monitoring_facts_by_symbol.get(item['symbol'], []),
+                facts_complete=monitoring_facts_complete,
+            )
+            for item in items
+        ]
         generated_at = _utcnow()
         freshness = self._build_runtime_monitored_freshness(
             source_freshness=board.get('freshness'),
@@ -6589,6 +6610,98 @@ class SignalDeciderExecIntegrationService:
             'items': items,
         }
         return serialize_execution_monitored_symbols_payload(payload)
+
+    @staticmethod
+    def _apply_live_exec_monitoring_truth(
+        *,
+        item: dict[str, Any],
+        facts: Sequence[dict[str, Any]],
+        facts_complete: bool,
+    ) -> dict[str, Any]:
+        result = dict(item)
+        if not facts_complete or not bool(item.get('exec_monitoring_active')):
+            return result
+
+        monitoring_statuses = {
+            status
+            for status in (item.get('monitoring_statuses') or [])
+            if _normalize_optional_text(status)
+        }
+        monitoring_statuses.discard('runtime_monitoring_facts_unavailable')
+        if not facts:
+            result.update(
+                {
+                    'target_price': None,
+                    'stop_loss_price': None,
+                    'trigger_price': None,
+                    'monitoring_state': UI_MONITORING_STATE_RECONCILING,
+                    'last_event_at': None,
+                }
+            )
+            monitoring_statuses.discard('target_sell_monitoring')
+            monitoring_statuses.discard('stop_sell_monitoring')
+            monitoring_statuses.add('runtime_monitoring_facts_unavailable')
+            result['monitoring_statuses'] = sorted(monitoring_statuses)
+            return result
+
+        facts_by_intent = {
+            intent: fact
+            for fact in facts
+            if isinstance(fact, dict)
+            and (
+                intent := _normalize_optional_text(
+                    fact.get('intent'),
+                    lowercase=True,
+                )
+            )
+        }
+        target_fact = facts_by_intent.get('target_sell')
+        stop_fact = facts_by_intent.get('stop_sell')
+        result['target_price'] = (
+            target_fact.get('trigger_price')
+            if target_fact is not None
+            else None
+        )
+        result['stop_loss_price'] = (
+            stop_fact.get('trigger_price')
+            if stop_fact is not None
+            else None
+        )
+        result['trigger_price'] = None
+
+        for fact in facts:
+            status = _normalize_optional_text(fact.get('status'), lowercase=True)
+            if status:
+                monitoring_statuses.add(status)
+        result['monitoring_statuses'] = sorted(monitoring_statuses)
+
+        if target_fact is not None or stop_fact is not None:
+            result['monitoring_state'] = UI_MONITORING_STATE_WATCHING_TARGET_STOP
+
+        observed_at = _latest_iso_timestamp(
+            fact.get('observed_at')
+            for fact in facts
+        )
+        if observed_at is not None:
+            result['last_event_at'] = observed_at
+
+        observed_price = None
+        for fact in reversed(facts):
+            observed_price = _safe_decimal(fact.get('observed_price'))
+            if observed_price is not None:
+                break
+        if observed_price is not None:
+            result.update(
+                {
+                    'current_price': _to_json_number(observed_price),
+                    'price_as_of': observed_at,
+                    'price_received_at': observed_at,
+                    'price_source': 'exec_runtime_monitoring',
+                    'price_status': 'available',
+                    'display_price_available': True,
+                }
+            )
+        return result
 
     @staticmethod
     def _apply_direct_runtime_membership_truth(
@@ -11471,6 +11584,10 @@ class SignalDeciderExecIntegrationService:
         autonomous_monitoring = (
             autonomous.get('monitoring') if isinstance(autonomous.get('monitoring'), dict) else {}
         )
+        (
+            active_monitoring_items,
+            active_monitoring_facts_complete,
+        ) = self._extract_active_exec_monitoring_facts(autonomous_monitoring)
         symbols = payload.get('symbols') if isinstance(payload.get('symbols'), dict) else None
         daily_pnl = payload.get('daily_pnl') if isinstance(payload.get('daily_pnl'), dict) else None
         weekly_pnl = payload.get('weekly_pnl') if isinstance(payload.get('weekly_pnl'), dict) else None
@@ -11612,10 +11729,69 @@ class SignalDeciderExecIntegrationService:
             'monthly_pnl': monthly_pnl,
             'pnl_coverage': pnl_coverage,
             'actionable_alerts': actionable_alerts,
+            'active_monitoring_items': active_monitoring_items,
+            'active_monitoring_facts_complete': (
+                active_monitoring_facts_complete
+            ),
             'issues': issues,
             'core_integration_mode': integration.get('mode'),
             'delegate_execution': bool(integration.get('delegate_execution')),
         })
+
+    @staticmethod
+    def _extract_active_exec_monitoring_facts(
+        autonomous_monitoring: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        last_cycle = autonomous_monitoring.get('last_cycle')
+        if not isinstance(last_cycle, dict):
+            return [], False
+        items = last_cycle.get('items')
+        if not isinstance(items, list):
+            return [], False
+
+        observed_at = _parse_iso_datetime(last_cycle.get('triggered_at'))
+        if observed_at is None:
+            observed_at = _parse_iso_datetime(
+                autonomous_monitoring.get('last_success_at')
+            )
+        observed_at_text = observed_at.isoformat() if observed_at else None
+        facts: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            symbol = _normalize_optional_text(item.get('symbol'))
+            intent = _normalize_optional_text(item.get('intent'), lowercase=True)
+            status = _normalize_optional_text(item.get('status'), lowercase=True)
+            outcome = _normalize_optional_text(item.get('outcome'), lowercase=True)
+            is_active = bool(status and 'monitoring' in status) or outcome in {
+                'active',
+                'deferred',
+                'monitoring',
+                'pending',
+                'waiting',
+            }
+            if not symbol or not intent or not is_active:
+                continue
+            facts.append(
+                {
+                    'symbol': symbol,
+                    'intent': intent,
+                    'status': status,
+                    'trigger_price': _decimal_to_text(
+                        _safe_decimal(item.get('trigger_price'))
+                    ),
+                    'observed_price': _decimal_to_text(
+                        _safe_decimal(item.get('observed_price'))
+                    ),
+                    'outcome': outcome,
+                    'observed_at': observed_at_text,
+                }
+            )
+        facts_complete = bool(
+            observed_at is not None
+            and last_cycle.get('items_truncated') is not True
+        )
+        return facts, facts_complete
 
     @staticmethod
     def _build_runtime_pnl_coverage(
