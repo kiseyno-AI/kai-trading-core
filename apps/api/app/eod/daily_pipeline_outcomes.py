@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
@@ -46,6 +46,12 @@ PYKRX_ENRICHMENT_REQUIRED_CATEGORIES: frozenset[str] = frozenset(
         'investor_flow_symbol',
         'short_selling',
     }
+)
+AGENT_FEEDBACK_RECOVERY_STAGE_ORDER: tuple[str, ...] = (
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+    'signal_decider_evaluations',
 )
 _TERMINAL_FEEDBACK_LEASE_LOSS_ERROR = re.compile(
     r'\Afeedback retry lease ownership lost for '
@@ -764,3 +770,45 @@ def daily_pipeline_prefix_outcome_is_satisfied(
     ):
         return False
     return True
+
+
+def daily_pipeline_has_only_agent_feedback_recovery_debt(
+    *,
+    resolved_stage_ids: Sequence[str],
+    stage_outcomes: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """Return whether retry debt starts at missing agent feedback.
+
+    Persisted data and context stages remain recovery requirements. Once that
+    prefix is satisfied, feedback absence is not historical data debt and must
+    not hold a later market date behind it.
+    """
+
+    normalized_stage_ids = tuple(
+        str(stage_id or '').strip() for stage_id in resolved_stage_ids
+    )
+    if (
+        not normalized_stage_ids
+        or any(not stage_id for stage_id in normalized_stage_ids)
+        or len(normalized_stage_ids) != len(set(normalized_stage_ids))
+        or 'agent_feedback_summaries' not in normalized_stage_ids
+    ):
+        return False
+    feedback_index = normalized_stage_ids.index(
+        'agent_feedback_summaries'
+    )
+    feedback_suffix = normalized_stage_ids[feedback_index:]
+    if feedback_suffix != AGENT_FEEDBACK_RECOVERY_STAGE_ORDER[
+        : len(feedback_suffix)
+    ]:
+        return False
+    if any(
+        not daily_pipeline_prefix_outcome_is_satisfied(
+            stage_outcomes.get(stage_id)
+        )
+        for stage_id in normalized_stage_ids[:feedback_index]
+    ):
+        return False
+    return not daily_pipeline_outcome_is_satisfied(
+        stage_outcomes.get('agent_feedback_summaries')
+    )

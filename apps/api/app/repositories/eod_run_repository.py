@@ -25,6 +25,7 @@ from app.db_models import (
     Symbol,
 )
 from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_has_only_agent_feedback_recovery_debt,
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
     terminal_continuation_expired_decision_skip_evidence_is_valid,
@@ -900,6 +901,48 @@ def _pipeline_stage_outcome(stage_row: DailyPipelineStageRun) -> dict[str, Any]:
             stage_row.details if isinstance(stage_row.details, dict) else {}
         ),
     }
+
+
+def _pipeline_has_only_agent_feedback_recovery_debt(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+) -> bool:
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, dict)
+        else {}
+    )
+    resolved_stages = metadata.get('resolved_stages')
+    if (
+        not isinstance(resolved_stages, list)
+        or not resolved_stages
+        or any(
+            not isinstance(stage_id, str) or not stage_id.strip()
+            for stage_id in resolved_stages
+        )
+    ):
+        return False
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(tuple(resolved_stages)),
+            )
+        ).scalars()
+    )
+    return daily_pipeline_has_only_agent_feedback_recovery_debt(
+        resolved_stage_ids=resolved_stages,
+        stage_outcomes={
+            str(stage_row.stage_id or '').strip(): (
+                _pipeline_stage_outcome(stage_row)
+            )
+            for stage_row in stage_rows
+        },
+    )
 
 
 def _terminal_continuation_lease_loss_child_is_valid(
@@ -1789,6 +1832,46 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                     eod_run_id=eod_row.id,
                 )
             if _eod_has_followup_recovery_scope(eod_row):
+                pipeline_candidates = _load_pipeline_recovery_candidates(
+                    session,
+                    market_dates=[eod_row.trade_date],
+                )
+                latest_linked_pipeline = next(
+                    (
+                        pipeline_row
+                        for pipeline_row in pipeline_candidates
+                        if _is_automatic_daily_pipeline_run(pipeline_row)
+                        and _pipeline_run_links_to_eod(
+                            pipeline_row,
+                            eod_row,
+                        )
+                    ),
+                    None,
+                )
+                if (
+                    (
+                        latest_linked_pipeline is not None
+                        and (
+                            latest_linked_pipeline.trigger
+                            == _AUTO_DAILY_RECOVERY_TRIGGER
+                            or (
+                                not _metadata_list(
+                                    eod_row.run_metadata,
+                                    'downstream_retry_symbols',
+                                )
+                                and not _metadata_positive_int(
+                                    eod_row.run_metadata,
+                                    'downstream_retry_symbols_count',
+                                )
+                            )
+                        )
+                    )
+                    and _pipeline_has_only_agent_feedback_recovery_debt(
+                        session,
+                        pipeline_run=latest_linked_pipeline,
+                    )
+                ):
+                    continue
                 followup_attempts = _count_auto_followup_recovery_attempts(
                     session,
                     eod_run=eod_row,
@@ -1798,10 +1881,6 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                         trade_date=eod_row.trade_date.isoformat(),
                         eod_run_id=eod_row.id,
                     )
-                pipeline_candidates = _load_pipeline_recovery_candidates(
-                    session,
-                    market_dates=[eod_row.trade_date],
-                )
                 latest_recovery = _latest_exact_followup_recovery(
                     candidates=pipeline_candidates,
                     eod_run=eod_row,

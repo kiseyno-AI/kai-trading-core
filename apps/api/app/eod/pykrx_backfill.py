@@ -14,6 +14,8 @@ from app.agent_context.derived_contexts import daily_price_context_service
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import (
+    AGENT_FEEDBACK_RECOVERY_STAGE_ORDER,
+    daily_pipeline_has_only_agent_feedback_recovery_debt,
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
     terminal_continuation_feedback_lease_loss_run_id,
@@ -96,12 +98,7 @@ MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE = 5
 AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
 AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
 AUTO_EOD_PIPELINE_ENTRYPOINT = 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
-TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
-    'agent_feedback_summaries',
-    'signal_decider',
-    'next_open_execution_plan',
-    'signal_decider_evaluations',
-)
+TERMINAL_FOLLOWUP_CONTINUATION_STAGES = AGENT_FEEDBACK_RECOVERY_STAGE_ORDER
 RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
 PYKRX_STAGE_SEQUENCE = (
     'price_collection',
@@ -248,6 +245,17 @@ def _dedupe_symbol_codes(symbols: Sequence[object]) -> list[str]:
             normalized = normalized.zfill(6)
         deduped.setdefault(normalized, None)
     return list(deduped.keys())
+
+
+def _positive_count(value: object) -> bool:
+    """Fail closed when durable retry-count metadata is malformed."""
+
+    if value is None:
+        return False
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _stage_result_summary(stage: object) -> Mapping[str, Any]:
@@ -2207,6 +2215,16 @@ class PykrxBackfillService:
         price_retry_symbols = set(
             self._metadata_retry_symbol_codes(latest_eod_run)
         )
+        price_retry_scope_pending = bool(
+            price_retry_symbols
+            or _positive_count(latest_eod_run.get('symbols_failed'))
+            or _positive_count(
+                latest_eod_metadata.get('failed_symbols_count')
+            )
+            or _positive_count(
+                latest_eod_metadata.get('unattempted_symbols_count')
+            )
+        )
         downstream_retry_symbols = [
             symbol
             for symbol in _dedupe_symbol_codes(
@@ -2214,6 +2232,12 @@ class PykrxBackfillService:
             )
             if symbol not in price_retry_symbols
         ]
+        downstream_retry_scope_pending = bool(
+            downstream_retry_symbols
+            or _positive_count(
+                latest_eod_metadata.get('downstream_retry_symbols_count')
+            )
+        )
 
         try:
             pipeline_run = daily_pipeline_run_state_service.get_latest_run_for_context(
@@ -2280,6 +2304,35 @@ class PykrxBackfillService:
         if not recovery_scope:
             return None
 
+        stage_outcomes = {
+            stage_id: {
+                **dict(stage),
+                'stage': stage_id,
+            }
+            for stage_id, stage in stage_rows.items()
+            if isinstance(stage, Mapping)
+        }
+        feedback_stage_index = (
+            recovery_scope.index('agent_feedback_summaries')
+            if 'agent_feedback_summaries' in recovery_scope
+            else -1
+        )
+        feedback_suffix = (
+            tuple(recovery_scope[feedback_stage_index:])
+            if feedback_stage_index >= 0
+            else ()
+        )
+        agent_feedback_backfill_disabled = bool(
+            feedback_suffix
+            and feedback_suffix
+            == AGENT_FEEDBACK_RECOVERY_STAGE_ORDER[
+                : len(feedback_suffix)
+            ]
+            and not daily_pipeline_outcome_is_satisfied(
+                stage_outcomes.get('agent_feedback_summaries')
+            )
+        )
+
         outcome_is_satisfied = (
             daily_pipeline_prefix_outcome_is_satisfied
             if terminal_continuation_marker_is_valid(run_metadata)
@@ -2287,12 +2340,7 @@ class PykrxBackfillService:
         )
         incomplete_stages = []
         for stage_id in recovery_scope:
-            stage = stage_rows.get(stage_id)
-            stage_outcome = (
-                {**dict(stage), 'stage': stage_id}
-                if isinstance(stage, Mapping)
-                else {}
-            )
+            stage_outcome = stage_outcomes.get(stage_id, {})
             if not outcome_is_satisfied(stage_outcome):
                 incomplete_stages.append(stage_id)
         pipeline_status = str(pipeline_run.get('status') or '').strip().lower()
@@ -2313,7 +2361,7 @@ class PykrxBackfillService:
             )
         if (
             pipeline_run.get('trigger') != AUTO_FOLLOWUP_RECOVERY_TRIGGER
-            and downstream_retry_symbols
+            and downstream_retry_scope_pending
             and downstream_resume_from_stage in recovery_scope
             and (
                 not incomplete_stages
@@ -2322,6 +2370,36 @@ class PykrxBackfillService:
             )
         ):
             incomplete_stages.insert(0, downstream_resume_from_stage)
+        feedback_only_recovery_debt = (
+            agent_feedback_backfill_disabled
+            and daily_pipeline_has_only_agent_feedback_recovery_debt(
+                resolved_stage_ids=recovery_scope,
+                stage_outcomes=stage_outcomes,
+            )
+        )
+        if (
+            not price_retry_scope_pending
+            and incomplete_stages
+            and feedback_only_recovery_debt
+            and (
+                pipeline_run.get('trigger')
+                == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+                or not downstream_retry_scope_pending
+            )
+        ):
+            result = build_daily_skip_result(
+                reason='agent_feedback_backfill_disabled',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'skipped',
+                'reason': 'agent_feedback_backfill_disabled',
+                'pipeline_run_id': pipeline_run.get('id'),
+                'resume_from_stage': 'agent_feedback_summaries',
+            }
+            return result
         if not incomplete_stages:
             is_followup_recovery_parent = bool(
                 pipeline_run.get('trigger')
@@ -2398,6 +2476,15 @@ class PykrxBackfillService:
         resume_from_stage = incomplete_stages[0]
         resume_index = recovery_scope.index(resume_from_stage)
         recovery_stages = recovery_scope[resume_index:]
+        if (
+            agent_feedback_backfill_disabled
+            and 'agent_feedback_summaries' in recovery_stages
+        ):
+            recovery_stages = recovery_stages[
+                : recovery_stages.index('agent_feedback_summaries')
+            ]
+        if not recovery_stages:
+            return None
         recovery_reaches_followup_stage = any(
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in recovery_stages
@@ -2407,7 +2494,7 @@ class PykrxBackfillService:
             and price_retry_symbols
             and downstream_retry_symbols
         )
-        if recovery_reaches_followup_stage and price_retry_symbols:
+        if recovery_reaches_followup_stage and price_retry_scope_pending:
             if not recovering_safe_downstream_scope:
                 return None
 
@@ -2537,7 +2624,7 @@ class PykrxBackfillService:
         current_price_scope_preflight_required = bool(
             not terminal_continuation_in_place
             and not point_in_time_recovery
-            and not price_retry_symbols
+            and not price_retry_scope_pending
             and (
                 untracked_followup_parent
                 or pipeline_run.get('trigger')
@@ -2685,13 +2772,18 @@ class PykrxBackfillService:
             recovery_symbols = verified_downstream_symbols
         elif verified_orphan_symbols:
             recovery_symbols = verified_orphan_symbols
-        elif recovery_reaches_followup_stage and not price_retry_symbols:
+        elif (
+            recovery_reaches_followup_stage
+            and not price_retry_scope_pending
+        ):
             recovery_symbols = []
         elif run_metadata.get('synthetic_recovery_parent'):
             recovery_symbols = downstream_retry_symbols
         elif has_incomplete_followup_stage:
             recovery_symbols = (
-                downstream_retry_symbols if price_retry_symbols else []
+                downstream_retry_symbols
+                if price_retry_scope_pending
+                else []
             )
         else:
             recovery_symbols = downstream_retry_symbols
@@ -3130,6 +3222,24 @@ class PykrxBackfillService:
                     if isinstance(latest_run.get('run_metadata'), dict)
                     else {}
                 )
+                price_retry_pending = bool(
+                    latest_failed > 0
+                    or metadata_retry_symbols
+                    or _positive_count(
+                        latest_metadata.get('failed_symbols_count')
+                    )
+                    or _positive_count(
+                        latest_metadata.get('unattempted_symbols_count')
+                    )
+                )
+                has_downstream_retry_scope = bool(
+                    latest_metadata.get('downstream_retry_symbols')
+                    or _positive_count(
+                        latest_metadata.get(
+                            'downstream_retry_symbols_count'
+                        )
+                    )
+                )
                 if point_in_time_recovery:
                     markets = _point_in_time_source_markets(
                         latest_metadata,
@@ -3138,22 +3248,18 @@ class PykrxBackfillService:
                 collection_is_terminal = bool(
                     (
                         latest_status == 'completed'
-                        and latest_failed == 0
+                        and not price_retry_pending
                     )
                     or (
                         latest_status == 'completed_with_errors'
-                        and latest_failed == 0
-                        and not metadata_retry_symbols
+                        and not price_retry_pending
                     )
-                    or self._failed_run_has_exact_complete_price_scope(
-                        latest_run
+                    or (
+                        not price_retry_pending
+                        and self._failed_run_has_exact_complete_price_scope(
+                            latest_run
+                        )
                     )
-                )
-                has_downstream_retry_scope = bool(
-                    latest_metadata.get('downstream_retry_symbols')
-                )
-                price_retry_pending = bool(
-                    latest_failed > 0 or metadata_retry_symbols
                 )
                 is_automatic_retryable_run = bool(
                     _is_auto_daily_trigger(trigger)
@@ -3204,7 +3310,7 @@ class PykrxBackfillService:
                             },
                         )
                         return recovery_result
-                if latest_status == 'completed' and latest_failed == 0:
+                if latest_status == 'completed' and not price_retry_pending:
                     result = build_daily_skip_result(
                         reason='already_completed',
                         market_date=market_date_iso,
@@ -3215,8 +3321,7 @@ class PykrxBackfillService:
                     return result
                 if (
                     latest_status == 'completed_with_errors'
-                    and latest_failed == 0
-                    and not metadata_retry_symbols
+                    and not price_retry_pending
                 ):
                     result = build_daily_skip_result(
                         reason='already_completed_with_errors',
@@ -3856,8 +3961,16 @@ class PykrxBackfillService:
             return False
         if status == 'failed':
             return True
-        return int(run.get('symbols_failed') or 0) > 0 or bool(
-            self._metadata_retry_symbol_codes(run)
+        metadata = (
+            run.get('run_metadata')
+            if isinstance(run.get('run_metadata'), Mapping)
+            else {}
+        )
+        return bool(
+            _positive_count(run.get('symbols_failed'))
+            or self._metadata_retry_symbol_codes(run)
+            or _positive_count(metadata.get('failed_symbols_count'))
+            or _positive_count(metadata.get('unattempted_symbols_count'))
         )
 
     @staticmethod

@@ -550,6 +550,189 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             ),
         )
 
+    def test_skips_followup_when_only_agent_feedback_is_missing(
+        self,
+    ) -> None:
+        market_date = date(2026, 9, 21)
+        started_at = datetime(2026, 9, 21, 7, tzinfo=timezone.utc)
+        resolved_stages = [
+            'technical_snapshots',
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        with self.session_factory.begin() as session:
+            eod_run = EODCollectionRun(
+                market='KRX',
+                trade_date=market_date,
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=1,
+                symbols_succeeded=1,
+                symbols_failed=0,
+                started_at=started_at,
+                completed_at=started_at + timedelta(minutes=1),
+                run_metadata={
+                    'mode': 'daily_auto',
+                    'followup_recovery_required': True,
+                },
+            )
+            session.add(eod_run)
+            session.flush()
+            pipeline_run = DailyPipelineRun(
+                market_date=market_date,
+                trigger='auto_close_scheduler',
+                status='failed',
+                current_stage='agent_feedback_summaries',
+                started_at=started_at,
+                completed_at=started_at + timedelta(minutes=2),
+                error_message='agent feedback unavailable',
+                run_metadata={
+                    'entrypoint': (
+                        'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+                    ),
+                    'eod_collection_run_id': eod_run.id,
+                    'resolved_stages': resolved_stages,
+                    'resumable': True,
+                },
+            )
+            session.add(pipeline_run)
+            session.flush()
+            eod_run_id = eod_run.id
+            pipeline_run_id = pipeline_run.id
+            session.add_all(
+                [
+                    DailyPipelineStageRun(
+                        pipeline_run_id=pipeline_run.id,
+                        market_date=market_date,
+                        stage_id='technical_snapshots',
+                        status='completed',
+                        processed=1,
+                        total=1,
+                        succeeded=1,
+                        failed=0,
+                        remaining=0,
+                        started_at=started_at,
+                        completed_at=started_at + timedelta(minutes=1),
+                    ),
+                    DailyPipelineStageRun(
+                        pipeline_run_id=pipeline_run.id,
+                        market_date=market_date,
+                        stage_id='agent_feedback_summaries',
+                        status='failed',
+                        processed=1,
+                        total=1,
+                        succeeded=0,
+                        failed=1,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=1),
+                        completed_at=started_at + timedelta(minutes=2),
+                        error_message='agent feedback unavailable',
+                    ),
+                    *[
+                        DailyPipelineStageRun(
+                            pipeline_run_id=pipeline_run.id,
+                            market_date=market_date,
+                            stage_id=stage_id,
+                            status='blocked',
+                            processed=0,
+                            total=0,
+                            succeeded=0,
+                            failed=0,
+                            remaining=0,
+                            started_at=started_at + timedelta(minutes=2),
+                            completed_at=started_at + timedelta(minutes=2),
+                        )
+                        for stage_id in resolved_stages[2:]
+                    ],
+                ]
+            )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=market_date,
+                on_or_before=market_date,
+            )
+
+        self.assertIsNone(target)
+
+        with self.session_factory.begin() as session:
+            technical_stage = session.execute(
+                select(DailyPipelineStageRun).where(
+                    DailyPipelineStageRun.pipeline_run_id
+                    == pipeline_run_id,
+                    DailyPipelineStageRun.stage_id
+                    == 'technical_snapshots',
+                )
+            ).scalar_one()
+            technical_stage.status = 'failed'
+            technical_stage.succeeded = 0
+            technical_stage.failed = 1
+            technical_stage.error_message = 'numeric snapshot unavailable'
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            numeric_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date,
+                    on_or_before=market_date,
+                )
+            )
+
+        self.assertEqual(
+            numeric_target,
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=eod_run_id,
+            ),
+        )
+
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, eod_run_id)
+            eod_run.run_metadata = {
+                **eod_run.run_metadata,
+                'downstream_retry_symbols': [],
+                'downstream_retry_symbols_count': 1,
+            }
+            pipeline_run = session.get(DailyPipelineRun, pipeline_run_id)
+            pipeline_run.trigger = 'auto_eod_followup_resume'
+            pipeline_run.run_metadata = {
+                **pipeline_run.run_metadata,
+                'reused_eod_collection_run_id': eod_run_id,
+            }
+            technical_stage = session.execute(
+                select(DailyPipelineStageRun).where(
+                    DailyPipelineStageRun.pipeline_run_id
+                    == pipeline_run_id,
+                    DailyPipelineStageRun.stage_id
+                    == 'technical_snapshots',
+                )
+            ).scalar_one()
+            technical_stage.status = 'completed'
+            technical_stage.succeeded = 1
+            technical_stage.failed = 0
+            technical_stage.error_message = None
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            settled_recovery_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date,
+                    on_or_before=market_date,
+                )
+            )
+
+        self.assertIsNone(settled_recovery_target)
+
     def test_exact_automatic_loader_ignores_newer_manual_and_historical_rows(
         self,
     ) -> None:

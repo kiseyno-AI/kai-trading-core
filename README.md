@@ -386,7 +386,7 @@ python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market
 
 Use `RUNBOOK.md` for the full command catalog, stage dependencies, overnight runners, and recovery procedures.
 
-The automatic close pipeline records price collection and every downstream stage separately. Once price collection is terminal, a failed fundamentals, factor, news, feedback, decider, plan, or evaluation stage is resumed from the first incomplete follow-up without downloading prices again. Follow-up recovery waits at least five minutes between attempts and stops after five attempts for the trade date; the skip reason and recovery metadata remain visible in the run result.
+The automatic close pipeline records price collection and every downstream stage separately. Once price collection is terminal, automatic recovery resumes incomplete persisted data and context stages without downloading prices again. The same-day pipeline still attempts agent feedback once, but a missing `agent_feedback_summaries` stage is not historical backfill debt: Core leaves that failure visible for audit and advances to the current session instead of replaying the dependent agent suffix. Independent downstream failures after feedback succeeds remain recoverable. Follow-up recovery waits at least five minutes between attempts and stops after five attempts for the trade date; the skip reason and recovery metadata remain visible in the run result.
 
 ### Agent feedback and decisions
 
