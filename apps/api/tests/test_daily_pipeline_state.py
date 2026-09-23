@@ -4986,7 +4986,60 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(result['id'], 341)
         self.assertEqual(result['deduplication_reason'], 'overlapping_run_already_active')
 
-    def test_start_run_abandons_stale_activity_before_admitting_recovery(self) -> None:
+    def test_same_date_active_factor_run_blocks_non_overlapping_feedback_suffix(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 29, tzinfo=timezone.utc)
+        existing_run = SimpleNamespace(
+            id=342,
+            market_date=date(2026, 8, 28),
+            trigger='auto_close_scheduler',
+            status='running',
+            current_stage='momentum_factors',
+            started_at=now,
+            updated_at=now,
+            completed_at=None,
+            error_message=None,
+            run_metadata={'resolved_stages': ['momentum_factors']},
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = [existing_run]
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            active_result,
+            stages_result,
+        ]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+        ):
+            result = DailyPipelineRunStateService().start_run(
+                market_date='2026-08-28',
+                trigger='manual_api',
+                requested_stages=['agent_feedback_summaries', 'signal_decider'],
+                resolved_stages=['agent_feedback_summaries', 'signal_decider'],
+            )
+
+        self.assertTrue(result['deduplicated'])
+        self.assertEqual(result['id'], 342)
+        self.assertEqual(
+            result['deduplication_reason'],
+            'overlapping_run_already_active',
+        )
+        session.add.assert_not_called()
+
+    def test_start_run_deduplicates_stale_activity_without_stealing_ownership(
+        self,
+    ) -> None:
         now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
         last_activity_at = now - timedelta(minutes=31)
         stale_run = SimpleNamespace(
@@ -4994,18 +5047,18 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             market_date=date(2026, 8, 28),
             trigger='manual_api',
             status='running',
-            current_stage='signal_decider',
+            current_stage='momentum_factors',
             started_at=last_activity_at - timedelta(minutes=5),
             updated_at=last_activity_at,
             completed_at=None,
             error_message=None,
-            run_metadata={'resolved_stages': ['signal_decider'], 'owner': 'stale-worker'},
+            run_metadata={'resolved_stages': ['momentum_factors'], 'owner': 'slow-worker'},
         )
         stale_stage = SimpleNamespace(
             id=812,
             pipeline_run_id=341,
             market_date=date(2026, 8, 28),
-            stage_id='signal_decider',
+            stage_id='momentum_factors',
             status='running',
             processed=2,
             total=10,
@@ -5013,7 +5066,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             failed=0,
             remaining=8,
             current_step='dispatching',
-            current_activity='Dispatching signal decider',
+            current_activity='Computing momentum factors',
             current_symbol='005930',
             current_period=None,
             started_at=last_activity_at - timedelta(minutes=5),
@@ -5027,14 +5080,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         active_result.scalars.return_value = [stale_run]
         stages_result = MagicMock()
         stages_result.scalars.return_value = [stale_stage]
-        existing_recovery_result = MagicMock()
-        existing_recovery_result.scalar_one_or_none.return_value = None
         session = MagicMock()
         session.execute.side_effect = [
             MagicMock(),
             active_result,
             stages_result,
-            existing_recovery_result,
         ]
         session_context = MagicMock()
         session_context.__enter__.return_value = session
@@ -5051,20 +5101,461 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 resolved_stages=['signal_decider'],
             )
 
+        self.assertTrue(result['deduplicated'])
+        self.assertEqual(
+            result['deduplication_reason'],
+            'stale_run_requires_explicit_reconciliation',
+        )
+        self.assertEqual(result['id'], 341)
+        self.assertEqual(stale_run.status, 'running')
+        self.assertIsNone(stale_run.completed_at)
+        self.assertEqual(stale_run.run_metadata['owner'], 'slow-worker')
+        self.assertEqual(stale_stage.status, 'running')
+        self.assertEqual(stale_stage.current_step, 'dispatching')
+        session.add.assert_not_called()
+
+    def test_provider_fence_proof_only_reconciles_stale_auto_lineage(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+        stale_at = now - timedelta(minutes=31)
+        cases = (
+            {
+                'name': 'stale_auto_without_proof',
+                'provider_fence_owned': False,
+                'trigger': 'auto_close_scheduler',
+                'updated_at': stale_at,
+                'run_metadata': {
+                    'entrypoint': (
+                        'PYKRX_BACKFILL_SERVICE.'
+                        'run_daily_pipeline_if_due'
+                    ),
+                    'mode': 'daily_auto',
+                    'resolved_stages': ['momentum_factors'],
+                },
+            },
+            {
+                'name': 'stale_manual_with_proof',
+                'provider_fence_owned': True,
+                'trigger': 'manual_api',
+                'updated_at': stale_at,
+                'run_metadata': {
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'mode': 'manual',
+                    'resolved_stages': ['momentum_factors'],
+                },
+            },
+            {
+                'name': 'fresh_auto_with_proof',
+                'provider_fence_owned': True,
+                'trigger': 'auto_close_scheduler',
+                'updated_at': now,
+                'run_metadata': {
+                    'entrypoint': (
+                        'PYKRX_BACKFILL_SERVICE.'
+                        'run_daily_pipeline_if_due'
+                    ),
+                    'mode': 'daily_auto',
+                    'resolved_stages': ['momentum_factors'],
+                },
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case['name']):
+                active_run = SimpleNamespace(
+                    id=341,
+                    market_date=date(2026, 8, 28),
+                    trigger=case['trigger'],
+                    status='running',
+                    current_stage='momentum_factors',
+                    started_at=stale_at - timedelta(minutes=5),
+                    updated_at=case['updated_at'],
+                    completed_at=None,
+                    error_message=None,
+                    run_metadata=case['run_metadata'],
+                )
+                active_stage = SimpleNamespace(
+                    id=812,
+                    pipeline_run_id=341,
+                    market_date=date(2026, 8, 28),
+                    stage_id='momentum_factors',
+                    status='running',
+                    processed=2,
+                    total=10,
+                    succeeded=2,
+                    failed=0,
+                    remaining=8,
+                    current_step='computing',
+                    current_activity='Computing momentum factors',
+                    current_symbol=None,
+                    current_period=None,
+                    started_at=stale_at - timedelta(minutes=5),
+                    updated_at=case['updated_at'],
+                    completed_at=None,
+                    error_message=None,
+                    source_run_ids={},
+                    details={},
+                )
+                active_result = MagicMock()
+                active_result.scalars.return_value = [active_run]
+                stages_result = MagicMock()
+                stages_result.scalars.return_value = [active_stage]
+                session = MagicMock()
+                session.execute.side_effect = [
+                    MagicMock(),
+                    active_result,
+                    stages_result,
+                ]
+                session_context = MagicMock()
+                session_context.__enter__.return_value = session
+
+                with (
+                    patch(
+                        'app.eod.daily_pipeline_state.session_scope',
+                        return_value=session_context,
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_state._utcnow',
+                        return_value=now,
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_state.settings.'
+                        'eod_auto_pykrx_stale_run_minutes',
+                        30,
+                    ),
+                ):
+                    result = DailyPipelineRunStateService().start_run(
+                        market_date='2026-08-28',
+                        trigger='auto_close_scheduler',
+                        requested_stages=['momentum_factors'],
+                        resolved_stages=['momentum_factors'],
+                        provider_admission_fence_owned=case[
+                            'provider_fence_owned'
+                        ],
+                    )
+
+                self.assertTrue(result['deduplicated'])
+                self.assertEqual(active_run.status, 'running')
+                self.assertEqual(active_stage.status, 'running')
+                session.add.assert_not_called()
+
+    def test_provider_fence_reconciles_stale_auto_lineage_before_admission(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+        stale_at = now - timedelta(minutes=31)
+        stale_run = SimpleNamespace(
+            id=341,
+            market_date=date(2026, 8, 28),
+            trigger='auto_close_scheduler',
+            status='running',
+            current_stage='momentum_factors',
+            started_at=stale_at - timedelta(minutes=5),
+            updated_at=stale_at,
+            completed_at=None,
+            error_message=None,
+            run_metadata={
+                'entrypoint': (
+                    'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+                ),
+                'mode': 'daily_auto',
+                'resolved_stages': ['momentum_factors'],
+            },
+        )
+        stale_stage = SimpleNamespace(
+            id=812,
+            pipeline_run_id=341,
+            market_date=date(2026, 8, 28),
+            stage_id='momentum_factors',
+            status='running',
+            processed=2,
+            total=10,
+            succeeded=2,
+            failed=0,
+            remaining=8,
+            current_step='computing',
+            current_activity='Computing momentum factors',
+            current_symbol=None,
+            current_period=None,
+            started_at=stale_at - timedelta(minutes=5),
+            updated_at=stale_at,
+            completed_at=None,
+            error_message=None,
+            source_run_ids={},
+            details={},
+        )
+        active_result = MagicMock()
+        active_result.scalars.return_value = [stale_run]
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = [stale_stage]
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            active_result,
+            stages_result,
+        ]
+
+        def assign_run_id(row) -> None:
+            row.id = 999
+
+        session.add.side_effect = assign_run_id
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+            patch(
+                'app.eod.daily_pipeline_state.settings.'
+                'eod_auto_pykrx_stale_run_minutes',
+                30,
+            ),
+        ):
+            result = DailyPipelineRunStateService().start_run(
+                market_date='2026-08-28',
+                trigger='auto_close_scheduler',
+                requested_stages=['momentum_factors'],
+                resolved_stages=['momentum_factors'],
+                provider_admission_fence_owned=True,
+            )
+
         self.assertNotIn('deduplicated', result)
-        self.assertEqual(stale_run.status, 'abandoned')
+        self.assertEqual(result['id'], 999)
+        self.assertEqual(stale_run.status, 'interrupted')
         self.assertEqual(stale_run.completed_at, now)
-        self.assertEqual(stale_run.run_metadata['abandoned_reason'], 'stale_activity_timeout')
-        self.assertEqual(stale_run.run_metadata['last_activity_at'], last_activity_at.isoformat())
+        self.assertEqual(
+            stale_run.run_metadata['interrupted_reason'],
+            'stale_auto_run_reconciled_under_provider_fence',
+        )
         self.assertTrue(stale_run.run_metadata['resumable'])
-        self.assertEqual(stale_stage.status, 'abandoned')
-        self.assertEqual(stale_stage.current_step, 'stale_run_abandoned')
-        self.assertEqual(stale_stage.details['stale_after_minutes'], 30)
-        admitted_run = session.add.call_args.args[0]
-        self.assertEqual(admitted_run.status, 'running')
-        self.assertEqual(admitted_run.trigger, 'monitor_stale_continuation')
-        self.assertEqual(admitted_run.run_metadata['resolved_stages'], ['signal_decider'])
-        self.assertNotIn('owner', admitted_run.run_metadata)
+        self.assertEqual(stale_stage.status, 'interrupted')
+        self.assertEqual(
+            stale_stage.current_step,
+            'provider_fence_reconciled',
+        )
+
+    def test_provider_fence_accepts_stale_auto_followup_recovery_lineage(
+        self,
+    ) -> None:
+        stale_cutoff = datetime(
+            2026,
+            8,
+            29,
+            11,
+            30,
+            tzinfo=timezone.utc,
+        )
+        recovery_run = SimpleNamespace(
+            trigger='auto_eod_followup_resume',
+            started_at=stale_cutoff - timedelta(minutes=5),
+            updated_at=stale_cutoff - timedelta(seconds=1),
+            run_metadata={
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'reused_eod_collection_run_id': 77,
+            },
+        )
+
+        self.assertTrue(
+            DailyPipelineRunStateService.
+            _is_stale_auto_run_owned_by_provider_fence(
+                recovery_run,
+                stale_cutoff=stale_cutoff,
+            )
+        )
+
+        for trigger in ('manual_daily_api', 'internal_ops_cli'):
+            with self.subTest(trigger=trigger):
+                provider_run = SimpleNamespace(
+                    trigger=trigger,
+                    started_at=stale_cutoff - timedelta(minutes=5),
+                    updated_at=stale_cutoff - timedelta(seconds=1),
+                    run_metadata={
+                        'entrypoint': (
+                            'PYKRX_BACKFILL_SERVICE.'
+                            'run_daily_pipeline_if_due'
+                        ),
+                        'mode': 'daily_auto',
+                    },
+                )
+                self.assertTrue(
+                    DailyPipelineRunStateService.
+                    _is_stale_auto_run_owned_by_provider_fence(
+                        provider_run,
+                        stale_cutoff=stale_cutoff,
+                    )
+                )
+
+    def test_provider_fence_blocks_all_when_any_same_date_owner_is_ineligible(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+        stale_at = now - timedelta(minutes=31)
+
+        def active_run(
+            run_id: int,
+            *,
+            updated_at: datetime,
+            trigger: str = 'auto_close_scheduler',
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                id=run_id,
+                market_date=date(2026, 8, 28),
+                trigger=trigger,
+                status='running',
+                current_stage='momentum_factors',
+                started_at=stale_at - timedelta(minutes=5),
+                updated_at=updated_at,
+                completed_at=None,
+                error_message=None,
+                run_metadata={
+                    'entrypoint': (
+                        'PYKRX_BACKFILL_SERVICE.'
+                        'run_daily_pipeline_if_due'
+                    ),
+                    'mode': 'daily_auto',
+                },
+            )
+
+        stale_auto = active_run(341, updated_at=stale_at)
+        fresh_auto = active_run(342, updated_at=now)
+        active_result = MagicMock()
+        active_result.scalars.return_value = [stale_auto, fresh_auto]
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            active_result,
+            stages_result,
+        ]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+            patch(
+                'app.eod.daily_pipeline_state.settings.'
+                'eod_auto_pykrx_stale_run_minutes',
+                30,
+            ),
+        ):
+            result = DailyPipelineRunStateService().start_run(
+                market_date='2026-08-28',
+                trigger='auto_close_scheduler',
+                requested_stages=['momentum_factors'],
+                resolved_stages=['momentum_factors'],
+                provider_admission_fence_owned=True,
+            )
+
+        self.assertTrue(result['deduplicated'])
+        self.assertEqual(stale_auto.status, 'running')
+        self.assertEqual(fresh_auto.status, 'running')
+        session.add.assert_not_called()
+
+    def test_heartbeat_stage_refreshes_owned_run_with_short_isolated_write(
+        self,
+    ) -> None:
+        previous = datetime(2026, 8, 29, 11, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 29, 11, 1, tzinfo=timezone.utc)
+        run = SimpleNamespace(
+            id=341,
+            status='running',
+            current_stage='momentum_factors',
+            updated_at=previous,
+        )
+        stage = SimpleNamespace(
+            pipeline_run_id=341,
+            stage_id='momentum_factors',
+            status='running',
+            updated_at=previous,
+            processed=17,
+            total=2_678,
+            current_activity='Computing momentum factors',
+            details={'source': 'daily_factor_followup'},
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stage_result = MagicMock()
+        stage_result.scalar_one_or_none.return_value = stage
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stage_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ) as session_scope_mock,
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+        ):
+            owned = DailyPipelineRunStateService().heartbeat_stage(
+                pipeline_run_id=341,
+                stage_id='momentum_factors',
+                market_date='2026-08-28',
+            )
+
+        self.assertTrue(owned)
+        session_scope_mock.assert_called_once_with(
+            statement_timeout_ms=2_000,
+            lock_timeout_ms=1_000,
+            isolated_connection=True,
+        )
+        self.assertEqual(run.updated_at, now)
+        self.assertEqual(stage.updated_at, now)
+        self.assertEqual(run.current_stage, 'momentum_factors')
+        self.assertEqual(stage.status, 'running')
+        self.assertEqual(stage.processed, 17)
+        self.assertEqual(stage.total, 2_678)
+        self.assertEqual(
+            stage.current_activity,
+            'Computing momentum factors',
+        )
+        self.assertEqual(
+            stage.details,
+            {'source': 'daily_factor_followup'},
+        )
+
+    def test_heartbeat_stage_rejects_stage_or_market_date_mismatch(self) -> None:
+        run = SimpleNamespace(
+            id=341,
+            status='running',
+            current_stage='momentum_factors',
+            updated_at=datetime(2026, 8, 29, 11, 0, tzinfo=timezone.utc),
+            market_date=date(2026, 8, 28),
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stage_result = MagicMock()
+        stage_result.scalar_one_or_none.return_value = None
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stage_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            owned = DailyPipelineRunStateService().heartbeat_stage(
+                pipeline_run_id=341,
+                stage_id='value_factors',
+                market_date='2026-08-28',
+            )
+
+        self.assertFalse(owned)
+        self.assertEqual(
+            run.updated_at,
+            datetime(2026, 8, 29, 11, 0, tzinfo=timezone.utc),
+        )
 
     def test_finish_run_rejects_terminal_run_owned_by_reconciled_worker(self) -> None:
         abandoned_run = SimpleNamespace(id=341, status='abandoned')
@@ -5088,6 +5579,50 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     status='completed',
                 )
         session_scope_mock.assert_called_once_with(statement_timeout_ms=15_000)
+
+    def test_finish_run_is_idempotent_for_same_terminal_status(self) -> None:
+        completed_at = datetime(
+            2026,
+            8,
+            29,
+            11,
+            0,
+            tzinfo=timezone.utc,
+        )
+        completed_run = SimpleNamespace(
+            id=341,
+            market_date=date(2026, 8, 28),
+            trigger='auto_close_scheduler',
+            status='completed',
+            current_stage='signal_decider',
+            started_at=completed_at - timedelta(hours=1),
+            updated_at=completed_at,
+            completed_at=completed_at,
+            error_message=None,
+            run_metadata={'terminal': True},
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = completed_run
+        stage_result = MagicMock()
+        stage_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stage_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = DailyPipelineRunStateService().finish_run(
+                pipeline_run_id=341,
+                status='completed',
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(completed_run.completed_at, completed_at)
+        self.assertEqual(completed_run.run_metadata, {'terminal': True})
+        session.flush.assert_not_called()
 
     def test_finish_stage_recomputes_stale_remaining_from_terminal_counts(self) -> None:
         now = datetime(2026, 9, 12, 16, 5, tzinfo=timezone.utc)

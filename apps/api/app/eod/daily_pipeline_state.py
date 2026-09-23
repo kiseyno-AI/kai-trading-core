@@ -43,6 +43,20 @@ _expired_decision_skip_evidence_is_valid = (
 
 ACTIVE_DAILY_PIPELINE_STATUSES = {'running'}
 DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS = 15_000
+DAILY_PIPELINE_HEARTBEAT_WRITE_TIMEOUT_MS = 2_000
+DAILY_PIPELINE_HEARTBEAT_LOCK_TIMEOUT_MS = 1_000
+PROVIDER_FENCED_AUTO_ENTRYPOINT = (
+    'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+)
+PROVIDER_FENCED_RECOVERY_ENTRYPOINT = 'daily_pipeline_stage_service.run'
+PROVIDER_FENCED_PRIMARY_TRIGGERS = frozenset(
+    {
+        'auto_close',
+        'auto_close_scheduler',
+        'manual_daily_api',
+        'internal_ops_cli',
+    }
+)
 STARTUP_RECOVERABLE_EOD_STATUSES = {
     'running',
     'completed',
@@ -333,6 +347,7 @@ class DailyPipelineRunStateService:
         requested_stages: Sequence[str],
         resolved_stages: Sequence[str],
         run_metadata: Mapping[str, Any] | None = None,
+        provider_admission_fence_owned: bool = False,
     ) -> dict[str, Any]:
         now = _utcnow()
         normalized_market_date = _normalize_market_date(market_date)
@@ -365,73 +380,92 @@ class DailyPipelineRunStateService:
             )
             stale_after_minutes = max(1, int(settings.eod_auto_pykrx_stale_run_minutes or 30))
             stale_cutoff = now - timedelta(minutes=stale_after_minutes)
-            current_active_rows: list[DailyPipelineRun] = []
-            for active_row in active_rows:
-                last_activity_at = _as_utc_datetime(active_row.updated_at or active_row.started_at)
-                if last_activity_at is None or last_activity_at > stale_cutoff:
-                    current_active_rows.append(active_row)
-                    continue
-
+            can_reconcile_all_active = bool(
+                active_rows
+                and provider_admission_fence_owned
+                and all(
+                    self._is_stale_auto_run_owned_by_provider_fence(
+                        row,
+                        stale_cutoff=stale_cutoff,
+                    )
+                    for row in active_rows
+                )
+            )
+            if can_reconcile_all_active:
                 reason = (
-                    f'Marked abandoned after {stale_after_minutes} minutes without daily pipeline activity.'
+                    'Interrupted stale automatic daily pipeline after the '
+                    'new provider worker acquired the same-date advisory fence.'
                 )
-                stale_metadata = dict(active_row.run_metadata or {})
-                stale_metadata.update(
-                    {
-                        'abandoned_reason': 'stale_activity_timeout',
-                        'abandoned_at': now.isoformat(),
-                        'last_activity_at': last_activity_at.isoformat(),
-                        'stale_after_minutes': stale_after_minutes,
-                        'resumable': True,
-                    }
-                )
-                active_row.status = 'abandoned'
-                active_row.error_message = reason
-                active_row.completed_at = now
-                active_row.updated_at = now
-                active_row.run_metadata = stale_metadata
-
-                running_stage_rows = list(
-                    session.execute(
-                        select(DailyPipelineStageRun)
-                        .where(
-                            DailyPipelineStageRun.pipeline_run_id == active_row.id,
-                            DailyPipelineStageRun.status.in_(ACTIVE_DAILY_PIPELINE_STATUSES),
-                        )
-                        .with_for_update()
-                    ).scalars()
-                )
-                for stage_row in running_stage_rows:
-                    details = dict(stage_row.details or {})
-                    details.update(
+                for active_row in active_rows:
+                    last_activity_at = _as_utc_datetime(
+                        active_row.updated_at or active_row.started_at
+                    )
+                    reconciliation_metadata = dict(
+                        active_row.run_metadata or {}
+                    )
+                    reconciliation_metadata.update(
                         {
-                            'abandoned_reason': 'stale_activity_timeout',
-                            'abandoned_at': now.isoformat(),
-                            'last_activity_at': last_activity_at.isoformat(),
+                            'interrupted_reason': (
+                                'stale_auto_run_reconciled_under_provider_fence'
+                            ),
+                            'interrupted_at': now.isoformat(),
+                            'last_activity_at': _iso(last_activity_at),
                             'stale_after_minutes': stale_after_minutes,
                             'resumable': True,
                         }
                     )
-                    stage_row.status = 'abandoned'
-                    stage_row.error_message = reason
-                    stage_row.current_step = 'stale_run_abandoned'
-                    stage_row.current_activity = reason
-                    stage_row.completed_at = now
-                    stage_row.updated_at = now
-                    stage_row.details = details
-
-            requested_stage_set = set(metadata['resolved_stages'])
-            existing_active = next(
-                (
-                    row
-                    for row in current_active_rows
-                    if requested_stage_set.intersection(
-                        set((row.run_metadata or {}).get('resolved_stages') or [])
+                    active_row.status = 'interrupted'
+                    active_row.error_message = reason
+                    active_row.completed_at = now
+                    active_row.updated_at = now
+                    active_row.run_metadata = reconciliation_metadata
+                    running_stage_rows = list(
+                        session.execute(
+                            select(DailyPipelineStageRun)
+                            .where(
+                                DailyPipelineStageRun.pipeline_run_id
+                                == active_row.id,
+                                DailyPipelineStageRun.status.in_(
+                                    ACTIVE_DAILY_PIPELINE_STATUSES
+                                ),
+                            )
+                            .with_for_update()
+                        ).scalars()
                     )
-                ),
-                None,
-            )
+                    for stage_row in running_stage_rows:
+                        details = dict(stage_row.details or {})
+                        details.update(
+                            {
+                                'interrupted_reason': (
+                                    'stale_auto_run_reconciled_under_provider_fence'
+                                ),
+                                'interrupted_at': now.isoformat(),
+                                'last_activity_at': _iso(last_activity_at),
+                                'stale_after_minutes': stale_after_minutes,
+                                'resumable': True,
+                            }
+                        )
+                        stage_row.status = 'interrupted'
+                        stage_row.error_message = reason
+                        stage_row.current_step = 'provider_fence_reconciled'
+                        stage_row.current_activity = reason
+                        stage_row.completed_at = now
+                        stage_row.updated_at = now
+                        stage_row.details = details
+                active_rows = []
+            # Timestamp age is alert evidence, not proof that the owning worker
+            # is dead. Startup reconciliation verifies the provider advisory
+            # lock before interrupting an orphan. Admission therefore fences
+            # every same-date active run, including non-overlapping suffixes.
+            existing_active = active_rows[0] if active_rows else None
             if existing_active is not None:
+                last_activity_at = _as_utc_datetime(
+                    existing_active.updated_at or existing_active.started_at
+                )
+                stale_activity_detected = bool(
+                    last_activity_at is not None
+                    and last_activity_at <= stale_cutoff
+                )
                 stage_rows = list(
                     session.execute(
                         select(DailyPipelineStageRun)
@@ -441,7 +475,15 @@ class DailyPipelineRunStateService:
                 )
                 payload = self._serialize_run(existing_active, stage_rows)
                 payload['deduplicated'] = True
-                payload['deduplication_reason'] = 'overlapping_run_already_active'
+                payload['deduplication_reason'] = (
+                    'stale_run_requires_explicit_reconciliation'
+                    if stale_activity_detected
+                    else 'overlapping_run_already_active'
+                )
+                payload['stale_activity_detected'] = stale_activity_detected
+                if stale_activity_detected:
+                    payload['stale_after_minutes'] = stale_after_minutes
+                    payload['last_activity_at'] = _iso(last_activity_at)
                 return payload
 
             if str(trigger or '').strip() == 'monitor_stale_continuation':
@@ -484,6 +526,38 @@ class DailyPipelineRunStateService:
             session.add(row)
             session.flush()
             return self._serialize_run(row, [])
+
+    @staticmethod
+    def _is_stale_auto_run_owned_by_provider_fence(
+        row: DailyPipelineRun,
+        *,
+        stale_cutoff: datetime,
+    ) -> bool:
+        last_activity_at = _as_utc_datetime(row.updated_at or row.started_at)
+        metadata = dict(row.run_metadata or {})
+        trigger = str(row.trigger or '').strip()
+        entrypoint = str(metadata.get('entrypoint') or '').strip()
+        primary_auto_lineage = bool(
+            trigger in PROVIDER_FENCED_PRIMARY_TRIGGERS
+            and entrypoint == PROVIDER_FENCED_AUTO_ENTRYPOINT
+            and str(metadata.get('mode') or '').strip() == 'daily_auto'
+        )
+        try:
+            reused_eod_collection_run_id = int(
+                metadata.get('reused_eod_collection_run_id') or 0
+            )
+        except (TypeError, ValueError):
+            reused_eod_collection_run_id = 0
+        followup_auto_lineage = bool(
+            trigger == 'auto_eod_followup_resume'
+            and entrypoint == PROVIDER_FENCED_RECOVERY_ENTRYPOINT
+            and reused_eod_collection_run_id > 0
+        )
+        return bool(
+            last_activity_at is not None
+            and last_activity_at <= stale_cutoff
+            and (primary_auto_lineage or followup_auto_lineage)
+        )
 
     def start_stage(
         self,
@@ -621,6 +695,56 @@ class DailyPipelineRunStateService:
             session.flush()
             return self._serialize_stage(row)
 
+    def heartbeat_stage(
+        self,
+        *,
+        pipeline_run_id: int,
+        stage_id: str,
+        market_date: str | date,
+    ) -> bool:
+        """Refresh only ownership timestamps in a short isolated transaction."""
+
+        now = _utcnow()
+        normalized_market_date = _normalize_market_date(market_date)
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_HEARTBEAT_WRITE_TIMEOUT_MS,
+            lock_timeout_ms=DAILY_PIPELINE_HEARTBEAT_LOCK_TIMEOUT_MS,
+            isolated_connection=True,
+        ) as session:
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(
+                    DailyPipelineRun.id == int(pipeline_run_id),
+                    DailyPipelineRun.market_date == normalized_market_date,
+                    DailyPipelineRun.status.in_(
+                        ACTIVE_DAILY_PIPELINE_STATUSES
+                    ),
+                    DailyPipelineRun.current_stage == stage_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if run_row is None:
+                return False
+            stage_row = session.execute(
+                select(DailyPipelineStageRun)
+                .where(
+                    DailyPipelineStageRun.pipeline_run_id
+                    == int(pipeline_run_id),
+                    DailyPipelineStageRun.market_date
+                    == normalized_market_date,
+                    DailyPipelineStageRun.stage_id == stage_id,
+                    DailyPipelineStageRun.status.in_(
+                        ACTIVE_DAILY_PIPELINE_STATUSES
+                    ),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if stage_row is None:
+                return False
+            run_row.updated_at = now
+            stage_row.updated_at = now
+            return True
+
     def finish_stage(
         self,
         *,
@@ -676,14 +800,27 @@ class DailyPipelineRunStateService:
             ).scalar_one_or_none()
             if row is None:
                 raise ValueError(f'daily pipeline run not found: {pipeline_run_id}')
+            requested_status = str(status or 'completed')
             if row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                if row.status == requested_status:
+                    stage_rows = list(
+                        session.execute(
+                            select(DailyPipelineStageRun)
+                            .where(
+                                DailyPipelineStageRun.pipeline_run_id
+                                == int(pipeline_run_id)
+                            )
+                            .order_by(DailyPipelineStageRun.id.asc())
+                        ).scalars()
+                    )
+                    return self._serialize_run(row, stage_rows)
                 raise ValueError(
                     f'daily pipeline run is not active: {pipeline_run_id} ({row.status})'
                 )
             metadata = dict(row.run_metadata or {})
             if run_metadata:
                 metadata.update(dict(run_metadata))
-            row.status = str(status or 'completed')
+            row.status = requested_status
             row.error_message = error_message
             row.completed_at = now
             row.updated_at = now

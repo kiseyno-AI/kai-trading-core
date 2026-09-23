@@ -687,7 +687,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertIn('daily_pipeline_stage_runs.market_date =', where_sql)
         self.assertIn('daily_pipeline_stage_runs.stage_id IN', where_sql)
 
-    def test_load_latest_pipeline_pykrx_run_reconciles_selected_daily_run_instead_of_newer_historical_backfill(self):
+    def test_load_latest_pipeline_pykrx_run_is_read_only_for_stale_looking_daily_run(self):
         historical_run = {
             'id': 900,
             'market': 'KRX',
@@ -723,30 +723,21 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'stage': 'technical_snapshots',
             },
         }
-        daily_failed_run = {
-            **daily_running_run,
-            'status': 'failed',
-            'symbols_failed': 2,
-            'error_message': 'Marked stale after 30 minutes without completion.',
-        }
-
         with (
             patch(
                 'app.eod.pipeline_status._load_pipeline_pykrx_run_rows',
-                side_effect=[
-                    [historical_run, daily_running_run],
-                    [historical_run, daily_failed_run],
-                ],
+                return_value=[historical_run, daily_running_run],
             ),
             patch(
-                'app.eod.pipeline_status.PYKRX_BACKFILL_SERVICE.reconcile_latest_daily_run_status',
+                'app.eod.pykrx_backfill.PYKRX_BACKFILL_SERVICE.'
+                'reconcile_latest_daily_run_status',
             ) as reconcile_run,
         ):
             result = _load_latest_pipeline_pykrx_run(trade_date='2026-04-21')
 
-        self.assertEqual(result['id'], daily_failed_run['id'])
-        self.assertEqual(result['status'], 'failed')
-        reconcile_run.assert_called_once_with(latest_run=daily_running_run)
+        self.assertEqual(result['id'], daily_running_run['id'])
+        self.assertEqual(result['status'], 'running')
+        reconcile_run.assert_not_called()
 
     def test_load_pipeline_pykrx_run_rows_filters_historical_runs_in_sql_before_limit(self):
         daily_run = {'id': 901, 'run_metadata': {'mode': 'daily_auto'}}

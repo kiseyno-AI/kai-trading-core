@@ -24,6 +24,7 @@ from app.eod.run_stage_support import (
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
 )
+from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.market.clock import get_market_state
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
@@ -82,6 +83,8 @@ AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
 )
 MAX_NON_BLOCKING_STAGE_MISSING_RATIO = 0.10
 PYKRX_PROVIDER_OUTAGE_EARLY_ABORT_FAILURES = 20
+FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS = 60.0
+DAILY_PIPELINE_TRACKER_FINISH_ATTEMPTS = 3
 POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS: frozenset[str] = frozenset(
     {
         'master_refresh',
@@ -546,6 +549,10 @@ def _resolve_auto_daily_tracked_stages(
     return [stage_id for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER if stage_id in requested_set]
 
 
+class DailyPipelineTrackingWriteError(RuntimeError):
+    """An ownership-critical official pipeline checkpoint was not persisted."""
+
+
 class _OfficialDailyPipelineTracker:
     def __init__(self, *, service: Any | None, log_fetch: Callable[..., None]) -> None:
         self.service = service
@@ -556,6 +563,23 @@ class _OfficialDailyPipelineTracker:
         self.stage_statuses: dict[str, str] = {}
         self.enabled = service is not None
 
+    def _log_tracking_failure(self, *, stage: str, exc: Exception, **extra: Any) -> None:
+        try:
+            self.log_fetch(
+                'daily_pipeline_tracking',
+                'failed',
+                stage=stage,
+                run_id=self.eod_run_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                **extra,
+            )
+        except Exception as log_exc:  # pragma: no cover - logging must be fail-open
+            logger.warning(
+                'daily pipeline tracking failure log also failed: %s',
+                log_exc,
+            )
+
     def start(
         self,
         *,
@@ -565,6 +589,7 @@ class _OfficialDailyPipelineTracker:
         resolved_stages: Sequence[str],
         eod_run_id: int | None,
         run_metadata: dict[str, Any],
+        provider_admission_fence_owned: bool = False,
     ) -> dict[str, Any] | None:
         if not self.enabled or self.service is None:
             return None
@@ -581,6 +606,9 @@ class _OfficialDailyPipelineTracker:
                 requested_stages=requested_stages,
                 resolved_stages=resolved_stages,
                 run_metadata=tracking_metadata,
+                provider_admission_fence_owned=(
+                    provider_admission_fence_owned
+                ),
             )
             if run.get('deduplicated'):
                 self.enabled = False
@@ -597,18 +625,15 @@ class _OfficialDailyPipelineTracker:
             self.market_date = market_date
             self.eod_run_id = eod_run_id
             return run
-        except Exception as exc:  # pragma: no cover - defensive production guard
-            self.enabled = False
+        except Exception as exc:
             logger.warning('daily pipeline tracker start failed for auto EOD run %s: %s', eod_run_id, exc)
-            self.log_fetch(
-                'daily_pipeline_tracking',
-                'failed',
+            self._log_tracking_failure(
                 stage='start_run',
-                run_id=eod_run_id,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
+                exc=exc,
             )
-            return None
+            raise DailyPipelineTrackingWriteError(
+                f'daily pipeline admission checkpoint failed: {exc}'
+            ) from exc
 
     def update_stage(
         self,
@@ -655,16 +680,44 @@ class _OfficialDailyPipelineTracker:
                 source_run_ids=merged_source_run_ids,
                 details=merged_details,
             )
-        except Exception as exc:  # pragma: no cover - defensive production guard
+        except Exception as exc:
             logger.warning('daily pipeline tracker update failed for run %s stage %s: %s', self.eod_run_id, stage, exc)
-            self.log_fetch(
-                'daily_pipeline_tracking',
-                'failed',
+            self._log_tracking_failure(
                 stage=stage,
-                run_id=self.eod_run_id,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
+                exc=exc,
             )
+            raise DailyPipelineTrackingWriteError(
+                f'daily pipeline stage checkpoint failed for {stage}: {exc}'
+            ) from exc
+
+    def heartbeat_stage(self, *, stage: str) -> bool:
+        if (
+            not self.enabled
+            or self.service is None
+            or self.pipeline_run_id is None
+            or self.market_date is None
+        ):
+            return True
+        try:
+            return bool(
+                self.service.heartbeat_stage(
+                    pipeline_run_id=self.pipeline_run_id,
+                    stage_id=stage,
+                    market_date=self.market_date,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive production guard
+            logger.warning(
+                'daily pipeline heartbeat failed for run %s stage %s: %s',
+                self.eod_run_id,
+                stage,
+                exc,
+            )
+            self._log_tracking_failure(
+                stage=stage,
+                exc=exc,
+            )
+            return True
 
     def link_eod_run(self, eod_run_id: int) -> None:
         self.eod_run_id = int(eod_run_id)
@@ -679,45 +732,72 @@ class _OfficialDailyPipelineTracker:
                 pipeline_run_id=self.pipeline_run_id,
                 eod_run_id=self.eod_run_id,
             )
-        except Exception as exc:  # pragma: no cover - defensive production guard
+        except Exception as exc:
             logger.warning(
                 'daily pipeline EOD link failed for provider run %s: %s',
                 self.eod_run_id,
                 exc,
             )
-            self.log_fetch(
-                'daily_pipeline_tracking',
-                'failed',
+            self._log_tracking_failure(
                 stage='link_eod_run',
-                run_id=self.eod_run_id,
+                exc=exc,
                 pipeline_run_id=self.pipeline_run_id,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
             )
+            raise DailyPipelineTrackingWriteError(
+                f'daily pipeline EOD link checkpoint failed: {exc}'
+            ) from exc
 
     def finish_run(self, *, status: str | None = None, error_message: str | None = None) -> None:
         if not self.enabled or self.service is None or self.pipeline_run_id is None:
             return
         final_status = status or self.resolve_overall_status()
+        last_error: Exception | None = None
+        for attempt in range(1, DAILY_PIPELINE_TRACKER_FINISH_ATTEMPTS + 1):
+            try:
+                self.service.finish_run(
+                    pipeline_run_id=self.pipeline_run_id,
+                    status=final_status,
+                    error_message=error_message,
+                    run_metadata={
+                        'stage_statuses': dict(self.stage_statuses),
+                        'eod_collection_run_id': self.eod_run_id,
+                    },
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    'daily pipeline tracker finish attempt %s/%s failed for run %s: %s',
+                    attempt,
+                    DAILY_PIPELINE_TRACKER_FINISH_ATTEMPTS,
+                    self.eod_run_id,
+                    exc,
+                )
+        assert last_error is not None
+        self._log_tracking_failure(
+            stage='finish_run',
+            exc=last_error,
+            attempts=DAILY_PIPELINE_TRACKER_FINISH_ATTEMPTS,
+        )
+        raise DailyPipelineTrackingWriteError(
+            f'daily pipeline terminal checkpoint failed after '
+            f'{DAILY_PIPELINE_TRACKER_FINISH_ATTEMPTS} attempts: {last_error}'
+        ) from last_error
+
+    def finish_run_preserving_primary_error(
+        self,
+        *,
+        error_message: str,
+    ) -> None:
+        """Retry terminal tracking without masking the worker's root error."""
+
         try:
-            self.service.finish_run(
-                pipeline_run_id=self.pipeline_run_id,
-                status=final_status,
-                error_message=error_message,
-                run_metadata={
-                    'stage_statuses': dict(self.stage_statuses),
-                    'eod_collection_run_id': self.eod_run_id,
-                },
-            )
-        except Exception as exc:  # pragma: no cover - defensive production guard
-            logger.warning('daily pipeline tracker finish failed for run %s: %s', self.eod_run_id, exc)
-            self.log_fetch(
-                'daily_pipeline_tracking',
-                'failed',
-                stage='finish_run',
-                run_id=self.eod_run_id,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
+            self.finish_run(status='failed', error_message=error_message)
+        except DailyPipelineTrackingWriteError as exc:
+            logger.error(
+                'Unable to terminalize official daily pipeline after '
+                'worker failure: %s',
+                exc,
             )
 
     def resolve_overall_status(self) -> str:
@@ -750,7 +830,58 @@ def _run_daily_piotroski_filter_followup(
     )
 
 
-def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
+def _execute_factor_stage_with_heartbeat(
+    *,
+    call: Callable[[], dict[str, Any]],
+    heartbeat: Callable[[], bool],
+    interval_seconds: float,
+    thread_name: str,
+) -> tuple[dict[str, Any], bool]:
+    pulse = PeriodicStageHeartbeat(
+        heartbeat,
+        interval_seconds=interval_seconds,
+        thread_name=thread_name,
+    )
+    if not pulse.check_now():
+        return (
+            {
+                'status': 'interrupted',
+                'reason': 'pipeline_run_ownership_lost',
+            },
+            False,
+        )
+    try:
+        with pulse:
+            result = call()
+    except Exception as exc:
+        if not pulse.ownership_lost:
+            raise
+        return (
+            {
+                'status': 'interrupted',
+                'reason': 'pipeline_run_ownership_lost',
+                'error_type': type(exc).__name__,
+                'error_message': str(exc),
+            },
+            False,
+        )
+    return result, not pulse.ownership_lost
+
+
+def _run_daily_factor_followup(
+    *,
+    market_date: str,
+    stage_executor: (
+        Callable[
+            [str, Callable[[], dict[str, Any]]],
+            tuple[dict[str, Any], bool],
+        ]
+        | None
+    ) = None,
+    stage_result_callback: (
+        Callable[[str, dict[str, Any]], None] | None
+    ) = None,
+) -> dict[str, Any]:
     from app.signals.advanced_value_factor import ADVANCED_VALUE_FACTOR_SOURCE, daily_advanced_value_factor_service
     from app.signals.beta_factor import BETA_FACTOR_SOURCE, daily_beta_factor_service
     from app.signals.composite_factor import COMPOSITE_FACTOR_SOURCE, daily_composite_factor_service
@@ -795,7 +926,26 @@ def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
     overall_status = 'completed'
     for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
         try:
-            result = stage_calls[stage_id]()
+            if stage_executor is None:
+                result = stage_calls[stage_id]()
+                ownership_retained = True
+            else:
+                result, ownership_retained = stage_executor(
+                    stage_id,
+                    stage_calls[stage_id],
+                )
+            if not ownership_retained:
+                stages[stage_id] = {
+                    'status': 'interrupted',
+                    'result': result,
+                }
+                return {
+                    'triggered': False,
+                    'reason': 'pipeline_run_ownership_lost',
+                    'market_date': market_date,
+                    'status': 'interrupted',
+                    'stages': stages,
+                }
             failed = int(
                 result.get('results_failed')
                 or result.get('failed')
@@ -805,23 +955,32 @@ def _run_daily_factor_followup(*, market_date: str) -> dict[str, Any]:
             stage_status = 'completed' if failed == 0 else 'partial'
             if failed:
                 overall_status = 'partial'
-            stages[stage_id] = {
+            stage_result = {
                 'status': stage_status,
                 'result': result,
             }
+            stages[stage_id] = stage_result
+            if stage_result_callback is not None:
+                stage_result_callback(stage_id, stage_result)
         except Exception as exc:  # pragma: no cover - defensive production guard
             logger.exception('Daily factor follow-up failed for %s on %s', stage_id, market_date)
             overall_status = 'partial'
-            stages[stage_id] = {
+            stage_result = {
                 'status': 'failed',
                 'error_type': type(exc).__name__,
                 'error_message': str(exc),
             }
+            stages[stage_id] = stage_result
+            if stage_result_callback is not None:
+                stage_result_callback(stage_id, stage_result)
     return {
         'triggered': True,
         'market_date': market_date,
         'status': overall_status,
         'stages': stages,
+        '_stage_results_recorded_incrementally': (
+            stage_result_callback is not None
+        ),
     }
 
 
@@ -1259,6 +1418,7 @@ def run_market_data_pipeline(
     chain_fundamentals_followup: bool = True,
     track_daily_pipeline: bool = False,
     point_in_time_recovery: bool = False,
+    provider_admission_fence_owned: bool = False,
 ) -> dict:
     feedback_knowledge_cutoff_at: datetime | None = None
 
@@ -1505,9 +1665,8 @@ def run_market_data_pipeline(
         selected_stages=resolved_selected_stages,
         chain_fundamentals_followup=chain_fundamentals_followup,
     )
-    # Keep the intended stage contract on the EOD row itself. The official
-    # tracker is fail-open, so this is the durable evidence used to detect a
-    # restart between EOD finalization and the first follow-up checkpoint.
+    # Keep the intended stage contract on the EOD row itself so restart
+    # recovery can prove which follow-ups remain after EOD finalization.
     run_metadata['expected_daily_pipeline_stages'] = list(tracked_stages)
     daily_pipeline_tracker = _OfficialDailyPipelineTracker(
         service=dependencies.daily_pipeline_run_state_service if track_daily_pipeline else None,
@@ -1527,6 +1686,7 @@ def run_market_data_pipeline(
             'chain_fundamentals_followup': chain_fundamentals_followup,
             'retry': retry_context,
         },
+        provider_admission_fence_owned=provider_admission_fence_owned,
     )
     if pipeline_admission and pipeline_admission.get('deduplicated'):
         return {
@@ -1558,14 +1718,87 @@ def run_market_data_pipeline(
             run_metadata=run_metadata,
         )
     except Exception as exc:
-        daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
+        daily_pipeline_tracker.finish_run_preserving_primary_error(
+            error_message=str(exc)
+        )
         raise
-    daily_pipeline_tracker.link_eod_run(run_id)
 
     symbols_succeeded = 0
     symbols_failed = 0
     failed_symbols: list[str] = []
     bars_upserted = 0
+
+    def terminalize_tracking_failure(
+        exc: Exception,
+        *,
+        current_step: str,
+    ) -> None:
+        """Best-effort cleanup without masking the critical checkpoint error."""
+
+        nonlocal run_metadata
+        run_metadata = dependencies.update_run_stage_metadata(
+            run_metadata,
+            stage='price_collection',
+            status='failed',
+            current_step=current_step,
+            current_activity='Official daily pipeline tracking failed',
+            processed=symbols_succeeded + symbols_failed,
+            total=len(symbols),
+            succeeded=symbols_succeeded,
+            failed=symbols_failed,
+            current_symbol=first_symbol,
+            extra={
+                'tracking_checkpoint_failed': True,
+                'error_type': type(exc).__name__,
+                'bars_upserted': bars_upserted,
+            },
+        )
+        try:
+            dependencies.complete_eod_collection_run(
+                run_id,
+                status='failed',
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                error_message=str(exc),
+                run_metadata=run_metadata,
+            )
+        except Exception as cleanup_exc:  # pragma: no cover - defensive log
+            logger.warning(
+                'EOD cleanup failed after daily pipeline tracking setup '
+                'failure for run %s: %s',
+                run_id,
+                cleanup_exc,
+            )
+        try:
+            daily_pipeline_tracker.finish_run(
+                status='failed',
+                error_message=str(exc),
+            )
+        except Exception as cleanup_exc:  # bounded retry already occurred
+            logger.warning(
+                'Official pipeline cleanup failed after tracking setup '
+                'failure for run %s: %s',
+                run_id,
+                cleanup_exc,
+            )
+
+    def complete_eod_run_or_fail_tracking(**kwargs: Any) -> None:
+        try:
+            dependencies.complete_eod_collection_run(run_id, **kwargs)
+        except Exception as exc:
+            daily_pipeline_tracker.finish_run_preserving_primary_error(
+                error_message=str(exc)
+            )
+            raise
+
+    try:
+        daily_pipeline_tracker.link_eod_run(run_id)
+    except Exception as exc:
+        terminalize_tracking_failure(
+            exc,
+            current_step='daily_pipeline_link_failed',
+        )
+        raise
 
     def persist_stage_progress(
         *,
@@ -1600,20 +1833,27 @@ def run_market_data_pipeline(
             current_period=current_period,
             extra=metadata_extra,
         )
-        daily_pipeline_tracker.update_stage(
-            stage=stage,
-            status=status,
-            current_step=current_step,
-            current_activity=current_activity,
-            processed=processed,
-            total=total,
-            succeeded=succeeded,
-            failed=failed,
-            current_symbol=current_symbol,
-            current_period=current_period,
-            source_run_ids=source_run_ids,
-            details=metadata_extra,
-        )
+        try:
+            daily_pipeline_tracker.update_stage(
+                stage=stage,
+                status=status,
+                current_step=current_step,
+                current_activity=current_activity,
+                processed=processed,
+                total=total,
+                succeeded=succeeded,
+                failed=failed,
+                current_symbol=current_symbol,
+                current_period=current_period,
+                source_run_ids=source_run_ids,
+                details=metadata_extra,
+            )
+        except DailyPipelineTrackingWriteError as exc:
+            terminalize_tracking_failure(
+                exc,
+                current_step=f'{stage}_tracking_failed',
+            )
+            raise
         try:
             dependencies.update_eod_collection_run_progress(
                 run_id,
@@ -1713,6 +1953,8 @@ def run_market_data_pipeline(
                     persisted_count=persisted_count,
                     duration_ms=round((time.perf_counter() - symbol_started_at) * 1000, 3),
                 )
+            except DailyPipelineTrackingWriteError:
+                raise
             except Exception as exc:
                 symbols_failed += 1
                 failed_symbols.append(item.symbol)
@@ -1797,6 +2039,8 @@ def run_market_data_pipeline(
                         **_gap_policy_details(failed=symbols_failed, total=len(symbols)),
                     },
                 )
+            except DailyPipelineTrackingWriteError:
+                raise
             except Exception as exc:
                 logger.warning('pykrx progress update failed for run %s after %s: %s', run_id, item.symbol, exc)
                 dependencies.log_fetch(
@@ -1843,15 +2087,25 @@ def run_market_data_pipeline(
         )
         if failed_symbols:
             run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
-        dependencies.complete_eod_collection_run(
-            run_id,
-            status='failed',
-            symbols_succeeded=symbols_succeeded,
-            symbols_failed=symbols_failed,
-            error_message=str(exc),
-            run_metadata=run_metadata,
+        try:
+            dependencies.complete_eod_collection_run(
+                run_id,
+                status='failed',
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                error_message=str(exc),
+                run_metadata=run_metadata,
+            )
+        except Exception as cleanup_exc:
+            logger.warning(
+                'EOD cleanup failed after price collection error for run '
+                '%s: %s',
+                run_id,
+                cleanup_exc,
+            )
+        daily_pipeline_tracker.finish_run_preserving_primary_error(
+            error_message=str(exc)
         )
-        daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
         raise
 
     turnover_coverage = _summarize_turnover_coverage(
@@ -1895,8 +2149,7 @@ def run_market_data_pipeline(
             },
         )
         run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
-        dependencies.complete_eod_collection_run(
-            run_id,
+        complete_eod_run_or_fail_tracking(
             status='failed',
             symbols_succeeded=symbols_succeeded,
             symbols_failed=symbols_failed,
@@ -2793,8 +3046,7 @@ def run_market_data_pipeline(
     run_metadata['turnover_invalid_symbols_count'] = len(
         run_metadata['turnover_invalid_symbols']
     )
-    dependencies.complete_eod_collection_run(
-        run_id,
+    complete_eod_run_or_fail_tracking(
         status=status,
         symbols_succeeded=symbols_succeeded,
         symbols_failed=symbols_failed,
@@ -2956,47 +3208,64 @@ def run_market_data_pipeline(
             extra=details,
         )
 
+    def record_factor_stage_result(
+        stage_id: str,
+        raw_stage_result: dict[str, Any],
+        *,
+        factor_followup_status: str | None,
+    ) -> None:
+        nested_result = (
+            raw_stage_result.get('result')
+            if isinstance(raw_stage_result.get('result'), dict)
+            else {}
+        )
+        stage_status = _normalize_stage_status(
+            raw_stage_result.get('status')
+        )
+        counts = _extract_result_counts(nested_result, default_total=0)
+        if stage_status == 'failed' and counts['failed'] <= 0:
+            counts['failed'] = 1
+            counts['processed'] = max(counts['processed'], 1)
+            counts['total'] = max(counts['total'], 1)
+        persist_stage_progress(
+            stage=stage_id,
+            status=stage_status,
+            current_step=f'{stage_id}_{stage_status}',
+            current_activity=(
+                f'{_status_activity_prefix(stage_status)} '
+                f'{stage_id.replace("_", " ")}'
+            ),
+            processed=counts['processed'],
+            total=counts['total'],
+            succeeded=counts['succeeded'],
+            failed=counts['failed'],
+            extra={
+                'factor_scoring_followup_status': factor_followup_status,
+                'result_summary': _compact_result_summary(
+                    nested_result or raw_stage_result
+                ),
+            },
+        )
+
     def record_factor_followup_result(factor_result: dict[str, Any]) -> None:
         stage_results = factor_result.get('stages') if isinstance(factor_result.get('stages'), dict) else {}
         for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
             raw_stage_result = stage_results.get(stage_id) if isinstance(stage_results.get(stage_id), dict) else {}
-            nested_result = (
-                raw_stage_result.get('result')
-                if isinstance(raw_stage_result.get('result'), dict)
-                else {}
-            )
-            stage_status = (
-                _normalize_stage_status(raw_stage_result.get('status'))
-                if raw_stage_result
-                else _resolve_result_status(factor_result)
-            )
             if factor_result.get('triggered') is True and not raw_stage_result:
-                stage_status = 'failed'
                 raw_stage_result = {
                     'status': 'failed',
                     'reason': 'factor_followup_missing_stage_result',
                     'market_date': factor_result.get('market_date'),
                 }
             elif not raw_stage_result:
-                raw_stage_result = factor_result
-            counts = _extract_result_counts(nested_result, default_total=0)
-            if stage_status == 'failed' and counts['failed'] <= 0:
-                counts['failed'] = 1
-                counts['processed'] = max(counts['processed'], 1)
-                counts['total'] = max(counts['total'], 1)
-            persist_stage_progress(
-                stage=stage_id,
-                status=stage_status,
-                current_step=f'{stage_id}_{stage_status}',
-                current_activity=f'{_status_activity_prefix(stage_status)} {stage_id.replace("_", " ")}',
-                processed=counts['processed'],
-                total=counts['total'],
-                succeeded=counts['succeeded'],
-                failed=counts['failed'],
-                extra={
-                    'factor_scoring_followup_status': factor_result.get('status'),
-                    'result_summary': _compact_result_summary(nested_result or raw_stage_result),
-                },
+                raw_stage_result = {
+                    **factor_result,
+                    'status': _resolve_result_status(factor_result),
+                }
+            record_factor_stage_result(
+                stage_id,
+                raw_stage_result,
+                factor_followup_status=factor_result.get('status'),
             )
 
     def build_blocked_followup_result(stage_id: str, reason: str, *, upstream_status: str | None = None) -> dict[str, Any]:
@@ -3010,13 +3279,64 @@ def run_market_data_pipeline(
         }
 
     def run_factor_followup() -> dict[str, Any]:
-        record_followup_start('momentum_factors', 'Running daily factor scoring follow-up')
+        started_factor_stages = {'momentum_factors'}
+        record_followup_start(
+            'momentum_factors',
+            'Running daily momentum factors',
+        )
+
+        def execute_factor_stage(
+            stage_id: str,
+            call: Callable[[], dict[str, Any]],
+        ) -> tuple[dict[str, Any], bool]:
+            if stage_id not in started_factor_stages:
+                record_followup_start(
+                    stage_id,
+                    f'Running daily {stage_id.replace("_", " ")}',
+                )
+                started_factor_stages.add(stage_id)
+            return _execute_factor_stage_with_heartbeat(
+                call=call,
+                heartbeat=lambda: (
+                    daily_pipeline_tracker.heartbeat_stage(stage=stage_id)
+                ),
+                interval_seconds=FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS,
+                thread_name=(
+                    f'daily-eod-{run_id}-{stage_id}-heartbeat'
+                ),
+            )
+
+        def record_incremental_factor_result(
+            stage_id: str,
+            stage_result: dict[str, Any],
+        ) -> None:
+            record_factor_stage_result(
+                stage_id,
+                stage_result,
+                factor_followup_status=stage_result.get('status'),
+            )
+
         try:
-            factor_result = _run_daily_factor_followup(market_date=latest_trade_date)
+            factor_result = _run_daily_factor_followup(
+                market_date=latest_trade_date,
+                stage_executor=execute_factor_stage,
+                stage_result_callback=record_incremental_factor_result,
+            )
         except Exception as exc:
             record_followup_failure('momentum_factors', exc)
             raise
-        record_factor_followup_result(factor_result)
+        recorded_incrementally = bool(
+            factor_result.pop(
+                '_stage_results_recorded_incrementally',
+                False,
+            )
+        )
+        if (
+            not recorded_incrementally
+            and factor_result.get('reason')
+            != 'pipeline_run_ownership_lost'
+        ):
+            record_factor_followup_result(factor_result)
         return factor_result
 
     def collect_post_factor_signal_features() -> dict[str, Any]:
@@ -3230,6 +3550,13 @@ def run_market_data_pipeline(
                 stage_id='piotroski_filter',
             ):
                 result['factor_scoring_followup'] = run_factor_followup()
+                if (
+                    result['factor_scoring_followup'].get('reason')
+                    == 'pipeline_run_ownership_lost'
+                ):
+                    result['status'] = 'interrupted'
+                    result['reason'] = 'pipeline_run_ownership_lost'
+                    return result
             else:
                 result['factor_scoring_followup'] = (
                     build_blocked_followup_result(
@@ -3407,6 +3734,13 @@ def run_market_data_pipeline(
             )
             if fundamentals_satisfied and piotroski_satisfied:
                 result['factor_scoring_followup'] = run_factor_followup()
+                if (
+                    result['factor_scoring_followup'].get('reason')
+                    == 'pipeline_run_ownership_lost'
+                ):
+                    result['status'] = 'interrupted'
+                    result['reason'] = 'pipeline_run_ownership_lost'
+                    return result
                 factor_status = _resolve_result_status(
                     result['factor_scoring_followup']
                 )
@@ -3731,7 +4065,9 @@ def run_market_data_pipeline(
                 result['signal_decider_evaluation_followup'],
             )
     except Exception as exc:
-        daily_pipeline_tracker.finish_run(status='failed', error_message=str(exc))
+        daily_pipeline_tracker.finish_run_preserving_primary_error(
+            error_message=str(exc)
+        )
         raise
     daily_pipeline_tracker.finish_run()
     if retry_context is not None:

@@ -11,9 +11,13 @@ from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from app.agent_context.derived_contexts import daily_price_context_service
+from app.agent_context.prerequisite_service import (
+    FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
+)
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import (
+    ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS,
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
     terminal_continuation_feedback_lease_loss_run_id,
@@ -101,6 +105,10 @@ TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
     'signal_decider',
     'next_open_execution_plan',
     'signal_decider_evaluations',
+)
+CURRENT_FEEDBACK_ORDERING_PREREQUISITE_STAGES = (
+    *FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
+    'signal_features',
 )
 RETRYABLE_DAILY_STATUSES = {'completed_with_errors', 'failed'}
 PYKRX_STAGE_SEQUENCE = (
@@ -936,15 +944,98 @@ def _utcnow_iso() -> str:
 
 
 def _parse_activity_datetime(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _feedback_suffix_has_stale_prerequisite_ordering(
+    *,
+    stage_rows: Mapping[str, Any],
+    point_in_time_recovery: bool,
+) -> bool:
+    """Detect terminal feedback artifacts produced before required inputs."""
+
+    downstream_boundaries: list[datetime] = []
+    for stage_id in ('agent_feedback_summaries', 'signal_decider'):
+        stage = stage_rows.get(stage_id)
+        if not isinstance(stage, Mapping):
+            continue
+        boundary = (
+            _parse_activity_datetime(stage.get('started_at'))
+            or _parse_activity_datetime(stage.get('completed_at'))
+            or _parse_activity_datetime(stage.get('updated_at'))
+        )
+        if boundary is not None:
+            downstream_boundaries.append(boundary)
+    if not downstream_boundaries:
+        return False
+
+    prerequisite_stage_ids = (
+        FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+        if point_in_time_recovery
+        else (
+            *CURRENT_FEEDBACK_ORDERING_PREREQUISITE_STAGES,
+            *ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS,
+        )
+    )
+    downstream_started_at = min(downstream_boundaries)
+    for stage_id in prerequisite_stage_ids:
+        stage = stage_rows.get(stage_id)
+        if not isinstance(stage, Mapping):
+            continue
+        prerequisite_completed_at = (
+            _parse_activity_datetime(stage.get('completed_at'))
+            or _parse_activity_datetime(stage.get('updated_at'))
+        )
+        if (
+            prerequisite_completed_at is not None
+            and prerequisite_completed_at > downstream_started_at
+        ):
+            return True
+    return False
+
+
+def _signal_features_have_stale_prerequisite_ordering(
+    *,
+    stage_rows: Mapping[str, Any],
+    point_in_time_recovery: bool,
+) -> bool:
+    if point_in_time_recovery:
+        return False
+    signal_features = stage_rows.get('signal_features')
+    if not isinstance(signal_features, Mapping):
+        return False
+    signal_started_at = (
+        _parse_activity_datetime(signal_features.get('started_at'))
+        or _parse_activity_datetime(signal_features.get('completed_at'))
+        or _parse_activity_datetime(signal_features.get('updated_at'))
+    )
+    if signal_started_at is None:
+        return False
+    for stage_id in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER:
+        stage = stage_rows.get(stage_id)
+        if not isinstance(stage, Mapping):
+            continue
+        prerequisite_completed_at = (
+            _parse_activity_datetime(stage.get('completed_at'))
+            or _parse_activity_datetime(stage.get('updated_at'))
+        )
+        if (
+            prerequisite_completed_at is not None
+            and prerequisite_completed_at > signal_started_at
+        ):
+            return True
+    return False
 
 
 def _update_run_stage_metadata(
@@ -1834,6 +1925,7 @@ class PykrxBackfillService:
         requested_symbols: Sequence[str],
         point_in_time_recovery: bool,
         failure_reason: str,
+        provider_admission_fence_owned: bool = False,
     ) -> dict[str, Any]:
         """Persist a bounded attempt when follow-up scope is unprovable."""
 
@@ -1847,7 +1939,7 @@ class PykrxBackfillService:
             requested_stages=list(recovery_stages),
             resolved_stages=list(recovery_stages),
             run_metadata={
-                'entrypoint': AUTO_EOD_PIPELINE_ENTRYPOINT,
+                'entrypoint': 'daily_pipeline_stage_service.run',
                 'reused_eod_collection_run_id': int(latest_eod_run['id']),
                 'point_in_time_recovery': point_in_time_recovery,
                 'resume_from_stage': resume_from_stage,
@@ -1857,6 +1949,9 @@ class PykrxBackfillService:
                 ),
                 'failure_reason': failure_reason,
             },
+            provider_admission_fence_owned=(
+                provider_admission_fence_owned
+            ),
         )
         if started_run.get('deduplicated'):
             result = build_daily_skip_result(
@@ -2177,6 +2272,7 @@ class PykrxBackfillService:
         markets: Sequence[str],
         allow_safe_downstream_scope_with_price_failures: bool = False,
         point_in_time_recovery: bool = False,
+        provider_admission_fence_owned: bool = False,
     ) -> dict | None:
         """Resume failed post-collection stages without downloading prices again."""
 
@@ -2295,6 +2391,38 @@ class PykrxBackfillService:
             )
             if not outcome_is_satisfied(stage_outcome):
                 incomplete_stages.append(stage_id)
+        stale_feedback_ordering = (
+            _feedback_suffix_has_stale_prerequisite_ordering(
+                stage_rows=stage_rows,
+                point_in_time_recovery=point_in_time_recovery,
+            )
+        )
+        stale_signal_feature_ordering = (
+            _signal_features_have_stale_prerequisite_ordering(
+                stage_rows=stage_rows,
+                point_in_time_recovery=point_in_time_recovery,
+            )
+        )
+        ordering_repair_stage = (
+            'signal_features'
+            if stale_signal_feature_ordering
+            and 'signal_features' in recovery_scope
+            else (
+                'agent_feedback_summaries'
+                if stale_feedback_ordering
+                and 'agent_feedback_summaries' in recovery_scope
+                else None
+            )
+        )
+        if (
+            ordering_repair_stage is not None
+            and (
+                not incomplete_stages
+                or recovery_scope.index(ordering_repair_stage)
+                < recovery_scope.index(incomplete_stages[0])
+            )
+        ):
+            incomplete_stages.insert(0, ordering_repair_stage)
         pipeline_status = str(pipeline_run.get('status') or '').strip().lower()
         downstream_resume_from_stage = str(
             latest_eod_metadata.get('downstream_retry_resume_from_stage') or ''
@@ -2582,6 +2710,9 @@ class PykrxBackfillService:
                     failure_reason=(
                         'followup_recovery_price_scope_unavailable'
                     ),
+                    provider_admission_fence_owned=(
+                        provider_admission_fence_owned
+                    ),
                 )
 
         if (
@@ -2620,6 +2751,9 @@ class PykrxBackfillService:
                     failure_reason=(
                         'point_in_time_recovery_scope_unavailable'
                     ),
+                    provider_admission_fence_owned=(
+                        provider_admission_fence_owned
+                    ),
                 )
 
         # Imported lazily because the stage orchestrator depends on this service.
@@ -2635,15 +2769,35 @@ class PykrxBackfillService:
                 if str(market or '').strip()
             )
 
+        feedback_input_stage_ids = set(
+            FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+        )
+        if not point_in_time_recovery:
+            feedback_input_stage_ids.add('signal_features')
+            feedback_input_stage_ids.update(
+                ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS
+            )
+        rebuilds_feedback_inputs = bool(
+            'agent_feedback_summaries' in recovery_stages
+            and feedback_input_stage_ids.intersection(recovery_stages)
+        )
+        force_feedback_recompute = bool(
+            ordering_repair_stage is not None
+            or rebuilds_feedback_inputs
+        )
+
         recovery_kwargs: dict[str, Any] = {
             'market_date': market_date,
             'stages': recovery_stages,
             'markets': recovery_markets,
-            'force': False,
-            'reuse_existing_feedback': True,
+            'force': force_feedback_recompute,
+            'reuse_existing_feedback': not force_feedback_recompute,
             'resume_from_stage': resume_from_stage,
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
             'reused_eod_collection_run_id': int(latest_eod_run['id']),
+            'provider_admission_fence_owned': (
+                provider_admission_fence_owned
+            ),
         }
         if terminal_continuation_in_place:
             recovery_kwargs['existing_pipeline_run_id'] = int(
@@ -2768,6 +2922,14 @@ class PykrxBackfillService:
             'symbols': recovery_symbols,
             'state_convergence': convergence,
         }
+        if ordering_repair_stage is not None:
+            recovery_result['followup_recovery'][
+                'ordering_repair'
+            ] = (
+                'signal_feature_prerequisite_completed_after_signal_started'
+                if ordering_repair_stage == 'signal_features'
+                else 'feedback_prerequisite_completed_after_feedback_started'
+            )
         if terminal_continuation_in_place:
             recovery_result['followup_recovery'][
                 'terminal_continuation_in_place'
@@ -3185,6 +3347,7 @@ class PykrxBackfillService:
                             >= MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE
                         ),
                         point_in_time_recovery=point_in_time_recovery,
+                        provider_admission_fence_owned=True,
                     )
                     recovery_exhausted = bool(
                         recovery_result is not None
@@ -3520,6 +3683,7 @@ class PykrxBackfillService:
                                     latest_eod_run=converged_run,
                                     markets=markets,
                                     point_in_time_recovery=True,
+                                    provider_admission_fence_owned=True,
                                 )
                             )
                             if recovery_result is not None:
@@ -3690,6 +3854,7 @@ class PykrxBackfillService:
                 chain_fundamentals_followup=True,
                 track_daily_pipeline=True,
                 point_in_time_recovery=point_in_time_recovery,
+                provider_admission_fence_owned=True,
             )
             result.setdefault('triggered', True)
             _log_pykrx_fetch(
@@ -4447,6 +4612,7 @@ class PykrxBackfillService:
         chain_fundamentals_followup: bool = True,
         track_daily_pipeline: bool = False,
         point_in_time_recovery: bool = False,
+        provider_admission_fence_owned: bool = False,
     ) -> dict:
         self._symbol_fundamentals_disabled_for_run = False
         self._symbol_fundamentals_failure_count_for_run = 0
@@ -4487,6 +4653,9 @@ class PykrxBackfillService:
             chain_fundamentals_followup=chain_fundamentals_followup,
             track_daily_pipeline=track_daily_pipeline,
             point_in_time_recovery=point_in_time_recovery,
+            provider_admission_fence_owned=(
+                provider_admission_fence_owned
+            ),
         )
 
     def _load_symbol_fundamentals(self, *, symbol: str, start_date: str, end_date: str):

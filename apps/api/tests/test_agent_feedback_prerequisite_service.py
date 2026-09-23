@@ -77,6 +77,71 @@ def _price_collection_stage(*, rows_persisted: int) -> dict:
     }
 
 
+def test_current_run_can_require_signal_features_without_optional_context():
+    required_stage_ids = (
+        *FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
+        'signal_features',
+    )
+    assert 'signal_features' not in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+    assert 'external_news_collect' not in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+    assert 'external_news_enrich' not in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+    assert 'macro_context_refresh' not in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+    pipeline_status = _pipeline_status(
+        pykrx_stage=_pykrx_enrichment_stage(category_overrides={}),
+        stage_overrides={
+            'signal_features': {
+                'task': 'signal_features',
+                'status': 'pending',
+                'current_activity': 'Pending signal features',
+                'details': {},
+            },
+        },
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-18',
+            fs_div='CFS',
+            required_stage_ids=required_stage_ids,
+        )
+
+    assert result['ready'] is False
+    assert result['status'] == 'waiting'
+    assert result['waiting_stage_ids'] == ['signal_features']
+    assert result['required_stage_ids'] == list(required_stage_ids)
+
+
+def test_default_point_in_time_prerequisites_ignore_current_signal_features():
+    pipeline_status = _pipeline_status(
+        pykrx_stage=_pykrx_enrichment_stage(category_overrides={}),
+        stage_overrides={
+            'signal_features': {
+                'task': 'signal_features',
+                'status': 'pending',
+                'current_activity': 'Pending current-only signal features',
+                'details': {},
+            },
+        },
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-18',
+            fs_div='CFS',
+        )
+
+    assert result['ready'] is True
+    assert result['required_stage_ids'] == list(
+        FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+    )
+
+
 def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
     payload = {
         'status': 'partial',
