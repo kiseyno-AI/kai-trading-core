@@ -2774,6 +2774,9 @@ class PykrxBackfillService:
         )
         if not point_in_time_recovery:
             feedback_input_stage_ids.add('signal_features')
+            feedback_input_stage_ids.update(
+                ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS
+            )
         rebuilds_feedback_inputs = bool(
             'agent_feedback_summaries' in recovery_stages
             and feedback_input_stage_ids.intersection(recovery_stages)

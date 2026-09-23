@@ -357,7 +357,7 @@ class EODFreshnessRegressionPackTests(unittest.TestCase):
 
 
 class EODPipelineStatusRegressionPackTests(unittest.TestCase):
-    def test_latest_pykrx_pipeline_run_selection_prefers_daily_run_and_reconciles_running_row(self):
+    def test_latest_pykrx_pipeline_run_selection_is_read_only_for_running_daily_run(self):
         historical_run = {
             'id': 900,
             'market': 'KRX',
@@ -391,30 +391,22 @@ class EODPipelineStatusRegressionPackTests(unittest.TestCase):
                 'stage': 'technical_snapshots',
             },
         }
-        daily_failed_run = {
-            **daily_running_run,
-            'status': 'failed',
-            'symbols_failed': 2,
-            'error_message': 'Marked stale after 30 minutes without completion.',
-        }
-
         with (
             patch(
                 'app.eod.pipeline_status._load_pipeline_pykrx_run_rows',
-                side_effect=[
-                    [historical_run, daily_running_run],
-                    [historical_run, daily_failed_run],
-                ],
-            ),
+                return_value=[historical_run, daily_running_run],
+            ) as load_rows,
             patch(
-                'app.eod.pipeline_status.PYKRX_BACKFILL_SERVICE.reconcile_latest_daily_run_status',
+                'app.eod.pykrx_backfill.PYKRX_BACKFILL_SERVICE.'
+                'reconcile_latest_daily_run_status',
             ) as reconcile_run,
         ):
             result = _load_latest_pipeline_pykrx_run(trade_date='2026-04-21')
 
-        self.assertEqual(result['id'], daily_failed_run['id'])
-        self.assertEqual(result['status'], 'failed')
-        reconcile_run.assert_called_once_with(latest_run=daily_running_run)
+        self.assertEqual(result['id'], daily_running_run['id'])
+        self.assertEqual(result['status'], 'running')
+        load_rows.assert_called_once_with(trade_date='2026-04-21')
+        reconcile_run.assert_not_called()
 
     def test_pipeline_status_preserves_running_stage_progress_and_fundamentals_activity_mapping(self):
         pykrx_run = {

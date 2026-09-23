@@ -9361,6 +9361,7 @@ class PykrxBackfillServiceTests(TestCase):
 
     def test_run_collection_aborts_daily_auto_price_loop_after_initial_provider_failures(self) -> None:
         service = PykrxBackfillService()
+        fake_run_state_service = _FakeDailyPipelineRunStateService()
         symbols = [
             PykrxSymbol(symbol=str(index).zfill(6), market='KOSPI', name_ko=f'Symbol {index}')
             for index in range(25)
@@ -9382,6 +9383,12 @@ class PykrxBackfillServiceTests(TestCase):
             complete_run = stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
             fundamentals_refresh = stack.enter_context(
                 patch('app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh')
+            )
+            stack.enter_context(
+                patch(
+                    'app.eod.pykrx_backfill.daily_pipeline_run_state_service',
+                    fake_run_state_service,
+                )
             )
 
             result = service._run_market_data_pipeline(
@@ -9409,6 +9416,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(latest_progress_metadata['failed_symbols'], [f'{index:06d}' for index in range(20)])
         self.assertEqual(latest_progress_metadata['unattempted_symbols'], [f'{index:06d}' for index in range(20, 25)])
         fundamentals_refresh.assert_not_called()
+        self.assertEqual(fake_run_state_service.finish_runs[-1]['status'], 'failed')
 
     def test_grouped_daily_stage_run_rebuilds_price_contexts_with_technical_stage(self) -> None:
         service = PykrxBackfillService()
