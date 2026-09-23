@@ -1932,13 +1932,16 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                 with patch(
                     'app.agent_context.progress_service.agent_context_feedback_run_state_service.find_latest_run',
                     return_value=run_snapshot,
-                ):
+                ), patch(
+                    'app.agent_context.progress_service.agent_context_reuse_service.build_latest_decisions',
+                ) as reuse_loader:
                     result = AgentContextProgressService().get_feedback_progress(
                         market_date='2026-04-14',
                         symbols=None,
                         expected_agents=['technical-summarizer'],
                     )
 
+        reuse_loader.assert_not_called()
         compiled_statements = [fake_session._compile(statement) for statement in fake_session.statements]
         self.assertFalse(any('daily_price_bars' in sql for sql in compiled_statements))
         self.assertEqual(result['summary']['total_symbols'], 1)
