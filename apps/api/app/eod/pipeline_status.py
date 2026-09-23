@@ -43,7 +43,7 @@ from app.eod.daily_pipeline_stages import (
     DailyPipelineStageService,
 )
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
-from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_backfill import DEFAULT_MARKETS
 from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES, pykrx_enrichment_service
 from app.eod.pipeline_status_support import (
     PYKRX_STAGE_ORDER,
@@ -161,15 +161,12 @@ def _select_pipeline_pykrx_run(rows: list[dict[str, Any]]) -> dict[str, Any] | N
 
 
 def _load_latest_pipeline_pykrx_run(*, trade_date: str) -> dict[str, Any] | None:
-    preferred = _select_pipeline_pykrx_run(_load_pipeline_pykrx_run_rows(trade_date=trade_date))
-    if preferred is None:
-        return None
-
-    if preferred.get('status') == 'running':
-        PYKRX_BACKFILL_SERVICE.reconcile_latest_daily_run_status(latest_run=preferred)
-        preferred = _select_pipeline_pykrx_run(_load_pipeline_pykrx_run_rows(trade_date=trade_date))
-
-    return preferred
+    # Status reads must remain observational. Orphan reconciliation mutates
+    # EOD run state and is only safe from the scheduler path while it holds the
+    # provider advisory lock.
+    return _select_pipeline_pykrx_run(
+        _load_pipeline_pykrx_run_rows(trade_date=trade_date)
+    )
 
 
 def _load_latest_fundamentals_refresh_run(*, market_date: str, fs_div: str) -> dict[str, Any] | None:

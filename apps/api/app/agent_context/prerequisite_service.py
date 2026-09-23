@@ -454,11 +454,19 @@ class AgentFeedbackPrerequisiteService:
         market_date: str | date,
         fs_div: str | None = None,
         feedback_run_context: dict[str, Any] | None = None,
+        required_stage_ids: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         from app.eod.pipeline_status import eod_pipeline_status_service
 
         normalized_market_date = _normalize_market_date(market_date)
         resolved_fs_div = _normalize_fs_div(fs_div)
+        resolved_required_stage_ids = tuple(
+            dict.fromkeys(
+                required_stage_ids
+                if required_stage_ids is not None
+                else FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+            )
+        )
         pipeline_status = eod_pipeline_status_service.read(
             market_date=normalized_market_date.isoformat(),
             fs_div=resolved_fs_div,
@@ -500,7 +508,7 @@ class AgentFeedbackPrerequisiteService:
         waiting_stage_ids: list[str] = []
         blocked_stage_ids: list[str] = []
 
-        for stage_id in FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER:
+        for stage_id in resolved_required_stage_ids:
             raw_stage_payload = stages.get(stage_id) if isinstance(stages, dict) else None
             stage_payload = (
                 dict(raw_stage_payload)
@@ -561,7 +569,7 @@ class AgentFeedbackPrerequisiteService:
             'fs_div': resolved_fs_div,
             'status': overall_status,
             'ready': overall_status == 'ready',
-            'required_stage_ids': list(FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER),
+            'required_stage_ids': list(resolved_required_stage_ids),
             'ready_stage_ids': ready_stage_ids,
             'waiting_stage_ids': waiting_stage_ids,
             'blocked_stage_ids': blocked_stage_ids,

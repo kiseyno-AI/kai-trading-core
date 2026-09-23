@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
@@ -11,7 +12,10 @@ from app.agent_context.retry_service import (
     agent_feedback_retry_service,
     resolve_latest_completed_summary_knowledge_cutoff,
 )
-from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
+from app.agent_context.prerequisite_service import (
+    FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
+    agent_feedback_prerequisite_service,
+)
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
@@ -47,6 +51,7 @@ from app.eod.run_stage_support import (
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
 )
+from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
 from app.macro_context.service import macro_context_service
@@ -76,6 +81,8 @@ from app.signals.unified_value_factor import (
     daily_unified_value_factor_service,
 )
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
+
+logger = logging.getLogger(__name__)
 
 PYKRX_PIPELINE_STAGE_ORDER: tuple[str, ...] = (
     'price_collection',
@@ -139,6 +146,17 @@ TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER: tuple[str, ...] = (
 )
 DEFAULT_FEEDBACK_MAX_CYCLES = 3
 DEFAULT_FEEDBACK_OUTER_BATCH_SIZE = 20
+FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS = 60.0
+DAILY_PIPELINE_FINALIZATION_ATTEMPTS = 3
+CURRENT_FEEDBACK_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
+    *FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
+    'signal_features',
+)
+# External news collect/enrich and macro refresh are deliberately absent from
+# the hard gate. daily_pipeline_outcomes classifies them as ordering-only
+# optional context whose terminal degradation may lower confidence but must
+# not block feedback. Historical point-in-time recovery also excludes current-
+# only signal features and retains the date-bounded numeric prerequisite set.
 
 @dataclass(frozen=True)
 class DailyStageDefinition:
@@ -581,6 +599,7 @@ class DailyPipelineStageService:
         reused_eod_collection_run_id: int | None = None,
         point_in_time_recovery: bool = False,
         existing_pipeline_run_id: int | None = None,
+        provider_admission_fence_owned: bool = False,
     ) -> dict[str, Any]:
         validated_request = self.validate_run_request(
             market_date=market_date,
@@ -609,6 +628,64 @@ class DailyPipelineStageService:
         feedback_knowledge_cutoff_at: datetime | None = None
         feedback_cutoff_resolution: dict[str, Any] | None = None
         terminal_summary_source_run_id: str | None = None
+        feedback_prerequisite_stage_ids = (
+            self._feedback_prerequisite_stage_ids(
+                point_in_time_recovery=point_in_time_recovery,
+            )
+        )
+        persisted_feedback_prerequisite_stage_ids = tuple(
+            stage_id
+            for stage_id in feedback_prerequisite_stage_ids
+            if stage_id not in resolved_stages
+        )
+
+        if (
+            existing_pipeline_run_id is None
+            and self._requires_persisted_feedback_prerequisite_preflight(
+                resolved_stages,
+                required_stage_ids=feedback_prerequisite_stage_ids,
+            )
+        ):
+            prerequisites = (
+                agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                    market_date=resolved_market_date,
+                    fs_div=resolved_fs_div,
+                    required_stage_ids=(
+                        persisted_feedback_prerequisite_stage_ids
+                    ),
+                )
+            )
+            if not prerequisites['ready']:
+                gated_stage_id = next(
+                    stage_id
+                    for stage_id in (
+                        'agent_feedback_summaries',
+                        'signal_decider',
+                    )
+                    if stage_id in resolved_stages
+                )
+                gate_result = self._build_prerequisite_gate_result(
+                    stage_id=gated_stage_id,
+                    market_date=resolved_market_date,
+                    prerequisites=prerequisites,
+                )
+                return {
+                    'triggered': False,
+                    'reason': gate_result['reason'],
+                    'pipeline_run_id': None,
+                    'pipeline_run': None,
+                    'market_date': resolved_market_date,
+                    'requested_stages': requested_stages,
+                    'resolved_stages': resolved_stages,
+                    'status': gate_result['status'],
+                    'stages': {
+                        gated_stage_id: self._build_stage_outcome(
+                            gated_stage_id,
+                            gate_result,
+                        ),
+                    },
+                    'prerequisites': prerequisites,
+                }
 
         stage_outcomes: dict[str, dict[str, Any]] = {}
         handled: set[str] = set()
@@ -668,7 +745,7 @@ class DailyPipelineStageService:
                     )
                 )
             except Exception as exc:
-                self.run_state_service.finish_run(
+                self._finish_run_preserving_primary_error(
                     pipeline_run_id=int(existing_pipeline_run_id),
                     status='failed',
                     error_message=str(exc),
@@ -713,7 +790,7 @@ class DailyPipelineStageService:
                 and feedback_cutoff_resolution.get('source_run_id')
                 == terminal_summary_source_run_id
             ):
-                self.run_state_service.finish_run(
+                self._finish_run_preserving_primary_error(
                     pipeline_run_id=int(existing_pipeline_run_id),
                     status='failed',
                     error_message=(
@@ -733,7 +810,7 @@ class DailyPipelineStageService:
                 {},
             )
             if not isinstance(raw_persisted_stage_outcomes, dict):
-                self.run_state_service.finish_run(
+                self._finish_run_preserving_primary_error(
                     pipeline_run_id=int(existing_pipeline_run_id),
                     status='failed',
                     error_message=(
@@ -749,7 +826,7 @@ class DailyPipelineStageService:
             if persisted_stage_ids != resolved_stages[
                 : len(persisted_stage_ids)
             ]:
-                self.run_state_service.finish_run(
+                self._finish_run_preserving_primary_error(
                     pipeline_run_id=int(existing_pipeline_run_id),
                     status='failed',
                     error_message=(
@@ -771,7 +848,7 @@ class DailyPipelineStageService:
                         persisted_outcome
                     )
                 ):
-                    self.run_state_service.finish_run(
+                    self._finish_run_preserving_primary_error(
                         pipeline_run_id=int(existing_pipeline_run_id),
                         status='failed',
                         error_message=(
@@ -835,6 +912,9 @@ class DailyPipelineStageService:
                     ),
                     'point_in_time_recovery': point_in_time_recovery,
                 },
+                provider_admission_fence_owned=(
+                    provider_admission_fence_owned
+                ),
             )
         pipeline_run_id = int(pipeline_run['id'])
         if pipeline_run.get('deduplicated'):
@@ -872,7 +952,7 @@ class DailyPipelineStageService:
                     **pykrx_kwargs,
                 )
             except Exception as exc:
-                self.run_state_service.finish_run(
+                self._finish_run_preserving_primary_error(
                     pipeline_run_id=pipeline_run_id,
                     status='failed',
                     error_message=str(exc),
@@ -893,12 +973,19 @@ class DailyPipelineStageService:
         for stage_id in resolved_stages:
             if stage_id in handled:
                 continue
-            self._start_tracked_stage(
-                pipeline_run_id=pipeline_run_id,
-                stage_id=stage_id,
-                market_date=resolved_market_date,
-                symbols=resolved_symbols,
-            )
+            try:
+                self._start_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    symbols=resolved_symbols,
+                )
+            except Exception as exc:
+                self._finish_run_after_stage_start_failure(
+                    pipeline_run_id=pipeline_run_id,
+                    error_message=str(exc),
+                )
+                raise
             incomplete_dependencies = [
                 dependency
                 for dependency in STAGE_DEFINITIONS[stage_id].depends_on
@@ -946,6 +1033,7 @@ class DailyPipelineStageService:
                         result=stage_result,
                     )
                     continue
+            stage_heartbeat: PeriodicStageHeartbeat | None = None
             try:
                 if stage_id in {
                     'agent_feedback_summaries',
@@ -1015,41 +1103,109 @@ class DailyPipelineStageService:
                         },
                     }
                 else:
-                    stage_result = self._execute_stage(
-                        stage_id,
-                        market_date=resolved_market_date,
-                        symbols=resolved_symbols,
-                        markets=resolved_markets,
-                        force=force,
-                        bypass_prerequisite_gate=(
-                            bypass_prerequisite_gate
-                        ),
-                        fs_div=resolved_fs_div,
-                        symbol_limit=symbol_limit,
-                        symbol_offset=symbol_offset,
-                        capture_limit=capture_limit,
-                        retry_cycles=retry_cycles,
-                        feedback_max_cycles=feedback_max_cycles,
-                        feedback_outer_batch_size=(
-                            feedback_outer_batch_size
-                        ),
-                        reuse_existing_feedback=(
-                            reuse_existing_feedback
-                        ),
-                        feedback_knowledge_cutoff_at=(
-                            feedback_knowledge_cutoff_at
-                        ),
-                        feedback_cutoff_resolution=(
-                            feedback_cutoff_resolution
-                        ),
-                        point_in_time_recovery=point_in_time_recovery,
-                        run_id=reused_eod_collection_run_id,
-                        progress_callback=self._build_progress_callback(
-                            pipeline_run_id=pipeline_run_id,
-                            stage_id=stage_id,
+                    def execute_current_stage() -> dict[str, Any]:
+                        return self._execute_stage(
+                            stage_id,
                             market_date=resolved_market_date,
-                        ),
-                    )
+                            symbols=resolved_symbols,
+                            markets=resolved_markets,
+                            force=force,
+                            bypass_prerequisite_gate=(
+                                bypass_prerequisite_gate
+                            ),
+                            fs_div=resolved_fs_div,
+                            symbol_limit=symbol_limit,
+                            symbol_offset=symbol_offset,
+                            capture_limit=capture_limit,
+                            retry_cycles=retry_cycles,
+                            feedback_max_cycles=feedback_max_cycles,
+                            feedback_outer_batch_size=(
+                                feedback_outer_batch_size
+                            ),
+                            reuse_existing_feedback=(
+                                reuse_existing_feedback
+                            ),
+                            feedback_knowledge_cutoff_at=(
+                                feedback_knowledge_cutoff_at
+                            ),
+                            feedback_cutoff_resolution=(
+                                feedback_cutoff_resolution
+                            ),
+                            point_in_time_recovery=(
+                                point_in_time_recovery
+                            ),
+                            run_id=reused_eod_collection_run_id,
+                            progress_callback=(
+                                self._build_progress_callback(
+                                    pipeline_run_id=pipeline_run_id,
+                                    stage_id=stage_id,
+                                    market_date=resolved_market_date,
+                                )
+                            ),
+                        )
+
+                    if stage_id in FACTOR_STAGE_ORDER:
+                        stage_heartbeat = PeriodicStageHeartbeat(
+                            lambda: self.run_state_service.heartbeat_stage(
+                                pipeline_run_id=pipeline_run_id,
+                                stage_id=stage_id,
+                                market_date=resolved_market_date,
+                            ),
+                            interval_seconds=(
+                                FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS
+                            ),
+                            thread_name=(
+                                'daily-pipeline-'
+                                f'{pipeline_run_id}-{stage_id}-heartbeat'
+                            ),
+                        )
+                        if not stage_heartbeat.check_now():
+                            stage_result = {
+                                'triggered': False,
+                                'status': 'interrupted',
+                                'reason': 'pipeline_run_ownership_lost',
+                                'market_date': resolved_market_date,
+                                'stage': stage_id,
+                            }
+                            stage_outcomes[stage_id] = (
+                                self._build_stage_outcome(
+                                    stage_id,
+                                    stage_result,
+                                )
+                            )
+                            return {
+                                'triggered': False,
+                                'reason': 'pipeline_run_ownership_lost',
+                                'pipeline_run_id': pipeline_run_id,
+                                'pipeline_run': pipeline_run,
+                                'market_date': resolved_market_date,
+                                'requested_stages': requested_stages,
+                                'resolved_stages': resolved_stages,
+                                'status': 'interrupted',
+                                'stages': stage_outcomes,
+                            }
+                        with stage_heartbeat:
+                            stage_result = execute_current_stage()
+                        if stage_heartbeat.ownership_lost:
+                            stage_outcomes[stage_id] = (
+                                self._build_stage_outcome(
+                                    stage_id,
+                                    stage_result,
+                                )
+                            )
+                            return {
+                                'triggered': False,
+                                'reason': 'pipeline_run_ownership_lost',
+                                'pipeline_run_id': pipeline_run_id,
+                                'pipeline_run': pipeline_run,
+                                'market_date': resolved_market_date,
+                                'requested_stages': requested_stages,
+                                'resolved_stages': resolved_stages,
+                                'status': 'interrupted',
+                                'stages': stage_outcomes,
+                            }
+                    else:
+                        stage_result = execute_current_stage()
                 stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
                 self._finish_tracked_stage(
                     pipeline_run_id=pipeline_run_id,
@@ -1059,16 +1215,55 @@ class DailyPipelineStageService:
                     result=stage_result,
                 )
             except Exception as exc:
-                self.run_state_service.finish_stage(
-                    pipeline_run_id=pipeline_run_id,
-                    stage_id=stage_id,
-                    market_date=resolved_market_date,
-                    status='failed',
-                    current_step=f'{stage_id}_failed',
-                    current_activity=f'{STAGE_DEFINITIONS[stage_id].label} failed',
-                    error_message=str(exc),
-                )
-                self.run_state_service.finish_run(
+                if (
+                    stage_heartbeat is not None
+                    and stage_heartbeat.ownership_lost
+                ):
+                    stage_result = {
+                        'triggered': False,
+                        'status': 'interrupted',
+                        'reason': 'pipeline_run_ownership_lost',
+                        'market_date': resolved_market_date,
+                        'stage': stage_id,
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc),
+                    }
+                    stage_outcomes[stage_id] = self._build_stage_outcome(
+                        stage_id,
+                        stage_result,
+                    )
+                    return {
+                        'triggered': False,
+                        'reason': 'pipeline_run_ownership_lost',
+                        'pipeline_run_id': pipeline_run_id,
+                        'pipeline_run': pipeline_run,
+                        'market_date': resolved_market_date,
+                        'requested_stages': requested_stages,
+                        'resolved_stages': resolved_stages,
+                        'status': 'interrupted',
+                        'stages': stage_outcomes,
+                    }
+                try:
+                    self.run_state_service.finish_stage(
+                        pipeline_run_id=pipeline_run_id,
+                        stage_id=stage_id,
+                        market_date=resolved_market_date,
+                        status='failed',
+                        current_step=f'{stage_id}_failed',
+                        current_activity=(
+                            f'{STAGE_DEFINITIONS[stage_id].label} failed'
+                        ),
+                        error_message=str(exc),
+                    )
+                except Exception as cleanup_exc:
+                    logger.error(
+                        'Unable to mark failed stage %s for pipeline run '
+                        '%s: %s',
+                        stage_id,
+                        pipeline_run_id,
+                        cleanup_exc,
+                    )
+                self._finish_run_preserving_primary_error(
                     pipeline_run_id=pipeline_run_id,
                     status='failed',
                     error_message=str(exc),
@@ -1114,7 +1309,7 @@ class DailyPipelineStageService:
             for outcome in stage_outcomes.values()
         ):
             run_metadata['resumable'] = False
-        final_run = self.run_state_service.finish_run(
+        final_run = self._finish_run_with_retry(
             pipeline_run_id=pipeline_run_id,
             status=overall_status,
             run_metadata=run_metadata,
@@ -1194,6 +1389,41 @@ class DailyPipelineStageService:
             },
         )
 
+    def _finish_run_after_stage_start_failure(
+        self,
+        *,
+        pipeline_run_id: int,
+        error_message: str,
+    ) -> None:
+        """Bound terminalization when an admitted run cannot checkpoint a stage."""
+
+        self._finish_run_preserving_primary_error(
+            pipeline_run_id=pipeline_run_id,
+            status='failed',
+            error_message=error_message,
+        )
+
+    def _finish_run_with_retry(self, **kwargs: Any) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for _attempt in range(DAILY_PIPELINE_FINALIZATION_ATTEMPTS):
+            try:
+                return self.run_state_service.finish_run(**kwargs)
+            except Exception as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+    def _finish_run_preserving_primary_error(self, **kwargs: Any) -> None:
+        try:
+            self._finish_run_with_retry(**kwargs)
+        except Exception as exc:
+            logger.error(
+                'Unable to terminalize daily pipeline run %s after worker '
+                'failure: %s',
+                kwargs.get('pipeline_run_id'),
+                exc,
+            )
+
     def _build_progress_callback(
         self,
         *,
@@ -1234,21 +1464,48 @@ class DailyPipelineStageService:
     ) -> None:
         counts = self._extract_stage_counts(stage_id=stage_id, result=result)
         status = str(outcome.get('status') or 'completed')
-        self.run_state_service.finish_stage(
+        finish_kwargs = {
+            'pipeline_run_id': pipeline_run_id,
+            'stage_id': stage_id,
+            'market_date': market_date,
+            'status': status,
+            'processed': counts['processed'],
+            'total': counts['total'],
+            'succeeded': counts['succeeded'],
+            'failed': counts['failed'],
+            'current_step': f'{stage_id}_{status}',
+            'current_activity': (
+                f'{self._status_activity_prefix(status)} '
+                f'{STAGE_DEFINITIONS[stage_id].label}'
+            ),
+            'error_message': (
+                str(
+                    result.get('error')
+                    or result.get('error_message')
+                    or ''
+                )
+                or None
+            ),
+            'source_run_ids': self._extract_stage_source_run_ids(result),
+            'details': self._build_stage_run_details(
+                stage_id=stage_id,
+                result=result,
+            ),
+        }
+        last_error: Exception | None = None
+        for _attempt in range(DAILY_PIPELINE_FINALIZATION_ATTEMPTS):
+            try:
+                self.run_state_service.finish_stage(**finish_kwargs)
+                return
+            except Exception as exc:
+                last_error = exc
+        assert last_error is not None
+        self._finish_run_preserving_primary_error(
             pipeline_run_id=pipeline_run_id,
-            stage_id=stage_id,
-            market_date=market_date,
-            status=status,
-            processed=counts['processed'],
-            total=counts['total'],
-            succeeded=counts['succeeded'],
-            failed=counts['failed'],
-            current_step=f'{stage_id}_{status}',
-            current_activity=f'{self._status_activity_prefix(status)} {STAGE_DEFINITIONS[stage_id].label}',
-            error_message=str(result.get('error') or result.get('error_message') or '') or None,
-            source_run_ids=self._extract_stage_source_run_ids(result),
-            details=self._build_stage_run_details(stage_id=stage_id, result=result),
+            status='failed',
+            error_message=str(last_error),
         )
+        raise last_error
 
     @staticmethod
     def _status_activity_prefix(status: str) -> str:
@@ -1965,8 +2222,11 @@ class DailyPipelineStageService:
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                 market_date=market_date,
                 fs_div=fs_div,
+                required_stage_ids=self._feedback_prerequisite_stage_ids(
+                    point_in_time_recovery=point_in_time_recovery,
+                ),
             )
-            if not bypass_prerequisite_gate and not prerequisites['ready']:
+            if not prerequisites['ready']:
                 return self._build_prerequisite_gate_result(
                     stage_id=stage_id,
                     market_date=market_date,
@@ -2099,6 +2359,30 @@ class DailyPipelineStageService:
             'prerequisites': prerequisites,
             'missing_prerequisites': prerequisites.get('missing_prerequisites') or [],
         }
+
+    @staticmethod
+    def _feedback_prerequisite_stage_ids(
+        *,
+        point_in_time_recovery: bool,
+    ) -> tuple[str, ...]:
+        if point_in_time_recovery:
+            return FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+        return CURRENT_FEEDBACK_PREREQUISITE_STAGE_ORDER
+
+    @staticmethod
+    def _requires_persisted_feedback_prerequisite_preflight(
+        resolved_stages: Sequence[str],
+        *,
+        required_stage_ids: Sequence[str],
+    ) -> bool:
+        resolved_stage_set = set(resolved_stages)
+        if not resolved_stage_set.intersection(
+            {'agent_feedback_summaries', 'signal_decider'}
+        ):
+            return False
+        return not set(required_stage_ids).issubset(
+            resolved_stage_set
+        )
 
     def _extract_pykrx_stage_result(self, stage_id: str, result: dict[str, Any]) -> dict[str, Any]:
         if result.get('skipped') or result.get('triggered') is False:
