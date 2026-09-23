@@ -4,6 +4,9 @@ from datetime import date
 from typing import Any, Sequence
 
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.eod.pykrx_enrichment_coverage_policy import (
+    required_category_minimum_coverage_ratio,
+)
 
 REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'sector_classification',
@@ -11,15 +14,6 @@ REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES: tuple[str, ...] = (
     'short_selling',
     'valuation_snapshot',
 )
-REQUIRED_CATEGORY_MIN_COVERAGE_RATIO = 0.99
-REQUIRED_CATEGORY_MIN_COVERAGE_RATIOS = {
-    # PyKRX valuation excludes a small, stable subset of the broader KRX
-    # universe. Direct same-day rows remain mandatory; 95% of the supported
-    # stock universe is the explicit readiness floor.
-    'valuation_snapshot': 0.95,
-}
-
-
 def _normalize_iso_date(value: str | date) -> str:
     if isinstance(value, date):
         return value.isoformat()
@@ -58,10 +52,7 @@ def _category_gate_item(
         coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
     coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
     missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
-    minimum_coverage_ratio = REQUIRED_CATEGORY_MIN_COVERAGE_RATIOS.get(
-        category,
-        REQUIRED_CATEGORY_MIN_COVERAGE_RATIO,
-    )
+    minimum_coverage_ratio = required_category_minimum_coverage_ratio(category)
 
     if (
         not missing_category_payload

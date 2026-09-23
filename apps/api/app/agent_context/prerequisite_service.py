@@ -7,6 +7,9 @@ from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import (
     GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO,
 )
+from app.eod.pykrx_enrichment_coverage_policy import (
+    required_category_minimum_coverage_ratio,
+)
 
 FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
     'pykrx_enrichment',
@@ -227,6 +230,7 @@ class AgentFeedbackPrerequisiteService:
             payload.get('expectation_status') or 'available'
         ).strip().lower()
         missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
+        minimum_coverage_ratio = required_category_minimum_coverage_ratio(category)
 
         provider_error = cls._has_pykrx_provider_error(payload)
 
@@ -256,7 +260,7 @@ class AgentFeedbackPrerequisiteService:
         elif present_rows <= 0 or coverage_status == 'missing':
             gate_status = 'blocked'
             reason = 'missing_required_pykrx_enrichment_category'
-        elif coverage_ratio is None or coverage_ratio < GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO:
+        elif coverage_ratio is None or coverage_ratio < minimum_coverage_ratio:
             gate_status = 'blocked'
             reason = 'incomplete_required_pykrx_enrichment_category'
         elif coverage_status != 'complete':
