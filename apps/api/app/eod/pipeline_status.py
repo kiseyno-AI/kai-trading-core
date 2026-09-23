@@ -718,7 +718,6 @@ def _load_latest_feedback_run_summary(*, market_date: str) -> dict[str, Any] | N
 
         progress = agent_context_progress_service.get_feedback_progress(
             market_date=normalized_market_date,
-            symbols=requested_symbols,
             run_id=run_snapshot.get('run_id'),
         )
     except Exception:

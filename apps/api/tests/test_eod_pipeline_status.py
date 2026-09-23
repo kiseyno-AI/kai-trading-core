@@ -2323,6 +2323,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             [DAILY_RETRY_CYCLE_MODE],
         )
         progress_loader.assert_called_once()
+        self.assertIsNone(progress_loader.call_args.kwargs.get('symbols'))
+        self.assertEqual(
+            progress_loader.call_args.kwargs['run_id'],
+            'symbol-run-2026-06-19-stale',
+        )
         stage = result['stages']['agent_feedback_summaries']
         self.assertEqual(stage['status'], 'running')
         self.assertEqual(stage['updated_at'], '2026-06-19T09:39:03+00:00')
