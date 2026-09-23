@@ -28,9 +28,11 @@ from app.agent_context.retry_service import (
     RoleSequenceSnapshot,
     _FeedbackRetryClaimLease,
     _feedback_retry_admission_lock_key,
+    _feedback_retry_owner_token_hash,
     _claim_feedback_retry_run,
     _previous_run_matches_fs_div,
     _previous_run_matches_knowledge_cutoff,
+    _refresh_feedback_retry_claim,
     resolve_latest_completed_summary_knowledge_cutoff,
 )
 from app.agent_context.roles import (
@@ -988,6 +990,45 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             'lease ownership lost',
         ):
             lease.assert_owned(stage='before_child_dispatch')
+
+    def test_retry_heartbeat_refresh_does_not_use_exhausted_shared_pool(self):
+        owner_token = 'isolated-heartbeat-token'
+        row = SimpleNamespace(
+            status='running',
+            request_payload={
+                'retry_admission': {
+                    'owner_token_hash': _feedback_retry_owner_token_hash(
+                        owner_token
+                    ),
+                },
+            },
+            updated_at=None,
+        )
+        session = MagicMock()
+        session.execute.return_value.scalar_one_or_none.return_value = row
+        isolated_scope = MagicMock()
+        isolated_scope.__enter__.return_value = session
+        isolated_scope.__exit__.return_value = False
+        scope_modes: list[bool] = []
+
+        def starving_shared_pool(*, isolated_connection=False, **_kwargs):
+            scope_modes.append(isolated_connection)
+            if not isolated_connection:
+                raise AssertionError('heartbeat used exhausted shared pool')
+            return isolated_scope
+
+        with patch(
+            'app.agent_context.retry_service.session_scope',
+            side_effect=starving_shared_pool,
+        ):
+            refreshed = _refresh_feedback_retry_claim(
+                run_id='isolated-heartbeat-owner',
+                owner_token=owner_token,
+            )
+
+        self.assertTrue(refreshed)
+        self.assertEqual(scope_modes, [True])
+        self.assertIsNotNone(row.updated_at)
 
     def test_retry_lease_ignores_late_heartbeat_after_finalization_begins(self):
         lease = _FeedbackRetryClaimLease(

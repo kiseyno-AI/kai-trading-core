@@ -789,7 +789,8 @@ def _refresh_feedback_retry_claim(
     run_id: str,
     owner_token: str,
 ) -> bool:
-    with session_scope() as session:
+    # Shared worker-pool saturation must not be mistaken for lease loss.
+    with session_scope(isolated_connection=True) as session:
         row = session.execute(
             select(AgentContextFeedbackRun).where(
                 AgentContextFeedbackRun.run_id == run_id

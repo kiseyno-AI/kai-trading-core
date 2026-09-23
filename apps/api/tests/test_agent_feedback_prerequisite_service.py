@@ -454,6 +454,39 @@ def test_inspect_feedback_prerequisites_allows_pykrx_enrichment_above_minimum_co
     assert [item['category'] for item in warning_categories] == ['investor_flow_symbol', 'valuation_snapshot']
 
 
+def test_pykrx_enrichment_uses_lower_valuation_coverage_floor_only_for_valuation():
+    category_payloads = _pykrx_enrichment_stage(
+        status='completed',
+        category_overrides={
+            'investor_flow_symbol': {
+                'present_rows': 2734,
+                'expected_rows': 2762,
+                'coverage_ratio': 0.989862,
+                'coverage_status': 'partial',
+            },
+            'valuation_snapshot': {
+                'present_rows': 2714,
+                'expected_rows': 2762,
+                'coverage_ratio': 0.982621,
+                'coverage_status': 'partial',
+            },
+        },
+    )['details']['categories']
+
+    details = AgentFeedbackPrerequisiteService.build_pykrx_enrichment_gate_details(
+        category_payloads=category_payloads,
+    )
+
+    gates = {
+        item['category']: item
+        for item in details['decider_category_gates']
+    }
+    assert gates['valuation_snapshot']['gate_status'] == 'ready'
+    assert gates['valuation_snapshot']['reason'] == 'required_pykrx_enrichment_category_near_complete'
+    assert gates['investor_flow_symbol']['gate_status'] == 'blocked'
+    assert gates['investor_flow_symbol']['reason'] == 'incomplete_required_pykrx_enrichment_category'
+
+
 def test_pykrx_category_row_counts_block_when_price_bar_universe_is_partial():
     stage = {
         'task': 'pykrx_enrichment',
