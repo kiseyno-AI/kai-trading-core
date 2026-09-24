@@ -3873,6 +3873,24 @@ class SignalDeciderExecIntegrationService:
                 ),
                 None,
             )
+            if remote_plan is None and remote_plans:
+                reason_code = 'dispatch_write_ahead_readback_conflict'
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code=reason_code,
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': reason_code,
+                    }
+                )
+                continue
             if remote_plan is None:
                 can_retry = bool(
                     integration.get('delegate_execution')

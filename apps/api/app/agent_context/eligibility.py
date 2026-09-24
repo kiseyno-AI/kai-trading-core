@@ -105,6 +105,7 @@ _ACTIVE_BROKER_ORDER_STATUSES = {
 _ACTIVE_EXEC_WATCH_STATUSES = {
     'planned',
     'awaiting_trigger',
+    'dispatch_pending_remote_ack',
     'dry_run',
     'submitted',
     'delegated_for_exec_agent_sizing',

@@ -6849,6 +6849,56 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertTrue(_row_has_accepted_exec_dispatch(row))
 
+    async def test_restart_never_retries_write_ahead_after_conflicting_readback(
+        self,
+    ) -> None:
+        async def crash_before_remote_send(payload: dict) -> dict:
+            raise SystemExit('simulated crash before remote send')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_before_remote_send,
+        ):
+            with self.assertRaisesRegex(SystemExit, 'before remote send'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='seed_pending_write_ahead',
+                )
+
+        self.client.plan_response = {
+            'items': [
+                {
+                    'plan_id': 'unexpected-plan',
+                    'external_plan_id': 'unexpected-plan',
+                    'status': 'accepted',
+                }
+            ]
+        }
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=False,
+            trigger='conflicting_readback',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'dispatch_write_ahead_readback_conflict',
+            )
+
     async def test_restart_does_not_retry_write_ahead_when_buy_authority_blocks(
         self,
     ) -> None:

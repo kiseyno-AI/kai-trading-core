@@ -4293,61 +4293,6 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
         self.assertIn('data_quality_warnings_present', block_codes)
 
-    def test_refresh_plan_items_delegates_closed_market_auxiliary_warnings_for_exec_watch(self) -> None:
-        settings.signal_decider_exec_integration_mode = 'dispatch'
-        pre_decider_context = self._pre_decider_context()
-        pre_decider_context['market_data_phase_contract'] = {
-            'schema_version': 'market_data_phase_contract_v1',
-            'recommendation_basis': 'latest_completed_eod',
-            'realtime_quote_orderbook_required': False,
-            'eod_reference_price_accepted': True,
-            'not_applicable_realtime_is_expected': True,
-        }
-        pre_decider_context['quote_orderbook_snapshot'].update(
-            {
-                'status': 'stale_eod',
-                'snapshot_type': 'eod_stale',
-                'quote_freshness_status': 'stale',
-                'bid_price': None,
-                'ask_price': None,
-                'spread_points': None,
-                'spread_bps': None,
-                'spread_source_context': None,
-                'spread_component_source_context': {},
-            }
-        )
-        data_warnings = [
-            'Detailed financial and disclosure context is older and was used only as supporting context.',
-            'News evidence is title-only and was not used to predict price direction.',
-        ]
-        self._seed_short_term_snapshot(
-            symbol='005930',
-            data_warnings=data_warnings,
-            pre_decider_enrichment_context=pre_decider_context,
-        )
-        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
-
-        with patch(
-            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
-            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
-        ):
-            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
-
-        item = next(
-            item
-            for item in result['items']
-            if item['symbol'] == '005930'
-            and item['decision_agent_name'] == 'short-term-decider'
-        )
-        self.assertEqual(item['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
-        self.assertEqual(item['execution_status'], EXECUTION_STATUS_AWAITING_TRIGGER)
-        self.assertEqual(item['validation']['blocking_reasons'], [])
-        warning_codes = {warning['code'] for warning in item['validation']['warnings']}
-        self.assertIn('data_quality_warnings_delegated_to_exec_watch', warning_codes)
-        self.assertEqual(item['validation']['short_term']['data_quality_warnings'], data_warnings)
-        self.assertEqual(item['validation']['handoff']['approval_state'], 'pending_exec_agent')
-
     def test_refresh_plan_items_keeps_short_term_missing_liquidity_as_warning(self) -> None:
         self._seed_short_term_snapshot(
             symbol='005930',

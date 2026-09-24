@@ -2011,22 +2011,6 @@ def _has_canonical_completed_eod_phase(
     )
 
 
-def _should_delegate_short_term_watch_data_warnings(
-    *,
-    decision_agent_name: str,
-    tactical_action: str | None,
-    handoff_intent: str | None,
-    pre_decider_enrichment_context: dict[str, Any],
-) -> bool:
-    return bool(
-        _exec_agent_sizing_dispatch_enabled()
-        and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-        and tactical_action == 'watch_for_trigger'
-        and handoff_intent == 'intraday_watch_buy'
-        and _has_canonical_completed_eod_phase(pre_decider_enrichment_context)
-    )
-
-
 def _is_dispatch_terminal_status(value: Any) -> bool:
     return _normalize_optional_text(value) in {
         EXECUTION_STATUS_SUBMITTED,
@@ -6424,29 +6408,12 @@ class SignalDeciderNextOpenExecutionService:
             )
         data_quality_warnings = _normalize_text_list(snapshot.data_quality_warnings_payload)
         if settings.signal_decider_next_open_block_on_data_warnings and data_quality_warnings:
-            if _should_delegate_short_term_watch_data_warnings(
-                decision_agent_name=decision_agent_name,
-                tactical_action=short_term_tactical_action,
-                handoff_intent=handoff_intent,
-                pre_decider_enrichment_context=pre_decider_enrichment_context,
-            ):
-                warnings.append(
-                    _reason(
-                        'data_quality_warnings_delegated_to_exec_watch',
-                        (
-                            'Snapshot data-quality warnings remain visible as decision context for this '
-                            'monitor-only completed-EOD handoff. Exec must confirm live trigger, price, '
-                            'liquidity, and costs before any buy.'
-                        ),
-                    )
+            blocking_reasons.append(
+                _reason(
+                    'data_quality_warnings_present',
+                    'Snapshot has data quality warnings that Exec cannot independently revalidate.',
                 )
-            else:
-                blocking_reasons.append(
-                    _reason(
-                        'data_quality_warnings_present',
-                        'Snapshot has data quality warnings that Exec cannot independently revalidate.',
-                    )
-                )
+            )
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
             snapshot.specialist_disagreement_payload
         ):
