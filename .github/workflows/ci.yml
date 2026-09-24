@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   api:
-    name: API (Python 3.11)
+    name: API (Python 3.12)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -43,7 +43,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: |
             apps/api/requirements.txt

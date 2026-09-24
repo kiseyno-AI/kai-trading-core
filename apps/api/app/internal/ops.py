@@ -1230,7 +1230,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Example:\n'
-            '  python3.11 -m app.internal.ops agent-decider-replay \\\n'
+            '  python3.12 -m app.internal.ops agent-decider-replay \\\n'
             '    --market-date-from 2026-06-15 --market-date-to 2026-06-19 \\\n'
             '    --agent-name short-term-decider \\\n'
             '    --rule-config-json \'{"rules":[{"name":"stale_watch_veto",'
@@ -1283,7 +1283,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Example:\n'
-            '  python3.11 -m app.internal.ops agent-short-term-wait-conflict-replay \\\n'
+            '  python3.12 -m app.internal.ops agent-short-term-wait-conflict-replay \\\n'
             '    --completed-weeks 4 --as-of-date-kst 2026-09-06 \\\n'
             '    --gate-mode downsize_probe --probe-quantity 3 \\\n'
             '    --output-format markdown\n\n'

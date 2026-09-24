@@ -66,6 +66,12 @@ exit 1
         )
         self.wrapper_path.chmod(0o755)
 
+    def test_default_python_runtime_is_312(self) -> None:
+        script = self.script_path.read_text(encoding='utf-8')
+
+        self.assertIn('PYTHON_BIN="python3.12"', script)
+        self.assertNotIn('PYTHON_BIN="python3.11"', script)
+
     def _run_script(
         self,
         *,
