@@ -3644,7 +3644,7 @@ class SignalDeciderNextOpenExecutionService:
                     self._build_agent_context_completeness_from_state(
                         source_market_date=source_market_date,
                         candidate_symbols=[
-                            snapshot.symbol for snapshot in snapshots
+                            snapshot.symbol for snapshot in current_raw_snapshots
                         ],
                         source_run=current_scope_state.get('source_run'),
                         scope_state=current_scope_state,

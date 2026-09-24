@@ -1550,14 +1550,18 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             '_build_agent_context_completeness_context',
             side_effect=complete_agent_context,
         )
-        self.agent_context_completeness_patcher.start()
+        self.agent_context_completeness_mock = (
+            self.agent_context_completeness_patcher.start()
+        )
         self.addCleanup(self.agent_context_completeness_patcher.stop)
         self.agent_context_from_state_patcher = patch.object(
             SignalDeciderNextOpenExecutionService,
             '_build_agent_context_completeness_from_state',
             side_effect=complete_agent_context,
         )
-        self.agent_context_from_state_patcher.start()
+        self.agent_context_from_state_mock = (
+            self.agent_context_from_state_patcher.start()
+        )
         self.addCleanup(self.agent_context_from_state_patcher.stop)
         def valid_snapshot_generations(
             *,
@@ -1823,6 +1827,88 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn('pykrx_enrichment_preflight_blocked', blocking_codes)
         self.assertIn('candidate_pykrx_enrichment_missing', blocking_codes)
+
+    def test_refresh_compares_agent_context_over_same_raw_snapshot_cohort(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        self._seed_snapshot(symbol='000660')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        def reject_one_generation(*, market_date, snapshots, **_kwargs):
+            valid_ids = sorted(
+                int(snapshot.id)
+                for snapshot in snapshots
+                if snapshot.symbol == '005930'
+            )
+            invalid_ids = sorted(
+                int(snapshot.id)
+                for snapshot in snapshots
+                if snapshot.symbol == '000660'
+            )
+            return {
+                'schema_version': (
+                    'persisted_decider_generation_validation_v1'
+                ),
+                'market_date': str(market_date),
+                'valid_snapshot_ids': valid_ids,
+                'invalid_snapshot_ids': invalid_ids,
+                'validations': [
+                    {
+                        'snapshot_id': int(snapshot.id),
+                        'symbol': snapshot.symbol,
+                        'agent_name': snapshot.agent_name,
+                        'status': (
+                            'valid'
+                            if snapshot.symbol == '005930'
+                            else 'invalid'
+                        ),
+                        'reason': (
+                            'test_generation_unchanged'
+                            if snapshot.symbol == '005930'
+                            else 'test_generation_rejected'
+                        ),
+                    }
+                    for snapshot in snapshots
+                ],
+                'generation_fingerprint': 'test-mixed-generation',
+            }
+
+        self.snapshot_generation_mock.side_effect = reject_one_generation
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        initial_symbols = sorted(
+            self.agent_context_completeness_mock.call_args.kwargs[
+                'candidate_symbols'
+            ]
+        )
+        locked_symbol_sets = [
+            sorted(call.kwargs['candidate_symbols'])
+            for call in self.agent_context_from_state_mock.call_args_list
+        ]
+        self.assertEqual(initial_symbols, ['000660', '005930'])
+        self.assertEqual(locked_symbol_sets, [['000660', '005930']])
+        self.assertEqual(
+            {
+                item['symbol']
+                for item in result['items']
+                if item['account_reference'] == self.account_reference
+            },
+            {'005930'},
+        )
 
     def test_refresh_retries_when_source_parent_scope_changes_without_snapshot_change(
         self,
