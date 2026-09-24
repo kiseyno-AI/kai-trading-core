@@ -29,7 +29,7 @@
     <key>EnvironmentVariables</key>
     <dict>
       <key>PYTHON_BIN</key>
-      <string>/opt/homebrew/bin/python3.12</string>
+      <string>/Users/shawn/kai-trading-core/apps/api/.venv/bin/python</string>
       <key>HOST</key>
       <string>0.0.0.0</string>
       <key>PORT</key>
