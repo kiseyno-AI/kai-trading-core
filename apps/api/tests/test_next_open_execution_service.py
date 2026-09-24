@@ -78,6 +78,7 @@ from app.orders.next_open_execution import (
     _next_open_performance_cost_evidence,
     _next_open_policy_fingerprint,
     _normalize_objective_percentile,
+    _set_plan_refresh_idle_transaction_timeout,
     _preopen_plan_covers_latest_snapshots,
     _previous_trading_day,
     _to_decimal,
@@ -207,6 +208,50 @@ def test_dispatch_authority_source_locks_use_one_deadlock_safe_order() -> None:
             'IN SHARE MODE NOWAIT'
         ),
     ]
+
+
+def test_plan_refresh_extends_only_its_transaction_idle_timeout_before_locks() -> None:
+    session = MagicMock()
+    bind = MagicMock()
+    bind.dialect.name = 'postgresql'
+    session.get_bind.return_value = bind
+
+    with (
+        patch.object(settings, 'signal_decider_db_statement_timeout_ms', 300_000),
+        patch.object(settings, 'signal_decider_db_lock_timeout_ms', 30_000),
+    ):
+        _set_plan_refresh_idle_transaction_timeout(session)
+
+    statement = str(session.execute.call_args.args[0])
+    assert statement == (
+        'SET LOCAL idle_in_transaction_session_timeout = 390000'
+    )
+
+
+def test_plan_refresh_idle_timeout_is_bounded_for_postgres_only() -> None:
+    postgres_session = MagicMock()
+    postgres_bind = MagicMock()
+    postgres_bind.dialect.name = 'postgresql'
+    postgres_session.get_bind.return_value = postgres_bind
+
+    with (
+        patch.object(settings, 'signal_decider_db_statement_timeout_ms', 2_000_000),
+        patch.object(settings, 'signal_decider_db_lock_timeout_ms', 1_000_000),
+    ):
+        _set_plan_refresh_idle_transaction_timeout(postgres_session)
+
+    assert str(postgres_session.execute.call_args.args[0]) == (
+        'SET LOCAL idle_in_transaction_session_timeout = 1200000'
+    )
+
+    sqlite_session = MagicMock()
+    sqlite_bind = MagicMock()
+    sqlite_bind.dialect.name = 'sqlite'
+    sqlite_session.get_bind.return_value = sqlite_bind
+
+    _set_plan_refresh_idle_transaction_timeout(sqlite_session)
+
+    sqlite_session.execute.assert_not_called()
 
 
 def test_dispatch_authority_source_lock_contention_is_a_retryable_revision_conflict(

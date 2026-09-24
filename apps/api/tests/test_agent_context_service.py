@@ -3,7 +3,7 @@ from copy import deepcopy
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -29,6 +29,7 @@ from app.agent_context.read_service import (
     _build_us_market_session_metadata,
     _historical_external_news_knowledge_cutoff_at,
     _load_latest_symbol_day_block_history,
+    _load_persisted_factor_rows_with_retry,
     _resolve_external_news_knowledge_cutoff_at,
     _resolve_symbol_market_session,
     resolve_external_news_knowledge_cutoff_for_symbols,
@@ -39,6 +40,38 @@ EMPTY_LATEST_PRIOR_ROWS = {
     'factor_rows': {family: {} for family in PERSISTED_FACTOR_FAMILIES},
     'signal_features': {},
 }
+
+
+class PersistedFactorReadRetryTests(unittest.TestCase):
+    def test_transient_sqlalchemy_error_returns_retry_result(self):
+        expected_rows = [{'symbol': '005930'}]
+        loader = Mock(
+            side_effect=[
+                SQLAlchemyError('transient factor read failure'),
+                expected_rows,
+            ]
+        )
+
+        rows, storage_unavailable = _load_persisted_factor_rows_with_retry(
+            loader,
+            empty_factory=list,
+        )
+
+        self.assertIs(rows, expected_rows)
+        self.assertFalse(storage_unavailable)
+        self.assertEqual(loader.call_count, 2)
+
+    def test_repeated_sqlalchemy_error_fails_closed_after_retry(self):
+        loader = Mock(side_effect=SQLAlchemyError('persistent factor read failure'))
+
+        rows, storage_unavailable = _load_persisted_factor_rows_with_retry(
+            loader,
+            empty_factory=list,
+        )
+
+        self.assertEqual(rows, [])
+        self.assertTrue(storage_unavailable)
+        self.assertEqual(loader.call_count, 2)
 
 
 class ShortSellingContextQualityTests(unittest.TestCase):
@@ -3556,7 +3589,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
             patch(
                 'app.agent_context.read_service.load_daily_value_factor_results',
                 side_effect=SQLAlchemyError('value table unavailable'),
-            ),
+            ) as load_value_factor_results_mock,
             patch('app.agent_context.read_service.load_daily_unified_value_factor_results', return_value=[]),
             patch('app.agent_context.read_service.load_daily_quality_factor_results', return_value=[]),
             patch(
@@ -3725,6 +3758,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
         self.assertEqual(summary['beta']['status'], 'not_computed_for_market_date')
         self.assertEqual(summary['beta']['source_status'], 'missing_market_date_bar')
         self.assertEqual(summary['composite']['status'], 'not_eligible')
+        self.assertEqual(load_value_factor_results_mock.call_count, 2)
         self.assertEqual(item['liquidity_context']['ranking']['status'], 'missing')
         self.assertEqual(item['liquidity_context']['ranking']['reason'], 'low_risk_liquidity_fields_missing')
         self.assertEqual(item['context_completeness']['factor_rows']['value']['row_status'], 'storage_unavailable')
@@ -4084,6 +4118,34 @@ class AgentContextReadServiceTests(unittest.TestCase):
         for model_name, extra_fields in extra_fields_by_model.items():
             if model_name != 'DailyLowRiskFactorResult':
                 self.assertEqual(extra_fields, ())
+
+    def test_load_latest_symbol_day_block_history_retries_transient_factor_error(self):
+        value_attempts = 0
+
+        def load_prior_rows(**kwargs):
+            nonlocal value_attempts
+            if kwargs['model'].__name__ != 'DailyValueFactorResult':
+                return {}
+            value_attempts += 1
+            if value_attempts == 1:
+                raise SQLAlchemyError('transient prior factor read failure')
+            return {'005930': {'market_date': '2026-04-07'}}
+
+        with patch(
+            'app.agent_context.read_service._load_latest_prior_rows_for_model',
+            side_effect=load_prior_rows,
+        ):
+            result = _load_latest_symbol_day_block_history(
+                market_date=date(2026, 4, 8),
+                symbols=['005930'],
+            )
+
+        self.assertEqual(value_attempts, 2)
+        self.assertEqual(
+            result['factor_rows']['value'],
+            {'005930': {'market_date': '2026-04-07'}},
+        )
+        self.assertFalse(result['factor_storage_unavailable']['value'])
 
     def test_build_factor_summary_entry_marks_unscored_value_families_not_eligible(self):
         cases = (

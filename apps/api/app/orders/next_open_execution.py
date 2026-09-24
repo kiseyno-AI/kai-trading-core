@@ -141,6 +141,9 @@ EXECUTION_STATUS_REVOKED = 'revoked'
 EXECUTION_REVISION_HISTORY_LIMIT = 5
 PLAN_REFRESH_REVISION_RETRY_ATTEMPTS = 6
 PLAN_REFRESH_REVISION_RETRY_DELAY_SECONDS = 0.025
+PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MIN_MS = 360_000
+PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MAX_MS = 1_200_000
+PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_HEADROOM_MS = 60_000
 EXECUTION_REVOCATION_LOCKED_STATUSES = frozenset(
     {
         EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
@@ -580,6 +583,25 @@ def _acquire_plan_refresh_advisory_lock(
         raise _PlanRefreshRevisionConflict(
             f'next-open plan refresh already active for {target_trade_date.isoformat()}'
         )
+
+
+def _set_plan_refresh_idle_transaction_timeout(session: Any) -> None:
+    """Keep the locked refresh alive while independent sessions prove inputs."""
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != 'postgresql':
+        return
+    configured_runtime_ms = (
+        int(settings.signal_decider_db_statement_timeout_ms)
+        + int(settings.signal_decider_db_lock_timeout_ms)
+        + PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_HEADROOM_MS
+    )
+    timeout_ms = min(
+        PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MAX_MS,
+        max(PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MIN_MS, configured_runtime_ms),
+    )
+    session.execute(
+        text(f'SET LOCAL idle_in_transaction_session_timeout = {timeout_ms}')
+    )
 
 
 def _lock_dispatch_authority_source_tables(session: Any) -> None:
@@ -3320,6 +3342,7 @@ class SignalDeciderNextOpenExecutionService:
         now = _utcnow()
 
         with session_scope() as session:
+            _set_plan_refresh_idle_transaction_timeout(session)
             _acquire_plan_refresh_advisory_lock(
                 session,
                 target_trade_date=resolved_target_date,
