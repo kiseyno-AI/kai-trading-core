@@ -1,3 +1,4 @@
+import copy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -78,7 +79,8 @@ from app.orders.next_open_execution import (
     _next_open_performance_cost_evidence,
     _next_open_policy_fingerprint,
     _normalize_objective_percentile,
-    _set_plan_refresh_idle_transaction_timeout,
+    _snapshot_generation_authority_fingerprint,
+    _set_plan_refresh_transaction_timeouts,
     _preopen_plan_covers_latest_snapshots,
     _previous_trading_day,
     _to_decimal,
@@ -210,7 +212,7 @@ def test_dispatch_authority_source_locks_use_one_deadlock_safe_order() -> None:
     ]
 
 
-def test_plan_refresh_extends_only_its_transaction_idle_timeout_before_locks() -> None:
+def test_plan_refresh_sets_bounded_transaction_timeouts_before_locks() -> None:
     session = MagicMock()
     bind = MagicMock()
     bind.dialect.name = 'postgresql'
@@ -220,12 +222,14 @@ def test_plan_refresh_extends_only_its_transaction_idle_timeout_before_locks() -
         patch.object(settings, 'signal_decider_db_statement_timeout_ms', 300_000),
         patch.object(settings, 'signal_decider_db_lock_timeout_ms', 30_000),
     ):
-        _set_plan_refresh_idle_transaction_timeout(session)
+        _set_plan_refresh_transaction_timeouts(session)
 
-    statement = str(session.execute.call_args.args[0])
-    assert statement == (
-        'SET LOCAL idle_in_transaction_session_timeout = 390000'
-    )
+    statements = [str(call.args[0]) for call in session.execute.call_args_list]
+    assert statements == [
+        'SET LOCAL statement_timeout = 300000',
+        'SET LOCAL lock_timeout = 30000',
+        'SET LOCAL idle_in_transaction_session_timeout = 930000'
+    ]
 
 
 def test_plan_refresh_idle_timeout_is_bounded_for_postgres_only() -> None:
@@ -238,9 +242,9 @@ def test_plan_refresh_idle_timeout_is_bounded_for_postgres_only() -> None:
         patch.object(settings, 'signal_decider_db_statement_timeout_ms', 2_000_000),
         patch.object(settings, 'signal_decider_db_lock_timeout_ms', 1_000_000),
     ):
-        _set_plan_refresh_idle_transaction_timeout(postgres_session)
+        _set_plan_refresh_transaction_timeouts(postgres_session)
 
-    assert str(postgres_session.execute.call_args.args[0]) == (
+    assert str(postgres_session.execute.call_args_list[-1].args[0]) == (
         'SET LOCAL idle_in_transaction_session_timeout = 1200000'
     )
 
@@ -249,9 +253,46 @@ def test_plan_refresh_idle_timeout_is_bounded_for_postgres_only() -> None:
     sqlite_bind.dialect.name = 'sqlite'
     sqlite_session.get_bind.return_value = sqlite_bind
 
-    _set_plan_refresh_idle_transaction_timeout(sqlite_session)
+    _set_plan_refresh_transaction_timeouts(sqlite_session)
 
     sqlite_session.execute.assert_not_called()
+
+
+def test_generation_authority_ignores_diagnostics_but_not_validity() -> None:
+    baseline = {
+        'schema_version': 'persisted_decider_generation_validation_v1',
+        'market_date': '2026-09-23',
+        'valid_snapshot_ids': [],
+        'invalid_snapshot_ids': [28741],
+        'validations': [
+            {
+                'snapshot_id': 28741,
+                'symbol': '019010',
+                'agent_name': 'short-term-decider',
+                'status': 'invalid',
+                'reason': 'durable_decider_inputs_changed',
+                'details': {'error_type': 'OperationalError'},
+            }
+        ],
+    }
+    concrete_mismatch = copy.deepcopy(baseline)
+    concrete_mismatch['validations'][0]['details'] = {
+        'reasons': [{'code': 'source_context_changed'}]
+    }
+    now_valid = copy.deepcopy(baseline)
+    now_valid['valid_snapshot_ids'] = [28741]
+    now_valid['invalid_snapshot_ids'] = []
+    now_valid['validations'][0].update(
+        status='valid',
+        reason='durable_decider_inputs_unchanged',
+    )
+
+    assert _snapshot_generation_authority_fingerprint(
+        baseline
+    ) == _snapshot_generation_authority_fingerprint(concrete_mismatch)
+    assert _snapshot_generation_authority_fingerprint(
+        baseline
+    ) != _snapshot_generation_authority_fingerprint(now_valid)
 
 
 def test_dispatch_authority_source_lock_contention_is_a_retryable_revision_conflict(
@@ -1074,6 +1115,34 @@ class FakeCalendarClient:
 
 
 class NextOpenRefreshUnitTests(unittest.TestCase):
+    def test_scope_state_reads_use_signal_decider_db_budget(self) -> None:
+        service = SignalDeciderNextOpenExecutionService()
+        session = MagicMock()
+        session.execute.return_value.scalars.return_value.all.return_value = []
+        session.execute.return_value.all.return_value = []
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+        session_context.__exit__.return_value = False
+
+        with (
+            patch.object(settings, 'signal_decider_db_statement_timeout_ms', 300_000),
+            patch.object(settings, 'signal_decider_db_lock_timeout_ms', 30_000),
+            patch(
+                'app.orders.next_open_execution.session_scope',
+                return_value=session_context,
+            ) as scoped_session,
+        ):
+            result = service._load_latest_decider_scope_state(
+                source_market_date=date(2026, 9, 23),
+                target_trade_date=date(2026, 9, 28),
+            )
+
+        scoped_session.assert_called_once_with(
+            statement_timeout_ms=300_000,
+            lock_timeout_ms=30_000,
+        )
+        self.assertEqual(result['selected_by_key'], {})
+
     def test_policy_context_versions_include_only_actionable_signals(self) -> None:
         def snapshot(action: str, policy_version: str) -> SimpleNamespace:
             return SimpleNamespace(

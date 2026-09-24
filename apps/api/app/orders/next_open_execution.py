@@ -143,7 +143,11 @@ PLAN_REFRESH_REVISION_RETRY_ATTEMPTS = 6
 PLAN_REFRESH_REVISION_RETRY_DELAY_SECONDS = 0.025
 PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MIN_MS = 360_000
 PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MAX_MS = 1_200_000
-PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_HEADROOM_MS = 60_000
+# Durable validation performs several bounded reads while the authority lock is
+# held.  The idle budget therefore needs process-level headroom, not just one
+# query's statement/lock budget.  Keep it finite so abandoned refreshes are
+# still reclaimed by PostgreSQL.
+PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_HEADROOM_MS = 600_000
 EXECUTION_REVOCATION_LOCKED_STATUSES = frozenset(
     {
         EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
@@ -532,6 +536,57 @@ def _snapshot_scope_selection_fingerprint(
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 
+def _snapshot_generation_authority_fingerprint(
+    generation_validation: dict[str, Any],
+) -> str:
+    """Fingerprint only fields that can change execution authority.
+
+    Revalidation diagnostics can improve from a transient storage error to a
+    concrete mismatch while the snapshot remains invalid. That must not keep
+    the whole plan in a retry loop; a valid/invalid transition still changes
+    this fingerprint and therefore remains fail-closed.
+    """
+    validations = [
+        {
+            'snapshot_id': item.get('snapshot_id'),
+            'symbol': item.get('symbol'),
+            'agent_name': item.get('agent_name'),
+            'status': item.get('status'),
+            'reason': item.get('reason'),
+        }
+        for item in generation_validation.get('validations') or []
+        if isinstance(item, dict)
+    ]
+    validations.sort(
+        key=lambda item: (
+            int(item.get('snapshot_id') or 0),
+            str(item.get('symbol') or ''),
+            str(item.get('agent_name') or ''),
+        )
+    )
+    return _canonical_payload_fingerprint(
+        {
+            'schema_version': generation_validation.get('schema_version'),
+            'market_date': generation_validation.get('market_date'),
+            'valid_snapshot_ids': sorted(
+                int(snapshot_id)
+                for snapshot_id in generation_validation.get(
+                    'valid_snapshot_ids'
+                )
+                or []
+            ),
+            'invalid_snapshot_ids': sorted(
+                int(snapshot_id)
+                for snapshot_id in generation_validation.get(
+                    'invalid_snapshot_ids'
+                )
+                or []
+            ),
+            'validations': validations,
+        }
+    )
+
+
 def _live_market_snapshot_fingerprint(
     snapshot_context: dict[str, Any] | None,
     *,
@@ -585,20 +640,24 @@ def _acquire_plan_refresh_advisory_lock(
         )
 
 
-def _set_plan_refresh_idle_transaction_timeout(session: Any) -> None:
-    """Keep the locked refresh alive while independent sessions prove inputs."""
+def _set_plan_refresh_transaction_timeouts(session: Any) -> None:
+    """Give the locked proof the same bounded DB budget as signal decisions."""
     bind = session.get_bind()
     if bind is None or bind.dialect.name != 'postgresql':
         return
+    statement_timeout_ms = int(settings.signal_decider_db_statement_timeout_ms)
+    lock_timeout_ms = int(settings.signal_decider_db_lock_timeout_ms)
     configured_runtime_ms = (
-        int(settings.signal_decider_db_statement_timeout_ms)
-        + int(settings.signal_decider_db_lock_timeout_ms)
+        statement_timeout_ms
+        + lock_timeout_ms
         + PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_HEADROOM_MS
     )
     timeout_ms = min(
         PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MAX_MS,
         max(PLAN_REFRESH_IDLE_TRANSACTION_TIMEOUT_MIN_MS, configured_runtime_ms),
     )
+    session.execute(text(f'SET LOCAL statement_timeout = {statement_timeout_ms}'))
+    session.execute(text(f'SET LOCAL lock_timeout = {lock_timeout_ms}'))
     session.execute(
         text(f'SET LOCAL idle_in_transaction_session_timeout = {timeout_ms}')
     )
@@ -3342,7 +3401,7 @@ class SignalDeciderNextOpenExecutionService:
         now = _utcnow()
 
         with session_scope() as session:
-            _set_plan_refresh_idle_transaction_timeout(session)
+            _set_plan_refresh_transaction_timeouts(session)
             _acquire_plan_refresh_advisory_lock(
                 session,
                 target_trade_date=resolved_target_date,
@@ -3500,8 +3559,12 @@ class SignalDeciderNextOpenExecutionService:
                 )
             )
             if (
-                locked_generation_validation.get('generation_fingerprint')
-                != generation_validation.get('generation_fingerprint')
+                _snapshot_generation_authority_fingerprint(
+                    locked_generation_validation
+                )
+                != _snapshot_generation_authority_fingerprint(
+                    generation_validation
+                )
             ):
                 raise _PlanRefreshRevisionConflict
             generation_validation = locked_generation_validation
@@ -4863,7 +4926,14 @@ class SignalDeciderNextOpenExecutionService:
         _session: Any | None = None,
     ) -> dict[str, Any]:
         owns_session = _session is None
-        session_context = session_scope() if owns_session else nullcontext(_session)
+        session_context = (
+            session_scope(
+                statement_timeout_ms=settings.signal_decider_db_statement_timeout_ms,
+                lock_timeout_ms=settings.signal_decider_db_lock_timeout_ms,
+            )
+            if owns_session
+            else nullcontext(_session)
+        )
         with session_context as session:
             snapshots = session.execute(
                 select(SignalDeciderDecisionSnapshot)
@@ -5934,7 +6004,12 @@ class SignalDeciderNextOpenExecutionService:
         )
         validation_summary = {
             'schema_version': scoped_validation.get('schema_version'),
-            'generation_fingerprint': scoped_validation.get(
+            'generation_fingerprint': (
+                _snapshot_generation_authority_fingerprint(
+                    scoped_validation
+                )
+            ),
+            'diagnostic_generation_fingerprint': scoped_validation.get(
                 'generation_fingerprint'
             ),
             'invalid_snapshot_ids': invalid_snapshot_ids,

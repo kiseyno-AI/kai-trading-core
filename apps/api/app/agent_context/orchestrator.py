@@ -116,7 +116,7 @@ from app.agent_context.signal_decider_loop_service import (
     signal_decider_loop_service,
 )
 from app.core.settings import settings
-from app.db import session_scope
+from app.db import session_scope, session_timeout_budget
 from app.db_models import AgentContextFeedback, EODCollectionRun
 from app.external_news.store import list_external_news_items
 
@@ -3461,27 +3461,33 @@ class AgentFeedbackOrchestrator:
         for group in grouped.values():
             material = group['material']
             try:
-                failures = self._revalidate_decider_dispatch_inputs(
-                    market_date=normalized_market_date,
-                    request_run_id=material['decision_run_id'],
-                    source_items=group['source_items'],
-                    source_context_scope_symbols=material[
-                        'source_context_scope_symbols'
-                    ],
-                    eligibility_scope_symbols=material[
-                        'eligibility_scope_symbols'
-                    ],
-                    fs_div=material['fs_div'],
-                    disclosures_limit=material['disclosures_limit'],
-                    allow_current_run_feedback=True,
-                    revalidate_market_context=False,
-                    allow_persisted_current_run_upstream=True,
-                    durable_source_generation=True,
-                    revalidate_post_decision_material_context=True,
-                    source_knowledge_cutoff_at=material[
-                        'source_knowledge_cutoff_at'
-                    ],
-                )
+                with session_timeout_budget(
+                    statement_timeout_ms=(
+                        settings.signal_decider_db_statement_timeout_ms
+                    ),
+                    lock_timeout_ms=settings.signal_decider_db_lock_timeout_ms,
+                ):
+                    failures = self._revalidate_decider_dispatch_inputs(
+                        market_date=normalized_market_date,
+                        request_run_id=material['decision_run_id'],
+                        source_items=group['source_items'],
+                        source_context_scope_symbols=material[
+                            'source_context_scope_symbols'
+                        ],
+                        eligibility_scope_symbols=material[
+                            'eligibility_scope_symbols'
+                        ],
+                        fs_div=material['fs_div'],
+                        disclosures_limit=material['disclosures_limit'],
+                        allow_current_run_feedback=True,
+                        revalidate_market_context=False,
+                        allow_persisted_current_run_upstream=True,
+                        durable_source_generation=True,
+                        revalidate_post_decision_material_context=True,
+                        source_knowledge_cutoff_at=material[
+                            'source_knowledge_cutoff_at'
+                        ],
+                    )
             except Exception as exc:  # noqa: BLE001
                 failures = {
                     (
