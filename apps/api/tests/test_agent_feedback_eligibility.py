@@ -8,6 +8,7 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_SCOPE_ALL,
     AGENT_FEEDBACK_SCOPE_REQUESTED,
     AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY,
+    _ACTIVE_EXEC_WATCH_STATUSES,
     _load_forced_inclusion_reasons,
     _load_prior_missed_opportunity_reasons,
     _load_prior_positive_decision_reasons,
@@ -25,6 +26,9 @@ from app.agent_context.run_modes import (
 
 
 class AgentFeedbackEligibilityTests(unittest.TestCase):
+    def test_pending_remote_ack_remains_in_active_watch_scope(self) -> None:
+        self.assertIn('dispatch_pending_remote_ack', _ACTIVE_EXEC_WATCH_STATUSES)
+
     def test_prior_positive_decision_does_not_fall_back_past_late_latest_feedback(self) -> None:
         late_feedback = SimpleNamespace(
             symbol='005930',

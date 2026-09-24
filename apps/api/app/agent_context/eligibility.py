@@ -104,9 +104,15 @@ _ACTIVE_BROKER_ORDER_STATUSES = {
 }
 _ACTIVE_EXEC_WATCH_STATUSES = {
     'planned',
+    'awaiting_trigger',
+    'dispatch_pending_remote_ack',
     'dry_run',
     'submitted',
     'delegated_for_exec_agent_sizing',
+}
+_ACTIVE_EXEC_WATCH_ELIGIBILITY_STATUSES = {
+    'eligible',
+    'monitor_candidate',
 }
 
 
@@ -874,11 +880,18 @@ def _load_active_watch_reasons(
                     SignalDeciderExecutionPlanItem.decision_agent_name,
                     SignalDeciderExecutionPlanItem.execution_window,
                     SignalDeciderExecutionPlanItem.target_trade_date,
+                    SignalDeciderExecutionPlanItem.source_market_date,
                     SignalDeciderExecutionPlanItem.eligibility_status,
                     SignalDeciderExecutionPlanItem.execution_status,
                 )
                 .where(SignalDeciderExecutionPlanItem.symbol.in_(list(symbols)))
                 .where(SignalDeciderExecutionPlanItem.target_trade_date >= market_date)
+                .where(SignalDeciderExecutionPlanItem.source_market_date < market_date)
+                .where(
+                    SignalDeciderExecutionPlanItem.eligibility_status.in_(
+                        list(_ACTIVE_EXEC_WATCH_ELIGIBILITY_STATUSES)
+                    )
+                )
                 .where(SignalDeciderExecutionPlanItem.execution_status.in_(list(_ACTIVE_EXEC_WATCH_STATUSES)))
                 .order_by(
                     SignalDeciderExecutionPlanItem.symbol.asc(),
@@ -902,6 +915,7 @@ def _load_active_watch_reasons(
                 'decision_agent_name': row.decision_agent_name,
                 'execution_window': row.execution_window,
                 'target_trade_date': row.target_trade_date.isoformat() if row.target_trade_date else None,
+                'source_market_date': row.source_market_date.isoformat() if row.source_market_date else None,
                 'eligibility_status': row.eligibility_status,
                 'execution_status': row.execution_status,
             },

@@ -5594,7 +5594,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 force=True,
                 trigger='test_initial_ambiguous_timeout',
             )
-            self.assertEqual(first_result['summary']['failed_group_count'], 1)
+            self.assertEqual(first_result['summary']['failed_group_count'], 0)
+            self.assertEqual(
+                first_result['dispatch']['groups'][0]['dispatch_status'],
+                'pending_remote_ack',
+            )
 
             with session_scope() as session:
                 row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
@@ -6692,21 +6696,20 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.revocation_calls), 1)
         self.assertEqual(
             self.client.revocation_calls[0]['reason_code'],
-            'policy_scope_changed',
+            'execution_control_disabled',
         )
         self.assertEqual(result['summary']['reason'], 'execution_control_disabled')
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
-            self.assertEqual(row.execution_status, 'planned')
+            self.assertEqual(row.execution_status, 'revoked')
             self.assertEqual(
                 row.submission_payload['revocation']['reason_code'],
-                'policy_scope_changed',
+                'execution_control_disabled',
             )
             self.assertEqual(
                 row.submission_payload['revocation']['status'],
                 'acknowledged',
             )
-            self.assertNotIn('exec_dispatch', row.submission_payload)
 
     async def test_restart_recovers_exact_accepted_write_ahead_before_refresh(
         self,
@@ -6845,6 +6848,56 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+    async def test_restart_never_retries_write_ahead_after_conflicting_readback(
+        self,
+    ) -> None:
+        async def crash_before_remote_send(payload: dict) -> dict:
+            raise SystemExit('simulated crash before remote send')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_before_remote_send,
+        ):
+            with self.assertRaisesRegex(SystemExit, 'before remote send'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=False,
+                    force=True,
+                    trigger='seed_pending_write_ahead',
+                )
+
+        self.client.plan_response = {
+            'items': [
+                {
+                    'plan_id': 'unexpected-plan',
+                    'external_plan_id': 'unexpected-plan',
+                    'status': 'accepted',
+                }
+            ]
+        }
+        restarted_service = SignalDeciderExecIntegrationService(
+            client=self.client
+        )
+
+        result = await restarted_service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            force=False,
+            trigger='conflicting_readback',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['dispatched_group_count'], 0)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['reason_code'],
+                'dispatch_write_ahead_readback_conflict',
+            )
 
     async def test_restart_does_not_retry_write_ahead_when_buy_authority_blocks(
         self,
@@ -8209,6 +8262,194 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(short_group['dispatch_status'], 'skipped')
         self.assertEqual(short_group['eligible_count'], 0)
+
+    async def test_retryable_exec_failure_stays_pending_until_strict_not_found_retry(
+        self,
+    ) -> None:
+        events: list[str] = []
+        original_list = self.client.list_execution_plans
+        original_post = self.client.post_execution_plan
+
+        async def empty_readback(*, external_plan_id: str | None = None) -> dict:
+            events.append('readback')
+            return await original_list(external_plan_id=external_plan_id)
+
+        async def retryable_failure(payload: dict) -> dict:
+            events.append('failed_post')
+            self.client.post_calls.append(copy.deepcopy(payload))
+            raise SignalDeciderExecClientError(
+                'exec returned 500 after accepting the request body',
+                code='unavailable',
+                retryable=True,
+                status_code=500,
+            )
+
+        with patch.object(
+            self.client,
+            'list_execution_plans',
+            side_effect=empty_readback,
+        ), patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=retryable_failure,
+        ):
+            first = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='retryable_500_pending_reconciliation',
+            )
+
+        self.assertEqual(events, ['failed_post', 'readback'])
+        self.assertEqual(
+            first['dispatch']['groups'][0]['dispatch_status'],
+            'pending_remote_ack',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'dispatch_pending_remote_ack')
+            self.assertEqual(row.eligibility_status, 'eligible')
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['dispatch_status'],
+                'pending_remote_ack',
+            )
+            self.assertEqual(
+                row.submission_payload['dispatch_reconciliation']['status'],
+                'pending_remote_ack',
+            )
+
+        events.clear()
+
+        async def accepted_retry(payload: dict) -> dict:
+            events.append('post')
+            return await original_post(payload)
+
+        with patch.object(
+            self.client,
+            'list_execution_plans',
+            side_effect=empty_readback,
+        ), patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=accepted_retry,
+        ):
+            await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='retry_after_confirmed_not_found',
+            )
+
+        self.assertEqual(events[:2], ['readback', 'post'])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+    async def test_legacy_retryable_ambiguity_is_requeued_before_remote_retry(
+        self,
+    ) -> None:
+        async def crash_after_write_ahead(_payload: dict) -> dict:
+            raise SystemExit('seed legacy retryable ambiguity')
+
+        with patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=crash_after_write_ahead,
+        ):
+            with self.assertRaisesRegex(SystemExit, 'legacy retryable'):
+                await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                    refresh_plan=False,
+                    dry_run=False,
+                    force=True,
+                    trigger='seed_legacy_retryable_ambiguity',
+                )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            exec_dispatch = copy.deepcopy(row.submission_payload['exec_dispatch'])
+            plan_id = exec_dispatch['plan_id']
+            fingerprint = exec_dispatch['plan_fingerprint']
+            dispatch_revision_fingerprint = row.submission_payload[
+                'exec_dispatch'
+            ]['dispatch_revision_fingerprint']
+            row.execution_status = 'revocation_manual_review'
+            row.eligibility_status = 'blocked'
+            row.submission_payload = {
+                **copy.deepcopy(row.submission_payload),
+                'exec_dispatch': {
+                    **copy.deepcopy(row.submission_payload['exec_dispatch']),
+                    'dispatch_status': 'unavailable',
+                    'last_error': {
+                        'code': 'unavailable',
+                        'message': 'exec returned 500',
+                        'retryable': True,
+                        'status_code': 500,
+                    },
+                },
+                'dispatch_reconciliation': {
+                    'status': 'manual_review_required',
+                    'plan_id': plan_id,
+                    'plan_fingerprint': fingerprint,
+                    'reason_code': 'ambiguous_remote_acceptance',
+                    'submitted_dispatch_revision_fingerprint': (
+                        dispatch_revision_fingerprint
+                    ),
+                    'current_dispatch_revision_fingerprint': (
+                        dispatch_revision_fingerprint
+                    ),
+                    'error': {
+                        'code': 'unavailable',
+                        'message': 'exec returned 500',
+                        'retryable': True,
+                        'status_code': 500,
+                    },
+                },
+            }
+
+        events: list[str] = []
+        original_list = self.client.list_execution_plans
+        original_post = self.client.post_execution_plan
+
+        async def empty_readback(*, external_plan_id: str | None = None) -> dict:
+            events.append('readback')
+            return await original_list(external_plan_id=external_plan_id)
+
+        async def accepted_retry(retry_payload: dict) -> dict:
+            events.append('post')
+            return await original_post(retry_payload)
+
+        with patch.object(
+            self.client,
+            'list_execution_plans',
+            side_effect=empty_readback,
+        ), patch.object(
+            self.client,
+            'post_execution_plan',
+            side_effect=accepted_retry,
+        ):
+            await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='recover_legacy_retryable_ambiguity',
+            )
+
+        self.assertEqual(events[:2], ['readback', 'post'])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+            self.assertNotIn(
+                'dispatch_reconciliation',
+                row.submission_payload,
+            )
 
     async def test_dispatch_next_open_plan_recovers_retryable_timeout_from_exec_readback(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()

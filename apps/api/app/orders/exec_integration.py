@@ -2578,6 +2578,142 @@ class SignalDeciderExecIntegrationService:
         )
 
     @staticmethod
+    def _legacy_retryable_ambiguous_write_ahead_state(
+        row: SignalDeciderExecutionPlanItem,
+    ) -> dict[str, Any] | None:
+        submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
+        reconciliation = (
+            submission.get('dispatch_reconciliation')
+            if isinstance(submission.get('dispatch_reconciliation'), dict)
+            else {}
+        )
+        exec_dispatch = (
+            submission.get('exec_dispatch')
+            if isinstance(submission.get('exec_dispatch'), dict)
+            else {}
+        )
+        reconciliation_error = (
+            reconciliation.get('error')
+            if isinstance(reconciliation.get('error'), dict)
+            else {}
+        )
+        dispatch_error = (
+            exec_dispatch.get('last_error')
+            if isinstance(exec_dispatch.get('last_error'), dict)
+            else {}
+        )
+        current_revision_fingerprint = _row_dispatch_revision_fingerprint(row)
+        revision_fingerprints = {
+            _validated_sha256_hex(value)
+            for value in (
+                reconciliation.get('submitted_dispatch_revision_fingerprint'),
+                reconciliation.get('current_dispatch_revision_fingerprint'),
+                exec_dispatch.get('dispatch_revision_fingerprint'),
+                current_revision_fingerprint,
+            )
+        }
+        plan_id = _normalize_optional_text(exec_dispatch.get('plan_id'))
+        prior_eligibility_status = _normalize_optional_text(
+            exec_dispatch.get('prior_eligibility_status'),
+            lowercase=True,
+        )
+        if not (
+            row.execution_status == 'revocation_manual_review'
+            and row.eligibility_status == 'blocked'
+            and _normalize_optional_text(
+                reconciliation.get('reason_code'),
+                lowercase=True,
+            )
+            == 'ambiguous_remote_acceptance'
+            and reconciliation_error.get('retryable') is True
+            and dispatch_error.get('retryable') is True
+            and plan_id
+            and reconciliation.get('plan_id') == plan_id
+            and _validated_sha256_hex(exec_dispatch.get('plan_fingerprint'))
+            and reconciliation.get('plan_fingerprint')
+            == exec_dispatch.get('plan_fingerprint')
+            and _validated_sha256_hex(
+                exec_dispatch.get('dispatch_material_fingerprint')
+            )
+            and _validated_exec_destination_binding(
+                exec_dispatch.get('destination_binding')
+            )
+            is not None
+            and exec_dispatch.get('item_links')
+            and isinstance(exec_dispatch.get('authority_generation_before'), dict)
+            and exec_dispatch['authority_generation_before'].get('status') == 'valid'
+            and _normalize_optional_text(
+                exec_dispatch.get('prior_execution_status'),
+                lowercase=True,
+            )
+            and prior_eligibility_status
+            and revision_fingerprints == {current_revision_fingerprint}
+        ):
+            return None
+        return {
+            'plan_id': plan_id,
+            'prior_eligibility_status': prior_eligibility_status,
+        }
+
+    def _requeue_legacy_retryable_ambiguous_write_aheads(
+        self,
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        trigger: str,
+    ) -> None:
+        grouped_rows = self._group_rows_by_plan_id(rows)
+        for plan_id, group_rows in grouped_rows.items():
+            if not plan_id or not group_rows or any(
+                self._legacy_retryable_ambiguous_write_ahead_state(row) is None
+                for row in group_rows
+            ):
+                continue
+            row_ids = [int(row.id) for row in group_rows]
+            now = _utcnow()
+            with session_scope() as session:
+                persisted_rows = session.execute(
+                    select(SignalDeciderExecutionPlanItem)
+                    .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
+                    .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                    .with_for_update()
+                ).scalars().all()
+                persisted_states = [
+                    self._legacy_retryable_ambiguous_write_ahead_state(row)
+                    for row in persisted_rows
+                ]
+                if (
+                    len(persisted_rows) != len(row_ids)
+                    or any(state is None for state in persisted_states)
+                ):
+                    continue
+                for row, state in zip(persisted_rows, persisted_states):
+                    assert state is not None
+                    submission = copy.deepcopy(row.submission_payload)
+                    exec_dispatch = copy.deepcopy(submission['exec_dispatch'])
+                    exec_dispatch['dispatch_status'] = (
+                        EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+                    )
+                    submission['exec_dispatch'] = exec_dispatch
+                    submission['dispatch_reconciliation'] = {
+                        **copy.deepcopy(submission['dispatch_reconciliation']),
+                        'status': EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK,
+                        'requeued_at': now.isoformat(),
+                        'requeue_trigger': trigger,
+                    }
+                    row.execution_status = (
+                        EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+                    )
+                    row.eligibility_status = state[
+                        'prior_eligibility_status'
+                    ]
+                    row.submission_payload = (
+                        slim_signal_decider_exec_submission_payload(
+                            submission
+                        ).payload
+                    )
+                session.flush()
+
+    @staticmethod
     def _row_requires_destination_manual_review(
         row: SignalDeciderExecutionPlanItem,
     ) -> bool:
@@ -3419,6 +3555,15 @@ class SignalDeciderExecIntegrationService:
             account_reference=account_reference,
             include_payloads=True,
         )
+        self._requeue_legacy_retryable_ambiguous_write_aheads(
+            rows=rows,
+            trigger=trigger,
+        )
+        rows = self._load_next_open_rows(
+            target_trade_date=target_trade_date,
+            account_reference=account_reference,
+            include_payloads=True,
+        )
         pending_rows = [
             row
             for row in rows
@@ -3671,11 +3816,21 @@ class SignalDeciderExecIntegrationService:
                 and row_core_key_bindings_match
             )
             if not local_material_matches:
+                revision_changed = any(
+                    _row_dispatch_revision_fingerprint(row)
+                    != revision_fingerprints.get(int(row.id))
+                    for row in group_rows
+                )
+                reason_code = (
+                    'ambiguous_remote_acceptance_after_core_revision'
+                    if revision_changed
+                    else 'dispatch_write_ahead_material_mismatch'
+                )
                 for row in group_rows:
                     self._mark_exec_destination_manual_review(
                         row_id=int(row.id),
                         trigger=trigger,
-                        reason_code='dispatch_write_ahead_material_mismatch',
+                        reason_code=reason_code,
                         expected_destination=expected_destination,
                         active_destination=active_destination,
                     )
@@ -3683,7 +3838,7 @@ class SignalDeciderExecIntegrationService:
                     {
                         'plan_id': plan_id,
                         'status': 'manual_review_required',
-                        'reason_code': 'dispatch_write_ahead_material_mismatch',
+                        'reason_code': reason_code,
                     }
                 )
                 continue
@@ -3718,6 +3873,24 @@ class SignalDeciderExecIntegrationService:
                 ),
                 None,
             )
+            if remote_plan is None and remote_plans:
+                reason_code = 'dispatch_write_ahead_readback_conflict'
+                for row in group_rows:
+                    self._mark_exec_destination_manual_review(
+                        row_id=int(row.id),
+                        trigger=trigger,
+                        reason_code=reason_code,
+                        expected_destination=expected_destination,
+                        active_destination=active_destination,
+                    )
+                results.append(
+                    {
+                        'plan_id': plan_id,
+                        'status': 'manual_review_required',
+                        'reason_code': reason_code,
+                    }
+                )
+                continue
             if remote_plan is None:
                 can_retry = bool(
                     integration.get('delegate_execution')
@@ -3835,23 +4008,31 @@ class SignalDeciderExecIntegrationService:
                         payload
                     )
                 except SignalDeciderExecClientError as exc:
-                    candidate_response = (
-                        await self._recover_duplicate_dispatch_response(
+                    recovery_status = 'not_attempted'
+                    if (
+                        exc.status_code == 409
+                        or exc.retryable
+                        or exc.code == EXEC_DISPATCH_STATUS_UNAVAILABLE
+                    ):
+                        (
+                            candidate_response,
+                            recovery_status,
+                        ) = await self._recover_duplicate_dispatch_response(
                             plan_id=plan_id,
                             row_links=row_links,
                             expected_dispatch_material_fingerprint=str(
                                 expected_material_fingerprint
                             ),
                         )
-                        if (
-                            exc.status_code == 409
-                            or exc.retryable
-                            or exc.code == EXEC_DISPATCH_STATUS_UNAVAILABLE
-                        )
-                        else None
-                    )
+                    else:
+                        candidate_response = None
                     if candidate_response is None:
-                        self._persist_dispatch_failure(
+                        preserve_write_ahead = bool(
+                            exc.retryable
+                            and recovery_status
+                            in {'not_found', 'unavailable'}
+                        )
+                        preserved_write_ahead = self._persist_dispatch_failure(
                             rows=group_rows,
                             submitted_revision_fingerprints={
                                 row_id: str(value)
@@ -3870,12 +4051,21 @@ class SignalDeciderExecIntegrationService:
                                 status_code=exc.status_code,
                             ),
                             remote_acceptance_ambiguous=True,
+                            preserve_write_ahead=preserve_write_ahead,
                         )
                         results.append(
                             {
                                 'plan_id': plan_id,
-                                'status': 'manual_review_required',
-                                'reason_code': 'ambiguous_remote_acceptance',
+                                'status': (
+                                    'not_found_pending_retry'
+                                    if preserved_write_ahead
+                                    else 'manual_review_required'
+                                ),
+                                'reason_code': (
+                                    'retryable_remote_acceptance_ambiguous'
+                                    if preserved_write_ahead
+                                    else 'ambiguous_remote_acceptance'
+                                ),
                             }
                         )
                         continue
@@ -3928,6 +4118,11 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(exec_states[0].get('authority_generation_before'), dict)
                 else None
             )
+            activation_allowed = bool(
+                integration.get('delegate_execution')
+                and integration.get('config_status') == 'ready'
+                and settings.signal_decider_next_open_enabled
+            )
             persisted = await self._persist_dispatch_success_with_revision_retry(
                 rows=group_rows,
                 submitted_revision_fingerprints={
@@ -3940,12 +4135,11 @@ class SignalDeciderExecIntegrationService:
                 payload=payload,
                 response_payload=candidate_response,
                 trigger=f'{trigger}_write_ahead_recovery',
-                authority_generation_before=authority_generation_before,
-            )
-            activation_allowed = bool(
-                integration.get('delegate_execution')
-                and integration.get('config_status') == 'ready'
-                and settings.signal_decider_next_open_enabled
+                authority_generation_before=(
+                    authority_generation_before
+                    if activation_allowed
+                    else None
+                ),
             )
             if activation_allowed:
                 persisted, _ = await self._activate_core_confirmed_dispatch(
@@ -3958,7 +4152,10 @@ class SignalDeciderExecIntegrationService:
                     trigger=f'{trigger}_write_ahead_recovery',
                 )
             results.append({'plan_id': plan_id, **persisted})
-            if persisted.get('dispatch_status') == 'revocation_pending':
+            if (
+                persisted.get('dispatch_status') == 'revocation_pending'
+                and activation_allowed
+            ):
                 await self._flush_pending_exec_revocations(
                     target_trade_date=target_trade_date,
                     account_reference=str(group_rows[0].account_reference),
@@ -4676,13 +4873,19 @@ class SignalDeciderExecIntegrationService:
                     or exc.retryable
                     or exc.code == EXEC_DISPATCH_STATUS_UNAVAILABLE
                 )
+                recovery_status = 'not_attempted'
                 if recoverable_dispatch_error:
-                    response_payload = await self._recover_duplicate_dispatch_response(
+                    (
+                        response_payload,
+                        recovery_status,
+                    ) = await self._recover_duplicate_dispatch_response(
                         plan_id=plan_id,
                         row_links=row_links,
-                        expected_dispatch_material_fingerprint=plan_payload['metadata'][
-                            'dispatch_material_fingerprint'
-                        ],
+                        expected_dispatch_material_fingerprint=(
+                            plan_payload['metadata'][
+                                'dispatch_material_fingerprint'
+                            ]
+                        ),
                     )
                     if response_payload is not None:
                         recovered_revision_fingerprints = (
@@ -4761,6 +4964,58 @@ class SignalDeciderExecIntegrationService:
                             }
                         )
                         continue
+                if (
+                    exc.retryable
+                    and recovery_status in {'not_found', 'unavailable'}
+                ):
+                    pending_error = _serialize_error(
+                        code=exc.code,
+                        message=str(exc),
+                        retryable=exc.retryable,
+                        status_code=exc.status_code,
+                    )
+                    preserved_write_ahead = self._persist_dispatch_failure(
+                        rows=dispatch_rows,
+                        submitted_revision_fingerprints=(
+                            dispatch_revision_fingerprints
+                        ),
+                        row_links=row_links,
+                        plan_id=plan_id,
+                        fingerprint=fingerprint,
+                        payload=plan_payload,
+                        trigger=trigger,
+                        status=self._client_error_status(exc),
+                        error=pending_error,
+                        remote_acceptance_ambiguous=True,
+                        preserve_write_ahead=True,
+                    )
+                    if preserved_write_ahead:
+                        skipped_group_count += 1
+                    else:
+                        failed_group_count += 1
+                    group_results.append(
+                        {
+                            'account_reference': account_key,
+                            'decision_agent_name': decision_agent_name,
+                            'plan_id': plan_id,
+                            'dispatch_status': (
+                                EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+                                if preserved_write_ahead
+                                else self._client_error_status(exc)
+                            ),
+                            'eligible_count': len(eligible_rows),
+                            'already_dispatched_count': len(
+                                already_dispatched_rows
+                            ),
+                            'dispatch_candidate_count': len(dispatch_rows),
+                            'translated_item_count': len(
+                                plan_payload['items']
+                            ),
+                            'reconciliation_status': recovery_status,
+                            'error': pending_error,
+                        }
+                    )
+                    continue
                 status = self._client_error_status(exc)
                 failed_group_count += 1
                 self._persist_dispatch_failure(
@@ -5084,11 +5339,11 @@ class SignalDeciderExecIntegrationService:
         plan_id: str,
         row_links: dict[int, list[dict[str, Any]]],
         expected_dispatch_material_fingerprint: str,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, str]:
         try:
             readback = await self.client.list_execution_plans(external_plan_id=plan_id)
         except SignalDeciderExecClientError:
-            return None
+            return None, 'unavailable'
         plans = _collect_items(readback)
         plan = next(
             (
@@ -5096,12 +5351,12 @@ class SignalDeciderExecIntegrationService:
                 for item in plans
                 if _normalize_optional_text(item.get('plan_id') or item.get('external_plan_id')) == plan_id
             ),
-            plans[0] if len(plans) == 1 else None,
+            None,
         )
         if not isinstance(plan, dict):
-            return None
+            return (None, 'not_found') if not plans else (None, 'conflict')
         if _normalize_status(plan.get('status')) != EXEC_DISPATCH_STATUS_ACCEPTED:
-            return None
+            return None, 'conflict'
         submitted_core_keys: list[str] = []
         for links in row_links.values():
             for link in links:
@@ -5117,7 +5372,7 @@ class SignalDeciderExecIntegrationService:
             'item_acks': plan.get('item_acks'),
         }
         try:
-            recovered_by_key = validate_execution_plan_dispatch_ack(
+            validate_execution_plan_dispatch_ack(
                 candidate,
                 plan_id=plan_id,
                 submitted_core_item_keys=submitted_core_keys,
@@ -5126,8 +5381,8 @@ class SignalDeciderExecIntegrationService:
                 ),
             )
         except ValueError:
-            return None
-        return candidate
+            return None, 'conflict'
+        return candidate, 'accepted'
 
     async def list_signal_decider_exec_overview(
         self,
@@ -8787,10 +9042,12 @@ class SignalDeciderExecIntegrationService:
         status: str,
         error: dict[str, Any],
         remote_acceptance_ambiguous: bool = False,
-    ) -> None:
+        preserve_write_ahead: bool = False,
+    ) -> bool:
         now = _utcnow()
         row_ids = [int(row.id) for row in rows]
         submitted_by_id = {int(row.id): row for row in rows}
+        preserved_row_count = 0
         if set(submitted_revision_fingerprints) != set(row_ids):
             raise ValueError('dispatch revision fingerprints must bind every submitted row')
         with session_scope() as session:
@@ -8910,6 +9167,59 @@ class SignalDeciderExecIntegrationService:
                     ),
                 }
                 if remote_acceptance_ambiguous:
+                    if (
+                        preserve_write_ahead
+                        and error.get('retryable') is True
+                        and not row_revision_changed
+                        and write_ahead_matches
+                    ):
+                        failed_exec_dispatch['dispatch_status'] = (
+                            EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+                        )
+                        existing_submission.update(
+                            {
+                                'mode': 'exec_dispatch',
+                                'latest': {
+                                    **attempt,
+                                    'dispatch_status': (
+                                        EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+                                    ),
+                                },
+                                'exec_dispatch': failed_exec_dispatch,
+                                'dispatch_reconciliation': {
+                                    'status': (
+                                        EXEC_DISPATCH_STATUS_PENDING_REMOTE_ACK
+                                    ),
+                                    'plan_id': plan_id,
+                                    'plan_fingerprint': fingerprint,
+                                    'observed_at': now.isoformat(),
+                                    'reason_code': (
+                                        'retryable_remote_acceptance_ambiguous'
+                                    ),
+                                    'submitted_dispatch_revision_fingerprint': (
+                                        submitted_revision_fingerprint
+                                    ),
+                                    'current_dispatch_revision_fingerprint': (
+                                        current_revision_fingerprint
+                                    ),
+                                    'error': summarize_error(error),
+                                },
+                            }
+                        )
+                        row.eligibility_status = str(
+                            existing_exec.get('prior_eligibility_status')
+                            or submitted_row.eligibility_status
+                        )
+                        row.execution_status = (
+                            EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+                        )
+                        row.submission_payload = (
+                            slim_signal_decider_exec_submission_payload(
+                                existing_submission
+                            ).payload
+                        )
+                        preserved_row_count += 1
+                        continue
                     existing_submission['dispatch_reconciliation'] = {
                         'status': 'manual_review_required',
                         'plan_id': plan_id,
@@ -8953,6 +9263,10 @@ class SignalDeciderExecIntegrationService:
                 }
                 row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
             session.flush()
+        return bool(
+            preserve_write_ahead
+            and preserved_row_count == len(row_ids)
+        )
 
     @staticmethod
     def _release_not_found_dispatch_write_ahead(
@@ -9817,6 +10131,7 @@ class SignalDeciderExecIntegrationService:
                 else:
                     row.execution_status = EXECUTION_STATUS_SUBMITTED
                 row.submitted_at = row.submitted_at or now
+                existing_submission.pop('dispatch_reconciliation', None)
                 submission = {
                     **existing_submission,
                     'mode': 'exec_dispatch',

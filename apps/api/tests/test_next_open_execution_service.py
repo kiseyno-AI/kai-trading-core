@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, event, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -36,6 +36,7 @@ from app.market.clock import MarketState
 from app.agent_context.signal_decider_loop_service import (
     SignalDeciderLoopRepository,
 )
+from app.agent_context.eligibility import _load_active_watch_reasons
 from app.market.session import (
     KisKrxTradingCalendarProvider,
     reset_krx_calendar_provider,
@@ -4799,6 +4800,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             ).scalar_one()
             row.request_payload = {
                 **dict(row.request_payload or {}),
+                'reuse_existing': None,
                 'large_unrelated_request_context': 'x' * 100_000,
             }
             row.summary_payload = {
@@ -4818,9 +4820,26 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 'large_unrelated_summary_context': 'w' * 100_000,
             }
 
-        state = self._service()._load_latest_decider_scope_state(
-            source_market_date=self.market_date,
-        )
+        statements: list[str] = []
+
+        def record_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if 'FROM agent_context_feedback_runs' in statement:
+                statements.append(statement)
+
+        event.listen(engine, 'before_cursor_execute', record_statement)
+        try:
+            state = self._service()._load_latest_decider_scope_state(
+                source_market_date=self.market_date,
+            )
+        finally:
+            event.remove(engine, 'before_cursor_execute', record_statement)
 
         projected = next(
             run
@@ -4837,6 +4856,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'large_unrelated_request_context',
             projected['request_payload'],
         )
+        self.assertIn('reuse_existing', projected['request_payload'])
+        self.assertIsNone(projected['request_payload']['reuse_existing'])
         self.assertNotIn(
             'large_unrelated_summary_context',
             projected['summary_payload'],
@@ -4849,6 +4870,18 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'large_unrelated_summary_request_context',
             projected['summary_payload']['request'],
         )
+        self.assertEqual(len(statements), 1)
+        run_query = statements[0]
+        self.assertEqual(
+            run_query.count('agent_context_feedback_runs.request_payload'),
+            1,
+        )
+        self.assertEqual(
+            run_query.count('agent_context_feedback_runs.summary_payload'),
+            1,
+        )
+        self.assertNotIn('json_typeof', run_query.lower())
+        self.assertNotIn('->', run_query)
 
     def test_scope_state_preserves_legacy_summary_request_scope_fallback(
         self,
@@ -8416,6 +8449,206 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self._ack_pending_revocation(service=service, item=item)
         revoked = service.list_plan_items(target_trade_date=self.target_trade_date)['items'][0]
         self.assertEqual(revoked['execution_status'], EXECUTION_STATUS_REVOKED)
+
+    def test_refresh_reports_invalid_generation_instead_of_candidate_removed(self) -> None:
+        snapshot_id = self._seed_snapshot(symbol='005930')
+        service = self._service()
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_valid_generation',
+            )
+
+        def reject_snapshot_generation(*, market_date, snapshots, **_kwargs):
+            return {
+                'schema_version': 'persisted_decider_generation_validation_v1',
+                'market_date': str(market_date),
+                'valid_snapshot_ids': [],
+                'invalid_snapshot_ids': [int(snapshot.id) for snapshot in snapshots],
+                'validations': [
+                    {
+                        'snapshot_id': int(snapshot.id),
+                        'symbol': snapshot.symbol,
+                        'agent_name': snapshot.agent_name,
+                        'status': 'invalid',
+                        'reason': 'durable_decider_inputs_changed',
+                    }
+                    for snapshot in snapshots
+                ],
+                'generation_fingerprint': f'test-snapshot-generation:invalid:{snapshot_id}',
+            }
+
+        self.snapshot_generation_mock.side_effect = reject_snapshot_generation
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='generation_changed',
+            )
+
+        item = next(
+            row
+            for row in refreshed['items']
+            if row['account_reference'] == self.account_reference
+            and row['symbol'] == '005930'
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(item['execution_status'], EXECUTION_STATUS_PLANNED)
+        self.assertEqual(item['decision_snapshot_id'], snapshot_id)
+        self.assertEqual(
+            [reason['code'] for reason in item['validation']['blocking_reasons']],
+            ['decision_input_generation_changed'],
+        )
+
+    def test_feedback_active_watch_excludes_same_generation_and_blocked_rows(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service()
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_plan_row',
+            )
+
+        with session_scope() as session:
+            row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+            ).scalar_one()
+            row.eligibility_status = ELIGIBILITY_MONITOR_CANDIDATE
+            row.execution_status = EXECUTION_STATUS_AWAITING_TRIGGER
+            row.source_market_date = self.market_date
+
+        same_generation_reasons: dict[str, list[dict]] = {}
+        same_generation = _load_active_watch_reasons(
+            market_date=self.market_date,
+            symbols=['005930'],
+            reasons_by_symbol=same_generation_reasons,
+        )
+        self.assertEqual(same_generation['matched_rows'], 0)
+        self.assertEqual(same_generation_reasons, {})
+
+        with session_scope() as session:
+            row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+            ).scalar_one()
+            row.source_market_date = self.market_date - timedelta(days=1)
+
+        prior_generation_reasons: dict[str, list[dict]] = {}
+        prior_generation = _load_active_watch_reasons(
+            market_date=self.market_date,
+            symbols=['005930'],
+            reasons_by_symbol=prior_generation_reasons,
+        )
+        self.assertEqual(prior_generation['matched_rows'], 1)
+        self.assertEqual(
+            prior_generation_reasons['005930'][0]['code'],
+            'active_exec_watch_item',
+        )
+
+        with session_scope() as session:
+            row = session.execute(
+                select(SignalDeciderExecutionPlanItem).where(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+            ).scalar_one()
+            row.eligibility_status = ELIGIBILITY_BLOCKED
+
+        blocked_reasons: dict[str, list[dict]] = {}
+        blocked = _load_active_watch_reasons(
+            market_date=self.market_date,
+            symbols=['005930'],
+            reasons_by_symbol=blocked_reasons,
+        )
+        self.assertEqual(blocked['matched_rows'], 0)
+        self.assertEqual(blocked_reasons, {})
+
+    def test_snapshot_scope_selection_hydrates_only_selected_payloads(self) -> None:
+        older_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id='scope-projection-older',
+            feedback_received_at=datetime(
+                2026, 4, 29, 5, 0, tzinfo=timezone.utc
+            ),
+        )
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            decision_run_id='scope-projection-selected',
+            feedback_received_at=datetime(
+                2026, 4, 29, 6, 0, tzinfo=timezone.utc
+            ),
+        )
+        service = self._service()
+        statements: list[tuple[str, object]] = []
+
+        def record_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if 'FROM signal_decider_decision_snapshots' in statement:
+                statements.append((statement, _parameters))
+
+        event.listen(engine, 'before_cursor_execute', record_statement)
+        try:
+            state = service._load_latest_decider_scope_state(
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+            )
+        finally:
+            event.remove(engine, 'before_cursor_execute', record_statement)
+
+        selected = state['selected_by_key'][('005930', 'signal-decider')]
+        self.assertEqual(selected.id, snapshot_id)
+        self.assertIsInstance(selected.supporting_evidence_payload, (dict, list))
+        metadata_queries = [
+            (statement, parameters)
+            for statement, parameters in statements
+            if 'market_date' in statement and 'id IN' not in statement
+        ]
+        hydration_queries = [
+            (statement, parameters)
+            for statement, parameters in statements
+            if 'id IN' in statement
+        ]
+        self.assertEqual(len(metadata_queries), 1)
+        self.assertNotIn(
+            'supporting_evidence_payload',
+            metadata_queries[0][0],
+        )
+        self.assertEqual(len(hydration_queries), 1)
+        self.assertIn(
+            'supporting_evidence_payload',
+            hydration_queries[0][0],
+        )
+        hydration_parameters = hydration_queries[0][1]
+        self.assertIsInstance(hydration_parameters, dict)
+        hydrated_ids = {
+            int(value)
+            for value in hydration_parameters.values()
+            if isinstance(value, int)
+        }
+        self.assertIn(snapshot_id, hydrated_ids)
+        self.assertNotIn(older_snapshot_id, hydrated_ids)
 
     def test_refresh_revokes_terminal_buy_when_account_route_is_removed(self) -> None:
         self._seed_snapshot(symbol='005930')
