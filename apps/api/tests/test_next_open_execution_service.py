@@ -1705,6 +1705,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             market_state_getter=get_market_state
         )
         with patch(
+            'app.orders.next_open_execution._set_plan_refresh_transaction_timeouts',
+        ) as set_transaction_timeouts, patch(
             'app.orders.next_open_execution._lock_dispatch_authority_source_tables',
             side_effect=mark_authority_locked,
         ):
@@ -1715,6 +1717,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(generation['status'], 'valid')
         self.assertEqual(market_state_call_count, 2)
+        set_transaction_timeouts.assert_called_once()
 
     def test_refresh_revalidates_pykrx_authority_after_source_tables_are_locked(
         self,
