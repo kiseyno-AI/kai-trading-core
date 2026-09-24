@@ -2350,6 +2350,7 @@ class SignalDeciderNextOpenExecutionService:
 
         session_context = session_scope() if _session is None else nullcontext(_session)
         with session_context as session:
+            _set_plan_refresh_transaction_timeouts(session)
             _acquire_plan_refresh_advisory_lock(
                 session,
                 target_trade_date=resolved_target_date,
