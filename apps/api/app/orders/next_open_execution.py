@@ -587,6 +587,40 @@ def _snapshot_generation_authority_fingerprint(
     )
 
 
+def _snapshot_generation_authority_changes(
+    initial: dict[str, Any],
+    locked: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return only snapshot authority rows that changed across the proof lock."""
+
+    def rows(validation: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {
+            str(item.get('snapshot_id')): {
+                'snapshot_id': item.get('snapshot_id'),
+                'symbol': item.get('symbol'),
+                'agent_name': item.get('agent_name'),
+                'status': item.get('status'),
+                'reason': item.get('reason'),
+            }
+            for item in validation.get('validations') or []
+            if isinstance(item, dict) and item.get('snapshot_id') is not None
+        }
+
+    initial_rows = rows(initial)
+    locked_rows = rows(locked)
+    return {
+        snapshot_id: {
+            'initial': initial_rows.get(snapshot_id),
+            'locked': locked_rows.get(snapshot_id),
+        }
+        for snapshot_id in sorted(
+            set(initial_rows) | set(locked_rows),
+            key=lambda value: int(value),
+        )
+        if initial_rows.get(snapshot_id) != locked_rows.get(snapshot_id)
+    }
+
+
 def _live_market_snapshot_fingerprint(
     snapshot_context: dict[str, Any] | None,
     *,
@@ -3247,14 +3281,19 @@ class SignalDeciderNextOpenExecutionService:
                     force=force,
                     _compact_response=_compact_response,
                 )
-            except _PlanRefreshRevisionConflict:
+            except _PlanRefreshRevisionConflict as exc:
                 if attempt + 1 >= PLAN_REFRESH_REVISION_RETRY_ATTEMPTS:
                     raise RuntimeError(
-                        'next-open plan refresh could not bind stable decision inputs'
-                    )
-                logger.info(
-                    'Retrying next-open plan refresh after decision inputs changed: %s',
+                        'next-open plan refresh could not bind stable decision inputs; '
+                        f'last_conflict={exc}'
+                    ) from exc
+                logger.warning(
+                    'Retrying next-open plan refresh after decision inputs changed: '
+                    'target_trade_date=%s attempt=%s/%s conflict=%s',
                     target_trade_date,
+                    attempt + 1,
+                    PLAN_REFRESH_REVISION_RETRY_ATTEMPTS,
+                    exc,
                 )
                 time.sleep(
                     PLAN_REFRESH_REVISION_RETRY_DELAY_SECONDS * (2**attempt)
@@ -3512,7 +3551,9 @@ class SignalDeciderNextOpenExecutionService:
                     )
                     != initial_live_market_snapshot_fingerprint
                 ):
-                    raise _PlanRefreshRevisionConflict
+                    raise _PlanRefreshRevisionConflict(
+                        'live_market_snapshot_authority_changed'
+                    )
             else:
                 live_market_snapshot_context = None
                 live_market_snapshot_load_error = False
@@ -3549,7 +3590,9 @@ class SignalDeciderNextOpenExecutionService:
             ) != snapshot_generation_state[
                 'raw_snapshot_cohort_fingerprint'
             ]:
-                raise _PlanRefreshRevisionConflict
+                raise _PlanRefreshRevisionConflict(
+                    'selected_snapshot_scope_changed'
+                )
             locked_generation_validation = (
                 agent_feedback_orchestrator
                 .revalidate_persisted_decider_snapshots(
@@ -3566,7 +3609,14 @@ class SignalDeciderNextOpenExecutionService:
                     generation_validation
                 )
             ):
-                raise _PlanRefreshRevisionConflict
+                changes = _snapshot_generation_authority_changes(
+                    generation_validation,
+                    locked_generation_validation,
+                )
+                raise _PlanRefreshRevisionConflict(
+                    'snapshot_generation_authority_changed '
+                    f'changes={json.dumps(changes, sort_keys=True, default=str)}'
+                )
             generation_validation = locked_generation_validation
             valid_snapshot_ids = {
                 int(snapshot_id)
@@ -3583,7 +3633,9 @@ class SignalDeciderNextOpenExecutionService:
             if _snapshot_cohort_fingerprint(
                 current_snapshots
             ) != _snapshot_cohort_fingerprint(snapshots):
-                raise _PlanRefreshRevisionConflict
+                raise _PlanRefreshRevisionConflict(
+                    'valid_snapshot_cohort_changed'
+                )
             initial_agent_context_authority = str(
                 agent_context_completeness.get('authority_fingerprint') or ''
             ).strip()
@@ -3615,7 +3667,9 @@ class SignalDeciderNextOpenExecutionService:
                         agent_context_completeness.get('status') or ''
                     ).strip().lower()
                 ):
-                    raise _PlanRefreshRevisionConflict
+                    raise _PlanRefreshRevisionConflict(
+                        'agent_context_authority_changed'
+                    )
             current_account_targets, current_account_target_errors = (
                 self._parse_account_targets()
             )
@@ -3626,7 +3680,9 @@ class SignalDeciderNextOpenExecutionService:
                 or _next_open_policy_fingerprint(current_account_targets)
                 != plan_policy_fingerprint
             ):
-                raise _PlanRefreshRevisionConflict
+                raise _PlanRefreshRevisionConflict(
+                    'account_target_policy_changed'
+                )
             attached_existing = {
                 (
                     row.account_reference,

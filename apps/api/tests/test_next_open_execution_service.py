@@ -79,6 +79,7 @@ from app.orders.next_open_execution import (
     _next_open_performance_cost_evidence,
     _next_open_policy_fingerprint,
     _normalize_objective_percentile,
+    _snapshot_generation_authority_changes,
     _snapshot_generation_authority_fingerprint,
     _set_plan_refresh_transaction_timeouts,
     _preopen_plan_covers_latest_snapshots,
@@ -293,6 +294,31 @@ def test_generation_authority_ignores_diagnostics_but_not_validity() -> None:
     assert _snapshot_generation_authority_fingerprint(
         baseline
     ) != _snapshot_generation_authority_fingerprint(now_valid)
+    assert _snapshot_generation_authority_changes(
+        baseline,
+        concrete_mismatch,
+    ) == {}
+    assert _snapshot_generation_authority_changes(
+        baseline,
+        now_valid,
+    ) == {
+        '28741': {
+            'initial': {
+                'snapshot_id': 28741,
+                'symbol': '019010',
+                'agent_name': 'short-term-decider',
+                'status': 'invalid',
+                'reason': 'durable_decider_inputs_changed',
+            },
+            'locked': {
+                'snapshot_id': 28741,
+                'symbol': '019010',
+                'agent_name': 'short-term-decider',
+                'status': 'valid',
+                'reason': 'durable_decider_inputs_unchanged',
+            },
+        }
+    }
 
 
 def test_dispatch_authority_source_lock_contention_is_a_retryable_revision_conflict(
