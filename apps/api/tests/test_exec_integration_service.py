@@ -8413,8 +8413,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             }
 
         events: list[str] = []
+        observed_session_scope_kwargs: list[dict[str, object]] = []
         original_list = self.client.list_execution_plans
         original_post = self.client.post_execution_plan
+
+        def recording_session_scope(**kwargs: object):
+            observed_session_scope_kwargs.append(dict(kwargs))
+            return session_scope(**kwargs)
 
         async def empty_readback(*, external_plan_id: str | None = None) -> dict:
             events.append('readback')
@@ -8432,6 +8437,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.client,
             'post_execution_plan',
             side_effect=accepted_retry,
+        ), patch(
+            'app.orders.exec_integration.session_scope',
+            side_effect=recording_session_scope,
         ):
             await self.service.dispatch_next_open_plan(
                 target_trade_date=self.target_trade_date,
@@ -8443,6 +8451,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(events[:2], ['readback', 'post'])
+        self.assertIn(
+            {
+                'statement_timeout_ms': (
+                    settings.signal_decider_db_statement_timeout_ms
+                ),
+                'lock_timeout_ms': settings.signal_decider_db_lock_timeout_ms,
+            },
+            observed_session_scope_kwargs,
+        )
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertTrue(_row_has_accepted_exec_dispatch(row))

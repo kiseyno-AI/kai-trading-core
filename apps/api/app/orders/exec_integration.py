@@ -2670,7 +2670,12 @@ class SignalDeciderExecIntegrationService:
                 continue
             row_ids = [int(row.id) for row in group_rows]
             now = _utcnow()
-            with session_scope() as session:
+            with session_scope(
+                statement_timeout_ms=(
+                    settings.signal_decider_db_statement_timeout_ms
+                ),
+                lock_timeout_ms=settings.signal_decider_db_lock_timeout_ms,
+            ) as session:
                 persisted_rows = session.execute(
                     select(SignalDeciderExecutionPlanItem)
                     .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
