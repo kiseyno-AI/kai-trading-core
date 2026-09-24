@@ -16,7 +16,7 @@ import time
 from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import defer
 
@@ -240,15 +240,11 @@ def _load_projected_decider_feedback_runs(
     """Load only run metadata needed to reconstruct decider authority.
 
     Feedback run payloads also contain large diagnostics and model artifacts.
-    Next-open authority only consumes the bounded scope, lineage, failure, and
-    reuse fields projected below; fetching the full JSON documents amplifies DB
-    contention and JSON decoding during the market-open refresh path.
+    Read each JSON document once, then retain only the bounded scope, lineage,
+    failure, and reuse fields below.  Extracting every field in PostgreSQL
+    repeatedly detoasts and parses the same documents on the authority path.
     """
 
-    request_payload = AgentContextFeedbackRun.request_payload
-    summary_payload = AgentContextFeedbackRun.summary_payload
-    progress_summary = summary_payload['progress_summary']
-    summary_request = summary_payload['request']
     rows = session.execute(
         select(
             AgentContextFeedbackRun.id,
@@ -262,53 +258,8 @@ def _load_projected_decider_feedback_runs(
             AgentContextFeedbackRun.completed_at,
             AgentContextFeedbackRun.created_at,
             AgentContextFeedbackRun.updated_at,
-            request_payload['mode'].label('request_mode'),
-            request_payload['roles'].label('request_roles'),
-            request_payload['scope'].label('request_scope'),
-            request_payload['role_symbol_scopes'].label(
-                'request_role_symbol_scopes'
-            ),
-            request_payload['requested_symbols'].label(
-                'request_requested_symbols'
-            ),
-            request_payload['symbols'].label('request_symbols'),
-            request_payload['parent_run_id'].label(
-                'request_parent_run_id'
-            ),
-            request_payload['reuse_existing'].label(
-                'request_reuse_existing'
-            ),
-            request_payload['force_recompute'].label(
-                'request_force_recompute'
-            ),
-            request_payload['child_run_lineage'].label(
-                'request_child_run_lineage'
-            ),
-            func.json_typeof(request_payload['reuse_existing']).label(
-                'request_reuse_existing_json_type'
-            ),
-            summary_payload['failed_symbols_by_role'].label(
-                'summary_failed_symbols_by_role'
-            ),
-            summary_payload['reused_symbols_by_role'].label(
-                'summary_reused_symbols_by_role'
-            ),
-            summary_payload['reused_feedback_evidence_by_role'].label(
-                'summary_reused_feedback_evidence_by_role'
-            ),
-            progress_summary['failed_symbols_by_role'].label(
-                'progress_failed_symbols_by_role'
-            ),
-            progress_summary['reused_symbols_by_role'].label(
-                'progress_reused_symbols_by_role'
-            ),
-            progress_summary['reused_feedback_evidence_by_role'].label(
-                'progress_reused_feedback_evidence_by_role'
-            ),
-            summary_request['symbols'].label('summary_request_symbols'),
-            summary_request['requested_symbols'].label(
-                'summary_request_requested_symbols'
-            ),
+            AgentContextFeedbackRun.request_payload,
+            AgentContextFeedbackRun.summary_payload,
         )
         .where(AgentContextFeedbackRun.market_date == market_date)
         .order_by(
@@ -318,62 +269,73 @@ def _load_projected_decider_feedback_runs(
     ).mappings().all()
 
     request_fields = (
-        ('mode', 'request_mode'),
-        ('roles', 'request_roles'),
-        ('scope', 'request_scope'),
-        ('role_symbol_scopes', 'request_role_symbol_scopes'),
-        ('requested_symbols', 'request_requested_symbols'),
-        ('symbols', 'request_symbols'),
-        ('parent_run_id', 'request_parent_run_id'),
-        ('reuse_existing', 'request_reuse_existing'),
-        ('force_recompute', 'request_force_recompute'),
-        ('child_run_lineage', 'request_child_run_lineage'),
+        'mode',
+        'roles',
+        'scope',
+        'role_symbol_scopes',
+        'requested_symbols',
+        'symbols',
+        'parent_run_id',
+        'reuse_existing',
+        'force_recompute',
+        'child_run_lineage',
     )
     summary_fields = (
-        ('failed_symbols_by_role', 'summary_failed_symbols_by_role'),
-        ('reused_symbols_by_role', 'summary_reused_symbols_by_role'),
-        (
-            'reused_feedback_evidence_by_role',
-            'summary_reused_feedback_evidence_by_role',
-        ),
+        'failed_symbols_by_role',
+        'reused_symbols_by_role',
+        'reused_feedback_evidence_by_role',
     )
     progress_fields = (
-        ('failed_symbols_by_role', 'progress_failed_symbols_by_role'),
-        ('reused_symbols_by_role', 'progress_reused_symbols_by_role'),
-        (
-            'reused_feedback_evidence_by_role',
-            'progress_reused_feedback_evidence_by_role',
-        ),
+        'failed_symbols_by_role',
+        'reused_symbols_by_role',
+        'reused_feedback_evidence_by_role',
     )
     summary_request_fields = (
-        ('symbols', 'summary_request_symbols'),
-        ('requested_symbols', 'summary_request_requested_symbols'),
+        'symbols',
+        'requested_symbols',
     )
 
     def projected_fields(
-        row: Any,
-        fields: Sequence[tuple[str, str]],
+        payload: dict[str, Any],
+        fields: Sequence[str],
     ) -> dict[str, Any]:
         return {
-            key: row[label]
-            for key, label in fields
-            if row[label] is not None
+            key: payload[key]
+            for key in fields
+            if key in payload and payload[key] is not None
         }
 
     projected_runs: list[dict[str, Any]] = []
     for row in rows:
-        projected_request = projected_fields(row, request_fields)
+        raw_request = (
+            row['request_payload']
+            if isinstance(row['request_payload'], dict)
+            else {}
+        )
+        raw_summary = (
+            row['summary_payload']
+            if isinstance(row['summary_payload'], dict)
+            else {}
+        )
+        raw_progress = raw_summary.get('progress_summary')
+        if not isinstance(raw_progress, dict):
+            raw_progress = {}
+        raw_summary_request = raw_summary.get('request')
+        if not isinstance(raw_summary_request, dict):
+            raw_summary_request = {}
+
+        projected_request = projected_fields(raw_request, request_fields)
         if (
-            row['request_reuse_existing_json_type'] is not None
+            'reuse_existing' in raw_request
             and 'reuse_existing' not in projected_request
         ):
             # Preserve explicit JSON null.  Omitting the key would incorrectly
             # activate payload.get('reuse_existing', True)'s legacy default.
             projected_request['reuse_existing'] = None
-        projected_summary = projected_fields(row, summary_fields)
-        projected_progress = projected_fields(row, progress_fields)
+        projected_summary = projected_fields(raw_summary, summary_fields)
+        projected_progress = projected_fields(raw_progress, progress_fields)
         projected_summary_request = projected_fields(
-            row,
+            raw_summary_request,
             summary_request_fields,
         )
         if projected_progress:
@@ -2023,6 +1985,48 @@ def _exec_agent_sizing_dispatch_enabled() -> bool:
     return str(settings.signal_decider_exec_integration_mode or '').strip().lower() == 'dispatch'
 
 
+def _has_canonical_completed_eod_phase(
+    pre_decider_enrichment_context: dict[str, Any],
+) -> bool:
+    phase_contract = pre_decider_enrichment_context.get('market_data_phase_contract')
+    quote = pre_decider_enrichment_context.get('quote_orderbook_snapshot')
+    if not isinstance(phase_contract, dict) or not isinstance(quote, dict):
+        return False
+    quote_shape = (
+        str(quote.get('status') or '').strip().lower(),
+        str(quote.get('snapshot_type') or '').strip().lower(),
+        str(quote.get('quote_freshness_status') or '').strip().lower(),
+    )
+    return bool(
+        phase_contract.get('schema_version') == 'market_data_phase_contract_v1'
+        and phase_contract.get('recommendation_basis') == 'latest_completed_eod'
+        and phase_contract.get('realtime_quote_orderbook_required') is False
+        and phase_contract.get('eod_reference_price_accepted') is True
+        and phase_contract.get('not_applicable_realtime_is_expected') is True
+        and quote_shape
+        in {
+            ('stale_eod', 'eod_stale', 'stale'),
+            ('not_applicable', 'closed_market_no_eod_price', 'not_applicable'),
+        }
+    )
+
+
+def _should_delegate_short_term_watch_data_warnings(
+    *,
+    decision_agent_name: str,
+    tactical_action: str | None,
+    handoff_intent: str | None,
+    pre_decider_enrichment_context: dict[str, Any],
+) -> bool:
+    return bool(
+        _exec_agent_sizing_dispatch_enabled()
+        and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+        and tactical_action == 'watch_for_trigger'
+        and handoff_intent == 'intraday_watch_buy'
+        and _has_canonical_completed_eod_phase(pre_decider_enrichment_context)
+    )
+
+
 def _is_dispatch_terminal_status(value: Any) -> bool:
     return _normalize_optional_text(value) in {
         EXECUTION_STATUS_SUBMITTED,
@@ -2067,13 +2071,9 @@ def _is_canonical_closed_market_cost_absence(
         or execution_feasibility_context.get('expected_slippage_basis') != 'unavailable'
     ):
         return False
-    phase_contract = pre_decider_enrichment_context.get('market_data_phase_contract')
     quote = pre_decider_enrichment_context.get('quote_orderbook_snapshot')
-    if not isinstance(phase_contract, dict) or not isinstance(quote, dict):
+    if not isinstance(quote, dict):
         return False
-    quote_status = str(quote.get('status') or '').strip().lower()
-    snapshot_type = str(quote.get('snapshot_type') or '').strip().lower()
-    quote_freshness_status = str(quote.get('quote_freshness_status') or '').strip().lower()
     status_and_reason = (
         execution_feasibility_context.get('expected_slippage_status'),
         execution_feasibility_context.get('expected_slippage_reason'),
@@ -2092,20 +2092,7 @@ def _is_canonical_closed_market_cost_absence(
             return False
     else:
         return False
-    return bool(
-        phase_contract.get('schema_version') == 'market_data_phase_contract_v1'
-        and phase_contract.get('recommendation_basis') == 'latest_completed_eod'
-        and phase_contract.get('realtime_quote_orderbook_required') is False
-        and phase_contract.get('eod_reference_price_accepted') is True
-        and phase_contract.get('not_applicable_realtime_is_expected') is True
-        and (
-            (quote_status, snapshot_type, quote_freshness_status)
-            in {
-                ('stale_eod', 'eod_stale', 'stale'),
-                ('not_applicable', 'closed_market_no_eod_price', 'not_applicable'),
-            }
-        )
-    )
+    return _has_canonical_completed_eod_phase(pre_decider_enrichment_context)
 
 
 def _pykrx_preflight_has_partial_coverage(preflight: dict[str, Any] | None) -> bool:
@@ -2141,6 +2128,35 @@ class NextOpenAccountTarget:
     label: str
     account_reference: str
     budget_krw: Decimal
+
+
+@dataclass(frozen=True)
+class _DecisionSnapshotAuthorityProjection:
+    id: int
+    feedback_id: int | None
+    content_fingerprint: str | None
+    market_date: date
+    symbol: str
+    agent_name: str
+    decision_run_id: str | None
+    feedback_received_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+def _decision_snapshot_authority_token(snapshot: Any) -> tuple[Any, ...]:
+    return (
+        int(snapshot.id),
+        snapshot.feedback_id,
+        snapshot.content_fingerprint,
+        snapshot.market_date,
+        snapshot.symbol,
+        snapshot.agent_name,
+        snapshot.decision_run_id,
+        snapshot.feedback_received_at,
+        snapshot.created_at,
+        snapshot.updated_at,
+    )
 
 
 def _next_open_policy_fingerprint(account_targets: Sequence[NextOpenAccountTarget]) -> str:
@@ -3398,6 +3414,18 @@ class SignalDeciderNextOpenExecutionService:
             (snapshot.symbol, _snapshot_agent_name(snapshot))
             for snapshot in snapshots
         }
+        invalid_snapshot_ids = {
+            int(snapshot_id)
+            for snapshot_id in generation_validation.get(
+                'invalid_snapshot_ids'
+            )
+            or []
+        }
+        invalid_snapshot_scopes = {
+            (snapshot.symbol, _snapshot_agent_name(snapshot))
+            for snapshot in snapshot_generation_state['raw_snapshots']
+            if int(snapshot.id) in invalid_snapshot_ids
+        }
         actionable_short_term_symbols = [
             snapshot.symbol for snapshot in snapshots if _is_actionable_short_term_snapshot(snapshot)
         ]
@@ -4104,6 +4132,8 @@ class SignalDeciderNextOpenExecutionService:
                 removal_code = (
                     'decision_snapshot_after_target_open'
                     if row_scope in expired_snapshot_by_key
+                    else 'decision_input_generation_changed'
+                    if row_scope in invalid_snapshot_scopes
                     else 'account_route_removed'
                     if row_scope in actionable_snapshot_scopes
                     else 'candidate_removed'
@@ -4113,6 +4143,10 @@ class SignalDeciderNextOpenExecutionService:
                         'The latest decision snapshot was observed at or after '
                         'the target session opened; next-open BUY authority is expired.'
                     )
+                elif removal_code == 'decision_input_generation_changed':
+                    removal_message = _dispatch_authority_issue_reason(
+                        removal_code
+                    )['message']
                 elif removal_code == 'account_route_removed':
                     removal_message = (
                         f'Configured account route no longer permits {row.decision_agent_name} '
@@ -4981,59 +5015,92 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: date | None = None,
         _session: Any | None = None,
     ) -> dict[str, Any]:
-        owns_session = _session is None
-        session_context = (
-            session_scope(
+        if _session is None:
+            with session_scope(
                 statement_timeout_ms=settings.signal_decider_db_statement_timeout_ms,
                 lock_timeout_ms=settings.signal_decider_db_lock_timeout_ms,
-            )
-            if owns_session
-            else nullcontext(_session)
-        )
-        with session_context as session:
-            snapshots = session.execute(
-                select(SignalDeciderDecisionSnapshot)
-                .where(
-                    SignalDeciderDecisionSnapshot.agent_name.in_(
-                        [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
-                    ),
-                    SignalDeciderDecisionSnapshot.market_date == source_market_date,
+            ) as session:
+                state = self._load_latest_decider_scope_state_in_session(
+                    source_market_date=source_market_date,
+                    target_trade_date=target_trade_date,
+                    session=session,
                 )
-                .order_by(
-                    SignalDeciderDecisionSnapshot.created_at.desc(),
-                    SignalDeciderDecisionSnapshot.id.desc(),
-                )
-            ).scalars().all()
-            run_snapshots = _load_projected_decider_feedback_runs(
-                session=session,
-                market_date=source_market_date,
-            )
-            failure_rows = session.execute(
-                select(
-                    AgentContextFeedbackFailure.symbol,
-                    AgentContextFeedbackFailure.agent_name,
-                    AgentContextFeedbackFailure.run_id,
-                    AgentContextFeedbackFailure.failure_kind,
-                    AgentContextFeedbackFailure.retryable,
-                    AgentContextFeedbackFailure.summary_payload,
-                    AgentContextFeedbackFailure.context_payload,
-                    AgentContextFeedbackFailure.received_at,
-                    AgentContextFeedbackFailure.id,
-                )
-                .where(
-                    AgentContextFeedbackFailure.market_date == source_market_date,
-                    AgentContextFeedbackFailure.agent_name.in_(
-                        [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
-                    ),
-                )
-                .order_by(
-                    AgentContextFeedbackFailure.received_at.desc(),
-                    AgentContextFeedbackFailure.id.desc(),
-                )
-            ).all()
-            if owns_session:
-                for snapshot in snapshots:
+                detached_snapshot_ids: set[int] = set()
+                for snapshot in state['selected_by_key'].values():
+                    if snapshot is None or int(snapshot.id) in detached_snapshot_ids:
+                        continue
                     session.expunge(snapshot)
+                    detached_snapshot_ids.add(int(snapshot.id))
+                return state
+
+        return self._load_latest_decider_scope_state_in_session(
+            source_market_date=source_market_date,
+            target_trade_date=target_trade_date,
+            session=_session,
+        )
+
+    def _load_latest_decider_scope_state_in_session(
+        self,
+        *,
+        source_market_date: date,
+        target_trade_date: date | None,
+        session: Any,
+    ) -> dict[str, Any]:
+        snapshot_rows = session.execute(
+            select(
+                SignalDeciderDecisionSnapshot.id,
+                SignalDeciderDecisionSnapshot.feedback_id,
+                SignalDeciderDecisionSnapshot.content_fingerprint,
+                SignalDeciderDecisionSnapshot.market_date,
+                SignalDeciderDecisionSnapshot.symbol,
+                SignalDeciderDecisionSnapshot.agent_name,
+                SignalDeciderDecisionSnapshot.decision_run_id,
+                SignalDeciderDecisionSnapshot.feedback_received_at,
+                SignalDeciderDecisionSnapshot.created_at,
+                SignalDeciderDecisionSnapshot.updated_at,
+            )
+            .where(
+                SignalDeciderDecisionSnapshot.agent_name.in_(
+                    [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
+                ),
+                SignalDeciderDecisionSnapshot.market_date == source_market_date,
+            )
+            .order_by(
+                SignalDeciderDecisionSnapshot.created_at.desc(),
+                SignalDeciderDecisionSnapshot.id.desc(),
+            )
+        ).all()
+        snapshots = [
+            _DecisionSnapshotAuthorityProjection(*row)
+            for row in snapshot_rows
+        ]
+        run_snapshots = _load_projected_decider_feedback_runs(
+            session=session,
+            market_date=source_market_date,
+        )
+        failure_rows = session.execute(
+            select(
+                AgentContextFeedbackFailure.symbol,
+                AgentContextFeedbackFailure.agent_name,
+                AgentContextFeedbackFailure.run_id,
+                AgentContextFeedbackFailure.failure_kind,
+                AgentContextFeedbackFailure.retryable,
+                AgentContextFeedbackFailure.summary_payload,
+                AgentContextFeedbackFailure.context_payload,
+                AgentContextFeedbackFailure.received_at,
+                AgentContextFeedbackFailure.id,
+            )
+            .where(
+                AgentContextFeedbackFailure.market_date == source_market_date,
+                AgentContextFeedbackFailure.agent_name.in_(
+                    [SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME]
+                ),
+            )
+            .order_by(
+                AgentContextFeedbackFailure.received_at.desc(),
+                AgentContextFeedbackFailure.id.desc(),
+            )
+        ).all()
 
         required_agents = sorted(
             [SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME]
@@ -5900,6 +5967,49 @@ class SignalDeciderNextOpenExecutionService:
                 selected_by_key[key] = None
                 evidenced_scope_keys.discard(key)
                 reused_scope_keys.discard(key)
+
+        selected_projections_by_id = {
+            int(snapshot.id): snapshot
+            for snapshot in selected_by_key.values()
+            if snapshot is not None
+        }
+        if selected_projections_by_id:
+            selected_snapshot_ids = sorted(selected_projections_by_id)
+            hydrated_snapshots = session.execute(
+                select(SignalDeciderDecisionSnapshot)
+                .where(
+                    SignalDeciderDecisionSnapshot.id.in_(
+                        selected_snapshot_ids
+                    )
+                )
+                .order_by(SignalDeciderDecisionSnapshot.id.asc())
+            ).scalars().all()
+            hydrated_by_id = {
+                int(snapshot.id): snapshot for snapshot in hydrated_snapshots
+            }
+            if (
+                len(hydrated_snapshots) != len(selected_snapshot_ids)
+                or set(hydrated_by_id) != set(selected_snapshot_ids)
+            ):
+                raise _PlanRefreshRevisionConflict(
+                    'selected_decision_snapshot_changed_during_hydration'
+                )
+            for snapshot_id, projected in selected_projections_by_id.items():
+                hydrated = hydrated_by_id[snapshot_id]
+                if _decision_snapshot_authority_token(
+                    hydrated
+                ) != _decision_snapshot_authority_token(projected):
+                    raise _PlanRefreshRevisionConflict(
+                        'selected_decision_snapshot_changed_during_hydration'
+                    )
+            selected_by_key = {
+                key: (
+                    hydrated_by_id[int(snapshot.id)]
+                    if snapshot is not None
+                    else None
+                )
+                for key, snapshot in selected_by_key.items()
+            }
         return {
             'selected_by_key': selected_by_key,
             'expired_snapshot_by_key': expired_snapshot_by_key,
@@ -6314,12 +6424,29 @@ class SignalDeciderNextOpenExecutionService:
             )
         data_quality_warnings = _normalize_text_list(snapshot.data_quality_warnings_payload)
         if settings.signal_decider_next_open_block_on_data_warnings and data_quality_warnings:
-            blocking_reasons.append(
-                _reason(
-                    'data_quality_warnings_present',
-                    'Snapshot has data quality warnings that Exec cannot independently revalidate.',
+            if _should_delegate_short_term_watch_data_warnings(
+                decision_agent_name=decision_agent_name,
+                tactical_action=short_term_tactical_action,
+                handoff_intent=handoff_intent,
+                pre_decider_enrichment_context=pre_decider_enrichment_context,
+            ):
+                warnings.append(
+                    _reason(
+                        'data_quality_warnings_delegated_to_exec_watch',
+                        (
+                            'Snapshot data-quality warnings remain visible as decision context for this '
+                            'monitor-only completed-EOD handoff. Exec must confirm live trigger, price, '
+                            'liquidity, and costs before any buy.'
+                        ),
+                    )
                 )
-            )
+            else:
+                blocking_reasons.append(
+                    _reason(
+                        'data_quality_warnings_present',
+                        'Snapshot has data quality warnings that Exec cannot independently revalidate.',
+                    )
+                )
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
             snapshot.specialist_disagreement_payload
         ):
