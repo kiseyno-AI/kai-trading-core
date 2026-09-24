@@ -131,6 +131,111 @@ def test_session_scope_uses_isolated_connection_for_deadline_persistence() -> No
     assert session.closed is True
 
 
+def test_session_timeout_budget_applies_to_nested_default_sessions() -> None:
+    session = _DeadlineSession()
+
+    with (
+        patch.object(db, 'SessionLocal', return_value=session),
+        db.session_timeout_budget(
+            statement_timeout_ms=300_000,
+            lock_timeout_ms=30_000,
+        ),
+    ):
+        with db.session_scope():
+            pass
+
+    assert session.statements == [
+        'SET LOCAL statement_timeout = 300000',
+        'SET LOCAL lock_timeout = 30000',
+    ]
+
+
+def test_explicit_session_timeout_beats_nested_budget() -> None:
+    session = _DeadlineSession()
+
+    with (
+        patch.object(db, 'SessionLocal', return_value=session),
+        db.session_timeout_budget(
+            statement_timeout_ms=300_000,
+            lock_timeout_ms=30_000,
+        ),
+    ):
+        with db.session_scope(
+            statement_timeout_ms=5_000,
+            lock_timeout_ms=2_000,
+        ):
+            pass
+
+    assert session.statements == [
+        'SET LOCAL statement_timeout = 5000',
+        'SET LOCAL lock_timeout = 2000',
+    ]
+
+
+def test_session_timeout_budget_restores_nested_and_outer_defaults() -> None:
+    outer_session = _DeadlineSession()
+    inner_session = _DeadlineSession()
+    restored_session = _DeadlineSession()
+    unscoped_session = _DeadlineSession()
+
+    with patch.object(
+        db,
+        'SessionLocal',
+        side_effect=[
+            outer_session,
+            inner_session,
+            restored_session,
+            unscoped_session,
+        ],
+    ):
+        with db.session_timeout_budget(
+            statement_timeout_ms=300_000,
+            lock_timeout_ms=30_000,
+        ):
+            with db.session_scope():
+                pass
+            with db.session_timeout_budget(
+                statement_timeout_ms=10_000,
+                lock_timeout_ms=2_000,
+            ):
+                with db.session_scope():
+                    pass
+            with db.session_scope():
+                pass
+        with db.session_scope():
+            pass
+
+    assert outer_session.statements == [
+        'SET LOCAL statement_timeout = 300000',
+        'SET LOCAL lock_timeout = 30000',
+    ]
+    assert inner_session.statements == [
+        'SET LOCAL statement_timeout = 10000',
+        'SET LOCAL lock_timeout = 2000',
+    ]
+    assert restored_session.statements == outer_session.statements
+    assert unscoped_session.statements == []
+
+
+def test_session_timeout_budget_resets_after_exception() -> None:
+    session = _DeadlineSession()
+
+    try:
+        with db.session_timeout_budget(
+            statement_timeout_ms=300_000,
+            lock_timeout_ms=30_000,
+        ):
+            raise RuntimeError('test failure')
+    except RuntimeError:
+        pass
+
+    with patch.object(db, 'SessionLocal', return_value=session):
+        with db.session_scope():
+            pass
+
+    assert session.statements == []
+
+
 class _WatchdogCursor:
     def __init__(self) -> None:
         self.last_query = ''

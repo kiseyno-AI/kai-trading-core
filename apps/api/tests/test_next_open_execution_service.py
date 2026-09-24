@@ -1,3 +1,4 @@
+import copy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -78,6 +79,9 @@ from app.orders.next_open_execution import (
     _next_open_performance_cost_evidence,
     _next_open_policy_fingerprint,
     _normalize_objective_percentile,
+    _snapshot_generation_authority_changes,
+    _snapshot_generation_authority_fingerprint,
+    _set_plan_refresh_transaction_timeouts,
     _preopen_plan_covers_latest_snapshots,
     _previous_trading_day,
     _to_decimal,
@@ -207,6 +211,114 @@ def test_dispatch_authority_source_locks_use_one_deadlock_safe_order() -> None:
             'IN SHARE MODE NOWAIT'
         ),
     ]
+
+
+def test_plan_refresh_sets_bounded_transaction_timeouts_before_locks() -> None:
+    session = MagicMock()
+    bind = MagicMock()
+    bind.dialect.name = 'postgresql'
+    session.get_bind.return_value = bind
+
+    with (
+        patch.object(settings, 'signal_decider_db_statement_timeout_ms', 300_000),
+        patch.object(settings, 'signal_decider_db_lock_timeout_ms', 30_000),
+    ):
+        _set_plan_refresh_transaction_timeouts(session)
+
+    statements = [str(call.args[0]) for call in session.execute.call_args_list]
+    assert statements == [
+        'SET LOCAL statement_timeout = 300000',
+        'SET LOCAL lock_timeout = 30000',
+        'SET LOCAL idle_in_transaction_session_timeout = 930000'
+    ]
+
+
+def test_plan_refresh_idle_timeout_is_bounded_for_postgres_only() -> None:
+    postgres_session = MagicMock()
+    postgres_bind = MagicMock()
+    postgres_bind.dialect.name = 'postgresql'
+    postgres_session.get_bind.return_value = postgres_bind
+
+    with (
+        patch.object(settings, 'signal_decider_db_statement_timeout_ms', 2_000_000),
+        patch.object(settings, 'signal_decider_db_lock_timeout_ms', 1_000_000),
+    ):
+        _set_plan_refresh_transaction_timeouts(postgres_session)
+
+    assert str(postgres_session.execute.call_args_list[-1].args[0]) == (
+        'SET LOCAL idle_in_transaction_session_timeout = 1200000'
+    )
+
+    sqlite_session = MagicMock()
+    sqlite_bind = MagicMock()
+    sqlite_bind.dialect.name = 'sqlite'
+    sqlite_session.get_bind.return_value = sqlite_bind
+
+    _set_plan_refresh_transaction_timeouts(sqlite_session)
+
+    sqlite_session.execute.assert_not_called()
+
+
+def test_generation_authority_ignores_diagnostics_but_not_validity() -> None:
+    baseline = {
+        'schema_version': 'persisted_decider_generation_validation_v1',
+        'market_date': '2026-09-23',
+        'valid_snapshot_ids': [],
+        'invalid_snapshot_ids': [28741],
+        'validations': [
+            {
+                'snapshot_id': 28741,
+                'symbol': '019010',
+                'agent_name': 'short-term-decider',
+                'status': 'invalid',
+                'reason': 'durable_decider_inputs_changed',
+                'details': {'error_type': 'OperationalError'},
+            }
+        ],
+    }
+    concrete_mismatch = copy.deepcopy(baseline)
+    concrete_mismatch['validations'][0]['details'] = {
+        'reasons': [{'code': 'source_context_changed'}]
+    }
+    now_valid = copy.deepcopy(baseline)
+    now_valid['valid_snapshot_ids'] = [28741]
+    now_valid['invalid_snapshot_ids'] = []
+    now_valid['validations'][0].update(
+        status='valid',
+        reason='durable_decider_inputs_unchanged',
+    )
+
+    assert _snapshot_generation_authority_fingerprint(
+        baseline
+    ) == _snapshot_generation_authority_fingerprint(concrete_mismatch)
+    assert _snapshot_generation_authority_fingerprint(
+        baseline
+    ) != _snapshot_generation_authority_fingerprint(now_valid)
+    assert _snapshot_generation_authority_changes(
+        baseline,
+        concrete_mismatch,
+    ) == {}
+    assert _snapshot_generation_authority_changes(
+        baseline,
+        now_valid,
+    ) == {
+        '28741': {
+            'initial': {
+                'snapshot_id': 28741,
+                'symbol': '019010',
+                'agent_name': 'short-term-decider',
+                'status': 'invalid',
+                'reason': 'durable_decider_inputs_changed',
+            },
+            'locked': {
+                'snapshot_id': 28741,
+                'symbol': '019010',
+                'agent_name': 'short-term-decider',
+                'status': 'valid',
+                'reason': 'durable_decider_inputs_unchanged',
+            },
+        }
+    }
 
 
 def test_dispatch_authority_source_lock_contention_is_a_retryable_revision_conflict(
@@ -1029,6 +1141,34 @@ class FakeCalendarClient:
 
 
 class NextOpenRefreshUnitTests(unittest.TestCase):
+    def test_scope_state_reads_use_signal_decider_db_budget(self) -> None:
+        service = SignalDeciderNextOpenExecutionService()
+        session = MagicMock()
+        session.execute.return_value.scalars.return_value.all.return_value = []
+        session.execute.return_value.all.return_value = []
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+        session_context.__exit__.return_value = False
+
+        with (
+            patch.object(settings, 'signal_decider_db_statement_timeout_ms', 300_000),
+            patch.object(settings, 'signal_decider_db_lock_timeout_ms', 30_000),
+            patch(
+                'app.orders.next_open_execution.session_scope',
+                return_value=session_context,
+            ) as scoped_session,
+        ):
+            result = service._load_latest_decider_scope_state(
+                source_market_date=date(2026, 9, 23),
+                target_trade_date=date(2026, 9, 28),
+            )
+
+        scoped_session.assert_called_once_with(
+            statement_timeout_ms=300_000,
+            lock_timeout_ms=30_000,
+        )
+        self.assertEqual(result['selected_by_key'], {})
+
     def test_policy_context_versions_include_only_actionable_signals(self) -> None:
         def snapshot(action: str, policy_version: str) -> SimpleNamespace:
             return SimpleNamespace(
@@ -1410,14 +1550,18 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             '_build_agent_context_completeness_context',
             side_effect=complete_agent_context,
         )
-        self.agent_context_completeness_patcher.start()
+        self.agent_context_completeness_mock = (
+            self.agent_context_completeness_patcher.start()
+        )
         self.addCleanup(self.agent_context_completeness_patcher.stop)
         self.agent_context_from_state_patcher = patch.object(
             SignalDeciderNextOpenExecutionService,
             '_build_agent_context_completeness_from_state',
             side_effect=complete_agent_context,
         )
-        self.agent_context_from_state_patcher.start()
+        self.agent_context_from_state_mock = (
+            self.agent_context_from_state_patcher.start()
+        )
         self.addCleanup(self.agent_context_from_state_patcher.stop)
         def valid_snapshot_generations(
             *,
@@ -1683,6 +1827,88 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn('pykrx_enrichment_preflight_blocked', blocking_codes)
         self.assertIn('candidate_pykrx_enrichment_missing', blocking_codes)
+
+    def test_refresh_compares_agent_context_over_same_raw_snapshot_cohort(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        self._seed_snapshot(symbol='000660')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        def reject_one_generation(*, market_date, snapshots, **_kwargs):
+            valid_ids = sorted(
+                int(snapshot.id)
+                for snapshot in snapshots
+                if snapshot.symbol == '005930'
+            )
+            invalid_ids = sorted(
+                int(snapshot.id)
+                for snapshot in snapshots
+                if snapshot.symbol == '000660'
+            )
+            return {
+                'schema_version': (
+                    'persisted_decider_generation_validation_v1'
+                ),
+                'market_date': str(market_date),
+                'valid_snapshot_ids': valid_ids,
+                'invalid_snapshot_ids': invalid_ids,
+                'validations': [
+                    {
+                        'snapshot_id': int(snapshot.id),
+                        'symbol': snapshot.symbol,
+                        'agent_name': snapshot.agent_name,
+                        'status': (
+                            'valid'
+                            if snapshot.symbol == '005930'
+                            else 'invalid'
+                        ),
+                        'reason': (
+                            'test_generation_unchanged'
+                            if snapshot.symbol == '005930'
+                            else 'test_generation_rejected'
+                        ),
+                    }
+                    for snapshot in snapshots
+                ],
+                'generation_fingerprint': 'test-mixed-generation',
+            }
+
+        self.snapshot_generation_mock.side_effect = reject_one_generation
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        initial_symbols = sorted(
+            self.agent_context_completeness_mock.call_args.kwargs[
+                'candidate_symbols'
+            ]
+        )
+        locked_symbol_sets = [
+            sorted(call.kwargs['candidate_symbols'])
+            for call in self.agent_context_from_state_mock.call_args_list
+        ]
+        self.assertEqual(initial_symbols, ['000660', '005930'])
+        self.assertEqual(locked_symbol_sets, [['000660', '005930']])
+        self.assertEqual(
+            {
+                item['symbol']
+                for item in result['items']
+                if item['account_reference'] == self.account_reference
+            },
+            {'005930'},
+        )
 
     def test_refresh_retries_when_source_parent_scope_changes_without_snapshot_change(
         self,

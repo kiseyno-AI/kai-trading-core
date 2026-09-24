@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from contextvars import ContextVar
 import logging
 from pathlib import Path
 import sys
@@ -17,6 +18,14 @@ from app.db_models import Base
 
 logger = logging.getLogger(__name__)
 _database_healthcheck_lock = threading.Lock()
+_session_statement_timeout_override_ms: ContextVar[int | None] = ContextVar(
+    'session_statement_timeout_override_ms',
+    default=None,
+)
+_session_lock_timeout_override_ms: ContextVar[int | None] = ContextVar(
+    'session_lock_timeout_override_ms',
+    default=None,
+)
 
 
 def _running_under_database_test_runner() -> bool:
@@ -146,6 +155,26 @@ def _log_database_disconnect(exception_context) -> None:
 
 
 @contextmanager
+def session_timeout_budget(
+    *,
+    statement_timeout_ms: int | None = None,
+    lock_timeout_ms: int | None = None,
+):
+    """Apply transaction timeout defaults to nested session_scope calls."""
+    statement_token = _session_statement_timeout_override_ms.set(
+        int(statement_timeout_ms) if statement_timeout_ms is not None else None
+    )
+    lock_token = _session_lock_timeout_override_ms.set(
+        int(lock_timeout_ms) if lock_timeout_ms is not None else None
+    )
+    try:
+        yield
+    finally:
+        _session_lock_timeout_override_ms.reset(lock_token)
+        _session_statement_timeout_override_ms.reset(statement_token)
+
+
+@contextmanager
 def session_scope(
     *,
     statement_timeout_ms: int | None = None,
@@ -153,6 +182,10 @@ def session_scope(
     deadline_monotonic: float | None = None,
     isolated_connection: bool = False,
 ):
+    if statement_timeout_ms is None:
+        statement_timeout_ms = _session_statement_timeout_override_ms.get()
+    if lock_timeout_ms is None:
+        lock_timeout_ms = _session_lock_timeout_override_ms.get()
     session_factory = IsolatedSessionLocal if isolated_connection else SessionLocal
     session = session_factory()
     try:

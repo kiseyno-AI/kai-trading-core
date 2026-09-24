@@ -4,7 +4,7 @@ from calendar import monthrange
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from math import isfinite
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence, TypeVar
 from zoneinfo import ZoneInfo
 
 import exchange_calendars
@@ -67,6 +67,8 @@ from app.market_data_store import (
     load_symbols,
 )
 from app.signals.momentum_factor import enrich_momentum_audit_fields
+
+PersistedFactorReadResultT = TypeVar('PersistedFactorReadResultT')
 
 PRICE_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
 FRESHNESS_STATUS_FRESH = 'fresh'
@@ -443,6 +445,7 @@ FACTOR_ROW_MODELS: dict[str, type[Any]] = {
     'beta': DailyBetaFactorResult,
     'composite': DailyCompositeFactorResult,
 }
+PERSISTED_FACTOR_READ_MAX_ATTEMPTS = 2
 PRIOR_FACTOR_ROW_EXTRA_FIELDS: dict[str, tuple[str, ...]] = {
     'low_risk': (
         'avg_trading_value_20d',
@@ -3856,6 +3859,22 @@ def _build_freshness_provenance(
     return metadata
 
 
+def _load_persisted_factor_rows_with_retry(
+    loader: Callable[[], PersistedFactorReadResultT],
+    *,
+    empty_factory: Callable[[], PersistedFactorReadResultT],
+) -> tuple[PersistedFactorReadResultT, bool]:
+    # These reads are small and idempotent; one immediate retry absorbs a
+    # transient connection failure without masking a sustained storage error.
+    for attempt in range(PERSISTED_FACTOR_READ_MAX_ATTEMPTS):
+        try:
+            return loader(), False
+        except SQLAlchemyError:
+            if attempt + 1 >= PERSISTED_FACTOR_READ_MAX_ATTEMPTS:
+                return empty_factory(), True
+    return empty_factory(), True
+
+
 def _load_latest_prior_rows_for_model(
     *,
     model: type[Any],
@@ -3925,17 +3944,17 @@ def _load_latest_symbol_day_block_history(
     factor_rows: dict[str, dict[str, dict[str, Any]]] = {}
     factor_storage_unavailable: dict[str, bool] = {}
     for family, model in FACTOR_ROW_MODELS.items():
-        try:
-            factor_rows[family] = _load_latest_prior_rows_for_model(
-                model=model,
-                market_date=market_date,
-                symbols=symbols,
-                extra_fields=PRIOR_FACTOR_ROW_EXTRA_FIELDS.get(family, ()),
+        factor_rows[family], factor_storage_unavailable[family] = (
+            _load_persisted_factor_rows_with_retry(
+                lambda: _load_latest_prior_rows_for_model(
+                    model=model,
+                    market_date=market_date,
+                    symbols=symbols,
+                    extra_fields=PRIOR_FACTOR_ROW_EXTRA_FIELDS.get(family, ()),
+                ),
+                empty_factory=dict,
             )
-            factor_storage_unavailable[family] = False
-        except SQLAlchemyError:
-            factor_rows[family] = {}
-            factor_storage_unavailable[family] = True
+        )
     try:
         signal_features = _load_latest_prior_rows_for_model(
             model=DailySignalFeature,
@@ -6693,11 +6712,12 @@ class AgentContextReadService:
         factor_storage_unavailable = {family: False for family in PERSISTED_FACTOR_FAMILIES}
 
         def _load_factor_rows(family: str, loader) -> list[dict[str, Any]]:
-            try:
-                return loader()
-            except SQLAlchemyError:
-                factor_storage_unavailable[family] = True
-                return []
+            rows, storage_unavailable = _load_persisted_factor_rows_with_retry(
+                loader,
+                empty_factory=list,
+            )
+            factor_storage_unavailable[family] = storage_unavailable
+            return rows
 
         signal_features_storage_unavailable = False
         try:
