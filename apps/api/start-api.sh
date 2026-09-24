@@ -51,7 +51,7 @@ elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
 elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
   PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
 else
-  PYTHON_BIN="python3.11"
+  PYTHON_BIN="python3.12"
 fi
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
