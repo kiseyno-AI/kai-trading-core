@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import plistlib
 import shlex
 import subprocess
 import tempfile
@@ -71,6 +72,18 @@ exit 1
 
         self.assertIn('PYTHON_BIN="python3.12"', script)
         self.assertNotIn('PYTHON_BIN="python3.11"', script)
+
+    def test_launchd_uses_the_project_python312_virtualenv(self) -> None:
+        plist_path = (
+            Path(__file__).resolve().parent.parent
+            / 'com.kiseyno.kai-trading-core-api.plist'
+        )
+
+        with plist_path.open('rb') as plist_file:
+            launchd_config = plistlib.load(plist_file)
+
+        python_bin = launchd_config['EnvironmentVariables']['PYTHON_BIN']
+        self.assertTrue(python_bin.endswith('/apps/api/.venv/bin/python'))
 
     def _run_script(
         self,
