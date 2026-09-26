@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import case, delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -152,6 +152,7 @@ def upsert_symbol_universe(
     stale_sources: list[str] | None = None,
     stale_markets: list[str] | None = None,
     instrument_type: str = 'equity',
+    preserve_existing_lifecycle: bool = False,
 ) -> int:
     if not items:
         return 0
@@ -169,25 +170,56 @@ def upsert_symbol_universe(
     with session_scope() as session:
         for symbol_chunk in _iter_symbol_universe_chunks(symbol_rows):
             statement = pg_insert(Symbol).values(symbol_chunk)
+            conflict_updates = {
+                'standard_code': statement.excluded.standard_code,
+                'name_ko': statement.excluded.name_ko,
+                'name_en': statement.excluded.name_en,
+                'market': statement.excluded.market,
+                'country_code': statement.excluded.country_code,
+                'currency_code': statement.excluded.currency_code,
+                'exchange_code': statement.excluded.exchange_code,
+                'regulatory_id': statement.excluded.regulatory_id,
+                'source_payload': statement.excluded.source_payload,
+                'instrument_type': statement.excluded.instrument_type,
+                'last_refreshed_at': statement.excluded.last_refreshed_at,
+                'updated_at': refreshed_at,
+            }
+            if preserve_existing_lifecycle:
+                existing_owned_by_source = Symbol.source == source
+                conflict_updates.update(
+                    {
+                        'source': case(
+                            (existing_owned_by_source, statement.excluded.source),
+                            else_=Symbol.source,
+                        ),
+                        'is_active': case(
+                            (existing_owned_by_source, statement.excluded.is_active),
+                            else_=Symbol.is_active,
+                        ),
+                        'source_payload': case(
+                            (existing_owned_by_source, statement.excluded.source_payload),
+                            else_=Symbol.source_payload,
+                        ),
+                        'last_refreshed_at': case(
+                            (
+                                existing_owned_by_source,
+                                statement.excluded.last_refreshed_at,
+                            ),
+                            else_=Symbol.last_refreshed_at,
+                        ),
+                    }
+                )
+            else:
+                conflict_updates.update(
+                    {
+                        'source': statement.excluded.source,
+                        'is_active': statement.excluded.is_active,
+                    }
+                )
             session.execute(
                 statement.on_conflict_do_update(
                     index_elements=[Symbol.symbol],
-                    set_={
-                        'standard_code': statement.excluded.standard_code,
-                        'name_ko': statement.excluded.name_ko,
-                        'name_en': statement.excluded.name_en,
-                        'market': statement.excluded.market,
-                        'country_code': statement.excluded.country_code,
-                        'currency_code': statement.excluded.currency_code,
-                        'exchange_code': statement.excluded.exchange_code,
-                        'regulatory_id': statement.excluded.regulatory_id,
-                        'source_payload': statement.excluded.source_payload,
-                        'instrument_type': statement.excluded.instrument_type,
-                        'source': statement.excluded.source,
-                        'is_active': statement.excluded.is_active,
-                        'last_refreshed_at': statement.excluded.last_refreshed_at,
-                        'updated_at': refreshed_at,
-                    },
+                    set_=conflict_updates,
                 )
             )
         stale_source_names = [source] if stale_sources is None else stale_sources
@@ -206,7 +238,11 @@ def upsert_symbol_universe(
 
 
 def upsert_master_symbols(items: list) -> int:
-    return upsert_symbol_universe(items, source='kis_master')
+    return upsert_symbol_universe(
+        items,
+        source='kis_master',
+        preserve_existing_lifecycle=True,
+    )
 
 
 def load_symbols(

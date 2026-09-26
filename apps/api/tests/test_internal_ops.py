@@ -154,6 +154,126 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_daily.call_args.kwargs['trigger'], 'internal_ops_cli')
         self.assertEqual(run_daily.call_args.kwargs['force'], True)
 
+    def test_backfill_dart_audit_signals_uses_bounded_direct_service_call(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.dart_signals_service.backfill_missing_annual_audit_signals',
+                new=AsyncMock(return_value={'status': 'completed', 'audit_signals_captured': 2}),
+            ) as backfill,
+        ):
+            result = ops.backfill_dart_audit_signals(
+                market_date='2026-04-30',
+                limit=2,
+                after_event_id=40,
+                dry_run=False,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result['audit_signals_captured'], 2)
+        self.assertEqual(backfill.call_args.kwargs['market_date'], date(2026, 4, 30))
+        self.assertEqual(backfill.call_args.kwargs['limit'], 2)
+        self.assertEqual(backfill.call_args.kwargs['after_event_id'], 40)
+        self.assertFalse(backfill.call_args.kwargs['dry_run'])
+
+    def test_cli_dart_audit_signals_backfill_outputs_resume_metadata(self) -> None:
+        payload = {
+            'status': 'dry_run',
+            'candidate_count': 2,
+            'next_after_event_id': 42,
+            'has_more_after_cursor': True,
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.backfill_dart_audit_signals',
+                return_value=payload,
+            ) as backfill,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'dart-audit-signals-backfill',
+                    '--market-date',
+                    '2026-04-30',
+                    '--limit',
+                    '2',
+                    '--after-event-id',
+                    '40',
+                    '--dry-run',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        backfill.assert_called_once_with(
+            market_date='2026-04-30',
+            limit=2,
+            after_event_id=40,
+            dry_run=True,
+        )
+
+    def test_cli_dart_audit_signals_backfill_defaults_to_dry_run(self) -> None:
+        payload = {'status': 'dry_run', 'candidate_count': 0}
+        with patch(
+            'app.internal.ops.backfill_dart_audit_signals',
+            return_value=payload,
+        ) as backfill:
+            exit_code = ops.main(
+                [
+                    'dart-audit-signals-backfill',
+                    '--market-date',
+                    '2026-04-30',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(backfill.call_args.kwargs['dry_run'])
+
+    def test_cli_dart_audit_signals_backfill_requires_apply_for_writes(self) -> None:
+        payload = {'status': 'completed', 'audit_signals_captured': 1}
+        with patch(
+            'app.internal.ops.backfill_dart_audit_signals',
+            return_value=payload,
+        ) as backfill:
+            exit_code = ops.main(
+                [
+                    'dart-audit-signals-backfill',
+                    '--market-date',
+                    '2026-04-30',
+                    '--apply',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(backfill.call_args.kwargs['dry_run'])
+
+    def test_cli_dart_audit_signals_backfill_requires_market_date(self) -> None:
+        with self.assertRaises(SystemExit):
+            ops._build_parser().parse_args(['dart-audit-signals-backfill'])
+
+    def test_cli_dart_audit_signals_backfill_returns_nonzero_for_partial_or_gaps(self) -> None:
+        for status in ('partial', 'completed_with_gaps'):
+            with self.subTest(status=status):
+                stdout = io.StringIO()
+                with (
+                    patch(
+                        'app.internal.ops.backfill_dart_audit_signals',
+                        return_value={'status': status},
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    exit_code = ops.main(
+                        [
+                            'dart-audit-signals-backfill',
+                            '--market-date',
+                            '2026-04-30',
+                        ]
+                    )
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(json.loads(stdout.getvalue()), {'status': status})
+
     def test_run_next_open_execution_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

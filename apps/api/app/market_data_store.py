@@ -5,9 +5,9 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy import Boolean, Numeric, and_, case, cast, delete, func, select, text, true, update
+from sqlalchemy import Boolean, Numeric, and_, bindparam, case, cast, delete, func, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import aliased
 
@@ -617,6 +617,361 @@ def persist_daily_price_bars(
             )
         )
     return len(values)
+
+
+def _normalize_turnover_repair_symbol(value: object) -> str:
+    symbol = str(value or '').strip().upper()
+    if symbol.isdigit():
+        symbol = symbol.zfill(6)
+    if not symbol or not symbol.isdigit() or len(symbol) != 6:
+        raise ValueError(f'invalid KRX turnover-repair symbol: {value!r}')
+    return symbol
+
+
+def _turnover_repair_symbol_preview(symbols: Sequence[str]) -> list[str]:
+    return list(symbols[:20])
+
+
+def repair_daily_price_bar_turnovers(
+    *,
+    market_date: str | date,
+    expected_symbols: Sequence[str],
+    turnover_by_symbol: Mapping[str, int],
+    provider_volume_by_symbol: Mapping[str, int],
+    provider_ohlc_by_symbol: Mapping[str, Sequence[int]],
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Repair final volume and turnover without rewriting price/fundamental data.
+
+    The caller must provide exact-date market membership.  Coverage validation
+    and the update share one transaction.  The paired liquidity fields are
+    updated only when the provider OHLC exactly matches the stored OHLC for
+    every expected bar; this prevents current adjusted history from being
+    mixed into the point-in-time price series.  Provider liquidity must be
+    complete and monotonic relative to the stored partial-close values.
+    """
+
+    normalized_market_date = _normalize_trade_date(market_date)
+    normalized_expected = [
+        _normalize_turnover_repair_symbol(symbol) for symbol in expected_symbols
+    ]
+    if not normalized_expected:
+        raise ValueError('turnover repair requires exact-date membership')
+    if len(normalized_expected) != len(set(normalized_expected)):
+        raise ValueError('turnover repair membership contains duplicate symbols')
+
+    normalized_turnovers: dict[str, int] = {}
+    for raw_symbol, raw_turnover in turnover_by_symbol.items():
+        symbol = _normalize_turnover_repair_symbol(raw_symbol)
+        if symbol in normalized_turnovers:
+            raise ValueError(
+                f'turnover repair provider payload contains duplicate symbol: {symbol}'
+            )
+        if isinstance(raw_turnover, bool) or not isinstance(raw_turnover, int):
+            raise ValueError(
+                f'turnover repair requires integer turnover for {symbol}'
+            )
+        if raw_turnover < 0:
+            raise ValueError(
+                f'turnover repair requires non-negative turnover for {symbol}'
+            )
+        normalized_turnovers[symbol] = raw_turnover
+
+    normalized_provider_volumes: dict[str, int] = {}
+    for raw_symbol, raw_volume in provider_volume_by_symbol.items():
+        symbol = _normalize_turnover_repair_symbol(raw_symbol)
+        if symbol in normalized_provider_volumes:
+            raise ValueError(
+                'turnover repair provider volume payload contains duplicate '
+                f'symbol: {symbol}'
+            )
+        if isinstance(raw_volume, bool) or not isinstance(raw_volume, int):
+            raise ValueError(
+                f'turnover repair requires integer provider volume for {symbol}'
+            )
+        if raw_volume < 0:
+            raise ValueError(
+                f'turnover repair requires non-negative provider volume for {symbol}'
+            )
+        normalized_provider_volumes[symbol] = raw_volume
+
+    normalized_provider_ohlc: dict[str, tuple[int, int, int, int]] = {}
+    for raw_symbol, raw_ohlc in provider_ohlc_by_symbol.items():
+        symbol = _normalize_turnover_repair_symbol(raw_symbol)
+        if symbol in normalized_provider_ohlc:
+            raise ValueError(
+                'turnover repair provider OHLC payload contains duplicate '
+                f'symbol: {symbol}'
+            )
+        values = tuple(raw_ohlc)
+        if len(values) != 4 or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in values
+        ):
+            raise ValueError(
+                f'turnover repair requires four non-negative OHLC integers for {symbol}'
+            )
+        normalized_provider_ohlc[symbol] = values
+
+    expected_set = set(normalized_expected)
+    provider_sets = {
+        'turnover': set(normalized_turnovers),
+        'volume': set(normalized_provider_volumes),
+        'ohlc': set(normalized_provider_ohlc),
+    }
+    missing_provider_symbols = sorted(
+        set().union(
+            *(expected_set.difference(symbols) for symbols in provider_sets.values())
+        )
+    )
+    unexpected_provider_symbols = sorted(
+        set().union(
+            *(symbols.difference(expected_set) for symbols in provider_sets.values())
+        )
+    )
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                DailyPriceBar.id.label('bar_id'),
+                Symbol.symbol,
+                DailyPriceBar.volume,
+                DailyPriceBar.turnover,
+                DailyPriceBar.open_price,
+                DailyPriceBar.high_price,
+                DailyPriceBar.low_price,
+                DailyPriceBar.close_price,
+                Symbol.is_active,
+            )
+            .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+            .where(
+                DailyPriceBar.trade_date == normalized_market_date,
+                Symbol.market.in_(('KOSPI', 'KOSDAQ')),
+            )
+            .with_for_update(of=DailyPriceBar)
+        ).all()
+
+        stored_by_symbol: dict[str, Any] = {}
+        active_stored_outside_membership_symbols: list[str] = []
+        inactive_stored_outside_membership_symbols: list[str] = []
+        for row in rows:
+            symbol = _normalize_turnover_repair_symbol(row.symbol)
+            if symbol in stored_by_symbol:
+                raise RuntimeError(
+                    f'duplicate stored daily price bar for turnover repair: {symbol}'
+                )
+            if symbol in expected_set:
+                stored_by_symbol[symbol] = row
+            elif bool(row.is_active):
+                active_stored_outside_membership_symbols.append(symbol)
+            else:
+                inactive_stored_outside_membership_symbols.append(symbol)
+
+        missing_price_bar_symbols = sorted(
+            expected_set.difference(stored_by_symbol)
+        )
+        invalid_provider_liquidity_symbols: list[str] = []
+        provider_stored_ohlc_mismatch_symbols: list[str] = []
+        stored_volume_changed_symbols: list[str] = []
+        stored_turnover_changed_symbols: list[str] = []
+        provider_volume_decrease_symbols: list[str] = []
+        provider_turnover_decrease_symbols: list[str] = []
+        update_parameters: list[dict[str, int]] = []
+        unchanged_count = 0
+
+        for symbol in normalized_expected:
+            row = stored_by_symbol.get(symbol)
+            if row is None:
+                continue
+            volume = int(row.volume)
+            if volume < 0:
+                raise RuntimeError(
+                    f'negative stored volume blocks turnover repair for {symbol}'
+                )
+            provider_volume = normalized_provider_volumes.get(symbol)
+            provider_ohlc = normalized_provider_ohlc.get(symbol)
+            stored_ohlc = (
+                int(row.open_price),
+                int(row.high_price),
+                int(row.low_price),
+                int(row.close_price),
+            )
+            if provider_volume is None or provider_ohlc is None:
+                provider_stored_ohlc_mismatch_symbols.append(symbol)
+                continue
+            if provider_ohlc != stored_ohlc:
+                provider_stored_ohlc_mismatch_symbols.append(symbol)
+                continue
+            if provider_volume != volume:
+                stored_volume_changed_symbols.append(symbol)
+            provider_turnover = normalized_turnovers.get(symbol)
+            if provider_turnover is None:
+                invalid_provider_liquidity_symbols.append(symbol)
+                continue
+            if (provider_volume > 0 and provider_turnover <= 0) or (
+                provider_volume == 0 and provider_turnover != 0
+            ):
+                invalid_provider_liquidity_symbols.append(symbol)
+                continue
+            stored_turnover = int(row.turnover)
+            if provider_volume < volume:
+                provider_volume_decrease_symbols.append(symbol)
+                continue
+            if provider_turnover < stored_turnover:
+                provider_turnover_decrease_symbols.append(symbol)
+                continue
+            if stored_turnover != provider_turnover:
+                stored_turnover_changed_symbols.append(symbol)
+            if volume == provider_volume and stored_turnover == provider_turnover:
+                unchanged_count += 1
+                continue
+            update_parameters.append(
+                {
+                    'repair_bar_id': int(row.bar_id),
+                    'repair_volume': provider_volume,
+                    'repair_turnover': provider_turnover,
+                }
+            )
+
+        active_stored_outside_membership_symbols.sort()
+        inactive_stored_outside_membership_symbols.sort()
+        invalid_provider_liquidity_symbols.sort()
+        provider_stored_ohlc_mismatch_symbols.sort()
+        stored_volume_changed_symbols.sort()
+        stored_turnover_changed_symbols.sort()
+        provider_volume_decrease_symbols.sort()
+        provider_turnover_decrease_symbols.sort()
+        blocked_reasons = []
+        if missing_provider_symbols or unexpected_provider_symbols:
+            blocked_reasons.append('provider_membership_mismatch')
+        if missing_price_bar_symbols:
+            blocked_reasons.append('missing_price_bars')
+        if active_stored_outside_membership_symbols:
+            blocked_reasons.append('active_stored_rows_outside_provider_membership')
+        if invalid_provider_liquidity_symbols:
+            blocked_reasons.append('invalid_provider_liquidity')
+        if provider_stored_ohlc_mismatch_symbols:
+            blocked_reasons.append('provider_stored_ohlc_mismatch')
+        if provider_volume_decrease_symbols:
+            blocked_reasons.append('provider_volume_decreased')
+        if provider_turnover_decrease_symbols:
+            blocked_reasons.append('provider_turnover_decreased')
+
+        result: dict[str, Any] = {
+            'market_date': normalized_market_date.isoformat(),
+            'status': 'blocked' if blocked_reasons else 'ready',
+            'reason': 'incomplete_repair_coverage' if blocked_reasons else None,
+            'blocked_reasons': blocked_reasons,
+            'applied': False,
+            'membership_sha256': market_membership_sha256(normalized_expected),
+            'expected_symbol_count': len(normalized_expected),
+            'stored_symbol_count': len(stored_by_symbol),
+            'stored_domestic_symbol_count': len(rows),
+            'provider_symbol_count': len(normalized_turnovers),
+            'would_update_count': len(update_parameters),
+            'updated_count': 0,
+            'unchanged_count': unchanged_count,
+            'missing_price_bar_count': len(missing_price_bar_symbols),
+            'missing_price_bar_symbols': _turnover_repair_symbol_preview(
+                missing_price_bar_symbols
+            ),
+            'missing_provider_symbol_count': len(missing_provider_symbols),
+            'missing_provider_symbols': _turnover_repair_symbol_preview(
+                missing_provider_symbols
+            ),
+            'active_stored_outside_membership_count': len(
+                active_stored_outside_membership_symbols
+            ),
+            'active_stored_outside_membership_symbols': (
+                _turnover_repair_symbol_preview(
+                    active_stored_outside_membership_symbols
+                )
+            ),
+            'inactive_stored_outside_membership_count': len(
+                inactive_stored_outside_membership_symbols
+            ),
+            'inactive_stored_outside_membership_symbols': (
+                _turnover_repair_symbol_preview(
+                    inactive_stored_outside_membership_symbols
+                )
+            ),
+            'invalid_provider_liquidity_count': len(
+                invalid_provider_liquidity_symbols
+            ),
+            'invalid_provider_liquidity_symbols': _turnover_repair_symbol_preview(
+                invalid_provider_liquidity_symbols
+            ),
+            'provider_stored_ohlc_mismatch_count': len(
+                provider_stored_ohlc_mismatch_symbols
+            ),
+            'provider_stored_ohlc_mismatch_symbols': (
+                _turnover_repair_symbol_preview(
+                    provider_stored_ohlc_mismatch_symbols
+                )
+            ),
+            'stored_volume_changed_count': len(stored_volume_changed_symbols),
+            'stored_volume_changed_symbols': _turnover_repair_symbol_preview(
+                stored_volume_changed_symbols
+            ),
+            'stored_turnover_changed_count': len(
+                stored_turnover_changed_symbols
+            ),
+            'stored_turnover_changed_symbols': _turnover_repair_symbol_preview(
+                stored_turnover_changed_symbols
+            ),
+            'provider_volume_decrease_count': len(
+                provider_volume_decrease_symbols
+            ),
+            'provider_volume_decrease_symbols': _turnover_repair_symbol_preview(
+                provider_volume_decrease_symbols
+            ),
+            'provider_turnover_decrease_count': len(
+                provider_turnover_decrease_symbols
+            ),
+            'provider_turnover_decrease_symbols': _turnover_repair_symbol_preview(
+                provider_turnover_decrease_symbols
+            ),
+            'unexpected_provider_symbol_count': len(
+                unexpected_provider_symbols
+            ),
+            'unexpected_provider_symbols': _turnover_repair_symbol_preview(
+                unexpected_provider_symbols
+            ),
+        }
+        if blocked_reasons or not apply:
+            return result
+
+        if update_parameters:
+            update_statement = (
+                update(DailyPriceBar.__table__)
+                .where(
+                    and_(
+                        DailyPriceBar.__table__.c.id
+                        == bindparam('repair_bar_id'),
+                        DailyPriceBar.__table__.c.trade_date
+                        == normalized_market_date,
+                    )
+                )
+                .values(
+                    volume=bindparam('repair_volume'),
+                    turnover=bindparam('repair_turnover'),
+                )
+            )
+            update_result = session.execute(update_statement, update_parameters)
+            rowcount = int(update_result.rowcount or 0)
+            if rowcount >= 0 and rowcount != len(update_parameters):
+                raise RuntimeError(
+                    'turnover repair update count changed after coverage validation'
+                )
+
+        result.update(
+            {
+                'status': 'completed',
+                'applied': True,
+                'updated_count': len(update_parameters),
+            }
+        )
+        return result
 
 
 def load_daily_price_bar_dates_for_symbol(

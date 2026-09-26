@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import and_, case, func, select
 
@@ -118,6 +118,24 @@ def _chunks(items: list[str], size: int) -> list[list[str]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
 
 
+def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
+    if symbols is None:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol or '').strip().upper()
+        if not symbol:
+            raise ValueError('symbol must not be blank')
+        if symbol.isdigit():
+            symbol = symbol.zfill(6)
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        normalized.append(symbol)
+    return normalized
+
+
 def _mapped_float(
     values_by_symbol: dict[str, dict[tuple[str, int], Any]],
     *,
@@ -199,20 +217,49 @@ def _compute_signals(item: PiotroskiInputs) -> tuple[dict[str, PiotroskiSignalRe
 
 
 class DailyPiotroskiFilterService:
-    def rebuild_for_market_date(self, *, market_date: str | date) -> dict[str, Any]:
+    def rebuild_for_market_date(
+        self,
+        *,
+        market_date: str | date,
+        symbols: Sequence[str] | None = None,
+        ranking_symbols: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(market_date) if isinstance(market_date, str) else market_date
+        normalized_symbols = _normalize_symbols(symbols)
+        normalized_ranking_symbols = _normalize_symbols(ranking_symbols)
+        if ranking_symbols is not None and normalized_symbols is None:
+            normalized_symbols = list(normalized_ranking_symbols or [])
+        if ranking_symbols is not None and normalized_symbols is not None:
+            outside_ranking_scope = sorted(
+                set(normalized_symbols).difference(normalized_ranking_symbols or [])
+            )
+            if outside_ranking_scope:
+                raise ValueError(
+                    'requested symbols must be contained in ranking_symbols: '
+                    + ','.join(outside_ranking_scope[:20])
+                )
         default_annual_year = normalized_market_date.year - 1
         default_prior_annual_year = default_annual_year - 1
-        inputs = self._load_inputs(normalized_market_date)
-        pbr_values = [item.pbr for item in inputs if item.pbr is not None and item.pbr > 0]
-        momentum_values = [item.return_20d for item in inputs if item.return_20d is not None]
+        ranking_inputs = self._load_inputs(
+            normalized_market_date,
+            symbols=(
+                normalized_ranking_symbols
+                if ranking_symbols is not None
+                else None
+            ),
+        )
+        target_symbol_set = (
+            set(normalized_symbols) if normalized_symbols is not None else None
+        )
+        pbr_values = [item.pbr for item in ranking_inputs if item.pbr is not None and item.pbr > 0]
+        momentum_values = [item.return_20d for item in ranking_inputs if item.return_20d is not None]
         passed_count = 0
         persisted_count = 0
         result_payloads: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
 
-        for item in inputs:
+        for item in ranking_inputs:
             annual_year = item.annual_year if item.annual_year is not None else default_annual_year
             prior_annual_year = (
                 item.prior_annual_year
@@ -259,8 +306,6 @@ class DailyPiotroskiFilterService:
                 passes_piotroski_score,
                 not is_bottom_momentum,
             ])
-            if passed_filter:
-                passed_count += 1
             payload = {
                 'symbol': item.symbol,
                 'market_date': normalized_market_date.isoformat(),
@@ -353,6 +398,10 @@ class DailyPiotroskiFilterService:
                     },
                 },
             }
+            if target_symbol_set is not None and item.symbol not in target_symbol_set:
+                continue
+            if passed_filter:
+                passed_count += 1
             result_payloads.append(payload)
 
         if result_payloads:
@@ -372,10 +421,15 @@ class DailyPiotroskiFilterService:
         return {
             'market_date': normalized_market_date.isoformat(),
             'source': FILTER_SOURCE,
-            'symbols_evaluated': len(inputs),
-            'symbols_excluded_missing_valuation': sum(1 for item in inputs if item.pbr is None or item.pbr <= 0),
+            'symbols_evaluated': len(result_payloads),
+            'symbols_excluded_missing_valuation': sum(
+                1
+                for item in ranking_inputs
+                if (target_symbol_set is None or item.symbol in target_symbol_set)
+                and (item.pbr is None or item.pbr <= 0)
+            ),
             'symbols_passed': passed_count,
-            'symbols_not_passed': len(inputs) - passed_count,
+            'symbols_not_passed': len(result_payloads) - passed_count,
             'results_persisted': persisted_count,
             'results_failed': len(failed_symbols),
             'failed_symbols': failed_symbols,
@@ -464,9 +518,14 @@ class DailyPiotroskiFilterService:
             normalized = normalized.zfill(6)
         return normalized
 
-    def _load_inputs(self, market_date: date) -> list[PiotroskiInputs]:
+    def _load_inputs(
+        self,
+        market_date: date,
+        *,
+        symbols: Sequence[str] | None = None,
+    ) -> list[PiotroskiInputs]:
         with session_scope() as session:
-            base_rows = session.execute(
+            base_query = (
                 select(
                     Symbol.symbol,
                     Symbol.name_ko,
@@ -483,7 +542,10 @@ class DailyPiotroskiFilterService:
                     isouter=True,
                 )
                 .order_by(Symbol.symbol.asc())
-            ).all()
+            )
+            if symbols is not None:
+                base_query = base_query.where(Symbol.symbol.in_(list(symbols)))
+            base_rows = session.execute(base_query).all()
 
             symbols = [row.symbol for row in base_rows]
             if not symbols:
