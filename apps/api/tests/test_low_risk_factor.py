@@ -182,16 +182,16 @@ class DailyLowRiskFactorServiceTests(unittest.TestCase):
                 '_load_inputs',
                 return_value=(inputs, ['000001', '000002', '000003'], []),
             ),
-            patch('app.signals.low_risk_factor.upsert_daily_low_risk_factor_result') as upsert,
+            patch('app.signals.low_risk_factor.upsert_daily_low_risk_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
         self.assertEqual(result['feature_version'], LOW_RISK_FEATURE_VERSION)
         self.assertEqual(result['results_persisted'], 3)
         self.assertEqual(result['results_failed'], 0)
-        self.assertEqual(upsert.call_count, 3)
+        upsert.assert_called_once()
 
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
         low_risk = persisted_by_symbol['000001']
         mid_risk = persisted_by_symbol['000002']
         high_risk = persisted_by_symbol['000003']
@@ -250,11 +250,11 @@ class DailyLowRiskFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
-            patch('app.signals.low_risk_factor.upsert_daily_low_risk_factor_result') as upsert,
+            patch('app.signals.low_risk_factor.upsert_daily_low_risk_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertIsNotNone(persisted['volatility_60d'])
         self.assertIsNone(persisted['volatility_120d'])
         self.assertIsNone(persisted['max_drawdown_120d'])
@@ -263,6 +263,8 @@ class DailyLowRiskFactorServiceTests(unittest.TestCase):
         self.assertIsNone(persisted['low_risk_score'])
         self.assertFalse(persisted['is_low_risk_eligible'])
         self.assertEqual(result['summary']['insufficient_history_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 0)
+        self.assertEqual(result['summary']['unready_count'], 1)
 
     def test_subset_rerun_uses_full_market_date_universe_for_persisted_rankings(self) -> None:
         service = DailyLowRiskFactorService()
@@ -314,14 +316,14 @@ class DailyLowRiskFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', side_effect=load_inputs_side_effect),
-            patch('app.signals.low_risk_factor.upsert_daily_low_risk_factor_result') as upsert,
+            patch('app.signals.low_risk_factor.upsert_daily_low_risk_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(
                 market_date=market_date,
                 symbols=['000002'],
             )
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual(result['summary']['ranking_universe_counts']['volatility_60d'], 3)
         self.assertEqual(result['summary']['ranking_universe_counts']['combined_score'], 3)

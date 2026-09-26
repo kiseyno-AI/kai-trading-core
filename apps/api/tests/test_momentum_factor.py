@@ -287,20 +287,70 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
                 'app.signals.momentum_factor.load_recent_price_bars_by_symbol',
                 return_value=histories,
             ),
-            patch('app.signals.momentum_factor.upsert_daily_momentum_factor_result') as upsert,
+            patch('app.signals.momentum_factor.upsert_daily_momentum_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date='2025-09-10')
 
         self.assertEqual(result['requested_symbols'], 2)
+        self.assertEqual(result['requested_symbol_count'], 2)
         self.assertEqual(result['symbols_evaluated'], 2)
+        self.assertEqual(result['ready_count'], 2)
+        self.assertEqual(result['unready_count'], 0)
+        self.assertEqual(result['persisted_ready_count'], 2)
+        self.assertEqual(result['persisted_unready_count'], 0)
         self.assertEqual(result['ranked_symbols'], 2)
         self.assertEqual(result['top_percentile_symbols'], 1)
         self.assertEqual(result['results_persisted'], 2)
         self.assertEqual(result['results_failed'], 0)
-        self.assertEqual(upsert.call_count, 2)
-        persisted = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        upsert.assert_called_once()
+        persisted = {item['symbol']: item for item in upsert.call_args.args[0]}
         self.assertEqual(persisted['005930']['momentum_rank'], 1)
         self.assertEqual(persisted['000660']['momentum_rank'], 2)
+
+    def test_persisted_readiness_excludes_the_only_ready_row_when_its_write_fails(self) -> None:
+        service = DailyMomentumFactorService()
+        histories = {
+            '005930': list(reversed(_build_bars([100] + [150] * 252))),
+            '000660': list(
+                reversed(
+                    _build_bars(
+                        [100] * 40,
+                        start_date=date(2025, 8, 2),
+                    )
+                )
+            ),
+        }
+
+        def persist_one(row):
+            if row.get('has_sufficient_history'):
+                raise RuntimeError('ready row write failed')
+
+        with (
+            patch(
+                'app.signals.momentum_factor.list_symbols_with_daily_bar_on_date',
+                return_value=['005930', '000660'],
+            ),
+            patch(
+                'app.signals.momentum_factor.load_recent_price_bars_by_symbol',
+                return_value=histories,
+            ),
+            patch(
+                'app.signals.momentum_factor.upsert_daily_momentum_factor_results',
+                side_effect=RuntimeError('batch failed'),
+            ),
+            patch(
+                'app.signals.momentum_factor.upsert_daily_momentum_factor_result',
+                side_effect=persist_one,
+            ),
+        ):
+            result = service.rebuild_for_market_date(market_date='2025-09-10')
+
+        self.assertEqual(result['ready_count'], 1)
+        self.assertEqual(result['unready_count'], 1)
+        self.assertEqual(result['results_persisted'], 1)
+        self.assertEqual(result['results_failed'], 1)
+        self.assertEqual(result['persisted_ready_count'], 0)
+        self.assertEqual(result['persisted_unready_count'], 1)
 
     def test_subset_rebuild_uses_full_day_universe_rankings_and_only_persists_target(self) -> None:
         service = DailyMomentumFactorService()
@@ -319,7 +369,7 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
                 'app.signals.momentum_factor.load_recent_price_bars_by_symbol',
                 return_value=histories,
             ) as load_histories,
-            patch('app.signals.momentum_factor.upsert_daily_momentum_factor_result') as upsert,
+            patch('app.signals.momentum_factor.upsert_daily_momentum_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(
                 market_date='2025-09-10',
@@ -332,12 +382,13 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
             history_days=service.history_window,
         )
         self.assertEqual(result['requested_symbols'], 1)
+        self.assertEqual(result['requested_symbol_count'], 1)
         self.assertEqual(result['symbols_evaluated'], 1)
         self.assertEqual(result['ranked_symbols'], 1)
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual([item['symbol'] for item in result['items']], ['000660'])
         upsert.assert_called_once()
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['symbol'], '000660')
         self.assertEqual(persisted['momentum_rank'], 2)
         self.assertEqual(persisted['momentum_percentile'], 0.5)

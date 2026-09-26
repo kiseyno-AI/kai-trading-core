@@ -110,14 +110,14 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
                 ],
             ),
             patch(
-                'app.signals.piotroski_filter.upsert_daily_piotroski_filter_result'
+                'app.signals.piotroski_filter.upsert_daily_piotroski_filter_results'
             ) as upsert,
         ):
             service.rebuild_for_market_date(market_date='2026-04-14')
 
         persisted = {
-            call.args[0]['symbol']: call.args[0]
-            for call in upsert.call_args_list
+            payload['symbol']: payload
+            for payload in upsert.call_args.args[0]
         }['005930']
         self.assertEqual(persisted['piotroski_score'], 1)
         self.assertEqual(
@@ -146,14 +146,14 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
                 ],
             ),
             patch(
-                'app.signals.piotroski_filter.upsert_daily_piotroski_filter_result'
+                'app.signals.piotroski_filter.upsert_daily_piotroski_filter_results'
             ) as upsert,
         ):
             service.rebuild_for_market_date(market_date='2026-04-14')
 
         persisted = {
-            call.args[0]['symbol']: call.args[0]
-            for call in upsert.call_args_list
+            payload['symbol']: payload
+            for payload in upsert.call_args.args[0]
         }['005930']
         summary = persisted['filter_payload']['score_summary']
         self.assertEqual(persisted['piotroski_score'], 8)
@@ -181,11 +181,13 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=inputs),
-            patch('app.signals.piotroski_filter.upsert_daily_piotroski_filter_result') as upsert,
+            patch('app.signals.piotroski_filter.upsert_daily_piotroski_filter_results') as upsert,
         ):
             service.rebuild_for_market_date(market_date='2026-04-14')
 
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        persisted_by_symbol = {
+            payload['symbol']: payload for payload in upsert.call_args.args[0]
+        }
         missing_audit = persisted_by_symbol['005930']
         self.assertFalse(missing_audit['passed_filter'])
         self.assertTrue(missing_audit['has_audit_issue'])
@@ -203,7 +205,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=inputs),
-            patch('app.signals.piotroski_filter.upsert_daily_piotroski_filter_result') as upsert,
+            patch('app.signals.piotroski_filter.upsert_daily_piotroski_filter_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date='2026-04-14')
 
@@ -212,9 +214,11 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         self.assertEqual(result['symbols_not_passed'], 1)
         self.assertEqual(result['results_persisted'], 2)
         self.assertEqual(result['results_failed'], 0)
-        self.assertEqual(upsert.call_count, 2)
+        upsert.assert_called_once()
 
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        persisted_by_symbol = {
+            payload['symbol']: payload for payload in upsert.call_args.args[0]
+        }
         self.assertTrue(persisted_by_symbol['005930']['passed_filter'])
         self.assertFalse(persisted_by_symbol['000660']['passed_filter'])
         self.assertTrue(persisted_by_symbol['005930']['passes_piotroski_score'])
@@ -248,11 +252,11 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=[input_row]),
-            patch('app.signals.piotroski_filter.upsert_daily_piotroski_filter_result') as upsert,
+            patch('app.signals.piotroski_filter.upsert_daily_piotroski_filter_results') as upsert,
         ):
             service.rebuild_for_market_date(market_date='2026-04-14')
 
-        provenance = upsert.call_args.args[0]['filter_payload']['provenance']
+        provenance = upsert.call_args.args[0][0]['filter_payload']['provenance']
         self.assertEqual(provenance['as_of_market_date'], '2026-04-14')
         self.assertEqual(provenance['universe_policy'], 'exact_market_date_daily_price_bar')
         self.assertEqual(provenance['fundamentals_by_business_year']['2025']['snapshot_id'], 25)
@@ -272,6 +276,10 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=inputs),
+            patch(
+                'app.signals.piotroski_filter.upsert_daily_piotroski_filter_results',
+                side_effect=RuntimeError('bulk write failed'),
+            ),
             patch(
                 'app.signals.piotroski_filter.upsert_daily_piotroski_filter_result',
                 side_effect=failing_upsert,

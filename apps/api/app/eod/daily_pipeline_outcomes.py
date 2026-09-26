@@ -119,6 +119,135 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _semantic_result_payloads(
+    result: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    payloads: list[Mapping[str, Any]] = []
+    pending: list[Mapping[str, Any]] = [result]
+    seen_ids: set[int] = set()
+    while pending:
+        payload = pending.pop(0)
+        if id(payload) in seen_ids:
+            continue
+        seen_ids.add(id(payload))
+        payloads.append(payload)
+        for key in ('result', 'result_summary', 'summary', 'details'):
+            nested = payload.get(key)
+            if isinstance(nested, Mapping):
+                pending.append(nested)
+    return tuple(payloads)
+
+
+def daily_pipeline_result_has_no_ready_content(
+    result: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether persisted factor rows contain no decision-usable result."""
+
+    if not isinstance(result, Mapping):
+        return False
+    payloads = _semantic_result_payloads(result)
+    persisted_count = next(
+        (
+            value
+            for key in ('results_persisted', 'rows_persisted')
+            for payload in payloads
+            if (value := _optional_int(payload.get(key))) is not None
+            and value > 0
+        ),
+        None,
+    )
+    if persisted_count is not None:
+        for payload in payloads:
+            persisted_ready_count = _optional_int(
+                payload.get('persisted_ready_count')
+            )
+            persisted_unready_count = _optional_int(
+                payload.get('persisted_unready_count')
+            )
+            if (
+                persisted_ready_count == 0
+                and (persisted_unready_count or 0) >= persisted_count
+            ):
+                return True
+    expected_count = next(
+        (
+            value
+            for key in (
+                'results_persisted',
+                'rows_persisted',
+                'matched_symbol_count',
+                'requested_symbol_count',
+                'total',
+            )
+            for payload in payloads
+            if (value := _optional_int(payload.get(key))) is not None
+            and value > 0
+        ),
+        None,
+    )
+    if expected_count is None:
+        return False
+
+    for payload in payloads:
+        ready_count = _optional_int(payload.get('ready_count'))
+        insufficient_count = _optional_int(
+            payload.get('insufficient_history_count')
+        )
+        unready_count = _optional_int(payload.get('unready_count'))
+        if ready_count != 0:
+            continue
+        if (unready_count or 0) >= expected_count:
+            return True
+        if (insufficient_count or 0) >= expected_count:
+            return True
+    return False
+
+
+def daily_pipeline_zero_scope_gate_status(
+    result: Mapping[str, Any] | None,
+) -> str | None:
+    """Return a blocking semantic status for zero-work incomplete context."""
+
+    if not isinstance(result, Mapping):
+        return None
+    summary = _mapping(result.get('summary'))
+    scope_counts = [
+        value
+        for payload in (result, summary)
+        for key in ('items_total', 'symbol_count')
+        if (value := _optional_int(payload.get(key))) is not None
+    ]
+    if not scope_counts or any(value > 0 for value in scope_counts):
+        return None
+
+    context = _mapping(summary.get('agent_context_completeness'))
+    context_statuses = {
+        str(value or '').strip().lower()
+        for value in (
+            result.get('agent_context_completeness_status'),
+            summary.get('agent_context_completeness_status'),
+            context.get('status'),
+        )
+        if str(value or '').strip()
+    }
+    if context_statuses & {'waiting', 'pending', 'running'}:
+        return 'waiting'
+    if context_statuses & {
+        'abandoned',
+        'blocked',
+        'failed',
+        'incomplete',
+        'interrupted',
+        'partial',
+        'unverified',
+    }:
+        return 'blocked'
+    pending_scope_count = _optional_int(context.get('pending_scope_count')) or 0
+    if context.get('candidate_set_definitive') is False and pending_scope_count > 0:
+        return 'blocked'
+    return None
+
+
 def terminal_continuation_expired_decision_skip_evidence_is_valid(
     *,
     stage_row: object,
@@ -603,6 +732,8 @@ def _nested_stages_are_satisfied(outcome: Mapping[str, Any]) -> bool | None:
 
 def _partial_outcome_is_satisfied(outcome: Mapping[str, Any]) -> bool:
     payloads = _payloads(outcome)
+    if daily_pipeline_result_has_no_ready_content(outcome):
+        return False
     if _partial_has_blocking_evidence(payloads):
         return False
     if not _partial_retries_are_terminal(payloads):
@@ -647,7 +778,8 @@ def daily_pipeline_outcome_is_satisfied(
     if status == 'completed':
         payloads = _payloads(outcome)
         if (
-            _partial_has_blocking_evidence(payloads)
+            daily_pipeline_result_has_no_ready_content(outcome)
+            or _partial_has_blocking_evidence(payloads)
             or not _partial_retries_are_terminal(payloads)
             or _has_positive_failure_evidence(payloads)
         ):

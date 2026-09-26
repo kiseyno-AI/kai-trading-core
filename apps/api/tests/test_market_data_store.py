@@ -23,6 +23,8 @@ from app.market_data_store import (
     _build_daily_market_relative_rows_query,
     _build_prior_market_turnover_bars_query,
     _build_prior_market_turnover_baselines_query,
+    _build_recent_price_bars_query,
+    _resolve_derived_symbol_ids,
     load_current_market_snapshot_context,
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
@@ -32,8 +34,10 @@ from app.market_data_store import (
     persist_daily_price_bars,
     persist_kis_intraday_snapshot,
     upsert_daily_action_summary,
+    upsert_daily_market_risk_filter_results,
     upsert_daily_price_context,
     upsert_daily_pykrx_enrichment_rows,
+    upsert_daily_momentum_factor_results,
     upsert_daily_technical_snapshot,
 )
 
@@ -340,6 +344,43 @@ class EodLineagePreservingUpsertTests(unittest.TestCase):
 
 
 class MarketRelativeQueryShapeTests(unittest.TestCase):
+    def test_single_day_price_bar_query_requires_exact_market_date(self) -> None:
+        statement = _build_recent_price_bars_query(
+            symbol_ids=[11, 12],
+            market_date=date(2026, 9, 23),
+            history_days=1,
+        )
+
+        compiled = str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={'literal_binds': True},
+            )
+        ).lower()
+
+        self.assertIn("daily_price_bars.trade_date = '2026-09-23'", compiled)
+        self.assertNotIn("daily_price_bars.trade_date <= '2026-09-23'", compiled)
+
+    def test_recent_price_bar_query_limits_each_symbol_in_sql(self) -> None:
+        statement = _build_recent_price_bars_query(
+            symbol_ids=[11, 12],
+            market_date=date(2026, 9, 23),
+            history_days=121,
+        )
+
+        compiled = str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={'literal_binds': True},
+            )
+        ).lower()
+
+        self.assertIn('join lateral', compiled)
+        self.assertIn('daily_price_bars.symbol_id = recent_price_bar_symbols.symbol_id', compiled)
+        self.assertIn('limit 121', compiled)
+        self.assertNotIn('row_number() over', compiled)
+        self.assertNotIn("daily_price_bars.trade_date >=", compiled)
+
     def test_market_relative_rows_query_uses_bounded_per_market_trade_dates(self) -> None:
         statement = _build_daily_market_relative_rows_query(
             target_markets=['KOSPI', 'KOSDAQ'],
@@ -395,6 +436,154 @@ class MarketRelativeQueryShapeTests(unittest.TestCase):
         self.assertNotIn("daily_price_bars.trade_date = '2026-04-07'", compiled_bars)
         self.assertIn('daily_price_bars.trade_date', compiled_bars)
         self.assertIn("daily_price_bars.source = 'pykrx'", compiled_bars)
+
+
+class FactorBatchPersistenceTests(unittest.TestCase):
+    def test_batch_symbol_resolution_uses_filter_payload_name_for_new_symbol(self) -> None:
+        refreshed_at = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+        added = []
+
+        class EmptyResult:
+            @staticmethod
+            def scalars():
+                return EmptyResult()
+
+            @staticmethod
+            def all():
+                return []
+
+        class FakeSession:
+            @staticmethod
+            def execute(_statement):
+                return EmptyResult()
+
+            @staticmethod
+            def add(symbol):
+                symbol.id = 202
+                added.append(symbol)
+
+            @staticmethod
+            def flush():
+                return None
+
+        resolved = _resolve_derived_symbol_ids(
+            FakeSession(),
+            [
+                {
+                    'symbol': '000660',
+                    'source': 'strategy_piotroski_v1',
+                    'filter_payload': {'name_ko': 'SK하이닉스'},
+                }
+            ],
+            refreshed_at=refreshed_at,
+        )
+
+        self.assertEqual(resolved, {'000660': 202})
+        self.assertEqual(added[0].name_ko, 'SK하이닉스')
+
+    def test_batch_symbol_resolution_repairs_placeholder_name(self) -> None:
+        refreshed_at = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+        existing = SimpleNamespace(
+            id=101,
+            symbol='005930',
+            name_ko='005930',
+            last_refreshed_at=None,
+        )
+
+        class ExistingResult:
+            @staticmethod
+            def scalars():
+                return ExistingResult()
+
+            @staticmethod
+            def all():
+                return [existing]
+
+        class FakeSession:
+            @staticmethod
+            def execute(_statement):
+                return ExistingResult()
+
+        resolved = _resolve_derived_symbol_ids(
+            FakeSession(),
+            [
+                {
+                    'symbol': '005930',
+                    'factor_payload': {'name_ko': '삼성전자'},
+                }
+            ],
+            refreshed_at=refreshed_at,
+        )
+
+        self.assertEqual(resolved, {'005930': 101})
+        self.assertEqual(existing.name_ko, '삼성전자')
+        self.assertEqual(existing.last_refreshed_at, refreshed_at)
+
+    def test_market_risk_filter_batch_flattens_snapshot_fields(self) -> None:
+        row = {
+            'symbol': '005930',
+            'market_date': '2026-09-23',
+            'filter_payload': {'watchlist_reasons': []},
+            '_snapshot_fields': {
+                'vi_class_code': 'N',
+                'is_vi_triggered': False,
+            },
+        }
+
+        with patch(
+            'app.market_data_store._upsert_daily_derived_results',
+            return_value=1,
+        ) as bulk_upsert:
+            persisted = upsert_daily_market_risk_filter_results([row])
+
+        self.assertEqual(persisted, 1)
+        normalized = bulk_upsert.call_args.args[0][0]
+        self.assertEqual(normalized['vi_class_code'], 'N')
+        self.assertFalse(normalized['is_vi_triggered'])
+        self.assertNotIn('_snapshot_fields', normalized)
+        self.assertEqual(
+            bulk_upsert.call_args.kwargs['constraint'],
+            'uq_daily_market_risk_filter_results_symbol_market_date',
+        )
+
+    def test_momentum_results_share_one_bulk_upsert(self) -> None:
+        statements = []
+
+        class FakeSession:
+            def execute(self, statement):
+                statements.append(statement)
+                return None
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeSession()
+
+        rows = [
+            {
+                'symbol': symbol,
+                'market_date': '2026-09-23',
+                'source': 'daily_price_bars',
+                'close_price': close_price,
+                'momentum_percentile_threshold': 0.8,
+                'factor_payload': {'symbol': symbol},
+            }
+            for symbol, close_price in [('661501', 10_000), ('661502', 20_000)]
+        ]
+
+        with (
+            patch('app.market_data_store.session_scope', fake_session_scope),
+            patch(
+                'app.market_data_store._resolve_derived_symbol_ids',
+                return_value={'661501': 101, '661502': 102},
+            ),
+        ):
+            persisted = upsert_daily_momentum_factor_results(rows)
+
+        self.assertEqual(persisted, 2)
+        self.assertEqual(len(statements), 1)
+        compiled = str(statements[0].compile(dialect=postgresql.dialect())).lower()
+        self.assertIn('insert into daily_momentum_factor_results', compiled)
+        self.assertIn('on conflict on constraint uq_daily_momentum_factor_results_symbol_market_date', compiled)
 
     def test_load_current_market_snapshot_context_preserves_cache_provenance(self) -> None:
         cached_at = datetime(2026, 4, 8, 0, 10, tzinfo=timezone.utc)

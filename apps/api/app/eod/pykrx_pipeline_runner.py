@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Sequence
 
-from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_result_has_no_ready_content,
+    daily_pipeline_zero_scope_gate_status,
+)
 from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
@@ -389,8 +393,13 @@ def _resolve_result_status(result: dict[str, Any]) -> str:
         status = _normalize_stage_status(result.get('status'))
         return status if status in {'waiting', 'blocked', 'failed', 'partial'} else 'skipped'
     status = _normalize_stage_status(result.get('status'))
+    zero_scope_gate_status = daily_pipeline_zero_scope_gate_status(result)
+    if zero_scope_gate_status:
+        return zero_scope_gate_status
     if status != 'completed':
         return status
+    if daily_pipeline_result_has_no_ready_content(result):
+        return 'partial'
     failed_keys = (
         'symbols_failed',
         'events_failed',
@@ -1304,21 +1313,13 @@ def _run_daily_agent_feedback_followup(
 
     from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
     from app.agent_context.retry_service import FeedbackRetryCycleConfig, agent_feedback_retry_service
-    from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
-    from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
     from app.core.settings import settings
 
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
         market_date=market_date,
     )
-    bypass_prerequisite_gate_enabled = (
-        bool(settings.openclaw_feedback_fast_path_bypass_prerequisite_gate)
-        and feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
-        and set(roles).issubset(set(DECISION_SUPPORT_AGENT_NAMES))
-    )
     prerequisites_ready = bool(prerequisites['ready'])
-    bypass_prerequisite_gate = bypass_prerequisite_gate_enabled and not prerequisites_ready
-    if not prerequisites_ready and not bypass_prerequisite_gate:
+    if not prerequisites_ready:
         return {
             'triggered': False,
             'reason': 'feedback_prerequisites_not_ready',
@@ -1340,7 +1341,7 @@ def _run_daily_agent_feedback_followup(
             reuse_existing=True,
             progress_callback=progress_callback,
         ),
-        bypass_prerequisite_gate=bypass_prerequisite_gate,
+        bypass_prerequisite_gate=False,
     )
     expired_after_completion = build_expired_decision_replay_result(
         stage_id=stage_id,
@@ -1354,8 +1355,8 @@ def _run_daily_agent_feedback_followup(
         }
     return {
         'triggered': True,
-        'prerequisite_gate_bypassed': bypass_prerequisite_gate,
-        'prerequisites': prerequisites if bypass_prerequisite_gate else None,
+        'prerequisite_gate_bypassed': False,
+        'prerequisites': None,
         **result,
     }
 

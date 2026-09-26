@@ -40,6 +40,7 @@ AGENT_FEEDBACK_ELIGIBILITY_FILTERS: tuple[str, ...] = (
 )
 AGENT_FEEDBACK_ELIGIBILITY_RULE = 'strategy_aware_prefilter_scoring_v1'
 AGENT_FEEDBACK_CANDIDATE_CAP_RULE = 'strategy_aware_prefilter_broad_top_percentile_cap_v2'
+AGENT_FEEDBACK_CANDIDATE_SCORE_VERSION = 'decider_role_gated_candidate_score_v2'
 AGENT_FEEDBACK_ROLE_CAP_RULE = 'agent_feedback_role_scope_cap_v1'
 AGENT_FEEDBACK_FUNNEL_SCHEMA_VERSION = 'agent_feedback_funnel_v1'
 AGENT_FEEDBACK_VALUE_LONG_ONLY_ELIGIBILITY_RULE = 'market_risk_filter_passed_and_piotroski_passed_v1'
@@ -328,6 +329,7 @@ def _piotroski_filter_signals(row: dict | None) -> dict[str, Any]:
     score_summary = _as_dict(filter_payload.get('score_summary'))
     thresholds = _as_dict(filter_payload.get('thresholds'))
     valuation = _as_dict(filter_payload.get('valuation'))
+    provenance = _as_dict(filter_payload.get('provenance'))
     return {
         'available': True,
         'source': row.get('source'),
@@ -341,6 +343,7 @@ def _piotroski_filter_signals(row: dict | None) -> dict[str, Any]:
         'has_profitability_issue': row.get('has_profitability_issue'),
         'has_capital_impairment': row.get('has_capital_impairment'),
         'has_audit_issue': row.get('has_audit_issue'),
+        'audit_evidence_status': provenance.get('audit_evidence_status'),
         'piotroski_score': row.get('piotroski_score'),
         'passes_piotroski_score': row.get('passes_piotroski_score'),
         'piotroski_min_score': thresholds.get('piotroski_min_score'),
@@ -446,6 +449,16 @@ def _piotroski_soft_penalties(row: dict | None) -> list[dict[str, Any]]:
     ]
     filter_payload = _as_dict(row.get('filter_payload'))
     thresholds = _as_dict(filter_payload.get('thresholds'))
+    provenance = _as_dict(filter_payload.get('provenance'))
+    audit_evidence_status = provenance.get('audit_evidence_status')
+    if audit_evidence_status == 'unknown':
+        penalties.append(
+            _penalty(
+                code='audit_evidence_unknown',
+                source='piotroski_filter',
+                message='Audit evidence is unavailable; this is treated as data-quality uncertainty, not a proven issue.',
+            )
+        )
     if row.get('is_low_pbr') is False:
         penalties.append(
             _penalty(
@@ -477,6 +490,8 @@ def _piotroski_soft_penalties(row: dict | None) -> list[dict[str, Any]]:
         ('has_audit_issue', 'Audit issue flagged by the Piotroski/value filter.'),
         ('is_bottom_momentum', 'Bottom-momentum signal flagged by the Piotroski/value filter.'),
     ):
+        if field == 'has_audit_issue' and audit_evidence_status == 'unknown':
+            continue
         if row.get(field) is True:
             penalties.append(
                 _penalty(
@@ -552,15 +567,44 @@ def _candidate_score_payload(
     )
     momentum_score = _as_float(row.get('momentum_percentile')) * 80.0
     composite_score = _as_float(row.get('composite_percentile')) * 60.0
+    momentum_eligible = (
+        row.get('is_momentum_eligible') is True
+        and row.get('passes_momentum_top_percentile') is True
+    )
+    eligible_momentum_score = momentum_score if momentum_eligible else 0.0
+    eligible_composite_score = composite_score if row.get('is_composite_eligible') is True else 0.0
     quality_adjustment = _soft_penalty_score(list(record.get('soft_penalties') or []))
-    total_score = signal_score + direct_signal_score + momentum_score + composite_score + quality_adjustment
+    # Direct rank signals and the percentile factor are both momentum-shaped evidence.
+    # Taking the stronger of them prevents one market move from being counted twice.
+    short_term_score = (
+        signal_score
+        + max(direct_signal_score, eligible_momentum_score)
+        + eligible_composite_score * 0.20
+        + quality_adjustment
+    )
+    signal_decider_score = (
+        signal_score
+        + direct_signal_score * 0.25
+        + eligible_momentum_score * 0.25
+        + eligible_composite_score
+        + quality_adjustment
+    )
+    role_scores = {
+        'short-term-decider': round(short_term_score, 6),
+        'signal-decider': round(signal_decider_score, 6),
+    }
+    total_score = max(role_scores.values())
     return {
+        'scoring_version': AGENT_FEEDBACK_CANDIDATE_SCORE_VERSION,
         'score': round(total_score, 6),
+        'role_scores': role_scores,
         'components': {
             'action_signal_score': signal_score,
             'direct_signal_score': round(direct_signal_score, 6),
             'momentum_score': round(momentum_score, 6),
             'composite_score': round(composite_score, 6),
+            'eligible_momentum_score': round(eligible_momentum_score, 6),
+            'eligible_composite_score': round(eligible_composite_score, 6),
             'soft_penalty_adjustment': round(quality_adjustment, 6),
         },
         'source_values': {
@@ -572,6 +616,7 @@ def _candidate_score_payload(
             'overtime_volume_rank': row.get('overtime_volume_rank'),
             'overtime_fluctuation_rank': row.get('overtime_fluctuation_rank'),
             'momentum_percentile': row.get('momentum_percentile'),
+            'is_momentum_eligible': row.get('is_momentum_eligible'),
             'passes_momentum_top_percentile': row.get('passes_momentum_top_percentile'),
             'composite_percentile': row.get('composite_percentile'),
             'is_composite_eligible': row.get('is_composite_eligible'),
@@ -1113,6 +1158,34 @@ def _cap_metadata(
     }
 
 
+def _rank_scored_candidates(dispatchable: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked = sorted(
+        dispatchable,
+        key=lambda record: (
+            -_as_float(record.get('candidate_score')),
+            str(record.get('symbol') or ''),
+        ),
+    )
+    for index, record in enumerate(ranked, start=1):
+        record['candidate_rank'] = index
+        record['candidate_global_rank'] = index
+        record['candidate_role_ranks'] = {}
+    for role in DECISION_SUPPORT_AGENT_NAMES:
+        role_ranked = sorted(
+            dispatchable,
+            key=lambda record: (
+                -_as_float(
+                    _as_dict(_as_dict(record.get('candidate_score_payload')).get('role_scores')).get(role),
+                    default=_as_float(record.get('candidate_score')),
+                ),
+                str(record.get('symbol') or ''),
+            ),
+        )
+        for index, record in enumerate(role_ranked, start=1):
+            record['candidate_role_ranks'][role] = index
+    return ranked
+
+
 def _apply_candidate_cap(
     *,
     records: list[dict[str, Any]],
@@ -1120,20 +1193,40 @@ def _apply_candidate_cap(
 ) -> list[dict[str, Any]]:
     dispatchable = [record for record in records if not bool(record.get('hard_blocked'))]
     requested_cap_bypass = _requested_scope_bypasses_caps(requested_symbols)
-    if requested_cap_bypass or not dispatchable:
-        market_date = (
-            date.fromisoformat(str(records[0]['market_date']))
-            if records and records[0].get('market_date')
-            else None
+    if not dispatchable:
+        metadata = _cap_metadata(total=0, limit=0, cap_applied=False)
+        for record in records:
+            record.setdefault('candidate_cap', dict(metadata))
+            record.setdefault('cap_excluded', False)
+            record.setdefault('forced_inclusion_reasons', [])
+            record.setdefault('forced_included', False)
+            record.setdefault('forced_inclusion_reason', None)
+        return records
+
+    market_date = date.fromisoformat(str(records[0]['market_date']))
+    score_rows = load_agent_feedback_candidate_score_rows(
+        market_date=market_date,
+        symbols=[str(record['symbol']) for record in dispatchable],
+    )
+    score_by_symbol = _score_rows_by_symbol(score_rows)
+    for record in dispatchable:
+        score_payload = _candidate_score_payload(
+            record=record,
+            score_row=score_by_symbol.get(str(record.get('symbol'))),
         )
+        record['candidate_score'] = score_payload['score']
+        record['candidate_score_payload'] = score_payload
+    ranked = _rank_scored_candidates(dispatchable)
+
+    if requested_cap_bypass:
         forced_reasons_by_symbol: dict[str, list[dict[str, Any]]] = {}
         forced_source_diagnostics: dict[str, Any] = {}
-        if market_date is not None:
-            forced_reasons_by_symbol, forced_source_diagnostics = _load_forced_inclusion_reasons(
-                market_date=market_date,
-                symbols=[str(record['symbol']) for record in dispatchable],
-                requested_symbols=requested_symbols,
-            )
+        forced_reasons_by_symbol, forced_source_diagnostics = _load_forced_inclusion_reasons(
+            market_date=market_date,
+            symbols=[str(record['symbol']) for record in dispatchable],
+            requested_symbols=requested_symbols,
+            score_by_symbol=score_by_symbol,
+        )
         metadata = _cap_metadata(
             total=len(dispatchable),
             limit=len(dispatchable),
@@ -1148,42 +1241,17 @@ def _apply_candidate_cap(
             record['forced_inclusion_reasons'] = list(reasons)
             record['forced_included'] = bool(reasons)
             record['forced_inclusion_reason'] = str(reasons[0].get('code')) if reasons else None
-        for index, record in enumerate(dispatchable, start=1):
-            record['candidate_rank'] = index
+        for record in dispatchable:
             record['candidate_cap'] = dict(metadata)
-            record['candidate_selection_reason'] = (
-                AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED
-                if requested_cap_bypass
-                else 'uncapped_broad_universe'
-            )
+            record['candidate_selection_reason'] = AGENT_FEEDBACK_ROLE_CAP_BYPASS_REASON_REQUESTED
         return records
 
     limit = _candidate_cap_limit(len(dispatchable))
-    score_rows = load_agent_feedback_candidate_score_rows(
-        market_date=date.fromisoformat(str(records[0]['market_date'])),
-        symbols=[str(record['symbol']) for record in dispatchable],
-    )
-    score_by_symbol = _score_rows_by_symbol(score_rows)
-    for record in dispatchable:
-        score_payload = _candidate_score_payload(
-            record=record,
-            score_row=score_by_symbol.get(str(record.get('symbol'))),
-        )
-        record['candidate_score'] = score_payload['score']
-        record['candidate_score_payload'] = score_payload
-
     forced_reasons_by_symbol, forced_source_diagnostics = _load_forced_inclusion_reasons(
-        market_date=date.fromisoformat(str(records[0]['market_date'])),
+        market_date=market_date,
         symbols=[str(record['symbol']) for record in dispatchable],
         requested_symbols=requested_symbols if requested_cap_bypass else None,
         score_by_symbol=score_by_symbol,
-    )
-    ranked = sorted(
-        dispatchable,
-        key=lambda record: (
-            -_as_float(record.get('candidate_score')),
-            str(record.get('symbol') or ''),
-        ),
     )
     forced_symbols = {
         symbol
@@ -1442,6 +1510,9 @@ def _role_ranked_records(
         symbol = str(record.get('symbol') or '').strip().upper()
         score = _as_float(record.get('candidate_score'), default=0.0)
         if role in DECISION_SUPPORT_AGENT_NAMES:
+            score_payload = _as_dict(record.get('candidate_score_payload'))
+            role_scores = _as_dict(score_payload.get('role_scores'))
+            score = _as_float(role_scores.get(role), default=score)
             gate = _summarizer_gate_payload(gate_by_symbol.get(symbol))
             score += _summarizer_gate_score(gate)
         elif role == 'fundamental-summarizer':
@@ -1540,16 +1611,28 @@ def _build_role_scope_selection(
     }
     if decider_scope_applied:
         # The fast path is already bounded by the smallest requested upstream
-        # role cap. Preserve that decision scope exactly so a role-specific
-        # ranking cannot silently remove a prerequisite for a decider symbol.
-        selected_symbols = set(normalized_decider_scope).intersection(ranked_symbol_set)
+        # role cap. Summarizers cover the combined prerequisite scope, while
+        # each decider keeps only its own role-ranked candidates.
+        decider_scope_set = set(normalized_decider_scope).intersection(ranked_symbol_set)
+        if role in DECISION_SUPPORT_AGENT_NAMES:
+            selected_symbols.intersection_update(decider_scope_set)
+        else:
+            selected_symbols = decider_scope_set
 
     if decider_scope_applied:
-        ordered_selected = [
-            symbol
-            for symbol in normalized_decider_scope
-            if symbol in ranked_symbol_set and symbol in selected_symbols
-        ]
+        if role in DECISION_SUPPORT_AGENT_NAMES:
+            ordered_selected = [
+                str(record.get('symbol') or '').strip().upper()
+                for record in ranked
+                if str(record.get('symbol') or '').strip().upper() in selected_symbols
+                and str(record.get('symbol') or '').strip().upper() in normalized_decider_scope
+            ]
+        else:
+            ordered_selected = [
+                symbol
+                for symbol in normalized_decider_scope
+                if symbol in ranked_symbol_set and symbol in selected_symbols
+            ]
     else:
         ordered_selected = [
             str(record.get('symbol') or '').strip().upper()
@@ -1656,10 +1739,19 @@ def _build_decider_scope_fast_path(
             'prerequisite_role_cap_limits': {},
         }
 
-    reference_role, reference_symbols, _ = min(
-        candidate_scopes,
-        key=lambda item: (len(item[1]), source_roles.index(item[0])),
-    )
+    reference_role = 'decider_role_union'
+    reference_symbols: list[str] = []
+    seen_symbols: set[str] = set()
+    max_scope_size = max(len(symbols) for _, symbols, _ in candidate_scopes)
+    for index in range(max_scope_size):
+        for _, symbols, _ in candidate_scopes:
+            if index >= len(symbols):
+                continue
+            symbol = symbols[index]
+            if symbol in seen_symbols:
+                continue
+            seen_symbols.add(symbol)
+            reference_symbols.append(symbol)
     prerequisite_role_cap_limits = {
         role: _role_cap_limit(role, len(records))
         for role in roles

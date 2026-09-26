@@ -1235,6 +1235,109 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             {'type': 'list', 'item_count': 200},
         )
 
+    def test_full_factor_row_count_does_not_hide_zero_ready_content(self):
+        market_date = '2026-09-23'
+        official_item = _completed_official_stage(
+            run_id=475,
+            stage_id='low_risk_factors',
+            market_date=market_date,
+            processed=2_678,
+            total=2_678,
+        )
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'results_persisted': 2_678,
+                'results_failed': 0,
+                'summary': {
+                    'requested_symbol_count': 2_678,
+                    'matched_symbol_count': 2_678,
+                    'insufficient_history_count': 2_678,
+                    'ready_count': 0,
+                },
+            }
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_678,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'low_risk_factors': official_item,
+            },
+            price_bar_count_loader=lambda **_: 2_678,
+            row_count_stage_counts_loader=lambda **_: {
+                'low_risk_factors': {
+                    'persisted': 2_678,
+                    'updated_at': '2026-09-23T12:00:00+00:00',
+                },
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['low_risk_factors']
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'no_decision_ready_rows',
+        )
+
+    def test_completed_zero_scope_history_is_blocked_by_incomplete_context(self):
+        market_date = '2026-09-22'
+        signal_decider_item = _completed_official_stage(
+            run_id=467,
+            stage_id='signal_decider',
+            market_date=market_date,
+            processed=1,
+            total=1,
+        )
+        official_item = _completed_official_stage(
+            run_id=467,
+            stage_id='next_open_execution_plan',
+            market_date=market_date,
+            processed=0,
+            total=0,
+        )
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'summary': {
+                    'items_total': 0,
+                    'symbol_count': 0,
+                    'agent_context_completeness_status': 'incomplete',
+                    'agent_context_completeness': {
+                        'status': 'incomplete',
+                        'candidate_set_definitive': False,
+                        'pending_scope_count': 157,
+                    },
+                },
+                'items': [],
+            }
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_678,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'signal_decider': signal_decider_item,
+                'next_open_execution_plan': official_item,
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['next_open_execution_plan']
+        self.assertEqual(stage['status'], 'blocked')
+        self.assertEqual(
+            stage['details']['status_repair_reason'],
+            'incomplete_result_summary',
+        )
+
     def test_official_feedback_stage_repairs_counts_and_activity_from_role_progress(self):
         market_date = '2026-04-21'
         official_item = _completed_official_stage(

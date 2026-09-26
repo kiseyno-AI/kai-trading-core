@@ -6,6 +6,7 @@ from typing import Any, Sequence
 from app.market_data_store import (
     load_daily_quality_factor_results,
     upsert_daily_quality_factor_result,
+    upsert_daily_quality_factor_results,
 )
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
@@ -271,13 +272,29 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
         persisted_count = 0
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
-        for item in items:
-            try:
-                upsert_daily_quality_factor_result(item)
-                persisted_count += 1
-            except Exception as exc:
-                failed_symbols.append(item['symbol'])
-                failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        try:
+            upsert_daily_quality_factor_results(items)
+            persisted_count = len(items)
+        except Exception:
+            for item in items:
+                try:
+                    upsert_daily_quality_factor_result(item)
+                    persisted_count += 1
+                except Exception as exc:
+                    failed_symbols.append(item['symbol'])
+                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+
+        failed_symbol_set = set(failed_symbols)
+        persisted_items = [
+            item for item in items if item['symbol'] not in failed_symbol_set
+        ]
+        persisted_ready_count = sum(
+            1
+            for item in persisted_items
+            if item.get('quality_score') is not None
+        )
+        summary['persisted_ready_count'] = persisted_ready_count
+        summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
 
         return {
             'market_date': normalized_market_date.isoformat(),
@@ -836,6 +853,7 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
         missing_symbols: list[str],
         universe_counts: dict[str, int],
     ) -> dict[str, Any]:
+        ready_count = sum(1 for item in items if item.get('quality_score') is not None)
         return {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
@@ -864,7 +882,9 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
             'scored_partial_count': sum(
                 1 for item in items if item.get('quality_status') == QUALITY_STATUS_SCORED_PARTIAL
             ),
-            'scored_count': sum(1 for item in items if item.get('quality_score') is not None),
+            'scored_count': ready_count,
+            'ready_count': ready_count,
+            'unready_count': len(missing_symbols) + len(items) - ready_count,
             'invalid_assets_count': sum(
                 1 for item in items if item.get('quality_status') == QUALITY_STATUS_INVALID_ASSETS
             ),

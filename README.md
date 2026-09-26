@@ -402,6 +402,8 @@ master_refresh -> pykrx_universe_refresh -> price_collection -> pykrx_enrichment
 
 Consumers must read `/eod/pipeline/stages` rather than hard-code this list. The PyKRX decision preflight requires same-day `sector_classification`, `investor_flow_symbol`, `short_selling`, and direct `valuation_snapshot` coverage; valuation must cover at least 95% of the fresh PyKRX KOSPI/KOSDAQ stock universe (excluding active-universe ETFs outside that feed), and the other required categories at least 99%.
 
+Pipeline completion is semantic, not row-count-only. Factor stages publish computed `ready_count`/`unready_count` and post-write `persisted_ready_count`/`persisted_unready_count`; a non-empty scope with zero decision-usable persisted rows remains partial/blocked even when row coverage exceeds 99%. A direct `next_open_execution_plan` run automatically includes `signal_decider`, and the decider fast path cannot bypass an unresolved structural prerequisite. Historical factor inputs use an index-friendly per-symbol `LATERAL ... LIMIT` lookback in SQL, while derived factor/filter rows are persisted in bounded batch upserts with single-row fallback for error isolation.
+
 Successful annual DART fundamentals capture extracts and persists the filing's audit opinion before writing the financial snapshot or marking the disclosure event captured. Missing or unparseable audit evidence keeps that event retryable and the refresh visibly incomplete. Piotroski reads only captured-event snapshots and accepts audit evidence with the exact same `rcept_no`, so it cannot silently reuse an older clean opinion.
 
 ### Agent feedback and decisions

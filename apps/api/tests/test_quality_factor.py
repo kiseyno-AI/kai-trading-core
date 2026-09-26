@@ -220,11 +220,11 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
-            patch('app.signals.quality_factor.upsert_daily_quality_factor_result') as upsert,
+            patch('app.signals.quality_factor.upsert_daily_quality_factor_results') as upsert,
         ):
             service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['gross_profit_to_assets'], 0.25)
         self.assertEqual(persisted['debt_ratio'], 0.2)
         gross_profit_audit = persisted['factor_payload']['audit']['matched_highlights']['gross_profit_to_assets']
@@ -289,14 +289,14 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['000001', '000002', '000003'], [])),
-            patch('app.signals.quality_factor.upsert_daily_quality_factor_result') as upsert,
+            patch('app.signals.quality_factor.upsert_daily_quality_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
         self.assertEqual(result['feature_version'], QUALITY_FACTOR_VERSION)
         self.assertEqual(result['results_persisted'], 3)
-        self.assertEqual(upsert.call_count, 3)
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        upsert.assert_called_once()
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
 
         best = persisted_by_symbol['000001']
         middle = persisted_by_symbol['000002']
@@ -344,11 +344,11 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
-            patch('app.signals.quality_factor.upsert_daily_quality_factor_result') as upsert,
+            patch('app.signals.quality_factor.upsert_daily_quality_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['quality_status'], QUALITY_STATUS_SCORED_PARTIAL)
         self.assertEqual(persisted['components_possible'], 6)
         self.assertEqual(persisted['components_used'], 5)
@@ -369,15 +369,17 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['035420'], [])),
-            patch('app.signals.quality_factor.upsert_daily_quality_factor_result') as upsert,
+            patch('app.signals.quality_factor.upsert_daily_quality_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['quality_status'], QUALITY_STATUS_INSUFFICIENT_FUNDAMENTALS)
         self.assertEqual(persisted['components_used'], 0)
         self.assertIsNone(persisted['quality_score'])
         self.assertEqual(result['summary']['insufficient_fundamentals_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 0)
+        self.assertEqual(result['summary']['unready_count'], 1)
 
     def test_subset_rerun_uses_full_universe_rankings(self) -> None:
         service = DailyQualityFactorService()
@@ -440,11 +442,11 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', side_effect=load_inputs_side_effect),
-            patch('app.signals.quality_factor.upsert_daily_quality_factor_result') as upsert,
+            patch('app.signals.quality_factor.upsert_daily_quality_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date, symbols=['000002'])
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual(result['summary']['ranking_universe_counts']['quality_score'], 3)
         self.assertEqual(persisted['symbol'], '000002')

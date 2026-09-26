@@ -30,6 +30,8 @@ from app.dart.fundamentals_capture_service import dart_fundamentals_capture_serv
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_result_has_no_ready_content,
+    daily_pipeline_zero_scope_gate_status,
     pykrx_enrichment_preflight_is_ready,
 )
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
@@ -571,7 +573,10 @@ class DailyPipelineStageService:
         return {
             'market_date': self._normalize_market_date(market_date),
             'requested_stages': requested_stages,
-            'resolved_stages': self._resolve_stage_ids(requested_stages),
+            'resolved_stages': self._resolve_stage_ids(
+                requested_stages,
+                inject_next_open_dependency=resume_from_stage is None,
+            ),
         }
 
     def run(
@@ -2458,7 +2463,12 @@ class DailyPipelineStageService:
     def _dependency_outcome_is_satisfied(outcome: dict[str, Any] | None) -> bool:
         return daily_pipeline_outcome_is_satisfied(outcome)
 
-    def _resolve_stage_ids(self, requested_stages: Sequence[str]) -> list[str]:
+    def _resolve_stage_ids(
+        self,
+        requested_stages: Sequence[str],
+        *,
+        inject_next_open_dependency: bool = True,
+    ) -> list[str]:
         requested_set: set[str] = set()
         normalized: list[str] = []
         for raw_stage in requested_stages:
@@ -2470,6 +2480,14 @@ class DailyPipelineStageService:
             if stage_id in requested_set:
                 continue
             requested_set.add(stage_id)
+        if (
+            inject_next_open_dependency
+            and 'next_open_execution_plan' in requested_set
+        ):
+            # A direct plan refresh must be backed by a decider result from this
+            # run. Resume requests intentionally retain their persisted-output
+            # boundary and let the plan service validate stored candidates.
+            requested_set.add('signal_decider')
         for stage_id in DAILY_STAGE_ORDER:
             if stage_id in requested_set:
                 normalized.append(stage_id)
@@ -2792,6 +2810,10 @@ class DailyPipelineStageService:
                     break
             if has_reported_failures:
                 break
+        has_no_ready_content = daily_pipeline_result_has_no_ready_content(
+            result
+        )
+        zero_scope_gate_status = daily_pipeline_zero_scope_gate_status(result)
 
         raw_status = str(result.get('status') or '').strip().lower()
         normalized_status = {
@@ -2804,8 +2826,12 @@ class DailyPipelineStageService:
             'not_configured': 'skipped',
         }.get(raw_status, raw_status)
         if raw_status:
+            if normalized_status == 'completed' and zero_scope_gate_status:
+                return zero_scope_gate_status
             if normalized_status == 'completed' and (
-                has_reported_failures or has_incomplete_role
+                has_reported_failures
+                or has_incomplete_role
+                or has_no_ready_content
             ):
                 return 'partial'
             return normalized_status
@@ -2821,6 +2847,11 @@ class DailyPipelineStageService:
             if DailyPipelineStageService._has_successful_work(result):
                 return 'partial'
             return 'failed'
+
+        if has_no_ready_content:
+            return 'partial'
+        if zero_scope_gate_status:
+            return zero_scope_gate_status
 
         if any(failed_key in result for failed_key in failed_keys):
             return 'partial' if has_reported_failures else 'completed'

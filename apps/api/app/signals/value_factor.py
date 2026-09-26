@@ -11,6 +11,7 @@ from app.market_data_store import (
     load_recent_price_bars_by_symbol,
     load_symbols,
     upsert_daily_value_factor_result,
+    upsert_daily_value_factor_results,
 )
 
 VALUE_FACTOR_VERSION = 'value_factor_v1'
@@ -195,13 +196,29 @@ class DailyValueFactorService:
         persisted_count = 0
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
-        for item in items:
-            try:
-                upsert_daily_value_factor_result(item)
-                persisted_count += 1
-            except Exception as exc:
-                failed_symbols.append(item['symbol'])
-                failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        try:
+            upsert_daily_value_factor_results(items)
+            persisted_count = len(items)
+        except Exception:
+            for item in items:
+                try:
+                    upsert_daily_value_factor_result(item)
+                    persisted_count += 1
+                except Exception as exc:
+                    failed_symbols.append(item['symbol'])
+                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+
+        failed_symbol_set = set(failed_symbols)
+        persisted_items = [
+            item for item in items if item['symbol'] not in failed_symbol_set
+        ]
+        persisted_ready_count = sum(
+            1
+            for item in persisted_items
+            if item.get('value_status') == VALUE_STATUS_SCORED
+        )
+        summary['persisted_ready_count'] = persisted_ready_count
+        summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
 
         return {
             'market_date': normalized_market_date.isoformat(),
@@ -553,6 +570,9 @@ class DailyValueFactorService:
         missing_symbols: list[str],
         universe_counts: dict[str, int],
     ) -> dict[str, Any]:
+        ready_count = sum(
+            1 for item in items if item.get('value_status') == VALUE_STATUS_SCORED
+        )
         return {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
@@ -563,7 +583,9 @@ class DailyValueFactorService:
             ),
             'invalid_per_count': sum(1 for item in items if item.get('value_status') == VALUE_STATUS_INVALID_PER),
             'missing_metric_count': sum(1 for item in items if item.get('value_status') == VALUE_STATUS_MISSING_METRIC),
-            'scored_count': sum(1 for item in items if item.get('value_status') == VALUE_STATUS_SCORED),
+            'scored_count': ready_count,
+            'ready_count': ready_count,
+            'unready_count': len(missing_symbols) + len(items) - ready_count,
             'ranking_universe_counts': universe_counts,
         }
 

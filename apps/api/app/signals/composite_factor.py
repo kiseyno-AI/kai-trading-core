@@ -13,6 +13,7 @@ from app.market_data_store import (
     load_daily_value_factor_results,
     load_symbols,
     upsert_daily_composite_factor_result,
+    upsert_daily_composite_factor_results,
 )
 from app.signals.momentum_factor import enrich_momentum_audit_fields
 
@@ -34,6 +35,7 @@ CLASSIFICATION_INSUFFICIENT_INPUTS = 'insufficient_inputs'
 
 HARD_EXCLUSION_MOMENTUM_OVERHEAT = 'momentum_recent_overheat'
 HARD_EXCLUSION_LOW_RISK_LIQUIDITY = 'low_risk_liquidity_floor'
+HARD_EXCLUSION_LOW_RISK_EVIDENCE_MISSING = 'low_risk_liquidity_evidence_missing'
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,13 +251,33 @@ class DailyCompositeFactorService:
         persisted_count = 0
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
-        for item in items:
-            try:
-                upsert_daily_composite_factor_result(item)
-                persisted_count += 1
-            except Exception as exc:
-                failed_symbols.append(item['symbol'])
-                failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        try:
+            persisted_count = upsert_daily_composite_factor_results(items)
+            if persisted_count != len(items):
+                raise RuntimeError(
+                    f'composite batch upsert persisted {persisted_count} of {len(items)} results'
+                )
+        except Exception:
+            persisted_count = 0
+            for item in items:
+                try:
+                    upsert_daily_composite_factor_result(item)
+                    persisted_count += 1
+                except Exception as exc:
+                    failed_symbols.append(item['symbol'])
+                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+
+        failed_symbol_set = set(failed_symbols)
+        persisted_items = [
+            item for item in items if item['symbol'] not in failed_symbol_set
+        ]
+        persisted_ready_count = sum(
+            1
+            for item in persisted_items
+            if item.get('composite_score') is not None
+        )
+        summary['persisted_ready_count'] = persisted_ready_count
+        summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
 
         return {
             'market_date': normalized_market_date.isoformat(),
@@ -663,7 +685,10 @@ class DailyCompositeFactorService:
             hard_exclusion_reasons: list[str] = []
             if factor_snapshot['momentum']['gate_flags'].get('is_recent_overheated') is True:
                 hard_exclusion_reasons.append(HARD_EXCLUSION_MOMENTUM_OVERHEAT)
-            if factor_snapshot['low_risk']['gate_flags'].get('passes_liquidity_floor') is False:
+            liquidity_evidence = factor_snapshot['low_risk']['gate_flags'].get('passes_liquidity_floor')
+            if not factor_snapshot['low_risk']['available'] or liquidity_evidence is None:
+                hard_exclusion_reasons.append(HARD_EXCLUSION_LOW_RISK_EVIDENCE_MISSING)
+            elif liquidity_evidence is False:
                 hard_exclusion_reasons.append(HARD_EXCLUSION_LOW_RISK_LIQUIDITY)
             item['_hard_exclusion_reasons'] = hard_exclusion_reasons
             item['is_hard_excluded'] = bool(hard_exclusion_reasons)
@@ -769,6 +794,10 @@ class DailyCompositeFactorService:
                         'type': 'hard_exclusion',
                         'description': 'Exclude symbols that fail the low-risk liquidity floor.',
                     },
+                    HARD_EXCLUSION_LOW_RISK_EVIDENCE_MISSING: {
+                        'type': 'hard_exclusion',
+                        'description': 'Exclude live candidates when low-risk or liquidity evidence is unavailable.',
+                    },
                 },
                 'informational_only_rules': {
                     'momentum_eligibility_status': factor_snapshot['momentum']['status'],
@@ -839,13 +868,16 @@ class DailyCompositeFactorService:
         missing_symbols: list[str],
         input_universe_counts: dict[str, int],
     ) -> dict[str, Any]:
+        ready_count = sum(1 for item in items if item.get('composite_score') is not None)
         return {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
             'symbols_with_any_input': sum(1 for item in items if item.get('valid_factor_count', 0) > 0),
             'sufficient_input_count': sum(1 for item in items if item.get('has_required_inputs')),
-            'scored_count': sum(1 for item in items if item.get('composite_score') is not None),
+            'scored_count': ready_count,
+            'ready_count': ready_count,
+            'unready_count': len(missing_symbols) + len(items) - ready_count,
             'eligible_count': sum(1 for item in items if item.get('is_composite_eligible')),
             'watchlist_count': sum(
                 1 for item in items if item.get('composite_classification') == CLASSIFICATION_WATCHLIST
@@ -869,6 +901,11 @@ class DailyCompositeFactorService:
                     1
                     for item in items
                     if HARD_EXCLUSION_LOW_RISK_LIQUIDITY in item.get('_hard_exclusion_reasons', [])
+                ),
+                HARD_EXCLUSION_LOW_RISK_EVIDENCE_MISSING: sum(
+                    1
+                    for item in items
+                    if HARD_EXCLUSION_LOW_RISK_EVIDENCE_MISSING in item.get('_hard_exclusion_reasons', [])
                 ),
             },
             'input_universe_counts': input_universe_counts,

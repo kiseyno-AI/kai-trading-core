@@ -77,6 +77,13 @@ class _AnySymbolTurnoverFrame:
 
 
 class PykrxPipelineResultStatusTests(TestCase):
+    def test_fast_path_prerequisite_bypass_default_is_disabled(self) -> None:
+        self.assertFalse(
+            Settings.model_fields[
+                'openclaw_feedback_fast_path_bypass_prerequisite_gate'
+            ].default
+        )
+
     def test_ordering_repair_includes_optional_context_and_signal_lineage(
         self,
     ) -> None:
@@ -133,6 +140,38 @@ class PykrxPipelineResultStatusTests(TestCase):
         }
 
         self.assertEqual(_resolve_result_status(result), 'partial')
+
+    def test_factor_payload_without_ready_content_is_partial(self) -> None:
+        result = {
+            'status': 'completed',
+            'results_persisted': 2_678,
+            'results_failed': 0,
+            'summary': {
+                'requested_symbol_count': 2_678,
+                'matched_symbol_count': 2_678,
+                'insufficient_history_count': 2_678,
+                'ready_count': 0,
+            },
+        }
+
+        self.assertEqual(_resolve_result_status(result), 'partial')
+
+    def test_zero_scope_payload_with_incomplete_context_is_blocked(self) -> None:
+        result = {
+            'summary': {
+                'items_total': 0,
+                'symbol_count': 0,
+                'agent_context_completeness_status': 'incomplete',
+                'agent_context_completeness': {
+                    'status': 'incomplete',
+                    'candidate_set_definitive': False,
+                    'pending_scope_count': 157,
+                },
+            },
+            'items': [],
+        }
+
+        self.assertEqual(_resolve_result_status(result), 'blocked')
 
     def test_factor_followup_stops_before_next_factor_when_stage_owner_is_lost(
         self,
@@ -8108,7 +8147,9 @@ class PykrxBackfillServiceTests(TestCase):
             ]
         )
 
-    def test_daily_signal_decider_followup_bypasses_blocked_full_market_prerequisites_for_fast_path(self) -> None:
+    def test_daily_signal_decider_followup_does_not_structurally_bypass_prerequisites(
+        self,
+    ) -> None:
         blocked_prerequisites = {
             'ready': False,
             'status': 'blocked',
@@ -8131,12 +8172,11 @@ class PykrxBackfillServiceTests(TestCase):
                 enabled=True,
             )
 
-        self.assertTrue(result['triggered'])
-        self.assertTrue(result['prerequisite_gate_bypassed'])
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'feedback_prerequisites_not_ready')
+        self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['prerequisites'], blocked_prerequisites)
-        self.assertTrue(run_retry_cycles.call_args.kwargs['bypass_prerequisite_gate'])
-        self.assertFalse(run_retry_cycles.call_args.kwargs.get('force', False))
-        self.assertFalse(run_retry_cycles.call_args.kwargs['config'].force_recompute)
+        run_retry_cycles.assert_not_called()
 
     def test_daily_signal_decider_followup_does_not_bypass_or_force_when_prerequisites_are_ready(self) -> None:
         ready_prerequisites = {'ready': True, 'status': 'ready'}

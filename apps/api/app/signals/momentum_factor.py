@@ -12,6 +12,7 @@ from app.market_data_store import (
     load_daily_momentum_factor_results,
     load_recent_price_bars_by_symbol,
     upsert_daily_momentum_factor_result,
+    upsert_daily_momentum_factor_results,
 )
 
 MOMENTUM_FACTOR_VERSION = 'price_momentum_v1'
@@ -761,7 +762,14 @@ class DailyMomentumFactorService:
                 'eligibility_rule_version': self.eligibility_rule.rule_version,
                 'momentum_percentile_threshold': _round(self.eligibility_rule.top_percentile_threshold),
                 'requested_symbols': 0,
+                'requested_symbol_count': 0,
                 'symbols_evaluated': 0,
+                'ready_count': 0,
+                'unready_count': 0,
+                'persisted_ready_count': 0,
+                'persisted_unready_count': 0,
+                'insufficient_history_count': 0,
+                'missing_market_date_bar_count': 0,
                 'ranked_symbols': 0,
                 'top_percentile_symbols': 0,
                 'eligible_symbols': 0,
@@ -798,14 +806,21 @@ class DailyMomentumFactorService:
 
         persisted_items: list[dict[str, Any]] = []
         write_failed_symbols: list[str] = []
-        for row in rows:
-            try:
-                upsert_daily_momentum_factor_result(row)
-                persisted_items.append(row)
-            except Exception:
-                write_failed_symbols.append(row['symbol'])
+        try:
+            upsert_daily_momentum_factor_results(rows)
+            persisted_items = list(rows)
+        except Exception:
+            for row in rows:
+                try:
+                    upsert_daily_momentum_factor_result(row)
+                    persisted_items.append(row)
+                except Exception:
+                    write_failed_symbols.append(row['symbol'])
 
         combined_failed_symbols = list(dict.fromkeys([*failed_symbols, *write_failed_symbols]))
+        persisted_ready_count = sum(
+            1 for row in persisted_items if row.get('has_sufficient_history')
+        )
         return {
             'market_date': normalized_market_date,
             'source': MOMENTUM_FACTOR_SOURCE,
@@ -813,7 +828,19 @@ class DailyMomentumFactorService:
             'eligibility_rule_version': self.eligibility_rule.rule_version,
             'momentum_percentile_threshold': _round(self.eligibility_rule.top_percentile_threshold),
             'requested_symbols': len(target_symbols),
+            'requested_symbol_count': len(target_symbols),
             'symbols_evaluated': len(rows),
+            'ready_count': sum(1 for row in rows if row.get('has_sufficient_history')),
+            'unready_count': (
+                len(failed_symbols)
+                + sum(1 for row in rows if not row.get('has_sufficient_history'))
+            ),
+            'persisted_ready_count': persisted_ready_count,
+            'persisted_unready_count': len(persisted_items) - persisted_ready_count,
+            'insufficient_history_count': sum(
+                1 for row in rows if not row.get('has_sufficient_history')
+            ),
+            'missing_market_date_bar_count': len(failed_symbols),
             'ranked_symbols': sum(1 for row in rows if row.get('momentum_rank') is not None),
             'top_percentile_symbols': sum(1 for row in rows if row.get('passes_momentum_top_percentile')),
             'eligible_symbols': sum(1 for row in rows if row.get('is_momentum_eligible')),
