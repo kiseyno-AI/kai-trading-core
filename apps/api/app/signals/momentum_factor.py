@@ -749,11 +749,31 @@ class DailyMomentumFactorService:
         *,
         market_date: str | date,
         symbols: Sequence[str] | None = None,
+        ranking_symbols: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         requested_symbols = _normalize_symbols(symbols)
-        available_symbols = list_symbols_with_daily_bar_on_date(normalized_market_date)
-        target_symbols = requested_symbols or available_symbols
+        normalized_ranking_symbols = _normalize_symbols(ranking_symbols)
+        if ranking_symbols is None:
+            ranking_population = list_symbols_with_daily_bar_on_date(
+                normalized_market_date
+            )
+        else:
+            ranking_population = normalized_ranking_symbols or []
+        target_symbols = (
+            requested_symbols
+            if requested_symbols is not None
+            else ranking_population
+        )
+        if ranking_symbols is not None:
+            outside_ranking_scope = sorted(
+                set(target_symbols).difference(ranking_population)
+            )
+            if outside_ranking_scope:
+                raise ValueError(
+                    'requested symbols must be contained in ranking_symbols: '
+                    + ','.join(outside_ranking_scope[:20])
+                )
         if not target_symbols:
             return {
                 'market_date': normalized_market_date,
@@ -779,15 +799,14 @@ class DailyMomentumFactorService:
                 'items': [],
             }
 
-        ranking_symbols = available_symbols if requested_symbols else target_symbols
         price_histories = load_recent_price_bars_by_symbol(
             market_date=normalized_market_date,
-            symbols=ranking_symbols,
+            symbols=ranking_population,
             history_days=self.history_window,
         )
         valid_histories = self._extract_valid_histories(
             market_date=normalized_market_date,
-            target_symbols=ranking_symbols,
+            target_symbols=ranking_population,
             price_histories=price_histories,
         )
         failed_symbols = [symbol for symbol in target_symbols if symbol not in valid_histories]

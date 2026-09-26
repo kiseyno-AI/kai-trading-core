@@ -380,6 +380,7 @@ Common bounded recomputation/backfill paths:
 python3.11 -m app.eod.technical_snapshots --market-date YYYY-MM-DD
 python3.11 -m app.eod.action_summaries --market-date YYYY-MM-DD
 python3.11 -m app.dart.backfill_current_universe --symbol-limit 10 --capture-limit 200 --fs-div CFS
+.venv/bin/python -m app.internal.ops dart-audit-signals-backfill --market-date YYYY-MM-DD --limit 25 --after-event-id 0 --dry-run
 python3.11 -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD
 python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market-date YYYY-MM-DD --horizons 1,3,5,10
 ```
@@ -405,6 +406,21 @@ Consumers must read `/eod/pipeline/stages` rather than hard-code this list. The 
 Pipeline completion is semantic, not row-count-only. Factor stages publish computed `ready_count`/`unready_count` and post-write `persisted_ready_count`/`persisted_unready_count`; a non-empty scope with zero decision-usable persisted rows remains partial/blocked even when row coverage exceeds 99%. A direct `next_open_execution_plan` run automatically includes `signal_decider`, and the decider fast path cannot bypass an unresolved structural prerequisite. Historical factor inputs use an index-friendly per-symbol `LATERAL ... LIMIT` lookback in SQL, while derived factor/filter rows are persisted in bounded batch upserts with single-row fallback for error isolation.
 
 Successful annual DART fundamentals capture extracts and persists the filing's audit opinion before writing the financial snapshot or marking the disclosure event captured. Missing or unparseable audit evidence keeps that event retryable and the refresh visibly incomplete. Piotroski reads only captured-event snapshots and accepts audit evidence with the exact same `rcept_no`, so it cannot silently reuse an older clean opinion.
+
+The bounded audit repair command requires one explicit market date and never reruns agent stages. It selects only that date's priced universe and Piotroski's exact point-in-time annual filing, skips an existing audit for the same receipt number, and is safe to rerun date by date. Apply pages explicitly with `--apply`; advance a forward scan with `next_forward_after_event_id`, then rerun from cursor zero until the convergence cursor `next_after_event_id` is zero and `retry_event_ids` is empty. A `partial` or `completed_with_gaps` result exits nonzero.
+
+### Bounded numeric data repair
+
+Run these from `apps/api` with the repository's single virtual-environment Python. Every repair defaults to dry-run and excludes agent feedback, deciders, current KIS risk/ranking, news, and macro stages:
+
+```bash
+.venv/bin/python -m app.eod.missing_bar_repair --market-date YYYY-MM-DD --dry-run
+.venv/bin/python -m app.eod.symbol_history_repair --symbols 005930,000660 --start-date YYYY-MM-DD --end-date YYYY-MM-DD --dry-run
+.venv/bin/python -m app.eod.turnover_repair --market-date YYYY-MM-DD --dry-run
+.venv/bin/python -m app.eod.exact_factor_repair --market-date YYYY-MM-DD
+```
+
+Take and verify a database backup first, inspect each dry-run, then repeat only a `ready` command with `--apply`. Stop Core and drain every other factor writer for the full exact-factor repair window. Exact-factor apply additionally requires the reviewed dry-run's `exact_provider_membership_count` and `membership_sha256` as `--expected-provider-membership-count` and `--expected-membership-sha256`; add `--prune-stale` only when disclosed stale derived rows should be deleted. Repaired raw bars use `eod_run_id=NULL` so the original failed run remains historically accurate. An inactive historical extra is retained and disclosed; an active row outside exact provider membership blocks paired liquidity repair.
 
 ### Agent feedback and decisions
 

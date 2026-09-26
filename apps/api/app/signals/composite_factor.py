@@ -156,10 +156,23 @@ class DailyCompositeFactorService:
         *,
         market_date: str | date,
         symbols: Sequence[str] | None = None,
+        ranking_symbols: Sequence[str] | None = None,
         source: str = COMPOSITE_FACTOR_SOURCE,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
+        normalized_ranking_symbols = _normalize_symbols(ranking_symbols)
+        if ranking_symbols is not None and normalized_symbols is None:
+            normalized_symbols = list(normalized_ranking_symbols or [])
+        if ranking_symbols is not None and normalized_symbols is not None:
+            outside_ranking_scope = sorted(
+                set(normalized_symbols).difference(normalized_ranking_symbols or [])
+            )
+            if outside_ranking_scope:
+                raise ValueError(
+                    'requested symbols must be contained in ranking_symbols: '
+                    + ','.join(outside_ranking_scope[:20])
+                )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
             return self._empty_rebuild_result(
@@ -172,7 +185,11 @@ class DailyCompositeFactorService:
 
         ranking_rows_by_family = self._load_factor_rows(
             market_date=normalized_market_date,
-            symbols=None,
+            symbols=(
+                normalized_ranking_symbols
+                if ranking_symbols is not None
+                else None
+            ),
         )
         ranking_symbols = self._collect_symbol_universe(ranking_rows_by_family)
 

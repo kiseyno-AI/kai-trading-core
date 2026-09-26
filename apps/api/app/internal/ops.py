@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -241,6 +242,24 @@ def run_dart_fundamentals_daily_if_due(
 def capture_dart_signals(*, rcept_no: str) -> dict[str, Any]:
     bootstrap_runtime()
     return asyncio.run(dart_signals_service.capture_signals_for_event(rcept_no=rcept_no))
+
+
+def backfill_dart_audit_signals(
+    *,
+    market_date: str,
+    limit: int = 25,
+    after_event_id: int = 0,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    bootstrap_runtime()
+    return asyncio.run(
+        dart_signals_service.backfill_missing_annual_audit_signals(
+            market_date=date.fromisoformat(market_date),
+            limit=limit,
+            after_event_id=after_event_id,
+            dry_run=dry_run,
+        )
+    )
 
 
 def collect_kis_daily_signal_features(
@@ -995,6 +1014,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dart_signal_parser.add_argument('--rcept-no', required=True)
 
+    dart_audit_backfill_parser = subparsers.add_parser(
+        'dart-audit-signals-backfill',
+        help='Backfill missing audit opinions for captured annual DART fundamentals only',
+    )
+    dart_audit_backfill_parser.add_argument('--market-date', required=True)
+    dart_audit_backfill_parser.add_argument('--limit', type=int, default=25)
+    dart_audit_backfill_parser.add_argument('--after-event-id', type=int, default=0)
+    dart_audit_backfill_mode = dart_audit_backfill_parser.add_mutually_exclusive_group()
+    dart_audit_backfill_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help='Persist captured audit signals. The default is a read-only dry run.',
+    )
+    dart_audit_backfill_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Inspect the bounded candidate page without writing (default).',
+    )
+    dart_audit_backfill_parser.set_defaults(dry_run=True)
+
     signal_features_parser = subparsers.add_parser(
         'kis-daily-signal-features-collect',
         help='Collect daily KIS ranking signal features directly',
@@ -1481,6 +1522,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
     elif args.command == 'dart-signals-capture':
         payload = capture_dart_signals(rcept_no=args.rcept_no)
+    elif args.command == 'dart-audit-signals-backfill':
+        payload = backfill_dart_audit_signals(
+            market_date=args.market_date,
+            limit=args.limit,
+            after_event_id=args.after_event_id,
+            dry_run=args.dry_run,
+        )
     elif args.command == 'kis-daily-signal-features-collect':
         payload = collect_kis_daily_signal_features(
             market_date=args.market_date,
@@ -1684,6 +1732,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(payload['markdown_summary'])
     else:
         print(json.dumps(payload, ensure_ascii=False))
+    if (
+        args.command == 'dart-audit-signals-backfill'
+        and payload.get('status') in {'partial', 'completed_with_gaps', 'failed'}
+    ):
+        return 2
     return 0
 
 
