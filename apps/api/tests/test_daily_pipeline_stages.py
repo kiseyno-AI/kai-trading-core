@@ -2127,6 +2127,34 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unknown daily stage'):
             service.run(market_date='2026-04-14', stages=['not-a-stage'])
 
+    def test_next_open_only_request_injects_signal_decider_dependency(self) -> None:
+        service = DailyPipelineStageService()
+
+        validated = service.validate_run_request(
+            market_date='2026-04-14',
+            stages=['next_open_execution_plan'],
+            resume_from_stage=None,
+        )
+
+        self.assertEqual(
+            validated['resolved_stages'],
+            ['signal_decider', 'next_open_execution_plan'],
+        )
+
+    def test_next_open_resume_keeps_persisted_dependency_boundary(self) -> None:
+        service = DailyPipelineStageService()
+
+        validated = service.validate_run_request(
+            market_date='2026-04-14',
+            stages=['next_open_execution_plan'],
+            resume_from_stage='next_open_execution_plan',
+        )
+
+        self.assertEqual(
+            validated['resolved_stages'],
+            ['next_open_execution_plan'],
+        )
+
     def test_run_marks_grouped_pykrx_skip_payloads_as_skipped(self) -> None:
         pykrx_runner = _FakeSkippedPykrxStageRunner()
         service = DailyPipelineStageService(pykrx_service=pykrx_runner)
@@ -2306,6 +2334,45 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 'partial')
+
+    def test_resolve_result_status_rejects_persisted_factor_rows_without_ready_content(
+        self,
+    ) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {
+                'results_persisted': 2_678,
+                'results_failed': 0,
+                'summary': {
+                    'requested_symbol_count': 2_678,
+                    'matched_symbol_count': 2_678,
+                    'insufficient_history_count': 2_678,
+                    'ready_count': 0,
+                },
+            }
+        )
+
+        self.assertEqual(status, 'partial')
+
+    def test_resolve_result_status_blocks_zero_scope_with_incomplete_context(
+        self,
+    ) -> None:
+        status = DailyPipelineStageService._resolve_result_status(
+            {
+                'summary': {
+                    'items_total': 0,
+                    'symbol_count': 0,
+                    'agent_context_completeness_status': 'incomplete',
+                    'agent_context_completeness': {
+                        'status': 'incomplete',
+                        'candidate_set_definitive': False,
+                        'pending_scope_count': 157,
+                    },
+                },
+                'items': [],
+            }
+        )
+
+        self.assertEqual(status, 'blocked')
 
     def test_resolve_result_status_accepts_failed_item_collections(self) -> None:
         status = DailyPipelineStageService._resolve_result_status(
@@ -3309,7 +3376,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         ):
             result = service.run(
                 market_date='2026-04-14',
-                stages=['signal_decider', 'next_open_execution_plan'],
+                stages=['next_open_execution_plan'],
             )
 
         self.assertEqual(result['stages']['signal_decider']['status'], 'blocked')

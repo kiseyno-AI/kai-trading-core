@@ -195,6 +195,38 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
 
         self.assertEqual(result, ['005930'])
 
+    def test_unknown_audit_evidence_is_data_quality_uncertainty_but_value_scope_stays_fail_closed(self) -> None:
+        piotroski_row = {
+            'symbol': '005930',
+            'passed_filter': False,
+            'has_audit_issue': True,
+            'filter_payload': {'provenance': {'audit_evidence_status': 'unknown'}},
+        }
+        with (
+            patch('app.agent_context.eligibility.load_daily_piotroski_filter_results', return_value=[piotroski_row]),
+            patch(
+                'app.agent_context.eligibility.load_daily_market_risk_filter_results',
+                return_value=[{'symbol': '005930', 'passed_filter': True, 'filter_payload': {}}],
+            ),
+            patch('app.agent_context.eligibility._load_forced_inclusion_reasons', return_value=({}, {})),
+        ):
+            short_term = load_agent_feedback_eligibility_records(
+                market_date=date.fromisoformat('2026-04-16'),
+                requested_symbols=['005930'],
+            )[0]
+            value = load_agent_feedback_eligibility_records(
+                market_date=date.fromisoformat('2026-04-16'),
+                requested_symbols=['005930'],
+                strategy_scope=AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY,
+            )[0]
+
+        short_codes = {item['code'] for item in short_term['soft_penalties']}
+        self.assertIn('audit_evidence_unknown', short_codes)
+        self.assertNotIn('has_audit_issue', short_codes)
+        self.assertEqual(short_term['filter_signals']['piotroski_filter']['audit_evidence_status'], 'unknown')
+        self.assertFalse(short_term['hard_blocked'])
+        self.assertTrue(value['hard_blocked'])
+
     def test_hard_market_risk_block_still_excludes_symbol(self) -> None:
         with patch(
             'app.agent_context.eligibility.load_daily_piotroski_filter_results',
@@ -281,6 +313,18 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
                 ],
             ):
                 with patch(
+                    'app.agent_context.eligibility.load_agent_feedback_candidate_score_rows',
+                    return_value=[
+                        {
+                            'symbol': symbol,
+                            'signal_score': index,
+                            'is_momentum_eligible': True,
+                            'passes_momentum_top_percentile': True,
+                            'is_composite_eligible': True,
+                        }
+                        for index, symbol in enumerate(symbols, start=1)
+                    ],
+                ) as load_scores, patch(
                     'app.agent_context.eligibility.settings.openclaw_feedback_candidate_cap_percentile',
                     0.2,
                 ):
@@ -296,13 +340,89 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
                             )
 
         self.assertEqual(result, symbols)
+        self.assertEqual(load_scores.call_count, 2)
         self.assertFalse(any(record.get('cap_excluded') for record in records))
+        self.assertEqual(records[0]['candidate_global_rank'], 10)
+        self.assertEqual(records[-1]['candidate_global_rank'], 1)
+        self.assertEqual(
+            records[0]['candidate_score_payload']['scoring_version'],
+            'decider_role_gated_candidate_score_v2',
+        )
+        self.assertIn('short-term-decider', records[0]['candidate_score_payload']['role_scores'])
+        self.assertIn('signal-decider', records[0]['candidate_role_ranks'])
         self.assertTrue(
             all(
                 record.get('candidate_selection_reason') == 'requested_symbol_scope_cap_bypass'
                 for record in records
             )
         )
+
+    def test_decider_rankings_are_distinct_and_ignore_ineligible_factor_boosts(self) -> None:
+        symbols = ['000001', '000002', '000003']
+        score_rows = [
+            {
+                'symbol': '000001',
+                'signal_score': 10,
+                'signal_count': 2,
+                'momentum_percentile': 1.0,
+                'is_momentum_eligible': True,
+                'passes_momentum_top_percentile': True,
+                'composite_percentile': 0.2,
+                'is_composite_eligible': True,
+            },
+            {
+                'symbol': '000002',
+                'signal_score': 10,
+                'signal_count': 0,
+                'momentum_percentile': 0.2,
+                'is_momentum_eligible': True,
+                'passes_momentum_top_percentile': True,
+                'composite_percentile': 1.0,
+                'is_composite_eligible': True,
+            },
+            {
+                'symbol': '000003',
+                'signal_score': 10,
+                'signal_count': 0,
+                'momentum_percentile': 1.0,
+                'is_momentum_eligible': False,
+                'passes_momentum_top_percentile': False,
+                'composite_percentile': 1.0,
+                'is_composite_eligible': False,
+            },
+        ]
+        with (
+            patch(
+                'app.agent_context.eligibility.load_daily_piotroski_filter_results',
+                return_value=[{'symbol': symbol, 'passed_filter': True, 'filter_payload': {}} for symbol in symbols],
+            ),
+            patch(
+                'app.agent_context.eligibility.load_daily_market_risk_filter_results',
+                return_value=[{'symbol': symbol, 'passed_filter': True, 'filter_payload': {}} for symbol in symbols],
+            ),
+            patch('app.agent_context.eligibility.load_agent_feedback_candidate_score_rows', return_value=score_rows),
+            patch('app.agent_context.eligibility._load_forced_inclusion_reasons', return_value=({}, {})),
+        ):
+            records = load_agent_feedback_eligibility_records(
+                market_date=date.fromisoformat('2026-04-16'),
+                requested_symbols=symbols,
+            )
+
+        with (
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_short_term_decider', 1),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1),
+        ):
+            funnel = build_agent_feedback_role_funnel(
+                records=records,
+                roles=['short-term-decider', 'signal-decider'],
+            )
+
+        self.assertEqual(funnel['role_symbols']['short-term-decider'], ['000001'])
+        self.assertEqual(funnel['role_symbols']['signal-decider'], ['000002'])
+        ineligible = next(record for record in records if record['symbol'] == '000003')
+        components = ineligible['candidate_score_payload']['components']
+        self.assertEqual(components['eligible_momentum_score'], 0.0)
+        self.assertEqual(components['eligible_composite_score'], 0.0)
 
     def test_large_requested_symbol_scope_is_ranked_and_candidate_capped(self) -> None:
         symbols = [f'{index:06d}' for index in range(1, 11)]
@@ -558,6 +678,46 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
             self.assertTrue(funnel['role_diagnostics'][role]['scope_alignment']['applied'])
         self.assertEqual(funnel['role_symbols']['short-term-decider'], ['005930', '000660'])
         self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930', '000660'])
+
+    def test_role_funnel_fast_path_preserves_distinct_decider_top_rankings(self) -> None:
+        records = [
+            {
+                'symbol': '005930',
+                'candidate_rank': 1,
+                'candidate_score': 100,
+                'candidate_score_payload': {
+                    'role_scores': {'short-term-decider': 100, 'signal-decider': 10},
+                },
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+            {
+                'symbol': '000660',
+                'candidate_rank': 2,
+                'candidate_score': 100,
+                'candidate_score_payload': {
+                    'role_scores': {'short-term-decider': 10, 'signal-decider': 100},
+                },
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            },
+        ]
+
+        with (
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_short_term_decider', 1),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1),
+        ):
+            funnel = build_agent_feedback_role_funnel(
+                records=records,
+                roles=['short-term-decider', 'signal-decider'],
+                feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            )
+
+        self.assertEqual(set(funnel['decider_scope']['symbols']), {'005930', '000660'})
+        self.assertEqual(funnel['role_symbols']['short-term-decider'], ['005930'])
+        self.assertEqual(funnel['role_symbols']['signal-decider'], ['000660'])
 
     def test_role_funnel_fast_path_keeps_decider_prerequisites_across_role_rankings(self) -> None:
         records = [

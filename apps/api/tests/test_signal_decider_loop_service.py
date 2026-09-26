@@ -2100,7 +2100,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
                 },
             )
         finally:
-            Base.metadata.drop_all(engine, tables=reversed(tables))
+            Base.metadata.drop_all(engine, tables=list(reversed(tables)))
             engine.dispose()
 
     def test_insert_decision_snapshots_preserves_history_and_idempotent_feedback_retries(self):

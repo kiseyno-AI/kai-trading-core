@@ -13,6 +13,7 @@ from app.signals.composite_factor import (
     COMPOSITE_ELIGIBLE_SCORE,
     COMPOSITE_FACTOR_VERSION,
     DailyCompositeFactorService,
+    HARD_EXCLUSION_LOW_RISK_EVIDENCE_MISSING,
 )
 
 
@@ -199,14 +200,16 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
             patch('app.signals.composite_factor.load_daily_low_risk_factor_results', return_value=low_risk_rows),
             patch('app.signals.composite_factor.load_daily_beta_factor_results', return_value=beta_rows),
             patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(['000001', '000002', '000003'])),
-            patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as upsert,
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_results', return_value=3) as batch_upsert,
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as single_upsert,
         ):
             result = self.service.rebuild_for_market_date(market_date=self.market_date)
 
         self.assertEqual(result['feature_version'], COMPOSITE_FACTOR_VERSION)
         self.assertEqual(result['results_persisted'], 3)
-        self.assertEqual(upsert.call_count, 3)
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        batch_upsert.assert_called_once()
+        single_upsert.assert_not_called()
+        persisted_by_symbol = {item['symbol']: item for item in batch_upsert.call_args.args[0]}
 
         best = persisted_by_symbol['000001']
         middle = persisted_by_symbol['000002']
@@ -258,11 +261,13 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
                 return_value=[_beta_row('005930', self.market_date, score=0.20, classification='watchlist', eligible=False)],
             ),
             patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(['005930'])),
-            patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as upsert,
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_results', return_value=1) as upsert,
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as single_upsert,
         ):
             result = self.service.rebuild_for_market_date(market_date=self.market_date)
 
-        persisted = upsert.call_args.args[0]
+        single_upsert.assert_not_called()
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(result['summary']['input_universe_counts']['advanced_value'], 0)
         self.assertEqual(persisted['valid_factor_count'], 4)
         self.assertAlmostEqual(persisted['available_base_weight'], 0.8, places=6)
@@ -297,15 +302,19 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
                 return_value=[_beta_row('005930', self.market_date, score=0.70)],
             ),
             patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(['005930'])),
-            patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as upsert,
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_results', return_value=1) as upsert,
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as single_upsert,
         ):
             result = self.service.rebuild_for_market_date(market_date=self.market_date)
 
-        persisted = upsert.call_args.args[0]
+        single_upsert.assert_not_called()
+        persisted = upsert.call_args.args[0][0]
         self.assertFalse(persisted['has_required_inputs'])
         self.assertIsNone(persisted['composite_score'])
         self.assertEqual(persisted['composite_classification'], CLASSIFICATION_INSUFFICIENT_INPUTS)
         self.assertEqual(result['summary']['insufficient_inputs_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 0)
+        self.assertEqual(result['summary']['unready_count'], 1)
 
     def test_rebuild_marks_hard_excluded_but_preserves_score_when_gate_fails(self) -> None:
         with (
@@ -345,6 +354,10 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
                 ],
             ),
             patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(['000001', '000002'])),
+            patch(
+                'app.signals.composite_factor.upsert_daily_composite_factor_results',
+                side_effect=RuntimeError('batch unavailable'),
+            ),
             patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as upsert,
         ):
             result = self.service.rebuild_for_market_date(market_date=self.market_date)
@@ -367,6 +380,46 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
         self.assertIsNotNone(illiquid['composite_score'])
 
         self.assertEqual(result['summary']['hard_excluded_count'], 2)
+        self.assertEqual(result['results_persisted'], 2)
+        self.assertEqual(result['results_failed'], 0)
+
+    def test_rebuild_preserves_analytic_score_but_fails_live_eligibility_without_low_risk_evidence(self) -> None:
+        symbols = ['000001', '000002']
+        with (
+            patch(
+                'app.signals.composite_factor.load_daily_momentum_factor_results',
+                return_value=[_momentum_row(symbol, self.market_date, percentile=0.95) for symbol in symbols],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_value_factor_results',
+                return_value=[_value_row(symbol, self.market_date, score=0.90) for symbol in symbols],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_advanced_value_factor_results',
+                return_value=[_advanced_value_row(symbol, self.market_date, score=0.85) for symbol in symbols],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_low_risk_factor_results',
+                return_value=[_low_risk_row('000002', self.market_date, score=0.80, passes_liquidity_floor=None)],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_beta_factor_results',
+                return_value=[_beta_row(symbol, self.market_date, score=0.80) for symbol in symbols],
+            ),
+            patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(symbols)),
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_results', return_value=2) as upsert,
+            patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as single_upsert,
+        ):
+            self.service.rebuild_for_market_date(market_date=self.market_date)
+
+        single_upsert.assert_not_called()
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
+        for symbol in symbols:
+            item = persisted_by_symbol[symbol]
+            self.assertIsNotNone(item['composite_score'])
+            self.assertFalse(item['is_composite_eligible'])
+            self.assertTrue(item['is_hard_excluded'])
+            self.assertIn(HARD_EXCLUSION_LOW_RISK_EVIDENCE_MISSING, item['gates']['hard_exclusion_reasons'])
 
     def test_inspect_returns_single_item_for_symbol(self) -> None:
         stored_items = [

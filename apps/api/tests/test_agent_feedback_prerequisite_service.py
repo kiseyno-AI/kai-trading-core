@@ -158,6 +158,30 @@ def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
     assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'ready'
 
 
+def test_high_coverage_partial_is_blocked_when_no_ready_row_persisted():
+    payload = {
+        'task': 'momentum_factors',
+        'status': 'partial',
+        'total': 2678,
+        'succeeded': 2677,
+        'processed': 2678,
+        'details': {
+            'rows_persisted': 2677,
+            'expected_rows': 2678,
+            'remaining_retryable_events': 0,
+            'result_summary': {
+                'results_persisted': 2677,
+                'ready_count': 1,
+                'unready_count': 2677,
+                'persisted_ready_count': 0,
+                'persisted_unready_count': 2677,
+            },
+        },
+    }
+
+    assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
+
+
 def test_konex_only_pykrx_categories_satisfy_feedback_prerequisites():
     not_applicable = {
         category: {
@@ -314,6 +338,26 @@ def test_explicit_pipeline_gate_status_overrides_partial_coverage_heuristic():
     }
 
     assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'ready'
+
+
+def test_explicit_blocked_gate_overrides_full_persisted_coverage():
+    payload = {
+        'task': 'low_risk_factors',
+        'status': 'completed',
+        'total': 2_678,
+        'succeeded': 2_678,
+        'processed': 2_678,
+        'gate_status': 'blocked',
+        'details': {
+            'gate_status': 'blocked',
+            'blocking_status': 'blocking',
+            'gate_reason': 'no_decision_ready_rows',
+            'rows_persisted': 2_678,
+            'expected_rows': 2_678,
+        },
+    }
+
+    assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
 
 
 def test_inspect_feedback_prerequisites_preserves_non_blocking_market_risk_gate():

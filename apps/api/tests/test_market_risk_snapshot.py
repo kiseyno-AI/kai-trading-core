@@ -36,6 +36,34 @@ class FakeKISRiskClient:
 
 
 class MarketRiskSnapshotNormalizationTests(unittest.TestCase):
+    def test_vi_yn_codes_are_normalized_without_treating_n_as_triggered(self) -> None:
+        inactive = build_market_risk_snapshot(
+            symbol='005930',
+            market_date='2026-04-14',
+            quote_response={'output': {'vi_cls_code': 'N'}},
+        )
+        active = build_market_risk_snapshot(
+            symbol='000660',
+            market_date='2026-04-14',
+            quote_response={'output': {'vi_cls_code': 'Y'}},
+        )
+
+        self.assertFalse(inactive['is_vi_triggered'])
+        self.assertEqual(inactive['vi_evidence_status'], 'inactive')
+        self.assertTrue(active['is_vi_triggered'])
+        self.assertEqual(active['vi_evidence_status'], 'active')
+
+    def test_unknown_vi_code_is_preserved_as_auditable_uncertainty(self) -> None:
+        snapshot = build_market_risk_snapshot(
+            symbol='005930',
+            market_date='2026-04-14',
+            quote_response={'output': {'vi_cls_code': 'unexpected'}},
+        )
+
+        self.assertFalse(snapshot['is_vi_triggered'])
+        self.assertEqual(snapshot['vi_evidence_status'], 'unknown')
+        self.assertEqual(snapshot['snapshot_payload']['vi_evidence_status'], 'unknown')
+
     def test_build_market_risk_snapshot_normalizes_quote_flags(self) -> None:
         snapshot = build_market_risk_snapshot(
             symbol='005930',
@@ -116,6 +144,10 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(service, '_load_symbol_rows', return_value=(inputs, ['005930', '000660', '051910'], [])),
             patch(
+                'app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots',
+                side_effect=RuntimeError('bulk write failed'),
+            ) as bulk_upsert,
+            patch(
                 'app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot',
                 side_effect=upsert_side_effect,
             ) as upsert,
@@ -128,6 +160,7 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['collected_count'], 2)
         self.assertEqual(result['failed_symbols'], ['051910', '000660'])
         self.assertEqual([item['symbol'] for item in result['items']], ['005930'])
+        bulk_upsert.assert_called_once()
         self.assertEqual(upsert.call_count, 2)
         persisted_symbols = {call.args[0]['symbol'] for call in upsert.call_args_list}
         self.assertEqual(persisted_symbols, {'005930', '000660'})
@@ -156,14 +189,15 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(service, '_load_symbol_rows', return_value=(inputs, ['005930'], [])),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
-            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
         ):
             result = await service.collect_for_market_date(market_date='2026-04-14')
 
         self.assertEqual(client.calls, ['005930', '005930'])
         self.assertEqual(result['snapshots_persisted'], 1)
         self.assertEqual(result['snapshots_failed'], 0)
-        self.assertEqual(upsert.call_count, 1)
+        upsert.assert_called_once()
+        self.assertEqual(upsert.call_args.args[0][0]['symbol'], '005930')
         self.assertTrue(any(call.args[0] == 1.0 for call in sleep.call_args_list))
 
     async def test_collect_for_market_date_retries_kis_timeout_errors(self) -> None:
@@ -195,14 +229,15 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(service, '_load_symbol_rows', return_value=(inputs, ['272110'], [])),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
-            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
         ):
             result = await service.collect_for_market_date(market_date='2026-06-15')
 
         self.assertEqual(client.calls, ['272110', '272110'])
         self.assertEqual(result['snapshots_persisted'], 1)
         self.assertEqual(result['snapshots_failed'], 0)
-        self.assertEqual(upsert.call_count, 1)
+        upsert.assert_called_once()
+        self.assertEqual(upsert.call_args.args[0][0]['symbol'], '272110')
         self.assertTrue(any(call.args[0] == 1.0 for call in sleep.call_args_list))
 
     async def test_collect_for_market_date_reports_timeout_after_retry_exhaustion(self) -> None:
@@ -219,7 +254,7 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(service, '_load_symbol_rows', return_value=(inputs, ['272110'], [])),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
-            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
         ):
             result = await service.collect_for_market_date(market_date='2026-06-15')
 
@@ -292,7 +327,7 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
                 return_value=(inputs, ['008775', '159800'], []),
             ),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
-            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot') as upsert,
+            patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
         ):
             result = await service.collect_for_market_date(market_date='2026-09-11')
 
@@ -301,7 +336,8 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['snapshots_persisted'], 1)
         self.assertEqual(result['snapshots_failed'], 1)
         self.assertEqual(result['failed_symbols'], ['159800'])
-        self.assertEqual(upsert.call_count, 1)
+        upsert.assert_called_once()
+        self.assertEqual(upsert.call_args.args[0][0]['symbol'], '008775')
         retry_delays = [call.args[0] for call in sleep.call_args_list if call.args[0] >= 1.0]
         self.assertEqual(retry_delays, [1.0])
 

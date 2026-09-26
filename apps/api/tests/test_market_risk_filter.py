@@ -41,6 +41,36 @@ class FakeKISRiskClient:
 
 
 class MarketRiskEvaluatorTests(unittest.TestCase):
+    def test_unknown_vi_evidence_is_conservatively_watchlisted_and_auditable(self) -> None:
+        snapshot = {
+            'symbol': '005930',
+            'market_date': '2026-04-14',
+            'vi_class_code': 'unexpected',
+            'is_vi_triggered': False,
+            'snapshot_payload': {'vi_evidence_status': 'unknown'},
+        }
+
+        result = build_market_risk_filter_result_from_snapshot(snapshot)
+
+        self.assertTrue(result['passed_filter'])
+        self.assertTrue(result['watchlist_flagged'])
+        self.assertIn('volatility_interruption_evidence_unknown', result['filter_payload']['watchlist_reasons'])
+        self.assertEqual(result['filter_payload']['vi_evidence_status'], 'unknown')
+
+    def test_vi_code_reclassifies_legacy_stale_boolean_snapshot(self) -> None:
+        result = build_market_risk_filter_result_from_snapshot(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'vi_class_code': 'N',
+                'is_vi_triggered': True,
+                'snapshot_payload': {},
+            }
+        )
+
+        self.assertFalse(result['watchlist_flagged'])
+        self.assertEqual(result['filter_payload']['vi_evidence_status'], 'inactive')
+
     def test_evaluate_market_warning_reasons_distinguishes_blocking_and_watchlist_codes(self) -> None:
         blocking, watchlist = evaluate_market_warning_reasons({'market_warning_code': '03'})
         self.assertEqual(blocking, ['market_warning_03'])
@@ -165,6 +195,10 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=snapshot_collection),
             ) as collect_snapshots,
             patch(
+                'app.signals.market_risk_filter.upsert_daily_market_risk_filter_results',
+                side_effect=RuntimeError('bulk write failed'),
+            ) as bulk_upsert,
+            patch(
                 'app.signals.market_risk_filter.upsert_daily_market_risk_filter_result',
                 side_effect=upsert_side_effect,
             ) as upsert,
@@ -186,6 +220,7 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['evaluated_count'], 2)
         self.assertEqual(result['summary']['watchlist_count'], 1)
         self.assertEqual(result['failed_symbols'], ['051910', '000660'])
+        bulk_upsert.assert_called_once()
         self.assertEqual(upsert.call_count, 2)
         self.assertEqual([item['symbol'] for item in result['items']], ['005930'])
         self.assertEqual(

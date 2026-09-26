@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.signals.market_risk_snapshot import classify_vi_code
+
 MARKET_RISK_FILTER_SOURCE = 'kis_market_risk_v1'
 BLOCKING_MARKET_WARNING_CODES = frozenset({'02', '03'})
 WATCHLIST_MARKET_WARNING_CODES = frozenset({'01'})
@@ -45,7 +47,17 @@ def evaluate_management_item_reasons(snapshot: dict[str, Any]) -> tuple[list[str
 
 def evaluate_volatility_interruption_reasons(snapshot: dict[str, Any]) -> tuple[list[str], list[str]]:
     watchlist: list[str] = []
-    _append_reason(watchlist, 'volatility_interruption', when=bool(snapshot.get('is_vi_triggered')))
+    snapshot_payload = snapshot.get('snapshot_payload')
+    payload_status = snapshot_payload.get('vi_evidence_status') if isinstance(snapshot_payload, dict) else None
+    _, inferred_status = classify_vi_code(snapshot.get('vi_class_code'))
+    evidence_status = snapshot.get('vi_evidence_status') or payload_status or inferred_status
+    is_triggered = evidence_status == 'active'
+    _append_reason(watchlist, 'volatility_interruption', when=is_triggered)
+    _append_reason(
+        watchlist,
+        'volatility_interruption_evidence_unknown',
+        when=evidence_status == 'unknown',
+    )
     return [], watchlist
 
 
@@ -114,6 +126,12 @@ def build_market_risk_filter_result_from_snapshot(
     eod_run_id: int | None = None,
 ) -> dict[str, Any]:
     evaluation = evaluate_market_risk_snapshot(snapshot)
+    snapshot_payload = snapshot.get('snapshot_payload')
+    vi_evidence_status = snapshot.get('vi_evidence_status')
+    if vi_evidence_status is None and isinstance(snapshot_payload, dict):
+        vi_evidence_status = snapshot_payload.get('vi_evidence_status')
+    if vi_evidence_status is None:
+        _, vi_evidence_status = classify_vi_code(snapshot.get('vi_class_code'))
     return {
         'symbol': snapshot['symbol'],
         'name_ko': snapshot.get('name_ko'),
@@ -133,6 +151,7 @@ def build_market_risk_filter_result_from_snapshot(
             'snapshot_market_code': snapshot.get('market_code'),
             'snapshot_source_endpoint': snapshot.get('source_endpoint'),
             'snapshot_captured_at': snapshot.get('captured_at'),
+            'vi_evidence_status': vi_evidence_status,
             'blocking_reasons': evaluation['blocking_reasons'],
             'watchlist_reasons': evaluation['watchlist_reasons'],
         },

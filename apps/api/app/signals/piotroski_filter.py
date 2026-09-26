@@ -22,6 +22,7 @@ from app.market_data_store import (
     load_daily_piotroski_filter_results,
     load_latest_available_daily_piotroski_filter_result_date,
     upsert_daily_piotroski_filter_result,
+    upsert_daily_piotroski_filter_results,
 )
 
 FILTER_SOURCE = 'strategy_piotroski_v1'
@@ -207,6 +208,7 @@ class DailyPiotroskiFilterService:
         momentum_values = [item.return_20d for item in inputs if item.return_20d is not None]
         passed_count = 0
         persisted_count = 0
+        result_payloads: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
 
@@ -351,12 +353,21 @@ class DailyPiotroskiFilterService:
                     },
                 },
             }
+            result_payloads.append(payload)
+
+        if result_payloads:
             try:
-                upsert_daily_piotroski_filter_result(payload)
-                persisted_count += 1
-            except Exception as exc:
-                failed_symbols.append(item.symbol)
-                failed_symbol_errors.append({'symbol': item.symbol, 'error': str(exc)})
+                upsert_daily_piotroski_filter_results(result_payloads)
+                persisted_count = len(result_payloads)
+            except Exception:
+                for payload in result_payloads:
+                    try:
+                        upsert_daily_piotroski_filter_result(payload)
+                        persisted_count += 1
+                    except Exception as exc:
+                        symbol = str(payload['symbol'])
+                        failed_symbols.append(symbol)
+                        failed_symbol_errors.append({'symbol': symbol, 'error': str(exc)})
 
         return {
             'market_date': normalized_market_date.isoformat(),

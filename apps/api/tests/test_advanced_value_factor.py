@@ -456,14 +456,14 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['000001', '000002', '000003'], [])),
-            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_result') as upsert,
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
         self.assertEqual(result['feature_version'], ADVANCED_VALUE_FACTOR_VERSION)
         self.assertEqual(result['results_persisted'], 3)
-        self.assertEqual(upsert.call_count, 3)
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        upsert.assert_called_once()
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
 
         best = persisted_by_symbol['000001']
         middle = persisted_by_symbol['000002']
@@ -528,11 +528,11 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['000001', '000002'], [])),
-            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_result') as upsert,
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_results') as upsert,
         ):
             service.rebuild_for_market_date(market_date=market_date)
 
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
         positive = persisted_by_symbol['000001']
         negative = persisted_by_symbol['000002']
 
@@ -566,11 +566,11 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
-            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_result') as upsert,
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['ev_to_ebitda_status'], METRIC_STATUS_INVALID_NON_POSITIVE_EBITDA)
         self.assertFalse(persisted['ev_to_ebitda_valid_for_scoring'])
         self.assertIsNone(persisted['advanced_value_score'])
@@ -591,15 +591,17 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['035420'], [])),
-            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_result') as upsert,
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['advanced_value_classification'], 'insufficient_fundamentals')
         self.assertIsNone(persisted['advanced_value_score'])
         self.assertFalse(persisted['is_advanced_value_eligible'])
         self.assertEqual(result['summary']['insufficient_fundamentals_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 0)
+        self.assertEqual(result['summary']['unready_count'], 1)
 
     def test_load_inputs_attaches_positive_same_day_observed_market_cap(self) -> None:
         service = DailyAdvancedValueFactorService()
@@ -798,11 +800,11 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', side_effect=load_inputs_side_effect),
-            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_result') as upsert,
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date, symbols=['000002'])
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual(result['summary']['ranking_universe_counts']['fcf_yield'], 3)
         self.assertEqual(result['summary']['ranking_universe_counts']['advanced_value_score'], 3)
@@ -817,7 +819,7 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=([], [], ['999999'])) as load_inputs,
-            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_result') as upsert,
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date, symbols=['999999'])
 
@@ -842,6 +844,9 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
                 'symbols_with_annual_fundamentals': 0,
                 'fcf_yield_valid_count': 0,
                 'ev_to_ebitda_valid_count': 0,
+                'scored_count': 0,
+                'ready_count': 0,
+                'unready_count': 1,
                 'eligible_count': 0,
                 'watchlist_count': 0,
                 'ineligible_count': 0,

@@ -42,6 +42,9 @@ from app.eod.daily_pipeline_stages import (
     STAGE_DEFINITIONS,
     DailyPipelineStageService,
 )
+from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_result_has_no_ready_content,
+)
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS
 from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES, pykrx_enrichment_service
@@ -1001,6 +1004,15 @@ class EODPipelineStatusService:
             )
         for stage_id, stored_stage in stored_row_count_stage_overrides.items():
             if stage_id in stages:
+                current_details = (
+                    stages[stage_id].get('details')
+                    if isinstance(stages[stage_id].get('details'), dict)
+                    else {}
+                )
+                if daily_pipeline_result_has_no_ready_content(
+                    current_details.get('result_summary')
+                ):
+                    continue
                 stages[stage_id] = stored_stage
         stages = self._mark_preopen_stage_skips(stages=stages)
         stages = self._normalize_stage_contract(stages)
@@ -1465,6 +1477,7 @@ class EODPipelineStatusService:
             if self._should_preserve_stored_coverage_stage(
                 stage_id=stage_id,
                 fallback_stage=stages.get(stage_id) or {},
+                official_stage=official_stage,
             ):
                 continue
             overlaid[stage_id] = self._build_official_stage(
@@ -1496,6 +1509,7 @@ class EODPipelineStatusService:
             if self._should_preserve_stored_coverage_stage(
                 stage_id=stage_id,
                 fallback_stage=fallback_stage,
+                official_stage=official_stage,
             ):
                 continue
             if not self._should_overlay_official_stage_history(
@@ -1521,11 +1535,22 @@ class EODPipelineStatusService:
         *,
         stage_id: str,
         fallback_stage: dict[str, Any],
+        official_stage: dict[str, Any] | None = None,
     ) -> bool:
         details = fallback_stage.get('details') if isinstance(fallback_stage.get('details'), dict) else {}
         if stage_id == 'pykrx_enrichment':
             return False
         if stage_id not in FACTOR_STAGE_MODELS and stage_id not in {'composite_factors'}:
+            return False
+        official_details = (
+            official_stage.get('details')
+            if isinstance(official_stage, dict)
+            and isinstance(official_stage.get('details'), dict)
+            else {}
+        )
+        if daily_pipeline_result_has_no_ready_content(
+            official_details.get('result_summary')
+        ):
             return False
         return (
             str(fallback_stage.get('status') or '').strip().lower() == 'completed'
@@ -1538,6 +1563,15 @@ class EODPipelineStatusService:
         fallback_stage: dict[str, Any],
         official_stage: dict[str, Any],
     ) -> bool:
+        official_details = (
+            official_stage.get('details')
+            if isinstance(official_stage.get('details'), dict)
+            else {}
+        )
+        if daily_pipeline_result_has_no_ready_content(
+            official_details.get('result_summary')
+        ):
+            return True
         fallback_status = str(fallback_stage.get('status') or '').strip().lower()
         if fallback_status == 'pending':
             return True
@@ -1586,10 +1620,14 @@ class EODPipelineStatusService:
             else status
         )
         status_repaired_from_result_summary = (
-            stored_status == 'completed' and result_summary_status == 'partial'
+            stored_status == 'completed'
+            and result_summary_status in {'partial', 'blocked', 'waiting'}
+        )
+        no_ready_content = daily_pipeline_result_has_no_ready_content(
+            result_summary
         )
         if status_repaired_from_result_summary:
-            status = 'partial'
+            status = result_summary_status
         should_repair_legacy_counts = (
             counts.processed == 0
             and counts.succeeded == 0
@@ -1637,9 +1675,18 @@ class EODPipelineStatusService:
         )
         details = (
             {**fallback_details, **official_details}
-            if uses_fallback_coverage_diagnostics
+            if uses_fallback_coverage_diagnostics or no_ready_content
             else official_details
         )
+        if no_ready_content:
+            details.update(
+                {
+                    'gate_status': 'blocked',
+                    'severity': 'blocked',
+                    'blocking_status': 'blocking',
+                    'gate_reason': 'no_decision_ready_rows',
+                }
+            )
         if result_summary:
             compacted_result_summary, read_time_omissions = (
                 DailyPipelineStageService.compact_stage_result_summary(result_summary)
@@ -1723,6 +1770,14 @@ class EODPipelineStatusService:
             for field_name in ('gate_status', 'severity', 'blocking_status'):
                 if fallback_stage.get(field_name) is not None:
                     stage_payload[field_name] = fallback_stage[field_name]
+        if no_ready_content:
+            stage_payload.update(
+                {
+                    'gate_status': 'blocked',
+                    'severity': 'blocked',
+                    'blocking_status': 'blocking',
+                }
+            )
         return stage_payload
 
     def _build_agent_feedback_stage(

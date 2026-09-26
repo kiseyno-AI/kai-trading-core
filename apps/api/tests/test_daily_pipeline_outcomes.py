@@ -8,6 +8,7 @@ import pytest
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    daily_pipeline_result_has_no_ready_content,
     terminal_continuation_feedback_lease_loss_run_id,
 )
 from app.eod.pykrx_backfill import PykrxBackfillService
@@ -302,6 +303,71 @@ def test_feedback_partial_is_not_satisfied_by_generic_coverage() -> None:
         'details': {'remaining_retryable_events': 0},
     }
 
+    assert daily_pipeline_outcome_is_satisfied(outcome) is False
+
+
+def test_factor_rows_without_ready_content_do_not_satisfy_downstream_dependency() -> None:
+    outcome = {
+        'stage': 'low_risk_factors',
+        'status': 'partial',
+        'result': {
+            'results_persisted': 2_678,
+            'results_failed': 0,
+            'summary': {
+                'requested_symbol_count': 2_678,
+                'matched_symbol_count': 2_678,
+                'insufficient_history_count': 2_678,
+                'ready_count': 0,
+            },
+        },
+        'succeeded': 2_678,
+        'total': 2_678,
+        'details': {'remaining_retryable_events': 0},
+    }
+
+    assert daily_pipeline_outcome_is_satisfied(outcome) is False
+
+
+def test_standard_unready_coverage_blocks_completed_factor_outcome() -> None:
+    outcome = {
+        'stage': 'beta_factors',
+        'status': 'completed',
+        'result': {
+            'results_persisted': 2,
+            'summary': {
+                'requested_symbol_count': 2,
+                'matched_symbol_count': 2,
+                'ready_count': 0,
+                'unready_count': 2,
+            },
+        },
+    }
+
+    assert daily_pipeline_outcome_is_satisfied(outcome) is False
+
+
+def test_persisted_readiness_prevents_failed_ready_row_from_passing_partial_coverage() -> None:
+    outcome = {
+        'stage': 'momentum_factors',
+        'status': 'partial',
+        'result': {
+            'results_persisted': 2_677,
+            'results_failed': 1,
+            'summary': {
+                'requested_symbol_count': 2_678,
+                'matched_symbol_count': 2_678,
+                'ready_count': 1,
+                'unready_count': 2_677,
+                'persisted_ready_count': 0,
+                'persisted_unready_count': 2_677,
+            },
+        },
+        'succeeded': 2_677,
+        'total': 2_678,
+        'details': {'remaining_retryable_events': 0},
+    }
+
+    assert daily_pipeline_result_has_no_ready_content(outcome) is True
     assert daily_pipeline_outcome_is_satisfied(outcome) is False
 
 

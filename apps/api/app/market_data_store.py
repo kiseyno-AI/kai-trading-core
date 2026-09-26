@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import Numeric, and_, case, cast, delete, func, select, text, true, update
+from sqlalchemy import Boolean, Numeric, and_, case, cast, delete, func, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import aliased
 
@@ -140,6 +140,7 @@ TRENDING_RANK_INSERT_CHUNK_SIZE = 50
 TRENDING_RANK_PERSIST_LIMIT = 250
 DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
 RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 200
+FACTOR_RESULT_UPSERT_CHUNK_SIZE = 400
 
 
 def _utcnow() -> datetime:
@@ -826,6 +827,73 @@ def load_daily_bars_for_symbol_range(
         ]
 
 
+def _build_recent_price_bars_query(
+    *,
+    symbol_ids: Sequence[int],
+    market_date: date,
+    history_days: int,
+):
+    date_predicate = (
+        DailyPriceBar.trade_date == market_date
+        if history_days == 1
+        else DailyPriceBar.trade_date <= market_date
+    )
+    symbol_scope = (
+        select(Symbol.id.label('symbol_id'))
+        .where(Symbol.id.in_(symbol_ids))
+        .subquery('recent_price_bar_symbols')
+    )
+    recent_rows = (
+        select(
+            DailyPriceBar.symbol_id.label('symbol_id'),
+            DailyPriceBar.trade_date.label('trade_date'),
+            DailyPriceBar.open_price.label('open_price'),
+            DailyPriceBar.high_price.label('high_price'),
+            DailyPriceBar.low_price.label('low_price'),
+            DailyPriceBar.close_price.label('close_price'),
+            DailyPriceBar.volume.label('volume'),
+            DailyPriceBar.turnover.label('turnover'),
+            DailyPriceBar.per.label('per'),
+            DailyPriceBar.pbr.label('pbr'),
+            DailyPriceBar.bps.label('bps'),
+            DailyPriceBar.eps.label('eps'),
+            DailyPriceBar.dividend_yield.label('dividend_yield'),
+            DailyPriceBar.dps.label('dps'),
+            DailyPriceBar.source.label('source'),
+            DailyPriceBar.captured_at.label('captured_at'),
+        )
+        .where(
+            DailyPriceBar.symbol_id == symbol_scope.c.symbol_id,
+            date_predicate,
+        )
+        .order_by(DailyPriceBar.trade_date.desc())
+        .limit(history_days)
+        .lateral('recent_price_bars')
+    )
+    return (
+        select(
+            recent_rows.c.symbol_id,
+            recent_rows.c.trade_date,
+            recent_rows.c.open_price,
+            recent_rows.c.high_price,
+            recent_rows.c.low_price,
+            recent_rows.c.close_price,
+            recent_rows.c.volume,
+            recent_rows.c.turnover,
+            recent_rows.c.per,
+            recent_rows.c.pbr,
+            recent_rows.c.bps,
+            recent_rows.c.eps,
+            recent_rows.c.dividend_yield,
+            recent_rows.c.dps,
+            recent_rows.c.source,
+            recent_rows.c.captured_at,
+        )
+        .select_from(symbol_scope.join(recent_rows, true()))
+        .order_by(recent_rows.c.symbol_id.asc(), recent_rows.c.trade_date.desc())
+    )
+
+
 def load_recent_price_bars_by_symbol(
     *,
     market_date: str | date,
@@ -837,8 +905,6 @@ def load_recent_price_bars_by_symbol(
 
     normalized_symbols = list(dict.fromkeys(symbols))
     normalized_market_date = _normalize_trade_date(market_date)
-    lower_bound_date = normalized_market_date - timedelta(days=max(history_days * 7, 14))
-
     grouped: dict[str, list[dict]] = {symbol: [] for symbol in normalized_symbols}
     if history_days == 1 and len(normalized_symbols) > 100:
         requested_symbol_set = set(normalized_symbols)
@@ -902,35 +968,11 @@ def load_recent_price_bars_by_symbol(
             symbol_ids = list(symbol_by_id)
             if not symbol_ids:
                 continue
-            stmt = (
-                select(
-                    DailyPriceBar.symbol_id.label('symbol_id'),
-                    DailyPriceBar.trade_date.label('trade_date'),
-                    DailyPriceBar.open_price.label('open_price'),
-                    DailyPriceBar.high_price.label('high_price'),
-                    DailyPriceBar.low_price.label('low_price'),
-                    DailyPriceBar.close_price.label('close_price'),
-                    DailyPriceBar.volume.label('volume'),
-                    DailyPriceBar.turnover.label('turnover'),
-                    DailyPriceBar.per.label('per'),
-                    DailyPriceBar.pbr.label('pbr'),
-                    DailyPriceBar.bps.label('bps'),
-                    DailyPriceBar.eps.label('eps'),
-                    DailyPriceBar.dividend_yield.label('dividend_yield'),
-                    DailyPriceBar.dps.label('dps'),
-                    DailyPriceBar.source.label('source'),
-                    DailyPriceBar.captured_at.label('captured_at'),
-                )
-                .where(
-                    DailyPriceBar.symbol_id.in_(symbol_ids),
-                    DailyPriceBar.trade_date <= normalized_market_date,
-                )
-                .order_by(DailyPriceBar.symbol_id.asc(), DailyPriceBar.trade_date.desc())
+            stmt = _build_recent_price_bars_query(
+                symbol_ids=symbol_ids,
+                market_date=normalized_market_date,
+                history_days=history_days,
             )
-            if history_days == 1:
-                stmt = stmt.where(DailyPriceBar.trade_date == normalized_market_date)
-            else:
-                stmt = stmt.where(DailyPriceBar.trade_date >= lower_bound_date)
             rows = session.execute(stmt).mappings().all()
         for row in rows:
             symbol = symbol_by_id.get(row['symbol_id'])
@@ -2903,6 +2945,243 @@ def upsert_daily_piotroski_filter_result(result: dict) -> None:
         )
 
 
+def _resolve_derived_symbol_ids(
+    session,
+    results: Sequence[dict],
+    *,
+    refreshed_at: datetime,
+) -> dict[str, int]:
+    result_by_symbol = {
+        str(result['symbol']): result
+        for result in results
+    }
+    symbols = list(result_by_symbol)
+    if not symbols:
+        return {}
+
+    existing = session.execute(
+        select(Symbol).where(Symbol.symbol.in_(symbols))
+    ).scalars().all()
+    symbol_ids = {row.symbol: int(row.id) for row in existing}
+    for row in existing:
+        result = result_by_symbol[row.symbol]
+        payload = (
+            result.get('factor_payload')
+            or result.get('filter_payload')
+            or result.get('snapshot_payload')
+            or {}
+        )
+        resolved_name = result.get('name_ko') or payload.get('name_ko')
+        if resolved_name and row.name_ko == row.symbol:
+            row.name_ko = str(resolved_name)
+            row.last_refreshed_at = refreshed_at
+    for symbol_code in symbols:
+        if symbol_code in symbol_ids:
+            continue
+        result = result_by_symbol[symbol_code]
+        payload = (
+            result.get('factor_payload')
+            or result.get('filter_payload')
+            or result.get('snapshot_payload')
+            or {}
+        )
+        symbol = Symbol(
+            symbol=symbol_code,
+            market=result.get('market') or 'KRX',
+            name_ko=result.get('name_ko') or payload.get('name_ko') or symbol_code,
+            instrument_type='equity',
+            source=result.get('source') or 'daily_derived_batch',
+            is_active=True,
+            last_refreshed_at=refreshed_at,
+        )
+        session.add(symbol)
+        session.flush()
+        symbol_ids[symbol_code] = int(symbol.id)
+    return symbol_ids
+
+
+def _derived_column_default(column) -> Any:
+    default = column.default
+    if default is None or not default.is_scalar:
+        return None
+    return default.arg
+
+
+def _derived_result_values(
+    *,
+    model,
+    result: dict,
+    symbol_id: int,
+    refreshed_at: datetime,
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for column in model.__table__.columns:
+        name = column.name
+        if name in {'id', 'created_at'}:
+            continue
+        if name == 'symbol_id':
+            value: Any = symbol_id
+        elif name == 'market_date':
+            value = _normalize_trade_date(result['market_date'])
+        elif name in {'captured_at', 'updated_at'}:
+            value = refreshed_at
+        elif name == 'factor_payload':
+            value = result['factor_payload']
+        elif name in result:
+            value = result[name]
+        else:
+            value = _derived_column_default(column)
+
+        default_value = _derived_column_default(column)
+        if value is None and not column.nullable and default_value is not None:
+            value = default_value
+        if isinstance(column.type, Boolean) and not column.nullable:
+            value = bool(value)
+        values[name] = value
+    return values
+
+
+def _upsert_daily_derived_results(
+    results: Sequence[dict],
+    *,
+    model,
+    constraint: str,
+) -> int:
+    normalized_results = list(results)
+    if not normalized_results:
+        return 0
+
+    refreshed_at = _utcnow()
+    with session_scope() as session:
+        symbol_ids = _resolve_derived_symbol_ids(
+            session,
+            normalized_results,
+            refreshed_at=refreshed_at,
+        )
+        for start in range(0, len(normalized_results), FACTOR_RESULT_UPSERT_CHUNK_SIZE):
+            result_chunk = normalized_results[start:start + FACTOR_RESULT_UPSERT_CHUNK_SIZE]
+            values = [
+                _derived_result_values(
+                    model=model,
+                    result=result,
+                    symbol_id=symbol_ids[str(result['symbol'])],
+                    refreshed_at=refreshed_at,
+                )
+                for result in result_chunk
+            ]
+            statement = pg_insert(model).values(values)
+            session.execute(
+                statement.on_conflict_do_update(
+                    constraint=constraint,
+                    set_={
+                        column_name: getattr(statement.excluded, column_name)
+                        for column_name in values[0]
+                        if column_name not in {'symbol_id', 'market_date'}
+                    },
+                )
+            )
+    return len(normalized_results)
+
+
+def upsert_daily_momentum_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyMomentumFactorResult,
+        constraint='uq_daily_momentum_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_low_risk_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyLowRiskFactorResult,
+        constraint='uq_daily_low_risk_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_beta_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyBetaFactorResult,
+        constraint='uq_daily_beta_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_value_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyValueFactorResult,
+        constraint='uq_daily_value_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_advanced_value_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyAdvancedValueFactorResult,
+        constraint='uq_daily_advanced_value_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_unified_value_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyUnifiedValueFactorResult,
+        constraint='uq_daily_unified_value_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_quality_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyQualityFactorResult,
+        constraint='uq_daily_quality_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_composite_factor_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyCompositeFactorResult,
+        constraint='uq_daily_composite_factor_results_symbol_market_date',
+    )
+
+
+def upsert_daily_market_risk_snapshots(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyMarketRiskSnapshot,
+        constraint='uq_daily_market_risk_snapshots_symbol_market_date',
+    )
+
+
+def upsert_daily_market_risk_filter_results(results: Sequence[dict]) -> int:
+    normalized_results = [
+        {
+            **{
+                key: value
+                for key, value in result.items()
+                if key != '_snapshot_fields'
+            },
+            **dict(result.get('_snapshot_fields') or {}),
+        }
+        for result in results
+    ]
+    return _upsert_daily_derived_results(
+        normalized_results,
+        model=DailyMarketRiskFilterResult,
+        constraint='uq_daily_market_risk_filter_results_symbol_market_date',
+    )
+
+
+def upsert_daily_piotroski_filter_results(results: Sequence[dict]) -> int:
+    return _upsert_daily_derived_results(
+        results,
+        model=DailyPiotroskiFilterResult,
+        constraint='uq_daily_piotroski_filter_results_symbol_market_date',
+    )
+
+
 def upsert_daily_momentum_factor_result(result: dict) -> None:
     refreshed_at = _utcnow()
     with session_scope() as session:
@@ -3247,6 +3526,7 @@ def load_agent_feedback_candidate_score_rows(
                 DailySignalFeature.overtime_fluctuation_rank,
                 DailyMomentumFactorResult.momentum_percentile,
                 DailyMomentumFactorResult.passes_momentum_top_percentile,
+                DailyMomentumFactorResult.is_momentum_eligible,
                 DailyCompositeFactorResult.composite_percentile,
                 DailyCompositeFactorResult.is_composite_eligible,
             )
@@ -3295,6 +3575,7 @@ def load_agent_feedback_candidate_score_rows(
                 'overtime_fluctuation_rank': overtime_fluctuation_rank,
                 'momentum_percentile': _round_float(momentum_percentile, 6),
                 'passes_momentum_top_percentile': passes_momentum_top_percentile,
+                'is_momentum_eligible': is_momentum_eligible,
                 'composite_percentile': _round_float(composite_percentile, 6),
                 'is_composite_eligible': is_composite_eligible,
             }
@@ -3309,6 +3590,7 @@ def load_agent_feedback_candidate_score_rows(
                 overtime_fluctuation_rank,
                 momentum_percentile,
                 passes_momentum_top_percentile,
+                is_momentum_eligible,
                 composite_percentile,
                 is_composite_eligible,
             ) in rows

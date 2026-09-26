@@ -12,6 +12,7 @@ from app.market_data_store import (
     load_latest_available_daily_market_risk_snapshot_date,
     load_symbols,
     upsert_daily_market_risk_snapshot,
+    upsert_daily_market_risk_snapshots,
 )
 
 MARKET_RISK_SNAPSHOT_SOURCE = 'kis_quote2_snapshot_v1'
@@ -20,7 +21,8 @@ DEFAULT_FETCH_CONCURRENCY = 1
 DEFAULT_FETCH_THROTTLE_SECONDS = 0.25
 RATE_LIMIT_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 LATEST_FALLBACK_POLICY = 'latest_on_or_before_requested_market_date'
-INACTIVE_VI_CODES = frozenset({'', '0', '00'})
+ACTIVE_VI_CODES = frozenset({'Y', '1', '01'})
+INACTIVE_VI_CODES = frozenset({'N', '0', '00'})
 
 
 def normalize_market_date(value: str | date) -> date:
@@ -81,6 +83,15 @@ def _normalize_flag(value: Any) -> bool:
     return normalized in {'Y', '1', 'TRUE', 'T'}
 
 
+def classify_vi_code(value: Any) -> tuple[bool, str]:
+    normalized = str(value or '').strip().upper()
+    if normalized in ACTIVE_VI_CODES:
+        return True, 'active'
+    if normalized in INACTIVE_VI_CODES:
+        return False, 'inactive'
+    return False, 'unknown'
+
+
 def _extract_quote_payload(response: dict[str, Any]) -> dict[str, Any]:
     for key in ('output', 'output1'):
         payload = response.get(key)
@@ -120,7 +131,7 @@ def build_market_risk_snapshot(
     short_overheat_class_code = _normalize_code(payload.get('short_over_cls_code'))
     is_short_sale_overheated = _normalize_flag(payload.get('ssts_hot_yn'))
     vi_class_code = _normalize_code(payload.get('vi_cls_code'))
-    is_vi_triggered = (vi_class_code or '') not in INACTIVE_VI_CODES
+    is_vi_triggered, vi_evidence_status = classify_vi_code(vi_class_code)
     is_dishonest_disclosure = _normalize_flag(payload.get('insn_pbnt_yn'))
     is_trade_halted = _normalize_flag(payload.get('trht_yn'))
 
@@ -143,12 +154,14 @@ def build_market_risk_snapshot(
         'is_short_sale_overheated': is_short_sale_overheated,
         'vi_class_code': vi_class_code,
         'is_vi_triggered': is_vi_triggered,
+        'vi_evidence_status': vi_evidence_status,
         'is_dishonest_disclosure': is_dishonest_disclosure,
         'is_trade_halted': is_trade_halted,
         'snapshot_payload': {
             'feature_version': source,
             'market_code': normalized_market_code,
             'source_endpoint': 'inquire-price-2',
+            'vi_evidence_status': vi_evidence_status,
             'raw': payload,
         },
     }
@@ -381,13 +394,18 @@ class DailyMarketRiskSnapshotService:
         )
 
         persisted_items: list[dict[str, Any]] = []
-        for item in items:
+        if items:
             try:
-                upsert_daily_market_risk_snapshot(item)
-                persisted_items.append(item)
-            except Exception as exc:
-                failed_symbols.append(item['symbol'])
-                failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+                upsert_daily_market_risk_snapshots(items)
+                persisted_items = list(items)
+            except Exception:
+                for item in items:
+                    try:
+                        upsert_daily_market_risk_snapshot(item)
+                        persisted_items.append(item)
+                    except Exception as exc:
+                        failed_symbols.append(item['symbol'])
+                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
 
         return {
             'market_date': normalized_market_date.isoformat(),

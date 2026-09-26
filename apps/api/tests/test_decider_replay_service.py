@@ -1282,7 +1282,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                 f'{SHORT_TERM_DECIDER_AGENT_NAME}|openai/gpt-5.6-sol',
             )
         finally:
-            Base.metadata.drop_all(engine, tables=reversed(tables))
+            Base.metadata.drop_all(engine, tables=list(reversed(tables)))
             engine.dispose()
 
     def test_short_term_replay_uses_tactical_action_instead_of_legacy_generic_buy(self) -> None:
@@ -1389,7 +1389,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
             self.assertEqual([trade.snapshot_id for trade in signal_dataset], [5])
             self.assertEqual(signal_dataset.excluded_reason_counts, {})
         finally:
-            Base.metadata.drop_all(engine, tables=reversed(tables))
+            Base.metadata.drop_all(engine, tables=list(reversed(tables)))
             engine.dispose()
 
     def test_replay_uses_latest_snapshot_per_feedback_and_keeps_null_feedback_independent(self) -> None:
@@ -1543,7 +1543,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
             self.assertEqual(dataset.source_decision_count, 2)
             self.assertEqual({trade.snapshot_id for trade in dataset}, {13, 14})
         finally:
-            Base.metadata.drop_all(engine, tables=reversed(tables))
+            Base.metadata.drop_all(engine, tables=list(reversed(tables)))
             engine.dispose()
 
     def test_wait_conflict_gate_filters_source_date_and_applies_one_replay_probe(self) -> None:

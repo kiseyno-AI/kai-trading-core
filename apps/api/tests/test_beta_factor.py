@@ -119,14 +119,14 @@ class DailyBetaFactorServiceTests(unittest.TestCase):
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['000001', '000002', '000003'], [])),
             patch.object(service, '_build_benchmark_context', return_value=_benchmark_context(market_date, benchmark_returns)),
-            patch('app.signals.beta_factor.upsert_daily_beta_factor_result') as upsert,
+            patch('app.signals.beta_factor.upsert_daily_beta_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
         self.assertEqual(result['feature_version'], BETA_FACTOR_VERSION)
         self.assertEqual(result['results_persisted'], 3)
-        self.assertEqual(upsert.call_count, 3)
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        upsert.assert_called_once()
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
 
         low_beta = persisted_by_symbol['000001']
         mid_beta = persisted_by_symbol['000002']
@@ -174,17 +174,19 @@ class DailyBetaFactorServiceTests(unittest.TestCase):
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
             patch.object(service, '_build_benchmark_context', return_value=_benchmark_context(market_date, benchmark_returns)),
-            patch('app.signals.beta_factor.upsert_daily_beta_factor_result') as upsert,
+            patch('app.signals.beta_factor.upsert_daily_beta_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertIsNotNone(persisted['beta_60d'])
         self.assertIsNone(persisted['beta_120d'])
         self.assertEqual(persisted['low_beta_classification'], 'insufficient_history')
         self.assertIsNone(persisted['low_beta_score'])
         self.assertFalse(persisted['is_low_beta_eligible'])
         self.assertEqual(result['summary']['insufficient_history_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 0)
+        self.assertEqual(result['summary']['unready_count'], 1)
 
     def test_rebuild_populates_60d_and_120d_outputs_when_history_exists(self) -> None:
         service = DailyBetaFactorService()
@@ -195,11 +197,11 @@ class DailyBetaFactorServiceTests(unittest.TestCase):
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
             patch.object(service, '_build_benchmark_context', return_value=_benchmark_context(market_date, benchmark_returns, contributors=1)),
-            patch('app.signals.beta_factor.upsert_daily_beta_factor_result') as upsert,
+            patch('app.signals.beta_factor.upsert_daily_beta_factor_results') as upsert,
         ):
             service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertIsNotNone(persisted['beta_60d'])
         self.assertIsNotNone(persisted['beta_120d'])
         self.assertEqual(persisted['factor_payload']['availability']['observations']['beta_60d'], 60)

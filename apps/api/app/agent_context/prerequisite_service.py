@@ -6,6 +6,7 @@ from typing import Any
 from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import (
     GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO,
+    daily_pipeline_result_has_no_ready_content,
 )
 from app.eod.pykrx_enrichment_coverage_policy import (
     required_category_minimum_coverage_ratio,
@@ -67,13 +68,15 @@ class AgentFeedbackPrerequisiteService:
         explicit_gate_status = str(
             stage_payload.get('gate_status') or details.get('gate_status') or ''
         ).strip().lower()
+        if explicit_gate_status in {'ready', 'blocked', 'waiting'}:
+            return explicit_gate_status
+        if daily_pipeline_result_has_no_ready_content(stage_payload):
+            return 'blocked'
         if str(stage_payload.get('task') or '') != PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
             if AgentFeedbackPrerequisiteService._has_complete_persisted_stage_coverage(stage_payload):
                 return 'ready'
             if status == 'partial' and AgentFeedbackPrerequisiteService._is_nonblocking_fundamentals_partial(stage_payload):
                 return 'ready'
-        if explicit_gate_status in {'ready', 'blocked', 'waiting'}:
-            return explicit_gate_status
         if str(stage_payload.get('task') or '') == PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
             category_gate_status = str(details.get('decider_category_gate_status') or '').strip().lower()
             if category_gate_status in {'ready', 'blocked', 'waiting'}:

@@ -42,14 +42,14 @@ class DailyValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['000001', '000002', '000003'], [])),
-            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+            patch('app.signals.value_factor.upsert_daily_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
         self.assertEqual(result['feature_version'], VALUE_FACTOR_VERSION)
         self.assertEqual(result['results_persisted'], 3)
-        self.assertEqual(upsert.call_count, 3)
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        upsert.assert_called_once()
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
 
         best = persisted_by_symbol['000001']
         mid = persisted_by_symbol['000002']
@@ -85,11 +85,11 @@ class DailyValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['000001', '000002'], [])),
-            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+            patch('app.signals.value_factor.upsert_daily_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
+        persisted_by_symbol = {item['symbol']: item for item in upsert.call_args.args[0]}
         invalid = persisted_by_symbol['000001']
         scored = persisted_by_symbol['000002']
 
@@ -110,14 +110,16 @@ class DailyValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['000001'], [])),
-            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+            patch('app.signals.value_factor.upsert_daily_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['value_status'], VALUE_STATUS_MISSING_METRIC)
         self.assertIsNone(persisted['value_score'])
         self.assertEqual(result['summary']['missing_metric_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 0)
+        self.assertEqual(result['summary']['unready_count'], 1)
 
     def test_rebuild_prefers_same_day_valuation_snapshot_when_bar_metrics_are_null(self) -> None:
         service = DailyValueFactorService()
@@ -147,11 +149,11 @@ class DailyValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
-            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+            patch('app.signals.value_factor.upsert_daily_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['value_status'], VALUE_STATUS_SCORED)
         self.assertEqual(persisted['per'], 8.0)
         self.assertEqual(persisted['pbr'], 0.9)
@@ -194,11 +196,11 @@ class DailyValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
-            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+            patch('app.signals.value_factor.upsert_daily_value_factor_results') as upsert,
         ):
             service.rebuild_for_market_date(market_date=market_date)
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['per'], 7.0)
         self.assertEqual(persisted['pbr'], 0.95)
         self.assertEqual(persisted['dividend_yield'], 0.02)
@@ -284,11 +286,11 @@ class DailyValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs', side_effect=load_inputs_side_effect),
-            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+            patch('app.signals.value_factor.upsert_daily_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(market_date=market_date, symbols=['000002'])
 
-        persisted = upsert.call_args.args[0]
+        persisted = upsert.call_args.args[0][0]
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual(result['summary']['ranking_universe_counts']['per'], 3)
         self.assertEqual(result['summary']['ranking_universe_counts']['composite_score'], 3)
@@ -303,7 +305,7 @@ class DailyValueFactorServiceTests(unittest.TestCase):
 
         with (
             patch.object(service, '_load_inputs') as load_inputs,
-            patch('app.signals.value_factor.upsert_daily_value_factor_result') as upsert,
+            patch('app.signals.value_factor.upsert_daily_value_factor_results') as upsert,
         ):
             result = service.rebuild_for_market_date(
                 market_date='2026-04-24',
@@ -329,6 +331,8 @@ class DailyValueFactorServiceTests(unittest.TestCase):
                 'invalid_per_count': 0,
                 'missing_metric_count': 0,
                 'scored_count': 0,
+                'ready_count': 0,
+                'unready_count': 0,
                 'ranking_universe_counts': {
                     'per': 0,
                     'pbr': 0,

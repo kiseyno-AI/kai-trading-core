@@ -12,6 +12,7 @@ from app.market_data_store import (
     load_recent_price_bars_by_symbol,
     load_symbols,
     upsert_daily_low_risk_factor_result,
+    upsert_daily_low_risk_factor_results,
 )
 
 LOW_RISK_FEATURE_VERSION = 'low_risk_v1'
@@ -227,13 +228,30 @@ class DailyLowRiskFactorService:
         persisted_count = 0
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
-        for item in items:
-            try:
-                upsert_daily_low_risk_factor_result(item)
-                persisted_count += 1
-            except Exception as exc:
-                failed_symbols.append(item['symbol'])
-                failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        try:
+            upsert_daily_low_risk_factor_results(items)
+            persisted_count = len(items)
+        except Exception:
+            for item in items:
+                try:
+                    upsert_daily_low_risk_factor_result(item)
+                    persisted_count += 1
+                except Exception as exc:
+                    failed_symbols.append(item['symbol'])
+                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+
+        failed_symbol_set = set(failed_symbols)
+        persisted_items = [
+            item for item in items if item['symbol'] not in failed_symbol_set
+        ]
+        persisted_ready_count = sum(
+            1
+            for item in persisted_items
+            if item['low_risk_classification']
+            in {'eligible', 'watchlist', 'ineligible', 'liquidity_excluded'}
+        )
+        summary['persisted_ready_count'] = persisted_ready_count
+        summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
 
         return {
             'market_date': normalized_market_date.isoformat(),
@@ -541,6 +559,11 @@ class DailyLowRiskFactorService:
         missing_symbols: list[str],
         universe_counts: dict[str, int],
     ) -> dict[str, Any]:
+        ready_count = sum(
+            1
+            for item in items
+            if item['low_risk_classification'] in {'eligible', 'watchlist', 'ineligible', 'liquidity_excluded'}
+        )
         return {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
@@ -560,11 +583,8 @@ class DailyLowRiskFactorService:
             'liquidity_excluded_count': sum(
                 1 for item in items if item['low_risk_classification'] == 'liquidity_excluded'
             ),
-            'ready_count': sum(
-                1
-                for item in items
-                if item['low_risk_classification'] in {'eligible', 'watchlist', 'ineligible', 'liquidity_excluded'}
-            ),
+            'ready_count': ready_count,
+            'unready_count': len(missing_symbols) + len(items) - ready_count,
             'ranking_universe_counts': universe_counts,
         }
 
