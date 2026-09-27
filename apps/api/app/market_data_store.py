@@ -4418,6 +4418,16 @@ def load_daily_advanced_value_factor_results(
     limit: int | None = None,
 ) -> list[dict]:
     with session_scope() as session:
+        resolved_symbol_ids: tuple[int, ...] | None = None
+        if symbols:
+            resolved_symbol_ids = tuple(
+                session.execute(
+                    select(Symbol.id).where(Symbol.symbol.in_(symbols))
+                ).scalars()
+            )
+            if not resolved_symbol_ids:
+                return []
+
         stmt = (
             select(DailyAdvancedValueFactorResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
             .join(Symbol, Symbol.id == DailyAdvancedValueFactorResult.symbol_id)
@@ -4430,8 +4440,10 @@ def load_daily_advanced_value_factor_results(
         )
         if limit is not None:
             stmt = stmt.limit(limit)
-        if symbols:
-            stmt = stmt.where(Symbol.symbol.in_(symbols))
+        if resolved_symbol_ids is not None:
+            stmt = stmt.where(
+                DailyAdvancedValueFactorResult.symbol_id.in_(resolved_symbol_ids)
+            )
         if classification is not None:
             stmt = stmt.where(DailyAdvancedValueFactorResult.advanced_value_classification == classification)
         if is_eligible is not None:
