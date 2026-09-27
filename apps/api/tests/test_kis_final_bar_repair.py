@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.orm import Session
 
 from app.db import engine
@@ -25,6 +25,7 @@ from app.eod.kis_final_bar_repair import (
     StoredFinalBar,
     TargetPage,
     extract_kis_final_bars,
+    load_target_page,
     plan_final_bar_repairs,
     repair_existing_final_bars,
 )
@@ -165,6 +166,108 @@ class KISFinalBarValidationTests(unittest.TestCase):
 
         self.assertEqual(result['missing_provider_row_count'], 1)
         self.assertEqual(result['safe_changed_count'], 0)
+
+
+class KISFinalBarTargetPageTests(unittest.TestCase):
+    def test_page_load_uses_bounded_timeout_and_price_bar_id_lookup(self) -> None:
+        generated_codes: set[str] = set()
+        while len(generated_codes) < 2:
+            generated_codes.add(f'Z{uuid4().hex[:5].upper()}')
+        symbol_codes = sorted(generated_codes)
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            session = Session(bind=connection)
+            captured_statements: list[str] = []
+
+            def capture_statement(
+                _connection,
+                _cursor,
+                statement,
+                _parameters,
+                _context,
+                _executemany,
+            ) -> None:
+                captured_statements.append(str(statement))
+
+            event.listen(connection, 'before_cursor_execute', capture_statement)
+            try:
+                symbols = [
+                    Symbol(
+                        symbol=symbol_code,
+                        name_ko=f'KIS page {symbol_code}',
+                        market='KOSPI',
+                        instrument_type='equity',
+                        source='test',
+                        is_active=True,
+                    )
+                    for symbol_code in symbol_codes
+                ]
+                session.add_all(symbols)
+                session.flush()
+                session.add_all(
+                    [
+                        DailyPriceBar(
+                            symbol_id=symbol.id,
+                            trade_date=MARKET_DATE,
+                            open_price=100,
+                            high_price=110,
+                            low_price=90,
+                            close_price=105,
+                            volume=100,
+                            turnover=10_500,
+                            source='test',
+                        )
+                        for symbol in symbols
+                    ]
+                )
+                session.flush()
+
+                @contextmanager
+                def rollback_only_session_scope(**kwargs):
+                    self.assertEqual(
+                        kwargs,
+                        {'statement_timeout_ms': 60_000},
+                    )
+                    yield session
+
+                with patch(
+                    'app.eod.kis_final_bar_repair.session_scope',
+                    rollback_only_session_scope,
+                ):
+                    page = load_target_page(
+                        start_date=MARKET_DATE,
+                        end_date=MARKET_DATE,
+                        after_symbol='YZZZZZ',
+                        symbol_limit=1,
+                    )
+
+                self.assertEqual(page.symbols, (symbol_codes[0],))
+                self.assertTrue(page.has_more)
+                self.assertEqual(len(page.rows), 1)
+                self.assertEqual(page.rows[0].symbol, symbol_codes[0])
+                normalized_sql = [
+                    ' '.join(statement.split())
+                    for statement in captured_statements
+                ]
+                self.assertTrue(
+                    any(
+                        statement.startswith(
+                            'SELECT daily_price_bars.id AS bar_id, '
+                            'daily_price_bars.symbol_id'
+                        )
+                        and 'JOIN symbols' not in statement
+                        and 'daily_price_bars.symbol_id IN' in statement
+                        for statement in normalized_sql
+                    )
+                )
+            finally:
+                event.remove(
+                    connection,
+                    'before_cursor_execute',
+                    capture_statement,
+                )
+                session.close()
+                transaction.rollback()
 
 
 class KISFinalBarRepairServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -617,40 +720,83 @@ class KISFinalBarRepositoryPostgresTests(unittest.TestCase):
             )
             original_captured_at = bar.captured_at
             original_eod_run_id = bar.eod_run_id
+            captured_statements: list[str] = []
+
+            def capture_statement(
+                _connection,
+                _cursor,
+                statement,
+                _parameters,
+                _context,
+                _executemany,
+            ) -> None:
+                captured_statements.append(str(statement))
 
             @contextmanager
-            def rollback_only_session_scope():
+            def rollback_only_session_scope(**kwargs):
+                self.assertEqual(
+                    kwargs,
+                    {'statement_timeout_ms': 60_000},
+                )
                 yield session
                 session.flush()
 
             try:
-                with patch(
-                    'app.eod.kis_final_bar_repair.session_scope',
-                    rollback_only_session_scope,
-                ):
-                    result = repair_existing_final_bars(
-                        start_date=MARKET_DATE,
-                        end_date=MARKET_DATE,
-                        selected_symbols=[symbol_code],
-                        initial_rows=[initial],
-                        provider_bars={
-                            (symbol_code, MARKET_DATE): ProviderFinalBar(
-                                symbol=symbol_code,
-                                trade_date=MARKET_DATE,
-                                open_price=100,
-                                high_price=110,
-                                low_price=94,
-                                close_price=108,
-                                volume=120,
-                                turnover=12_500,
-                            )
-                        },
-                        apply=True,
+                event.listen(
+                    connection,
+                    'before_cursor_execute',
+                    capture_statement,
+                )
+                try:
+                    with patch(
+                        'app.eod.kis_final_bar_repair.session_scope',
+                        rollback_only_session_scope,
+                    ):
+                        result = repair_existing_final_bars(
+                            start_date=MARKET_DATE,
+                            end_date=MARKET_DATE,
+                            selected_symbols=[symbol_code],
+                            initial_rows=[initial],
+                            provider_bars={
+                                (symbol_code, MARKET_DATE): ProviderFinalBar(
+                                    symbol=symbol_code,
+                                    trade_date=MARKET_DATE,
+                                    open_price=100,
+                                    high_price=110,
+                                    low_price=94,
+                                    close_price=108,
+                                    volume=120,
+                                    turnover=12_500,
+                                )
+                            },
+                            apply=True,
+                        )
+                finally:
+                    event.remove(
+                        connection,
+                        'before_cursor_execute',
+                        capture_statement,
                     )
 
                 self.assertEqual(result['status'], 'completed')
                 self.assertEqual(result['updated_count'], 1)
                 self.assertEqual(result['audit_count'], 1)
+                normalized_sql = [
+                    ' '.join(statement.split())
+                    for statement in captured_statements
+                ]
+                self.assertTrue(
+                    any(
+                        statement.startswith(
+                            'SELECT daily_price_bars.id AS bar_id, '
+                            'daily_price_bars.symbol_id'
+                        )
+                        and 'JOIN symbols' not in statement
+                        and 'daily_price_bars.symbol_id IN' in statement
+                        and 'FOR UPDATE OF daily_price_bars' in statement
+                        for statement in normalized_sql
+                    )
+                )
                 session.expire_all()
                 persisted = session.execute(
                     select(DailyPriceBar).where(DailyPriceBar.id == bar.id)
@@ -759,7 +905,7 @@ class KISFinalBarRepositoryPostgresTests(unittest.TestCase):
             session.refresh(bar)
 
             @contextmanager
-            def rollback_only_session_scope():
+            def rollback_only_session_scope(**_kwargs):
                 yield session
                 session.flush()
 
@@ -872,7 +1018,7 @@ class KISFinalBarRepositoryPostgresTests(unittest.TestCase):
             session.flush()
 
             @contextmanager
-            def rollback_only_session_scope():
+            def rollback_only_session_scope(**_kwargs):
                 yield session
                 session.flush()
 

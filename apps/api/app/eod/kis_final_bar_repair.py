@@ -38,6 +38,7 @@ MAX_SYMBOL_LIMIT = 500
 DEFAULT_SYMBOL_LIMIT = 100
 MAX_CONCURRENCY = 4
 PROVIDER_ATTEMPTS = 3
+REPAIR_STATEMENT_TIMEOUT_MS = 60_000
 MAX_PRICE_DEPENDENT_EVALUATION_HORIZON = 10
 LOCK_SOURCE = 'daily_price_bars'
 SUPPORTED_MARKETS = ('KOSPI', 'KOSDAQ')
@@ -262,6 +263,95 @@ def extract_kis_final_bars(
     return bars
 
 
+def _load_symbol_by_id(
+    session: Any,
+    *,
+    symbols: Sequence[str],
+) -> dict[int, str]:
+    if not symbols:
+        return {}
+    return {
+        int(row.id): str(row.symbol)
+        for row in session.execute(
+            select(Symbol.id, Symbol.symbol).where(
+                Symbol.symbol.in_(symbols),
+                Symbol.market.in_(SUPPORTED_MARKETS),
+            )
+        )
+    }
+
+
+def _load_stored_rows(
+    session: Any,
+    *,
+    symbol_by_id: Mapping[int, str],
+    start_date: date,
+    end_date: date,
+    for_update: bool = False,
+) -> tuple[StoredFinalBar, ...]:
+    if not symbol_by_id:
+        return ()
+    statement = (
+        select(
+            DailyPriceBar.id.label('bar_id'),
+            DailyPriceBar.symbol_id,
+            DailyPriceBar.trade_date,
+            DailyPriceBar.open_price,
+            DailyPriceBar.high_price,
+            DailyPriceBar.low_price,
+            DailyPriceBar.close_price,
+            DailyPriceBar.volume,
+            DailyPriceBar.turnover,
+            DailyPriceBar.source,
+            DailyPriceBar.captured_at,
+            DailyPriceBar.eod_run_id,
+            DailyPriceBar.repair_origin_eod_run_id,
+            DailyPriceBar.repair_origin_source,
+        )
+        .where(
+            DailyPriceBar.symbol_id.in_(tuple(symbol_by_id)),
+            DailyPriceBar.trade_date >= start_date,
+            DailyPriceBar.trade_date <= end_date,
+        )
+        .order_by(
+            DailyPriceBar.symbol_id.asc(),
+            DailyPriceBar.trade_date.asc(),
+        )
+    )
+    if for_update:
+        statement = statement.with_for_update(of=DailyPriceBar)
+    rows = (
+        StoredFinalBar(
+            bar_id=int(row.bar_id),
+            symbol=symbol_by_id[int(row.symbol_id)],
+            trade_date=row.trade_date,
+            open_price=int(row.open_price),
+            high_price=int(row.high_price),
+            low_price=int(row.low_price),
+            close_price=int(row.close_price),
+            volume=int(row.volume),
+            turnover=int(row.turnover),
+            source=str(row.source),
+            captured_at=row.captured_at,
+            eod_run_id=(
+                int(row.eod_run_id) if row.eod_run_id is not None else None
+            ),
+            repair_origin_eod_run_id=(
+                int(row.repair_origin_eod_run_id)
+                if row.repair_origin_eod_run_id is not None
+                else None
+            ),
+            repair_origin_source=(
+                str(row.repair_origin_source)
+                if row.repair_origin_source is not None
+                else None
+            ),
+        )
+        for row in session.execute(statement).all()
+    )
+    return tuple(sorted(rows, key=lambda item: (item.symbol, item.trade_date)))
+
+
 def load_target_page(
     *,
     start_date: date,
@@ -275,10 +365,12 @@ def load_target_page(
             f'symbol_limit must be between 1 and {MAX_SYMBOL_LIMIT}'
         )
     normalized_cursor = _normalize_cursor(after_symbol)
-    with session_scope() as session:
+    with session_scope(
+        statement_timeout_ms=REPAIR_STATEMENT_TIMEOUT_MS,
+    ) as session:
         if selected_symbols is None:
             symbol_statement = (
-                select(Symbol.symbol)
+                select(Symbol.id, Symbol.symbol)
                 .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
                 .where(
                     DailyPriceBar.trade_date >= start_date,
@@ -290,69 +382,31 @@ def load_target_page(
                 .order_by(Symbol.symbol.asc())
                 .limit(symbol_limit + 1)
             )
-            candidates = [str(item) for item in session.scalars(symbol_statement)]
+            candidates = [
+                (int(row.id), str(row.symbol))
+                for row in session.execute(symbol_statement)
+            ]
             has_more = len(candidates) > symbol_limit
-            symbols = tuple(candidates[:symbol_limit])
+            selected_identities = candidates[:symbol_limit]
+            symbols = tuple(symbol for _, symbol in selected_identities)
+            symbol_by_id = {
+                symbol_id: symbol
+                for symbol_id, symbol in selected_identities
+            }
         else:
             symbols = tuple(_normalize_symbol(item) for item in selected_symbols)
             if len(symbols) != len(set(symbols)):
                 raise ValueError('selected_symbols must not contain duplicates')
             has_more = False
+            symbol_by_id = _load_symbol_by_id(session, symbols=symbols)
         if not symbols:
             return TargetPage(symbols=(), rows=(), has_more=has_more)
 
-        row_statement = (
-            select(
-                DailyPriceBar.id.label('bar_id'),
-                Symbol.symbol,
-                DailyPriceBar.trade_date,
-                DailyPriceBar.open_price,
-                DailyPriceBar.high_price,
-                DailyPriceBar.low_price,
-                DailyPriceBar.close_price,
-                DailyPriceBar.volume,
-                DailyPriceBar.turnover,
-                DailyPriceBar.source,
-                DailyPriceBar.captured_at,
-                DailyPriceBar.eod_run_id,
-                DailyPriceBar.repair_origin_eod_run_id,
-                DailyPriceBar.repair_origin_source,
-            )
-            .join(Symbol, DailyPriceBar.symbol_id == Symbol.id)
-            .where(
-                Symbol.symbol.in_(symbols),
-                Symbol.market.in_(SUPPORTED_MARKETS),
-                DailyPriceBar.trade_date >= start_date,
-                DailyPriceBar.trade_date <= end_date,
-            )
-            .order_by(Symbol.symbol.asc(), DailyPriceBar.trade_date.asc())
-        )
-        rows = tuple(
-            StoredFinalBar(
-                bar_id=int(row.bar_id),
-                symbol=str(row.symbol),
-                trade_date=row.trade_date,
-                open_price=int(row.open_price),
-                high_price=int(row.high_price),
-                low_price=int(row.low_price),
-                close_price=int(row.close_price),
-                volume=int(row.volume),
-                turnover=int(row.turnover),
-                source=str(row.source),
-                captured_at=row.captured_at,
-                eod_run_id=(int(row.eod_run_id) if row.eod_run_id is not None else None),
-                repair_origin_eod_run_id=(
-                    int(row.repair_origin_eod_run_id)
-                    if row.repair_origin_eod_run_id is not None
-                    else None
-                ),
-                repair_origin_source=(
-                    str(row.repair_origin_source)
-                    if row.repair_origin_source is not None
-                    else None
-                ),
-            )
-            for row in session.execute(row_statement).all()
+        rows = _load_stored_rows(
+            session,
+            symbol_by_id=symbol_by_id,
+            start_date=start_date,
+            end_date=end_date,
         )
         return TargetPage(symbols=symbols, rows=rows, has_more=has_more)
 
@@ -546,61 +600,19 @@ def repair_existing_final_bars(
             'repair_batch_id': None,
         }
 
-    with session_scope() as session:
-        statement = (
-            select(
-                DailyPriceBar.id.label('bar_id'),
-                Symbol.symbol,
-                DailyPriceBar.trade_date,
-                DailyPriceBar.open_price,
-                DailyPriceBar.high_price,
-                DailyPriceBar.low_price,
-                DailyPriceBar.close_price,
-                DailyPriceBar.volume,
-                DailyPriceBar.turnover,
-                DailyPriceBar.source,
-                DailyPriceBar.captured_at,
-                DailyPriceBar.eod_run_id,
-                DailyPriceBar.repair_origin_eod_run_id,
-                DailyPriceBar.repair_origin_source,
-            )
-            .join(Symbol, DailyPriceBar.symbol_id == Symbol.id)
-            .where(
-                Symbol.symbol.in_(normalized_symbols),
-                Symbol.market.in_(SUPPORTED_MARKETS),
-                DailyPriceBar.trade_date >= start_date,
-                DailyPriceBar.trade_date <= end_date,
-            )
-            .order_by(Symbol.symbol.asc(), DailyPriceBar.trade_date.asc())
+    with session_scope(
+        statement_timeout_ms=REPAIR_STATEMENT_TIMEOUT_MS,
+    ) as session:
+        symbol_by_id = _load_symbol_by_id(
+            session,
+            symbols=normalized_symbols,
         )
-        if apply:
-            statement = statement.with_for_update(of=DailyPriceBar)
-        current_rows = tuple(
-            StoredFinalBar(
-                bar_id=int(row.bar_id),
-                symbol=str(row.symbol),
-                trade_date=row.trade_date,
-                open_price=int(row.open_price),
-                high_price=int(row.high_price),
-                low_price=int(row.low_price),
-                close_price=int(row.close_price),
-                volume=int(row.volume),
-                turnover=int(row.turnover),
-                source=str(row.source),
-                captured_at=row.captured_at,
-                eod_run_id=(int(row.eod_run_id) if row.eod_run_id is not None else None),
-                repair_origin_eod_run_id=(
-                    int(row.repair_origin_eod_run_id)
-                    if row.repair_origin_eod_run_id is not None
-                    else None
-                ),
-                repair_origin_source=(
-                    str(row.repair_origin_source)
-                    if row.repair_origin_source is not None
-                    else None
-                ),
-            )
-            for row in session.execute(statement).all()
+        current_rows = _load_stored_rows(
+            session,
+            symbol_by_id=symbol_by_id,
+            start_date=start_date,
+            end_date=end_date,
+            for_update=apply,
         )
         if _rows_fingerprint(current_rows) != _rows_fingerprint(initial_rows):
             return {
