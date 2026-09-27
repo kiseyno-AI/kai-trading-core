@@ -11,6 +11,7 @@ from app.eod.market_membership import market_membership_sha256
 from app.eod.price_bar_repair_state import (
     _exact_factor_stage_evidence,
     _signal_context_rebuild_evidence,
+    _verify_pending_price_bar_rebuilds_locked,
     rebuild_pending_price_dependent_evaluations,
     record_pending_exact_factor_rebuild,
     verify_pending_price_bar_rebuilds,
@@ -57,7 +58,7 @@ class PriceBarRepairFactorEvidenceTests(unittest.TestCase):
             patch(
                 'app.eod.price_bar_repair_state.session_scope',
                 return_value=_session_scope_for(session),
-            ),
+            ) as session_scope_mock,
             patch(
                 'app.eod.price_bar_repair_state._daily_price_input_fingerprint',
                 return_value=('raw-input-sha256', 2),
@@ -77,6 +78,9 @@ class PriceBarRepairFactorEvidenceTests(unittest.TestCase):
         expected_symbols = ['000660', '005930']
         expected_membership_hash = market_membership_sha256(expected_symbols)
         self.assertEqual(result['updated_batch_count'], 1)
+        session_scope_mock.assert_called_once_with(
+            statement_timeout_ms=60_000,
+        )
         self.assertEqual(
             result['ranking_membership_sha256'],
             expected_membership_hash,
@@ -306,9 +310,11 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
             (read_session, signal_evidence_session, write_session)
         )
         lock_calls: list[dict] = []
+        session_scope_calls: list[dict] = []
 
         @contextmanager
-        def fake_session_scope():
+        def fake_session_scope(**kwargs):
+            session_scope_calls.append(kwargs)
             yield next(sessions)
 
         @contextmanager
@@ -407,6 +413,10 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
 
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['updated_batch_count'], 1)
+        self.assertEqual(
+            session_scope_calls,
+            [{'statement_timeout_ms': 60_000}] * 3,
+        )
         self.assertEqual(
             lock_calls,
             [
@@ -570,6 +580,28 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
         self.assertFalse(result['applied'])
         self.assertEqual(result['pending_batch_count'], 1)
         verify_locked.assert_not_called()
+
+    def test_locked_verifier_uses_bounded_repair_timeout(self) -> None:
+        session = MagicMock()
+        session.scalars.return_value.all.return_value = []
+        session_scope_calls: list[dict] = []
+
+        @contextmanager
+        def fake_session_scope(**kwargs):
+            session_scope_calls.append(kwargs)
+            yield session
+
+        with patch(
+            'app.eod.price_bar_repair_state.session_scope',
+            side_effect=fake_session_scope,
+        ):
+            result = _verify_pending_price_bar_rebuilds_locked(apply=False)
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(
+            session_scope_calls,
+            [{'statement_timeout_ms': 60_000}],
+        )
 
 
 if __name__ == '__main__':
