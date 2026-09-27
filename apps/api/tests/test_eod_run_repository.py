@@ -4,22 +4,26 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import create_engine, delete, event, select, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, delete, event, func, select, text
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import engine, session_scope
 from app.db_models import (
     AgentContextFeedbackRun,
     DailyPipelineRun,
     DailyPipelineStageRun,
+    DailyPriceBar,
     EODCollectionRun,
+    Symbol,
 )
 from app.repositories.eod_run_repository import (
     AutoEODRecoveryTarget,
     advisory_eod_collection_lock,
+    advisory_eod_collection_locks,
     complete_eod_collection_run,
     count_eod_run_persisted_symbols,
     create_eod_collection_run,
+    daily_price_bar_has_current_eod_run_provenance,
     eod_collection_advisory_lock_keys,
     list_eod_collection_runs,
     load_latest_eod_collection_run,
@@ -179,11 +183,173 @@ class EODCollectionCoverageTests(unittest.TestCase):
             sql.lower(),
         )
         self.assertIn('daily_price_bars.eod_run_id', sql)
+        self.assertIn('daily_price_bars.repair_origin_eod_run_id', sql)
+        self.assertIn('daily_price_bars.source', sql)
         self.assertIn('daily_price_bars.trade_date', sql)
         self.assertEqual(
             set(statement.compile().params.values()),
-            {522, datetime(2026, 9, 14).date()},
+            {
+                522,
+                'kis_final_bar_repair',
+                datetime(2026, 9, 14).date(),
+            },
         )
+
+
+class DailyPriceBarRunProvenanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sqlite_engine = create_engine('sqlite+pysqlite:///:memory:')
+        for table in (
+            EODCollectionRun.__table__,
+            Symbol.__table__,
+            DailyPriceBar.__table__,
+        ):
+            table.create(self.sqlite_engine)
+
+    def tearDown(self) -> None:
+        self.sqlite_engine.dispose()
+
+    def _matching_count(
+        self,
+        session: Session,
+        *,
+        run_id: int,
+        original_source: str | None = None,
+    ) -> int:
+        return int(
+            session.execute(
+                select(func.count())
+                .select_from(DailyPriceBar)
+                .where(
+                    daily_price_bar_has_current_eod_run_provenance(
+                        run_id,
+                        original_source=original_source,
+                    )
+                )
+            ).scalar_one()
+        )
+
+    def test_repaired_bar_uses_indexed_root_lineage_only_for_repair_source(
+        self,
+    ) -> None:
+        captured_at = datetime(2026, 9, 23, 7, 30, tzinfo=timezone.utc)
+        repaired_at = datetime(2026, 9, 23, 11, 10, tzinfo=timezone.utc)
+        with Session(self.sqlite_engine) as session:
+            run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 9, 23),
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=1,
+                symbols_succeeded=1,
+                symbols_failed=0,
+                run_metadata={},
+            )
+            symbol = Symbol(
+                symbol='991191',
+                name_ko='Audit lineage test',
+                market='KOSPI',
+                source='test',
+                is_active=True,
+            )
+            session.add_all([run, symbol])
+            session.flush()
+            bar = DailyPriceBar(
+                symbol_id=symbol.id,
+                eod_run_id=None,
+                trade_date=run.trade_date,
+                open_price=100,
+                high_price=120,
+                low_price=90,
+                close_price=110,
+                volume=200,
+                turnover=22_000,
+                source='kis_final_bar_repair',
+                captured_at=repaired_at,
+                repair_origin_eod_run_id=run.id,
+                repair_origin_source='pykrx',
+            )
+            session.add(bar)
+            session.commit()
+
+            self.assertEqual(
+                self._matching_count(
+                    session,
+                    run_id=run.id,
+                    original_source='pykrx',
+                ),
+                1,
+            )
+
+            bar.source = 'unverified_rewrite'
+            session.flush()
+            self.assertEqual(
+                self._matching_count(
+                    session,
+                    run_id=run.id,
+                    original_source='pykrx',
+                ),
+                0,
+            )
+
+    def test_direct_bar_keeps_existing_run_and_source_semantics(self) -> None:
+        captured_at = datetime(2026, 9, 23, 7, 30, tzinfo=timezone.utc)
+        with Session(self.sqlite_engine) as session:
+            run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 9, 23),
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=1,
+                symbols_succeeded=1,
+                symbols_failed=0,
+                run_metadata={},
+            )
+            symbol = Symbol(
+                symbol='991192',
+                name_ko='Direct lineage test',
+                market='KOSPI',
+                source='test',
+                is_active=True,
+            )
+            session.add_all([run, symbol])
+            session.flush()
+            bar = DailyPriceBar(
+                symbol_id=symbol.id,
+                eod_run_id=run.id,
+                trade_date=run.trade_date,
+                open_price=100,
+                high_price=110,
+                low_price=90,
+                close_price=105,
+                volume=100,
+                turnover=10_500,
+                source='pykrx',
+                captured_at=captured_at,
+            )
+            session.add(bar)
+            session.commit()
+
+            self.assertEqual(
+                self._matching_count(
+                    session,
+                    run_id=run.id,
+                    original_source='pykrx',
+                ),
+                1,
+            )
+            bar.source = 'kis'
+            session.flush()
+            self.assertEqual(
+                self._matching_count(
+                    session,
+                    run_id=run.id,
+                    original_source='pykrx',
+                ),
+                0,
+            )
 
 
 class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
@@ -2796,6 +2962,150 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
 
 
 class AdvisoryEODCollectionLockTests(unittest.TestCase):
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_multi_date_lock_sorts_deduplicates_and_unlocks_in_reverse(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=(
+                '2026-09-23',
+                date(2026, 9, 21),
+                '2026-09-22',
+                date(2026, 9, 23),
+            ),
+            source='daily_price_bars',
+        ) as lock_result:
+            self.assertEqual(lock_result, (True, None))
+
+        engine.connect.assert_called_once_with()
+        raw_connection.execution_options.assert_called_once_with(
+            isolation_level='AUTOCOMMIT'
+        )
+        calls = connection.execute.call_args_list
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(
+            [call.args[1] for call in calls[:3]],
+            [
+                {'source_key': 10_003, 'trade_key': 20_260_921},
+                {'source_key': 10_003, 'trade_key': 20_260_922},
+                {'source_key': 10_003, 'trade_key': 20_260_923},
+            ],
+        )
+        self.assertEqual(
+            [call.args[1] for call in calls[3:]],
+            [
+                {'source_key': 10_003, 'trade_key': 20_260_923},
+                {'source_key': 10_003, 'trade_key': 20_260_922},
+                {'source_key': 10_003, 'trade_key': 20_260_921},
+            ],
+        )
+        for call in calls[:3]:
+            self.assertIn('pg_try_advisory_lock', str(call.args[0]))
+        for call in calls[3:]:
+            self.assertIn('pg_advisory_unlock', str(call.args[0]))
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_multi_date_lock_reports_blocked_date_and_releases_prefix(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        first_lock = MagicMock()
+        first_lock.scalar.return_value = True
+        blocked_lock = MagicMock()
+        blocked_lock.scalar.return_value = False
+        connection.execute.side_effect = [
+            first_lock,
+            blocked_lock,
+            MagicMock(),
+        ]
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=('2026-09-23', '2026-09-21', '2026-09-22'),
+            source='daily_price_bars',
+        ) as lock_result:
+            self.assertEqual(lock_result, (False, '2026-09-22'))
+
+        calls = connection.execute.call_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [call.args[1]['trade_key'] for call in calls],
+            [20_260_921, 20_260_922, 20_260_921],
+        )
+        self.assertIn('pg_advisory_unlock', str(calls[-1].args[0]))
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_multi_date_lock_releases_prefix_when_acquisition_raises(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        first_lock = MagicMock()
+        first_lock.scalar.return_value = True
+        connection.execute.side_effect = [
+            first_lock,
+            RuntimeError('database connection interrupted'),
+            MagicMock(),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, 'connection interrupted'):
+            with advisory_eod_collection_locks(
+                market='KRX',
+                trade_dates=('2026-09-21', '2026-09-22'),
+                source='daily_price_bars',
+            ):
+                self.fail('failed acquisition must not enter its context')
+
+        calls = connection.execute.call_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertIn('pg_try_advisory_lock', str(calls[0].args[0]))
+        self.assertIn('pg_try_advisory_lock', str(calls[1].args[0]))
+        self.assertIn('pg_advisory_unlock', str(calls[2].args[0]))
+        self.assertEqual(
+            calls[2].args[1],
+            {'source_key': 10_003, 'trade_key': 20_260_921},
+        )
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_multi_date_lock_rejects_empty_date_set_without_connecting(
+        self,
+        engine,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, 'at least one'):
+            with advisory_eod_collection_locks(
+                market='KRX',
+                trade_dates=(),
+                source='daily_price_bars',
+            ):
+                self.fail('empty lock set must not enter its context')
+
+        engine.connect.assert_not_called()
+
+    def test_daily_price_bar_lock_uses_shared_writer_key(self) -> None:
+        self.assertEqual(
+            eod_collection_advisory_lock_keys(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            ),
+            (10_003, 20_260_923),
+        )
+
     def test_transaction_lock_detects_live_session_lock(self):
         source_key, trade_key = eod_collection_advisory_lock_keys(
             market='KRX',

@@ -206,18 +206,24 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
         market_ohlcv_loader,
         database_repairer,
         minimum_market_membership=None,
+        lock_set_factory=None,
     ) -> SymbolHistoryRepairService:
+        lock_kwargs = (
+            {'lock_factory': _available_lock}
+            if lock_set_factory is None
+            else {'lock_set_factory': lock_set_factory}
+        )
         return SymbolHistoryRepairService(
             trade_date_resolver=_exact_resolver,
             trading_dates_resolver=_weekday_sessions,
             symbol_range_loader=symbol_range_loader,
             market_ohlcv_loader=market_ohlcv_loader,
             database_repairer=database_repairer,
-            lock_factory=_available_lock,
             minimum_market_membership=(
                 minimum_market_membership
                 or {'KOSPI': 1, 'KOSDAQ': 1}
             ),
+            **lock_kwargs,
         )
 
     def test_dry_run_fetches_each_symbol_range_once_and_uses_raw_turnover(self):
@@ -261,6 +267,9 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
             symbol_range_loader=range_loader,
             market_ohlcv_loader=market_loader,
             database_repairer=repairer,
+            lock_set_factory=lambda **_kwargs: self.fail(
+                'dry-run must not request writer locks'
+            ),
         )
         result = service.repair_range(
             symbols=['005930'],
@@ -602,13 +611,34 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
         calendar_only_date = date(2026, 9, 22)
         last_date = date(2026, 9, 23)
         database_calls: list[dict] = []
+        market_calls: list[tuple[str, str]] = []
+        lock_calls: list[dict] = []
+        lock_active = False
 
         def market_loader(trade_date: str, market: str):
+            market_calls.append((trade_date, market))
             if trade_date == '20260922':
                 code = '005930' if market == 'KOSPI' else '035720'
                 return _FakeFrame({code: _market_row(turnover=0)})
             code = '005930' if market == 'KOSPI' else '035720'
             return _FakeFrame({code: _market_row()})
+
+        @contextmanager
+        def date_locks(**kwargs):
+            nonlocal lock_active
+            lock_calls.append(kwargs)
+            self.assertEqual(len(market_calls), 6)
+            self.assertFalse(database_calls)
+            lock_active = True
+            try:
+                yield True, None
+            finally:
+                lock_active = False
+
+        def repairer(**kwargs):
+            self.assertTrue(lock_active)
+            database_calls.append(kwargs)
+            return {'status': 'completed', 'applied': True}
 
         service = self._service(
             symbol_range_loader=lambda *_args: _FakeFrame(
@@ -618,18 +648,18 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
                 }
             ),
             market_ohlcv_loader=market_loader,
-            database_repairer=lambda **kwargs: (
-                database_calls.append(kwargs)
-                or {'status': 'ready', 'applied': False}
-            ),
+            database_repairer=repairer,
+            lock_set_factory=date_locks,
         )
         result = service.repair_range(
             symbols=['005930'],
             start_date=first_date,
             end_date=last_date,
+            apply=True,
         )
 
-        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(result['applied'])
         self.assertEqual(result['provider_trade_date_count'], 2)
         self.assertEqual(result['provider_closed_calendar_date_count'], 1)
         self.assertEqual(
@@ -637,6 +667,83 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
             [calendar_only_date.isoformat()],
         )
         self.assertEqual(len(database_calls[0]['bars']), 2)
+        self.assertEqual(
+            lock_calls,
+            [
+                {
+                    'market': 'KRX',
+                    'trade_dates': (first_date, last_date),
+                    'source': 'daily_price_bars',
+                }
+            ],
+        )
+
+    def test_apply_validates_provider_before_actual_date_lock_denial(self):
+        first_date = date(2026, 9, 21)
+        middle_date = date(2026, 9, 22)
+        last_date = date(2026, 9, 23)
+        lock_calls: list[dict] = []
+        range_calls: list[tuple[str, str, str]] = []
+        market_calls: list[tuple[str, str]] = []
+
+        @contextmanager
+        def date_locks(**kwargs):
+            self.assertEqual(
+                range_calls,
+                [('20260921', '20260923', '005930')],
+            )
+            self.assertEqual(len(market_calls), 6)
+            lock_calls.append(kwargs)
+            yield False, middle_date.isoformat()
+
+        service = SymbolHistoryRepairService(
+            trade_date_resolver=_exact_resolver,
+            trading_dates_resolver=_weekday_sessions,
+            symbol_range_loader=lambda start, end, symbol: (
+                range_calls.append((start, end, symbol))
+                or _FakeFrame(
+                    {
+                        first_date: _range_row(),
+                        middle_date: _range_row(),
+                        last_date: _range_row(),
+                    }
+                )
+            ),
+            market_ohlcv_loader=lambda trade_date, market: (
+                market_calls.append((trade_date, market))
+                or _FakeFrame(
+                    {'005930': _market_row()}
+                    if market == 'KOSPI'
+                    else {'035720': _market_row()}
+                )
+            ),
+            database_repairer=lambda **_kwargs: self.fail(
+                'database repairer must not run while a range lock is blocked'
+            ),
+            lock_set_factory=date_locks,
+            minimum_market_membership={'KOSPI': 1, 'KOSDAQ': 1},
+        )
+
+        result = service.repair_range(
+            symbols=['005930'],
+            start_date=first_date,
+            end_date=last_date,
+            apply=True,
+        )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'advisory_lock_unavailable')
+        self.assertEqual(result['blocked_trade_date'], middle_date.isoformat())
+        self.assertEqual(
+            lock_calls,
+            [
+                {
+                    'market': 'KRX',
+                    'trade_dates': (first_date, middle_date, last_date),
+                    'source': 'daily_price_bars',
+                }
+            ],
+        )
 
     def test_incomplete_symbol_date_coverage_and_non_session_bound_block(self):
         first_date = date(2026, 9, 21)

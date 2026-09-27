@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Sequence
 
@@ -11,13 +11,15 @@ from sqlalchemy import and_, select, text, update
 from app.brokers.kis.client import KISClient
 from app.db import session_scope
 from app.db_models import DailyPriceBar, Symbol
+from app.eod.finality import validate_finalized_krx_write_date
+from app.repositories.eod_run_repository import advisory_eod_collection_lock
 
 KIS_VALUATION_BACKFILL_SOURCE = 'kis_quote_valuation'
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
+    """Return the shared aware-UTC writer clock expected by persistence code."""
+    return datetime.now(UTC)
 
 def _normalize_market_date(value: str | date) -> date:
     return value if isinstance(value, date) else date.fromisoformat(value)
@@ -205,7 +207,6 @@ def _extract_valuation(raw: dict[str, Any], target: ValuationTarget) -> dict[str
 def _persist_valuation(*, market_date: date, symbol: str, valuation: dict[str, Decimal | None]) -> int:
     if valuation.get('per') is None or valuation.get('pbr') is None:
         return 0
-    refreshed_at = _utcnow()
     with session_scope() as session:
         symbol_id = session.execute(select(Symbol.id).where(Symbol.symbol == symbol).limit(1)).scalar_one_or_none()
         if symbol_id is None:
@@ -220,8 +221,6 @@ def _persist_valuation(*, market_date: date, symbol: str, valuation: dict[str, D
                 eps=valuation.get('eps'),
                 dividend_yield=valuation.get('dividend_yield'),
                 dps=valuation.get('dps'),
-                source=KIS_VALUATION_BACKFILL_SOURCE,
-                captured_at=refreshed_at,
             )
         )
         return int(result.rowcount or 0)
@@ -236,6 +235,10 @@ async def backfill_kis_quote_valuation_for_market_date(
     request_timeout_seconds: float = 12.0,
 ) -> dict[str, Any]:
     normalized_market_date = _normalize_market_date(market_date)
+    validate_finalized_krx_write_date(
+        normalized_market_date,
+        operation='KIS valuation price-bar backfill',
+    )
     targets = _load_targets(market_date=normalized_market_date, symbols=symbols, limit=limit)
 
     client = KISClient()
@@ -245,6 +248,7 @@ async def backfill_kis_quote_valuation_for_market_date(
     failed = 0
     failures: list[dict[str, str]] = []
     dividend_basis_rows = 0
+    fetched_quotes: dict[str, dict[str, Any]] = {}
     for target in targets:
         try:
             raw = await asyncio.wait_for(
@@ -252,24 +256,57 @@ async def backfill_kis_quote_valuation_for_market_date(
                 timeout=max(1.0, float(request_timeout_seconds)),
             )
             fetched += 1
-            valuation = _extract_valuation(raw, target)
-            if valuation.get('dps') is not None:
-                dividend_basis_rows += 1
-            persisted = _persist_valuation(
-                market_date=normalized_market_date,
-                symbol=target.symbol,
-                valuation=valuation,
-            )
-            if persisted:
-                updated += persisted
-            else:
-                skipped += 1
+            fetched_quotes[target.symbol] = raw
         except Exception as exc:
             failed += 1
             if len(failures) < 20:
                 failures.append({'symbol': target.symbol, 'error': str(exc)[:300]})
         if sleep_seconds > 0:
             await asyncio.sleep(sleep_seconds)
+
+    if fetched_quotes:
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date=normalized_market_date.isoformat(),
+            source='daily_price_bars',
+        ) as lock_acquired:
+            if not lock_acquired:
+                raise RuntimeError(
+                    'daily price-bar writer lock is already held for '
+                    f'{normalized_market_date.isoformat()}'
+                )
+
+            refreshed_targets = _load_targets(
+                market_date=normalized_market_date,
+                symbols=tuple(fetched_quotes),
+            )
+            refreshed_by_symbol = {
+                target.symbol: target for target in refreshed_targets
+            }
+            for symbol, raw in fetched_quotes.items():
+                target = refreshed_by_symbol.get(symbol)
+                if target is None:
+                    skipped += 1
+                    continue
+                try:
+                    valuation = _extract_valuation(raw, target)
+                    if valuation.get('dps') is not None:
+                        dividend_basis_rows += 1
+                    persisted = _persist_valuation(
+                        market_date=normalized_market_date,
+                        symbol=symbol,
+                        valuation=valuation,
+                    )
+                    if persisted:
+                        updated += persisted
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    failed += 1
+                    if len(failures) < 20:
+                        failures.append(
+                            {'symbol': symbol, 'error': str(exc)[:300]}
+                        )
 
     return {
         'market_date': normalized_market_date.isoformat(),

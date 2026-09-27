@@ -137,6 +137,137 @@ class DailySignalFeatureBuilderTests(unittest.TestCase):
 
 
 class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_repair_rebuilds_owned_fallback_without_rewriting_direct_evidence(
+        self,
+    ) -> None:
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        stored_quote = {
+            'source': 'kis',
+            'market_state': 'CLOSED',
+            'price': 71_000,
+            'trade_date': '2026-05-06',
+            'captured_at': '2026-05-06T15:30:00+09:00',
+        }
+        stored_sources = {
+            VOLUME_POWER: {'data_rank': '1', 'tday_rltv': '145.7'}
+        }
+        stored_row = {
+            'symbol': '005930',
+            'name_ko': '삼성전자',
+            'market': 'KOSPI',
+            'market_date': '2026-05-06',
+            'source': 'kis_ranking',
+            'signal_count': 1,
+            'volume_power_rank': 1,
+            'volume_power': 145.7,
+            'overtime_volume_rank': None,
+            'overtime_volume': None,
+            'overtime_fluctuation_rank': None,
+            'overtime_fluctuation_rate': None,
+            'feature_payload': {
+                'sources': stored_sources,
+                'collection': {
+                    'collected_at': '2026-05-06T15:31:00+09:00',
+                    'source_errors': {},
+                },
+                'fallback_features': {
+                    'price_action': {'close_price': 70_000},
+                    'quote_snapshot': stored_quote,
+                },
+            },
+        }
+        support_maps = {
+            'symbol_map': {
+                '005930': {
+                    'symbol': '005930',
+                    'name_ko': '삼성전자',
+                    'market': 'KOSPI',
+                }
+            },
+            # This current quote must never replace historical quote evidence.
+            'quote_map': {'005930': {'price': 99_999}},
+            'price_bars_by_symbol': {
+                '005930': [
+                    {
+                        'trade_date': '2026-05-06',
+                        'open_price': 70_000,
+                        'high_price': 72_500,
+                        'low_price': 69_500,
+                        'close_price': 72_000,
+                        'volume': 120_000,
+                        'turnover': 8_640_000_000,
+                        'source': 'kis_final_bar_repair',
+                        'captured_at': '2026-05-07T01:00:00+00:00',
+                    },
+                    {
+                        'trade_date': '2026-05-02',
+                        'open_price': 69_000,
+                        'high_price': 70_500,
+                        'low_price': 68_500,
+                        'close_price': 70_000,
+                        'volume': 100_000,
+                        'turnover': 7_000_000_000,
+                        'source': 'pykrx',
+                        'captured_at': '2026-05-02T15:30:00+09:00',
+                    },
+                ]
+            },
+            'value_map': {},
+            'unified_value_map': {},
+            'quality_map': {},
+            'momentum_map': {},
+            'advanced_value_map': {},
+            'low_risk_map': {},
+            'beta_map': {},
+            'composite_map': {},
+        }
+
+        with (
+            patch(
+                'app.signals.daily_signal_features.load_daily_signal_features',
+                return_value=[stored_row],
+            ),
+            patch(
+                'app.signals.daily_signal_features._resolve_generation_universe',
+                return_value={
+                    'target_symbols': ['005930'],
+                    'active_symbols': ['005930'],
+                    'candidate_symbols': ['005930'],
+                    'candidate_universe_availability': 'available',
+                },
+            ),
+            patch(
+                'app.signals.daily_signal_features._load_support_maps',
+                return_value=support_maps,
+            ),
+            patch(
+                'app.signals.daily_signal_features.upsert_daily_signal_features',
+                return_value=1,
+            ) as upsert,
+        ):
+            result = service.rebuild_stored_owned_fallback_for_market_date(
+                market_date='2026-05-06'
+            )
+
+        self.assertEqual(result['features_persisted'], 1)
+        rebuilt = upsert.call_args.args[0][0]
+        self.assertEqual(rebuilt['signal_count'], 1)
+        self.assertEqual(rebuilt['volume_power_rank'], 1)
+        self.assertEqual(rebuilt['volume_power'], 145.7)
+        self.assertEqual(rebuilt['feature_payload']['sources'], stored_sources)
+        self.assertEqual(
+            rebuilt['feature_payload']['fallback_features']['price_action'][
+                'close_price'
+            ],
+            72_000,
+        )
+        self.assertEqual(
+            rebuilt['feature_payload']['fallback_features']['quote_snapshot'][
+                'price'
+            ],
+            71_000,
+        )
+
     async def test_refresh_for_market_date_calls_kis_sources_and_upserts_rows(self):
         service = DailySignalFeatureService(client=FakeKISRankingClient())
 

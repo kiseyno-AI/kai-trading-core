@@ -24,15 +24,23 @@ from app.db_models import (
     DailyValueFactorResult,
     Symbol,
 )
-from app.eod.market_membership import market_membership_sha256
+from app.eod.market_membership import (
+    market_membership_sha256,
+    validate_market_membership_snapshot,
+)
+from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.pykrx_backfill import (
     PYKRX_BACKFILL_SERVICE,
     _get_market_ohlcv_by_ticker,
+)
+from app.eod.price_bar_repair_state import (
+    record_pending_exact_factor_rebuild,
 )
 from app.market_data_store import (
     advisory_eod_collection_lock,
     list_symbols_with_daily_bar_on_date,
 )
+from app.repositories.eod_run_repository import list_eod_collection_runs
 from app.signals.advanced_value_factor import (
     daily_advanced_value_factor_service,
 )
@@ -54,6 +62,7 @@ MINIMUM_MARKET_MEMBERSHIP = {
     'KOSPI': 700,
     'KOSDAQ': 1200,
 }
+EXACT_FACTOR_REPAIR_STATEMENT_TIMEOUT_MS = 60_000
 
 FACTOR_RESULT_MODELS = {
     'piotroski_filter': DailyPiotroskiFilterResult,
@@ -125,6 +134,147 @@ def _extract_exact_market_membership(
     return sorted(symbols), sorted(skipped_codes)
 
 
+def _extract_stored_exact_market_membership(
+    run: Mapping[str, Any],
+    *,
+    market_date: date,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    if not isinstance(run, Mapping):
+        raise ValueError('same-date EOD run metadata is unavailable')
+    if (
+        isinstance(run.get('id'), bool)
+        or not isinstance(run.get('id'), int)
+        or int(run['id']) <= 0
+    ):
+        raise ValueError('stored EOD run id is invalid')
+    if _normalize_market_date(run.get('trade_date')) != market_date:
+        raise ValueError('stored EOD run date does not match requested date')
+    if run.get('market') != 'KRX':
+        raise ValueError('stored EOD run market is not KRX')
+    if str(run.get('source') or '').strip() != 'pykrx':
+        raise ValueError('stored EOD run source is not pykrx')
+    if run.get('status') not in {'completed', 'completed_with_errors'}:
+        raise ValueError('stored EOD run status is not complete')
+
+    metadata = run.get('run_metadata')
+    snapshot = (
+        metadata.get('universe_snapshot')
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    expected_status = {
+        market: 'pykrx_market_ohlcv'
+        for market in EXACT_FACTOR_REPAIR_MARKETS
+    }
+    if not isinstance(snapshot, Mapping):
+        raise ValueError('stored EOD run has no universe snapshot')
+    if snapshot.get('complete') is not True:
+        raise ValueError('stored universe snapshot is incomplete')
+    if _normalize_market_date(snapshot.get('latest_trade_date')) != market_date:
+        raise ValueError('stored universe snapshot date does not match requested date')
+    if snapshot.get('universe_source') != 'pykrx_market_ohlcv':
+        raise ValueError('stored universe snapshot is not direct PyKRX evidence')
+    if snapshot.get('source') != 'pykrx':
+        raise ValueError('stored universe snapshot source is not pykrx')
+    if snapshot.get('markets') != list(EXACT_FACTOR_REPAIR_MARKETS):
+        raise ValueError('stored universe snapshot markets are not exact')
+    if snapshot.get('market_status') != expected_status:
+        raise ValueError('stored universe snapshot market status is not direct PyKRX')
+    if snapshot.get('market_errors') != []:
+        raise ValueError('stored universe snapshot contains market errors')
+    if snapshot.get('unavailable_markets') != []:
+        raise ValueError('stored universe snapshot contains unavailable markets')
+    if snapshot.get('membership_basis') != 'end_date_snapshot':
+        raise ValueError('stored universe snapshot membership basis is invalid')
+
+    membership = snapshot.get('market_membership')
+    raw_market_entries = (
+        membership.get('markets')
+        if isinstance(membership, Mapping)
+        and isinstance(membership.get('markets'), Mapping)
+        else {}
+    )
+    requested_symbols = [
+        symbol
+        for market in EXACT_FACTOR_REPAIR_MARKETS
+        for symbol in (
+            raw_market_entries.get(market, {}).get('symbols', [])
+            if isinstance(raw_market_entries.get(market), Mapping)
+            else []
+        )
+    ]
+    validated = validate_market_membership_snapshot(
+        membership,
+        requested_symbols=requested_symbols,
+        markets=EXACT_FACTOR_REPAIR_MARKETS,
+    )
+    if validated is None:
+        raise ValueError('stored market membership proof is invalid')
+    if (
+        isinstance(snapshot.get('symbol_count'), bool)
+        or snapshot.get('symbol_count') != len(requested_symbols)
+    ):
+        raise ValueError('stored universe symbol count does not match membership')
+
+    symbols_by_market: dict[str, list[str]] = {}
+    skipped_by_market: dict[str, list[str]] = {}
+    for market in EXACT_FACTOR_REPAIR_MARKETS:
+        numeric_symbols: list[str] = []
+        skipped_codes: list[str] = []
+        for raw_symbol in validated[market]:
+            normalized = str(raw_symbol).strip().upper()
+            symbol = _normalize_provider_symbol(normalized)
+            if symbol is None or symbol != normalized:
+                skipped_codes.append(normalized)
+            else:
+                numeric_symbols.append(symbol)
+        minimum = MINIMUM_MARKET_MEMBERSHIP[market]
+        if len(numeric_symbols) < minimum:
+            raise ValueError(
+                f'{market} stored membership below safety floor: '
+                f'{len(numeric_symbols)} < {minimum}'
+            )
+        symbols_by_market[market] = sorted(numeric_symbols)
+        skipped_by_market[market] = sorted(skipped_codes)
+    return symbols_by_market, skipped_by_market
+
+
+def _build_symbol_driven_factor_symbols_query(
+    model: Any,
+    *,
+    market_date: date,
+    excluded_symbols: Sequence[str] = (),
+):
+    factor_row_exists = (
+        select(1)
+        .where(
+            model.symbol_id == Symbol.id,
+            model.market_date == market_date,
+        )
+        # Prevent PostgreSQL from decorrelating EXISTS into a factor-table-led
+        # semi-join.  The zero offset keeps the bounded symbols-table outer
+        # loop, so each factor lookup can use (symbol_id, market_date).
+        .offset(0)
+        .exists()
+    )
+    statement = select(Symbol.symbol).where(
+        Symbol.market.in_(EXACT_FACTOR_REPAIR_MARKETS),
+        factor_row_exists,
+    )
+    normalized_exclusions = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in excluded_symbols
+            if str(symbol).strip()
+        }
+    )
+    if normalized_exclusions:
+        statement = statement.where(
+            Symbol.symbol.not_in(normalized_exclusions)
+        )
+    return statement
+
+
 def load_stale_outside_membership_details(
     *,
     market_date: date,
@@ -136,25 +286,20 @@ def load_stale_outside_membership_details(
         raise ValueError('exact membership must not be empty')
     details: dict[str, dict[str, Any]] = {}
     membership_set = set(membership).union(protected_symbols)
-    with session_scope() as session:
-        symbol_by_id = {
-            int(row.id): str(row.symbol)
-            for row in session.execute(
-                select(Symbol.id.label('id'), Symbol.symbol.label('symbol'))
-            ).all()
-        }
+    with session_scope(
+        statement_timeout_ms=EXACT_FACTOR_REPAIR_STATEMENT_TIMEOUT_MS,
+    ) as session:
         for stage_id, model in FACTOR_RESULT_MODELS.items():
-            stored_symbol_ids = list(
+            stored_symbols = list(
                 session.scalars(
-                    select(model.symbol_id)
-                    .where(model.market_date == market_date)
+                    _build_symbol_driven_factor_symbols_query(
+                        model,
+                        market_date=market_date,
+                        excluded_symbols=membership_set,
+                    )
                 )
             )
-            outside_symbols = sorted(
-                symbol_by_id[int(symbol_id)]
-                for symbol_id in stored_symbol_ids
-                if symbol_by_id[int(symbol_id)] not in membership_set
-            )
+            outside_symbols = sorted(str(symbol) for symbol in stored_symbols)
             details[stage_id] = {
                 'count': len(outside_symbols),
                 'symbol_preview': outside_symbols[:20],
@@ -175,7 +320,9 @@ def verify_exact_factor_rows(
         raise ValueError('exact membership must not be empty')
 
     verified: dict[str, dict[str, int]] = {}
-    with session_scope() as session:
+    with session_scope(
+        statement_timeout_ms=EXACT_FACTOR_REPAIR_STATEMENT_TIMEOUT_MS,
+    ) as session:
         for stage_id, model in FACTOR_RESULT_MODELS.items():
             rows = session.execute(
                 select(Symbol.symbol, model.updated_at)
@@ -225,7 +372,9 @@ def prune_stale_factor_rows(
     pruned_counts: dict[str, int] = {}
     membership_set = set(membership)
     retained_membership_set = membership_set.union(protected_symbols)
-    with session_scope() as session:
+    with session_scope(
+        statement_timeout_ms=EXACT_FACTOR_REPAIR_STATEMENT_TIMEOUT_MS,
+    ) as session:
         preparer = session.connection().dialect.identifier_preparer
         for model in FACTOR_RESULT_MODELS.values():
             table_name = preparer.format_table(model.__table__)
@@ -341,10 +490,14 @@ class ExactFactorRepairService:
         *,
         trade_date_resolver: Callable[..., str] | None = None,
         market_ohlcv_loader: Callable[[str, str], object] | None = None,
+        stored_eod_run_loader: (
+            Callable[..., Sequence[dict[str, Any]]] | None
+        ) = None,
         price_bar_symbols_loader: Callable[[str], list[str]] | None = None,
         stale_details_loader: Callable[..., dict[str, dict[str, Any]]] | None = None,
         applied_scope_verifier: Callable[..., dict[str, dict[str, int]]] | None = None,
         stale_pruner: Callable[..., dict[str, int]] | None = None,
+        completion_recorder: Callable[..., dict[str, Any]] | None = None,
         lock_factory: Callable[..., AbstractContextManager[bool]] | None = None,
         stage_runners: Mapping[str, Callable[..., dict[str, Any]]] | None = None,
     ) -> None:
@@ -353,6 +506,9 @@ class ExactFactorRepairService:
         )
         self.market_ohlcv_loader = (
             market_ohlcv_loader or _get_market_ohlcv_by_ticker
+        )
+        self.stored_eod_run_loader = (
+            stored_eod_run_loader or list_eod_collection_runs
         )
         self.price_bar_symbols_loader = (
             price_bar_symbols_loader or list_symbols_with_daily_bar_on_date
@@ -364,6 +520,9 @@ class ExactFactorRepairService:
             applied_scope_verifier or verify_exact_factor_rows
         )
         self.stale_pruner = stale_pruner or prune_stale_factor_rows
+        self.completion_recorder = (
+            completion_recorder or record_pending_exact_factor_rebuild
+        )
         self.lock_factory = lock_factory or advisory_eod_collection_lock
         self.stage_runners = dict(stage_runners or _default_stage_runners())
         if list(self.stage_runners) != list(FACTOR_RESULT_MODELS):
@@ -402,6 +561,11 @@ class ExactFactorRepairService:
         expected_membership_sha256: str | None = None,
     ) -> dict[str, Any]:
         normalized_date = _normalize_market_date(market_date)
+        if apply:
+            validate_finalized_krx_write_date(
+                normalized_date,
+                operation='exact KRX factor repair',
+            )
         if prune_stale and not apply:
             return self._result(
                 market_date=normalized_date,
@@ -416,7 +580,7 @@ class ExactFactorRepairService:
         with self.lock_factory(
             market='KRX',
             trade_date=iso_date,
-            source='pykrx',
+            source='daily_price_bars',
         ) as lock_acquired:
             if not lock_acquired:
                 return self._result(
@@ -426,20 +590,18 @@ class ExactFactorRepairService:
                     reason='advisory_lock_unavailable',
                 )
 
+            live_trade_date_error: Exception | None = None
             try:
                 resolved_date = _normalize_market_date(
                     self.trade_date_resolver(end_date=compact_date)
                 )
             except Exception as exc:  # noqa: BLE001
-                return self._result(
-                    market_date=normalized_date,
-                    apply=apply,
-                    status='blocked',
-                    reason='trade_date_resolution_failed',
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                )
-            if resolved_date != normalized_date:
+                live_trade_date_error = exc
+                resolved_date = None
+            if (
+                live_trade_date_error is None
+                and resolved_date != normalized_date
+            ):
                 return self._result(
                     market_date=normalized_date,
                     apply=apply,
@@ -454,7 +616,16 @@ class ExactFactorRepairService:
             skipped_provider_codes: list[dict[str, str]] = []
             seen_provider_codes: set[str] = set()
             protected_provider_codes: list[str] = []
-            for market in EXACT_FACTOR_REPAIR_MARKETS:
+            membership_evidence_source = 'live_pykrx_market_ohlcv'
+            membership_evidence_run_id: int | None = None
+            membership_evidence_run_source: str | None = None
+            live_membership_error: Exception | None = live_trade_date_error
+            live_markets = (
+                ()
+                if live_membership_error is not None
+                else EXACT_FACTOR_REPAIR_MARKETS
+            )
+            for market in live_markets:
                 try:
                     frame = self.market_ohlcv_loader(compact_date, market)
                     market_symbols, market_skipped_codes = (
@@ -464,15 +635,8 @@ class ExactFactorRepairService:
                         )
                     )
                 except Exception as exc:  # noqa: BLE001
-                    return self._result(
-                        market_date=normalized_date,
-                        apply=apply,
-                        status='blocked',
-                        reason='invalid_exact_market_membership',
-                        failed_market=market,
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    )
+                    live_membership_error = exc
+                    break
                 provider_codes = [*market_symbols, *market_skipped_codes]
                 duplicates = sorted(seen_provider_codes.intersection(provider_codes))
                 if duplicates:
@@ -495,6 +659,72 @@ class ExactFactorRepairService:
                     {'market': market, 'code': code[:64]}
                     for code in market_skipped_codes[:20]
                 )
+
+            if live_membership_error is not None:
+                try:
+                    stored_runs = self.stored_eod_run_loader(
+                        market='KRX',
+                        trade_date=iso_date,
+                        source='pykrx',
+                        limit=20,
+                    )
+                    stored_run: Mapping[str, Any] | None = None
+                    stored_symbols: dict[str, list[str]] | None = None
+                    stored_skipped: dict[str, list[str]] | None = None
+                    for candidate in stored_runs:
+                        try:
+                            candidate_symbols, candidate_skipped = (
+                                _extract_stored_exact_market_membership(
+                                    candidate,
+                                    market_date=normalized_date,
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        stored_run = candidate
+                        stored_symbols = candidate_symbols
+                        stored_skipped = candidate_skipped
+                        break
+                    if (
+                        stored_run is None
+                        or stored_symbols is None
+                        or stored_skipped is None
+                    ):
+                        raise ValueError(
+                            'no strict same-date PyKRX EOD membership proof is available'
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    return self._result(
+                        market_date=normalized_date,
+                        apply=apply,
+                        status='blocked',
+                        reason='invalid_exact_market_membership',
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                        live_error_type=type(live_membership_error).__name__,
+                        live_error_message=str(live_membership_error),
+                    )
+                exact_symbols = []
+                market_symbol_counts = {}
+                skipped_provider_code_counts_by_market = {}
+                skipped_provider_codes = []
+                protected_provider_codes = []
+                for market in EXACT_FACTOR_REPAIR_MARKETS:
+                    market_symbols = stored_symbols[market]
+                    market_skipped_codes = stored_skipped[market]
+                    exact_symbols.extend(market_symbols)
+                    protected_provider_codes.extend(market_skipped_codes)
+                    market_symbol_counts[market] = len(market_symbols)
+                    skipped_provider_code_counts_by_market[market] = len(
+                        market_skipped_codes
+                    )
+                    skipped_provider_codes.extend(
+                        {'market': market, 'code': code[:64]}
+                        for code in market_skipped_codes[:20]
+                    )
+                membership_evidence_source = 'stored_eod_run_metadata'
+                membership_evidence_run_id = int(stored_run['id'])
+                membership_evidence_run_source = str(stored_run['source'])
 
             exact_symbols = sorted(exact_symbols)
             protected_provider_codes = sorted(protected_provider_codes)
@@ -552,6 +782,9 @@ class ExactFactorRepairService:
             }
             evidence = {
                 'membership_basis': 'exact_market_date_ohlcv',
+                'membership_evidence_source': membership_evidence_source,
+                'membership_evidence_run_id': membership_evidence_run_id,
+                'membership_evidence_run_source': membership_evidence_run_source,
                 'membership_sha256': membership_hash,
                 'ranking_membership_sha256': ranking_membership_hash,
                 'exact_provider_membership_count': len(full_provider_membership),
@@ -742,11 +975,41 @@ class ExactFactorRepairService:
                 'persistence_verification': persistence_verification,
                 'pruned_stale_counts': pruned_stale_counts,
             }
+            try:
+                completion_evidence = self.completion_recorder(
+                    market_date=normalized_date,
+                    exact_symbols=exact_symbols,
+                    provider_membership_sha256=membership_hash,
+                    repair_started_at=repair_started_at,
+                    rebuild_completed_at=datetime.now(timezone.utc),
+                    membership_evidence_source=membership_evidence_source,
+                    membership_evidence_run_id=membership_evidence_run_id,
+                    membership_evidence_run_source=(
+                        membership_evidence_run_source
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    'Unable to record exact factor rebuild evidence for %s',
+                    iso_date,
+                )
+                return self._result(
+                    market_date=normalized_date,
+                    apply=True,
+                    status='partial',
+                    reason='factor_rebuild_evidence_failed',
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    factor_repair_applied=True,
+                    stage_results=stage_results,
+                    **completed_evidence,
+                )
             return self._result(
                 market_date=normalized_date,
                 apply=True,
                 status='completed',
                 stage_results=stage_results,
+                completion_evidence=completion_evidence,
                 **completed_evidence,
             )
 

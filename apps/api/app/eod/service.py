@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from app.brokers.kis.provider import kis_client
+from app.core.settings import settings
+from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.sink import snapshot_sink
 from app.eod.state import job_state
 from app.eod.universe import UniverseSymbol, universe_service
-from app.market_data_store import complete_eod_collection_run, create_eod_collection_run
-from app.market.clock import async_get_market_state
+from app.market_data_store import (
+    advisory_eod_collection_lock,
+    complete_eod_collection_run,
+    create_eod_collection_run,
+)
+from app.market.clock import KST, async_get_market_state
 
 
 @dataclass
@@ -47,6 +53,25 @@ class EODService:
                 'job': job_state.snapshot(),
             }
 
+        if not market.session_close_at:
+            return {
+                'triggered': False,
+                'reason': 'missing_session_close',
+                'market_date': market_date,
+                'job': job_state.snapshot(),
+            }
+        server_time = datetime.fromisoformat(market.server_time)
+        eligible_at = datetime.fromisoformat(market.session_close_at) + timedelta(
+            minutes=settings.eod_auto_pykrx_after_close_minutes
+        )
+        if server_time < eligible_at:
+            return {
+                'triggered': False,
+                'reason': f'waiting_until:{eligible_at.isoformat()}',
+                'market_date': market_date,
+                'job': job_state.snapshot(),
+            }
+
         if job_state.last_market_date == market_date and job_state.last_status == 'completed':
             return {
                 'triggered': False,
@@ -55,9 +80,45 @@ class EODService:
                 'job': job_state.snapshot(),
             }
 
-        return await self.capture_market_date(market_date, trigger=trigger)
+        return await self.capture_market_date(
+            market_date,
+            trigger=trigger,
+            now=server_time,
+        )
 
-    async def capture_market_date(self, market_date: str, *, trigger: str = 'manual') -> dict:
+    async def capture_market_date(
+        self,
+        market_date: str,
+        *,
+        trigger: str = 'manual',
+        now: datetime | None = None,
+    ) -> dict:
+        now_kst = now.astimezone(KST) if now is not None else datetime.now(KST)
+        validate_finalized_krx_write_date(
+            market_date,
+            now=now_kst,
+            operation='KIS EOD capture',
+        )
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date=market_date,
+            source='daily_price_bars',
+        ) as lock_acquired:
+            if not lock_acquired:
+                raise RuntimeError(
+                    f'KIS EOD collection lock is already held for {market_date}'
+                )
+            return await self._capture_market_date_locked(
+                market_date,
+                trigger=trigger,
+            )
+
+    async def _capture_market_date_locked(
+        self,
+        market_date: str,
+        *,
+        trigger: str,
+    ) -> dict:
         symbols = list(universe_service.iter_symbols())
         job_state.start(market_date=market_date, symbols_total=len(symbols))
         items: list[dict] = []

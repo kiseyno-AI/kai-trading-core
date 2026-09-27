@@ -146,10 +146,13 @@ Supporting scheduler modules:
 
 - `app/eod/auto_pykrx.py`
   - decides whether the daily pykrx collection is due
+  - waits until 20:10 KST by default for same-day data finality (15:30 KRX close + 280 minutes), while older incomplete-date recovery remains eligible earlier
   - records scheduler status for `/eod/status`
   - runs the daily pykrx collection in a background task
 - `app/eod/state.py`
   - in-memory status for KIS-style EOD collection
+- `app/eod/service.py`
+  - manual same-day KIS capture uses the same 20:10 finality floor and the date-scoped common `daily_price_bars` writer lock
 - `app/eod/master_state.py`
   - in-memory status for master refresh
 
@@ -162,6 +165,8 @@ These are the implemented command-line paths that matter for data operations:
 | `python -m app.eod.pykrx_backfill` | Refresh universe, historical backfill, or daily pykrx collection |
 | `python -m app.eod.technical_snapshots` | Recompute deterministic technical snapshots for a market date |
 | `python -m app.eod.action_summaries` | Recompute deterministic action summaries for a market date |
+| `python -m app.eod.kis_final_bar_repair` | Finalize existing partial KRX bars from KIS J history with immutable before/after audit evidence; downstream numeric rebuild is mandatory |
+| `python -m app.eod.price_bar_repair_state` | Verify durable raw-bar repair obligations, refresh stored decision evaluations/calendar projections, and complete a batch only after numeric evidence matches |
 | `python -m app.dart.backfill_current_universe` | Run one DART current-universe backfill batch |
 | `python -m app.dart.backfill_current_universe_runner` | Run repeated DART current-universe backfill batches with progress logging |
 

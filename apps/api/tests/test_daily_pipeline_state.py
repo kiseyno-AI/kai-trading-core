@@ -1263,6 +1263,16 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
 
         self.assertEqual(result['run_ids'], [387])
         self.assertEqual(result['interrupted_eod_run_ids'], [522])
+        persisted_symbols_statement = session.execute.call_args_list[3].args[0]
+        persisted_symbols_sql = str(persisted_symbols_statement).lower()
+        self.assertIn(
+            'daily_price_bars.repair_origin_eod_run_id',
+            persisted_symbols_sql,
+        )
+        self.assertIn(
+            'daily_price_bars.source',
+            persisted_symbols_sql,
+        )
         self.assertEqual(stage.remaining, 401)
         session.get.assert_called_once_with(EODCollectionRun, 522)
         self.assertEqual(eod_run.status, 'failed')
@@ -1719,7 +1729,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertIn('pg_try_advisory_xact_lock', str(lock_call.args[0]))
         self.assertEqual(
             lock_call.args[1],
-            {'source_key': 10_001, 'trade_key': 20_260_914},
+            {'source_key': 10_003, 'trade_key': 20_260_914},
         )
 
     def test_startup_interrupt_links_unique_running_eod_before_first_checkpoint(

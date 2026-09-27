@@ -202,6 +202,10 @@ class AutoPykrxEODScheduler:
             if recovery_target is not None
             else None
         )
+        older_recovery_due = (
+            recovery_market_date is not None
+            and recovery_market_date < current_market_date
+        )
         if recovery_market_date is not None:
             target_market_date = recovery_market_date
         elif market.state == 'CLOSED':
@@ -228,7 +232,7 @@ class AutoPykrxEODScheduler:
         if self._state.preflight_failure_market_date is not None and not same_preflight_failure:
             self._clear_preflight_backoff()
 
-        if recovery_market_date is None and market.state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
+        if not older_recovery_due and market.state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
             self._state.last_status = 'idle'
             self._state.last_reason = f'market_not_closed:{market.state}'
             return
@@ -238,12 +242,12 @@ class AutoPykrxEODScheduler:
             self._state.last_reason = 'missing_latest_valid_trading_date'
             return
 
-        if recovery_market_date is None and market.state == 'CLOSED' and not market.session_close_at:
+        if not older_recovery_due and market.state == 'CLOSED' and not market.session_close_at:
             self._state.last_status = 'idle'
             self._state.last_reason = 'missing_session_close'
             return
 
-        if recovery_market_date is None and market.state == 'CLOSED':
+        if not older_recovery_due and market.state == 'CLOSED':
             close_at = datetime.fromisoformat(market.session_close_at)
             eligible_at = close_at + timedelta(
                 minutes=settings.eod_auto_pykrx_after_close_minutes
