@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, event, select, text
 from sqlalchemy.exc import OperationalError
 
 from app.db import engine, session_scope
@@ -1353,10 +1353,26 @@ class DailyAdvancedValueFactorPersistenceIntegrationTests(unittest.TestCase):
             result = self.service.rebuild_for_market_date(market_date=self.market_date)
 
         inspection = self.service.inspect(market_date=self.market_date, symbol=self.symbols[0])
-        stored_items = load_daily_advanced_value_factor_results(
-            market_date=self.market_date,
-            symbols=[self.symbols[0]],
-        )
+        statements: list[str] = []
+
+        def record_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            statements.append(' '.join(statement.split()))
+
+        event.listen(engine, 'before_cursor_execute', record_statement)
+        try:
+            stored_items = load_daily_advanced_value_factor_results(
+                market_date=self.market_date,
+                symbols=[self.symbols[0]],
+            )
+        finally:
+            event.remove(engine, 'before_cursor_execute', record_statement)
 
         self.assertEqual(result['results_persisted'], 3)
         self.assertEqual(inspection['item']['symbol'], self.symbols[0])
@@ -1364,3 +1380,51 @@ class DailyAdvancedValueFactorPersistenceIntegrationTests(unittest.TestCase):
         self.assertEqual(stored_items[0]['symbol'], self.symbols[0])
         self.assertEqual(stored_items[0]['advanced_value_classification'], 'eligible')
         self.assertTrue(stored_items[0]['is_advanced_value_eligible'])
+        self.assertTrue(
+            any(
+                statement.startswith('SELECT symbols.id')
+                and 'symbols.symbol IN' in statement
+                for statement in statements
+            )
+        )
+        factor_statements = [
+            statement
+            for statement in statements
+            if 'FROM daily_advanced_value_factor_results' in statement
+        ]
+        self.assertEqual(len(factor_statements), 1)
+        self.assertIn(
+            'daily_advanced_value_factor_results.symbol_id IN',
+            factor_statements[0],
+        )
+        self.assertNotIn('symbols.symbol IN', factor_statements[0])
+
+    def test_explicit_unknown_symbols_skip_factor_result_query(self) -> None:
+        statements: list[str] = []
+
+        def record_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            statements.append(' '.join(statement.split()))
+
+        event.listen(engine, 'before_cursor_execute', record_statement)
+        try:
+            stored_items = load_daily_advanced_value_factor_results(
+                market_date=self.market_date,
+                symbols=[f'UNKNOWN-{uuid4().hex}'],
+            )
+        finally:
+            event.remove(engine, 'before_cursor_execute', record_statement)
+
+        self.assertEqual(stored_items, [])
+        self.assertFalse(
+            any(
+                'FROM daily_advanced_value_factor_results' in statement
+                for statement in statements
+            )
+        )
