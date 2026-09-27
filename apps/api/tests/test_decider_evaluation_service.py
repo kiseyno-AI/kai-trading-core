@@ -1,8 +1,11 @@
 from datetime import date, datetime, timezone
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent_context.decider_evaluation_service import (
+    DeciderPostDecisionEvaluationRepository,
     DeciderPostDecisionEvaluationService,
     OUTCOME_AMBIGUOUS,
     OUTCOME_INVALID_MISSING_DATA,
@@ -11,6 +14,95 @@ from app.agent_context.decider_evaluation_service import (
     OUTCOME_STOP_HIT,
     OUTCOME_TARGET_HIT,
 )
+
+
+class _ScalarResult:
+    def __init__(self, values):
+        self._values = values
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return list(self._values)
+
+
+class _EvaluationSession:
+    def __init__(self, scalar_results):
+        self.scalar_results = iter(scalar_results)
+
+    def execute(self, _statement):
+        return _ScalarResult(next(self.scalar_results))
+
+
+class DeciderPostDecisionEvaluationRepositoryTests(unittest.TestCase):
+    def test_bulk_upsert_serializes_rows_before_session_exit(self):
+        record = SimpleNamespace(id=91)
+        session = _EvaluationSession([[91], [record]])
+        session_active = False
+
+        @contextmanager
+        def session_scope():
+            nonlocal session_active
+            session_active = True
+            try:
+                yield session
+            finally:
+                session_active = False
+
+        def serialize(item):
+            self.assertTrue(session_active)
+            return {'evaluation_id': item.id}
+
+        with (
+            patch(
+                'app.agent_context.decider_evaluation_service.session_scope',
+                session_scope,
+            ),
+            patch(
+                'app.agent_context.decider_evaluation_service._serialize_evaluation',
+                side_effect=serialize,
+            ),
+        ):
+            result = DeciderPostDecisionEvaluationRepository().bulk_upsert_evaluations(
+                items=[{'feedback_id': 81}]
+            )
+
+        self.assertEqual(result[0]['evaluation_id'], 91)
+
+    def test_list_serializes_rows_before_session_exit(self):
+        record = SimpleNamespace(id=91)
+        session = _EvaluationSession([[record]])
+        session_active = False
+
+        @contextmanager
+        def session_scope():
+            nonlocal session_active
+            session_active = True
+            try:
+                yield session
+            finally:
+                session_active = False
+
+        def serialize(item):
+            self.assertTrue(session_active)
+            return {'evaluation_id': item.id}
+
+        with (
+            patch(
+                'app.agent_context.decider_evaluation_service.session_scope',
+                session_scope,
+            ),
+            patch(
+                'app.agent_context.decider_evaluation_service._serialize_evaluation',
+                side_effect=serialize,
+            ),
+        ):
+            result = DeciderPostDecisionEvaluationRepository().list_evaluations(
+                market_date=date(2026, 9, 23)
+            )
+
+        self.assertEqual(result[0]['evaluation_id'], 91)
 
 
 def _feedback_source(
