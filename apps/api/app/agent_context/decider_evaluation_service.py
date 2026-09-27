@@ -388,9 +388,12 @@ class DeciderPostDecisionEvaluationRepository:
                     DeciderPostDecisionEvaluation.id.in_(record_ids)
                 )
             ).scalars().all()
-        rows_by_id = {row.id: row for row in rows}
+            rows_by_id = {
+                row.id: _serialize_evaluation(row)
+                for row in rows
+            }
         return [
-            _serialize_evaluation(rows_by_id[record_id])
+            rows_by_id[record_id]
             for record_id in record_ids
             if record_id in rows_by_id
         ]
@@ -429,7 +432,7 @@ class DeciderPostDecisionEvaluationRepository:
                 DeciderPostDecisionEvaluation.id.desc(),
             ).limit(_normalize_limit(limit))
             rows = session.execute(stmt).scalars().all()
-        return [_serialize_evaluation(row) for row in rows]
+            return [_serialize_evaluation(row) for row in rows]
 
 
 class DeciderPostDecisionEvaluationService:
