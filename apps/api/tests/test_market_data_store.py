@@ -436,6 +436,18 @@ class MarketRelativeQueryShapeTests(unittest.TestCase):
         self.assertNotIn("daily_price_bars.trade_date = '2026-04-07'", compiled_bars)
         self.assertIn('daily_price_bars.trade_date', compiled_bars)
         self.assertIn("daily_price_bars.source = 'pykrx'", compiled_bars)
+        self.assertIn(
+            'daily_price_bars.repair_origin_eod_run_id = 73',
+            compiled_bars,
+        )
+        self.assertIn(
+            "daily_price_bars.source = 'kis_final_bar_repair'",
+            compiled_bars,
+        )
+        self.assertIn(
+            "daily_price_bars.repair_origin_source = 'pykrx'",
+            compiled_bars,
+        )
 
 
 class FactorBatchPersistenceTests(unittest.TestCase):
@@ -1742,6 +1754,14 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(foreign_row['payload']['foreign_ownership_ratio_pct'], 33.1)
 
     def test_valuation_snapshot_updates_daily_price_bar_fundamentals(self) -> None:
+        original_captured_at = datetime(
+            2026,
+            4,
+            22,
+            7,
+            5,
+            tzinfo=timezone.utc,
+        )
         persist_daily_price_bar(
             {
                 'symbol': '661501',
@@ -1762,32 +1782,69 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
                 'source': 'pykrx',
             }
         )
+        with session_scope() as session:
+            price_row = (
+                session.execute(
+                    select(DailyPriceBar)
+                    .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                    .where(
+                        Symbol.symbol == '661501',
+                        DailyPriceBar.trade_date == date(2026, 4, 22),
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            price_row.source = 'kis_final_bar_repair'
+            price_row.captured_at = original_captured_at
+            price_row.repair_origin_source = 'pykrx'
 
-        inserted = upsert_daily_pykrx_enrichment_rows(
-            rows=[
-                {
-                    'market_date': '2026-04-22',
-                    'market': 'KOSPI',
-                    'category': 'valuation_snapshot',
-                    'scope_type': 'symbol',
-                    'scope_key': '661501',
-                    'source': 'pykrx',
-                    'symbol': '661501',
-                    'name_ko': 'Value Alpha',
-                    'standard_code': 'KR7661501001',
-                    'payload': {
-                        'per': 10.8,
-                        'pbr': 1.1,
-                        'bps': 952.4,
-                        'eps': 97.2,
-                        'dividend_yield': 2.5,
-                        'dps': 26.0,
+        lock_calls: list[dict[str, object]] = []
+
+        @contextmanager
+        def valuation_lock(**kwargs):
+            lock_calls.append(kwargs)
+            yield True, None
+
+        with patch(
+            'app.market_data_store.advisory_eod_collection_locks',
+            new=valuation_lock,
+        ):
+            inserted = upsert_daily_pykrx_enrichment_rows(
+                rows=[
+                    {
+                        'market_date': '2026-04-22',
+                        'market': 'KOSPI',
+                        'category': 'valuation_snapshot',
+                        'scope_type': 'symbol',
+                        'scope_key': '661501',
+                        'source': 'pykrx',
+                        'symbol': '661501',
+                        'name_ko': 'Value Alpha',
+                        'standard_code': 'KR7661501001',
+                        'payload': {
+                            'per': 10.8,
+                            'pbr': 1.1,
+                            'bps': 952.4,
+                            'eps': 97.2,
+                            'dividend_yield': 2.5,
+                            'dps': 26.0,
+                        },
                     },
-                }
-            ]
-        )
+                ]
+            )
 
         self.assertEqual(inserted, 1)
+        self.assertEqual(
+            lock_calls,
+            [
+                {
+                    'market': 'KRX',
+                    'trade_dates': (date(2026, 4, 22),),
+                    'source': 'daily_price_bars',
+                }
+            ],
+        )
         with session_scope() as session:
             price_row = (
                 session.execute(
@@ -1801,9 +1858,45 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
             per = float(price_row.per)
             pbr = float(price_row.pbr)
             dividend_yield = float(price_row.dividend_yield)
+            source = price_row.source
+            captured_at = price_row.captured_at
+            repair_origin_source = price_row.repair_origin_source
         self.assertEqual(per, 10.8)
         self.assertEqual(pbr, 1.1)
         self.assertEqual(dividend_yield, 2.5)
+        self.assertEqual(source, 'kis_final_bar_repair')
+        self.assertEqual(captured_at, original_captured_at)
+        self.assertEqual(repair_origin_source, 'pykrx')
+
+    def test_valuation_snapshot_fails_closed_when_price_bar_lock_is_busy(
+        self,
+    ) -> None:
+        @contextmanager
+        def busy_lock(**_kwargs):
+            yield False, '2026-04-22'
+
+        with patch(
+            'app.market_data_store.advisory_eod_collection_locks',
+            new=busy_lock,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'daily price-bar writer lock is already held for 2026-04-22',
+            ):
+                upsert_daily_pykrx_enrichment_rows(
+                    rows=[
+                        {
+                            'market_date': '2026-04-22',
+                            'market': 'KOSPI',
+                            'category': 'valuation_snapshot',
+                            'scope_type': 'symbol',
+                            'scope_key': '661501',
+                            'source': 'pykrx',
+                            'symbol': '661501',
+                            'payload': {'per': 10.8, 'pbr': 1.1},
+                        }
+                    ]
+                )
 
     def test_sparse_valuation_snapshot_preserves_existing_daily_price_bar_fundamentals(self) -> None:
         persist_daily_price_bar(
@@ -1879,7 +1972,7 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
                 'dps': 31.0,
             },
         )
-        self.assertEqual(source, 'daily_price_bars_carry_forward')
+        self.assertEqual(source, 'pykrx')
 
 
 class KISIntradaySnapshotStoreIntegrationTests(unittest.TestCase):

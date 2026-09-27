@@ -24,6 +24,7 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_marker_is_valid,
 )
 from app.eod.master import get_master_symbols
+from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import (
     build_market_membership_snapshot,
     validate_market_membership_snapshot,
@@ -58,6 +59,7 @@ from app.signals.daily_signal_features import daily_signal_feature_service
 from app.signals.market_risk_filter import daily_market_risk_filter_service
 from app.market_data_store import (
     advisory_eod_collection_lock,
+    advisory_eod_collection_locks,
     compute_and_persist_daily_trending_ranks,
     count_eod_run_persisted_symbols,
     count_eod_collection_runs,
@@ -1560,23 +1562,39 @@ class PykrxBackfillService:
             if end_date is not None
             else self.resolve_latest_trade_date().replace('-', '')
         )
+        validate_finalized_krx_write_date(normalized_end)
         normalized_start = _normalize_yyyymmdd(start_date, default=normalized_end)
-        return self._run_market_data_pipeline(
-            start_date=normalized_start,
-            end_date=normalized_end,
-            markets=markets,
-            trigger=trigger,
-            refresh_universe=refresh_universe,
-            limit=limit,
-            symbol=symbol,
-            mode='historical_backfill',
-            selected_stages=(
-                tuple(selected_stages)
-                if selected_stages is not None
-                else HISTORICAL_BACKFILL_STAGE_ORDER
-            ),
-            chain_fundamentals_followup=False,
-        )
+        if normalized_start != normalized_end:
+            raise ValueError(
+                'historical KRX backfill requires one exact market date per run'
+            )
+        market_date_iso = _normalize_iso_date(normalized_end)
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date=market_date_iso,
+            source='daily_price_bars',
+        ) as lock_acquired:
+            if not lock_acquired:
+                raise RuntimeError(
+                    'daily price-bar writer lock is already held for '
+                    f'{market_date_iso}'
+                )
+            return self._run_market_data_pipeline(
+                start_date=normalized_start,
+                end_date=normalized_end,
+                markets=markets,
+                trigger=trigger,
+                refresh_universe=refresh_universe,
+                limit=limit,
+                symbol=symbol,
+                mode='historical_backfill',
+                selected_stages=(
+                    tuple(selected_stages)
+                    if selected_stages is not None
+                    else HISTORICAL_BACKFILL_STAGE_ORDER
+                ),
+                chain_fundamentals_followup=False,
+            )
 
     @staticmethod
     def _pipeline_run_matches_eod_run(
@@ -3229,7 +3247,13 @@ class PykrxBackfillService:
             _log_pykrx_fetch('run_daily_pipeline_if_due', 'skipped', **result)
             return result
 
-        with advisory_eod_collection_lock(market='KRX', trade_date=market_date_iso, source='pykrx') as lock_acquired:
+        validate_finalized_krx_write_date(market_date_iso)
+
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date=market_date_iso,
+            source='daily_price_bars',
+        ) as lock_acquired:
             if not lock_acquired:
                 result = build_daily_skip_result(
                     reason='already_running',
@@ -3925,6 +3949,7 @@ class PykrxBackfillService:
 
         normalized_market_date = _normalize_yyyymmdd(market_date)
         market_date_iso = _normalize_iso_date(normalized_market_date)
+        validate_finalized_krx_write_date(market_date_iso)
         point_in_time_recovery = resolve_point_in_time_recovery(
             market_date=market_date_iso,
             requested=point_in_time_recovery,
@@ -3984,7 +4009,11 @@ class PykrxBackfillService:
             if not symbols_override:
                 raise RuntimeError('No active pykrx symbols matched the requested stage scope.')
 
-        with advisory_eod_collection_lock(market='KRX', trade_date=market_date_iso, source='pykrx') as lock_acquired:
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date=market_date_iso,
+            source='daily_price_bars',
+        ) as lock_acquired:
             if not lock_acquired:
                 result = build_daily_skip_result(
                     reason='already_running',
@@ -4771,6 +4800,7 @@ class PykrxBackfillService:
             if end_date is not None
             else self.resolve_latest_trade_date().replace('-', '')
         )
+        validate_finalized_krx_write_date(normalized_end)
         if symbol:
             target_symbols = [symbol]
         else:
@@ -4805,7 +4835,21 @@ class PykrxBackfillService:
                 matched = {trade_date: fundamentals_by_date.get(trade_date, {}) for trade_date in trade_dates if trade_date in fundamentals_by_date}
                 if not matched:
                     continue
-                updated_count = update_daily_price_bar_fundamentals(item.symbol, matched, source='pykrx')
+                with advisory_eod_collection_locks(
+                    market='KRX',
+                    trade_dates=tuple(matched),
+                    source='daily_price_bars',
+                ) as (locks_acquired, blocked_trade_date):
+                    if not locks_acquired:
+                        raise RuntimeError(
+                            'daily price-bar writer lock is already held for '
+                            f'{blocked_trade_date}'
+                        )
+                    updated_count = update_daily_price_bar_fundamentals(
+                        item.symbol,
+                        matched,
+                        source='pykrx',
+                    )
                 if updated_count > 0:
                     updated_symbols += 1
                     updated_rows += updated_count

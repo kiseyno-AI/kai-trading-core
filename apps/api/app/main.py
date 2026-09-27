@@ -45,6 +45,9 @@ from app.core.settings import settings
 from app.db import check_database, init_database, pool_status
 from app.db_pool_watchdog import db_pool_watchdog
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
+from app.eod.price_bar_repair_state import (
+    assert_no_pending_price_bar_rebuilds,
+)
 from app.eod.runner import background_runner
 from app.market.snapshot import market_snapshot_service
 from app.market_data_store import load_tracked_symbols
@@ -98,8 +101,13 @@ async def _run_startup_maintenance() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     startup_maintenance_task: asyncio.Task | None = None
+    # Database readiness and the durable repair marker are safety gates, not
+    # optional maintenance.  Starting realtime/background services without
+    # either check could expose stale price-derived decisions after the DB
+    # becomes reachable again.
+    await asyncio.to_thread(init_database)
+    await asyncio.to_thread(assert_no_pending_price_bar_rebuilds)
     try:
-        await asyncio.to_thread(init_database)
         await asyncio.to_thread(
             daily_pipeline_run_state_service.mark_active_runs_interrupted,
             reason='Core process started while previous daily pipeline run was still marked running.',
@@ -114,7 +122,10 @@ async def lifespan(_: FastAPI):
         tracked_symbols = await asyncio.to_thread(load_tracked_symbols)
         scanner_state.hydrate(tracked_symbols)
     except Exception as exc:
-        logger.warning('Database initialization failed; starting in degraded mode: %s', exc)
+        logger.warning(
+            'Database startup reconciliation failed; starting in degraded mode: %s',
+            exc,
+        )
     await kis_realtime_order_notice_service.start()
     await kis_realtime_price_service.start()
     await db_pool_watchdog.start()

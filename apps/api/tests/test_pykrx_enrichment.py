@@ -140,6 +140,25 @@ def _exact_membership_run(
 
 
 class PykrxEnrichmentServiceTests(unittest.TestCase):
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_valuation_collection_rejects_unfinalized_date_before_provider_work(
+        self,
+        load_symbols_mock,
+    ) -> None:
+        service = PykrxEnrichmentService()
+        with patch(
+            'app.eod.pykrx_enrichment.validate_finalized_krx_write_date',
+            side_effect=ValueError('not finalized'),
+        ):
+            with self.assertRaisesRegex(ValueError, 'not finalized'):
+                service.collect_for_market_date(
+                    market_date='2026-09-18',
+                    markets=['KOSPI'],
+                    categories=['valuation_snapshot'],
+                )
+
+        load_symbols_mock.assert_not_called()
+
     def test_large_price_fallback_filter_avoids_massive_sql_in_clause(self):
         captured_scope_kwargs: dict[str, object] = {}
         captured_statements = []
@@ -392,7 +411,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             patch(
                 'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
                 return_value=0,
-            ),
+            ) as upsert_mock,
         ):
             result = PykrxEnrichmentService().collect_for_market_date(
                 market_date='2026-09-18',
@@ -404,6 +423,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                     'foreign_ownership',
                 ],
                 use_full_market_coverage=True,
+                daily_price_bar_lock_owned=True,
             )
 
         self.assertEqual(
@@ -421,6 +441,13 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         )
         self.assertIsNone(
             collect_valuation_mock.call_args.kwargs['symbol_filter']
+        )
+        self.assertTrue(upsert_mock.call_args_list)
+        self.assertTrue(
+            all(
+                call.kwargs.get('daily_price_bar_lock_owned') is True
+                for call in upsert_mock.call_args_list
+            )
         )
         self.assertEqual(
             result['coverage']['categories']['market_breadth'][

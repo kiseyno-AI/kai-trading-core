@@ -18,6 +18,7 @@ from app.core.settings import settings
 from app.brokers.kis.provider import kis_real_client
 from app.db import session_scope
 from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
+from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import validate_market_membership_snapshot
 from app.eod.pykrx_import import import_pykrx_stock, pykrx_request_context
 from app.market_data_store import (
@@ -566,6 +567,7 @@ class PykrxEnrichmentService:
         allow_kis_candidate_fallback: bool = False,
         point_in_time_recovery: bool = False,
         use_full_market_coverage: bool = False,
+        daily_price_bar_lock_owned: bool = False,
     ) -> dict[str, Any]:
         market_date_iso = _normalize_iso_date(market_date)
         market_date_yyyymmdd = _normalize_yyyymmdd(market_date)
@@ -577,6 +579,26 @@ class PykrxEnrichmentService:
         normalized_markets = _normalize_markets(markets) or ['KOSPI', 'KOSDAQ', 'KONEX']
         normalized_symbols = _normalize_symbols(symbols)
         resolved_categories = _normalize_categories(categories)
+        if 'valuation_snapshot' in resolved_categories:
+            validate_finalized_krx_write_date(
+                market_date_iso,
+                operation='PyKRX valuation enrichment',
+            )
+
+        def persist_enrichment_rows(
+            *,
+            rows: list[dict[str, Any]],
+            replace_scopes: Sequence[dict[str, Any]] | None = None,
+        ) -> int:
+            kwargs: dict[str, Any] = {
+                'rows': rows,
+            }
+            if replace_scopes is not None:
+                kwargs['replace_scopes'] = replace_scopes
+            if daily_price_bar_lock_owned:
+                kwargs['daily_price_bar_lock_owned'] = True
+            return upsert_daily_pykrx_enrichment_rows(**kwargs)
+
         price_universe_rows = (
             self._daily_price_rows_for_fallback(
                 market_date_iso=market_date_iso,
@@ -736,7 +758,7 @@ class PykrxEnrichmentService:
                     if supported_replace_markets is None
                     or market in supported_replace_markets
                 ]
-                persisted_count = upsert_daily_pykrx_enrichment_rows(
+                persisted_count = persist_enrichment_rows(
                     rows=provider_rows,
                     replace_scopes=[
                         {
@@ -749,11 +771,11 @@ class PykrxEnrichmentService:
                     ],
                 )
                 if non_provider_rows:
-                    persisted_count += upsert_daily_pykrx_enrichment_rows(
+                    persisted_count += persist_enrichment_rows(
                         rows=non_provider_rows
                     )
             else:
-                persisted_count = upsert_daily_pykrx_enrichment_rows(
+                persisted_count = persist_enrichment_rows(
                     rows=category_rows
                 )
             should_fallback = persisted_count <= 0 and (details.get('errors') or category in SYMBOL_ENRICHMENT_CATEGORIES)
@@ -779,7 +801,7 @@ class PykrxEnrichmentService:
                         fallback_rows,
                         point_in_time_recovery=point_in_time_recovery,
                     )
-                    persisted_count = upsert_daily_pykrx_enrichment_rows(
+                    persisted_count = persist_enrichment_rows(
                         rows=fallback_rows
                     )
                     details['fallback'] = {

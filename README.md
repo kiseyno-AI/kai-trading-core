@@ -417,10 +417,23 @@ Run these from `apps/api` with the repository's single virtual-environment Pytho
 .venv/bin/python -m app.eod.missing_bar_repair --market-date YYYY-MM-DD --dry-run
 .venv/bin/python -m app.eod.symbol_history_repair --symbols 005930,000660 --start-date YYYY-MM-DD --end-date YYYY-MM-DD --dry-run
 .venv/bin/python -m app.eod.turnover_repair --market-date YYYY-MM-DD --dry-run
+.venv/bin/python -m app.eod.kis_final_bar_repair --start-date YYYY-MM-DD --end-date YYYY-MM-DD --symbol-limit 100 --dry-run
 .venv/bin/python -m app.eod.exact_factor_repair --market-date YYYY-MM-DD
 ```
 
-Take and verify a database backup first, inspect each dry-run, then repeat only a `ready` command with `--apply`. Stop Core and drain every other factor writer for the full exact-factor repair window. Exact-factor apply additionally requires the reviewed dry-run's `exact_provider_membership_count` and `membership_sha256` as `--expected-provider-membership-count` and `--expected-membership-sha256`; add `--prune-stale` only when disclosed stale derived rows should be deleted. Repaired raw bars use `eod_run_id=NULL` so the original failed run remains historically accurate. An inactive historical extra is retained and disclosed; an active row outside exact provider membership blocks paired liquidity repair.
+Take and verify a database backup first, inspect each dry-run, then repeat only a `ready` command with `--apply`. Stop Core and drain every other factor writer for the repair window. Exact-factor apply additionally requires the reviewed dry-run's `exact_provider_membership_count` and `membership_sha256` as `--expected-provider-membership-count` and `--expected-membership-sha256`; add `--prune-stale` only when disclosed stale derived rows should be deleted. Bars inserted by the missing-bar repair use `eod_run_id=NULL` so the original failed run remains historically accurate. An inactive historical extra is retained and disclosed; an active row outside exact provider membership blocks paired liquidity repair.
+
+`kis_final_bar_repair` is the bounded fallback for rows captured before the KRX daily bar settled. It reads official KIS `J` (KRX), original-price history and updates only existing rows whose final OHLCV/turnover is a monotonic extension of the stored partial bar. It never inserts a missing date. Apply is blocked for future dates and until 20:10 KST on the current date, and every raw-bar writer shares one date-scoped `daily_price_bars` advisory lock. Each changed row gets `source=kis_final_bar_repair`, a fresh capture timestamp, `eod_run_id=NULL`, and an immutable `daily_price_bar_repair_audits` before/after record; valuation fields remain unchanged.
+
+An apply that changes rows exits nonzero with `status=rebuild_required` and the full downstream `derived_rebuild_trade_dates`. Keep Core stopped. Rebuild price contexts, technical snapshots, action summaries, trending ranks, and exact-membership deterministic factors for every disclosed date; this repair flow never regenerates agent feedback. Then run the mandatory closeout in order:
+
+```bash
+.venv/bin/python -m app.eod.price_bar_repair_state --rebuild-evaluations
+.venv/bin/python -m app.eod.price_bar_repair_state
+.venv/bin/python -m app.eod.price_bar_repair_state --complete
+```
+
+The first command deterministically refreshes stored signal-feature fallback fields and market participation from the rebuilt bars/factors while preserving historical KIS ranking and quote evidence. It then recomputes evaluations only from already stored feedback and decision snapshots and refreshes their calendar projection; it never calls an agent. The second is a non-mutating verification. The final command marks batches complete only when exact factor membership/input hashes, raw-bar freshness, downstream coverage, signal/participation fingerprints, evaluation rows, and calendar rows all match. Core intentionally refuses to start while any repair batch remains pending. A `partial` KIS page deliberately omits `next_after_symbol`; retry the same `retry_after_symbol` page until its `retry_symbols` are resolved, then advance with `next_after_symbol`. Use `--symbols CODE1,CODE2` only for a bounded targeted retry.
 
 ### Agent feedback and decisions
 

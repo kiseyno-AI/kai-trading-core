@@ -1833,6 +1833,7 @@ class PykrxBackfillServiceTests(TestCase):
             markets=('KOSPI',),
             symbols=['099999'],
             use_full_market_coverage=True,
+            daily_price_bar_lock_owned=True,
             point_in_time_recovery=True,
         )
         rebuild_piotroski.assert_called_once_with(market_date='2026-09-11')
@@ -9555,6 +9556,7 @@ class PykrxBackfillServiceTests(TestCase):
             markets=('KOSPI',),
             symbols=['005930'],
             use_full_market_coverage=True,
+            daily_price_bar_lock_owned=True,
         )
         price_contexts.assert_called_once_with(
             market_date='2026-04-03',
@@ -11942,10 +11944,19 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(field.default, 'KOSPI,KOSDAQ')
 
+    def test_same_day_pipeline_default_waits_until_nxt_data_settles(self) -> None:
+        field = Settings.model_fields['eod_auto_pykrx_after_close_minutes']
+
+        self.assertEqual(field.default, 280)
+
+    def test_same_day_pipeline_rejects_shorter_finality_window(self) -> None:
+        with self.assertRaises(ValueError):
+            Settings(eod_auto_pykrx_after_close_minutes=279)
+
     async def test_schedule_daily_pipeline_if_due_waits_for_close_buffer(self) -> None:
         scheduler = AutoPykrxEODScheduler()
         now = datetime.now(KST)
-        close_at = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+        close_at = (now - timedelta(minutes=279)).replace(second=0, microsecond=0)
         market = MarketState(
             market='KRX',
             state='CLOSED',
@@ -11962,12 +11973,15 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
         snapshot = scheduler.snapshot()
         self.assertFalse(snapshot['active_task'])
         self.assertEqual(snapshot['last_status'], 'idle')
-        self.assertIn('waiting_until:', snapshot['last_reason'])
+        self.assertEqual(
+            snapshot['last_reason'],
+            f'waiting_until:{(close_at + timedelta(minutes=280)).isoformat()}',
+        )
 
     async def test_schedule_daily_pipeline_if_due_starts_background_task_after_close_buffer(self) -> None:
         scheduler = AutoPykrxEODScheduler()
         now = datetime.now(KST)
-        close_at = (now - timedelta(minutes=30)).replace(second=0, microsecond=0)
+        close_at = (now - timedelta(minutes=281)).replace(second=0, microsecond=0)
         market = MarketState(
             market='KRX',
             state='CLOSED',
@@ -12147,17 +12161,22 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             'market_state_changed:PREOPEN->OPEN',
         )
 
-    async def test_monday_closed_drains_friday_before_scheduling_monday(self) -> None:
+    async def test_closed_session_drains_older_recovery_before_same_day_finality_window(
+        self,
+    ) -> None:
         scheduler = AutoPykrxEODScheduler()
+        now = datetime.now(KST)
+        close_at = (now - timedelta(minutes=30)).replace(second=0, microsecond=0)
+        current_market_date = now.date().isoformat()
         market = MarketState(
             market='KRX',
             state='CLOSED',
             is_trading_day=True,
             is_open=False,
-            server_time='2026-09-14T16:00:00+09:00',
-            session_open_at='2026-09-14T09:00:00+09:00',
-            session_close_at='2026-09-14T15:30:00+09:00',
-            latest_valid_trading_date='2026-09-14',
+            server_time=now.isoformat(),
+            session_open_at=(close_at - timedelta(hours=6, minutes=30)).isoformat(),
+            session_close_at=close_at.isoformat(),
+            latest_valid_trading_date=current_market_date,
         )
 
         with (
@@ -12188,8 +12207,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             await scheduler._task
 
             await scheduler.schedule_daily_pipeline_if_due()
-            self.assertIsNotNone(scheduler._task)
-            await scheduler._task
+            self.assertIsNone(scheduler._task)
 
         self.assertEqual(load_recovery_target.call_count, 2)
         self.assertEqual(
@@ -12201,11 +12219,57 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
                     point_in_time_recovery=True,
                     recovery_eod_run_id=81,
                 ),
-                call(
-                    '2026-09-14',
-                    markets=('KOSPI', 'KOSDAQ'),
-                ),
             ],
+        )
+        self.assertEqual(scheduler.snapshot()['last_status'], 'idle')
+        self.assertEqual(
+            scheduler.snapshot()['last_reason'],
+            f'waiting_until:{(close_at + timedelta(minutes=280)).isoformat()}',
+        )
+
+    async def test_same_day_recovery_does_not_bypass_finality_window(self) -> None:
+        scheduler = AutoPykrxEODScheduler()
+        now = datetime.now(KST)
+        close_at = (now - timedelta(minutes=30)).replace(second=0, microsecond=0)
+        current_market_date = now.date().isoformat()
+        market = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time=now.isoformat(),
+            session_open_at=(close_at - timedelta(hours=6, minutes=30)).isoformat(),
+            session_close_at=close_at.isoformat(),
+            latest_valid_trading_date=current_market_date,
+        )
+
+        with (
+            patch(
+                'app.eod.auto_pykrx.async_get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.eod.auto_pykrx.'
+                'load_oldest_outstanding_auto_eod_recovery_target',
+                return_value=AutoEODRecoveryTarget(
+                    trade_date=current_market_date,
+                    eod_run_id=82,
+                ),
+            ),
+            patch.object(
+                scheduler,
+                '_run_scheduled_daily_pipeline',
+                new=AsyncMock(return_value=None),
+            ) as run_pipeline,
+        ):
+            await scheduler.schedule_daily_pipeline_if_due()
+
+        self.assertIsNone(scheduler._task)
+        run_pipeline.assert_not_awaited()
+        self.assertEqual(scheduler.snapshot()['last_status'], 'idle')
+        self.assertEqual(
+            scheduler.snapshot()['last_reason'],
+            f'waiting_until:{(close_at + timedelta(minutes=280)).isoformat()}',
         )
 
     async def test_triggered_failed_pipeline_remains_failed_in_scheduler_status(self) -> None:
@@ -12268,7 +12332,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
     async def test_incomplete_universe_preflight_uses_backoff_then_retries(self) -> None:
         scheduler = AutoPykrxEODScheduler()
         now = datetime.now(KST)
-        close_at = (now - timedelta(minutes=30)).replace(second=0, microsecond=0)
+        close_at = (now - timedelta(minutes=281)).replace(second=0, microsecond=0)
         market = MarketState(
             market='KRX',
             state='CLOSED',

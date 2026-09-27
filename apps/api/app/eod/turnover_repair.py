@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 from app.eod.market_membership import market_membership_sha256
+from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.pykrx_backfill import (
     PYKRX_BACKFILL_SERVICE,
     _get_market_ohlcv_by_ticker,
@@ -342,11 +343,16 @@ class DailyTurnoverRepairService:
         normalized_markets = _normalize_markets(markets)
         iso_date = normalized_date.isoformat()
         compact_date = normalized_date.strftime('%Y%m%d')
+        if apply:
+            validate_finalized_krx_write_date(
+                normalized_date,
+                operation='KRX turnover repair',
+            )
 
         with self.lock_factory(
             market='KRX',
             trade_date=iso_date,
-            source='pykrx',
+            source='daily_price_bars',
         ) as lock_acquired:
             if not lock_acquired:
                 return self._blocked_result(

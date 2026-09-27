@@ -43,6 +43,7 @@ from app.db_models import (
     Symbol,
     TrackedSymbol,
 )
+from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import (
     MARKET_MEMBERSHIP_SCHEMA_VERSION,
     market_membership_sha256,
@@ -51,6 +52,7 @@ from app.eod.market_membership import (
 from app.market.clock import MarketState
 from app.repositories.eod_run_repository import (
     advisory_eod_collection_lock,
+    advisory_eod_collection_locks,
     complete_eod_collection_run,
     count_daily_action_summaries_for_live_symbols,
     count_daily_price_bars_for_date,
@@ -60,6 +62,7 @@ from app.repositories.eod_run_repository import (
     count_eod_run_persisted_symbols,
     count_live_symbols,
     create_eod_collection_run,
+    daily_price_bar_has_current_eod_run_provenance,
     load_eod_run_persisted_symbols,
     load_eod_run_stage_counts,
     load_latest_available_daily_action_summary_date,
@@ -506,6 +509,8 @@ def persist_daily_price_bar(snapshot: dict, *, run_id: int | None = None) -> Non
             return
 
         row.eod_run_id = run_id
+        row.repair_origin_eod_run_id = None
+        row.repair_origin_source = None
         row.open_price = snapshot['open_price']
         row.high_price = snapshot['high_price']
         row.low_price = snapshot['low_price']
@@ -590,6 +595,8 @@ def persist_daily_price_bars(
                 index_elements=[DailyPriceBar.symbol_id, DailyPriceBar.trade_date],
                 set_={
                     'eod_run_id': statement.excluded.eod_run_id,
+                    'repair_origin_eod_run_id': None,
+                    'repair_origin_source': None,
                     'open_price': statement.excluded.open_price,
                     'high_price': statement.excluded.high_price,
                     'low_price': statement.excluded.low_price,
@@ -1004,7 +1011,6 @@ def update_daily_price_bar_fundamentals(
     if not fundamentals_by_date:
         return 0
 
-    refreshed_at = _utcnow()
     with session_scope() as session:
         record = _get_symbol(session, symbol)
         if record is None:
@@ -1027,14 +1033,10 @@ def update_daily_price_bar_fundamentals(
                     eps=_as_decimal(fundamentals['eps']) if fundamentals.get('eps') is not None else None,
                     dividend_yield=_as_decimal(fundamentals['dividend_yield']) if fundamentals.get('dividend_yield') is not None else None,
                     dps=_as_decimal(fundamentals['dps']) if fundamentals.get('dps') is not None else None,
-                    source=source,
-                    captured_at=refreshed_at,
                 )
             )
             updated_count += int(result.rowcount or 0)
         return updated_count
-
-
 
 
 def list_symbols_with_daily_bars_in_range(*, start_date: str | date | None = None, end_date: str | date | None = None) -> list[str]:
@@ -1597,8 +1599,10 @@ def _build_prior_market_turnover_bars_query(
         )
         .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
         .where(
-            DailyPriceBar.eod_run_id == run_id,
-            DailyPriceBar.source == 'pykrx',
+            daily_price_bar_has_current_eod_run_provenance(
+                run_id,
+                original_source='pykrx',
+            ),
         )
         .order_by(Symbol.symbol.asc())
     )
@@ -5014,7 +5018,7 @@ def load_daily_signal_features(
     *,
     market_date: str | date,
     symbols: list[str] | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
 ) -> list[dict]:
     with session_scope() as session:
         stmt = (
@@ -5142,7 +5146,54 @@ def upsert_daily_pykrx_enrichment_rows(
     *,
     rows: list[dict[str, Any]],
     replace_scopes: Sequence[dict[str, Any]] | None = None,
+    daily_price_bar_lock_owned: bool = False,
 ) -> int:
+    valuation_price_bar_dates = tuple(
+        sorted(
+            {
+                _normalize_trade_date(raw['market_date'])
+                for raw in rows
+                if str(raw.get('category') or '').strip()
+                == 'valuation_snapshot'
+                and str(raw.get('scope_type') or '').strip().lower()
+                == 'symbol'
+                and raw.get('symbol') is not None
+                and any(
+                    (raw.get('payload') or {}).get(field) is not None
+                    for field in (
+                        'per',
+                        'pbr',
+                        'bps',
+                        'eps',
+                        'dividend_yield',
+                        'dps',
+                    )
+                )
+            }
+        )
+    )
+    for valuation_date in valuation_price_bar_dates:
+        validate_finalized_krx_write_date(
+            valuation_date,
+            operation='PyKRX valuation price-bar mirror',
+        )
+    if valuation_price_bar_dates and not daily_price_bar_lock_owned:
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=valuation_price_bar_dates,
+            source='daily_price_bars',
+        ) as (locks_acquired, blocked_trade_date):
+            if not locks_acquired:
+                raise RuntimeError(
+                    'daily price-bar writer lock is already held for '
+                    f'{blocked_trade_date}'
+                )
+            return upsert_daily_pykrx_enrichment_rows(
+                rows=rows,
+                replace_scopes=replace_scopes,
+                daily_price_bar_lock_owned=True,
+            )
+
     normalized_replace_scopes: list[dict[str, Any]] = []
     for raw_scope in replace_scopes or []:
         market = str(raw_scope.get('market') or '').strip().upper()
@@ -5298,12 +5349,6 @@ def upsert_daily_pykrx_enrichment_rows(
             }
             if not update_values:
                 continue
-            update_values.update(
-                {
-                    'source': value['source'],
-                    'captured_at': value['captured_at'],
-                }
-            )
             session.execute(
                 update(DailyPriceBar)
                 .where(

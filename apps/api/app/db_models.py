@@ -660,11 +660,24 @@ class DailyPriceBar(Base):
     __table_args__ = (
         UniqueConstraint('symbol_id', 'trade_date', name='uq_daily_price_bars_symbol_trade_date'),
         Index('ix_daily_price_bars_trade_date_symbol', 'trade_date', 'symbol_id'),
+        Index(
+            'ix_daily_price_bars_repair_origin_eod_run_id',
+            'repair_origin_eod_run_id',
+            postgresql_where=text('repair_origin_eod_run_id IS NOT NULL'),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol_id: Mapped[int] = mapped_column(ForeignKey('symbols.id', ondelete='CASCADE'), nullable=False, index=True)
     eod_run_id: Mapped[int | None] = mapped_column(ForeignKey('eod_collection_runs.id', ondelete='SET NULL'), index=True)
+    repair_origin_eod_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            'eod_collection_runs.id',
+            name='fk_daily_price_bars_repair_origin_eod_run_id_eod_run',
+            ondelete='SET NULL',
+        ),
+    )
+    repair_origin_source: Mapped[str | None] = mapped_column(String(32))
     trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     open_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
     high_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -680,6 +693,140 @@ class DailyPriceBar(Base):
     dps: Mapped[float | None] = mapped_column(Numeric(18, 6))
     source: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DailyPriceBarRepairBatch(Base):
+    """Durable repair batch state retained until dependent rebuilds are verified."""
+
+    __tablename__ = 'daily_price_bar_repair_batches'
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'completed')",
+            name='ck_daily_price_bar_repair_batches_status',
+        ),
+        CheckConstraint(
+            'repaired_row_count > 0',
+            name='ck_daily_price_bar_repair_batches_positive_row_count',
+        ),
+        Index(
+            'ix_daily_price_bar_repair_batches_status_created',
+            'status',
+            'created_at',
+        ),
+    )
+
+    repair_batch_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default='pending')
+    affected_symbols: Mapped[list] = mapped_column(JSON, nullable=False)
+    affected_trade_dates: Mapped[list] = mapped_column(JSON, nullable=False)
+    required_rebuild_trade_dates: Mapped[list] = mapped_column(JSON, nullable=False)
+    required_evaluation_market_date_from: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+    )
+    required_evaluation_market_date_to: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+    )
+    evaluation_rebuilt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    evaluation_rebuild_metadata: Mapped[dict | None] = mapped_column(JSON)
+    factor_rebuild_metadata: Mapped[dict | None] = mapped_column(JSON)
+    repaired_row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verification_metadata: Mapped[dict | None] = mapped_column(JSON)
+
+
+class DailyPriceBarRepairAudit(Base):
+    """Append-only before/after evidence for an official KIS final-bar repair."""
+
+    __tablename__ = 'daily_price_bar_repair_audits'
+    __table_args__ = (
+        UniqueConstraint(
+            'repair_batch_id',
+            'daily_price_bar_id',
+            name='uq_daily_price_bar_repair_audits_batch_bar',
+        ),
+        CheckConstraint(
+            "provider = 'kis' AND provider_market_code = 'J' "
+            "AND provider_adjusted_price = '1' "
+            "AND provider_price_mode = 'original'",
+            name='ck_daily_price_bar_repair_audits_kis_original',
+        ),
+        CheckConstraint(
+            'old_open_price >= 0 AND old_high_price >= 0 '
+            'AND old_low_price >= 0 AND old_close_price >= 0 '
+            'AND old_volume >= 0 AND old_turnover >= 0 '
+            'AND new_open_price >= 0 AND new_high_price >= 0 '
+            'AND new_low_price >= 0 AND new_close_price >= 0 '
+            'AND new_volume >= 0 AND new_turnover >= 0',
+            name='ck_daily_price_bar_repair_audits_nonnegative',
+        ),
+        CheckConstraint(
+            '(old_open_price, old_high_price, old_low_price, old_close_price, '
+            'old_volume, old_turnover) <> '
+            '(new_open_price, new_high_price, new_low_price, new_close_price, '
+            'new_volume, new_turnover)',
+            name='ck_daily_price_bar_repair_audits_changed',
+        ),
+        Index(
+            'ix_daily_price_bar_repair_audits_trade_symbol',
+            'trade_date',
+            'symbol',
+        ),
+        Index(
+            'ix_daily_price_bar_repair_audits_bar_repaired',
+            'daily_price_bar_id',
+            'repaired_at',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    daily_price_bar_id: Mapped[int] = mapped_column(
+        ForeignKey('daily_price_bars.id', ondelete='RESTRICT'),
+        nullable=False,
+    )
+    repair_batch_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            'daily_price_bar_repair_batches.repair_batch_id',
+            ondelete='RESTRICT',
+        ),
+        nullable=False,
+    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default='kis')
+    provider_market_code: Mapped[str] = mapped_column(String(8), nullable=False, default='J')
+    provider_adjusted_price: Mapped[str] = mapped_column(String(8), nullable=False, default='1')
+    provider_price_mode: Mapped[str] = mapped_column(String(16), nullable=False, default='original')
+    old_open_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    old_high_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    old_low_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    old_close_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    old_volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    old_turnover: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    new_open_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    new_high_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    new_low_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    new_close_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    new_volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    new_turnover: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    original_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    original_captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    original_eod_run_id: Mapped[int | None] = mapped_column(Integer)
+    root_source: Mapped[str | None] = mapped_column(String(32))
+    root_eod_run_id: Mapped[int | None] = mapped_column(Integer)
+    repaired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 class USMarketDataCollectionRun(Base, TimestampMixin):

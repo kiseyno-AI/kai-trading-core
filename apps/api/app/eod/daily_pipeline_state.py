@@ -32,6 +32,7 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_resume_is_unconsumed,
 )
 from app.repositories.eod_run_repository import (
+    daily_price_bar_has_current_eod_run_provenance,
     eod_collection_advisory_lock_keys,
 )
 
@@ -2778,7 +2779,7 @@ class DailyPipelineRunStateService:
                     source_key, trade_key = eod_collection_advisory_lock_keys(
                         market='KRX',
                         trade_date=expected_market_date,
-                        source='pykrx',
+                        source='daily_price_bars',
                     )
                     lock_acquired = bool(
                         session.execute(
@@ -2968,7 +2969,9 @@ class DailyPipelineRunStateService:
                         select(Symbol.symbol)
                         .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
                         .where(
-                            DailyPriceBar.eod_run_id == eod_run_id,
+                            daily_price_bar_has_current_eod_run_provenance(
+                                eod_run_id,
+                            ),
                             DailyPriceBar.trade_date == expected_market_date,
                         )
                         .distinct()

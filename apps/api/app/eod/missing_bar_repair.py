@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db import session_scope
 from app.db_models import DailyPriceBar, Symbol
 from app.eod.market_membership import market_membership_sha256
+from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.master import load_all_domestic_masters, _validate_master_universe
 from app.eod.pykrx_backfill import (
     PYKRX_BACKFILL_SERVICE,
@@ -589,11 +590,16 @@ class MissingDailyBarRepairService:
         normalized_date = _normalize_market_date(market_date)
         iso_date = normalized_date.isoformat()
         compact_date = normalized_date.strftime('%Y%m%d')
+        if apply:
+            validate_finalized_krx_write_date(
+                normalized_date,
+                operation='missing KRX bar repair',
+            )
 
         with self.lock_factory(
             market='KRX',
             trade_date=iso_date,
-            source='pykrx',
+            source='daily_price_bars',
         ) as lock_acquired:
             if not lock_acquired:
                 return self._blocked_result(

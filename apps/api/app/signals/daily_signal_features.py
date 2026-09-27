@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Sequence
@@ -1268,6 +1269,147 @@ class DailySignalFeatureService:
         if include_retry_metadata:
             result['_retry_metadata'] = {'failed_symbols': failed_symbols}
         return result
+
+    def rebuild_stored_owned_fallback_for_market_date(
+        self,
+        *,
+        market_date: str | date,
+    ) -> dict[str, Any]:
+        """Refresh deterministic fallback fields without refetching rankings.
+
+        Historical KIS ranking responses cannot be reproduced safely.  This
+        path therefore starts from the rows already persisted for the date,
+        preserves their direct ranking columns and raw ``sources`` payload,
+        and replaces only the fallback fields owned by stored bars/factors.
+        The stored quote fallback is preserved as well because the current
+        quote cache is not valid historical evidence.
+        """
+
+        normalized_market_date = _normalize_market_date(market_date)
+        stored_rows = load_daily_signal_features(
+            market_date=normalized_market_date,
+            symbols=None,
+            limit=None,
+        )
+        if not stored_rows:
+            return {
+                'market_date': normalized_market_date,
+                'stored_rows': 0,
+                'features_persisted': 0,
+                'preserved_direct_source_rows': 0,
+            }
+
+        stored_symbols = [str(item['symbol']) for item in stored_rows]
+        universe = _resolve_generation_universe(
+            market_date=normalized_market_date,
+            direct_symbols=stored_symbols,
+        )
+        support_maps = _load_support_maps(
+            market_date=normalized_market_date,
+            target_symbols=stored_symbols,
+        )
+
+        # Do not let today's quote cache rewrite historical quote evidence.
+        preserved_quote_map: dict[str, dict[str, Any]] = {}
+        for row in stored_rows:
+            feature_payload = row.get('feature_payload') or {}
+            old_quote = (
+                (feature_payload.get('fallback_features') or {}).get(
+                    'quote_snapshot'
+                )
+            )
+            if isinstance(old_quote, dict) and old_quote:
+                preserved_quote_map[str(row['symbol'])] = deepcopy(old_quote)
+        support_maps['quote_map'] = preserved_quote_map
+
+        rebuilt_rows: list[dict[str, Any]] = []
+        preserved_direct_source_rows = 0
+        for stored_row in stored_rows:
+            entry = {
+                key: deepcopy(stored_row.get(key))
+                for key in (
+                    'symbol',
+                    'name_ko',
+                    'market',
+                    'market_date',
+                    'source',
+                    'signal_count',
+                    'volume_power_rank',
+                    'volume_power',
+                    'overtime_volume_rank',
+                    'overtime_volume',
+                    'overtime_fluctuation_rank',
+                    'overtime_fluctuation_rate',
+                    'feature_payload',
+                )
+            }
+            payload = dict(entry.get('feature_payload') or {})
+            entry['feature_payload'] = payload
+            collection_payload = dict(payload.get('collection') or {})
+            source_errors = dict(collection_payload.get('source_errors') or {})
+            direct_sources_before = deepcopy(payload.get('sources') or {})
+            direct_columns_before = tuple(
+                entry.get(key)
+                for key in (
+                    'signal_count',
+                    'volume_power_rank',
+                    'volume_power',
+                    'overtime_volume_rank',
+                    'overtime_volume',
+                    'overtime_fluctuation_rank',
+                    'overtime_fluctuation_rate',
+                )
+            )
+            merged = _merge_owned_fallback_features(
+                entry=entry,
+                market_date=normalized_market_date,
+                universe=universe,
+                support_maps=support_maps,
+                collection_payload=collection_payload,
+                source_errors=source_errors,
+            )
+            if merged is None:
+                raise RuntimeError(
+                    'stored signal feature lost every direct and deterministic '
+                    f'fallback input during repair: {stored_row["symbol"]}'
+                )
+            direct_columns_after = tuple(
+                merged.get(key)
+                for key in (
+                    'signal_count',
+                    'volume_power_rank',
+                    'volume_power',
+                    'overtime_volume_rank',
+                    'overtime_volume',
+                    'overtime_fluctuation_rank',
+                    'overtime_fluctuation_rate',
+                )
+            )
+            if (
+                direct_columns_after != direct_columns_before
+                or (merged.get('feature_payload') or {}).get('sources', {})
+                != direct_sources_before
+            ):
+                raise RuntimeError(
+                    'deterministic signal-feature repair changed preserved KIS '
+                    f'ranking evidence for {stored_row["symbol"]}'
+                )
+            if direct_sources_before:
+                preserved_direct_source_rows += 1
+            rebuilt_rows.append(merged)
+
+        persisted_count = upsert_daily_signal_features(rebuilt_rows)
+        if persisted_count != len(rebuilt_rows):
+            raise RuntimeError(
+                'deterministic signal-feature repair persistence mismatch: '
+                f'expected={len(rebuilt_rows)}, observed={persisted_count}'
+            )
+        return {
+            'market_date': normalized_market_date,
+            'stored_rows': len(stored_rows),
+            'features_persisted': persisted_count,
+            'preserved_direct_source_rows': preserved_direct_source_rows,
+        }
 
     def inspect(
         self,

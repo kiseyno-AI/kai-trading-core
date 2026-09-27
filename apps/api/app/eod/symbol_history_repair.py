@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    contextmanager,
+    nullcontext,
+)
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -23,8 +28,9 @@ from app.eod.pykrx_backfill import (
     _get_market_ohlcv_by_date,
     _get_market_ohlcv_by_ticker,
 )
+from app.eod.finality import validate_finalized_krx_write_date
 from app.market.session import KRX_EXCHANGE_CALENDAR
-from app.market_data_store import advisory_eod_collection_lock
+from app.market_data_store import advisory_eod_collection_locks
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +56,31 @@ MARKET_OHLCV_COLUMNS = {
     **RANGE_OHLCV_COLUMNS,
     MARKET_TURNOVER_COLUMN: 'turnover',
 }
+
+
+@contextmanager
+def _adapt_single_lock_factory(
+    lock_factory: Callable[..., AbstractContextManager[bool]],
+    *,
+    market: str,
+    trade_dates: Sequence[date],
+    source: str,
+):
+    """Compatibility adapter for injected unit-test lock factories."""
+
+    with ExitStack() as stack:
+        for trade_date in sorted(set(trade_dates)):
+            acquired = stack.enter_context(
+                lock_factory(
+                    market=market,
+                    trade_date=trade_date.isoformat(),
+                    source=source,
+                )
+            )
+            if not acquired:
+                yield False, trade_date.isoformat()
+                return
+        yield True, None
 
 
 @dataclass(frozen=True)
@@ -619,6 +650,10 @@ class SymbolHistoryRepairService:
         market_ohlcv_loader: Callable[[str, str], object] | None = None,
         database_repairer: Callable[..., dict[str, Any]] | None = None,
         lock_factory: Callable[..., AbstractContextManager[bool]] | None = None,
+        lock_set_factory: Callable[
+            ...,
+            AbstractContextManager[tuple[bool, str | None]],
+        ] | None = None,
         minimum_market_membership: Mapping[str, int] | None = None,
     ) -> None:
         self.trade_date_resolver = (
@@ -637,7 +672,15 @@ class SymbolHistoryRepairService:
         self.database_repairer = (
             database_repairer or repair_missing_symbol_history
         )
-        self.lock_factory = lock_factory or advisory_eod_collection_lock
+        if lock_set_factory is not None:
+            self.lock_set_factory = lock_set_factory
+        elif lock_factory is not None:
+            self.lock_set_factory = lambda **kwargs: _adapt_single_lock_factory(
+                lock_factory,
+                **kwargs,
+            )
+        else:
+            self.lock_set_factory = advisory_eod_collection_locks
         self.minimum_market_membership = dict(
             minimum_market_membership or MINIMUM_MARKET_MEMBERSHIP
         )
@@ -823,21 +866,13 @@ class SymbolHistoryRepairService:
         )
         compact_start = normalized_start.strftime('%Y%m%d')
         compact_end = normalized_end.strftime('%Y%m%d')
+        if apply:
+            validate_finalized_krx_write_date(
+                normalized_end,
+                operation='KRX symbol-history repair',
+            )
 
-        with self.lock_factory(
-            market='KRX',
-            trade_date=normalized_end.isoformat(),
-            source='pykrx',
-        ) as lock_acquired:
-            if not lock_acquired:
-                return self._blocked_result(
-                    symbols=normalized_symbols,
-                    start_date=normalized_start,
-                    end_date=normalized_end,
-                    apply=apply,
-                    reason='advisory_lock_unavailable',
-                )
-
+        def validate_provider_then_repair() -> dict[str, Any]:
             try:
                 resolved_start = _normalize_date(
                     self.trade_date_resolver(end_date=compact_start)
@@ -1172,33 +1207,64 @@ class SymbolHistoryRepairService:
                             turnover=turnover,
                         )
                     )
-            try:
-                database_result = self.database_repairer(
+            # Remote payload validation stays outside the writer critical
+            # section. The database repairer re-reads coverage after these
+            # locks are held and only inserts rows that are still absent.
+            if apply and not actual_trade_dates:
+                return self._blocked_result(
                     symbols=normalized_symbols,
                     start_date=normalized_start,
                     end_date=normalized_end,
-                    bars=validated_bars,
-                    apply=apply,
-                    source='pykrx',
+                    apply=True,
+                    reason='no_provider_trade_dates',
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    'Missing-only symbol history repair failed for %s through %s',
-                    normalized_start.isoformat(),
-                    normalized_end.isoformat(),
+            lock_scope = (
+                self.lock_set_factory(
+                    market='KRX',
+                    trade_dates=tuple(actual_trade_dates),
+                    source='daily_price_bars',
                 )
-                return {
-                    **self._blocked_result(
+                if apply
+                else nullcontext((True, None))
+            )
+            with lock_scope as (locks_acquired, blocked_trade_date):
+                if not locks_acquired:
+                    return self._blocked_result(
                         symbols=normalized_symbols,
                         start_date=normalized_start,
                         end_date=normalized_end,
                         apply=apply,
-                        reason='database_repair_failed',
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    ),
-                    'status': 'failed',
-                }
+                        reason='advisory_lock_unavailable',
+                        blocked_trade_date=blocked_trade_date,
+                    )
+                try:
+                    database_result = self.database_repairer(
+                        symbols=normalized_symbols,
+                        start_date=normalized_start,
+                        end_date=normalized_end,
+                        bars=validated_bars,
+                        apply=apply,
+                        source='pykrx',
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        'Missing-only symbol history repair failed for %s '
+                        'through %s',
+                        normalized_start.isoformat(),
+                        normalized_end.isoformat(),
+                    )
+                    return {
+                        **self._blocked_result(
+                            symbols=normalized_symbols,
+                            start_date=normalized_start,
+                            end_date=normalized_end,
+                            apply=apply,
+                            reason='database_repair_failed',
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        ),
+                        'status': 'failed',
+                    }
 
             return {
                 **database_result,
@@ -1236,6 +1302,8 @@ class SymbolHistoryRepairService:
                     for market in SYMBOL_HISTORY_REPAIR_MARKETS
                 },
             }
+
+        return validate_provider_then_repair()
 
 
 symbol_history_repair_service = SymbolHistoryRepairService()

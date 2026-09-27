@@ -238,7 +238,7 @@ class Settings(BaseSettings):
 
     eod_auto_pykrx_enabled: bool = True
     eod_auto_pykrx_poll_seconds: int = 60
-    eod_auto_pykrx_after_close_minutes: int = 10
+    eod_auto_pykrx_after_close_minutes: int = Field(default=280, ge=280, le=1_440)
     eod_auto_pykrx_markets: str = 'KOSPI,KOSDAQ'
     eod_auto_pykrx_refresh_universe: bool = True
     eod_auto_pykrx_stale_run_minutes: int = 30

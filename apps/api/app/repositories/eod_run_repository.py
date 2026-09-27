@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, or_, select, text
 
 from app.agent_context.lease_loss_evidence import (
     terminal_feedback_completed_run_evidence_error,
@@ -37,9 +37,37 @@ from app.eod.daily_pipeline_outcomes import (
 
 logger = logging.getLogger(__name__)
 
+
+KIS_FINAL_BAR_REPAIR_SOURCE = 'kis_final_bar_repair'
+
+
+def daily_price_bar_has_current_eod_run_provenance(
+    run_id: int,
+    *,
+    original_source: str | None = None,
+):
+    """Match direct or indexed repair-origin ownership by an EOD run."""
+
+    direct_conditions = [DailyPriceBar.eod_run_id == run_id]
+    repaired_conditions = [
+        DailyPriceBar.source == KIS_FINAL_BAR_REPAIR_SOURCE,
+        DailyPriceBar.repair_origin_eod_run_id == run_id,
+    ]
+    if original_source is not None:
+        direct_conditions.append(DailyPriceBar.source == original_source)
+        repaired_conditions.append(
+            DailyPriceBar.repair_origin_source == original_source
+        )
+
+    return or_(
+        and_(*direct_conditions),
+        and_(*repaired_conditions),
+    )
+
 _EOD_COLLECTION_LOCK_SOURCE_KEYS = {
     ('KRX', 'pykrx'): 10_001,
     ('KRX', 'kis'): 10_002,
+    ('KRX', 'daily_price_bars'): 10_003,
 }
 _AUTO_DAILY_PIPELINE_ENTRYPOINT = (
     'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
@@ -135,6 +163,69 @@ def eod_collection_advisory_lock_keys(
         19_999,
     )
     return source_key, int(normalized_trade_date.strftime('%Y%m%d'))
+
+
+@contextmanager
+def advisory_eod_collection_locks(
+    *,
+    market: str,
+    trade_dates: Sequence[str | date],
+    source: str,
+):
+    """Hold a sorted set of EOD date locks on one dedicated connection."""
+
+    normalized_dates = tuple(
+        sorted({_normalize_trade_date(item) for item in trade_dates})
+    )
+    if not normalized_dates:
+        raise ValueError('at least one EOD advisory-lock date is required')
+    source_key = _EOD_COLLECTION_LOCK_SOURCE_KEYS.get(
+        (market, source),
+        19_999,
+    )
+    acquired_trade_keys: list[int] = []
+    blocked_date: date | None = None
+    with engine.connect() as raw_connection:
+        connection = raw_connection.execution_options(isolation_level='AUTOCOMMIT')
+        try:
+            for trade_date in normalized_dates:
+                trade_key = int(trade_date.strftime('%Y%m%d'))
+                acquired = bool(
+                    connection.execute(
+                        text(
+                            'SELECT pg_try_advisory_lock('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': trade_key,
+                        },
+                    ).scalar()
+                )
+                if not acquired:
+                    blocked_date = trade_date
+                    break
+                acquired_trade_keys.append(trade_key)
+            yield (
+                blocked_date is None,
+                blocked_date.isoformat() if blocked_date is not None else None,
+            )
+        finally:
+            for trade_key in reversed(acquired_trade_keys):
+                try:
+                    connection.execute(
+                        text(
+                            'SELECT pg_advisory_unlock('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': trade_key,
+                        },
+                    )
+                except Exception:
+                    # Closing the dedicated connection releases every held lock.
+                    pass
 
 
 def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
@@ -2017,7 +2108,7 @@ def count_eod_run_persisted_symbols(
         statement = (
             select(func.count(func.distinct(DailyPriceBar.symbol_id)))
             .select_from(DailyPriceBar)
-            .where(DailyPriceBar.eod_run_id == run_id)
+            .where(daily_price_bar_has_current_eod_run_provenance(run_id))
         )
         if trade_date is not None:
             statement = statement.where(
@@ -2043,7 +2134,7 @@ def load_eod_run_persisted_symbols(
         statement = (
             select(Symbol.symbol)
             .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-            .where(DailyPriceBar.eod_run_id == run_id)
+            .where(daily_price_bar_has_current_eod_run_provenance(run_id))
             .group_by(Symbol.symbol)
             .order_by(Symbol.symbol.asc())
         )
@@ -2063,7 +2154,7 @@ def load_eod_run_stage_counts(run_id: int) -> dict[str, dict]:
                 func.max(DailyPriceBar.captured_at),
             )
             .select_from(DailyPriceBar)
-            .where(DailyPriceBar.eod_run_id == run_id)
+            .where(daily_price_bar_has_current_eod_run_provenance(run_id))
         ).one()
         technical_persisted, technical_updated_at = session.execute(
             select(
