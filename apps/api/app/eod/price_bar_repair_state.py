@@ -43,6 +43,7 @@ from app.repositories.eod_run_repository import advisory_eod_collection_locks
 
 
 SUPPORTED_MARKETS = ('KOSPI', 'KOSDAQ')
+REPAIR_STATE_STATEMENT_TIMEOUT_MS = 60_000
 REQUIRED_TRENDING_PERIODS = ('1d', '5d', '20d')
 REQUIRED_PRICE_COVERAGE_MODELS = (
     ('price_contexts', DailyPriceContext),
@@ -377,7 +378,9 @@ def record_pending_exact_factor_rebuild(
     market_date_key = market_date.isoformat()
     ranking_membership_sha256 = market_membership_sha256(normalized_symbols)
 
-    with session_scope() as session:
+    with session_scope(
+        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+    ) as session:
         pending_batches = session.scalars(
             select(DailyPriceBarRepairBatch)
             .where(DailyPriceBarRepairBatch.status == 'pending')
@@ -1430,7 +1433,9 @@ def _rebuild_pending_price_dependent_evaluations_locked(
         daily_signal_feature_service,
     )
 
-    with session_scope() as session:
+    with session_scope(
+        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+    ) as session:
         existing_evaluation_versions = {
             str(item)
             for item in session.scalars(
@@ -1474,7 +1479,9 @@ def _rebuild_pending_price_dependent_evaluations_locked(
                 source=SIGNAL_FEATURE_SOURCE,
             )
         )
-        with session_scope() as session:
+        with session_scope(
+            statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+        ) as session:
             (
                 signal_sha256,
                 signal_count,
@@ -1688,7 +1695,9 @@ def _rebuild_pending_price_dependent_evaluations_locked(
         'calendar_review': _slim_rebuild_result(calendar_review_result),
     }
 
-    with session_scope() as session:
+    with session_scope(
+        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+    ) as session:
         batches = session.scalars(
             select(DailyPriceBarRepairBatch)
             .where(
@@ -1764,7 +1773,9 @@ def _verify_pending_price_bar_rebuilds_locked(
     apply: bool,
 ) -> dict[str, Any]:
     completed_at = datetime.now(timezone.utc)
-    with session_scope() as session:
+    with session_scope(
+        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+    ) as session:
         statement = (
             select(DailyPriceBarRepairBatch)
             .where(DailyPriceBarRepairBatch.status == 'pending')
