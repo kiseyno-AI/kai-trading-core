@@ -171,6 +171,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             session_close_at='2026-04-30T15:30:00+09:00',
         )
         events: list[str] = []
+        plan_loops: list[asyncio.AbstractEventLoop] = []
 
         async def stop_after_tick(_seconds: int) -> None:
             runner._running = False
@@ -184,8 +185,9 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         def refresh_master():
             events.append('master')
 
-        def refresh_plan(**_kwargs):
+        def refresh_plan(**kwargs):
             events.append('plan')
+            plan_loops.append(kwargs['_live_market_snapshot_loop'])
 
         async def dispatch_plan(**_kwargs):
             events.append('dispatch')
@@ -232,6 +234,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             await runner._run_loop()
 
         self.assertEqual(events[:4], ['master', 'snapshot', 'plan', 'dispatch'])
+        self.assertEqual(plan_loops, [asyncio.get_running_loop()])
 
     async def test_open_master_refresh_timeout_fails_closed_before_snapshot_and_orders(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)
@@ -533,7 +536,9 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             await runner._run_loop()
 
         refresh_master.assert_called_once_with()
-        refresh_plan.assert_called_once_with()
+        refresh_plan.assert_called_once_with(
+            _live_market_snapshot_loop=asyncio.get_running_loop(),
+        )
         reconcile.assert_awaited_once_with()
 
     async def test_preopen_sync_maintenance_uses_thread_offload(self) -> None:
@@ -929,7 +934,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._running = True
             await runner._run_loop()
 
-        refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+        refresh_plan.assert_called_once_with(
+            target_trade_date='2026-04-30',
+            _live_market_snapshot_loop=asyncio.get_running_loop(),
+        )
         dispatch_exec.assert_awaited_once_with(
             target_trade_date='2026-04-30',
             refresh_plan=False,
@@ -1008,7 +1016,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 in_flight_dispatch = runner._async_step_tasks[
                     OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY
                 ]
-                refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+                refresh_plan.assert_called_once_with(
+                    target_trade_date='2026-04-30',
+                    _live_market_snapshot_loop=asyncio.get_running_loop(),
+                )
                 self.assertEqual(dispatch_exec.await_count, 1)
                 schedule_refresh.assert_not_called()
                 self.assertFalse(in_flight_dispatch.done())
@@ -1018,7 +1029,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                     runner._running = True
                     await runner._run_loop()
 
-                refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+                refresh_plan.assert_called_once_with(
+                    target_trade_date='2026-04-30',
+                    _live_market_snapshot_loop=asyncio.get_running_loop(),
+                )
                 self.assertEqual(dispatch_exec.await_count, 1)
                 schedule_refresh.assert_not_called()
                 self.assertFalse(in_flight_dispatch.done())
@@ -1136,7 +1150,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                     runner._running = True
                     await runner._run_loop()
 
-                refresh_plan.assert_called_once_with(target_trade_date='2026-04-30')
+                refresh_plan.assert_called_once_with(
+                    target_trade_date='2026-04-30',
+                    _live_market_snapshot_loop=asyncio.get_running_loop(),
+                )
                 self.assertEqual(dispatch_exec.await_count, 1)
                 schedule_refresh.assert_not_called()
         finally:

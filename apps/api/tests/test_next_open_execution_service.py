@@ -8636,7 +8636,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             events.append('generation_validation')
             return generation_validator(**kwargs)
 
-        async def refresh_live_snapshot(**kwargs):
+        def refresh_live_snapshot(**kwargs):
             events.append('live_snapshot_refresh')
             self.assertEqual(
                 kwargs,
@@ -8718,7 +8718,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             decliners=250,
         )
 
-        async def fail_live_snapshot_refresh(**_kwargs):
+        def fail_live_snapshot_refresh(**_kwargs):
             raise RuntimeError('synthetic refresh failure')
 
         open_service = self._service(

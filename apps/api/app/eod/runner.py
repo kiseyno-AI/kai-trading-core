@@ -303,6 +303,7 @@ class EODBackgroundRunner:
             raise
 
     async def _run_loop(self) -> None:
+        live_market_snapshot_loop = asyncio.get_running_loop()
         while self._running:
             market: object | None = None
             try:
@@ -366,7 +367,9 @@ class EODBackgroundRunner:
                         market=market,
                         awaitable=self._run_blocking_step(
                             NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
-                            signal_decider_next_open_execution_service.refresh_plan_if_due,
+                            lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
+                                _live_market_snapshot_loop=live_market_snapshot_loop,
+                            ),
                             fail_closed=True,
                         ),
                     )
@@ -408,7 +411,8 @@ class EODBackgroundRunner:
                                 awaitable=self._run_blocking_step(
                                     NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
                                     lambda: signal_decider_next_open_execution_service.refresh_plan_if_due(
-                                        target_trade_date=market.server_time[:10]
+                                        target_trade_date=market.server_time[:10],
+                                        _live_market_snapshot_loop=live_market_snapshot_loop,
                                     ),
                                     fail_closed=True,
                                 ),

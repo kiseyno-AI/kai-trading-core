@@ -4423,6 +4423,7 @@ class SignalDeciderExecIntegrationService:
                     target_trade_date=resolved_target_date,
                     trigger=f'{trigger}_plan_refresh',
                     force=force,
+                    _live_market_snapshot_loop=asyncio.get_running_loop(),
                 )
             except Exception:
                 await synchronize_buy_authority_if_needed()
@@ -4466,6 +4467,7 @@ class SignalDeciderExecIntegrationService:
                     target_trade_date=resolved_target_date,
                     trigger=f'{trigger}_revocation_ack_refresh',
                     force=force,
+                    _live_market_snapshot_loop=asyncio.get_running_loop(),
                 )
                 plan_refreshed_since_buy_authority_sync = True
         except Exception:

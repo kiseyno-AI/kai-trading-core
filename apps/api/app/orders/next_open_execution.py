@@ -2570,6 +2570,62 @@ def _preopen_plan_covers_latest_snapshots(
     return True
 
 
+async def _invoke_live_market_snapshot_refresher(
+    refresher: Callable[..., Any],
+    *,
+    trigger: str,
+) -> Any:
+    result = refresher(
+        trigger=trigger,
+        force_index=True,
+    )
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _run_live_market_snapshot_refresher_on_loop(
+    refresher: Callable[..., Any],
+    *,
+    event_loop: asyncio.AbstractEventLoop | None,
+    trigger: str,
+) -> Any:
+    """Run a shared async refresher only on the loop that owns its state."""
+    if event_loop is None:
+        result = refresher(
+            trigger=trigger,
+            force_index=True,
+        )
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            raise RuntimeError(
+                'async live market snapshot refresh requires the owning event loop'
+            )
+        return result
+    if event_loop.is_closed() or not event_loop.is_running():
+        raise RuntimeError('live market snapshot owning event loop is not running')
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is event_loop:
+        raise RuntimeError(
+            'live market snapshot refresh cannot synchronously wait on its owning event loop'
+        )
+
+    invocation = _invoke_live_market_snapshot_refresher(
+        refresher,
+        trigger=trigger,
+    )
+    try:
+        future = asyncio.run_coroutine_threadsafe(invocation, event_loop)
+    except BaseException:
+        invocation.close()
+        raise
+    return future.result()
+
+
 class SignalDeciderNextOpenExecutionService:
     def __init__(
         self,
@@ -3528,6 +3584,7 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: str | date | None = None,
         account_reference: str | None = None,
         refresh: bool = False,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
@@ -3535,6 +3592,7 @@ class SignalDeciderNextOpenExecutionService:
             self.refresh_plan_items(
                 target_trade_date=resolved_target_date,
                 trigger='route_refresh',
+                _live_market_snapshot_loop=_live_market_snapshot_loop,
             )
         rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
@@ -3563,11 +3621,17 @@ class SignalDeciderNextOpenExecutionService:
             'items': [self._serialize_row(row) for row in rows],
         }
 
-    def refresh_plan_if_due(self, *, target_trade_date: str | date | None = None) -> dict[str, Any]:
+    def refresh_plan_if_due(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
+    ) -> dict[str, Any]:
         return self.refresh_plan_items(
             target_trade_date=target_trade_date,
             trigger='preopen_scheduler',
             _compact_response=True,
+            _live_market_snapshot_loop=_live_market_snapshot_loop,
         )
 
     def refresh_plan_items(
@@ -3577,6 +3641,7 @@ class SignalDeciderNextOpenExecutionService:
         trigger: str = 'manual',
         force: bool = False,
         _compact_response: bool = False,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
         for attempt in range(PLAN_REFRESH_REVISION_RETRY_ATTEMPTS):
             try:
@@ -3585,6 +3650,7 @@ class SignalDeciderNextOpenExecutionService:
                     trigger=trigger,
                     force=force,
                     _compact_response=_compact_response,
+                    _live_market_snapshot_loop=_live_market_snapshot_loop,
                 )
             except _PlanRefreshRevisionConflict as exc:
                 if attempt + 1 >= PLAN_REFRESH_REVISION_RETRY_ATTEMPTS:
@@ -3612,6 +3678,7 @@ class SignalDeciderNextOpenExecutionService:
         trigger: str = 'manual',
         force: bool = False,
         _compact_response: bool = False,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
@@ -3761,11 +3828,10 @@ class SignalDeciderNextOpenExecutionService:
             and self.live_market_snapshot_refresher is not None
         ):
             try:
-                asyncio.run(
-                    self.live_market_snapshot_refresher(
-                        trigger=f'next_open_plan:{trigger}',
-                        force_index=True,
-                    )
+                _run_live_market_snapshot_refresher_on_loop(
+                    self.live_market_snapshot_refresher,
+                    event_loop=_live_market_snapshot_loop,
+                    trigger=f'next_open_plan:{trigger}',
                 )
             except Exception as exc:
                 live_market_snapshot_refresh_error = True
@@ -4710,6 +4776,7 @@ class SignalDeciderNextOpenExecutionService:
             target_trade_date=resolved_target_date,
             trigger=f'{trigger}_prepare',
             force=force,
+            _live_market_snapshot_loop=asyncio.get_running_loop(),
         )
         enrichment_preflight = refresh_result.get('enrichment_preflight') if isinstance(refresh_result, dict) else None
         if (

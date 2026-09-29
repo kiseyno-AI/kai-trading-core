@@ -18,6 +18,9 @@ from app.market.snapshot import (
     _parse_int,
 )
 from app.market.snapshot_store import MarketSnapshotCacheRecord
+from app.orders.next_open_execution import (
+    _run_live_market_snapshot_refresher_on_loop,
+)
 
 
 def test_market_snapshot_numeric_parsers_reject_nonfinite_values() -> None:
@@ -1036,6 +1039,51 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.index_calls.count('0001'), 2)
         self.assertEqual(client.index_calls.count('1001'), 2)
         self.assertEqual(client.index_time_calls, ['0001', '1001'])
+
+    async def test_plan_thread_refresh_joins_app_loop_snapshot_flight(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = BlockingKISClient()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        app_loop = asyncio.get_running_loop()
+        refresh_loops: list[asyncio.AbstractEventLoop] = []
+        plan_refresh_started = asyncio.Event()
+
+        async def refresh(**kwargs):
+            refresh_loops.append(asyncio.get_running_loop())
+            if kwargs['trigger'] == 'next_open_plan:test':
+                plan_refresh_started.set()
+            return await service.refresh_market_snapshot_if_due(**kwargs)
+
+        app_refresh = asyncio.create_task(
+            refresh(trigger='background_runner:open', force=True)
+        )
+        await client.index_started.wait()
+        plan_refresh = asyncio.create_task(
+            asyncio.to_thread(
+                _run_live_market_snapshot_refresher_on_loop,
+                refresh,
+                event_loop=app_loop,
+                trigger='next_open_plan:test',
+            )
+        )
+        await asyncio.wait_for(plan_refresh_started.wait(), timeout=1)
+        client.release_index.set()
+        app_result, plan_result = await asyncio.gather(
+            app_refresh,
+            plan_refresh,
+        )
+
+        self.assertIsNotNone(app_result)
+        self.assertIsNotNone(plan_result)
+        self.assertEqual(refresh_loops, [app_loop, app_loop])
+        self.assertEqual(client.token_calls, 1)
+        self.assertEqual(len(client.index_calls), 4)
 
     async def test_index_refresh_skips_provider_when_another_process_owns_bucket(self) -> None:
         settings.kis_use_mock = False
