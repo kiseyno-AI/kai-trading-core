@@ -126,6 +126,12 @@ MARKET_OPEN_DRIVE_SESSION_MINUTES = 390
 # Requiring at least 25% of prior full-session value in the denominator makes the
 # opening comparison deliberately harder to pass while preserving a deterministic baseline.
 MARKET_OPEN_DRIVE_MIN_ELAPSED_FRACTION = 0.25
+KIS_BREADTH_VERIFICATION_BASIS = (
+    'kis_directional_buckets_with_same_date_completed_master_upper_bound'
+)
+KIS_BREADTH_MASTER_COUNT_RELATION = 'upper_bound'
+KIS_BREADTH_LIMIT_BUCKET_SEMANTICS = 'included_in_direction_counts'
+KIS_BREADTH_MIN_MASTER_COVERAGE_RATIO = 0.95
 MARKET_OPEN_DRIVE_MARKET_METADATA: dict[str, dict[str, str]] = {
     'KOSPI': {'snapshot_key': 'kospi', 'label': 'KOSPI', 'index_code': '0001'},
     'KOSDAQ': {'snapshot_key': 'kosdaq', 'label': 'KOSDAQ', 'index_code': '1001'},
@@ -3000,7 +3006,25 @@ def _build_market_open_drive_context(
     completeness = _maybe_dict(market_row.get('breadth_completeness'))
     expected_symbol_count = _finite_int(completeness.get('expected_symbol_count'))
     observed_symbol_count = _finite_int(completeness.get('observed_symbol_count'))
+    coverage_ratio = _finite_float(completeness.get('coverage_ratio'))
     limit_bucket_semantics = str(completeness.get('limit_bucket_semantics') or '').strip().lower()
+    verification_basis = str(completeness.get('verification_basis') or '').strip().lower()
+    master_count_relation = str(completeness.get('master_count_relation') or '').strip().lower()
+    expected_universe = _maybe_dict(completeness.get('expected_universe'))
+    master_completed_at = _open_drive_datetime(expected_universe.get('completed_at'))
+    membership_sha256 = str(expected_universe.get('membership_sha256') or '').strip().lower()
+    master_upper_bound_proof_valid = bool(
+        expected_universe.get('provider') == 'kis_master'
+        and expected_universe.get('market_date') == requested_market_date.isoformat()
+        and _finite_int(expected_universe.get('symbol_count')) == expected_symbol_count
+        and str(expected_universe.get('relation_to_observed_count') or '').strip().lower()
+        == KIS_BREADTH_MASTER_COUNT_RELATION
+        and master_completed_at is not None
+        and master_completed_at.astimezone(ZoneInfo('Asia/Seoul')).date() == requested_market_date
+        and master_completed_at <= decision_at
+        and len(membership_sha256) == 64
+        and all(character in '0123456789abcdef' for character in membership_sha256)
+    )
     all_breadth_buckets_valid = all(
         value is not None and value >= 0
         for value in raw_breadth_buckets.values()
@@ -3014,37 +3038,26 @@ def _build_market_open_drive_context(
         if all(value is not None for value in (advancers, unchanged, decliners))
         else None
     )
-    five_bucket_count = (
-        sum(value or 0 for value in raw_breadth_buckets.values())
-        if all_breadth_buckets_valid
-        else None
-    )
-    calculated_observed_count = (
-        directional_count
-        if limit_bucket_semantics == 'included_in_direction_counts'
-        else five_bucket_count
-        if limit_bucket_semantics == 'disjoint_from_direction_counts'
-        else None
-    )
-    normalized_up_count = (
-        (advancers or 0) + (upper_limit_count or 0)
-        if limit_bucket_semantics == 'disjoint_from_direction_counts'
+    limit_buckets_are_subsets = bool(
+        upper_limit_count is not None
         and advancers is not None
-        and upper_limit_count is not None
-        else advancers
-    )
-    normalized_down_count = (
-        (decliners or 0) + (lower_limit_count or 0)
-        if limit_bucket_semantics == 'disjoint_from_direction_counts'
-        and decliners is not None
+        and upper_limit_count <= advancers
         and lower_limit_count is not None
-        else decliners
+        and decliners is not None
+        and lower_limit_count <= decliners
     )
-    normalized_directional_count = (
-        normalized_up_count + unchanged + normalized_down_count
-        if normalized_up_count is not None
-        and unchanged is not None
-        and normalized_down_count is not None
+    calculated_coverage_ratio = (
+        round(observed_symbol_count / expected_symbol_count, 6)
+        if observed_symbol_count is not None
+        and expected_symbol_count is not None
+        and expected_symbol_count > 0
+        else None
+    )
+    raw_calculated_coverage_ratio = (
+        observed_symbol_count / expected_symbol_count
+        if observed_symbol_count is not None
+        and expected_symbol_count is not None
+        and expected_symbol_count > 0
         else None
     )
     breadth_complete = bool(
@@ -3054,30 +3067,43 @@ def _build_market_open_drive_context(
         and expected_symbol_count is not None
         and expected_symbol_count >= MARKET_REGIME_MIN_SYMBOL_COUNT
         and observed_symbol_count is not None
-        and observed_symbol_count == expected_symbol_count
-        and calculated_observed_count == observed_symbol_count
-        and normalized_directional_count == observed_symbol_count
+        and observed_symbol_count >= MARKET_REGIME_MIN_SYMBOL_COUNT
+        and observed_symbol_count <= expected_symbol_count
+        and coverage_ratio is not None
+        and raw_calculated_coverage_ratio is not None
+        and raw_calculated_coverage_ratio >= KIS_BREADTH_MIN_MASTER_COVERAGE_RATIO
+        and calculated_coverage_ratio is not None
+        and abs(coverage_ratio - calculated_coverage_ratio) <= 0.000001
+        and directional_count == observed_symbol_count
+        and limit_buckets_are_subsets
+        and limit_bucket_semantics == KIS_BREADTH_LIMIT_BUCKET_SEMANTICS
+        and verification_basis == KIS_BREADTH_VERIFICATION_BASIS
+        and master_count_relation == KIS_BREADTH_MASTER_COUNT_RELATION
+        and master_upper_bound_proof_valid
     )
     if breadth_complete:
-        assert normalized_up_count is not None
+        assert advancers is not None
         assert unchanged is not None
-        assert normalized_down_count is not None
+        assert decliners is not None
         market_breadth_context = {
             'status': 'available',
             'market': normalized_market,
-            'market_symbol_count': expected_symbol_count,
-            'up_count': normalized_up_count,
-            'down_count': normalized_down_count,
+            'market_symbol_count': observed_symbol_count,
+            'up_count': advancers,
+            'down_count': decliners,
             'flat_count': unchanged,
             'advance_decline_ratio': (
-                round(normalized_up_count / normalized_down_count, 4)
-                if normalized_down_count > 0
-                else float(normalized_up_count)
+                round(advancers / decliners, 4)
+                if decliners > 0
+                else float(advancers)
             ),
             'raw_buckets': raw_breadth_buckets,
             'expected_symbol_count': expected_symbol_count,
             'observed_symbol_count': observed_symbol_count,
+            'coverage_ratio': coverage_ratio,
             'limit_bucket_semantics': limit_bucket_semantics,
+            'verification_basis': verification_basis,
+            'master_count_relation': master_count_relation,
             'basis': 'kis_intraday_issue_direction_counts_with_verified_universe',
             'source': MARKET_OPEN_DRIVE_SOURCE,
             'captured_at': observed_at.isoformat(),
@@ -3107,7 +3133,10 @@ def _build_market_open_drive_context(
             'raw_buckets': raw_breadth_buckets,
             'expected_symbol_count': expected_symbol_count,
             'observed_symbol_count': observed_symbol_count,
+            'coverage_ratio': coverage_ratio,
             'limit_bucket_semantics': limit_bucket_semantics or 'unknown',
+            'verification_basis': verification_basis or None,
+            'master_count_relation': master_count_relation or None,
             'basis': 'kis_intraday_issue_direction_counts_unverified',
             'source': MARKET_OPEN_DRIVE_SOURCE,
             'captured_at': observed_at.isoformat(),

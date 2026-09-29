@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -249,7 +249,31 @@ class FakeCalendarReviewRepository:
 
 class FakeLoopRepository:
     def list_decision_snapshots(self, **kwargs):
-        return [type('Row', (), {'id': 84, 'market_date': date.fromisoformat('2026-04-23'), 'symbol': '005930'})()]
+        return [
+            type(
+                'Row',
+                (),
+                {
+                    'id': 84,
+                    'market_date': date.fromisoformat('2026-04-23'),
+                    'symbol': '005930',
+                    'feedback_received_at': datetime(
+                        2026,
+                        4,
+                        23,
+                        6,
+                        tzinfo=timezone.utc,
+                    ),
+                    'created_at': datetime(
+                        2026,
+                        4,
+                        23,
+                        6,
+                        tzinfo=timezone.utc,
+                    ),
+                },
+            )()
+        ]
 
 
 class FakeLoopService:
@@ -308,6 +332,51 @@ class SignalDeciderCalendarReviewServiceTests(unittest.TestCase):
         self.assertEqual(self.loop_service.compute_args['horizons'], [1, 3, 5])
         self.assertEqual(sorted(item['primary_horizon_days'] for item in self.repository.items.values()), [3, 5])
         self.assertEqual(result['run']['status'], 'completed')
+
+    def test_refresh_reviews_excludes_snapshots_invalid_for_source_date(self) -> None:
+        valid_row = self.loop_service.repository.list_decision_snapshots()[0]
+        invalid_row = type(
+            'Row',
+            (),
+            {
+                'id': 85,
+                'market_date': date.fromisoformat('2026-04-23'),
+                'symbol': '000660',
+                'feedback_received_at': datetime(
+                    2026,
+                    4,
+                    24,
+                    1,
+                    tzinfo=timezone.utc,
+                ),
+                'created_at': datetime(
+                    2026,
+                    4,
+                    24,
+                    1,
+                    tzinfo=timezone.utc,
+                ),
+            },
+        )()
+        self.loop_service.repository.list_decision_snapshots = lambda **kwargs: [
+            valid_row,
+            invalid_row,
+        ]
+
+        self.service.refresh_reviews(
+            market_date_from='2026-04-23',
+            market_date_to='2026-04-23',
+            primary_horizons=[5],
+            evaluation_version='signal_decider_eval_test',
+            trigger='test_runner',
+            refresh_evaluations=False,
+            evaluation_refresh_summary={'computed_count': 1},
+        )
+
+        self.assertEqual(
+            [row.id for row in self.loop_service.build_args[0]['rows']],
+            [84],
+        )
 
     def test_refresh_recent_reviews_forwards_suppressed_evaluation_refresh(self) -> None:
         evaluation_summary = {'computed_count': 3, 'not_computed_count': 0}

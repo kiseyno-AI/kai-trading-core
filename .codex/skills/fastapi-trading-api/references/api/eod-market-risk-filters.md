@@ -7,7 +7,7 @@ The compute path now runs in two layers:
 - collect or reuse stored KIS `inquire-price-2` snapshots first
 - evaluate focused policy rules second and store the downstream result rows in `daily_market_risk_filter_results`
 
-Both layers are current-date only. For a prior `market_date`, the POST route returns HTTP 200 with an auditable safe-skip response and neither calls KIS nor writes filter rows from current observations. Use the GET route to inspect rows already persisted for that historical date.
+Both layers normally run only for the current Seoul market date. The sole prior-date exception is the immediately previous KRX trading session while the current trading day is still `PREOPEN`. In that bounded recovery window, the POST route may admit an official run, call KIS through snapshot collection, and persist snapshot and filter rows for the previous session. Older dates and every prior-date request once the market is `OPEN` or later return HTTP 200 with the auditable safe-skip response below, before official-run admission, KIS access, or result persistence. Use the GET route to inspect rows already persisted for other historical dates.
 
 The async POST route resolves the current Seoul market date through the asynchronous market clock before applying that fence, so a cold calendar cache cannot move synchronous KIS calendar I/O onto the FastAPI event loop.
 
@@ -55,7 +55,7 @@ POST /eod/market-risk-filters/compute?market_date=2026-04-15&symbols=005930,0006
 }
 ```
 
-## Prior-date safe-skip response
+## Prior-date safe-skip response outside the PREOPEN exception
 
 ```json
 {

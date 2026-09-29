@@ -211,6 +211,17 @@ def _stable_macro_context(value: Any) -> Any:
     return result
 
 
+def _durable_macro_context(value: Any) -> Any:
+    """Remove invocation metadata while preserving the macro data snapshot."""
+    result = _stable_macro_context(value)
+    if not isinstance(result, dict):
+        return result
+    freshness = result.get('freshness')
+    if isinstance(freshness, dict):
+        freshness.pop('knowledge_cutoff_applied', None)
+    return result
+
+
 def _source_names(value: Any) -> tuple[Any, ...]:
     """Normalize provenance source fields without treating text as characters."""
     if value is None:
@@ -237,7 +248,7 @@ def _durable_decider_source_context(item: dict[str, Any]) -> dict[str, Any]:
     }
 
     if 'macro_context' in projected:
-        projected['macro_context'] = _stable_macro_context(
+        projected['macro_context'] = _durable_macro_context(
             projected['macro_context']
         )
     company = item.get('company')
@@ -307,6 +318,48 @@ def _durable_decider_source_context(item: dict[str, Any]) -> dict[str, Any]:
             if key in DURABLE_DECIDER_AVAILABILITY_KEYS
         }
     return projected
+
+
+def durable_decider_source_context_fingerprint_matches(
+    *,
+    expected_fingerprint: Any,
+    observed_fingerprint: Any,
+    refreshed_source_context: dict[str, Any],
+) -> bool:
+    """Accept only the known legacy cutoff-marker fingerprint difference.
+
+    Older durable generations included ``macro_context.freshness``'s
+    ``knowledge_cutoff_applied`` invocation marker. The knowledge boundary is
+    independently bound by ``source_knowledge_cutoff_fingerprint``, so the
+    marker itself is not source data. Reconstructing the two legacy values from
+    the refreshed durable projection keeps every material field in the hash and
+    therefore still rejects real macro or eligibility changes.
+    """
+    if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
+        return False
+    if expected_fingerprint == observed_fingerprint:
+        return True
+
+    projected = _durable_decider_source_context(refreshed_source_context)
+    macro_context = projected.get('macro_context')
+    if not isinstance(macro_context, dict):
+        return False
+    freshness = macro_context.get('freshness')
+    if not isinstance(freshness, dict):
+        return False
+
+    legacy_fingerprints: set[str] = set()
+    for marker in (False, None):
+        legacy_projection = deepcopy(projected)
+        legacy_projection['macro_context']['freshness'][
+            'knowledge_cutoff_applied'
+        ] = marker
+        legacy_fingerprints.add(
+            build_decider_source_context_generation(legacy_projection)[
+                'fingerprint'
+            ]
+        )
+    return expected_fingerprint in legacy_fingerprints
 
 
 def build_durable_decider_input_generation(

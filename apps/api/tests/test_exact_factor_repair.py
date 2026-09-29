@@ -706,28 +706,21 @@ def _unique_numeric_symbol() -> str:
     return f'{900_000 + (int(uuid4().hex[:8], 16) % 99_999):06d}'
 
 
-def test_stale_scope_query_is_symbol_driven_composite_index_probe() -> None:
-    query = exact_factor_repair._build_symbol_driven_factor_symbols_query(
+def test_stale_scope_query_is_factor_date_index_driven() -> None:
+    query = exact_factor_repair._build_factor_symbols_for_date_query(
         DailyAdvancedValueFactorResult,
         market_date=date(2026, 9, 23),
     )
     compiled = str(query.compile(compile_kwargs={'literal_binds': True}))
 
-    assert 'FROM symbols' in compiled
+    assert 'FROM daily_advanced_value_factor_results JOIN symbols' in compiled
     assert "symbols.market IN ('KOSPI', 'KOSDAQ')" in compiled
-    assert 'EXISTS (SELECT 1' in compiled
-    assert (
-        'daily_advanced_value_factor_results.symbol_id = symbols.id'
-        in compiled
-    )
+    assert 'symbols.id = daily_advanced_value_factor_results.symbol_id' in compiled
     assert (
         "daily_advanced_value_factor_results.market_date = '2026-09-23'"
         in compiled
     )
-    assert 'OFFSET 0' in compiled
-    assert not compiled.startswith(
-        'SELECT daily_advanced_value_factor_results.symbol_id'
-    )
+    assert 'NOT IN' not in compiled
 
 
 def _unique_alphanumeric_symbol() -> str:
@@ -843,6 +836,65 @@ def test_stale_scope_loader_reports_only_symbols_outside_membership(
         }
     finally:
         _cleanup_symbols(symbols)
+
+
+def test_stale_scope_loader_filters_large_membership_in_memory(
+    monkeypatch,
+) -> None:
+    market_date = date(2026, 9, 23)
+    exact_symbols = [f'{value:06d}' for value in range(1, 2_768)]
+    protected_symbol = '00104K'
+    stale_symbol = '999999'
+    observed_market_dates: list[date] = []
+
+    class _Session:
+        @staticmethod
+        def scalars(_statement):
+            return [exact_symbols[0], protected_symbol, stale_symbol]
+
+    @contextmanager
+    def _session_scope(**kwargs):
+        assert kwargs == {
+            'statement_timeout_ms': (
+                exact_factor_repair.EXACT_FACTOR_REPAIR_STATEMENT_TIMEOUT_MS
+            )
+        }
+        yield _Session()
+
+    def _query_builder(
+        _model,
+        *,
+        market_date: date,
+    ):
+        assert market_date == date(2026, 9, 23)
+        observed_market_dates.append(market_date)
+        return object()
+
+    monkeypatch.setattr(
+        exact_factor_repair,
+        'FACTOR_RESULT_MODELS',
+        {'value_factors': DailyValueFactorResult},
+    )
+    monkeypatch.setattr(exact_factor_repair, 'session_scope', _session_scope)
+    monkeypatch.setattr(
+        exact_factor_repair,
+        '_build_factor_symbols_for_date_query',
+        _query_builder,
+    )
+
+    result = exact_factor_repair.load_stale_outside_membership_details(
+        market_date=market_date,
+        exact_symbols=exact_symbols,
+        protected_symbols=[protected_symbol],
+    )
+
+    assert observed_market_dates == [market_date]
+    assert result == {
+        'value_factors': {
+            'count': 1,
+            'symbol_preview': [stale_symbol],
+        }
+    }
 
 
 def test_database_verifier_rejects_same_count_wrong_symbol(monkeypatch) -> None:

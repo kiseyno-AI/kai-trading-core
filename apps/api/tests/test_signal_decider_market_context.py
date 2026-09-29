@@ -28,6 +28,21 @@ class FakeWeekendMarketState:
     market_session = 'weekend'
 
 
+class FakeCurrentMarketState:
+    def __init__(self, *, state: str, server_time: str, is_open: bool) -> None:
+        self.state = state
+        self.is_trading_day = True
+        self.is_open = is_open
+        self.reason = None
+        self.server_time = server_time
+        self.current_calendar_date = server_time[:10]
+        self.latest_valid_trading_date = self.current_calendar_date
+        self.market_session = state.lower()
+        self.calendar_source = 'exchange_calendars'
+        self.calendar_source_status = 'ok'
+        self.calendar_source_error = None
+
+
 def _snapshot_payload(
     *,
     fallback_applied: bool = False,
@@ -100,6 +115,74 @@ def _snapshot_payload(
 
 
 class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
+    def test_historical_build_is_stable_across_current_session_transitions(self) -> None:
+        snapshot_service = FakeSnapshotService(_snapshot_payload())
+        preopen_builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=snapshot_service,
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='PREOPEN',
+                server_time='2026-04-30T08:40:00+09:00',
+                is_open=False,
+            ),
+        )
+        open_builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=snapshot_service,
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='OPEN',
+                server_time='2026-04-30T09:10:00+09:00',
+                is_open=True,
+            ),
+        )
+
+        preopen_result = preopen_builder.build(market_date=date(2026, 4, 29))
+        open_result = open_builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(preopen_result, open_result)
+        self.assertIsNone(preopen_result['market_session']['current_calendar_date'])
+        self.assertIsNone(preopen_result['market_session']['current_market_state'])
+        self.assertIsNone(preopen_result['market_session']['current_market_session'])
+        self.assertEqual(
+            preopen_result['market_session']['recommendation_basis'],
+            'latest_completed_eod',
+        )
+
+    def test_historical_build_rejects_current_session_snapshot(self) -> None:
+        snapshot = _snapshot_payload()
+        snapshot['as_of'] = datetime.fromisoformat('2026-04-30T09:10:00+09:00')
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(snapshot),
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='OPEN',
+                server_time='2026-04-30T09:10:00+09:00',
+                is_open=True,
+            ),
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['indices'], {})
+        self.assertEqual(result['fx'], {})
+        self.assertEqual(result['flows'], {})
+        self.assertEqual(result['stale_reason'], 'historical_eod_snapshot_unavailable')
+
+    def test_current_date_build_preserves_live_session_state(self) -> None:
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(_snapshot_payload()),
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='OPEN',
+                server_time='2026-04-29T10:05:12+09:00',
+                is_open=True,
+            ),
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['market_session']['market_state'], 'OPEN')
+        self.assertEqual(result['market_session']['current_market_state'], 'OPEN')
+        self.assertEqual(result['market_session']['recommendation_basis'], 'live_intraday')
+
     def test_build_returns_ready_context_when_snapshot_is_complete(self) -> None:
         builder = SignalDeciderMarketContextBuilder(snapshot_service=FakeSnapshotService(_snapshot_payload()))
 

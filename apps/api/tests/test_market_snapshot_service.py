@@ -18,6 +18,9 @@ from app.market.snapshot import (
     _parse_int,
 )
 from app.market.snapshot_store import MarketSnapshotCacheRecord
+from app.orders.next_open_execution import (
+    _run_live_market_snapshot_refresher_on_loop,
+)
 
 
 def test_market_snapshot_numeric_parsers_reject_nonfinite_values() -> None:
@@ -568,7 +571,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             response_received_at.isoformat(),
         )
 
-    async def test_completed_same_date_kis_master_proves_five_bucket_breadth_completeness(self) -> None:
+    async def test_completed_same_date_kis_master_bounds_provider_directional_breadth(self) -> None:
         settings.kis_use_mock = False
         settings.market_snapshot_kis_use_real = True
         service = MarketSnapshotService(
@@ -605,16 +608,173 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         kosdaq = result['markets']['kosdaq']
         self.assertEqual(kospi['breadth_completeness']['status'], 'verified')
         self.assertEqual(kospi['breadth_completeness']['expected_symbol_count'], 940)
+        self.assertEqual(kospi['breadth_completeness']['observed_symbol_count'], 936)
+        self.assertEqual(kospi['breadth_completeness']['coverage_ratio'], 0.995745)
         self.assertEqual(
             kospi['breadth_completeness']['limit_bucket_semantics'],
-            'disjoint_from_direction_counts',
+            'included_in_direction_counts',
+        )
+        self.assertEqual(
+            kospi['breadth_completeness']['verification_basis'],
+            'kis_directional_buckets_with_same_date_completed_master_upper_bound',
+        )
+        self.assertEqual(
+            kospi['breadth_completeness']['master_count_relation'],
+            'upper_bound',
         )
         self.assertEqual(kosdaq['breadth_completeness']['status'], 'verified')
         self.assertEqual(kosdaq['breadth_completeness']['expected_symbol_count'], 1647)
+        self.assertEqual(kosdaq['breadth_completeness']['observed_symbol_count'], 1638)
         self.assertEqual(
             kospi['breadth_completeness']['expected_universe']['provider'],
             'kis_master',
         )
+
+    async def test_breadth_completeness_rejects_limit_bucket_subset_violations(self) -> None:
+        service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        target = MARKET_SNAPSHOT_TARGETS[0]
+        master_symbols = [
+            SimpleNamespace(symbol=f'P{index:04d}', market='KOSPI')
+            for index in range(940)
+        ]
+        master_state = SimpleNamespace(
+            symbols=master_symbols,
+            snapshot=lambda: {
+                'market_date': '2026-04-29',
+                'last_status': 'completed',
+                'last_completed_at': '2026-04-29T00:00:00+00:00',
+                'symbol_count': 940,
+                'kospi_count': 940,
+                'kosdaq_count': 0,
+            },
+        )
+        base_row = {
+            'provider_observed_at': '2026-04-29T10:05:00+09:00',
+            'breadth_raw_buckets': {
+                'upper_limit_count': 3,
+                'advancers': 512,
+                'unchanged': 94,
+                'decliners': 330,
+                'lower_limit_count': 1,
+            },
+        }
+
+        with patch('app.market.snapshot.master_refresh_state', master_state):
+            upper_violation = deepcopy(base_row)
+            upper_violation['breadth_raw_buckets']['upper_limit_count'] = 513
+            upper_result = service._build_breadth_completeness(
+                target=target,
+                market_row=upper_violation,
+            )
+            lower_violation = deepcopy(base_row)
+            lower_violation['breadth_raw_buckets']['lower_limit_count'] = 331
+            lower_result = service._build_breadth_completeness(
+                target=target,
+                market_row=lower_violation,
+            )
+
+        self.assertEqual(upper_result['status'], 'unverified')
+        self.assertEqual(upper_result['reason'], 'provider_limit_bucket_subset_invalid')
+        self.assertEqual(lower_result['status'], 'unverified')
+        self.assertEqual(lower_result['reason'], 'provider_limit_bucket_subset_invalid')
+
+    async def test_breadth_completeness_rejects_directional_count_above_master(self) -> None:
+        service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        target = MARKET_SNAPSHOT_TARGETS[0]
+        master_symbols = [
+            SimpleNamespace(symbol=f'P{index:04d}', market='KOSPI')
+            for index in range(940)
+        ]
+        master_state = SimpleNamespace(
+            symbols=master_symbols,
+            snapshot=lambda: {
+                'market_date': '2026-04-29',
+                'last_status': 'completed',
+                'last_completed_at': '2026-04-29T00:00:00+00:00',
+                'symbol_count': 940,
+                'kospi_count': 940,
+                'kosdaq_count': 0,
+            },
+        )
+        market_row = {
+            'provider_observed_at': '2026-04-29T10:05:00+09:00',
+            'breadth_raw_buckets': {
+                'upper_limit_count': 3,
+                'advancers': 520,
+                'unchanged': 94,
+                'decliners': 327,
+                'lower_limit_count': 1,
+            },
+        }
+
+        with patch('app.market.snapshot.master_refresh_state', master_state):
+            result = service._build_breadth_completeness(
+                target=target,
+                market_row=market_row,
+            )
+
+        self.assertEqual(result['status'], 'unverified')
+        self.assertEqual(
+            result['reason'],
+            'provider_directional_count_exceeds_master_upper_bound',
+        )
+
+    async def test_breadth_completeness_rejects_truncated_directional_coverage(self) -> None:
+        service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        target = MARKET_SNAPSHOT_TARGETS[0]
+        master_symbols = [
+            SimpleNamespace(symbol=f'P{index:04d}', market='KOSPI')
+            for index in range(940)
+        ]
+        master_state = SimpleNamespace(
+            symbols=master_symbols,
+            snapshot=lambda: {
+                'market_date': '2026-04-29',
+                'last_status': 'completed',
+                'last_completed_at': '2026-04-29T00:00:00+00:00',
+                'symbol_count': 940,
+                'kospi_count': 940,
+                'kosdaq_count': 0,
+            },
+        )
+        market_row = {
+            'provider_observed_at': '2026-04-29T10:05:00+09:00',
+            'breadth_raw_buckets': {
+                'upper_limit_count': 1,
+                'advancers': 300,
+                'unchanged': 50,
+                'decliners': 400,
+                'lower_limit_count': 1,
+            },
+        }
+
+        with patch('app.market.snapshot.master_refresh_state', master_state):
+            result = service._build_breadth_completeness(
+                target=target,
+                market_row=market_row,
+            )
+
+        self.assertEqual(result['status'], 'unverified')
+        self.assertEqual(
+            result['reason'],
+            'provider_directional_coverage_below_minimum',
+        )
+        self.assertEqual(result['coverage_ratio'], 0.797872)
 
     async def test_flow_failure_keeps_fresh_index_leg_available(self) -> None:
         settings.kis_use_mock = False
@@ -879,6 +1039,51 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.index_calls.count('0001'), 2)
         self.assertEqual(client.index_calls.count('1001'), 2)
         self.assertEqual(client.index_time_calls, ['0001', '1001'])
+
+    async def test_plan_thread_refresh_joins_app_loop_snapshot_flight(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = BlockingKISClient()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        app_loop = asyncio.get_running_loop()
+        refresh_loops: list[asyncio.AbstractEventLoop] = []
+        plan_refresh_started = asyncio.Event()
+
+        async def refresh(**kwargs):
+            refresh_loops.append(asyncio.get_running_loop())
+            if kwargs['trigger'] == 'next_open_plan:test':
+                plan_refresh_started.set()
+            return await service.refresh_market_snapshot_if_due(**kwargs)
+
+        app_refresh = asyncio.create_task(
+            refresh(trigger='background_runner:open', force=True)
+        )
+        await client.index_started.wait()
+        plan_refresh = asyncio.create_task(
+            asyncio.to_thread(
+                _run_live_market_snapshot_refresher_on_loop,
+                refresh,
+                event_loop=app_loop,
+                trigger='next_open_plan:test',
+            )
+        )
+        await asyncio.wait_for(plan_refresh_started.wait(), timeout=1)
+        client.release_index.set()
+        app_result, plan_result = await asyncio.gather(
+            app_refresh,
+            plan_refresh,
+        )
+
+        self.assertIsNotNone(app_result)
+        self.assertIsNotNone(plan_result)
+        self.assertEqual(refresh_loops, [app_loop, app_loop])
+        self.assertEqual(client.token_calls, 1)
+        self.assertEqual(len(client.index_calls), 4)
 
     async def test_index_refresh_skips_provider_when_another_process_owns_bucket(self) -> None:
         settings.kis_use_mock = False

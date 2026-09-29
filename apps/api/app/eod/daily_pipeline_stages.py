@@ -46,6 +46,7 @@ from app.eod.pykrx_pipeline_runner import (
     POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS,
     POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS,
     resolve_point_in_time_recovery,
+    should_skip_point_in_time_current_only_stage,
 )
 from app.eod.run_stage_support import (
     EXPIRED_DECISION_REPLAY_STAGE_IDS,
@@ -2000,6 +2001,11 @@ class DailyPipelineStageService:
         if (
             point_in_time_recovery
             and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
+            and should_skip_point_in_time_current_only_stage(
+                stage_id=stage_id,
+                market_date=market_date,
+                market=get_market_state(),
+            )
         ):
             return {
                 'triggered': False,

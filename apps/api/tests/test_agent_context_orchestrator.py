@@ -15,6 +15,7 @@ from unittest.mock import patch
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import (
+    build_decider_source_context_generation,
     build_durable_decider_input_generation,
     build_response_storage_payload,
     build_signal_decider_payload,
@@ -22,6 +23,7 @@ from app.agent_context.orchestrator_helpers import (
     compressed_batch_item_for_prompt,
     correlate_decoded_batch_response,
     extract_response_mismatch_flags,
+    durable_decider_source_context_fingerprint_matches,
     trim_batch_item_for_prompt,
 )
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
@@ -418,6 +420,88 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
         )
 
         self.assertNotEqual(friday_close, later_cutoff)
+
+    def test_cutoff_application_marker_does_not_revoke_durable_generation(self):
+        without_explicit_cutoff = self._source_context()
+        without_explicit_cutoff['macro_context']['freshness'] = {
+            'knowledge_cutoff_applied': False,
+            'knowledge_cutoff_at': '2026-04-23T06:30:00+00:00',
+        }
+        with_explicit_cutoff = deepcopy(without_explicit_cutoff)
+        with_explicit_cutoff['macro_context']['freshness'][
+            'knowledge_cutoff_applied'
+        ] = True
+
+        self.assertEqual(
+            build_durable_decider_input_generation(
+                source_context=without_explicit_cutoff,
+                source_knowledge_cutoff_at='2026-04-23T06:30:00+00:00',
+            ),
+            build_durable_decider_input_generation(
+                source_context=with_explicit_cutoff,
+                source_knowledge_cutoff_at='2026-04-23T06:30:00+00:00',
+            ),
+        )
+
+    def test_legacy_false_cutoff_marker_matches_only_unchanged_durable_source(self):
+        refreshed = {
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+            'macro_context': {
+                'status': 'available',
+                'freshness': {
+                    'status': 'fresh',
+                    'knowledge_cutoff_applied': True,
+                    'knowledge_cutoff_at': '2026-04-23T06:30:00+00:00',
+                },
+                'series': [
+                    {'series_id': 'DEXKOUS', 'latest_value': 1380.5}
+                ],
+            },
+        }
+        legacy_source = deepcopy(refreshed)
+        legacy_source['macro_context']['freshness'][
+            'knowledge_cutoff_applied'
+        ] = False
+        legacy_fingerprint = build_decider_source_context_generation(
+            legacy_source
+        )['fingerprint']
+        observed_fingerprint = build_durable_decider_input_generation(
+            source_context=refreshed
+        )['source_context_fingerprint']
+
+        self.assertTrue(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=legacy_fingerprint,
+                observed_fingerprint=observed_fingerprint,
+                refreshed_source_context=refreshed,
+            )
+        )
+        legacy_source['macro_context']['freshness'][
+            'knowledge_cutoff_applied'
+        ] = None
+        self.assertTrue(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=build_decider_source_context_generation(
+                    legacy_source
+                )['fingerprint'],
+                observed_fingerprint=observed_fingerprint,
+                refreshed_source_context=refreshed,
+            )
+        )
+
+        changed_series = deepcopy(refreshed)
+        changed_series['macro_context']['series'][0]['latest_value'] = 1401.0
+        changed_observed_fingerprint = build_durable_decider_input_generation(
+            source_context=changed_series
+        )['source_context_fingerprint']
+        self.assertFalse(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=legacy_fingerprint,
+                observed_fingerprint=changed_observed_fingerprint,
+                refreshed_source_context=changed_series,
+            )
+        )
 
     def test_actionable_legacy_snapshot_is_not_execution_valid(self):
         snapshot = SimpleNamespace(

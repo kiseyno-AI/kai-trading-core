@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -285,6 +286,7 @@ async def list_next_open_execution_plan(
             target_trade_date=target_trade_date,
             account_reference=account_reference,
             refresh=refresh,
+            _live_market_snapshot_loop=asyncio.get_running_loop(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

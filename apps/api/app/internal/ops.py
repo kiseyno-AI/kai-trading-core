@@ -569,10 +569,12 @@ def collect_market_risk_snapshots(
     market_code: str = 'J',
 ) -> dict[str, Any]:
     bootstrap_runtime()
+    market_state = get_market_state()
     safety_skip = build_prior_date_current_only_stage_skip(
         stage_id='market_risk_snapshots',
         market_date=market_date,
-        current_market_date=str(get_market_state().server_time)[:10],
+        current_market_date=str(market_state.server_time)[:10],
+        market=market_state,
     )
     if safety_skip is not None:
         return safety_skip

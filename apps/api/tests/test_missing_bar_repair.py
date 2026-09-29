@@ -14,10 +14,12 @@ from sqlalchemy.orm import Session
 from app.db import engine
 from app.db_models import DailyPriceBar, Symbol
 from app.eod.missing_bar_repair import (
+    MISSING_BAR_INSERT_BATCH_SIZE,
     MissingDailyBar,
     MissingDailyBarRepairService,
     _extract_market_fundamentals,
     _extract_market_ohlcv,
+    _missing_bar_insert_batches,
     main,
     repair_missing_daily_price_bars,
 )
@@ -76,6 +78,23 @@ def _available_lock(**_kwargs):
 
 
 class MissingBarProviderValidationTests(unittest.TestCase):
+    def test_missing_bar_insert_batches_bound_statement_size(self):
+        values = [
+            {'symbol_id': index}
+            for index in range(MISSING_BAR_INSERT_BATCH_SIZE * 2 + 1)
+        ]
+
+        batches = list(_missing_bar_insert_batches(values))
+
+        self.assertEqual(
+            [len(batch) for batch in batches],
+            [MISSING_BAR_INSERT_BATCH_SIZE, MISSING_BAR_INSERT_BATCH_SIZE, 1],
+        )
+        self.assertEqual(
+            [item for batch in batches for item in batch],
+            values,
+        )
+
     def test_extracts_required_ohlcv_and_skips_non_numeric_codes(self):
         frame = _FakeFrame(
             {

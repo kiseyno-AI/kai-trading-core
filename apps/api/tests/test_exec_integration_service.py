@@ -4530,6 +4530,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                             'expected_symbol_count': symbol_count,
                             'observed_symbol_count': symbol_count,
                             'limit_bucket_semantics': 'included_in_direction_counts',
+                            'verification_basis': (
+                                'kis_directional_buckets_with_same_date_completed_master_upper_bound'
+                            ),
+                            'master_count_relation': 'upper_bound',
+                            'coverage_ratio': 1.0,
                             'expected_universe': {
                                 'provider': 'kis_master',
                                 'market_date': observed_at.date().isoformat(),
@@ -4539,6 +4544,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                                     second=0,
                                 ).isoformat(),
                                 'symbol_count': symbol_count,
+                                'relation_to_observed_count': 'upper_bound',
                                 'membership_sha256': 'a' * 64,
                             },
                         },

@@ -11,7 +11,7 @@ The default operator sequence now includes `pykrx_enrichment` immediately after 
 
 ## Historical recovery boundary
 
-An explicit prior `market_date` submitted through this route uses trigger `manual_api` and automatically enables point-in-time recovery. The following current-only stages return an HTTP 200 safe-skip result rather than reading live data or writing it into a historical date: `master_refresh`, `pykrx_universe_refresh`, `signal_features`, `market_risk_snapshots`, `market_risk_filter`, `fundamentals_daily_refresh`, `external_news_collect`, `external_news_enrich`, `macro_context_refresh`, and `intraday_snapshots`.
+An explicit prior `market_date` submitted through this route uses trigger `manual_api` and automatically enables point-in-time recovery. The following current-only stages return an HTTP 200 safe-skip result rather than reading live data or writing it into a historical date: `master_refresh`, `pykrx_universe_refresh`, `signal_features`, `fundamentals_daily_refresh`, `external_news_collect`, `external_news_enrich`, `macro_context_refresh`, and `intraday_snapshots`. `market_risk_snapshots` and `market_risk_filter` follow that rule except for the immediately previous KRX trading session during the current trading day's `PREOPEN`; in that bounded window they may call KIS and persist rows for the previous session. Older dates and all prior-date requests from `OPEN` onward still safe-skip.
 
 Once the target next-open window has passed, `agent_feedback_summaries`, `signal_decider`, and `signal_decider_evaluations` return a `next_open_window_expired` result with their stage ID. `next_open_execution_plan` returns the same expiry reason without creating or refreshing plan items. These are auditable no-ops; they must not be interpreted as successful historical decisions.
 
@@ -113,7 +113,7 @@ The request above omits `market_date`, so the service resolves it at request tim
 }
 ```
 
-For a prior-date recovery, current-only stage results have this exact shape:
+Outside the bounded market-risk `PREOPEN` exception, prior-date current-only stage results have this exact shape:
 
 ```json
 {

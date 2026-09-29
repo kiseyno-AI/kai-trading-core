@@ -4203,20 +4203,57 @@ class SignalDeciderExecIntegrationService:
             'accounts': {},
             'errors': [],
         }
-        if not execution_control_disabled:
+        buy_authority_sync_deferred = bool(
+            not execution_control_disabled and refresh_plan
+        )
+        buy_authority_sync_completed = False
+
+        async def synchronize_buy_authority_if_needed() -> None:
+            nonlocal buy_authority_sync, buy_authority_sync_completed
+            if execution_control_disabled or buy_authority_sync_completed:
+                return
             buy_authority_sync = await self._synchronize_open_buy_authority(
                 target_trade_date=resolved_target_date,
                 account_reference=resolved_account_reference,
                 integration=integration,
             )
+            buy_authority_sync_completed = True
 
-        await self._reconcile_pending_dispatch_write_ahead(
-            target_trade_date=resolved_target_date,
-            account_reference=resolved_account_reference,
-            integration=integration,
-            buy_authority_sync=buy_authority_sync,
-            trigger=trigger,
-        )
+        reconciliation_buy_authority_sync = buy_authority_sync
+        if not execution_control_disabled:
+            if buy_authority_sync_deferred:
+                # Preserve accepted-remote write-ahead recovery before the
+                # planner can revise local rows, but never retry a missing
+                # remote BUY against authority sampled before that refresh.
+                reconciliation_buy_authority_sync = {
+                    'applies': True,
+                    'route_action': 'block_new_buy',
+                    'route_status': 'plan_refresh_pending',
+                    'source_observed_at': None,
+                    'accounts': {},
+                    'errors': [
+                        'OPEN buy authority is deferred until the refreshed '
+                        'plan has sampled current live market evidence.'
+                    ],
+                }
+            else:
+                await synchronize_buy_authority_if_needed()
+                reconciliation_buy_authority_sync = buy_authority_sync
+
+        try:
+            await self._reconcile_pending_dispatch_write_ahead(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                integration=integration,
+                buy_authority_sync=reconciliation_buy_authority_sync,
+                trigger=trigger,
+            )
+        except Exception:
+            # Before this ordering fix, authority had already been synchronized
+            # here. Preserve that fail-closed operational guarantee on an
+            # unexpected pre-refresh reconciliation failure.
+            await synchronize_buy_authority_if_needed()
+            raise
         managed_delegated_authority = bool(
             execution_control_disabled
             and self.should_manage_delegated_authority(
@@ -4304,6 +4341,7 @@ class SignalDeciderExecIntegrationService:
             }
 
         if not force and not resolved_dry_run and _calendar_day_requires_operator_override(calendar_day):
+            await synchronize_buy_authority_if_needed()
             plan_view = signal_decider_next_open_execution_service.list_plan_items(
                 target_trade_date=resolved_target_date,
                 account_reference=resolved_account_reference,
@@ -4377,13 +4415,20 @@ class SignalDeciderExecIntegrationService:
             }
 
         enrichment_preflight: dict[str, Any] | None = None
+        plan_refreshed_since_buy_authority_sync = False
         if refresh_plan:
-            refresh_result = await asyncio.to_thread(
-                signal_decider_next_open_execution_service.refresh_plan_items,
-                target_trade_date=resolved_target_date,
-                trigger=f'{trigger}_plan_refresh',
-                force=force,
-            )
+            try:
+                refresh_result = await asyncio.to_thread(
+                    signal_decider_next_open_execution_service.refresh_plan_items,
+                    target_trade_date=resolved_target_date,
+                    trigger=f'{trigger}_plan_refresh',
+                    force=force,
+                    _live_market_snapshot_loop=asyncio.get_running_loop(),
+                )
+            except Exception:
+                await synchronize_buy_authority_if_needed()
+                raise
+            plan_refreshed_since_buy_authority_sync = True
             enrichment_preflight = (
                 refresh_result.get('enrichment_preflight')
                 if isinstance(refresh_result, dict)
@@ -4405,21 +4450,44 @@ class SignalDeciderExecIntegrationService:
                 trigger=f'{trigger}_dispatch',
             )
 
-        revocation_results = await self._flush_pending_exec_revocations(
-            target_trade_date=resolved_target_date,
-            account_reference=resolved_account_reference,
-            integration=integration,
-            trigger=trigger,
-        )
-        if any(
-            result.get('status') == 'revoked' and result.get('replacement_actionable')
-            for result in revocation_results
-        ):
-            await asyncio.to_thread(
-                signal_decider_next_open_execution_service.refresh_plan_items,
+        try:
+            revocation_results = await self._flush_pending_exec_revocations(
                 target_trade_date=resolved_target_date,
-                trigger=f'{trigger}_revocation_ack_refresh',
-                force=force,
+                account_reference=resolved_account_reference,
+                integration=integration,
+                trigger=trigger,
+            )
+            if any(
+                result.get('status') == 'revoked'
+                and result.get('replacement_actionable')
+                for result in revocation_results
+            ):
+                await asyncio.to_thread(
+                    signal_decider_next_open_execution_service.refresh_plan_items,
+                    target_trade_date=resolved_target_date,
+                    trigger=f'{trigger}_revocation_ack_refresh',
+                    force=force,
+                    _live_market_snapshot_loop=asyncio.get_running_loop(),
+                )
+                plan_refreshed_since_buy_authority_sync = True
+        except Exception:
+            await synchronize_buy_authority_if_needed()
+            raise
+
+        if (
+            not execution_control_disabled
+            and plan_refreshed_since_buy_authority_sync
+        ):
+            # The planner may refresh the persisted live snapshot after several
+            # minutes of source validation. Bind Exec to that final evidence,
+            # not to the cache generation that existed before planning began.
+            await synchronize_buy_authority_if_needed()
+            await self._reconcile_pending_dispatch_write_ahead(
+                target_trade_date=resolved_target_date,
+                account_reference=resolved_account_reference,
+                integration=integration,
+                buy_authority_sync=buy_authority_sync,
+                trigger=f'{trigger}_post_refresh_authority',
             )
 
         if enrichment_preflight is not None and not force and not enrichment_preflight.get('allowed'):

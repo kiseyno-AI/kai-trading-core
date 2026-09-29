@@ -30,6 +30,7 @@ from app.eod.run_stage_support import (
 )
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.market.clock import get_market_state
+from app.market.session import previous_krx_trading_date
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,66 @@ POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS: frozenset[str] = frozenset(
         'manual_daily_api',
     }
 )
+PREOPEN_PREVIOUS_SESSION_CURRENT_ONLY_STAGE_IDS: frozenset[str] = frozenset(
+    {
+        'market_risk_snapshots',
+        'market_risk_filter',
+    }
+)
+
+
+def _parse_market_date(value: str | date) -> date:
+    normalized = str(value).strip()
+    if len(normalized) == 8 and normalized.isdigit():
+        return datetime.strptime(normalized, '%Y%m%d').date()
+    return date.fromisoformat(normalized[:10])
+
+
+def should_skip_point_in_time_current_only_stage(
+    *,
+    stage_id: str,
+    market_date: str | date,
+    market: Any | None = None,
+    current_market_date: str | date | None = None,
+    previous_trading_date: str | date | None = None,
+) -> bool:
+    """Allow only the immediately previous KRX session before today's open."""
+
+    if stage_id not in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS:
+        return False
+    if stage_id not in PREOPEN_PREVIOUS_SESSION_CURRENT_ONLY_STAGE_IDS:
+        return True
+
+    resolved_market = market if market is not None else get_market_state()
+    if (
+        str(getattr(resolved_market, 'state', '') or '').upper() != 'PREOPEN'
+        or getattr(resolved_market, 'is_trading_day', None) is False
+        or getattr(resolved_market, 'is_open', None) is True
+    ):
+        return True
+
+    if current_market_date is None:
+        current_market_date = (
+            getattr(resolved_market, 'current_calendar_date', None)
+            or str(getattr(resolved_market, 'server_time', ''))[:10]
+        )
+    current_date = _parse_market_date(current_market_date)
+    target_date = _parse_market_date(market_date)
+    if target_date >= current_date:
+        return True
+
+    resolved_previous_trading_date = previous_trading_date
+    if resolved_previous_trading_date is None:
+        try:
+            resolved_previous_trading_date = previous_krx_trading_date(
+                current_date,
+                allow_fallback=True,
+            )
+        except Exception:
+            return True
+    if resolved_previous_trading_date is None:
+        return True
+    return target_date != _parse_market_date(resolved_previous_trading_date)
 
 
 def resolve_point_in_time_recovery(
@@ -2804,7 +2865,14 @@ def run_market_data_pipeline(
 
     market_risk_filter_result: dict
     market_risk_filter_error_message: str | None = None
-    if point_in_time_recovery and 'market_risk_filter' in requested_stage_set:
+    if (
+        point_in_time_recovery
+        and 'market_risk_filter' in requested_stage_set
+        and should_skip_point_in_time_current_only_stage(
+            stage_id='market_risk_filter',
+            market_date=latest_trade_date,
+        )
+    ):
         market_risk_filter_result = _build_point_in_time_current_only_skip(
             stage_id='market_risk_filter',
             market_date=latest_trade_date,

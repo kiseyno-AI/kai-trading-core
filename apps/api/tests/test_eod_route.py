@@ -1645,6 +1645,54 @@ class EODRouteTests(unittest.TestCase):
         async_market_state.assert_awaited_once_with()
         self.assertIsNone(fake_service.compute_args)
 
+    def test_preopen_previous_session_market_risk_filter_route_runs(self):
+        fake_service = FakeMarketRiskFilterService()
+        original_service = routes_eod.daily_market_risk_filter_service
+        routes_eod.daily_market_risk_filter_service = fake_service
+        try:
+            with (
+                patch(
+                    'app.eod.daily_pipeline_tracking.daily_pipeline_run_state_service',
+                    FakeDailyPipelineRunStateService(),
+                ),
+                patch(
+                    'app.api.routes_eod.async_get_market_state',
+                    return_value=SimpleNamespace(
+                        state='PREOPEN',
+                        is_trading_day=True,
+                        is_open=False,
+                        server_time='2026-09-29T08:30:00+09:00',
+                    ),
+                ),
+                patch(
+                    'app.api.routes_eod.async_previous_krx_trading_date',
+                    return_value=date(2026, 9, 28),
+                    create=True,
+                ) as previous_trading_date,
+                patch(
+                    'app.eod.pykrx_pipeline_runner.get_market_state',
+                    side_effect=AssertionError(
+                        'sync market clock must not run in async route'
+                    ),
+                ),
+            ):
+                response = TestClient(self.app).post(
+                    '/eod/market-risk-filters/compute',
+                    params={
+                        'market_date': '2026-09-28',
+                        'symbols': '005930',
+                    },
+                )
+        finally:
+            routes_eod.daily_market_risk_filter_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.compute_args['market_date'], '2026-09-28')
+        previous_trading_date.assert_awaited_once_with(
+            date(2026, 9, 29),
+            allow_fallback=True,
+        )
+
     def test_collect_market_risk_snapshots_route_calls_service(self):
         fake_service = FakeMarketRiskSnapshotService()
         original_service = routes_eod.daily_market_risk_snapshot_service

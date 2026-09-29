@@ -1112,6 +1112,246 @@ class CoreExecBuyAuthorityBridgeTests(unittest.IsolatedAsyncioTestCase):
             'core_exec_buy_authority_not_acknowledged',
         )
 
+    async def test_open_dispatch_synchronizes_authority_after_final_plan_refresh(
+        self,
+    ) -> None:
+        client = _FakeClient()
+        service = SignalDeciderExecIntegrationService(client=client)  # type: ignore[arg-type]
+        calendar_day = SimpleNamespace(
+            calendar_source='exchange_calendars',
+            calendar_source_status='authoritative',
+            calendar_source_error=None,
+        )
+        fresh_sync = {
+            'applies': True,
+            'route_action': 'allow',
+            'route_status': 'available',
+            'source_observed_at': '2026-09-11T09:04:00+09:00',
+            'accounts': {},
+            'errors': [],
+        }
+        events: list[str] = []
+
+        def refresh_plan_items(**kwargs: object) -> dict[str, object]:
+            events.append(f"refresh:{kwargs['trigger']}")
+            return {
+                'enrichment_preflight': {
+                    'status': 'ready',
+                    'allowed': True,
+                    'failed_categories': [],
+                }
+            }
+
+        async def synchronize_authority(**_kwargs: object) -> dict[str, object]:
+            events.append('authority')
+            return fresh_sync
+
+        async def reconcile_write_ahead(**kwargs: object) -> list[object]:
+            authority = kwargs['buy_authority_sync']
+            events.append(f"reconcile:{authority.get('route_status')}")
+            return []
+
+        async def flush_revocations(**_kwargs: object) -> list[dict[str, object]]:
+            events.append('revocations')
+            return [
+                {
+                    'status': 'revoked',
+                    'replacement_actionable': True,
+                }
+            ]
+
+        next_open_service = __import__(
+            'app.orders.exec_integration',
+            fromlist=['signal_decider_next_open_execution_service'],
+        ).signal_decider_next_open_execution_service
+        with (
+            patch.object(
+                service,
+                'integration_status',
+                return_value={
+                    'mode': 'dispatch',
+                    'runtime_mode': 'live',
+                    'config_status': 'ready',
+                    'issues': [],
+                },
+            ),
+            patch.object(
+                service,
+                '_synchronize_open_buy_authority',
+                side_effect=synchronize_authority,
+            ) as synchronize,
+            patch.object(
+                service,
+                '_reconcile_pending_dispatch_write_ahead',
+                side_effect=reconcile_write_ahead,
+            ),
+            patch.object(
+                service,
+                '_flush_pending_exec_revocations',
+                side_effect=flush_revocations,
+            ),
+            patch.object(
+                service,
+                '_reconcile_pending_core_activations',
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(service, '_load_next_open_rows', return_value=[]),
+            patch.object(
+                service,
+                '_fence_unproven_remote_acceptance',
+                return_value=False,
+            ),
+            patch.object(service, '_load_snapshots', return_value={}),
+            patch.object(service, '_group_rows_by_dispatch_scope', return_value={}),
+            patch.object(
+                next_open_service,
+                'refresh_plan_items',
+                side_effect=refresh_plan_items,
+            ),
+            patch.object(
+                next_open_service,
+                'list_plan_items',
+                return_value={'summary': {}, 'items': []},
+            ),
+            patch(
+                'app.orders.exec_integration.async_normalize_next_open_target_trade_date',
+                new=AsyncMock(return_value=date(2026, 9, 11)),
+            ),
+            patch(
+                'app.orders.exec_integration.async_get_krx_calendar_day',
+                new=AsyncMock(return_value=calendar_day),
+            ),
+            patch(
+                'app.orders.exec_integration._async_previous_trading_day',
+                new=AsyncMock(return_value=date(2026, 9, 10)),
+            ),
+            patch(
+                'app.orders.exec_integration.settings.signal_decider_next_open_enabled',
+                True,
+            ),
+        ):
+            result = await service.dispatch_next_open_plan(
+                target_trade_date=date(2026, 9, 11),
+                refresh_plan=True,
+                dry_run=False,
+                force=True,
+                trigger='post_validation',
+            )
+
+        synchronize.assert_awaited_once()
+        self.assertEqual(
+            events,
+            [
+                'reconcile:plan_refresh_pending',
+                'refresh:post_validation_plan_refresh',
+                'revocations',
+                'refresh:post_validation_revocation_ack_refresh',
+                'authority',
+                'reconcile:available',
+            ],
+        )
+        self.assertEqual(
+            result['buy_authority_sync']['source_observed_at'],
+            '2026-09-11T09:04:00+09:00',
+        )
+        self.assertEqual(client.execution_plan_payloads, [])
+
+    async def test_calendar_early_return_still_synchronizes_deferred_authority(
+        self,
+    ) -> None:
+        client = _FakeClient()
+        service = SignalDeciderExecIntegrationService(client=client)  # type: ignore[arg-type]
+        events: list[str] = []
+        calendar_day = SimpleNamespace(
+            calendar_source='exchange_calendars',
+            calendar_source_status='fallback',
+            calendar_source_error='provider unavailable',
+        )
+
+        async def synchronize_authority(**_kwargs: object) -> dict[str, object]:
+            events.append('authority')
+            return {
+                'applies': True,
+                'route_action': 'block_new_buy',
+                'route_status': 'unavailable',
+                'source_observed_at': None,
+                'accounts': {},
+                'errors': [],
+            }
+
+        async def reconcile_write_ahead(**kwargs: object) -> list[object]:
+            authority = kwargs['buy_authority_sync']
+            events.append(f"reconcile:{authority.get('route_status')}")
+            return []
+
+        next_open_service = __import__(
+            'app.orders.exec_integration',
+            fromlist=['signal_decider_next_open_execution_service'],
+        ).signal_decider_next_open_execution_service
+        with (
+            patch.object(
+                service,
+                'integration_status',
+                return_value={
+                    'mode': 'dispatch',
+                    'runtime_mode': 'live',
+                    'config_status': 'ready',
+                    'issues': [],
+                },
+            ),
+            patch.object(
+                service,
+                '_synchronize_open_buy_authority',
+                side_effect=synchronize_authority,
+            ) as synchronize,
+            patch.object(
+                service,
+                '_reconcile_pending_dispatch_write_ahead',
+                side_effect=reconcile_write_ahead,
+            ),
+            patch.object(
+                next_open_service,
+                'refresh_plan_items',
+            ) as refresh_plan,
+            patch.object(
+                next_open_service,
+                'list_plan_items',
+                return_value={'summary': {}, 'items': []},
+            ),
+            patch(
+                'app.orders.exec_integration.async_normalize_next_open_target_trade_date',
+                new=AsyncMock(return_value=date(2026, 9, 11)),
+            ),
+            patch(
+                'app.orders.exec_integration.async_get_krx_calendar_day',
+                new=AsyncMock(return_value=calendar_day),
+            ),
+            patch(
+                'app.orders.exec_integration._async_previous_trading_day',
+                new=AsyncMock(return_value=date(2026, 9, 10)),
+            ),
+            patch(
+                'app.orders.exec_integration.settings.signal_decider_next_open_enabled',
+                True,
+            ),
+        ):
+            result = await service.dispatch_next_open_plan(
+                target_trade_date=date(2026, 9, 11),
+                refresh_plan=True,
+                dry_run=False,
+                force=False,
+                trigger='calendar_fallback',
+            )
+
+        synchronize.assert_awaited_once()
+        refresh_plan.assert_not_called()
+        self.assertEqual(
+            events,
+            ['reconcile:plan_refresh_pending', 'authority'],
+        )
+        self.assertEqual(result['summary']['reason'], 'calendar_unavailable')
+        self.assertEqual(client.execution_plan_payloads, [])
+
 
 if __name__ == '__main__':
     unittest.main()

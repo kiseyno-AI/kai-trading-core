@@ -24,7 +24,10 @@ from app.agent_context.read_service import (
     _build_market_open_drive_context,
     _build_market_regime_context,
 )
-from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
+from app.agent_context.decision_input_quality import (
+    DECISION_INPUT_QUALITY_SCHEMA_VERSION,
+    build_decision_input_quality_envelope,
+)
 from app.agent_context.eligibility import AGENT_FEEDBACK_SCOPE_REQUESTED
 from app.agent_context.feedback_failure_taxonomy import build_failure_groups
 from app.agent_context.orchestrator import agent_feedback_orchestrator
@@ -96,6 +99,7 @@ from app.eod.pykrx_enrichment_gate import (
 )
 from app.eod.pykrx_enrichment import is_decision_usable_pykrx_enrichment_row
 from app.market.clock import MarketState, async_get_market_state, get_market_state
+from app.market.snapshot import market_snapshot_service
 from app.market.session import (
     CALENDAR_SOURCE_EXCHANGE_CALENDARS,
     CALENDAR_SOURCE_STATUS_FALLBACK,
@@ -138,6 +142,10 @@ EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK = 'dispatch_pending_remote_ack'
 EXECUTION_STATUS_REVOCATION_PENDING = 'revocation_pending'
 EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW = 'revocation_manual_review'
 EXECUTION_STATUS_REVOKED = 'revoked'
+
+DECISION_INPUT_QUALITY_BUILDER = (
+    'app.agent_context.decision_input_quality.build_decision_input_quality_envelope'
+)
 EXECUTION_REVISION_HISTORY_LIMIT = 5
 PLAN_REFRESH_REVISION_RETRY_ATTEMPTS = 6
 PLAN_REFRESH_REVISION_RETRY_DELAY_SECONDS = 0.025
@@ -472,6 +480,12 @@ def _snapshot_scope_selection_fingerprint(
         if snapshot is not None
     ]
     expired_snapshot_by_key = scope_state.get('expired_snapshot_by_key') or {}
+    late_intraday_watch_by_key = (
+        scope_state.get('late_intraday_watch_by_key') or {}
+    )
+    late_intraday_context_by_key = (
+        scope_state.get('late_intraday_context_by_key') or {}
+    )
     material = {
         'selected_snapshot_cohort': _snapshot_cohort_fingerprint(
             selected_snapshots
@@ -483,6 +497,28 @@ def _snapshot_scope_selection_fingerprint(
                 **copy.deepcopy(value),
             }
             for key, value in sorted(expired_snapshot_by_key.items())
+            if isinstance(key, tuple)
+            and len(key) == 2
+            and isinstance(value, dict)
+        ],
+        'late_intraday_watches': [
+            {
+                'symbol': key[0],
+                'agent_name': key[1],
+                **copy.deepcopy(value),
+            }
+            for key, value in sorted(late_intraday_watch_by_key.items())
+            if isinstance(key, tuple)
+            and len(key) == 2
+            and isinstance(value, dict)
+        ],
+        'late_intraday_context': [
+            {
+                'symbol': key[0],
+                'agent_name': key[1],
+                **copy.deepcopy(value),
+            }
+            for key, value in sorted(late_intraday_context_by_key.items())
             if isinstance(key, tuple)
             and len(key) == 2
             and isinstance(value, dict)
@@ -899,6 +935,20 @@ def _snapshot_request_payload(snapshot: SignalDeciderDecisionSnapshot) -> dict[s
 def _snapshot_market_claims(
     snapshot: SignalDeciderDecisionSnapshot,
 ) -> tuple[str, ...]:
+    projected_claims = [
+        market.upper()
+        for market in (
+            _normalize_optional_text(
+                getattr(snapshot, 'symbol_day_market_claim', None)
+            ),
+            _normalize_optional_text(
+                getattr(snapshot, 'company_market_claim', None)
+            ),
+        )
+        if market
+    ]
+    if projected_claims:
+        return tuple(projected_claims)
     symbol_day_context = _snapshot_request_payload(snapshot).get('symbol_day_context')
     if not isinstance(symbol_day_context, dict):
         return ()
@@ -1300,6 +1350,10 @@ def _dispatch_authority_issue_reason(reason_code: str) -> dict[str, str]:
             'The latest decision was observed at or after the target session '
             'opened; expired next-open BUY authority is blocked.'
         ),
+        'late_intraday_watch_scope_changed': (
+            'Late feedback is valid only as a same-day trigger-gated intraday '
+            'watch; direct or retrospective next-open BUY authority is blocked.'
+        ),
         'policy_scope_changed': (
             'The execution policy, route, or dispatch material changed; stale BUY '
             'authority is blocked.'
@@ -1401,6 +1455,153 @@ def _snapshot_decider_data_quality_context(snapshot: SignalDeciderDecisionSnapsh
     return {}
 
 
+def _stored_decision_input_quality_envelope(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> dict[str, Any]:
+    request_payload = _snapshot_request_payload(snapshot)
+    context = request_payload.get('decision_input_quality_context')
+    if isinstance(context, dict):
+        return context
+    symbol_day_context = request_payload.get('symbol_day_context')
+    if isinstance(symbol_day_context, dict):
+        context = symbol_day_context.get('decision_input_quality_context')
+        if isinstance(context, dict):
+            return context
+    return {}
+
+
+def _has_trustworthy_decision_input_quality_envelope(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> bool:
+    """Accept only the canonical deterministic envelope persisted with its inputs."""
+
+    stored = _stored_decision_input_quality_envelope(snapshot)
+    if stored.get('schema_version') != DECISION_INPUT_QUALITY_SCHEMA_VERSION:
+        return False
+    provenance = stored.get('quality_provenance')
+    final_judgment = stored.get('final_judgment')
+    if not isinstance(provenance, dict) or not isinstance(final_judgment, dict):
+        return False
+    if provenance.get('deterministic') is not True:
+        return False
+    if provenance.get('builder') != DECISION_INPUT_QUALITY_BUILDER:
+        return False
+    if not isinstance(final_judgment.get('hard_blocks'), list):
+        return False
+    return bool(
+        stored.get('symbol') == snapshot.symbol
+        and stored.get('market_date') == snapshot.market_date.isoformat()
+        and isinstance(stored.get('data_quality'), dict)
+        and isinstance(stored.get('market_setup_edge'), dict)
+        and isinstance(stored.get('execution_feasibility'), dict)
+    )
+
+
+def _context_market_date(
+    *contexts: dict[str, Any],
+    default: date,
+) -> date | None:
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        for key in ('trade_date', 'market_date', 'as_of_market_date'):
+            raw_value = context.get(key)
+            if raw_value in (None, ''):
+                continue
+            try:
+                return _normalize_date(raw_value, default=default)
+            except (TypeError, ValueError):
+                return None
+    return default
+
+
+def _structured_close_price_mismatch(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> dict[str, Any] | None:
+    """Compare only typed close prices that describe the snapshot market date."""
+
+    request_payload = _snapshot_request_payload(snapshot)
+    symbol_day_context = (
+        request_payload.get('symbol_day_context')
+        if isinstance(request_payload.get('symbol_day_context'), dict)
+        else {}
+    )
+    price_context = (
+        symbol_day_context.get('price_context')
+        if isinstance(symbol_day_context.get('price_context'), dict)
+        else {}
+    )
+    canonical_close = _to_decimal(price_context.get('close_price'))
+    canonical_date = _context_market_date(
+        price_context,
+        symbol_day_context,
+        request_payload,
+        default=snapshot.market_date,
+    )
+    if canonical_close is None or canonical_close <= 0 or canonical_date != snapshot.market_date:
+        return None
+
+    def request_context(key: str) -> dict[str, Any]:
+        context = request_payload.get(key)
+        if isinstance(context, dict):
+            return context
+        context = symbol_day_context.get(key)
+        return context if isinstance(context, dict) else {}
+
+    sector_peer_context = request_context('sector_peer_context')
+    valuation_context = request_context('valuation_context')
+    valuation_snapshot = (
+        valuation_context.get('valuation_snapshot')
+        if isinstance(valuation_context.get('valuation_snapshot'), dict)
+        else {}
+    )
+    liquidity_context = request_context('liquidity_context')
+    turnover_context = (
+        liquidity_context.get('turnover')
+        if isinstance(liquidity_context.get('turnover'), dict)
+        else {}
+    )
+    candidates = (
+        ('sector_peer_context.close_price', sector_peer_context, sector_peer_context),
+        (
+            'valuation_context.valuation_snapshot.close_price',
+            valuation_snapshot,
+            valuation_context,
+        ),
+        ('liquidity_context.turnover.close_price', turnover_context, liquidity_context),
+    )
+    conflicts: list[dict[str, str]] = []
+    for source, price_payload, enclosing_payload in candidates:
+        close_price = _to_decimal(price_payload.get('close_price'))
+        source_date = _context_market_date(
+            price_payload,
+            enclosing_payload,
+            default=snapshot.market_date,
+        )
+        if (
+            close_price is None
+            or close_price <= 0
+            or source_date != canonical_date
+            or close_price == canonical_close
+        ):
+            continue
+        conflicts.append(
+            {
+                'source': source,
+                'close_price': _decimal_to_text(close_price) or str(close_price),
+                'market_date': source_date.isoformat(),
+            }
+        )
+    if not conflicts:
+        return None
+    return {
+        'canonical_source': 'symbol_day_context.price_context.close_price',
+        'canonical_close_price': _decimal_to_text(canonical_close) or str(canonical_close),
+        'market_date': canonical_date.isoformat(),
+        'conflicts': conflicts,
+    }
+
+
 def _snapshot_decision_input_quality_context(
     snapshot: SignalDeciderDecisionSnapshot,
     *,
@@ -1436,8 +1637,16 @@ def _snapshot_decision_input_quality_context(
 def _short_term_tactical_action(snapshot: SignalDeciderDecisionSnapshot) -> str:
     payload = _snapshot_response_payload(snapshot)
     action = _normalize_optional_text(
-        str(payload.get('tactical_action') or payload.get('preferred_action'))
-        if (payload.get('tactical_action') is not None or payload.get('preferred_action') is not None)
+        str(
+            payload.get('tactical_action')
+            or payload.get('preferred_action')
+            or getattr(snapshot, 'projected_tactical_action', None)
+        )
+        if (
+            payload.get('tactical_action') is not None
+            or payload.get('preferred_action') is not None
+            or getattr(snapshot, 'projected_tactical_action', None) is not None
+        )
         else None
     )
     action = action.lower() if action else 'wait'
@@ -1455,6 +1664,71 @@ def _is_actionable_snapshot(snapshot: SignalDeciderDecisionSnapshot) -> bool:
     if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
         return _short_term_tactical_action(snapshot) in SHORT_TERM_ACTIONABLE_ACTIONS
     return False
+
+
+def _is_bounded_intraday_watch_snapshot(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> bool:
+    """Return whether a late decision can only create a trigger-gated watch."""
+
+    return bool(
+        _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
+        and _is_krx_next_open_snapshot(snapshot)
+        and _short_term_tactical_action(snapshot) == 'watch_for_trigger'
+    )
+
+
+def _is_intraday_alignment_context_snapshot(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> bool:
+    """Keep a late non-BUY signal sibling only as watch alignment context."""
+
+    return bool(
+        _snapshot_agent_name(snapshot) == SIGNAL_DECIDER_AGENT_NAME
+        and _is_krx_next_open_snapshot(snapshot)
+        and _normalize_action(
+            snapshot.next_day_open_action or snapshot.decision_action
+        )
+        in {'wait', 'reject'}
+    )
+
+
+def _decision_authority_context(
+    *,
+    snapshot: SignalDeciderDecisionSnapshot,
+    target_trade_date: date,
+    late_intraday_watch: dict[str, Any] | None,
+) -> dict[str, Any]:
+    tactical_action = (
+        _short_term_tactical_action(snapshot)
+        if _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
+        else None
+    )
+    observed_at = decision_snapshot_observed_at_utc(snapshot)
+    target_open_at = decision_snapshot_target_open_at_utc(target_trade_date)
+    is_late_intraday_watch = isinstance(late_intraday_watch, dict)
+    return {
+        'schema_version': 'decision_execution_authority_v1',
+        'scope': (
+            'same_day_intraday_watch'
+            if is_late_intraday_watch
+            else 'preopen_intraday_watch'
+            if tactical_action == 'watch_for_trigger'
+            else 'tactical_trigger_entry'
+            if tactical_action == 'scalp_buy_candidate'
+            else 'next_open_at_open'
+        ),
+        'snapshot_observed_at': (
+            observed_at.isoformat() if observed_at is not None else None
+        ),
+        'target_open_at': target_open_at.isoformat(),
+        'observed_after_target_open': bool(
+            observed_at is not None and observed_at >= target_open_at
+        ),
+        'trigger_gated': tactical_action in SHORT_TERM_ACTIONABLE_ACTIONS,
+        'market_order_authority': tactical_action is None,
+        'late_feedback_exception': is_late_intraday_watch,
+    }
 
 
 def _actionable_signal_policy_versions(
@@ -2126,6 +2400,11 @@ class _DecisionSnapshotAuthorityProjection:
     feedback_received_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    decision_action: str
+    next_day_open_action: str
+    projected_tactical_action: str | None
+    symbol_day_market_claim: str | None
+    company_market_claim: str | None
 
 
 def _decision_snapshot_authority_token(snapshot: Any) -> tuple[Any, ...]:
@@ -2291,16 +2570,74 @@ def _preopen_plan_covers_latest_snapshots(
     return True
 
 
+async def _invoke_live_market_snapshot_refresher(
+    refresher: Callable[..., Any],
+    *,
+    trigger: str,
+) -> Any:
+    result = refresher(
+        trigger=trigger,
+        force_index=True,
+    )
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _run_live_market_snapshot_refresher_on_loop(
+    refresher: Callable[..., Any],
+    *,
+    event_loop: asyncio.AbstractEventLoop | None,
+    trigger: str,
+) -> Any:
+    """Run a shared async refresher only on the loop that owns its state."""
+    if event_loop is None:
+        result = refresher(
+            trigger=trigger,
+            force_index=True,
+        )
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            raise RuntimeError(
+                'async live market snapshot refresh requires the owning event loop'
+            )
+        return result
+    if event_loop.is_closed() or not event_loop.is_running():
+        raise RuntimeError('live market snapshot owning event loop is not running')
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is event_loop:
+        raise RuntimeError(
+            'live market snapshot refresh cannot synchronously wait on its owning event loop'
+        )
+
+    invocation = _invoke_live_market_snapshot_refresher(
+        refresher,
+        trigger=trigger,
+    )
+    try:
+        future = asyncio.run_coroutine_threadsafe(invocation, event_loop)
+    except BaseException:
+        invocation.close()
+        raise
+    return future.result()
+
+
 class SignalDeciderNextOpenExecutionService:
     def __init__(
         self,
         *,
         order_service: TradingOrderService | None = None,
         market_state_getter: Callable[[], Any] | None = None,
+        live_market_snapshot_refresher: Callable[..., Any] | None = None,
     ) -> None:
         self.order_service = order_service or trading_order_service
         self.market_state_getter = market_state_getter or get_market_state
         self._uses_default_market_state_getter = market_state_getter is None
+        self.live_market_snapshot_refresher = live_market_snapshot_refresher
 
     def runtime_status(self) -> dict[str, Any]:
         targets, errors = self._parse_account_targets()
@@ -2379,6 +2716,7 @@ class SignalDeciderNextOpenExecutionService:
             current_scope_state = self._load_latest_decider_scope_state(
                 source_market_date=source_market_date,
                 target_trade_date=resolved_target_date,
+                allow_post_open_intraday_watch=live_market_authority_applies,
                 _session=session,
             )
             raw_latest_snapshots = sorted(
@@ -2422,6 +2760,9 @@ class SignalDeciderNextOpenExecutionService:
             current_source_run = current_scope_state.get('source_run')
             expired_snapshot_by_key = (
                 current_scope_state.get('expired_snapshot_by_key') or {}
+            )
+            late_intraday_watch_by_key = (
+                current_scope_state.get('late_intraday_watch_by_key') or {}
             )
 
             account_targets, account_target_errors = self._parse_account_targets()
@@ -2561,6 +2902,25 @@ class SignalDeciderNextOpenExecutionService:
                     reason_code = 'agent_context_authority_changed'
                     replacement_action = 'reject'
                     replacement_actionable = False
+                elif scope in late_intraday_watch_by_key:
+                    decision_authority = row_validation.get(
+                        'decision_authority'
+                    )
+                    if not (
+                        decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        and latest_action == 'watch_for_trigger'
+                        and isinstance(decision_authority, dict)
+                        and decision_authority.get('scope')
+                        == 'same_day_intraday_watch'
+                        and decision_authority.get('trigger_gated') is True
+                        and decision_authority.get('market_order_authority')
+                        is False
+                        and row_validation.get('handoff_intent')
+                        == 'intraday_watch_buy'
+                    ):
+                        reason_code = 'late_intraday_watch_scope_changed'
+                        replacement_action = 'reject'
+                        replacement_actionable = False
 
                 target = account_targets_by_reference.get(row.account_reference)
                 if (
@@ -3224,6 +3584,7 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: str | date | None = None,
         account_reference: str | None = None,
         refresh: bool = False,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
@@ -3231,6 +3592,7 @@ class SignalDeciderNextOpenExecutionService:
             self.refresh_plan_items(
                 target_trade_date=resolved_target_date,
                 trigger='route_refresh',
+                _live_market_snapshot_loop=_live_market_snapshot_loop,
             )
         rows = self._load_plan_rows(
             target_trade_date=resolved_target_date,
@@ -3259,11 +3621,17 @@ class SignalDeciderNextOpenExecutionService:
             'items': [self._serialize_row(row) for row in rows],
         }
 
-    def refresh_plan_if_due(self, *, target_trade_date: str | date | None = None) -> dict[str, Any]:
+    def refresh_plan_if_due(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
+    ) -> dict[str, Any]:
         return self.refresh_plan_items(
             target_trade_date=target_trade_date,
             trigger='preopen_scheduler',
             _compact_response=True,
+            _live_market_snapshot_loop=_live_market_snapshot_loop,
         )
 
     def refresh_plan_items(
@@ -3273,6 +3641,7 @@ class SignalDeciderNextOpenExecutionService:
         trigger: str = 'manual',
         force: bool = False,
         _compact_response: bool = False,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
         for attempt in range(PLAN_REFRESH_REVISION_RETRY_ATTEMPTS):
             try:
@@ -3281,6 +3650,7 @@ class SignalDeciderNextOpenExecutionService:
                     trigger=trigger,
                     force=force,
                     _compact_response=_compact_response,
+                    _live_market_snapshot_loop=_live_market_snapshot_loop,
                 )
             except _PlanRefreshRevisionConflict as exc:
                 if attempt + 1 >= PLAN_REFRESH_REVISION_RETRY_ATTEMPTS:
@@ -3308,34 +3678,25 @@ class SignalDeciderNextOpenExecutionService:
         trigger: str = 'manual',
         force: bool = False,
         _compact_response: bool = False,
+        _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
         runtime = self.runtime_status()
-        initial_market_state = self.market_state_getter()
-        initial_live_market_authority_applies = (
+        selection_market_state = self.market_state_getter()
+        allow_post_open_intraday_watch = (
             _current_live_market_authority_applies(
-                market_state=initial_market_state,
+                market_state=selection_market_state,
                 target_trade_date=resolved_target_date,
-            )
-        )
-        live_market_snapshot_context: dict[str, Any] | None = None
-        live_market_snapshot_load_error = False
-        if initial_live_market_authority_applies:
-            (
-                live_market_snapshot_context,
-                live_market_snapshot_load_error,
-            ) = _load_live_market_snapshot_context()
-        initial_live_market_snapshot_fingerprint = (
-            _live_market_snapshot_fingerprint(
-                live_market_snapshot_context,
-                load_error=live_market_snapshot_load_error,
             )
         )
         snapshot_generation_state = (
             self._load_latest_snapshot_generation_state(
                 source_market_date=source_market_date,
                 target_trade_date=resolved_target_date,
+                allow_post_open_intraday_watch=(
+                    allow_post_open_intraday_watch
+                ),
             )
         )
         snapshots = snapshot_generation_state['snapshots']
@@ -3448,6 +3809,54 @@ class SignalDeciderNextOpenExecutionService:
             **signal_candidate_enrichment_by_symbol,
             **short_term_candidate_enrichment_by_symbol,
         }
+        # Source validation and enrichment repair can take longer than the live
+        # snapshot freshness window. Refresh and sample live authority only
+        # after that expensive pre-lock work, then bind the same generation
+        # again under the authority lock below.
+        initial_market_state = self.market_state_getter()
+        initial_live_market_authority_applies = (
+            _current_live_market_authority_applies(
+                market_state=initial_market_state,
+                target_trade_date=resolved_target_date,
+            )
+        )
+        live_market_snapshot_context: dict[str, Any] | None = None
+        live_market_snapshot_load_error = False
+        live_market_snapshot_refresh_error = False
+        if (
+            initial_live_market_authority_applies
+            and self.live_market_snapshot_refresher is not None
+        ):
+            try:
+                _run_live_market_snapshot_refresher_on_loop(
+                    self.live_market_snapshot_refresher,
+                    event_loop=_live_market_snapshot_loop,
+                    trigger=f'next_open_plan:{trigger}',
+                )
+            except Exception as exc:
+                live_market_snapshot_refresh_error = True
+                live_market_snapshot_load_error = True
+                logger.exception(
+                    'Live market snapshot refresh failed before next-open plan '
+                    'authority binding: target_trade_date=%s trigger=%s error=%s',
+                    resolved_target_date,
+                    trigger,
+                    exc,
+                )
+        if (
+            initial_live_market_authority_applies
+            and not live_market_snapshot_refresh_error
+        ):
+            (
+                live_market_snapshot_context,
+                live_market_snapshot_load_error,
+            ) = _load_live_market_snapshot_context()
+        initial_live_market_snapshot_fingerprint = (
+            _live_market_snapshot_fingerprint(
+                live_market_snapshot_context,
+                load_error=live_market_snapshot_load_error,
+            )
+        )
         price_cache: dict[str, int | None] = {}
         desired_keys: set[tuple[str, str, str]] = set()
         now = _utcnow()
@@ -3552,12 +3961,19 @@ class SignalDeciderNextOpenExecutionService:
                     .where(CurrentMarketSnapshotCache.cache_key == 'dashboard')
                     .with_for_update(read=True)
                 ).scalar_one_or_none()
-                (
-                    live_market_snapshot_context,
-                    live_market_snapshot_load_error,
-                ) = _load_live_market_snapshot_context()
+                if live_market_snapshot_refresh_error:
+                    # The refresh failure itself is authoritative. Do not
+                    # silently recover buy authority from an older cache row.
+                    live_market_snapshot_context = None
+                    live_market_snapshot_load_error = True
+                else:
+                    (
+                        live_market_snapshot_context,
+                        live_market_snapshot_load_error,
+                    ) = _load_live_market_snapshot_context()
                 if (
                     initial_live_market_authority_applies
+                    and not live_market_snapshot_refresh_error
                     and _live_market_snapshot_fingerprint(
                         live_market_snapshot_context,
                         load_error=live_market_snapshot_load_error,
@@ -3584,6 +4000,7 @@ class SignalDeciderNextOpenExecutionService:
             current_scope_state = self._load_latest_decider_scope_state(
                 source_market_date=source_market_date,
                 target_trade_date=resolved_target_date,
+                allow_post_open_intraday_watch=live_market_authority_applies,
                 _session=session,
             )
             current_raw_snapshots = sorted(
@@ -4051,6 +4468,20 @@ class SignalDeciderNextOpenExecutionService:
                         ),
                         agent_context_completeness=candidate_agent_context,
                     )
+                    validation['decision_authority'] = (
+                        _decision_authority_context(
+                            snapshot=snapshot,
+                            target_trade_date=resolved_target_date,
+                            late_intraday_watch=(
+                                current_scope_state.get(
+                                    'late_intraday_watch_by_key'
+                                )
+                                or {}
+                            ).get(
+                                (snapshot.symbol, decision_agent_name)
+                            ),
+                        )
+                    )
                     if current_live_market_authority.get('applies') is True:
                         validation['current_live_market_authority'] = copy.deepcopy(
                             current_live_market_authority
@@ -4345,6 +4776,7 @@ class SignalDeciderNextOpenExecutionService:
             target_trade_date=resolved_target_date,
             trigger=f'{trigger}_prepare',
             force=force,
+            _live_market_snapshot_loop=asyncio.get_running_loop(),
         )
         enrichment_preflight = refresh_result.get('enrichment_preflight') if isinstance(refresh_result, dict) else None
         if (
@@ -4998,6 +5430,7 @@ class SignalDeciderNextOpenExecutionService:
         *,
         source_market_date: date,
         target_trade_date: date | None = None,
+        allow_post_open_intraday_watch: bool = False,
         _session: Any | None = None,
     ) -> dict[str, Any]:
         if _session is None:
@@ -5008,6 +5441,9 @@ class SignalDeciderNextOpenExecutionService:
                 state = self._load_latest_decider_scope_state_in_session(
                     source_market_date=source_market_date,
                     target_trade_date=target_trade_date,
+                    allow_post_open_intraday_watch=(
+                        allow_post_open_intraday_watch
+                    ),
                     session=session,
                 )
                 detached_snapshot_ids: set[int] = set()
@@ -5021,6 +5457,7 @@ class SignalDeciderNextOpenExecutionService:
         return self._load_latest_decider_scope_state_in_session(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
+            allow_post_open_intraday_watch=allow_post_open_intraday_watch,
             session=_session,
         )
 
@@ -5029,6 +5466,7 @@ class SignalDeciderNextOpenExecutionService:
         *,
         source_market_date: date,
         target_trade_date: date | None,
+        allow_post_open_intraday_watch: bool,
         session: Any,
     ) -> dict[str, Any]:
         snapshot_rows = session.execute(
@@ -5043,6 +5481,23 @@ class SignalDeciderNextOpenExecutionService:
                 SignalDeciderDecisionSnapshot.feedback_received_at,
                 SignalDeciderDecisionSnapshot.created_at,
                 SignalDeciderDecisionSnapshot.updated_at,
+                SignalDeciderDecisionSnapshot.decision_action,
+                SignalDeciderDecisionSnapshot.next_day_open_action,
+                SignalDeciderDecisionSnapshot.response_payload[
+                    'tactical_action'
+                ]
+                .as_string()
+                .label('projected_tactical_action'),
+                SignalDeciderDecisionSnapshot.request_payload[
+                    'symbol_day_context'
+                ]['market']
+                .as_string()
+                .label('symbol_day_market_claim'),
+                SignalDeciderDecisionSnapshot.request_payload[
+                    'symbol_day_context'
+                ]['company']['market']
+                .as_string()
+                .label('company_market_claim'),
             )
             .where(
                 SignalDeciderDecisionSnapshot.agent_name.in_(
@@ -5924,10 +6379,29 @@ class SignalDeciderNextOpenExecutionService:
             tuple[str, str],
             dict[str, Any],
         ] = {}
+        late_intraday_watch_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
+        late_intraday_context_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
         if target_trade_date is not None:
             target_open_at = decision_snapshot_target_open_at_utc(
                 target_trade_date
             )
+            bounded_watch_symbols = {
+                key[0]
+                for key, snapshot in selected_by_key.items()
+                if snapshot is not None
+                and not is_decision_snapshot_pre_target_open(
+                    snapshot,
+                    target_trade_date=target_trade_date,
+                )
+                and allow_post_open_intraday_watch
+                and _is_bounded_intraday_watch_snapshot(snapshot)
+            }
             for key, snapshot in list(selected_by_key.items()):
                 if snapshot is None:
                     continue
@@ -5937,7 +6411,7 @@ class SignalDeciderNextOpenExecutionService:
                     target_trade_date=target_trade_date,
                 ):
                     continue
-                expired_snapshot_by_key[key] = {
+                timing_evidence = {
                     'snapshot_id': int(snapshot.id),
                     'observed_at': (
                         observed_at.isoformat()
@@ -5945,6 +6419,30 @@ class SignalDeciderNextOpenExecutionService:
                         else None
                     ),
                     'target_open_at': target_open_at.isoformat(),
+                }
+                if (
+                    allow_post_open_intraday_watch
+                    and _is_bounded_intraday_watch_snapshot(snapshot)
+                ):
+                    late_intraday_watch_by_key[key] = {
+                        **timing_evidence,
+                        'authority_scope': 'same_day_intraday_watch',
+                        'trigger_gated': True,
+                    }
+                    continue
+                if (
+                    allow_post_open_intraday_watch
+                    and key[0] in bounded_watch_symbols
+                    and _is_intraday_alignment_context_snapshot(snapshot)
+                ):
+                    late_intraday_context_by_key[key] = {
+                        **timing_evidence,
+                        'authority_scope': 'intraday_alignment_context_only',
+                        'buy_authority': False,
+                    }
+                    continue
+                expired_snapshot_by_key[key] = {
+                    **timing_evidence,
                 }
                 # The canonical latest snapshot is terminal for its scope.  Do
                 # not resurrect an older BUY merely because the latest result
@@ -5998,6 +6496,8 @@ class SignalDeciderNextOpenExecutionService:
         return {
             'selected_by_key': selected_by_key,
             'expired_snapshot_by_key': expired_snapshot_by_key,
+            'late_intraday_watch_by_key': late_intraday_watch_by_key,
+            'late_intraday_context_by_key': late_intraday_context_by_key,
             'authoritative_run_id_by_key': authoritative_run_id_by_key,
             'evidenced_scope_keys': evidenced_scope_keys,
             'reused_scope_keys': reused_scope_keys,
@@ -6016,11 +6516,13 @@ class SignalDeciderNextOpenExecutionService:
         *,
         source_market_date: date,
         target_trade_date: date | None = None,
+        allow_post_open_intraday_watch: bool = False,
         _session: Any | None = None,
     ) -> list[SignalDeciderDecisionSnapshot]:
         return self._load_latest_snapshot_generation_state(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
+            allow_post_open_intraday_watch=allow_post_open_intraday_watch,
             _session=_session,
         )['snapshots']
 
@@ -6029,11 +6531,13 @@ class SignalDeciderNextOpenExecutionService:
         *,
         source_market_date: date,
         target_trade_date: date | None = None,
+        allow_post_open_intraday_watch: bool = False,
         _session: Any | None = None,
     ) -> dict[str, Any]:
         scope_state = self._load_latest_decider_scope_state(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
+            allow_post_open_intraday_watch=allow_post_open_intraday_watch,
             _session=_session,
         )
         raw_snapshots = sorted(
@@ -6409,10 +6913,36 @@ class SignalDeciderNextOpenExecutionService:
             )
         data_quality_warnings = _normalize_text_list(snapshot.data_quality_warnings_payload)
         if settings.signal_decider_next_open_block_on_data_warnings and data_quality_warnings:
+            if _has_trustworthy_decision_input_quality_envelope(snapshot):
+                warnings.append(
+                    _reason(
+                        'data_quality_warnings_reported',
+                        'Snapshot reported data quality warnings; deterministic structured quality gates remain authoritative.',
+                    )
+                )
+            else:
+                blocking_reasons.append(
+                    _reason(
+                        'data_quality_warnings_present',
+                        'Legacy or unverified snapshot has data quality warnings that Exec cannot independently revalidate.',
+                    )
+                )
+        close_price_mismatch = _structured_close_price_mismatch(snapshot)
+        if close_price_mismatch is not None:
+            conflict_summary = ', '.join(
+                f"{item['source']}={item['close_price']}"
+                for item in close_price_mismatch['conflicts']
+            )
             blocking_reasons.append(
                 _reason(
-                    'data_quality_warnings_present',
-                    'Snapshot has data quality warnings that Exec cannot independently revalidate.',
+                    'structured_close_price_mismatch',
+                    (
+                        'Same-market-date structured close prices disagree: '
+                        f"{close_price_mismatch['canonical_source']}="
+                        f"{close_price_mismatch['canonical_close_price']}; "
+                        f'{conflict_summary} '
+                        f"({close_price_mismatch['market_date']})."
+                    ),
                 )
             )
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
@@ -7170,6 +7700,10 @@ class SignalDeciderNextOpenExecutionService:
             'pre_decider_enrichment_context': validation_payload.get('pre_decider_enrichment_context') or {},
             'market_regime_context': validation_payload.get('market_regime_context') or {},
             'decision_input_quality_context': validation_payload.get('decision_input_quality_context') or {},
+            'decision_authority': validation_payload.get(
+                'decision_authority'
+            )
+            or {},
             'response_summary': _snapshot_response_summary_payload(snapshot) or None,
             'response_payload_summary': _to_json_safe(response_payload),
             'decision_traceability': _snapshot_traceability_payload(snapshot),
@@ -8324,4 +8858,8 @@ class SignalDeciderNextOpenExecutionService:
             return row
 
 
-signal_decider_next_open_execution_service = SignalDeciderNextOpenExecutionService()
+signal_decider_next_open_execution_service = SignalDeciderNextOpenExecutionService(
+    live_market_snapshot_refresher=(
+        market_snapshot_service.refresh_market_snapshot_if_due
+    ),
+)

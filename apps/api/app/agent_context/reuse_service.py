@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, column, func, lateral, or_, select, true, values
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.orchestrator_helpers import trim_batch_item_for_prompt
@@ -43,6 +43,7 @@ FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION = 'agent_feedback_response_contract_
 FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION = 'fundamental_summary_reuse_policy_v2'
 FUNDAMENTAL_SUMMARY_REUSE_REASON = 'reuse_unchanged_fundamental_inputs'
 FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE = 50
+FEEDBACK_REUSE_KEY_CHUNK_SIZE = 15
 
 FUNDAMENTAL_REUSE_STALE_REASONS = {
     'forced_recompute',
@@ -74,6 +75,32 @@ class FeedbackReuseDecision:
     stored_input_fingerprint_payload: dict[str, Any] | None = None
     reuse_policy_version: str | None = None
     reuse_source: str | None = None
+
+
+@dataclass
+class FeedbackReuseStaticInputs:
+    """Run-local cache; current-day receipts and source versions stay live."""
+
+    latest_source_updated_at_by_key: dict[
+        tuple[str, str],
+        datetime | None,
+    ] = field(default_factory=dict)
+    fundamental_input_fingerprint_payloads: dict[
+        str,
+        dict[str, Any] | None,
+    ] = field(default_factory=dict)
+    fundamental_input_versions_by_symbol: dict[
+        str,
+        tuple[Any, ...],
+    ] = field(default_factory=dict)
+    prior_feedback_by_key: dict[
+        tuple[str, str],
+        Any | None,
+    ] = field(default_factory=dict)
+    prior_failure_by_key: dict[
+        tuple[str, str],
+        Any | None,
+    ] = field(default_factory=dict)
 
 
 ROLE_TO_AGENT = {
@@ -298,6 +325,31 @@ def _normalized_evidence_datetime(value: Any) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _latest_evidence_rows_by_key(
+    rows: Sequence[Any],
+) -> dict[tuple[str, str], Any]:
+    latest_by_key: dict[tuple[str, str], Any] = {}
+    for row in rows:
+        key = (str(row.symbol), str(row.agent_name))
+        current = latest_by_key.get(key)
+        row_order = (
+            _normalized_evidence_datetime(getattr(row, 'received_at', None)),
+            int(getattr(row, 'id', 0) or 0),
+        )
+        if current is None:
+            latest_by_key[key] = row
+            continue
+        current_order = (
+            _normalized_evidence_datetime(
+                getattr(current, 'received_at', None)
+            ),
+            int(getattr(current, 'id', 0) or 0),
+        )
+        if row_order > current_order:
+            latest_by_key[key] = row
+    return latest_by_key
+
+
 def _normalize_knowledge_cutoff_at(value: datetime | str) -> datetime:
     parsed = value
     if isinstance(value, str):
@@ -412,6 +464,7 @@ class AgentContextReuseService:
             str,
             Mapping[str, Any],
         ] | None = None,
+        static_inputs: FeedbackReuseStaticInputs | None = None,
     ) -> dict[str, dict[str, FeedbackReuseDecision]]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -458,83 +511,118 @@ class AgentContextReuseService:
             ).all()
             symbol_id_map = {str(row.symbol): int(row.id) for row in symbol_rows}
 
+            if static_inputs is not None:
+                self._refresh_latest_source_updated_at_cache(
+                    session=session,
+                    market_date=normalized_market_date,
+                    symbols=normalized_symbols,
+                    roles=requested_roles,
+                    symbol_id_map=symbol_id_map,
+                    static_inputs=static_inputs,
+                )
+
             latest_feedback_map: dict[tuple[str, str], Any] = {}
             latest_failure_map: dict[tuple[str, str], AgentContextFeedbackFailure] = {}
-            for role in requested_roles:
-                agent_name = ROLE_TO_AGENT[role]
-                for chunk in _chunked(normalized_symbols, FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE):
-                    same_day_feedback_rows = session.execute(
-                        select(
-                            AgentContextFeedback.id,
-                            AgentContextFeedback.market_date,
-                            AgentContextFeedback.symbol,
-                            AgentContextFeedback.agent_name,
-                            AgentContextFeedback.run_id,
-                            AgentContextFeedback.summary_payload,
-                            AgentContextFeedback.feedback_payload,
-                            AgentContextFeedback.context_payload,
-                            AgentContextFeedback.received_at,
-                        )
-                        .where(AgentContextFeedback.market_date == normalized_market_date)
-                        .where(AgentContextFeedback.symbol.in_(chunk))
-                        .where(AgentContextFeedback.agent_name == agent_name)
-                        .order_by(
-                            AgentContextFeedback.received_at.asc(),
-                            AgentContextFeedback.id.asc(),
-                        )
-                    ).all()
-                    for row in same_day_feedback_rows:
-                        if not hasattr(row, 'feedback_payload'):
+            if static_inputs is not None:
+                (
+                    latest_feedback_map,
+                    latest_failure_map,
+                ) = self._load_latest_feedback_state(
+                    session=session,
+                    market_date=normalized_market_date,
+                    symbols=normalized_symbols,
+                    roles=requested_roles,
+                    static_inputs=static_inputs,
+                )
+            else:
+                for role in requested_roles:
+                    agent_name = ROLE_TO_AGENT[role]
+                    for chunk in _chunked(normalized_symbols, FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE):
+                        same_day_feedback_rows = session.execute(
+                            select(
+                                AgentContextFeedback.id,
+                                AgentContextFeedback.market_date,
+                                AgentContextFeedback.symbol,
+                                AgentContextFeedback.agent_name,
+                                AgentContextFeedback.run_id,
+                                AgentContextFeedback.summary_payload,
+                                AgentContextFeedback.feedback_payload,
+                                AgentContextFeedback.context_payload,
+                                AgentContextFeedback.received_at,
+                            )
+                            .where(AgentContextFeedback.market_date == normalized_market_date)
+                            .where(AgentContextFeedback.symbol.in_(chunk))
+                            .where(AgentContextFeedback.agent_name == agent_name)
+                            .order_by(
+                                AgentContextFeedback.received_at.asc(),
+                                AgentContextFeedback.id.asc(),
+                            )
+                        ).all()
+                        for row in same_day_feedback_rows:
+                            if not hasattr(row, 'feedback_payload'):
+                                continue
+                            latest_feedback_map[(row.symbol, agent_name)] = row
+                    for symbol in normalized_symbols:
+                        if (symbol, agent_name) in latest_feedback_map:
                             continue
-                        latest_feedback_map[(row.symbol, agent_name)] = row
-                for symbol in normalized_symbols:
-                    if (symbol, agent_name) in latest_feedback_map:
-                        continue
-                    if role == SIGNAL_DECIDER_AGENT_NAME:
-                        continue
-                    feedback_rows = session.execute(
-                        select(
-                            AgentContextFeedback.id,
-                            AgentContextFeedback.market_date,
-                            AgentContextFeedback.symbol,
-                            AgentContextFeedback.agent_name,
-                            AgentContextFeedback.run_id,
-                            AgentContextFeedback.summary_payload,
-                            AgentContextFeedback.feedback_payload,
-                            AgentContextFeedback.context_payload,
-                            AgentContextFeedback.received_at,
-                        )
-                        .where(AgentContextFeedback.market_date <= normalized_market_date)
-                        .where(AgentContextFeedback.symbol == symbol)
-                        .where(AgentContextFeedback.agent_name == agent_name)
-                        .order_by(
-                            AgentContextFeedback.market_date.desc(),
-                            AgentContextFeedback.received_at.desc(),
-                            AgentContextFeedback.id.desc(),
-                        )
-                        .limit(1)
-                    ).all()
-                    for row in feedback_rows:
-                        if not hasattr(row, 'feedback_payload'):
+                        if role == SIGNAL_DECIDER_AGENT_NAME:
                             continue
-                        key = (row.symbol, agent_name)
-                        if key not in latest_feedback_map:
-                            latest_feedback_map[key] = row
-                for symbol in normalized_symbols:
-                    failure_row = session.execute(
-                        select(AgentContextFeedbackFailure)
-                        .where(AgentContextFeedbackFailure.market_date <= normalized_market_date)
-                        .where(AgentContextFeedbackFailure.symbol == symbol)
-                        .where(AgentContextFeedbackFailure.agent_name == agent_name)
-                        .order_by(
-                            AgentContextFeedbackFailure.market_date.desc(),
-                            AgentContextFeedbackFailure.received_at.desc(),
-                            AgentContextFeedbackFailure.id.desc(),
-                        )
-                        .limit(1)
-                    ).scalars().first()
-                    if failure_row is not None:
-                        latest_failure_map[(failure_row.symbol, agent_name)] = failure_row
+                        feedback_rows = session.execute(
+                            select(
+                                AgentContextFeedback.id,
+                                AgentContextFeedback.market_date,
+                                AgentContextFeedback.symbol,
+                                AgentContextFeedback.agent_name,
+                                AgentContextFeedback.run_id,
+                                AgentContextFeedback.summary_payload,
+                                AgentContextFeedback.feedback_payload,
+                                AgentContextFeedback.context_payload,
+                                AgentContextFeedback.received_at,
+                            )
+                            .where(AgentContextFeedback.market_date <= normalized_market_date)
+                            .where(AgentContextFeedback.symbol == symbol)
+                            .where(AgentContextFeedback.agent_name == agent_name)
+                            .order_by(
+                                AgentContextFeedback.market_date.desc(),
+                                AgentContextFeedback.received_at.desc(),
+                                AgentContextFeedback.id.desc(),
+                            )
+                            .limit(1)
+                        ).all()
+                        for row in feedback_rows:
+                            if not hasattr(row, 'feedback_payload'):
+                                continue
+                            key = (row.symbol, agent_name)
+                            if key not in latest_feedback_map:
+                                latest_feedback_map[key] = row
+                    for symbol in normalized_symbols:
+                        failure_row = session.execute(
+                            select(AgentContextFeedbackFailure)
+                            .where(AgentContextFeedbackFailure.market_date <= normalized_market_date)
+                            .where(AgentContextFeedbackFailure.symbol == symbol)
+                            .where(AgentContextFeedbackFailure.agent_name == agent_name)
+                            .order_by(
+                                AgentContextFeedbackFailure.market_date.desc(),
+                                AgentContextFeedbackFailure.received_at.desc(),
+                                AgentContextFeedbackFailure.id.desc(),
+                            )
+                            .limit(1)
+                        ).scalars().first()
+                        if failure_row is not None:
+                            latest_failure_map[(failure_row.symbol, agent_name)] = failure_row
+
+            decision_support_source_by_symbol = (
+                self._load_decision_support_source_updated_at(
+                    session=session,
+                    market_date=normalized_market_date,
+                    symbols=normalized_symbols,
+                )
+                if static_inputs is not None
+                and set(requested_roles).intersection(
+                    DECISION_SUPPORT_AGENT_NAMES
+                )
+                else {}
+            )
 
             evidence_run_ids = {
                 str(row.run_id or '').strip()
@@ -689,13 +777,43 @@ class AgentContextReuseService:
                     latest_feedback = latest_feedback_map.get((symbol, agent_name))
                     latest_failure = latest_failure_map.get((symbol, agent_name))
 
-                    latest_source_updated_at = self._get_latest_source_updated_at(
-                        session=session,
-                        role=role,
-                        market_date=normalized_market_date,
-                        symbol=symbol,
-                        symbol_id=symbol_id,
-                    )
+                    source_cache_key = (symbol, role)
+                    if role in DECISION_SUPPORT_AGENT_NAMES:
+                        latest_source_updated_at = (
+                            decision_support_source_by_symbol.get(symbol)
+                            if static_inputs is not None
+                            else self._get_latest_source_updated_at(
+                                session=session,
+                                role=role,
+                                market_date=normalized_market_date,
+                                symbol=symbol,
+                                symbol_id=symbol_id,
+                            )
+                        )
+                    elif (
+                        static_inputs is not None
+                        and source_cache_key
+                        in static_inputs.latest_source_updated_at_by_key
+                    ):
+                        latest_source_updated_at = (
+                            static_inputs.latest_source_updated_at_by_key[
+                                source_cache_key
+                            ]
+                        )
+                    else:
+                        latest_source_updated_at = (
+                            self._get_latest_source_updated_at(
+                                session=session,
+                                role=role,
+                                market_date=normalized_market_date,
+                                symbol=symbol,
+                                symbol_id=symbol_id,
+                            )
+                        )
+                        if static_inputs is not None:
+                            static_inputs.latest_source_updated_at_by_key[
+                                source_cache_key
+                            ] = latest_source_updated_at
                     input_fingerprint_payload = None
                     if role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME:
                         if fundamental_input_fingerprint_payloads is not None:
@@ -707,6 +825,19 @@ class AgentContextReuseService:
                             if isinstance(supplied_payload, Mapping):
                                 input_fingerprint_payload = dict(
                                     supplied_payload
+                                )
+                        elif (
+                            static_inputs is not None
+                            and symbol
+                            in static_inputs.fundamental_input_fingerprint_payloads
+                        ):
+                            cached_payload = (
+                                static_inputs
+                                .fundamental_input_fingerprint_payloads[symbol]
+                            )
+                            if isinstance(cached_payload, Mapping):
+                                input_fingerprint_payload = dict(
+                                    cached_payload
                                 )
                         else:
                             input_fingerprint_payload = (
@@ -724,6 +855,10 @@ class AgentContextReuseService:
                                     ),
                                 )
                             )
+                            if static_inputs is not None:
+                                static_inputs.fundamental_input_fingerprint_payloads[
+                                    symbol
+                                ] = input_fingerprint_payload
                     input_fingerprint = _fingerprint_value(input_fingerprint_payload)
 
                     if latest_feedback is None:
@@ -902,6 +1037,524 @@ class AgentContextReuseService:
                         ),
                     )
         return decisions
+
+    def _load_latest_feedback_state(
+        self,
+        *,
+        session,
+        market_date: date,
+        symbols: Sequence[str],
+        roles: Sequence[str],
+        static_inputs: FeedbackReuseStaticInputs,
+    ) -> tuple[
+        dict[tuple[str, str], Any],
+        dict[tuple[str, str], Any],
+    ]:
+        """Refresh same-day receipts and reuse immutable prior-date lookups."""
+
+        agent_names = tuple(
+            dict.fromkeys(ROLE_TO_AGENT[role] for role in roles)
+        )
+        requested_keys = tuple(
+            (symbol, agent_name)
+            for symbol in symbols
+            for agent_name in agent_names
+        )
+        same_day_feedback_map: dict[tuple[str, str], Any] = {}
+        same_day_failure_map: dict[tuple[str, str], Any] = {}
+        for chunk in _chunked(symbols, FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE):
+            feedback_rows = session.execute(
+                select(
+                    AgentContextFeedback.id,
+                    AgentContextFeedback.market_date,
+                    AgentContextFeedback.symbol,
+                    AgentContextFeedback.agent_name,
+                    AgentContextFeedback.run_id,
+                    AgentContextFeedback.summary_payload,
+                    AgentContextFeedback.feedback_payload,
+                    AgentContextFeedback.context_payload,
+                    AgentContextFeedback.received_at,
+                )
+                .where(
+                    AgentContextFeedback.market_date == market_date,
+                    AgentContextFeedback.symbol.in_(chunk),
+                    AgentContextFeedback.agent_name.in_(agent_names),
+                )
+                .order_by(
+                    AgentContextFeedback.received_at.asc(),
+                    AgentContextFeedback.id.asc(),
+                )
+            ).all()
+            same_day_feedback_map.update(
+                _latest_evidence_rows_by_key(feedback_rows)
+            )
+
+            failure_rows = session.execute(
+                select(
+                    AgentContextFeedbackFailure.id,
+                    AgentContextFeedbackFailure.market_date,
+                    AgentContextFeedbackFailure.symbol,
+                    AgentContextFeedbackFailure.agent_name,
+                    AgentContextFeedbackFailure.run_id,
+                    AgentContextFeedbackFailure.failure_kind,
+                    AgentContextFeedbackFailure.retryable,
+                    AgentContextFeedbackFailure.summary_payload,
+                    AgentContextFeedbackFailure.context_payload,
+                    AgentContextFeedbackFailure.received_at,
+                )
+                .where(
+                    AgentContextFeedbackFailure.market_date == market_date,
+                    AgentContextFeedbackFailure.symbol.in_(chunk),
+                    AgentContextFeedbackFailure.agent_name.in_(agent_names),
+                )
+                .order_by(
+                    AgentContextFeedbackFailure.received_at.asc(),
+                    AgentContextFeedbackFailure.id.asc(),
+                )
+            ).all()
+            same_day_failure_map.update(
+                _latest_evidence_rows_by_key(failure_rows)
+            )
+
+        def load_prior_rows(
+            *,
+            model,
+            keys: Sequence[tuple[str, str]],
+            selected_columns: Sequence[Any],
+        ) -> list[Any]:
+            loaded_rows: list[Any] = []
+            for index in range(
+                0,
+                len(keys),
+                FEEDBACK_REUSE_KEY_CHUNK_SIZE,
+            ):
+                key_chunk = keys[
+                    index:index + FEEDBACK_REUSE_KEY_CHUNK_SIZE
+                ]
+                requested = values(
+                    column('requested_symbol', String(32)),
+                    column('requested_agent_name', String(64)),
+                    name='requested_feedback_keys',
+                ).data(key_chunk).alias('requested_feedback_keys')
+                latest = lateral(
+                    select(model.id.label('row_id'))
+                    .select_from(model)
+                    .where(
+                        model.symbol == requested.c.requested_symbol,
+                        model.agent_name
+                        == requested.c.requested_agent_name,
+                        model.market_date < market_date,
+                    )
+                    .order_by(
+                        model.market_date.desc(),
+                        model.received_at.desc(),
+                        model.id.desc(),
+                    )
+                    .limit(1)
+                    .correlate(requested)
+                ).alias('latest_feedback_row')
+                loaded_rows.extend(
+                    session.execute(
+                        select(*selected_columns)
+                        .select_from(requested.join(latest, true()))
+                        .join(model, model.id == latest.c.row_id)
+                    ).all()
+                )
+            return loaded_rows
+
+        missing_prior_feedback_keys = tuple(
+            key
+            for key in requested_keys
+            if key[1] != SIGNAL_DECIDER_AGENT_NAME
+            and key not in static_inputs.prior_feedback_by_key
+        )
+        prior_feedback_rows = load_prior_rows(
+            model=AgentContextFeedback,
+            keys=missing_prior_feedback_keys,
+            selected_columns=(
+                AgentContextFeedback.id,
+                AgentContextFeedback.market_date,
+                AgentContextFeedback.symbol,
+                AgentContextFeedback.agent_name,
+                AgentContextFeedback.run_id,
+                AgentContextFeedback.summary_payload,
+                AgentContextFeedback.feedback_payload,
+                AgentContextFeedback.context_payload,
+                AgentContextFeedback.received_at,
+            ),
+        )
+        for key in missing_prior_feedback_keys:
+            static_inputs.prior_feedback_by_key[key] = None
+        for row in prior_feedback_rows:
+            static_inputs.prior_feedback_by_key[
+                (row.symbol, row.agent_name)
+            ] = row
+
+        missing_prior_failure_keys = tuple(
+            key
+            for key in requested_keys
+            if key not in static_inputs.prior_failure_by_key
+        )
+        prior_failure_rows = load_prior_rows(
+            model=AgentContextFeedbackFailure,
+            keys=missing_prior_failure_keys,
+            selected_columns=(
+                AgentContextFeedbackFailure.id,
+                AgentContextFeedbackFailure.market_date,
+                AgentContextFeedbackFailure.symbol,
+                AgentContextFeedbackFailure.agent_name,
+                AgentContextFeedbackFailure.run_id,
+                AgentContextFeedbackFailure.failure_kind,
+                AgentContextFeedbackFailure.retryable,
+                AgentContextFeedbackFailure.summary_payload,
+                AgentContextFeedbackFailure.context_payload,
+                AgentContextFeedbackFailure.received_at,
+            ),
+        )
+        for key in missing_prior_failure_keys:
+            static_inputs.prior_failure_by_key[key] = None
+        for row in prior_failure_rows:
+            static_inputs.prior_failure_by_key[
+                (row.symbol, row.agent_name)
+            ] = row
+
+        latest_feedback_map = {
+            key: row
+            for key, row in static_inputs.prior_feedback_by_key.items()
+            if key in requested_keys and row is not None
+        }
+        latest_feedback_map.update(same_day_feedback_map)
+        latest_failure_map = {
+            key: row
+            for key, row in static_inputs.prior_failure_by_key.items()
+            if key in requested_keys and row is not None
+        }
+        latest_failure_map.update(same_day_failure_map)
+
+        return latest_feedback_map, latest_failure_map
+
+    @staticmethod
+    def _load_decision_support_source_updated_at(
+        *,
+        session,
+        market_date: date,
+        symbols: Sequence[str],
+    ) -> dict[str, datetime]:
+        """Refresh the upstream receipt clock used by decider reuse checks."""
+
+        return {
+            str(row.symbol): row.latest_at
+            for row in session.execute(
+                select(
+                    AgentContextFeedback.symbol.label('symbol'),
+                    func.max(AgentContextFeedback.received_at).label(
+                        'latest_at'
+                    ),
+                )
+                .where(
+                    AgentContextFeedback.symbol.in_(symbols),
+                    AgentContextFeedback.market_date == market_date,
+                    AgentContextFeedback.agent_name.in_(
+                        (
+                            'eod-summarizer',
+                            'technical-summarizer',
+                            FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
+                        )
+                    ),
+                )
+                .group_by(AgentContextFeedback.symbol)
+            ).all()
+            if row.latest_at is not None
+        }
+
+    def _refresh_latest_source_updated_at_cache(
+        self,
+        *,
+        session,
+        market_date: date,
+        symbols: Sequence[str],
+        roles: Sequence[str],
+        symbol_id_map: Mapping[str, int],
+        static_inputs: FeedbackReuseStaticInputs,
+    ) -> None:
+        """Refresh source clocks and invalidate only affected fingerprints."""
+
+        (
+            current_clocks,
+            current_fundamental_versions,
+        ) = self._load_latest_source_state(
+            session=session,
+            market_date=market_date,
+            symbols=symbols,
+            roles=roles,
+            symbol_id_map=symbol_id_map,
+        )
+        missing = object()
+        for key, current_value in current_clocks.items():
+            static_inputs.latest_source_updated_at_by_key[key] = (
+                current_value
+            )
+        for symbol, current_version in (
+            current_fundamental_versions.items()
+        ):
+            previous_version = (
+                static_inputs.fundamental_input_versions_by_symbol.get(
+                    symbol,
+                    missing,
+                )
+            )
+            static_inputs.fundamental_input_versions_by_symbol[symbol] = (
+                current_version
+            )
+            if (
+                previous_version is not missing
+                and previous_version != current_version
+            ):
+                static_inputs.fundamental_input_fingerprint_payloads.pop(
+                    symbol,
+                    None,
+                )
+
+    def _load_latest_source_state(
+        self,
+        *,
+        session,
+        market_date: date,
+        symbols: Sequence[str],
+        roles: Sequence[str],
+        symbol_id_map: Mapping[str, int],
+    ) -> tuple[
+        dict[tuple[str, str], datetime | None],
+        dict[str, tuple[Any, ...]],
+    ]:
+        """Bulk-load current source clocks without per-symbol queries."""
+
+        requested_keys = {
+            (symbol, role)
+            for symbol in symbols
+            for role in roles
+            if role not in DECISION_SUPPORT_AGENT_NAMES
+        }
+        if not requested_keys:
+            return {}, {}
+
+        requested_roles = {role for _, role in requested_keys}
+        symbol_ids = tuple(
+            dict.fromkeys(
+                symbol_id_map[symbol]
+                for symbol in symbols
+                if symbol in symbol_id_map
+            )
+        )
+        symbol_by_id = {
+            symbol_id: symbol
+            for symbol, symbol_id in symbol_id_map.items()
+        }
+
+        def load_symbol_id_max(
+            *,
+            symbol_id_column,
+            timestamp_column,
+            market_date_column,
+        ) -> dict[str, datetime]:
+            if not symbol_ids:
+                return {}
+            rows = session.execute(
+                select(
+                    symbol_id_column.label('symbol_id'),
+                    func.max(timestamp_column).label('latest_at'),
+                )
+                .where(
+                    symbol_id_column.in_(symbol_ids),
+                    market_date_column == market_date,
+                )
+                .group_by(symbol_id_column)
+            ).all()
+            return {
+                symbol_by_id[int(row.symbol_id)]: row.latest_at
+                for row in rows
+                if row.latest_at is not None
+                and int(row.symbol_id) in symbol_by_id
+            }
+
+        technical_by_symbol: dict[str, datetime] = {}
+        action_by_symbol: dict[str, datetime] = {}
+        price_by_symbol: dict[str, datetime] = {}
+        if requested_roles.intersection(
+            {'technical-summarizer', 'eod-summarizer'}
+        ):
+            technical_by_symbol = load_symbol_id_max(
+                symbol_id_column=DailyTechnicalSnapshot.symbol_id,
+                timestamp_column=func.greatest(
+                    DailyTechnicalSnapshot.captured_at,
+                    DailyTechnicalSnapshot.updated_at,
+                ),
+                market_date_column=DailyTechnicalSnapshot.market_date,
+            )
+            action_by_symbol = load_symbol_id_max(
+                symbol_id_column=DailyActionSummary.symbol_id,
+                timestamp_column=func.greatest(
+                    DailyActionSummary.captured_at,
+                    DailyActionSummary.updated_at,
+                ),
+                market_date_column=DailyActionSummary.market_date,
+            )
+        if 'eod-summarizer' in requested_roles:
+            price_by_symbol = load_symbol_id_max(
+                symbol_id_column=DailyPriceBar.symbol_id,
+                timestamp_column=DailyPriceBar.captured_at,
+                market_date_column=DailyPriceBar.trade_date,
+            )
+
+        disclosure_state_by_symbol: dict[
+            str,
+            tuple[datetime | None, int],
+        ] = {}
+        fundamentals_state_by_symbol: dict[
+            str,
+            tuple[datetime | None, int],
+        ] = {}
+        valuation_state_by_symbol: dict[
+            str,
+            tuple[datetime | None, int],
+        ] = {}
+        if FUNDAMENTAL_SUMMARIZER_AGENT_NAME in requested_roles:
+            disclosure_state_by_symbol = {
+                str(row.symbol): (
+                    row.latest_at,
+                    int(row.row_count),
+                )
+                for row in session.execute(
+                    select(
+                        DartDisclosureEvent.stock_code.label('symbol'),
+                        func.max(DartDisclosureEvent.updated_at).label(
+                            'latest_at'
+                        ),
+                        func.count(DartDisclosureEvent.id).label(
+                            'row_count'
+                        ),
+                    )
+                    .where(
+                        DartDisclosureEvent.stock_code.in_(symbols),
+                        DartDisclosureEvent.receipt_date <= market_date,
+                    )
+                    .group_by(DartDisclosureEvent.stock_code)
+                ).all()
+            }
+            fundamentals_state_by_symbol = {
+                str(row.symbol): (
+                    row.latest_at,
+                    int(row.row_count),
+                )
+                for row in session.execute(
+                    # replace_snapshot_dataset updates the parent snapshot in
+                    # the same transaction before replacing rows/highlights,
+                    # so the parent clock covers all fingerprint child data.
+                    select(
+                        DartFundamentalsSnapshot.stock_code.label('symbol'),
+                        func.max(
+                            func.greatest(
+                                DartFundamentalsSnapshot.captured_at,
+                                DartFundamentalsSnapshot.updated_at,
+                            )
+                        ).label('latest_at'),
+                        func.count(DartFundamentalsSnapshot.id).label(
+                            'row_count'
+                        ),
+                    )
+                    .where(
+                        DartFundamentalsSnapshot.stock_code.in_(symbols),
+                    )
+                    .group_by(DartFundamentalsSnapshot.stock_code)
+                ).all()
+            }
+            if symbol_ids:
+                valuation_state_by_symbol = {
+                    symbol_by_id[int(row.symbol_id)]: (
+                        row.latest_at,
+                        int(row.row_count),
+                    )
+                    for row in session.execute(
+                        select(
+                            DailyPykrxEnrichmentRow.symbol_id.label(
+                                'symbol_id'
+                            ),
+                            func.max(
+                                func.greatest(
+                                    DailyPykrxEnrichmentRow.captured_at,
+                                    DailyPykrxEnrichmentRow.updated_at,
+                                )
+                            ).label('latest_at'),
+                            func.count(
+                                DailyPykrxEnrichmentRow.id
+                            ).label('row_count'),
+                        )
+                        .where(
+                            DailyPykrxEnrichmentRow.symbol_id.in_(
+                                symbol_ids
+                            ),
+                            DailyPykrxEnrichmentRow.market_date
+                            == market_date,
+                            DailyPykrxEnrichmentRow.category.in_(
+                                (
+                                    'valuation_snapshot',
+                                    'foreign_ownership',
+                                )
+                            ),
+                        )
+                        .group_by(DailyPykrxEnrichmentRow.symbol_id)
+                    ).all()
+                    if int(row.symbol_id) in symbol_by_id
+                }
+
+        def latest(*values: datetime | None) -> datetime | None:
+            available = [value for value in values if value is not None]
+            return max(available) if available else None
+
+        clocks: dict[tuple[str, str], datetime | None] = {}
+        for symbol, role in requested_keys:
+            if role == 'technical-summarizer':
+                value = latest(
+                    technical_by_symbol.get(symbol),
+                    action_by_symbol.get(symbol),
+                )
+            elif role == 'eod-summarizer':
+                value = latest(
+                    price_by_symbol.get(symbol),
+                    action_by_symbol.get(symbol),
+                    technical_by_symbol.get(symbol),
+                )
+            elif role == FUNDAMENTAL_SUMMARIZER_AGENT_NAME:
+                value = latest(
+                    disclosure_state_by_symbol.get(
+                        symbol,
+                        (None, 0),
+                    )[0],
+                    fundamentals_state_by_symbol.get(
+                        symbol,
+                        (None, 0),
+                    )[0],
+                    valuation_state_by_symbol.get(
+                        symbol,
+                        (None, 0),
+                    )[0],
+                )
+            else:
+                value = None
+            clocks[(symbol, role)] = value
+        fundamental_versions = (
+            {
+                symbol: (
+                    disclosure_state_by_symbol.get(symbol, (None, 0)),
+                    fundamentals_state_by_symbol.get(symbol, (None, 0)),
+                    valuation_state_by_symbol.get(symbol, (None, 0)),
+                )
+                for symbol in symbols
+            }
+            if FUNDAMENTAL_SUMMARIZER_AGENT_NAME in requested_roles
+            else {}
+        )
+        return clocks, fundamental_versions
 
     @staticmethod
     def _decide_fundamental_reuse(

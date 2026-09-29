@@ -202,7 +202,10 @@ class DailyBetaFactorService:
             symbols=normalized_symbols,
         )
         ranking_inputs = inputs
-        if normalized_symbols is not None:
+        if (
+            normalized_symbols is not None
+            and normalized_symbols != normalized_ranking_symbols
+        ):
             ranking_inputs, _, _ = self._load_inputs(
                 market_date=normalized_market_date,
                 symbols=(
