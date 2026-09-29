@@ -39,6 +39,7 @@ from app.agent_context.orchestrator_helpers import (
     build_decider_input_generation as _build_decider_input_generation,
     build_durable_decider_input_generation as _build_durable_decider_input_generation,
     build_decider_source_context_generation as _build_decider_source_context_generation,
+    durable_decider_source_context_fingerprint_matches as _durable_decider_source_context_fingerprint_matches,
     build_signal_decider_payload as _build_signal_decider_payload_helper,
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
     coerce_decoded_batch_response as _coerce_decoded_batch_response,
@@ -2784,9 +2785,22 @@ class AgentFeedbackOrchestrator:
                         'market_context_fingerprint'
                     ] = 'market_context_changed'
                 for component_key, reason_code in component_reason_by_key.items():
-                    if expected_generation.get(
-                        component_key
-                    ) != observed_generation.get(component_key):
+                    expected_component = expected_generation.get(component_key)
+                    observed_component = observed_generation.get(component_key)
+                    legacy_cutoff_marker_match = bool(
+                        durable_source_generation
+                        and component_key == 'source_context_fingerprint'
+                        and isinstance(refreshed_item, dict)
+                        and _durable_decider_source_context_fingerprint_matches(
+                            expected_fingerprint=expected_component,
+                            observed_fingerprint=observed_component,
+                            refreshed_source_context=refreshed_item,
+                        )
+                    )
+                    if (
+                        expected_component != observed_component
+                        and not legacy_cutoff_marker_match
+                    ):
                         reasons.append({'code': reason_code})
 
             upstream_traceability = source_item.get('upstream_traceability')

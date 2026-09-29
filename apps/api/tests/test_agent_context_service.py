@@ -267,9 +267,26 @@ def _stored_market_snapshot_context(
                     },
                     'breadth_completeness': {
                         'status': 'verified',
-                        'expected_symbol_count': 950,
+                        'expected_symbol_count': 970,
                         'observed_symbol_count': 950,
                         'limit_bucket_semantics': 'included_in_direction_counts',
+                        'verification_basis': (
+                            'kis_directional_buckets_with_same_date_completed_master_upper_bound'
+                        ),
+                        'master_count_relation': 'upper_bound',
+                        'coverage_ratio': round(950 / 970, 6),
+                        'expected_universe': {
+                            'provider': 'kis_master',
+                            'market_date': observed_at.date().isoformat(),
+                            'completed_at': observed_at.replace(
+                                hour=8,
+                                minute=0,
+                                second=0,
+                            ).isoformat(),
+                            'symbol_count': 970,
+                            'relation_to_observed_count': 'upper_bound',
+                            'membership_sha256': 'a' * 64,
+                        },
                     },
                     'provider_business_date': observed_at.date().isoformat(),
                     'provider_session_time': observed_at.strftime('%H:%M:%S'),
@@ -446,9 +463,22 @@ class MarketRegimeContextTests(unittest.TestCase):
                 },
                 'breadth_completeness': {
                     'status': 'verified',
-                    'expected_symbol_count': 950,
+                    'expected_symbol_count': 970,
                     'observed_symbol_count': 950,
                     'limit_bucket_semantics': 'included_in_direction_counts',
+                    'verification_basis': (
+                        'kis_directional_buckets_with_same_date_completed_master_upper_bound'
+                    ),
+                    'master_count_relation': 'upper_bound',
+                    'coverage_ratio': round(950 / 970, 6),
+                    'expected_universe': {
+                        'provider': 'kis_master',
+                        'market_date': '2026-04-29',
+                        'completed_at': '2026-04-29T08:00:00+09:00',
+                        'symbol_count': 970,
+                        'relation_to_observed_count': 'upper_bound',
+                        'membership_sha256': 'a' * 64,
+                    },
                 },
                 'index_leg': {
                     'status': 'ready',
@@ -585,7 +615,7 @@ class MarketRegimeContextTests(unittest.TestCase):
         )
         self.assertFalse(calculation['full_session_linear_extrapolation_used'])
 
-    def test_disjoint_limit_buckets_are_included_in_directional_market_breadth(self) -> None:
+    def test_only_official_included_limit_bucket_contract_is_accepted(self) -> None:
         snapshot = _stored_market_snapshot_context(
             as_of='2026-04-29T09:10:00+09:00'
         )
@@ -609,6 +639,11 @@ class MarketRegimeContextTests(unittest.TestCase):
                     'expected_symbol_count': 1000,
                     'observed_symbol_count': 1000,
                     'limit_bucket_semantics': 'disjoint_from_direction_counts',
+                    'verification_basis': (
+                        'kis_directional_buckets_with_same_date_completed_master_upper_bound'
+                    ),
+                    'master_count_relation': 'upper_bound',
+                    'coverage_ratio': 1.0,
                 },
             }
         )
@@ -622,23 +657,87 @@ class MarketRegimeContextTests(unittest.TestCase):
         )
         breadth = open_drive['market_breadth_context']
 
-        self.assertEqual(breadth['up_count'], 250)
-        self.assertEqual(breadth['down_count'], 650)
-        self.assertEqual(breadth['flat_count'], 100)
-        self.assertEqual(breadth['advance_decline_ratio'], 0.3846)
+        self.assertEqual(breadth['status'], 'unavailable')
+        self.assertEqual(breadth['reason'], 'breadth_completeness_unverified')
 
-        regime = _build_market_regime_context(
+    def test_master_upper_bound_larger_than_provider_breadth_uses_observed_count(self) -> None:
+        snapshot = _stored_market_snapshot_context(
+            as_of='2026-04-29T09:10:00+09:00'
+        )
+        snapshot['payload']['markets']['kospi']['breadth_completeness'][
+            'expected_universe'
+        ]['completed_at'] = '2026-04-29T09:10:20+09:00'
+
+        open_drive = _build_market_open_drive_context(
             requested_market_date=date(2026, 4, 29),
             market='KOSPI',
-            market_breadth_context=breadth,
-            market_breadth_provenance=open_drive['market_breadth_provenance'],
-            sector_peer_context=_sector_context(),
-            sector_peer_provenance=_fresh_provenance(),
-            market_relative_context=_relative_context(),
-            market_relative_provenance=_fresh_provenance(),
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=snapshot,
+            prior_market_turnover_baseline=None,
         )
-        self.assertEqual(regime['posture'], 'risk_off')
-        self.assertEqual(regime['recommended_exec_action'], 'reject')
+        breadth = open_drive['market_breadth_context']
+
+        self.assertEqual(breadth['status'], 'available')
+        self.assertEqual(breadth['market_symbol_count'], 950)
+        self.assertEqual(breadth['expected_symbol_count'], 970)
+        self.assertEqual(breadth['observed_symbol_count'], 950)
+        self.assertEqual(breadth['up_count'], 700)
+        self.assertEqual(breadth['down_count'], 200)
+        self.assertEqual(breadth['flat_count'], 50)
+
+    def test_breadth_contract_rejects_subset_violation_and_observed_above_master(self) -> None:
+        for case_name in ('upper_not_subset', 'observed_above_master', 'coverage_below_minimum'):
+            with self.subTest(case=case_name):
+                snapshot = _stored_market_snapshot_context(
+                    as_of='2026-04-29T09:10:00+09:00'
+                )
+                market_row = snapshot['payload']['markets']['kospi']
+                if case_name == 'upper_not_subset':
+                    market_row['upper_limit_count'] = 701
+                    market_row['breadth_raw_buckets']['upper_limit_count'] = 701
+                else:
+                    if case_name == 'observed_above_master':
+                        market_row['breadth_completeness']['expected_symbol_count'] = 949
+                    else:
+                        market_row['breadth_completeness']['expected_symbol_count'] = 1100
+                        market_row['breadth_completeness']['coverage_ratio'] = round(
+                            950 / 1100,
+                            6,
+                        )
+                        market_row['breadth_completeness']['expected_universe'][
+                            'symbol_count'
+                        ] = 1100
+
+                open_drive = _build_market_open_drive_context(
+                    requested_market_date=date(2026, 4, 29),
+                    market='KOSPI',
+                    decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+                    snapshot_context=snapshot,
+                    prior_market_turnover_baseline=None,
+                )
+
+                self.assertEqual(
+                    open_drive['market_breadth_context']['status'],
+                    'unavailable',
+                )
+
+    def test_breadth_contract_rejects_missing_verification_basis(self) -> None:
+        snapshot = _stored_market_snapshot_context(
+            as_of='2026-04-29T09:10:00+09:00'
+        )
+        snapshot['payload']['markets']['kospi']['breadth_completeness'].pop(
+            'verification_basis'
+        )
+
+        open_drive = _build_market_open_drive_context(
+            requested_market_date=date(2026, 4, 29),
+            market='KOSPI',
+            decision_time=datetime.fromisoformat('2026-04-29T09:10:30+09:00'),
+            snapshot_context=snapshot,
+            prior_market_turnover_baseline=None,
+        )
+
+        self.assertEqual(open_drive['market_breadth_context']['status'], 'unavailable')
 
     def test_market_open_drive_accepts_fresh_kis_leg_when_only_fx_leg_is_degraded(self) -> None:
         snapshot = _stored_market_snapshot_context(

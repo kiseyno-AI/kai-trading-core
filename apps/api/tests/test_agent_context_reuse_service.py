@@ -8,6 +8,7 @@ from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundl
 from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARY_REUSE_REASON,
     AgentContextReuseService,
+    FeedbackReuseStaticInputs,
     build_fundamental_input_fingerprint_payload_from_context,
     _extract_fingerprint_payload,
     _failure_supersedes_feedback,
@@ -427,6 +428,306 @@ class FundamentalReuseServiceTests(unittest.TestCase):
         self.assertEqual(decision.input_fingerprint, 'sha256:materialized')
         db_rebuild.assert_not_called()
 
+    def test_same_run_static_inputs_are_reused_while_feedback_state_refreshes(
+        self,
+    ):
+        service = AgentContextReuseService()
+        source_updated_at = datetime(
+            2026,
+            4,
+            16,
+            6,
+            0,
+            tzinfo=timezone.utc,
+        )
+        fingerprint_payload = {
+            'schema_version': 'fundamental_summary_input_fingerprint_v2',
+            'reuse_policy_version': 'fundamental_summary_reuse_policy_v2',
+            'fingerprint': 'sha256:cached-materialized',
+            'input': {'symbol': '005930'},
+        }
+        static_inputs = FeedbackReuseStaticInputs(
+            latest_source_updated_at_by_key={
+                ('005930', 'fundamental-summarizer'): source_updated_at,
+            },
+            fundamental_input_fingerprint_payloads={
+                '005930': fingerprint_payload,
+            },
+        )
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _reuse_session_scope,
+        ):
+            with patch.object(
+                service,
+                '_load_latest_feedback_state',
+                return_value=({}, {}),
+            ) as load_feedback_state:
+                with patch.object(
+                    service,
+                    '_load_latest_source_state',
+                    return_value=(
+                        {
+                            ('005930', 'fundamental-summarizer'): (
+                                source_updated_at
+                            ),
+                        },
+                        {'005930': ((source_updated_at, 1),)},
+                    ),
+                ) as load_source:
+                    with patch.object(
+                        service,
+                        '_get_latest_source_updated_at',
+                        side_effect=AssertionError(
+                            'unexpected per-symbol source refresh'
+                        ),
+                    ) as get_source:
+                        with patch.object(
+                            service,
+                            '_build_fundamental_input_fingerprint_payload',
+                            side_effect=AssertionError(
+                                'unexpected fingerprint rebuild'
+                            ),
+                        ) as build_fingerprint:
+                            first = service.build_latest_decisions(
+                                market_date='2026-04-16',
+                                symbols=['005930'],
+                                roles=['fundamental-summarizer'],
+                                static_inputs=static_inputs,
+                            )
+                            second = service.build_latest_decisions(
+                                market_date='2026-04-16',
+                                symbols=['005930'],
+                                roles=['fundamental-summarizer'],
+                                static_inputs=static_inputs,
+                            )
+
+        self.assertEqual(load_feedback_state.call_count, 2)
+        self.assertEqual(load_source.call_count, 2)
+        get_source.assert_not_called()
+        build_fingerprint.assert_not_called()
+        for decisions in (first, second):
+            decision = decisions['005930']['fundamental-summarizer']
+            self.assertEqual(
+                decision.latest_source_updated_at,
+                source_updated_at.isoformat(),
+            )
+            self.assertEqual(
+                decision.input_fingerprint_payload,
+                fingerprint_payload,
+            )
+
+    def test_mid_run_fundamental_source_change_invalidates_cached_fingerprint(
+        self,
+    ):
+        service = AgentContextReuseService()
+        first_source = datetime(
+            2026,
+            4,
+            16,
+            6,
+            0,
+            tzinfo=timezone.utc,
+        )
+        second_source = datetime(
+            2026,
+            4,
+            16,
+            6,
+            5,
+            tzinfo=timezone.utc,
+        )
+
+        def fingerprint_payload(value: str) -> dict[str, object]:
+            return {
+                'schema_version': (
+                    'fundamental_summary_input_fingerprint_v2'
+                ),
+                'reuse_policy_version': (
+                    'fundamental_summary_reuse_policy_v2'
+                ),
+                'fingerprint': value,
+                'input': {'symbol': '005930'},
+            }
+
+        stored_payload = fingerprint_payload('sha256:before-change')
+        refreshed_payload = fingerprint_payload('sha256:after-change')
+        feedback = SimpleNamespace(
+            id=17,
+            market_date=__import__('datetime').date.fromisoformat(
+                '2026-04-16'
+            ),
+            symbol='005930',
+            agent_name='fundamental-summarizer',
+            run_id='',
+            summary_payload={},
+            feedback_payload={'summary': 'stored fundamentals'},
+            context_payload={
+                'fundamental_summary_input_fingerprint': stored_payload,
+            },
+            received_at=datetime(
+                2026,
+                4,
+                16,
+                7,
+                0,
+                tzinfo=timezone.utc,
+            ),
+        )
+        static_inputs = FeedbackReuseStaticInputs()
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _reuse_session_scope,
+        ):
+            with patch.object(
+                service,
+                '_load_latest_feedback_state',
+                return_value=(
+                    {('005930', 'fundamental-summarizer'): feedback},
+                    {},
+                ),
+            ):
+                with patch.object(
+                    service,
+                    '_load_latest_source_state',
+                    side_effect=(
+                        (
+                            {
+                                ('005930', 'fundamental-summarizer'): (
+                                    second_source
+                                ),
+                            },
+                            {
+                                '005930': (
+                                    (second_source, 1),
+                                    (first_source, 1),
+                                ),
+                            },
+                        ),
+                        (
+                            {
+                                ('005930', 'fundamental-summarizer'): (
+                                    second_source
+                                ),
+                            },
+                            {
+                                '005930': (
+                                    (second_source, 1),
+                                    (second_source, 1),
+                                ),
+                            },
+                        ),
+                    ),
+                ) as load_source:
+                    with patch.object(
+                        service,
+                        '_build_fundamental_input_fingerprint_payload',
+                        side_effect=(stored_payload, refreshed_payload),
+                    ) as build_fingerprint:
+                        before_change = service.build_latest_decisions(
+                            market_date='2026-04-16',
+                            symbols=['005930'],
+                            roles=['fundamental-summarizer'],
+                            static_inputs=static_inputs,
+                        )['005930']['fundamental-summarizer']
+                        after_change = service.build_latest_decisions(
+                            market_date='2026-04-16',
+                            symbols=['005930'],
+                            roles=['fundamental-summarizer'],
+                            static_inputs=static_inputs,
+                        )['005930']['fundamental-summarizer']
+
+        self.assertEqual(load_source.call_count, 2)
+        self.assertEqual(build_fingerprint.call_count, 2)
+        self.assertFalse(before_change.should_dispatch)
+        self.assertEqual(
+            before_change.reason,
+            FUNDAMENTAL_SUMMARY_REUSE_REASON,
+        )
+        self.assertEqual(
+            before_change.latest_source_updated_at,
+            second_source.isoformat(),
+        )
+        self.assertEqual(
+            after_change.latest_source_updated_at,
+            second_source.isoformat(),
+        )
+        self.assertTrue(after_change.should_dispatch)
+        self.assertEqual(
+            after_change.reason,
+            'fundamental_input_fingerprint_changed',
+        )
+        self.assertEqual(
+            static_inputs.fundamental_input_fingerprint_payloads['005930'],
+            refreshed_payload,
+        )
+
+    def test_decider_upstream_source_clock_refreshes_with_same_run_cache(self):
+        service = AgentContextReuseService()
+        first_source = datetime(
+            2026,
+            4,
+            16,
+            6,
+            0,
+            tzinfo=timezone.utc,
+        )
+        second_source = datetime(
+            2026,
+            4,
+            16,
+            6,
+            5,
+            tzinfo=timezone.utc,
+        )
+        static_inputs = FeedbackReuseStaticInputs()
+
+        with patch(
+            'app.agent_context.reuse_service.session_scope',
+            _reuse_session_scope,
+        ):
+            with patch.object(
+                service,
+                '_load_latest_feedback_state',
+                return_value=({}, {}),
+            ):
+                with patch.object(
+                    service,
+                    '_load_decision_support_source_updated_at',
+                    side_effect=(
+                        {'005930': first_source},
+                        {'005930': second_source},
+                    ),
+                ) as load_source:
+                    first = service.build_latest_decisions(
+                        market_date='2026-04-16',
+                        symbols=['005930'],
+                        roles=['short-term-decider'],
+                        static_inputs=static_inputs,
+                    )
+                    second = service.build_latest_decisions(
+                        market_date='2026-04-16',
+                        symbols=['005930'],
+                        roles=['short-term-decider'],
+                        static_inputs=static_inputs,
+                    )
+
+        self.assertEqual(load_source.call_count, 2)
+        self.assertEqual(
+            first['005930']['short-term-decider'].latest_source_updated_at,
+            first_source.isoformat(),
+        )
+        self.assertEqual(
+            second['005930']['short-term-decider'].latest_source_updated_at,
+            second_source.isoformat(),
+        )
+        self.assertNotIn(
+            ('005930', 'short-term-decider'),
+            static_inputs.latest_source_updated_at_by_key,
+        )
+
     def test_same_day_matching_fingerprint_ignores_post_cutoff_source_update(
         self,
     ):
@@ -810,6 +1111,7 @@ class FundamentalReuseServiceTests(unittest.TestCase):
 
     def test_retry_snapshot_treats_reused_fundamental_as_completed_boundary(self):
         service = AgentFeedbackRetryService()
+        static_inputs = FeedbackReuseStaticInputs()
         decisions = {
             '005930': {
                 'fundamental-summarizer': _decision(
@@ -834,8 +1136,14 @@ class FundamentalReuseServiceTests(unittest.TestCase):
                     eligible_symbols=('005930',),
                     fs_div='OFS',
                     knowledge_cutoff_at='2026-04-16T15:30:00+09:00',
+                    reuse_static_inputs=static_inputs,
                 )
 
+        self.assertEqual(build_latest_decisions.call_count, 1)
+        self.assertIs(
+            build_latest_decisions.call_args.kwargs['static_inputs'],
+            static_inputs,
+        )
         self.assertEqual(
             build_latest_decisions.call_args.kwargs['knowledge_cutoff_at'],
             '2026-04-16T15:30:00+09:00',

@@ -21,6 +21,15 @@ EXPECTED_MISSING_FIELDS: tuple[str, ...] = (
     'flows.foreign',
     'flows.institutional',
 )
+HISTORICAL_VOLATILE_SESSION_FIELDS: tuple[str, ...] = (
+    'current_calendar_date',
+    'current_calendar_date_is_trading_day',
+    'current_market_state',
+    'current_market_session',
+    'current_calendar_source',
+    'current_calendar_source_status',
+    'current_calendar_source_error',
+)
 
 
 def _to_float(value: Any) -> float | None:
@@ -84,6 +93,15 @@ def _format_signed_int(value: int | None) -> str | None:
     return f'{value:+d}'
 
 
+def _freeze_historical_market_session(market_session: dict[str, Any]) -> dict[str, Any]:
+    if market_session.get('requested_date_is_current_calendar_date'):
+        return market_session
+    frozen = dict(market_session)
+    for field_name in HISTORICAL_VOLATILE_SESSION_FIELDS:
+        frozen[field_name] = None
+    return frozen
+
+
 def _run_coroutine(coro) -> Any:
     try:
         asyncio.get_running_loop()
@@ -113,15 +131,34 @@ class SignalDeciderMarketContextBuilder:
         self.market_state_loader = market_state_loader or get_market_state
 
     def build(self, *, market_date: date) -> dict[str, Any]:
-        market_session = build_market_session_metadata(
-            requested_date=market_date,
-            current_state=self.market_state_loader(),
+        market_session = _freeze_historical_market_session(
+            build_market_session_metadata(
+                requested_date=market_date,
+                current_state=self.market_state_loader(),
+            )
+        )
+        historical_request = not bool(
+            market_session.get('requested_date_is_current_calendar_date')
         )
         try:
             snapshot = _run_coroutine(self.snapshot_service.get_market_snapshot())
         except Exception as exc:  # Market context should degrade the payload, not block signal-decider dispatch.
             logger.warning('Signal-decider market context unavailable: %s', exc)
             return self._unavailable_payload(market_date=market_date, market_session=market_session)
+        if historical_request:
+            snapshot_as_of = _normalize_datetime(snapshot.get('as_of'))
+            if snapshot_as_of is None or snapshot_as_of.date() != market_date:
+                logger.warning(
+                    'Historical signal-decider market context rejected non-matching cached snapshot: '
+                    'market_date=%s as_of=%s',
+                    market_date.isoformat(),
+                    snapshot.get('as_of'),
+                )
+                return self._unavailable_payload(
+                    market_date=market_date,
+                    market_session=market_session,
+                    stale_reason='historical_eod_snapshot_unavailable',
+                )
         return self._build_payload(snapshot=snapshot, market_date=market_date, market_session=market_session)
 
     def _build_payload(
@@ -421,7 +458,13 @@ class SignalDeciderMarketContextBuilder:
             return None
         return '; '.join(parts)
 
-    def _unavailable_payload(self, *, market_date: date, market_session: dict[str, Any]) -> dict[str, Any]:
+    def _unavailable_payload(
+        self,
+        *,
+        market_date: date,
+        market_session: dict[str, Any],
+        stale_reason: str | None = None,
+    ) -> dict[str, Any]:
         return {
             'status': 'unavailable',
             'market_date': market_date.isoformat(),
@@ -436,7 +479,7 @@ class SignalDeciderMarketContextBuilder:
             'fx': {},
             'flows': {},
             'missing_fields': list(EXPECTED_MISSING_FIELDS),
-            'stale_reason': None,
+            'stale_reason': stale_reason,
         }
 
 

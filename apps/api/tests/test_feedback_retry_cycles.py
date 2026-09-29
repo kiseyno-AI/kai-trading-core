@@ -26,6 +26,7 @@ from app.agent_context.retry_service import (
     RetryCyclePlan,
     RoleSequenceRoleState,
     RoleSequenceSnapshot,
+    _SameDayTerminalSymbols,
     _FeedbackRetryClaimLease,
     _feedback_retry_admission_lock_key,
     _feedback_retry_owner_token_hash,
@@ -41,7 +42,10 @@ from app.agent_context.roles import (
 )
 from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundle
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
-from app.agent_context.reuse_service import AgentContextReuseService
+from app.agent_context.reuse_service import (
+    AgentContextReuseService,
+    FeedbackReuseStaticInputs,
+)
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.runtime_state import RuntimeFeedbackRunState
 from scripts import run_feedback_retry_cycles
@@ -2951,6 +2955,59 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(role_state.boundary_status, 'failed')
         filter_ready.assert_called_once()
 
+    def test_retryable_dependency_failure_bypasses_decider_reuse_gate_but_terminal_failure_does_not(
+        self,
+    ):
+        service = AgentFeedbackRetryService()
+        role = 'short-term-decider'
+        retryable_symbol = '005930'
+        terminal_symbol = '000660'
+        completed_symbol = '035420'
+        symbols = (
+            retryable_symbol,
+            terminal_symbol,
+            completed_symbol,
+        )
+        terminal_state = _SameDayTerminalSymbols(
+            completed_by_role={role: {completed_symbol}},
+            failed_by_role={role: {retryable_symbol, terminal_symbol}},
+            retryable_failed_by_role={role: {retryable_symbol}},
+            dependency_changed_retryable_failed_by_role={
+                role: {retryable_symbol}
+            },
+        )
+
+        with (
+            patch.object(
+                service,
+                '_load_same_day_terminal_symbols',
+                return_value=terminal_state,
+            ),
+            patch.object(
+                service,
+                '_filter_decider_retry_ready_symbols',
+                return_value=(),
+            ) as filter_ready,
+        ):
+            snapshot = service._build_role_sequence_snapshot(
+                market_date=date.fromisoformat('2026-04-16'),
+                roles=(role,),
+                eligible_symbols=symbols,
+                reuse_existing=False,
+                parent_run_id='retry-parent',
+            )
+
+        role_state = snapshot.role_states[role]
+        self.assertEqual(
+            role_state.failed_symbols,
+            (retryable_symbol, terminal_symbol),
+        )
+        self.assertEqual(
+            role_state.retry_pending_symbols,
+            (retryable_symbol,),
+        )
+        filter_ready.assert_not_called()
+
     def test_role_snapshot_force_recompute_counts_only_current_parent_feedback(self):
         service = AgentFeedbackRetryService()
         role = 'signal-decider'
@@ -3227,6 +3284,75 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(completed['eod-summarizer'], {'005930'})
         self.assertEqual(failed['eod-summarizer'], set())
 
+    def test_same_day_terminal_symbols_preserve_failure_retry_semantics(self):
+        service = AgentFeedbackRetryService()
+        market_date = date.fromisoformat('2026-04-16')
+        role = 'short-term-decider'
+        failure_rows = [
+            SimpleNamespace(
+                id=1,
+                symbol='005930',
+                agent_name=role,
+                run_id='retryable-child',
+                failure_kind=(
+                    'dependency_upstream_changed_during_dispatch'
+                ),
+                retryable=True,
+                received_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    31,
+                    tzinfo=timezone.utc,
+                ),
+            ),
+            SimpleNamespace(
+                id=2,
+                symbol='000660',
+                agent_name=role,
+                run_id='terminal-child',
+                failure_kind='response_contract_invalid',
+                retryable=False,
+                received_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    32,
+                    tzinfo=timezone.utc,
+                ),
+            ),
+        ]
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(all=lambda: []),
+            MagicMock(all=lambda: failure_rows),
+        ]
+
+        with patch(
+            'app.agent_context.retry_service.session_scope'
+        ) as session_scope_mock:
+            session_scope_mock.return_value.__enter__.return_value = session
+            terminal_state = service._load_same_day_terminal_symbols(
+                market_date=market_date,
+                roles=(role,),
+                symbols=('005930', '000660'),
+            )
+
+        self.assertEqual(
+            terminal_state.failed_by_role[role],
+            {'005930', '000660'},
+        )
+        self.assertEqual(
+            terminal_state.retryable_failed_by_role[role],
+            {'005930'},
+        )
+        self.assertEqual(
+            terminal_state.dependency_changed_retryable_failed_by_role[role],
+            {'005930'},
+        )
+
     def test_automatic_decider_filter_revalidates_same_day_and_prior_day_fundamentals(self):
         service = AgentFeedbackRetryService()
         completed_by_role = {
@@ -3267,6 +3393,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             symbols=('005930', '000660'),
             knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
             fs_div='CFS',
+            reuse_static_inputs=None,
         )
 
     def test_automatic_decider_filter_revalidates_same_day_fundamental_fingerprint(self):
@@ -3303,6 +3430,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 ),
             },
         }
+        reuse_static_inputs = FeedbackReuseStaticInputs()
 
         with (
             patch.object(
@@ -3322,6 +3450,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                     symbols=(symbol,),
                     knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
                     fs_div='CFS',
+                    reuse_static_inputs=reuse_static_inputs,
                 )
             )
 
@@ -3333,6 +3462,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             force_recompute=False,
             fs_div='CFS',
             knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+            static_inputs=reuse_static_inputs,
         )
 
     def test_load_incomplete_symbols_uses_feedback_eligible_universe(self):
@@ -3778,7 +3908,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 service,
                 '_build_role_sequence_snapshot',
                 side_effect=build_completed_snapshot,
-            ),
+            ) as build_snapshot,
             patch(
                 'app.agent_context.retry_service.agent_context_feedback_run_state_service',
                 run_state_service,
@@ -3821,11 +3951,11 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 knowledge_cutoff_source='market_close',
             )
 
-        return result, run_state_service, filter_ready
+        return result, run_state_service, filter_ready, build_snapshot
 
     def test_auto_decider_scope_promotes_unready_symbol_to_full_role_repair(self):
         upstream_ready_symbols = ('005930',)
-        result, run_state_service, filter_ready = (
+        result, run_state_service, filter_ready, build_snapshot = (
             self._run_decider_scope_case(
                 upstream_ready_symbols=upstream_ready_symbols,
             )
@@ -3843,6 +3973,11 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 tzinfo=timezone.utc,
             ),
             fs_div='CFS',
+            reuse_static_inputs=ANY,
+        )
+        self.assertIs(
+            filter_ready.call_args.kwargs['reuse_static_inputs'],
+            build_snapshot.call_args_list[0].kwargs['reuse_static_inputs'],
         )
         request_payload = run_state_service.started[0]['request_payload']
         self.assertEqual(request_payload['roles'], list(EXPECTED_ROLES))
@@ -3874,7 +4009,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertTrue(result['completed'])
 
     def test_auto_decider_scope_repairs_every_symbol_when_none_are_ready(self):
-        result, run_state_service, filter_ready = (
+        result, run_state_service, filter_ready, _ = (
             self._run_decider_scope_case(
                 upstream_ready_symbols=(),
             )
@@ -3909,7 +4044,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
     def test_explicit_decider_scope_is_not_silently_filtered(self):
         symbol = '005930'
-        result, run_state_service, filter_ready = (
+        result, run_state_service, filter_ready, _ = (
             self._run_decider_scope_case(
                 upstream_ready_symbols=(symbol,),
                 requested_symbols=(symbol,),
@@ -4609,6 +4744,142 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(role_progress['first_pass_failed_symbols'], 1)
         self.assertEqual(role_progress['retry_queued_symbols'], 1)
         self.assertEqual(role_progress['retry_attempted_symbols'], 1)
+
+    def test_retry_cycles_retry_dependency_failure_but_not_terminal_failure(
+        self,
+    ):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        role = 'short-term-decider'
+        symbols = ('005930', '000660', '035420')
+        retryable_symbol = '005930'
+        terminal_symbol = '000660'
+        completed_symbol = '035420'
+        dispatch_phase = {'value': 0}
+        dispatch_calls = []
+
+        def build_snapshot(**_kwargs):
+            if dispatch_phase['value'] == 0:
+                role_state = _role_state(
+                    role=role,
+                    symbols=symbols,
+                    boundary_pending=symbols,
+                    retry_pending=symbols,
+                )
+            elif dispatch_phase['value'] == 1:
+                role_state = _role_state(
+                    role=role,
+                    symbols=symbols,
+                    completed=(completed_symbol,),
+                    failed=(retryable_symbol, terminal_symbol),
+                    retry_pending=(retryable_symbol,),
+                )
+            else:
+                role_state = _role_state(
+                    role=role,
+                    symbols=symbols,
+                    completed=(retryable_symbol, completed_symbol),
+                    failed=(terminal_symbol,),
+                )
+            return _snapshot(
+                symbols=symbols,
+                role_states={role: role_state},
+            )
+
+        def dispatch_for_symbols(**kwargs):
+            dispatch_calls.append(kwargs)
+            dispatch_phase['value'] += 1
+            failed = 2 if dispatch_phase['value'] == 1 else 0
+            return {
+                'request': {
+                    'roles': kwargs['roles'],
+                    'symbols': kwargs['symbols'],
+                },
+                'summary': {
+                    'status': 'partial' if failed else 'completed',
+                    'completed': len(kwargs['symbols']) - failed,
+                    'failed': failed,
+                },
+            }
+
+        eligibility_records = [
+            {
+                'symbol': symbol,
+                'candidate_rank': rank,
+                'candidate_score': 100 - rank,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            }
+            for rank, symbol in enumerate(symbols, start=1)
+        ]
+        progress = {
+            'request': {'expected_agents': [role]},
+            'summary': {'cycle_status': 'partial'},
+        }
+
+        with (
+            patch(
+                'app.agent_context.retry_service.'
+                'load_agent_feedback_eligibility_records',
+                return_value=eligibility_records,
+            ),
+            patch.object(
+                service,
+                '_build_role_sequence_snapshot',
+                side_effect=build_snapshot,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_feedback_run_state_service',
+                run_state_service,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_orchestrator.dispatch_for_symbols',
+                side_effect=dispatch_for_symbols,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_progress_service.get_feedback_progress',
+                return_value=progress,
+            ),
+        ):
+            result = service._run_retry_cycles_admitted(
+                config=SimpleNamespace(
+                    market_date=date.fromisoformat('2026-04-16'),
+                    roles=(role,),
+                    symbols=symbols,
+                    feedback_scope_mode='decider_scope_fast_path',
+                    max_cycles=3,
+                    outer_batch_size=20,
+                    reuse_existing=False,
+                    force_recompute=False,
+                    progress_callback=None,
+                ),
+                prerequisites=_feedback_prerequisites(),
+                preloaded_eligible_symbols=symbols,
+                effective_knowledge_cutoff_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                knowledge_cutoff_source='market_close',
+            )
+
+        self.assertEqual(
+            [call['symbols'] for call in dispatch_calls],
+            [list(symbols), [retryable_symbol]],
+        )
+        self.assertEqual(
+            [cycle['mode'] for cycle in result['cycles']],
+            ['boundary_resume', 'retry_followup'],
+        )
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['final_pending'], 0)
 
     def test_decider_fast_path_retry_does_not_resume_from_prior_broad_scope_run(self):
         service = AgentFeedbackRetryService()

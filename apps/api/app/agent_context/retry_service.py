@@ -24,6 +24,7 @@ from app.agent_context.eligibility import (
     load_agent_feedback_eligibility_records,
     resolve_agent_feedback_scope,
 )
+from app.agent_context.feedback_failure_taxonomy import FeedbackFailureKind
 from app.agent_context.lease_loss_evidence import (
     RETRY_ADMISSION_LEASE_LOSS_SCHEMA_VERSION,
     RETRY_ADMISSION_SCHEMA_VERSION,
@@ -39,6 +40,7 @@ from app.agent_context.read_service import (
 )
 from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
+    FeedbackReuseStaticInputs,
     agent_context_reuse_service,
 )
 from app.agent_context.roles import (
@@ -1168,6 +1170,20 @@ class RoleSequenceRoleState:
 
 
 @dataclass(frozen=True)
+class _SameDayTerminalSymbols:
+    completed_by_role: dict[str, set[str]]
+    failed_by_role: dict[str, set[str]]
+    retryable_failed_by_role: dict[str, set[str]]
+    dependency_changed_retryable_failed_by_role: dict[str, set[str]]
+
+    def __iter__(self):
+        # Preserve the existing two-value unpacking contract for callers that
+        # only need terminal success/failure state.
+        yield self.completed_by_role
+        yield self.failed_by_role
+
+
+@dataclass(frozen=True)
 class RoleSequenceSnapshot:
     market_date: date
     symbols: tuple[str, ...]
@@ -1223,6 +1239,7 @@ class AgentFeedbackRetryService:
         reuse_existing: bool = True,
         knowledge_cutoff_at: datetime | str | None = None,
         fs_div: str | None = None,
+        reuse_decisions: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> list[str]:
         expected_roles = tuple(roles)
         symbols = list(eligible_symbols) if eligible_symbols is not None else self._load_eligible_symbols(market_date=market_date)
@@ -1239,11 +1256,15 @@ class AgentFeedbackRetryService:
         if knowledge_cutoff_at is not None:
             decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
         decisions = (
-            agent_context_reuse_service.build_latest_decisions(
-                **decision_kwargs
+            reuse_decisions
+            if reuse_decisions is not None
+            else (
+                agent_context_reuse_service.build_latest_decisions(
+                    **decision_kwargs
+                )
+                if reuse_existing
+                else {}
             )
-            if reuse_existing
-            else {}
         )
         completed_by_role: dict[str, set[str]] = {}
         if not force_recompute and reuse_existing:
@@ -1276,11 +1297,22 @@ class AgentFeedbackRetryService:
         symbols: Sequence[str],
         required_parent_run_id: str | None = None,
         knowledge_cutoff_at: datetime | str | None = None,
-    ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    ) -> _SameDayTerminalSymbols:
         completed_by_role: dict[str, set[str]] = defaultdict(set)
         failed_by_role: dict[str, set[str]] = defaultdict(set)
+        retryable_failed_by_role: dict[str, set[str]] = defaultdict(set)
+        dependency_changed_retryable_failed_by_role: dict[str, set[str]] = (
+            defaultdict(set)
+        )
         if not roles or not symbols:
-            return completed_by_role, failed_by_role
+            return _SameDayTerminalSymbols(
+                completed_by_role=completed_by_role,
+                failed_by_role=failed_by_role,
+                retryable_failed_by_role=retryable_failed_by_role,
+                dependency_changed_retryable_failed_by_role=(
+                    dependency_changed_retryable_failed_by_role
+                ),
+            )
 
         normalized_roles = {
             str(role or '').strip().lower()
@@ -1312,6 +1344,8 @@ class AgentFeedbackRetryService:
                     AgentContextFeedbackFailure.symbol,
                     AgentContextFeedbackFailure.agent_name,
                     AgentContextFeedbackFailure.run_id,
+                    AgentContextFeedbackFailure.failure_kind,
+                    AgentContextFeedbackFailure.retryable,
                     AgentContextFeedbackFailure.received_at,
                 )
                 .where(AgentContextFeedbackFailure.market_date == market_date)
@@ -1334,6 +1368,8 @@ class AgentFeedbackRetryService:
                     'symbol': str(row.symbol).upper(),
                     'agent_name': str(row.agent_name).lower(),
                     'run_id': str(row.run_id or '').strip(),
+                    'failure_kind': str(row.failure_kind or '').strip(),
+                    'retryable': bool(row.retryable),
                     'received_at': row.received_at,
                 }
                 for row in persisted_failure_rows
@@ -1440,6 +1476,34 @@ class AgentFeedbackRetryService:
             for row in failure_rows
         }
 
+        def mark_failed(
+            *,
+            symbol: str,
+            role: str,
+            required_run_id: str | None = None,
+        ) -> None:
+            failed_by_role[role].add(symbol)
+            failure = failure_by_key.get((symbol, role))
+            if failure is None or (
+                required_run_id is not None
+                and failure['run_id'] != required_run_id
+            ):
+                return
+            if not failure['retryable']:
+                return
+            retryable_failed_by_role[role].add(symbol)
+            if (
+                failure['failure_kind']
+                == (
+                    FeedbackFailureKind
+                    .DEPENDENCY_UPSTREAM_CHANGED_DURING_DISPATCH
+                    .value
+                )
+            ):
+                dependency_changed_retryable_failed_by_role[role].add(
+                    symbol
+                )
+
         def latest_evidence_kind(
             *,
             key: tuple[str, str],
@@ -1477,8 +1541,15 @@ class AgentFeedbackRetryService:
                 if evidence_kind == 'completed':
                     completed_by_role[role].add(symbol)
                 elif evidence_kind == 'failed':
-                    failed_by_role[role].add(symbol)
-            return completed_by_role, failed_by_role
+                    mark_failed(symbol=symbol, role=role)
+            return _SameDayTerminalSymbols(
+                completed_by_role=completed_by_role,
+                failed_by_role=failed_by_role,
+                retryable_failed_by_role=retryable_failed_by_role,
+                dependency_changed_retryable_failed_by_role=(
+                    dependency_changed_retryable_failed_by_role
+                ),
+            )
 
         def scopes_for_payload(payload: dict[str, Any]) -> dict[str, list[str]]:
             scopes: dict[str, list[str]] = {}
@@ -1576,10 +1647,18 @@ class AgentFeedbackRetryService:
                 )
             )
             if status in {'abandoned', 'failed'} or stale_running:
-                failed_by_role[role].add(symbol)
+                mark_failed(
+                    symbol=symbol,
+                    role=role,
+                    required_run_id=child['run_id'],
+                )
                 continue
             if key in failed_scope_keys_for_child(child):
-                failed_by_role[role].add(symbol)
+                mark_failed(
+                    symbol=symbol,
+                    role=role,
+                    required_run_id=child['run_id'],
+                )
                 continue
             if status not in terminal_child_statuses:
                 continue
@@ -1593,7 +1672,14 @@ class AgentFeedbackRetryService:
                 # A terminal child without its own success receipt is an
                 # incomplete result, even if an older sibling succeeded.
                 failed_by_role[role].add(symbol)
-        return completed_by_role, failed_by_role
+        return _SameDayTerminalSymbols(
+            completed_by_role=completed_by_role,
+            failed_by_role=failed_by_role,
+            retryable_failed_by_role=retryable_failed_by_role,
+            dependency_changed_retryable_failed_by_role=(
+                dependency_changed_retryable_failed_by_role
+            ),
+        )
 
     @staticmethod
     def _reuse_feedback_evidence(decision: Any) -> dict[str, Any] | None:
@@ -1898,6 +1984,7 @@ class AgentFeedbackRetryService:
         symbols: Sequence[str],
         knowledge_cutoff_at: datetime | str | None = None,
         fs_div: str | None = None,
+        reuse_static_inputs: FeedbackReuseStaticInputs | None = None,
     ) -> tuple[str, ...]:
         normalized_symbols = _normalize_optional_symbol_scope(symbols)
         if not normalized_symbols:
@@ -1912,6 +1999,8 @@ class AgentFeedbackRetryService:
         }
         if knowledge_cutoff_at is not None:
             decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
+        if reuse_static_inputs is not None:
+            decision_kwargs['static_inputs'] = reuse_static_inputs
         upstream_decisions = agent_context_reuse_service.build_latest_decisions(
             **decision_kwargs
         )
@@ -1935,6 +2024,7 @@ class AgentFeedbackRetryService:
         symbols: Sequence[str],
         knowledge_cutoff_at: datetime | str | None = None,
         fs_div: str | None = None,
+        reuse_static_inputs: FeedbackReuseStaticInputs | None = None,
     ) -> tuple[str, ...]:
         normalized_symbols = _normalize_optional_symbol_scope(symbols)
         if not normalized_symbols:
@@ -1967,6 +2057,7 @@ class AgentFeedbackRetryService:
                     symbols=upstream_revalidation_candidates,
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=fs_div,
+                    reuse_static_inputs=reuse_static_inputs,
                 )
             )
         return tuple(
@@ -2006,6 +2097,7 @@ class AgentFeedbackRetryService:
         parent_started_at: datetime | None = None,
         knowledge_cutoff_at: datetime | str | None = None,
         fs_div: str | None = None,
+        reuse_static_inputs: FeedbackReuseStaticInputs | None = None,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
@@ -2018,24 +2110,57 @@ class AgentFeedbackRetryService:
             )
             for role, scope in (role_symbol_scopes or {}).items()
         }
-        _, failed_by_role = self._load_same_day_terminal_symbols(
+        terminal_state = self._load_same_day_terminal_symbols(
             market_date=market_date,
             roles=normalized_roles,
             symbols=normalized_symbols,
         )
+        _, failed_by_role = terminal_state
+        retryable_failed_by_role = getattr(
+            terminal_state,
+            'retryable_failed_by_role',
+            failed_by_role,
+        )
+        dependency_changed_retryable_failed_by_role = getattr(
+            terminal_state,
+            'dependency_changed_retryable_failed_by_role',
+            {},
+        )
         current_completed_by_role: dict[str, set[str]] = defaultdict(set)
         current_failed_by_role: dict[str, set[str]] = defaultdict(set)
+        current_retryable_failed_by_role: dict[str, set[str]] = defaultdict(
+            set
+        )
+        current_dependency_changed_retryable_failed_by_role: dict[
+            str,
+            set[str],
+        ] = defaultdict(set)
         if parent_run_id:
+            current_terminal_state = self._load_same_day_terminal_symbols(
+                market_date=market_date,
+                roles=normalized_roles,
+                symbols=normalized_symbols,
+                required_parent_run_id=parent_run_id,
+            )
             current_completed_by_role, current_failed_by_role = (
-                self._load_same_day_terminal_symbols(
-                    market_date=market_date,
-                    roles=normalized_roles,
-                    symbols=normalized_symbols,
-                    required_parent_run_id=parent_run_id,
-                )
+                current_terminal_state
+            )
+            current_retryable_failed_by_role = getattr(
+                current_terminal_state,
+                'retryable_failed_by_role',
+                current_failed_by_role,
+            )
+            current_dependency_changed_retryable_failed_by_role = getattr(
+                current_terminal_state,
+                'dependency_changed_retryable_failed_by_role',
+                {},
             )
         if parent_run_id or force_recompute or not reuse_existing:
             failed_by_role = current_failed_by_role
+            retryable_failed_by_role = current_retryable_failed_by_role
+            dependency_changed_retryable_failed_by_role = (
+                current_dependency_changed_retryable_failed_by_role
+            )
         decision_kwargs: dict[str, Any] = {
             'market_date': market_date,
             'symbols': normalized_symbols,
@@ -2045,6 +2170,8 @@ class AgentFeedbackRetryService:
         }
         if knowledge_cutoff_at is not None:
             decision_kwargs['knowledge_cutoff_at'] = knowledge_cutoff_at
+        if reuse_static_inputs is not None:
+            decision_kwargs['static_inputs'] = reuse_static_inputs
         reuse_decisions = (
             agent_context_reuse_service.build_latest_decisions(
                 **decision_kwargs
@@ -2239,26 +2366,58 @@ class AgentFeedbackRetryService:
                     reuse_existing=reuse_existing,
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=fs_div,
+                    reuse_decisions=reuse_decisions,
                 )
+            )
+            failed_symbol_set = set(failed_symbols)
+            retryable_failed_symbols = set(
+                retryable_failed_by_role.get(role, set())
             )
             retry_pending_symbols = tuple(
                 symbol
                 for symbol in role_symbols
                 if symbol not in set(completed_symbols)
                 and (
-                    symbol in incomplete_symbols
-                    or symbol in current_failed_symbols
+                    (
+                        symbol not in failed_symbol_set
+                        and symbol in incomplete_symbols
+                    )
+                    or symbol in retryable_failed_symbols
                 )
             )
             if (
                 role in DECISION_SUPPORT_AGENT_NAMES
                 and not boundary_pending_symbols
             ):
-                retry_pending_symbols = self._filter_decider_retry_ready_symbols(
-                    market_date=market_date,
-                    symbols=failed_symbols,
-                    knowledge_cutoff_at=knowledge_cutoff_at,
-                    fs_div=fs_div,
+                dependency_changed_symbols = set(
+                    dependency_changed_retryable_failed_by_role.get(
+                        role,
+                        set(),
+                    )
+                )
+                revalidation_candidates = tuple(
+                    symbol
+                    for symbol in retry_pending_symbols
+                    if symbol not in dependency_changed_symbols
+                )
+                upstream_ready_symbols = (
+                    self._filter_decider_retry_ready_symbols(
+                        market_date=market_date,
+                        symbols=revalidation_candidates,
+                        knowledge_cutoff_at=knowledge_cutoff_at,
+                        fs_div=fs_div,
+                        reuse_static_inputs=reuse_static_inputs,
+                    )
+                    if revalidation_candidates
+                    else ()
+                )
+                retry_ready_symbols = dependency_changed_symbols | set(
+                    upstream_ready_symbols
+                )
+                retry_pending_symbols = tuple(
+                    symbol
+                    for symbol in role_symbols
+                    if symbol in retry_ready_symbols
                 )
             role_states[role] = RoleSequenceRoleState(
                 role=role,
@@ -3105,12 +3264,18 @@ class AgentFeedbackRetryService:
                 else None
             ),
         }
+        reuse_static_inputs = (
+            FeedbackReuseStaticInputs()
+            if config.reuse_existing
+            else None
+        )
         if decider_only_fast_path and automatic_scope:
             ready_symbols = self._filter_automatic_decider_upstream_ready_symbols(
                 market_date=config.market_date,
                 symbols=tuple(decider_scope_symbols),
                 knowledge_cutoff_at=effective_knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
+                reuse_static_inputs=reuse_static_inputs,
             )
             ready_symbol_set = set(ready_symbols)
             repair_symbols = [
@@ -3257,6 +3422,7 @@ class AgentFeedbackRetryService:
             parent_started_at=parent_started_at,
             knowledge_cutoff_at=knowledge_cutoff_at,
             fs_div=resolved_fs_div,
+            reuse_static_inputs=reuse_static_inputs,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -3448,6 +3614,7 @@ class AgentFeedbackRetryService:
                         parent_started_at=parent_started_at,
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
+                        reuse_static_inputs=reuse_static_inputs,
                     )
                     completed_roles_before = tuple(
                         list(active_plan.completed_roles) + list(active_plan.plan_roles[:index])
@@ -3566,6 +3733,7 @@ class AgentFeedbackRetryService:
                                     parent_started_at=parent_started_at,
                                     knowledge_cutoff_at=knowledge_cutoff_at,
                                     fs_div=resolved_fs_div,
+                                    reuse_static_inputs=reuse_static_inputs,
                                 )
                                 self._sync_runtime_state(
                                     market_date=config.market_date,
@@ -3650,6 +3818,7 @@ class AgentFeedbackRetryService:
                         parent_started_at=parent_started_at,
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
+                        reuse_static_inputs=reuse_static_inputs,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
                     role_boundary_complete = len(role_state_after.boundary_pending_symbols) == 0
@@ -3724,6 +3893,7 @@ class AgentFeedbackRetryService:
                     parent_started_at=parent_started_at,
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=resolved_fs_div,
+                    reuse_static_inputs=reuse_static_inputs,
                 )
                 cycle_state = runtime_feedback_state_store.get_run(
                     config.market_date,
@@ -3780,6 +3950,7 @@ class AgentFeedbackRetryService:
                 parent_started_at=parent_started_at,
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
+                reuse_static_inputs=reuse_static_inputs,
             )
             final_state_before_finish = runtime_feedback_state_store.get_run(
                 config.market_date,
@@ -3876,6 +4047,7 @@ class AgentFeedbackRetryService:
                 parent_started_at=parent_started_at,
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
+                reuse_static_inputs=reuse_static_inputs,
             ),
             retry_attempted_symbols_by_role=(
                 final_state.retry_attempted_symbols_by_role
