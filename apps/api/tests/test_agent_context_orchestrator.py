@@ -443,6 +443,100 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
             ),
         )
 
+    def test_replay_timestamps_do_not_revoke_durable_generation(self):
+        original = self._source_context()
+        original['context_provenance']['signal_features'] = {
+            'freshness_status': 'stale',
+            'latest_available_market_date': '2026-04-22',
+            'latest_available_timestamp': '2026-04-23T02:20:59+09:00',
+        }
+        original['agent_feedback_eligibility']['forced_inclusion_reasons'] = [
+            {
+                'source': 'prior_missed_opportunity',
+                'details': {
+                    'evaluated_at': '2026-04-23T02:27:59+09:00',
+                    'outcome_label': 'missed_upside',
+                },
+            }
+        ]
+        replayed = deepcopy(original)
+        replayed['context_provenance']['signal_features'][
+            'latest_available_timestamp'
+        ] = '2026-04-23T11:58:07+09:00'
+        replayed['agent_feedback_eligibility']['forced_inclusion_reasons'][0][
+            'details'
+        ]['evaluated_at'] = '2026-04-23T12:03:41+09:00'
+
+        self.assertEqual(
+            build_durable_decider_input_generation(source_context=original),
+            build_durable_decider_input_generation(source_context=replayed),
+        )
+
+    def test_legacy_replay_timestamp_fingerprint_matches_only_same_facts(self):
+        legacy_source = {
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+            'context_provenance': {
+                'signal_features': {
+                    'freshness_status': 'stale',
+                    'latest_available_market_date': '2026-04-22',
+                    'latest_available_timestamp': '2026-04-23T02:20:59+09:00',
+                }
+            },
+            'agent_feedback_eligibility': {
+                'eligible': True,
+                'candidate_rank': 2,
+                'forced_inclusion_reasons': [
+                    {
+                        'details': {
+                            'evaluated_at': '2026-04-23T02:27:59+09:00',
+                            'outcome_label': 'missed_upside',
+                        }
+                    }
+                ],
+            },
+        }
+        refreshed = deepcopy(legacy_source)
+        refreshed['context_provenance']['signal_features'][
+            'latest_available_timestamp'
+        ] = '2026-04-23T11:58:07+09:00'
+        refreshed['agent_feedback_eligibility']['forced_inclusion_reasons'][0][
+            'details'
+        ]['evaluated_at'] = '2026-04-23T12:03:41+09:00'
+        legacy_fingerprint = build_decider_source_context_generation(
+            legacy_source
+        )['fingerprint']
+        observed_fingerprint = build_durable_decider_input_generation(
+            source_context=refreshed
+        )['source_context_fingerprint']
+
+        self.assertTrue(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=legacy_fingerprint,
+                observed_fingerprint=observed_fingerprint,
+                refreshed_source_context=refreshed,
+                expected_source_context={
+                    'symbol_day_context': legacy_source,
+                },
+            )
+        )
+        changed_facts = deepcopy(refreshed)
+        changed_facts['agent_feedback_eligibility']['candidate_rank'] = 9
+        self.assertFalse(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=legacy_fingerprint,
+                observed_fingerprint=(
+                    build_durable_decider_input_generation(
+                        source_context=changed_facts
+                    )['source_context_fingerprint']
+                ),
+                refreshed_source_context=changed_facts,
+                expected_source_context={
+                    'symbol_day_context': legacy_source,
+                },
+            )
+        )
+
     def test_legacy_false_cutoff_marker_matches_only_unchanged_durable_source(self):
         refreshed = {
             'symbol': '005930',

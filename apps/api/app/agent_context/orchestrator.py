@@ -2795,6 +2795,7 @@ class AgentFeedbackOrchestrator:
                             expected_fingerprint=expected_component,
                             observed_fingerprint=observed_component,
                             refreshed_source_context=refreshed_item,
+                            expected_source_context=source_item,
                         )
                     )
                     if (

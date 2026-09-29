@@ -222,6 +222,85 @@ def _durable_macro_context(value: Any) -> Any:
     return result
 
 
+def _remove_nested_key(value: Any, key_to_remove: str) -> None:
+    if isinstance(value, dict):
+        value.pop(key_to_remove, None)
+        for nested in value.values():
+            _remove_nested_key(nested, key_to_remove)
+    elif isinstance(value, list):
+        for nested in value:
+            _remove_nested_key(nested, key_to_remove)
+
+
+def _strip_durable_replay_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    """Drop recomputation clocks that do not change decision facts."""
+    result = deepcopy(value)
+    context_provenance = result.get('context_provenance')
+    if isinstance(context_provenance, dict):
+        signal_features = context_provenance.get('signal_features')
+        if isinstance(signal_features, dict):
+            signal_features.pop('latest_available_timestamp', None)
+    eligibility = result.get('agent_feedback_eligibility')
+    if isinstance(eligibility, dict):
+        _remove_nested_key(eligibility, 'evaluated_at')
+    return result
+
+
+def _restore_nested_key(
+    target: Any,
+    source: Any,
+    key_to_restore: str,
+) -> None:
+    if isinstance(target, dict) and isinstance(source, dict):
+        if key_to_restore in source:
+            target[key_to_restore] = deepcopy(source[key_to_restore])
+        for key, source_value in source.items():
+            if key == key_to_restore or key not in target:
+                continue
+            _restore_nested_key(target[key], source_value, key_to_restore)
+    elif isinstance(target, list) and isinstance(source, list):
+        for target_item, source_item in zip(target, source):
+            _restore_nested_key(target_item, source_item, key_to_restore)
+
+
+def _restore_legacy_replay_metadata(
+    projected: dict[str, Any],
+    expected_source_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result = deepcopy(projected)
+    if not isinstance(expected_source_context, dict):
+        return result
+    persisted_context = expected_source_context.get('symbol_day_context')
+    if not isinstance(persisted_context, dict):
+        persisted_context = expected_source_context
+
+    expected_provenance = persisted_context.get('context_provenance')
+    current_provenance = result.get('context_provenance')
+    if isinstance(expected_provenance, dict) and isinstance(
+        current_provenance, dict
+    ):
+        expected_signal_features = expected_provenance.get('signal_features')
+        current_signal_features = current_provenance.get('signal_features')
+        if isinstance(expected_signal_features, dict) and isinstance(
+            current_signal_features, dict
+        ) and 'latest_available_timestamp' in expected_signal_features:
+            current_signal_features['latest_available_timestamp'] = deepcopy(
+                expected_signal_features['latest_available_timestamp']
+            )
+
+    expected_eligibility = persisted_context.get('agent_feedback_eligibility')
+    current_eligibility = result.get('agent_feedback_eligibility')
+    if isinstance(expected_eligibility, dict) and isinstance(
+        current_eligibility, dict
+    ):
+        _restore_nested_key(
+            current_eligibility,
+            expected_eligibility,
+            'evaluated_at',
+        )
+    return result
+
+
 def _source_names(value: Any) -> tuple[Any, ...]:
     """Normalize provenance source fields without treating text as characters."""
     if value is None:
@@ -317,7 +396,7 @@ def _durable_decider_source_context(item: dict[str, Any]) -> dict[str, Any]:
             for key, value in availability.items()
             if key in DURABLE_DECIDER_AVAILABILITY_KEYS
         }
-    return projected
+    return _strip_durable_replay_metadata(projected)
 
 
 def durable_decider_source_context_fingerprint_matches(
@@ -325,40 +404,47 @@ def durable_decider_source_context_fingerprint_matches(
     expected_fingerprint: Any,
     observed_fingerprint: Any,
     refreshed_source_context: dict[str, Any],
+    expected_source_context: dict[str, Any] | None = None,
 ) -> bool:
-    """Accept only the known legacy cutoff-marker fingerprint difference.
+    """Accept only known non-semantic legacy fingerprint differences.
 
     Older durable generations included ``macro_context.freshness``'s
     ``knowledge_cutoff_applied`` invocation marker. The knowledge boundary is
     independently bound by ``source_knowledge_cutoff_fingerprint``, so the
-    marker itself is not source data. Reconstructing the two legacy values from
-    the refreshed durable projection keeps every material field in the hash and
-    therefore still rejects real macro or eligibility changes.
+    marker itself is not source data. They also included replay timestamps from
+    signal-feature provenance and evaluation evidence. Reconstructing only those
+    legacy metadata values from the persisted request keeps every material field
+    in the current projection and therefore still rejects real source changes.
     """
     if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
         return False
     if expected_fingerprint == observed_fingerprint:
         return True
 
-    projected = _durable_decider_source_context(refreshed_source_context)
+    projected = _restore_legacy_replay_metadata(
+        _durable_decider_source_context(refreshed_source_context),
+        expected_source_context,
+    )
+    legacy_projections = [projected]
     macro_context = projected.get('macro_context')
-    if not isinstance(macro_context, dict):
-        return False
-    freshness = macro_context.get('freshness')
-    if not isinstance(freshness, dict):
-        return False
-
-    legacy_fingerprints: set[str] = set()
-    for marker in (False, None):
-        legacy_projection = deepcopy(projected)
-        legacy_projection['macro_context']['freshness'][
-            'knowledge_cutoff_applied'
-        ] = marker
-        legacy_fingerprints.add(
-            build_decider_source_context_generation(legacy_projection)[
-                'fingerprint'
-            ]
-        )
+    freshness = (
+        macro_context.get('freshness')
+        if isinstance(macro_context, dict)
+        else None
+    )
+    if isinstance(freshness, dict):
+        for marker in (False, None):
+            legacy_projection = deepcopy(projected)
+            legacy_projection['macro_context']['freshness'][
+                'knowledge_cutoff_applied'
+            ] = marker
+            legacy_projections.append(legacy_projection)
+    legacy_fingerprints = {
+        build_decider_source_context_generation(legacy_projection)[
+            'fingerprint'
+        ]
+        for legacy_projection in legacy_projections
+    }
     return expected_fingerprint in legacy_fingerprints
 
 
