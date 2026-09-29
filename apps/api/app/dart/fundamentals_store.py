@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import nullcontext
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
@@ -806,12 +807,14 @@ class DartFundamentalsRepository:
         stock_codes: list[str],
         fs_div: str | None = None,
         captured_before: datetime | str | None = None,
+        session: Any | None = None,
     ) -> list[dict[str, Any]]:
         return self._list_stored_fundamentals(
             stock_codes=stock_codes,
             fs_div=fs_div,
             captured_before=captured_before,
             include_statement_rows=False,
+            session=session,
         )
 
     def _list_stored_fundamentals(
@@ -821,11 +824,17 @@ class DartFundamentalsRepository:
         fs_div: str | None = None,
         captured_before: datetime | str | None = None,
         include_statement_rows: bool,
+        session: Any | None = None,
     ) -> list[dict[str, Any]]:
         if not stock_codes:
             return []
 
-        with session_scope() as session:
+        session_context = (
+            nullcontext(session)
+            if session is not None
+            else session_scope()
+        )
+        with session_context as active_session:
             requested_fs_div = (fs_div or 'CFS').strip().upper()
             eligible_fs_divs = eligible_fundamentals_fs_divs(requested_fs_div)
             stmt = (
@@ -847,7 +856,7 @@ class DartFundamentalsRepository:
                     < _normalize_capture_cutoff(captured_before)
                 )
 
-            snapshot_rows = session.execute(
+            snapshot_rows = active_session.execute(
                 stmt.order_by(
                     DartFundamentalsSnapshot.stock_code.asc(),
                     DartDisclosureEvent.receipt_date.desc(),
@@ -879,12 +888,12 @@ class DartFundamentalsRepository:
             snapshot_rows = selected_snapshot_rows
 
             snapshot_ids = [snapshot.id for snapshot, _event in snapshot_rows]
-            highlight_rows = session.execute(
+            highlight_rows = active_session.execute(
                 select(DartFundamentalsHighlight)
                 .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids))
                 .order_by(DartFundamentalsHighlight.snapshot_id.asc(), DartFundamentalsHighlight.metric_key.asc())
             ).scalars()
-            statement_row_counts = session.execute(
+            statement_row_counts = active_session.execute(
                 select(DartFundamentalsRow.snapshot_id, func.count())
                 .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
                 .group_by(DartFundamentalsRow.snapshot_id)
@@ -892,7 +901,7 @@ class DartFundamentalsRepository:
 
             statement_rows = []
             if include_statement_rows:
-                statement_rows = session.execute(
+                statement_rows = active_session.execute(
                     select(DartFundamentalsRow)
                     .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
                     .order_by(

@@ -95,6 +95,69 @@ def _ordered_symbol_union(symbol_scopes: Sequence[Sequence[str]]) -> list[str]:
     return ordered
 
 
+def _exact_completed_summary_scope(
+    payload: Mapping[str, Any],
+) -> tuple[list[str], int] | None:
+    """Return symbols completed by every summarizer plus role-item total."""
+
+    raw_symbols = payload.get('symbols')
+    raw_role_scopes = payload.get('role_symbol_scopes')
+    if not isinstance(raw_symbols, list) or not isinstance(
+        raw_role_scopes,
+        Mapping,
+    ):
+        return None
+    normalized_role_scopes = {
+        str(role or '').strip(): symbols
+        for role, symbols in raw_role_scopes.items()
+        if str(role or '').strip()
+    }
+    if set(normalized_role_scopes) != set(SUMMARIZER_AGENT_NAMES):
+        return None
+
+    role_scopes: list[set[str]] = []
+    role_item_total = 0
+    for role in SUMMARIZER_AGENT_NAMES:
+        role_symbols = normalized_role_scopes.get(role)
+        if not isinstance(role_symbols, list):
+            return None
+        normalized_symbols = set(
+            _normalize_optional_symbol_scope(role_symbols)
+        )
+        if len(normalized_symbols) != len(role_symbols):
+            return None
+        role_scopes.append(normalized_symbols)
+        role_item_total += len(normalized_symbols)
+
+    dispatched_symbols = set(
+        _normalize_optional_symbol_scope(raw_symbols)
+    )
+    if len(dispatched_symbols) != len(raw_symbols) or dispatched_symbols != set().union(
+        *role_scopes
+    ):
+        return None
+
+    raw_role_counts = payload.get('role_symbol_counts')
+    if raw_role_counts is not None:
+        if not isinstance(raw_role_counts, Mapping) or set(
+            raw_role_counts
+        ) != set(SUMMARIZER_AGENT_NAMES):
+            return None
+        for role, role_scope in zip(
+            SUMMARIZER_AGENT_NAMES,
+            role_scopes,
+            strict=True,
+        ):
+            if (
+                type(raw_role_counts.get(role)) is not int
+                or raw_role_counts[role] != len(role_scope)
+            ):
+                return None
+
+    completed_scope = set.intersection(*role_scopes)
+    return sorted(completed_scope), role_item_total
+
+
 def _feedback_retry_admission_lock_key(
     *,
     market_date: date,
@@ -187,6 +250,7 @@ def resolve_latest_completed_summary_knowledge_cutoff(
     *,
     market_date: date | str,
     feedback_scope_mode: str,
+    fs_div: str | None = None,
     source_run_id: str | None = None,
     requested_symbols: Sequence[str] | None = None,
     now: datetime | None = None,
@@ -208,6 +272,11 @@ def resolve_latest_completed_summary_knowledge_cutoff(
     )
     normalized_scope_mode = normalize_feedback_scope_mode(
         feedback_scope_mode
+    )
+    normalized_fs_div = (
+        _normalize_feedback_fs_div(fs_div)
+        if fs_div is not None
+        else None
     )
     normalized_source_run_id = (
         str(source_run_id or '').strip()
@@ -315,14 +384,53 @@ def resolve_latest_completed_summary_knowledge_cutoff(
             run_market_date = None
         if run_market_date != normalized_market_date:
             return {**base_result, 'reason': 'summary_run_market_date_mismatch'}
+        for payload in represented_request_payloads:
+            if 'market_date' not in payload:
+                continue
+            raw_payload_market_date = payload.get('market_date')
+            try:
+                payload_market_date = (
+                    raw_payload_market_date.date()
+                    if isinstance(raw_payload_market_date, datetime)
+                    else raw_payload_market_date
+                    if isinstance(raw_payload_market_date, date)
+                    else date.fromisoformat(
+                        str(raw_payload_market_date or '').strip()[:10]
+                    )
+                )
+            except (TypeError, ValueError):
+                payload_market_date = None
+            if payload_market_date != normalized_market_date:
+                return {
+                    **base_result,
+                    'reason': 'summary_run_market_date_mismatch',
+                }
         if (
             str(request_payload.get('mode') or '').strip()
             != DAILY_RETRY_CYCLE_MODE
         ):
             return {**base_result, 'reason': 'summary_run_mode_mismatch'}
+        if any(
+            'mode' in payload
+            and str(payload.get('mode') or '').strip()
+            != DAILY_RETRY_CYCLE_MODE
+            for payload in represented_request_payloads
+        ):
+            return {**base_result, 'reason': 'summary_run_mode_mismatch'}
+        raw_persisted_scope_mode = request_payload.get(
+            'feedback_scope_mode'
+        )
+        if not (
+            isinstance(raw_persisted_scope_mode, str)
+            and raw_persisted_scope_mode.strip()
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_feedback_scope_mode_mismatch',
+            }
         try:
             persisted_scope_mode = normalize_feedback_scope_mode(
-                request_payload.get('feedback_scope_mode')
+                raw_persisted_scope_mode
             )
         except ValueError:
             persisted_scope_mode = None
@@ -331,28 +439,85 @@ def resolve_latest_completed_summary_knowledge_cutoff(
                 **base_result,
                 'reason': 'summary_run_feedback_scope_mode_mismatch',
             }
-
-    run_roles = request_payload.get('roles')
-    if sorted(run_roles if isinstance(run_roles, list) else []) != sorted(
-        SUMMARIZER_AGENT_NAMES
-    ):
-        return {**base_result, 'reason': 'summary_run_roles_mismatch'}
-
-    if normalized_requested_symbols is not None:
-        represented_symbol_scopes: list[list[str]] = []
         for payload in represented_request_payloads:
-            if 'requested_symbols' not in payload:
-                continue
-            raw_symbols = payload.get('requested_symbols')
-            if not isinstance(raw_symbols, (list, tuple, set)):
+            raw_represented_scope_mode = payload.get(
+                'feedback_scope_mode'
+            )
+            if not (
+                isinstance(raw_represented_scope_mode, str)
+                and raw_represented_scope_mode.strip()
+            ):
                 return {
                     **base_result,
-                    'reason': 'summary_run_symbol_scope_unavailable',
+                    'reason': 'summary_run_feedback_scope_mode_mismatch',
                 }
-            represented_symbol_scopes.append(
-                sorted(_normalize_optional_symbol_scope(raw_symbols))
-            )
-        if not represented_symbol_scopes:
+            try:
+                represented_scope_mode = normalize_feedback_scope_mode(
+                    raw_represented_scope_mode
+                )
+            except ValueError:
+                represented_scope_mode = None
+            if represented_scope_mode != normalized_scope_mode:
+                return {
+                    **base_result,
+                    'reason': 'summary_run_feedback_scope_mode_mismatch',
+                }
+        if normalized_fs_div is not None:
+            for payload in represented_request_payloads:
+                raw_persisted_fs_div = payload.get('fs_div')
+                if not (
+                    isinstance(raw_persisted_fs_div, str)
+                    and raw_persisted_fs_div.strip()
+                ):
+                    return {
+                        **base_result,
+                        'reason': 'summary_run_fs_div_mismatch',
+                    }
+                try:
+                    persisted_fs_div = _normalize_feedback_fs_div(
+                        raw_persisted_fs_div
+                    )
+                except ValueError:
+                    persisted_fs_div = None
+                if (
+                    persisted_fs_div != normalized_fs_div
+                ):
+                    return {
+                        **base_result,
+                        'reason': 'summary_run_fs_div_mismatch',
+                    }
+
+    for payload in represented_request_payloads:
+        if payload is not request_payload and 'roles' not in payload:
+            continue
+        run_roles = payload.get('roles')
+        if sorted(run_roles if isinstance(run_roles, list) else []) != sorted(
+            SUMMARIZER_AGENT_NAMES
+        ):
+            return {**base_result, 'reason': 'summary_run_roles_mismatch'}
+
+    represented_symbol_scopes: list[list[str] | None] = []
+    for payload in represented_request_payloads:
+        if 'requested_symbols' not in payload:
+            continue
+        raw_symbols = payload.get('requested_symbols')
+        if raw_symbols is None:
+            represented_symbol_scopes.append(None)
+            continue
+        if not isinstance(raw_symbols, (list, tuple, set)):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_unavailable',
+            }
+        represented_symbol_scopes.append(
+            sorted(_normalize_optional_symbol_scope(raw_symbols))
+        )
+
+    if normalized_requested_symbols is not None:
+        if not represented_symbol_scopes or any(
+            persisted_scope is None
+            for persisted_scope in represented_symbol_scopes
+        ):
             return {
                 **base_result,
                 'reason': 'summary_run_symbol_scope_unavailable',
@@ -365,7 +530,17 @@ def resolve_latest_completed_summary_knowledge_cutoff(
                 **base_result,
                 'reason': 'summary_run_symbol_scope_mismatch',
             }
-
+    elif represented_symbol_scopes:
+        first_scope = represented_symbol_scopes[0]
+        if any(
+            persisted_scope != first_scope
+            for persisted_scope in represented_symbol_scopes[1:]
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_mismatch',
+            }
+        base_result['requested_symbols'] = first_scope
     if normalized_source_run_id is not None:
         for payload in represented_request_payloads:
             if (
@@ -393,33 +568,116 @@ def resolve_latest_completed_summary_knowledge_cutoff(
                     'reason': 'summary_run_lineage_mismatch',
                 }
 
+    exact_summary_item_total: int | None = None
+    if normalized_source_run_id is not None:
+        completed_scope_evidence = [
+            _exact_completed_summary_scope(payload)
+            for payload in represented_request_payloads
+        ]
+        if not completed_scope_evidence or any(
+            evidence is None for evidence in completed_scope_evidence
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_unavailable',
+            }
+        completed_scopes = [
+            evidence[0]
+            for evidence in completed_scope_evidence
+            if evidence is not None
+        ]
+        completed_item_totals = [
+            evidence[1]
+            for evidence in completed_scope_evidence
+            if evidence is not None
+        ]
+        if any(
+            scope != completed_scopes[0]
+            for scope in completed_scopes[1:]
+        ) or any(
+            item_total != completed_item_totals[0]
+            for item_total in completed_item_totals[1:]
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_mismatch',
+            }
+        completed_scope = completed_scopes[0]
+        if not completed_scope:
+            return {**base_result, 'reason': 'summary_run_zero_work'}
+        admitted_scope = (
+            represented_symbol_scopes[0]
+            if represented_symbol_scopes
+            else None
+        )
+        if not admitted_scope or not set(completed_scope).issubset(
+            admitted_scope
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_mismatch',
+            }
+        base_result['requested_symbols'] = completed_scope
+        exact_summary_item_total = completed_item_totals[0]
+
     status = str(latest_run.get('status') or '').strip().lower()
     completed_at = latest_run.get('completed_at')
     if completed_at is None:
         return {**base_result, 'reason': 'summary_run_not_finalized'}
-    try:
-        symbols_total = max(int(latest_run.get('symbols_total') or 0), 0)
-        completed_count = max(
-            int(latest_run.get('completed_count') or 0),
-            0,
-        )
-        failed_count = max(int(latest_run.get('failed_count') or 0), 0)
-    except (TypeError, ValueError):
+    raw_counts = (
+        latest_run.get('symbols_total'),
+        latest_run.get('completed_count'),
+        latest_run.get('failed_count'),
+    )
+    if any(type(value) is not int or value < 0 for value in raw_counts):
         return {**base_result, 'reason': 'summary_run_counts_invalid'}
+    symbols_total, completed_count, failed_count = raw_counts
     if (
         status != 'completed'
         or failed_count != 0
         or completed_count != symbols_total
     ):
         return {**base_result, 'reason': 'summary_run_incomplete'}
+    if normalized_source_run_id is not None and (
+        symbols_total <= 0
+        or exact_summary_item_total is None
+        or symbols_total != exact_summary_item_total
+    ):
+        return {**base_result, 'reason': 'summary_run_counts_invalid'}
 
-    raw_cutoff = request_payload.get('admission_knowledge_cutoff_at')
-    if raw_cutoff is None:
-        raw_cutoff = request_payload.get('knowledge_cutoff_at')
     try:
-        normalized_cutoff = _normalize_admission_knowledge_cutoff(raw_cutoff)
-        if normalized_cutoff is None:
+        represented_cutoffs: list[str] = []
+        for payload in represented_request_payloads:
+            payload_cutoffs = {
+                normalized
+                for key in (
+                    'admission_knowledge_cutoff_at',
+                    'knowledge_cutoff_at',
+                )
+                if key in payload and payload.get(key) is not None
+                for normalized in (
+                    _normalize_admission_knowledge_cutoff(payload.get(key)),
+                )
+                if normalized is not None
+            }
+            if len(payload_cutoffs) > 1:
+                return {
+                    **base_result,
+                    'reason': 'summary_cutoff_mismatch',
+                }
+            if payload_cutoffs:
+                represented_cutoffs.append(next(iter(payload_cutoffs)))
+        if not represented_cutoffs:
             raise ValueError('summary cutoff missing')
+        normalized_cutoff = represented_cutoffs[0]
+        if any(
+            represented_cutoff != normalized_cutoff
+            for represented_cutoff in represented_cutoffs[1:]
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_cutoff_mismatch',
+            }
         cutoff = datetime.fromisoformat(normalized_cutoff)
     except (TypeError, ValueError):
         return {**base_result, 'reason': 'summary_cutoff_invalid'}

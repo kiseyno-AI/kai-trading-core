@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -28,8 +27,6 @@ from app.db_models import (
     DailyPykrxEnrichmentRow,
     DailyTechnicalSnapshot,
     DartDisclosureEvent,
-    DartFundamentalsHighlight,
-    DartFundamentalsRow,
     DartFundamentalsSnapshot,
     SignalDeciderDecisionSnapshot,
     Symbol,
@@ -1738,84 +1735,14 @@ class AgentContextReuseService:
         )
         from app.dart.store import _serialize_event
 
-        snapshot_statement = (
-            select(DartFundamentalsSnapshot, DartDisclosureEvent)
-            .join(
-                DartDisclosureEvent,
-                DartDisclosureEvent.id
-                == DartFundamentalsSnapshot.disclosure_event_id,
+        fundamentals_items = (
+            dart_fundamentals_repository.list_stored_fundamentals_summary(
+                stock_codes=[symbol],
+                fs_div=fs_div,
+                captured_before=knowledge_cutoff_at,
+                session=session,
             )
-            .where(DartFundamentalsSnapshot.stock_code == symbol)
         )
-        if fs_div is not None:
-            snapshot_statement = snapshot_statement.where(
-                DartFundamentalsSnapshot.fs_div == fs_div
-            )
-        if knowledge_cutoff_at is not None:
-            snapshot_statement = snapshot_statement.where(
-                DartFundamentalsSnapshot.captured_at
-                < knowledge_cutoff_at
-            )
-        snapshot_pairs = session.execute(
-            snapshot_statement.order_by(
-                DartFundamentalsSnapshot.stock_code.asc(),
-                DartDisclosureEvent.receipt_date.desc(),
-                DartFundamentalsSnapshot.business_year.desc(),
-                DartFundamentalsSnapshot.report_code.desc(),
-                DartFundamentalsSnapshot.id.desc(),
-            )
-        ).all()
-        snapshot_ids = [int(snapshot.id) for snapshot, _ in snapshot_pairs]
-        highlights_by_snapshot: dict[int, list[dict[str, Any]]] = (
-            defaultdict(list)
-        )
-        row_count_by_snapshot: dict[int, int] = {}
-        if snapshot_ids:
-            highlight_rows = session.execute(
-                select(DartFundamentalsHighlight)
-                .where(
-                    DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids)
-                )
-                .order_by(
-                    DartFundamentalsHighlight.snapshot_id.asc(),
-                    DartFundamentalsHighlight.metric_key.asc(),
-                )
-            ).scalars().all()
-            for row in highlight_rows:
-                highlights_by_snapshot[int(row.snapshot_id)].append(
-                    dart_fundamentals_repository._serialize_highlight(row)
-                )
-            row_count_by_snapshot = {
-                int(snapshot_id): int(row_count)
-                for snapshot_id, row_count in session.execute(
-                    select(
-                        DartFundamentalsRow.snapshot_id,
-                        func.count(),
-                    )
-                    .where(
-                        DartFundamentalsRow.snapshot_id.in_(snapshot_ids)
-                    )
-                    .group_by(DartFundamentalsRow.snapshot_id)
-                ).all()
-            }
-        fundamentals_items = [
-            {
-                **dart_fundamentals_repository._serialize_snapshot(snapshot),
-                'disclosure': (
-                    dart_fundamentals_repository._serialize_event(event)
-                ),
-                'highlights': highlights_by_snapshot.get(
-                    int(snapshot.id),
-                    [],
-                ),
-                'statement_rows': [],
-                'statement_row_count': row_count_by_snapshot.get(
-                    int(snapshot.id),
-                    0,
-                ),
-            }
-            for snapshot, event in snapshot_pairs
-        ]
         fundamentals = _build_fundamentals_summary(
             fundamentals_items,
             market_date=market_date,

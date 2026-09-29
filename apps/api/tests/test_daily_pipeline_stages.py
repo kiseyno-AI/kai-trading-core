@@ -4,6 +4,9 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.daily_pipeline_state import _build_stage_duration_details
 from app.eod.daily_pipeline_stages import (
@@ -231,6 +234,7 @@ class _FakeTerminalContinuationRunStateService(_FakePipelineRunStateService):
                 ),
                 'source_run_id': 'feedback-cycle-summary',
                 'feedback_scope_mode': 'broad_feedback_universe',
+                'requested_symbols': ['005930'],
             },
             'pipeline_run': {
                 'id': kwargs['pipeline_run_id'],
@@ -289,6 +293,83 @@ class _FakeTerminalContinuationRunStateService(_FakePipelineRunStateService):
             'run_metadata': kwargs.get('run_metadata') or {},
         }
 
+
+class _FakeCutoffContractRepairRunStateService(
+    _FakePipelineRunStateService
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_calls: list[dict] = []
+        self.start_run_calls: list[dict] = []
+        self.finish_calls: list[dict] = []
+
+    def start_run(self, **kwargs):
+        self.start_run_calls.append(kwargs)
+        raise AssertionError('cutoff repair resume must not create a new run')
+
+    def claim_summary_cutoff_contract_repair_resume(self, **kwargs):
+        self.claim_calls.append(kwargs)
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+        }
+        return {
+            'claimed': True,
+            'resumed': True,
+            'pipeline_run_id': kwargs['pipeline_run_id'],
+            'summary_cutoff_proof': proof,
+            'knowledge_cutoff_resolution': {
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': datetime(
+                    2026,
+                    4,
+                    14,
+                    8,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                'source_run_id': 'feedback-cycle-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': ['005930'],
+            },
+            'pipeline_run': {
+                'id': kwargs['pipeline_run_id'],
+                'status': 'running',
+                'stages': {},
+                'run_metadata': {
+                    'symbols': None,
+                    'markets': ['KOSPI'],
+                    'force': False,
+                    'fs_div': 'CFS',
+                    'symbol_limit': None,
+                    'symbol_offset': 0,
+                    'capture_limit': 500,
+                    'retry_cycles': None,
+                    'feedback_max_cycles': 3,
+                    'feedback_outer_batch_size': 20,
+                    'reuse_existing_feedback': True,
+                    'bypass_prerequisite_gate': False,
+                    'point_in_time_recovery': False,
+                    'stage_statuses': {
+                        'signal_decider': 'pending',
+                        'next_open_execution_plan': 'pending',
+                        'signal_decider_evaluations': 'pending',
+                    },
+                    'summary_cutoff_contract_repair_version': 1,
+                    'summary_cutoff_contract_repair_proof': proof,
+                },
+            },
+        }
+
+    def finish_run(self, **kwargs):
+        self.finish_calls.append(kwargs)
+        return {
+            'id': kwargs['pipeline_run_id'],
+            'status': kwargs['status'],
+            'run_metadata': kwargs.get('run_metadata') or {},
+        }
 
 class _FakeSkippedPykrxStageRunner:
     def __init__(self) -> None:
@@ -1000,15 +1081,24 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'reason': 'latest_completed_summary_cutoff',
                     'knowledge_cutoff_at': cutoff,
                     'source_run_id': 'feedback-cycle-summary',
-                    'feedback_scope_mode': 'broad_feedback_universe',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': ['000660', '005930'],
                 },
             ) as resolve_cutoff,
         ):
             result = service.run(
                 market_date='2026-04-14',
                 stages=['signal_decider'],
-                symbols=['005930'],
                 trigger='auto_eod_followup_resume',
+                summary_cutoff_proof={
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': None,
+                },
             )
 
         self.assertEqual(result['status'], 'completed')
@@ -1017,17 +1107,83 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             cutoff,
         )
         self.assertEqual(
+            feedback_retry_service.calls[0]['config'].symbols,
+            ('000660', '005930'),
+        )
+        self.assertEqual(
             result['pipeline_run']['run_metadata'][
                 'feedback_knowledge_cutoff'
             ]['source_run_id'],
             'feedback-cycle-summary',
         )
+        self.assertEqual(
+            result['pipeline_run']['run_metadata'][
+                'feedback_knowledge_cutoff'
+            ]['requested_symbols'],
+            ['000660', '005930'],
+        )
         resolve_cutoff.assert_called_once_with(
             market_date=datetime(2026, 4, 14).date(),
-            feedback_scope_mode='broad_feedback_universe',
-            source_run_id=None,
+            feedback_scope_mode=(
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            ),
+            fs_div='CFS',
+            source_run_id='feedback-cycle-summary',
             requested_symbols=None,
         )
+
+    def test_decider_only_recovery_rejects_proof_outside_explicit_scope(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+        )
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'knowledge_cutoff_at': cutoff,
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': ['000660', '005930'],
+                },
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['signal_decider'],
+                symbols=['005930'],
+                trigger='auto_eod_followup_resume',
+                summary_cutoff_proof={
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': None,
+                },
+            )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(
+            result['stages']['signal_decider']['result'][
+                'knowledge_cutoff_resolution'
+            ]['reason'],
+            'summary_run_symbol_scope_mismatch',
+        )
+        self.assertEqual(feedback_retry_service.calls, [])
 
     def test_decider_only_force_bypass_blocks_without_proven_summary_cutoff(
         self,
@@ -1150,6 +1306,239 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(final_statuses['macro_context_refresh'], 'completed')
         self.assertEqual(final_statuses['signal_decider'], 'completed')
         self.assertEqual(result['status'], 'partial')
+
+    def test_terminal_continuation_limits_decider_to_fast_summary_scope(
+        self,
+    ) -> None:
+        run_state_service = _FakeTerminalContinuationRunStateService()
+        original_claim = run_state_service.claim_terminal_continuation
+
+        def claim_with_fast_subset(**kwargs):
+            claim = original_claim(**kwargs)
+            claim['knowledge_cutoff_resolution'].update(
+                {
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': ['005930'],
+                }
+            )
+            claim['pipeline_run']['run_metadata']['symbols'] = [
+                '005930',
+                '000660',
+            ]
+            return claim
+
+        run_state_service.claim_terminal_continuation = (
+            claim_with_fast_subset
+        )
+        service = DailyPipelineStageService(
+            run_state_service=run_state_service,
+        )
+        executed_symbols: dict[str, list[str] | None] = {}
+
+        def execute(stage_id, **kwargs):
+            executed_symbols[stage_id] = kwargs['symbols']
+            return {'status': 'completed', 'stage_id': stage_id}
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(service, '_execute_stage', side_effect=execute),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=546,
+                existing_pipeline_run_id=456,
+            )
+
+        self.assertEqual(result['pipeline_run_id'], 456)
+        self.assertEqual(
+            executed_symbols['signal_decider'],
+            ['005930'],
+        )
+
+    def test_cutoff_contract_repair_resume_reuses_same_run(self) -> None:
+        run_state_service = _FakeCutoffContractRepairRunStateService()
+        cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+        service = DailyPipelineStageService(
+            run_state_service=run_state_service,
+        )
+        executed: list[tuple[str, list[str] | None]] = []
+
+        def execute(stage_id, **kwargs):
+            executed.append((stage_id, kwargs['symbols']))
+            return {'status': 'completed', 'stage_id': stage_id}
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'knowledge_cutoff_at': cutoff,
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': ['005930'],
+                },
+            ) as resolve_cutoff,
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                trigger='auto_eod_followup_resume',
+                resume_from_stage='signal_decider',
+                reused_eod_collection_run_id=546,
+                existing_pipeline_run_id=456,
+                summary_cutoff_contract_repair=True,
+                summary_cutoff_proof={
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': None,
+                },
+            )
+
+        self.assertEqual(result['pipeline_run_id'], 456)
+        self.assertEqual(run_state_service.start_run_calls, [])
+        self.assertEqual(
+            run_state_service.claim_calls,
+            [
+                {
+                    'pipeline_run_id': 456,
+                    'market_date': '2026-04-14',
+                    'reused_eod_collection_run_id': 546,
+                }
+            ],
+        )
+        self.assertEqual(
+            executed,
+            [
+                ('signal_decider', ['005930']),
+                ('next_open_execution_plan', None),
+                ('signal_decider_evaluations', None),
+            ],
+        )
+        resolve_cutoff.assert_not_called()
+        self.assertEqual(result['status'], 'completed')
+
+    def test_cutoff_contract_repair_resume_rejects_invalid_persisted_fs_div(
+        self,
+    ) -> None:
+        class InvalidContextRunStateService(
+            _FakeCutoffContractRepairRunStateService
+        ):
+            def claim_summary_cutoff_contract_repair_resume(self, **kwargs):
+                result = super().claim_summary_cutoff_contract_repair_resume(
+                    **kwargs
+                )
+                result['pipeline_run']['run_metadata']['fs_div'] = 'INVALID'
+                return result
+
+        run_state_service = InvalidContextRunStateService()
+        service = DailyPipelineStageService(
+            run_state_service=run_state_service,
+        )
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                return_value={'status': 'completed'},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'cutoff contract repair fs_div is invalid',
+            ):
+                service.run(
+                    market_date='2026-04-14',
+                    stages=[
+                        'signal_decider',
+                        'next_open_execution_plan',
+                        'signal_decider_evaluations',
+                    ],
+                    trigger='auto_eod_followup_resume',
+                    resume_from_stage='signal_decider',
+                    reused_eod_collection_run_id=546,
+                    existing_pipeline_run_id=456,
+                    summary_cutoff_contract_repair=True,
+                    summary_cutoff_proof={
+                        'source_run_id': 'feedback-cycle-summary',
+                        'feedback_scope_mode': 'decider_scope_fast_path',
+                        'requested_symbols': None,
+                    },
+                )
+
+        self.assertEqual(len(run_state_service.finish_calls), 1)
+        self.assertEqual(
+            run_state_service.finish_calls[0]['pipeline_run_id'],
+            456,
+        )
+        self.assertEqual(run_state_service.finish_calls[0]['status'], 'failed')
+
+    def test_terminal_continuation_context_recovers_summary_result_lineage(
+        self,
+    ) -> None:
+        run_state_service = _FakeTerminalContinuationRunStateService()
+        pipeline_run = run_state_service.claim_terminal_continuation(
+            pipeline_run_id=456,
+            reason='summary_knowledge_cutoff_repair',
+        )['pipeline_run']
+        summary_evidence = pipeline_run['run_metadata'][
+            'terminal_continuation_evidence'
+        ]['suffix_stages']['agent_feedback_summaries']
+        summary_evidence['source_run_ids'] = {'eod_run_id': 546}
+        summary_evidence['details'] = {
+            'result_summary': {'run_id': 'feedback-cycle-summary'}
+        }
+
+        context = DailyPipelineStageService(
+            run_state_service=run_state_service,
+        )._terminal_continuation_execution_context(pipeline_run)
+
+        self.assertEqual(
+            context['summary_source_run_id'],
+            'feedback-cycle-summary',
+        )
+
+        summary_evidence['source_run_ids'] = {
+            'run_id': 'another-feedback-cycle'
+        }
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'terminal continuation summary source run is unavailable',
+        ):
+            DailyPipelineStageService(
+                run_state_service=run_state_service,
+            )._terminal_continuation_execution_context(pipeline_run)
 
     def test_terminal_continuation_skips_persisted_completed_prefix(self) -> None:
         suffix_ids = [

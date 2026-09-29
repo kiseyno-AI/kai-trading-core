@@ -13,8 +13,23 @@ from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.daily_pipeline_state import (
     DailyPipelineRunStateService,
     _expired_decision_skip_evidence_is_valid,
+    _summary_cutoff_contract_repair_execution_context_error,
     _stage_row_outcome,
 )
+
+
+def _completed_feedback_summary_stage(proof: dict) -> dict:
+    return {
+        'status': 'completed',
+        'source_run_ids': {'run_id': proof['source_run_id']},
+        'details': {
+            'result_summary': {
+                'status': 'completed',
+                **proof,
+                'run_id': proof['source_run_id'],
+            }
+        },
+    }
 
 
 class DailyPipelineRunStateServiceTests(unittest.TestCase):
@@ -37,7 +52,8 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'source_run_id': (
                     'agent_feedback_summaries-prior'
                 ),
-                'feedback_scope_mode': 'broad_feedback_universe',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': ['005930'],
             },
         )
         self.resolve_terminal_cutoff = (
@@ -134,7 +150,16 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             cls._terminal_continuation_stage(
                 stage_id='agent_feedback_summaries',
                 status='completed',
-                details={'result_summary': {'status': 'completed'}},
+                details={
+                    'result_summary': {
+                        'status': 'completed',
+                        'run_id': 'agent_feedback_summaries-prior',
+                        'feedback_scope_mode': (
+                            'decider_scope_fast_path'
+                        ),
+                        'requested_symbols': None,
+                    }
+                },
                 stage_row_id=2,
             ),
             cls._terminal_continuation_stage(
@@ -647,7 +672,6 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         session.execute.side_effect = [run_result, stages_result]
         session_context = MagicMock()
         session_context.__enter__.return_value = session
-
         with patch(
             'app.eod.daily_pipeline_state.session_scope',
             return_value=session_context,
@@ -2593,7 +2617,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.resolve_terminal_cutoff.assert_called_once_with(
             market_date=date(2026, 9, 18),
             source_run_id='agent_feedback_summaries-prior',
-            requested_symbols=['005930'],
+            feedback_scope_mode='decider_scope_fast_path',
+            requested_symbols=None,
+            fs_div='CFS',
             source_run_session=session,
         )
         self.assertEqual(
@@ -2676,7 +2702,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'source_run_id': (
                     'agent_feedback_summaries-prior'
                 ),
-                'feedback_scope_mode': 'broad_feedback_universe',
+                'feedback_scope_mode': 'decider_scope_fast_path',
                 'requested_symbols': ['005930'],
                 'requested_symbol_count': 1,
             },
@@ -2835,7 +2861,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.resolve_terminal_cutoff.assert_called_once_with(
             market_date=date(2026, 9, 18),
             source_run_id='agent_feedback_summaries-prior',
+            feedback_scope_mode='decider_scope_fast_path',
             requested_symbols=['005930'],
+            fs_div='CFS',
             source_run_session=second_session,
         )
         for stage in stages[1:]:
@@ -2997,7 +3025,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 reused_eod_collection_run_id=546,
             )
 
-        self.assertTrue(resumed['claimed'])
+        self.assertTrue(resumed['claimed'], resumed)
         self.assertTrue(resumed['resumed'])
         self.assertEqual(run.status, 'running')
         self.assertEqual(
@@ -3059,6 +3087,8 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'result_summary': {
                 'status': 'completed',
                 'run_id': 'agent_feedback_summaries-continued',
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'requested_symbols': None,
             }
         }
 
@@ -3654,6 +3684,15 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                             'run_id': f'{stage.stage_id}-continued',
                         }
                     }
+                    if stage.stage_id == 'agent_feedback_summaries':
+                        stage.details['result_summary'].update(
+                            {
+                                'feedback_scope_mode': (
+                                    'broad_feedback_universe'
+                                ),
+                                'requested_symbols': None,
+                            }
+                        )
 
                 interrupted_stage = suffix_stages[completed_prefix_size]
                 if completed_prefix_size == 1:
@@ -3771,7 +3810,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                                 reused_eod_collection_run_id=546,
                             )
                         )
-                    self.assertTrue(between_result['claimed'])
+                    self.assertTrue(between_result['claimed'], between_result)
                     self.assertEqual(
                         between_result['resume_from_stage'],
                         suffix_ids[1],
@@ -4478,7 +4517,536 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(result['field'], 'symbols')
         self.assertEqual(run.status, 'blocked')
 
-    def test_claim_terminal_continuation_requires_exact_summary_source_run(
+    def test_claim_cutoff_contract_repair_resumes_zero_work_in_place(
+        self,
+    ) -> None:
+        interrupted_at = datetime(
+            2026,
+            9,
+            20,
+            9,
+            0,
+            tzinfo=timezone.utc,
+        )
+        stage_ids = [
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+        }
+        run = SimpleNamespace(
+            id=456,
+            market_date=date(2026, 9, 18),
+            trigger='auto_eod_followup_resume',
+            status='interrupted',
+            current_stage='signal_decider',
+            started_at=interrupted_at - timedelta(minutes=1),
+            updated_at=interrupted_at,
+            completed_at=interrupted_at,
+            error_message='Core restarted.',
+            run_metadata={
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'reused_eod_collection_run_id': 546,
+                'resolved_stages': stage_ids,
+                'resume_from_stage': 'signal_decider',
+                'markets': ['KOSPI'],
+                'symbols': ['005930', '000660'],
+                'force': False,
+                'fs_div': 'CFS',
+                'symbol_limit': None,
+                'symbol_offset': 0,
+                'capture_limit': 500,
+                'retry_cycles': None,
+                'feedback_max_cycles': 3,
+                'feedback_outer_batch_size': 20,
+                'reuse_existing_feedback': True,
+                'bypass_prerequisite_gate': False,
+                'point_in_time_recovery': False,
+                'summary_cutoff_contract_repair_version': 1,
+                'summary_cutoff_contract_repair_proof': proof,
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+                'interrupted_at': interrupted_at.isoformat(),
+            },
+        )
+        stage = SimpleNamespace(
+            id=1,
+            pipeline_run_id=456,
+            market_date=date(2026, 9, 18),
+            stage_id='signal_decider',
+            status='interrupted',
+            processed=0,
+            total=2,
+            succeeded=0,
+            failed=0,
+            remaining=2,
+            current_step='core_restart_interrupted',
+            current_activity='Core restarted.',
+            current_symbol=None,
+            current_period=None,
+            started_at=interrupted_at - timedelta(seconds=10),
+            updated_at=interrupted_at,
+            completed_at=interrupted_at,
+            error_message='Core restarted.',
+            source_run_ids={},
+            details={
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+            },
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = [
+            SimpleNamespace(id=run_id)
+            for run_id in (451, 452, 453, 454, 455, 456)
+        ]
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = [stage]
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        session.get.return_value = SimpleNamespace(
+            id=546,
+            market='KRX',
+            source='pykrx',
+            trade_date=date(2026, 9, 18),
+            run_metadata={
+                'stage_progress': {
+                    'agent_feedback_summaries': (
+                        _completed_feedback_summary_stage(proof)
+                    )
+                }
+            },
+        )
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+        self.resolve_terminal_cutoff.return_value = {
+            'ready': True,
+            'reason': 'latest_completed_summary_cutoff',
+            'knowledge_cutoff_at': self.terminal_cutoff,
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': ['005930'],
+        }
+        resumed_at = interrupted_at + timedelta(hours=1)
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=resumed_at,
+            ),
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .claim_summary_cutoff_contract_repair_resume(
+                    pipeline_run_id=456,
+                    market_date='2026-09-18',
+                    reused_eod_collection_run_id=546,
+                )
+            )
+
+        self.assertTrue(result['claimed'])
+        self.assertTrue(result['resumed'])
+        self.assertEqual(result['summary_cutoff_proof'], proof)
+        self.assertEqual(
+            result['knowledge_cutoff_resolution']['requested_symbols'],
+            ['005930'],
+        )
+        self.resolve_terminal_cutoff.assert_called_once_with(
+            market_date=date(2026, 9, 18),
+            source_run_id='feedback-cycle-summary',
+            feedback_scope_mode='decider_scope_fast_path',
+            requested_symbols=None,
+            fs_div='CFS',
+            source_run_session=session,
+        )
+        self.assertEqual(run.status, 'running')
+        self.assertEqual(run.current_stage, 'signal_decider')
+        self.assertIsNone(run.completed_at)
+        self.assertIsNone(run.error_message)
+        self.assertEqual(
+            run.run_metadata[
+                'summary_cutoff_contract_repair_resume_count'
+            ],
+            1,
+        )
+        self.assertEqual(stage.status, 'pending')
+        self.assertEqual(stage.current_step, 'cutoff_contract_repair_pending')
+        self.assertEqual(stage.started_at, resumed_at)
+        self.assertEqual(stage.source_run_ids, {})
+        self.assertEqual(stage.details, {})
+
+    def test_claim_cutoff_contract_repair_rejects_invalid_context_before_claim(
+        self,
+    ) -> None:
+        interrupted_at = datetime(
+            2026,
+            9,
+            20,
+            9,
+            0,
+            tzinfo=timezone.utc,
+        )
+        stage_ids = [
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+        }
+        run = SimpleNamespace(
+            id=456,
+            market_date=date(2026, 9, 18),
+            trigger='auto_eod_followup_resume',
+            status='interrupted',
+            current_stage='signal_decider',
+            started_at=interrupted_at - timedelta(minutes=1),
+            updated_at=interrupted_at,
+            completed_at=interrupted_at,
+            error_message='Core restarted.',
+            run_metadata={
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'reused_eod_collection_run_id': 546,
+                'resolved_stages': stage_ids,
+                'resume_from_stage': 'signal_decider',
+                'markets': ['KOSPI'],
+                'symbols': ['005930'],
+                'force': False,
+                'fs_div': 'INVALID',
+                'symbol_limit': None,
+                'symbol_offset': 0,
+                'capture_limit': 500,
+                'retry_cycles': None,
+                'feedback_max_cycles': 3,
+                'feedback_outer_batch_size': 20,
+                'reuse_existing_feedback': True,
+                'bypass_prerequisite_gate': False,
+                'point_in_time_recovery': False,
+                'summary_cutoff_contract_repair_version': 1,
+                'summary_cutoff_contract_repair_proof': proof,
+                'resumable': True,
+                'interrupted_reason': 'Core restarted.',
+                'interrupted_at': interrupted_at.isoformat(),
+            },
+        )
+        stage = SimpleNamespace(
+            id=1,
+            pipeline_run_id=456,
+            market_date=date(2026, 9, 18),
+            stage_id='signal_decider',
+            status='interrupted',
+            processed=0,
+            total=1,
+            succeeded=0,
+            failed=0,
+            remaining=1,
+            current_step='core_restart_interrupted',
+            current_activity='Core restarted.',
+            current_symbol=None,
+            current_period=None,
+            started_at=interrupted_at - timedelta(seconds=10),
+            updated_at=interrupted_at,
+            completed_at=interrupted_at,
+            error_message='Core restarted.',
+            source_run_ids={},
+            details={'resumable': True},
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = [
+            SimpleNamespace(id=run_id)
+            for run_id in (451, 452, 453, 454, 455, 456)
+        ]
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = [stage]
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        eod_run = SimpleNamespace(
+            id=546,
+            market='KRX',
+            source='pykrx',
+            trade_date=date(2026, 9, 18),
+            run_metadata={
+                'stage_progress': {
+                    'agent_feedback_summaries': (
+                        _completed_feedback_summary_stage(proof)
+                    )
+                }
+            },
+        )
+        session.get.return_value = eod_run
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .claim_summary_cutoff_contract_repair_resume(
+                    pipeline_run_id=456,
+                    market_date='2026-09-18',
+                    reused_eod_collection_run_id=546,
+                )
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(
+            result['reason'],
+            'cutoff_contract_repair_execution_context_invalid',
+        )
+        self.assertEqual(result['field'], 'fs_div')
+        self.assertEqual(run.status, 'interrupted')
+        self.assertNotIn(
+            'summary_cutoff_contract_repair_resume_count',
+            run.run_metadata,
+        )
+
+        run.run_metadata['fs_div'] = 'CFS'
+        mismatched_proof = {
+            **proof,
+            'source_run_id': 'different-feedback-summary',
+        }
+        eod_run.run_metadata['stage_progress'][
+            'agent_feedback_summaries'
+        ] = _completed_feedback_summary_stage(mismatched_proof)
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        self.resolve_terminal_cutoff.reset_mock()
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            proof_rejected = (
+                DailyPipelineRunStateService()
+                .claim_summary_cutoff_contract_repair_resume(
+                    pipeline_run_id=456,
+                    market_date='2026-09-18',
+                    reused_eod_collection_run_id=546,
+                )
+            )
+
+        self.assertFalse(proof_rejected['claimed'])
+        self.assertEqual(
+            proof_rejected['reason'],
+            'eod_summary_cutoff_proof_mismatch',
+        )
+        self.assertEqual(run.status, 'interrupted')
+        self.assertNotIn(
+            'summary_cutoff_contract_repair_resume_count',
+            run.run_metadata,
+        )
+        self.resolve_terminal_cutoff.assert_not_called()
+
+        eod_run.run_metadata['stage_progress'][
+            'agent_feedback_summaries'
+        ] = _completed_feedback_summary_stage(proof)
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        self.resolve_terminal_cutoff.return_value = {
+            'ready': False,
+            'reason': 'summary_run_missing',
+            'knowledge_cutoff_at': None,
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+        }
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            source_rejected = (
+                DailyPipelineRunStateService()
+                .claim_summary_cutoff_contract_repair_resume(
+                    pipeline_run_id=456,
+                    market_date='2026-09-18',
+                    reused_eod_collection_run_id=546,
+                )
+            )
+
+        self.assertFalse(source_rejected['claimed'])
+        self.assertEqual(
+            source_rejected['reason'],
+            'summary_knowledge_cutoff_unavailable',
+        )
+        self.assertEqual(run.status, 'interrupted')
+        self.assertNotIn(
+            'summary_cutoff_contract_repair_resume_count',
+            run.run_metadata,
+        )
+        self.resolve_terminal_cutoff.assert_called_once_with(
+            market_date=date(2026, 9, 18),
+            source_run_id='feedback-cycle-summary',
+            feedback_scope_mode='decider_scope_fast_path',
+            requested_symbols=None,
+            fs_div='CFS',
+            source_run_session=session,
+        )
+
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            active_result,
+            stages_result,
+        ]
+        self.resolve_terminal_cutoff.reset_mock()
+        self.resolve_terminal_cutoff.return_value = {
+            'ready': True,
+            'reason': 'latest_completed_summary_cutoff',
+            'knowledge_cutoff_at': self.terminal_cutoff.isoformat(),
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': ['005930'],
+        }
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            malformed_cutoff_rejected = (
+                DailyPipelineRunStateService()
+                .claim_summary_cutoff_contract_repair_resume(
+                    pipeline_run_id=456,
+                    market_date='2026-09-18',
+                    reused_eod_collection_run_id=546,
+                )
+            )
+
+        self.assertFalse(malformed_cutoff_rejected['claimed'])
+        self.assertEqual(
+            malformed_cutoff_rejected['reason'],
+            'summary_knowledge_cutoff_proof_mismatch',
+        )
+        self.assertEqual(run.status, 'interrupted')
+        self.assertNotIn(
+            'summary_cutoff_contract_repair_resume_count',
+            run.run_metadata,
+        )
+
+    def test_cutoff_contract_repair_execution_context_is_fail_closed(
+        self,
+    ) -> None:
+        valid = {
+            'entrypoint': 'daily_pipeline_stage_service.run',
+            'reused_eod_collection_run_id': 546,
+            'resume_from_stage': 'signal_decider',
+            'symbols': ['005930'],
+            'markets': ['KOSPI'],
+            'force': False,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+            'point_in_time_recovery': False,
+        }
+        cases = {
+            'entrypoint': {'entrypoint': 'other'},
+            'reused_eod_collection_run_id': {
+                'reused_eod_collection_run_id': '546'
+            },
+            'resume_from_stage': {'resume_from_stage': 'next_open_execution_plan'},
+            'symbols': {'symbols': ['5930']},
+            'markets': {'markets': []},
+            'force': {'force': 'false'},
+            'bypass_prerequisite_gate': {
+                'bypass_prerequisite_gate': 0
+            },
+            'fs_div': {'fs_div': 'cfs'},
+            'symbol_limit': {'symbol_limit': 0},
+            'symbol_offset': {'symbol_offset': -1},
+            'capture_limit': {'capture_limit': 0},
+            'retry_cycles': {'retry_cycles': 0},
+            'feedback_max_cycles': {'feedback_max_cycles': 0},
+            'feedback_outer_batch_size': {
+                'feedback_outer_batch_size': 0
+            },
+            'reuse_existing_feedback': {
+                'reuse_existing_feedback': 'true'
+            },
+            'point_in_time_recovery': {'point_in_time_recovery': None},
+        }
+
+        self.assertIsNone(
+            _summary_cutoff_contract_repair_execution_context_error(
+                valid,
+                reused_eod_collection_run_id=546,
+            )
+        )
+        for expected_field, replacement in cases.items():
+            with self.subTest(field=expected_field):
+                metadata = {**valid, **replacement}
+                self.assertEqual(
+                    _summary_cutoff_contract_repair_execution_context_error(
+                        metadata,
+                        reused_eod_collection_run_id=546,
+                    ),
+                    expected_field,
+                )
+
+        for missing_field in (
+            'symbol_limit',
+            'symbol_offset',
+            'capture_limit',
+            'retry_cycles',
+            'feedback_max_cycles',
+            'feedback_outer_batch_size',
+        ):
+            with self.subTest(missing_field=missing_field):
+                metadata = dict(valid)
+                metadata.pop(missing_field)
+                self.assertEqual(
+                    _summary_cutoff_contract_repair_execution_context_error(
+                        metadata,
+                        reused_eod_collection_run_id=546,
+                    ),
+                    missing_field,
+                )
+
+    def test_claim_terminal_continuation_recovers_summary_source_from_result(
         self,
     ) -> None:
         run, stages, eod_run = self._terminal_continuation_fixture()
@@ -4515,12 +5083,60 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 reused_eod_collection_run_id=546,
             )
 
-        self.assertFalse(result['claimed'])
-        self.assertEqual(
-            result['reason'],
-            'summary_source_run_id_unavailable',
+        self.assertTrue(result['claimed'])
+        self.assertEqual(run.status, 'running')
+        self.resolve_terminal_cutoff.assert_called_once_with(
+            market_date=date(2026, 9, 18),
+            source_run_id='agent_feedback_summaries-prior',
+            feedback_scope_mode='decider_scope_fast_path',
+            requested_symbols=None,
+            fs_div='CFS',
+            source_run_session=session,
         )
+
+    def test_claim_terminal_continuation_rejects_disjoint_fast_summary_scope(
+        self,
+    ) -> None:
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        session = self._terminal_continuation_session(
+            run=run,
+            stages=stages,
+            eod_run=eod_run,
+        )
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state.'
+                '_resolve_terminal_summary_knowledge_cutoff',
+                return_value={
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'knowledge_cutoff_at': self.terminal_cutoff,
+                    'source_run_id': 'agent_feedback_summaries-prior',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': ['000660'],
+                },
+            ),
+        ):
+            result = DailyPipelineRunStateService().claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertFalse(result['claimed'])
+        self.assertEqual(result['reason'], 'summary_symbol_scope_mismatch')
         self.assertEqual(run.status, 'blocked')
+        self.assertNotIn(
+            'terminal_continuation_count',
+            run.run_metadata,
+        )
 
     def test_cutoff_proof_failure_does_not_spend_one_shot_claim(self) -> None:
         run, stages, eod_run = self._terminal_continuation_fixture()

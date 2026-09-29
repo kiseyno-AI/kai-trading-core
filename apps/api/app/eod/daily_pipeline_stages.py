@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.agent_context.retry_service import (
@@ -35,6 +35,11 @@ from app.eod.daily_pipeline_outcomes import (
     pykrx_enrichment_preflight_is_ready,
 )
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
+from app.eod.summary_cutoff_contract import (
+    LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION,
+    summary_scope_matches_parent,
+)
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
@@ -606,6 +611,8 @@ class DailyPipelineStageService:
         point_in_time_recovery: bool = False,
         existing_pipeline_run_id: int | None = None,
         provider_admission_fence_owned: bool = False,
+        summary_cutoff_proof: Mapping[str, Any] | None = None,
+        summary_cutoff_contract_repair: bool = False,
     ) -> dict[str, Any]:
         validated_request = self.validate_run_request(
             market_date=market_date,
@@ -634,6 +641,32 @@ class DailyPipelineStageService:
         feedback_knowledge_cutoff_at: datetime | None = None
         feedback_cutoff_resolution: dict[str, Any] | None = None
         terminal_summary_source_run_id: str | None = None
+        normalized_summary_cutoff_proof = (
+            dict(summary_cutoff_proof)
+            if isinstance(summary_cutoff_proof, Mapping)
+            else None
+        )
+        if summary_cutoff_contract_repair and not (
+            trigger == 'auto_eod_followup_resume'
+            and tuple(resolved_stages) == LEGACY_CUTOFF_REPAIR_STAGE_IDS
+            and resume_from_stage == LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+            and reused_eod_collection_run_id is not None
+            and isinstance(normalized_summary_cutoff_proof, dict)
+            and str(
+                normalized_summary_cutoff_proof.get('source_run_id') or ''
+            ).strip()
+            and str(
+                normalized_summary_cutoff_proof.get(
+                    'feedback_scope_mode'
+                )
+                or ''
+            ).strip()
+            == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+        ):
+            raise ValueError(
+                'summary cutoff contract repair requires the exact '
+                'automatic decider suffix and FAST summary proof'
+            )
         feedback_prerequisite_stage_ids = (
             self._feedback_prerequisite_stage_ids(
                 point_in_time_recovery=point_in_time_recovery,
@@ -695,7 +728,133 @@ class DailyPipelineStageService:
 
         stage_outcomes: dict[str, dict[str, Any]] = {}
         handled: set[str] = set()
-        if existing_pipeline_run_id is not None:
+        if (
+            existing_pipeline_run_id is not None
+            and summary_cutoff_contract_repair
+        ):
+            repair_claim = (
+                self.run_state_service
+                .claim_summary_cutoff_contract_repair_resume(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    market_date=resolved_market_date,
+                    reused_eod_collection_run_id=int(
+                        reused_eod_collection_run_id
+                    ),
+                )
+            )
+            if not repair_claim.get('claimed'):
+                return {
+                    'triggered': False,
+                    'reason': (
+                        repair_claim.get('reason')
+                        or 'cutoff_contract_repair_not_claimed'
+                    ),
+                    'pipeline_run_id': int(existing_pipeline_run_id),
+                    'pipeline_run': repair_claim.get('pipeline_run'),
+                    'market_date': resolved_market_date,
+                    'requested_stages': requested_stages,
+                    'resolved_stages': resolved_stages,
+                    'status': 'blocked',
+                    'stages': {},
+                }
+            pipeline_run = repair_claim.get('pipeline_run')
+            try:
+                if not isinstance(pipeline_run, dict):
+                    raise RuntimeError(
+                        'cutoff contract repair claim did not return pipeline '
+                        'state'
+                    )
+                repair_context = (
+                    self._cutoff_contract_repair_execution_context(
+                        pipeline_run
+                    )
+                )
+                resolved_symbols = repair_context['symbols']
+                resolved_markets = repair_context['markets']
+                force = repair_context['force']
+                bypass_prerequisite_gate = repair_context[
+                    'bypass_prerequisite_gate'
+                ]
+                resolved_fs_div = repair_context['fs_div']
+                symbol_limit = repair_context['symbol_limit']
+                symbol_offset = repair_context['symbol_offset']
+                capture_limit = repair_context['capture_limit']
+                retry_cycles = repair_context['retry_cycles']
+                feedback_max_cycles = repair_context[
+                    'feedback_max_cycles'
+                ]
+                feedback_outer_batch_size = repair_context[
+                    'feedback_outer_batch_size'
+                ]
+                reuse_existing_feedback = repair_context[
+                    'reuse_existing_feedback'
+                ]
+                point_in_time_recovery = repair_context[
+                    'point_in_time_recovery'
+                ]
+                normalized_summary_cutoff_proof = repair_context[
+                    'summary_cutoff_proof'
+                ]
+                claimed_cutoff_resolution = repair_claim.get(
+                    'knowledge_cutoff_resolution'
+                )
+                claimed_cutoff_symbols = (
+                    claimed_cutoff_resolution.get('requested_symbols')
+                    if isinstance(claimed_cutoff_resolution, dict)
+                    else None
+                )
+                if not (
+                    isinstance(claimed_cutoff_resolution, dict)
+                    and claimed_cutoff_resolution.get('ready') is True
+                    and isinstance(
+                        claimed_cutoff_resolution.get(
+                            'knowledge_cutoff_at'
+                        ),
+                        datetime,
+                    )
+                    and claimed_cutoff_resolution.get('source_run_id')
+                    == normalized_summary_cutoff_proof.get(
+                        'source_run_id'
+                    )
+                    and claimed_cutoff_resolution.get(
+                        'feedback_scope_mode'
+                    )
+                    == normalized_summary_cutoff_proof.get(
+                        'feedback_scope_mode'
+                    )
+                    and isinstance(claimed_cutoff_symbols, list)
+                    and claimed_cutoff_symbols
+                    and (
+                        resolved_symbols is None
+                        or summary_scope_matches_parent(
+                            feedback_scope_mode=(
+                                claimed_cutoff_resolution.get(
+                                    'feedback_scope_mode'
+                                )
+                            ),
+                            summary_symbols=claimed_cutoff_symbols,
+                            parent_symbols=resolved_symbols,
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        'cutoff contract repair claim returned invalid '
+                        'summary cutoff proof'
+                    )
+                feedback_cutoff_resolution = dict(
+                    claimed_cutoff_resolution
+                )
+                feedback_knowledge_cutoff_at = (
+                    claimed_cutoff_resolution['knowledge_cutoff_at']
+                )
+            except Exception as exc:
+                self._finish_run_preserving_primary_error(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    status='failed',
+                    error_message=str(exc),
+                )
+                raise
+        elif existing_pipeline_run_id is not None:
             if trigger != 'auto_eod_followup_resume':
                 raise ValueError(
                     'existing_pipeline_run_id is restricted to auto EOD follow-up recovery'
@@ -786,6 +945,11 @@ class DailyPipelineStageService:
             feedback_cutoff_resolution = continuation_claim.get(
                 'knowledge_cutoff_resolution'
             )
+            terminal_cutoff_symbols = (
+                feedback_cutoff_resolution.get('requested_symbols')
+                if isinstance(feedback_cutoff_resolution, dict)
+                else None
+            )
             if not (
                 isinstance(feedback_cutoff_resolution, dict)
                 and feedback_cutoff_resolution.get('ready')
@@ -795,6 +959,20 @@ class DailyPipelineStageService:
                 is not None
                 and feedback_cutoff_resolution.get('source_run_id')
                 == terminal_summary_source_run_id
+                and isinstance(terminal_cutoff_symbols, list)
+                and terminal_cutoff_symbols
+                and (
+                    resolved_symbols is None
+                    or summary_scope_matches_parent(
+                        feedback_scope_mode=(
+                            feedback_cutoff_resolution.get(
+                                'feedback_scope_mode'
+                            )
+                        ),
+                        summary_symbols=terminal_cutoff_symbols,
+                        parent_symbols=resolved_symbols,
+                    )
+                )
             ):
                 self._finish_run_preserving_primary_error(
                     pipeline_run_id=int(existing_pipeline_run_id),
@@ -917,6 +1095,18 @@ class DailyPipelineStageService:
                         else None
                     ),
                     'point_in_time_recovery': point_in_time_recovery,
+                    **(
+                        {
+                            'summary_cutoff_contract_repair_version': (
+                                SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION
+                            ),
+                            'summary_cutoff_contract_repair_proof': (
+                                normalized_summary_cutoff_proof
+                            ),
+                        }
+                        if summary_cutoff_contract_repair
+                        else {}
+                    ),
                 },
                 provider_admission_fence_owned=(
                     provider_admission_fence_owned
@@ -979,6 +1169,24 @@ class DailyPipelineStageService:
         for stage_id in resolved_stages:
             if stage_id in handled:
                 continue
+            stage_symbols = resolved_symbols
+            if (
+                existing_pipeline_run_id is not None
+                and stage_id == 'signal_decider'
+                and isinstance(feedback_cutoff_resolution, dict)
+                and feedback_cutoff_resolution.get('ready') is True
+                and str(
+                    feedback_cutoff_resolution.get('source_run_id') or ''
+                ).strip()
+                and isinstance(
+                    feedback_cutoff_resolution.get('requested_symbols'),
+                    list,
+                )
+                and feedback_cutoff_resolution['requested_symbols']
+            ):
+                stage_symbols = list(
+                    feedback_cutoff_resolution['requested_symbols']
+                )
             try:
                 self._start_tracked_stage(
                     pipeline_run_id=pipeline_run_id,
@@ -1064,31 +1272,149 @@ class DailyPipelineStageService:
                             ),
                         }
                     else:
-                        feedback_cutoff_resolution = (
-                            resolve_latest_completed_summary_knowledge_cutoff(
-                                market_date=date.fromisoformat(
-                                    resolved_market_date
-                                ),
-                                feedback_scope_mode=(
-                                    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
-                                ),
-                                source_run_id=(
-                                    terminal_summary_source_run_id
-                                ),
-                                requested_symbols=(
-                                    resolved_symbols
-                                    if terminal_summary_source_run_id
-                                    is not None
-                                    else None
-                                ),
+                        proof_source_run_id = str(
+                            (
+                                normalized_summary_cutoff_proof or {}
+                            ).get('source_run_id')
+                            or terminal_summary_source_run_id
+                            or ''
+                        ).strip()
+                        proof_scope_mode = str(
+                            (
+                                normalized_summary_cutoff_proof or {}
+                            ).get('feedback_scope_mode')
+                            or ''
+                        ).strip()
+                        proof_requested_symbols = (
+                            (normalized_summary_cutoff_proof or {}).get(
+                                'requested_symbols'
+                            )
+                            if normalized_summary_cutoff_proof is not None
+                            else (
+                                resolved_symbols
+                                if terminal_summary_source_run_id is not None
+                                else None
                             )
                         )
+                        proof_is_valid = bool(
+                            proof_source_run_id
+                            and proof_scope_mode
+                            in {
+                                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                            }
+                            and (
+                                proof_requested_symbols is None
+                                or isinstance(
+                                    proof_requested_symbols,
+                                    (list, tuple),
+                                )
+                            )
+                        )
+                        if (
+                            trigger == 'auto_eod_followup_resume'
+                            and existing_pipeline_run_id is None
+                            and not proof_is_valid
+                        ):
+                            feedback_cutoff_resolution = {
+                                'ready': False,
+                                'reason': 'summary_cutoff_proof_unavailable',
+                                'knowledge_cutoff_at': None,
+                                'source_run_id': (
+                                    proof_source_run_id or None
+                                ),
+                                'feedback_scope_mode': (
+                                    proof_scope_mode or None
+                                ),
+                            }
+                        else:
+                            feedback_cutoff_resolution = (
+                                resolve_latest_completed_summary_knowledge_cutoff(
+                                    market_date=date.fromisoformat(
+                                        resolved_market_date
+                                    ),
+                                    feedback_scope_mode=(
+                                        proof_scope_mode
+                                        or FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+                                    ),
+                                    fs_div=resolved_fs_div,
+                                    source_run_id=(
+                                        proof_source_run_id or None
+                                    ),
+                                    requested_symbols=(
+                                        list(proof_requested_symbols)
+                                        if isinstance(
+                                            proof_requested_symbols,
+                                            (list, tuple),
+                                        )
+                                        else None
+                                    ),
+                                )
+                            )
                         if feedback_cutoff_resolution.get('ready'):
                             feedback_knowledge_cutoff_at = (
                                 feedback_cutoff_resolution.get(
                                     'knowledge_cutoff_at'
                                 )
                             )
+                            resolved_proof_symbols = (
+                                feedback_cutoff_resolution.get(
+                                    'requested_symbols'
+                                )
+                            )
+                            resolved_proof_source = str(
+                                feedback_cutoff_resolution.get(
+                                    'source_run_id'
+                                )
+                                or ''
+                            ).strip()
+                            resolved_proof_scope = str(
+                                feedback_cutoff_resolution.get(
+                                    'feedback_scope_mode'
+                                )
+                                or ''
+                            ).strip()
+                            exact_decider_scope = bool(
+                                stage_id == 'signal_decider'
+                                and resolved_proof_source
+                            )
+                            proof_scope_is_valid = bool(
+                                isinstance(resolved_proof_symbols, list)
+                                and resolved_proof_symbols
+                                and (
+                                    not resolved_symbols
+                                    or summary_scope_matches_parent(
+                                        feedback_scope_mode=(
+                                            resolved_proof_scope
+                                        ),
+                                        summary_symbols=(
+                                            resolved_proof_symbols
+                                        ),
+                                        parent_symbols=resolved_symbols,
+                                    )
+                                )
+                            )
+                            if exact_decider_scope and not proof_scope_is_valid:
+                                feedback_knowledge_cutoff_at = None
+                                feedback_cutoff_resolution = {
+                                    **feedback_cutoff_resolution,
+                                    'ready': False,
+                                    'reason': (
+                                        'summary_run_symbol_scope_mismatch'
+                                        if isinstance(
+                                            resolved_proof_symbols,
+                                            list,
+                                        )
+                                        and resolved_proof_symbols
+                                        else (
+                                            'summary_run_symbol_scope_unavailable'
+                                        )
+                                    ),
+                                }
+                            elif exact_decider_scope:
+                                stage_symbols = list(
+                                    resolved_proof_symbols
+                                )
                 if (
                     stage_id == 'agent_feedback_summaries'
                     and isinstance(feedback_cutoff_resolution, dict)
@@ -1113,7 +1439,7 @@ class DailyPipelineStageService:
                         return self._execute_stage(
                             stage_id,
                             market_date=resolved_market_date,
-                            symbols=resolved_symbols,
+                            symbols=stage_symbols,
                             markets=resolved_markets,
                             force=force,
                             bypass_prerequisite_gate=(
@@ -1363,6 +1689,15 @@ class DailyPipelineStageService:
                 'feedback_scope_mode': (
                     resolution.get('feedback_scope_mode')
                     if isinstance(resolution, dict)
+                    else None
+                ),
+                'requested_symbols': (
+                    list(resolution['requested_symbols'])
+                    if isinstance(resolution, dict)
+                    and isinstance(
+                        resolution.get('requested_symbols'),
+                        (list, tuple),
+                    )
                     else None
                 ),
             },
@@ -2546,6 +2881,143 @@ class DailyPipelineStageService:
         configured = [item.strip().upper() for item in settings.eod_auto_pykrx_markets.split(',') if item.strip()]
         return configured or list(DEFAULT_MARKETS)
 
+    def _cutoff_contract_repair_execution_context(
+        self,
+        pipeline_run: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = pipeline_run.get('run_metadata')
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                'cutoff contract repair run metadata is unavailable'
+            )
+        if (
+            metadata.get('summary_cutoff_contract_repair_version')
+            != SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION
+        ):
+            raise RuntimeError('cutoff contract repair marker is invalid')
+
+        raw_symbols = metadata.get('symbols')
+        if raw_symbols is not None and not isinstance(
+            raw_symbols,
+            (list, tuple),
+        ):
+            raise RuntimeError('cutoff contract repair symbol scope is invalid')
+        resolved_symbols = self._normalize_symbols(raw_symbols)
+
+        raw_markets = metadata.get('markets')
+        if not isinstance(raw_markets, (list, tuple)):
+            raise RuntimeError(
+                'cutoff contract repair market scope is unavailable'
+            )
+        resolved_markets = list(
+            dict.fromkeys(
+                str(market or '').strip().upper()
+                for market in raw_markets
+                if str(market or '').strip()
+            )
+        )
+        if not resolved_markets:
+            raise RuntimeError('cutoff contract repair market scope is empty')
+
+        resolved_fs_div = str(metadata.get('fs_div') or '').strip().upper()
+        if resolved_fs_div not in {'CFS', 'OFS'}:
+            raise RuntimeError('cutoff contract repair fs_div is invalid')
+
+        def required_bool(key: str) -> bool:
+            value = metadata.get(key)
+            if not isinstance(value, bool):
+                raise RuntimeError(
+                    f'cutoff contract repair {key} is unavailable'
+                )
+            return value
+
+        def optional_int(
+            key: str,
+            *,
+            default: int | None,
+            minimum: int,
+        ) -> int | None:
+            value = metadata.get(key, default)
+            if value is None and default is None:
+                return None
+            if isinstance(value, bool):
+                raise RuntimeError(
+                    f'cutoff contract repair {key} is invalid'
+                )
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f'cutoff contract repair {key} is invalid'
+                ) from exc
+            if parsed < minimum:
+                raise RuntimeError(
+                    f'cutoff contract repair {key} is invalid'
+                )
+            return parsed
+
+        proof = metadata.get('summary_cutoff_contract_repair_proof')
+        if not (
+            isinstance(proof, dict)
+            and str(proof.get('source_run_id') or '').strip()
+            and str(proof.get('feedback_scope_mode') or '').strip()
+            == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            and (
+                proof.get('requested_symbols') is None
+                or isinstance(proof.get('requested_symbols'), list)
+            )
+        ):
+            raise RuntimeError(
+                'cutoff contract repair summary proof is invalid'
+            )
+
+        return {
+            'symbols': resolved_symbols,
+            'markets': resolved_markets,
+            'force': required_bool('force'),
+            'bypass_prerequisite_gate': required_bool(
+                'bypass_prerequisite_gate'
+            ),
+            'fs_div': resolved_fs_div,
+            'symbol_limit': optional_int(
+                'symbol_limit',
+                default=None,
+                minimum=1,
+            ),
+            'symbol_offset': optional_int(
+                'symbol_offset',
+                default=0,
+                minimum=0,
+            ),
+            'capture_limit': optional_int(
+                'capture_limit',
+                default=500,
+                minimum=1,
+            ),
+            'retry_cycles': optional_int(
+                'retry_cycles',
+                default=None,
+                minimum=1,
+            ),
+            'feedback_max_cycles': optional_int(
+                'feedback_max_cycles',
+                default=DEFAULT_FEEDBACK_MAX_CYCLES,
+                minimum=1,
+            ),
+            'feedback_outer_batch_size': optional_int(
+                'feedback_outer_batch_size',
+                default=DEFAULT_FEEDBACK_OUTER_BATCH_SIZE,
+                minimum=1,
+            ),
+            'reuse_existing_feedback': required_bool(
+                'reuse_existing_feedback'
+            ),
+            'point_in_time_recovery': required_bool(
+                'point_in_time_recovery'
+            ),
+            'summary_cutoff_proof': dict(proof),
+        }
+
     def _terminal_continuation_execution_context(
         self,
         pipeline_run: dict[str, Any],
@@ -2657,6 +3129,21 @@ class DailyPipelineStageService:
             for key in ('agent_feedback_run_id', 'run_id')
             if str(source_run_ids.get(key) or '').strip()
         }
+        summary_details = (
+            summary_evidence.get('details')
+            if isinstance(summary_evidence.get('details'), Mapping)
+            else {}
+        )
+        summary_result = (
+            summary_details.get('result_summary')
+            if isinstance(summary_details.get('result_summary'), Mapping)
+            else {}
+        )
+        summary_result_run_id = str(
+            summary_result.get('run_id') or ''
+        ).strip()
+        if summary_result_run_id:
+            summary_source_run_ids.add(summary_result_run_id)
         if len(summary_source_run_ids) != 1:
             raise RuntimeError(
                 'terminal continuation summary source run is unavailable'

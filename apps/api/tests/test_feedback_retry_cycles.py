@@ -213,6 +213,11 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                     'fundamental-summarizer',
                 ],
                 'requested_symbols': ['000660', '005930'],
+                'symbols': ['000660', '005930'],
+                'role_symbol_scopes': {
+                    role: ['000660', '005930']
+                    for role in SUMMARIZER_AGENT_NAMES
+                },
                 'feedback_scope_mode': 'broad_feedback_universe',
                 'request_run_id': source_run_id,
                 'child_run_lineage': {
@@ -254,6 +259,421 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             for_update=True,
         )
         find_latest_run.assert_not_called()
+
+    def test_exact_summary_cutoff_recovers_persisted_fast_symbol_scope(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-fast-summary'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 6,
+            'completed_count': 6,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': ['005930', '000660'],
+                'symbols': ['005930', '000660'],
+                'role_symbol_scopes': {
+                    role: ['005930', '000660']
+                    for role in SUMMARIZER_AGENT_NAMES
+                },
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'request_run_id': source_run_id,
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['source_run_id'], source_run_id)
+        self.assertEqual(result['requested_symbols'], ['000660', '005930'])
+
+        exact_run['request_payload']['market_date'] = '2026-04-15'
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            conflicting_market_date = (
+                resolve_latest_completed_summary_knowledge_cutoff(
+                    market_date=date(2026, 4, 16),
+                    feedback_scope_mode='decider_scope_fast_path',
+                    source_run_id=source_run_id,
+                    requested_symbols=None,
+                    now=cutoff + timedelta(minutes=5),
+                )
+            )
+
+        self.assertFalse(conflicting_market_date['ready'])
+        self.assertEqual(
+            conflicting_market_date['reason'],
+            'summary_run_market_date_mismatch',
+        )
+
+    def test_exact_summary_cutoff_uses_completed_role_scope_intersection(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-filtered-summary'
+        role_scopes = {
+            SUMMARIZER_AGENT_NAMES[0]: ['005930', '000660'],
+            SUMMARIZER_AGENT_NAMES[1]: ['005930', '000660'],
+            SUMMARIZER_AGENT_NAMES[2]: ['005930'],
+        }
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 5,
+            'completed_count': 5,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': ['005930', '000660'],
+                'symbols': ['005930', '000660'],
+                'role_symbol_scopes': role_scopes,
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'request_run_id': source_run_id,
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['requested_symbols'], ['005930'])
+
+    def test_exact_summary_cutoff_rejects_completed_zero_work_run(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-zero-summary'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 0,
+            'completed_count': 0,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': ['005930'],
+                'symbols': [],
+                'role_symbol_scopes': {
+                    role: [] for role in SUMMARIZER_AGENT_NAMES
+                },
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'request_run_id': source_run_id,
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['reason'], 'summary_run_zero_work')
+
+    def test_exact_summary_cutoff_rejects_fs_div_mismatch(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-cfs-summary'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 3,
+            'completed_count': 3,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': ['005930'],
+                'symbols': ['005930'],
+                'role_symbol_scopes': {
+                    role: ['005930'] for role in SUMMARIZER_AGENT_NAMES
+                },
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'fs_div': 'CFS',
+                'request_run_id': source_run_id,
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                fs_div='OFS',
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['reason'], 'summary_run_fs_div_mismatch')
+
+        exact_run['request_payload']['fs_div'] = None
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            null_result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                fs_div='CFS',
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(null_result['ready'])
+        self.assertEqual(
+            null_result['reason'],
+            'summary_run_fs_div_mismatch',
+        )
+
+    def test_exact_summary_cutoff_requires_explicit_scope_mode(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-missing-scope'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 3,
+            'completed_count': 3,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': ['005930'],
+                'symbols': ['005930'],
+                'role_symbol_scopes': {
+                    role: ['005930'] for role in SUMMARIZER_AGENT_NAMES
+                },
+                'request_run_id': source_run_id,
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(
+            result['reason'],
+            'summary_run_feedback_scope_mode_mismatch',
+        )
+
+        for invalid_scope_mode in (None, ''):
+            exact_run['request_payload'][
+                'feedback_scope_mode'
+            ] = invalid_scope_mode
+            with patch(
+                'app.agent_context.retry_service.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=exact_run,
+            ):
+                invalid_result = (
+                    resolve_latest_completed_summary_knowledge_cutoff(
+                        market_date=date(2026, 4, 16),
+                        feedback_scope_mode='decider_scope_fast_path',
+                        source_run_id=source_run_id,
+                        requested_symbols=None,
+                        now=cutoff + timedelta(minutes=5),
+                    )
+                )
+            self.assertFalse(invalid_result['ready'])
+            self.assertEqual(
+                invalid_result['reason'],
+                'summary_run_feedback_scope_mode_mismatch',
+            )
+
+    def test_exact_summary_cutoff_rejects_negative_counts(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-negative-count'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 3,
+            'completed_count': 3,
+            'failed_count': -1,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': ['005930'],
+                'symbols': ['005930'],
+                'role_symbol_scopes': {
+                    role: ['005930'] for role in SUMMARIZER_AGENT_NAMES
+                },
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'request_run_id': source_run_id,
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['reason'], 'summary_run_counts_invalid')
+
+    def test_exact_summary_cutoff_requires_concrete_persisted_symbol_scope(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-unscoped-summary'
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 3,
+            'completed_count': 3,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': None,
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'request_run_id': source_run_id,
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(
+            result['reason'],
+            'summary_run_symbol_scope_unavailable',
+        )
+
+    def test_exact_summary_cutoff_rejects_conflicting_request_copy(self):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-conflict-summary'
+        request_payload = {
+            'mode': DAILY_RETRY_CYCLE_MODE,
+            'roles': list(SUMMARIZER_AGENT_NAMES),
+            'requested_symbols': ['005930'],
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'request_run_id': source_run_id,
+            'admission_knowledge_cutoff_at': cutoff.isoformat(),
+        }
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'completed',
+            'symbols_total': 3,
+            'completed_count': 3,
+            'failed_count': 0,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': request_payload,
+            'summary_payload': {
+                'request': {
+                    **request_payload,
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                },
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='decider_scope_fast_path',
+                source_run_id=source_run_id,
+                requested_symbols=None,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(
+            result['reason'],
+            'summary_run_feedback_scope_mode_mismatch',
+        )
 
     def test_exact_summary_cutoff_rejects_symbol_scope_mismatch(self):
         cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
