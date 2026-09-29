@@ -53,6 +53,12 @@ KRW_UNIT = 'krw'
 KIS_TR_PBMN_TO_KRW_MULTIPLIER = 1_000_000
 LEGACY_INVESTOR_FLOW_UNITS = frozenset({KIS_TRADING_VALUE_UNIT, 'kis_net_value_raw'})
 KIS_INDEX_OBSERVATION_SOURCE = 'kis_index_intraday_bar'
+KIS_BREADTH_VERIFICATION_BASIS = (
+    'kis_directional_buckets_with_same_date_completed_master_upper_bound'
+)
+KIS_BREADTH_MASTER_COUNT_RELATION = 'upper_bound'
+KIS_BREADTH_LIMIT_BUCKET_SEMANTICS = 'included_in_direction_counts'
+KIS_BREADTH_MIN_MASTER_COVERAGE_RATIO = 0.95
 
 
 @dataclass(frozen=True)
@@ -617,7 +623,10 @@ class MarketSnapshotService:
             'reason': 'same_date_completed_kis_master_proof_unavailable',
             'expected_symbol_count': None,
             'observed_symbol_count': None,
+            'coverage_ratio': None,
             'limit_bucket_semantics': 'unknown',
+            'verification_basis': None,
+            'master_count_relation': None,
             'expected_universe': None,
         }
         try:
@@ -694,20 +703,42 @@ class MarketSnapshotService:
             + bucket_values['unchanged']
             + bucket_values['decliners']
         )
-        five_bucket_count = sum(bucket_values.values())
-        if directional_count == expected_symbol_count:
-            semantics = 'included_in_direction_counts'
-            observed_symbol_count = directional_count
-        elif five_bucket_count == expected_symbol_count:
-            semantics = 'disjoint_from_direction_counts'
-            observed_symbol_count = five_bucket_count
-        else:
+        raw_coverage_ratio = directional_count / expected_symbol_count
+        coverage_ratio = round(raw_coverage_ratio, 6)
+        if directional_count <= 0:
             return {
                 **unverified,
-                'reason': 'provider_bucket_count_does_not_match_expected_universe',
+                'reason': 'provider_directional_count_invalid',
                 'expected_symbol_count': expected_symbol_count,
                 'observed_symbol_count': directional_count,
-                'five_bucket_symbol_count': five_bucket_count,
+                'coverage_ratio': coverage_ratio,
+            }
+        if (
+            bucket_values['upper_limit_count'] > bucket_values['advancers']
+            or bucket_values['lower_limit_count'] > bucket_values['decliners']
+        ):
+            return {
+                **unverified,
+                'reason': 'provider_limit_bucket_subset_invalid',
+                'expected_symbol_count': expected_symbol_count,
+                'observed_symbol_count': directional_count,
+                'coverage_ratio': coverage_ratio,
+            }
+        if directional_count > expected_symbol_count:
+            return {
+                **unverified,
+                'reason': 'provider_directional_count_exceeds_master_upper_bound',
+                'expected_symbol_count': expected_symbol_count,
+                'observed_symbol_count': directional_count,
+                'coverage_ratio': coverage_ratio,
+            }
+        if raw_coverage_ratio < KIS_BREADTH_MIN_MASTER_COVERAGE_RATIO:
+            return {
+                **unverified,
+                'reason': 'provider_directional_coverage_below_minimum',
+                'expected_symbol_count': expected_symbol_count,
+                'observed_symbol_count': directional_count,
+                'coverage_ratio': coverage_ratio,
             }
 
         membership_fingerprint = hashlib.sha256(
@@ -717,13 +748,17 @@ class MarketSnapshotService:
             'status': 'verified',
             'reason': None,
             'expected_symbol_count': expected_symbol_count,
-            'observed_symbol_count': observed_symbol_count,
-            'limit_bucket_semantics': semantics,
+            'observed_symbol_count': directional_count,
+            'coverage_ratio': coverage_ratio,
+            'limit_bucket_semantics': KIS_BREADTH_LIMIT_BUCKET_SEMANTICS,
+            'verification_basis': KIS_BREADTH_VERIFICATION_BASIS,
+            'master_count_relation': KIS_BREADTH_MASTER_COUNT_RELATION,
             'expected_universe': {
                 'provider': 'kis_master',
                 'market_date': state.get('market_date'),
                 'completed_at': completed_at.isoformat(),
                 'symbol_count': expected_symbol_count,
+                'relation_to_observed_count': KIS_BREADTH_MASTER_COUNT_RELATION,
                 'membership_sha256': membership_fingerprint,
             },
         }
