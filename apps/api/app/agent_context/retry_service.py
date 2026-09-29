@@ -1337,6 +1337,10 @@ class AgentFeedbackRetryService:
                 .where(AgentContextFeedback.market_date == market_date)
                 .where(AgentContextFeedback.symbol.in_(list(symbols)))
                 .where(AgentContextFeedback.agent_name.in_(list(roles)))
+                .order_by(
+                    AgentContextFeedback.received_at.asc(),
+                    AgentContextFeedback.id.asc(),
+                )
             ).all()
             persisted_failure_rows = session.execute(
                 select(
@@ -1351,6 +1355,10 @@ class AgentFeedbackRetryService:
                 .where(AgentContextFeedbackFailure.market_date == market_date)
                 .where(AgentContextFeedbackFailure.symbol.in_(list(symbols)))
                 .where(AgentContextFeedbackFailure.agent_name.in_(list(roles)))
+                .order_by(
+                    AgentContextFeedbackFailure.received_at.asc(),
+                    AgentContextFeedbackFailure.id.asc(),
+                )
             ).all()
             feedback_rows = [
                 {
@@ -1467,14 +1475,60 @@ class AgentFeedbackRetryService:
                 return value.replace(tzinfo=timezone.utc)
             return value.astimezone(timezone.utc)
 
-        feedback_by_key = {
-            (row['symbol'], row['agent_name']): row
-            for row in feedback_rows
-        }
-        failure_by_key = {
-            (row['symbol'], row['agent_name']): row
-            for row in failure_rows
-        }
+        def latest_evidence_indexes(
+            rows: Sequence[dict[str, Any]],
+        ) -> tuple[
+            dict[tuple[str, str], dict[str, Any]],
+            dict[tuple[str, str, str], dict[str, Any]],
+        ]:
+            latest_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+            latest_by_run_key: dict[
+                tuple[str, str, str], dict[str, Any]
+            ] = {}
+
+            def retain_latest(
+                index: dict[Any, dict[str, Any]],
+                key: Any,
+                row: dict[str, Any],
+            ) -> None:
+                current = index.get(key)
+                row_order = (
+                    normalized_observed_at(row['received_at']),
+                    int(row['id']),
+                )
+                if current is None or row_order > (
+                    normalized_observed_at(current['received_at']),
+                    int(current['id']),
+                ):
+                    index[key] = row
+
+            for row in rows:
+                key = (row['symbol'], row['agent_name'])
+                retain_latest(latest_by_key, key, row)
+                retain_latest(
+                    latest_by_run_key,
+                    (*key, row['run_id']),
+                    row,
+                )
+            return latest_by_key, latest_by_run_key
+
+        feedback_by_key, feedback_by_run_key = latest_evidence_indexes(
+            feedback_rows
+        )
+        failure_by_key, failure_by_run_key = latest_evidence_indexes(
+            failure_rows
+        )
+
+        def scoped_evidence(
+            *,
+            key: tuple[str, str],
+            required_run_id: str | None,
+            by_key: dict[tuple[str, str], dict[str, Any]],
+            by_run_key: dict[tuple[str, str, str], dict[str, Any]],
+        ) -> dict[str, Any] | None:
+            if required_run_id is None:
+                return by_key.get(key)
+            return by_run_key.get((*key, required_run_id))
 
         def mark_failed(
             *,
@@ -1483,11 +1537,13 @@ class AgentFeedbackRetryService:
             required_run_id: str | None = None,
         ) -> None:
             failed_by_role[role].add(symbol)
-            failure = failure_by_key.get((symbol, role))
-            if failure is None or (
-                required_run_id is not None
-                and failure['run_id'] != required_run_id
-            ):
+            failure = scoped_evidence(
+                key=(symbol, role),
+                required_run_id=required_run_id,
+                by_key=failure_by_key,
+                by_run_key=failure_by_run_key,
+            )
+            if failure is None:
                 return
             if not failure['retryable']:
                 return
@@ -1509,13 +1565,18 @@ class AgentFeedbackRetryService:
             key: tuple[str, str],
             required_run_id: str | None = None,
         ) -> str | None:
-            feedback = feedback_by_key.get(key)
-            failure = failure_by_key.get(key)
-            if required_run_id is not None:
-                if feedback is not None and feedback['run_id'] != required_run_id:
-                    feedback = None
-                if failure is not None and failure['run_id'] != required_run_id:
-                    failure = None
+            feedback = scoped_evidence(
+                key=key,
+                required_run_id=required_run_id,
+                by_key=feedback_by_key,
+                by_run_key=feedback_by_run_key,
+            )
+            failure = scoped_evidence(
+                key=key,
+                required_run_id=required_run_id,
+                by_key=failure_by_key,
+                by_run_key=failure_by_run_key,
+            )
             if failure is None:
                 return 'completed' if feedback is not None else None
             if feedback is None:

@@ -3353,6 +3353,177 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             {'005930'},
         )
 
+    def test_same_day_terminal_symbols_use_latest_failure_independent_of_row_order(
+        self,
+    ):
+        service = AgentFeedbackRetryService()
+        market_date = date.fromisoformat('2026-04-16')
+        role = 'short-term-decider'
+        received_at = datetime(2026, 4, 16, 6, 31, tzinfo=timezone.utc)
+        failures = (
+            SimpleNamespace(
+                id=1,
+                symbol='005930',
+                agent_name=role,
+                run_id='child-run',
+                failure_kind=(
+                    'dependency_upstream_changed_during_dispatch'
+                ),
+                retryable=True,
+                received_at=received_at,
+            ),
+            SimpleNamespace(
+                id=2,
+                symbol='005930',
+                agent_name=role,
+                run_id='child-run',
+                failure_kind='response_contract_invalid',
+                retryable=False,
+                received_at=received_at,
+            ),
+        )
+
+        for failure_rows in (failures, tuple(reversed(failures))):
+            with self.subTest(ids=[row.id for row in failure_rows]):
+                session = MagicMock()
+                session.execute.side_effect = [
+                    MagicMock(all=lambda: []),
+                    MagicMock(all=lambda: failure_rows),
+                ]
+
+                with patch(
+                    'app.agent_context.retry_service.session_scope'
+                ) as session_scope_mock:
+                    session_scope_mock.return_value.__enter__.return_value = (
+                        session
+                    )
+                    terminal_state = service._load_same_day_terminal_symbols(
+                        market_date=market_date,
+                        roles=(role,),
+                        symbols=('005930',),
+                    )
+
+                self.assertEqual(
+                    terminal_state.failed_by_role[role],
+                    {'005930'},
+                )
+                self.assertEqual(
+                    terminal_state.retryable_failed_by_role[role],
+                    set(),
+                )
+                self.assertEqual(
+                    terminal_state.dependency_changed_retryable_failed_by_role[
+                        role
+                    ],
+                    set(),
+                )
+
+    def test_same_day_terminal_symbols_select_latest_failure_within_required_run(
+        self,
+    ):
+        service = AgentFeedbackRetryService()
+        market_date = date.fromisoformat('2026-04-16')
+        role = 'short-term-decider'
+        parent_run_id = 'parent-run'
+        child_run_id = 'required-child-run'
+        symbols = ('005930', '000660')
+        failure_rows = (
+            SimpleNamespace(
+                id=12,
+                symbol='005930',
+                agent_name=role,
+                run_id=child_run_id,
+                failure_kind='response_contract_invalid',
+                retryable=False,
+                received_at=datetime(
+                    2026, 4, 16, 6, 32, tzinfo=timezone.utc
+                ),
+            ),
+            SimpleNamespace(
+                id=21,
+                symbol='000660',
+                agent_name=role,
+                run_id=child_run_id,
+                failure_kind=(
+                    'dependency_upstream_changed_during_dispatch'
+                ),
+                retryable=True,
+                received_at=datetime(
+                    2026, 4, 16, 6, 31, tzinfo=timezone.utc
+                ),
+            ),
+            SimpleNamespace(
+                id=22,
+                symbol='000660',
+                agent_name=role,
+                run_id='other-child-run',
+                failure_kind='response_contract_invalid',
+                retryable=False,
+                received_at=datetime(
+                    2026, 4, 16, 6, 33, tzinfo=timezone.utc
+                ),
+            ),
+            SimpleNamespace(
+                id=11,
+                symbol='005930',
+                agent_name=role,
+                run_id=child_run_id,
+                failure_kind=(
+                    'dependency_upstream_changed_during_dispatch'
+                ),
+                retryable=True,
+                received_at=datetime(
+                    2026, 4, 16, 6, 30, tzinfo=timezone.utc
+                ),
+            ),
+        )
+        child_run = SimpleNamespace(
+            id=1,
+            run_id=child_run_id,
+            status='failed',
+            failed_count=2,
+            request_payload={
+                'parent_run_id': parent_run_id,
+                'roles': [role],
+                'symbols': list(symbols),
+                'requested_symbols': list(symbols),
+                'role_symbol_scopes': {role: list(symbols)},
+            },
+            summary_payload={},
+            started_at=datetime(2026, 4, 16, 6, 29, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 4, 16, 6, 34, tzinfo=timezone.utc),
+        )
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(all=lambda: []),
+            MagicMock(all=lambda: failure_rows),
+            MagicMock(all=lambda: [child_run]),
+        ]
+
+        with patch(
+            'app.agent_context.retry_service.session_scope'
+        ) as session_scope_mock:
+            session_scope_mock.return_value.__enter__.return_value = session
+            terminal_state = service._load_same_day_terminal_symbols(
+                market_date=market_date,
+                roles=(role,),
+                symbols=symbols,
+                required_parent_run_id=parent_run_id,
+            )
+
+        self.assertEqual(
+            terminal_state.failed_by_role[role],
+            set(symbols),
+        )
+        self.assertEqual(
+            terminal_state.retryable_failed_by_role[role],
+            {'000660'},
+        )
+        self.assertEqual(
+            terminal_state.dependency_changed_retryable_failed_by_role[role],
+            {'000660'},
+        )
+
     def test_automatic_decider_filter_revalidates_same_day_and_prior_day_fundamentals(self):
         service = AgentFeedbackRetryService()
         completed_by_role = {
