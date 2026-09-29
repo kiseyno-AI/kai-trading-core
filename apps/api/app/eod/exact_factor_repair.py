@@ -239,40 +239,20 @@ def _extract_stored_exact_market_membership(
     return symbols_by_market, skipped_by_market
 
 
-def _build_symbol_driven_factor_symbols_query(
+def _build_factor_symbols_for_date_query(
     model: Any,
     *,
     market_date: date,
-    excluded_symbols: Sequence[str] = (),
 ):
-    factor_row_exists = (
-        select(1)
+    return (
+        select(Symbol.symbol)
+        .select_from(model)
+        .join(Symbol, Symbol.id == model.symbol_id)
         .where(
-            model.symbol_id == Symbol.id,
             model.market_date == market_date,
+            Symbol.market.in_(EXACT_FACTOR_REPAIR_MARKETS),
         )
-        # Prevent PostgreSQL from decorrelating EXISTS into a factor-table-led
-        # semi-join.  The zero offset keeps the bounded symbols-table outer
-        # loop, so each factor lookup can use (symbol_id, market_date).
-        .offset(0)
-        .exists()
     )
-    statement = select(Symbol.symbol).where(
-        Symbol.market.in_(EXACT_FACTOR_REPAIR_MARKETS),
-        factor_row_exists,
-    )
-    normalized_exclusions = sorted(
-        {
-            str(symbol).strip().upper()
-            for symbol in excluded_symbols
-            if str(symbol).strip()
-        }
-    )
-    if normalized_exclusions:
-        statement = statement.where(
-            Symbol.symbol.not_in(normalized_exclusions)
-        )
-    return statement
 
 
 def load_stale_outside_membership_details(
@@ -285,21 +265,29 @@ def load_stale_outside_membership_details(
     if not membership:
         raise ValueError('exact membership must not be empty')
     details: dict[str, dict[str, Any]] = {}
-    membership_set = set(membership).union(protected_symbols)
+    retained_membership_set = set(membership).union(protected_symbols)
     with session_scope(
         statement_timeout_ms=EXACT_FACTOR_REPAIR_STATEMENT_TIMEOUT_MS,
     ) as session:
         for stage_id, model in FACTOR_RESULT_MODELS.items():
             stored_symbols = list(
                 session.scalars(
-                    _build_symbol_driven_factor_symbols_query(
+                    _build_factor_symbols_for_date_query(
                         model,
                         market_date=market_date,
-                        excluded_symbols=membership_set,
                     )
                 )
             )
-            outside_symbols = sorted(str(symbol) for symbol in stored_symbols)
+            # The exact KRX scope normally contains thousands of symbols.
+            # Filtering that scope in SQL expands into an equally large NOT IN
+            # parameter list and can exhaust the repair statement timeout.
+            # Keep the indexed, market/date-bounded lookup small and apply the
+            # already-loaded membership proof in memory instead.
+            outside_symbols = sorted(
+                str(symbol)
+                for symbol in stored_symbols
+                if str(symbol) not in retained_membership_set
+            )
             details[stage_id] = {
                 'count': len(outside_symbols),
                 'symbol_preview': outside_symbols[:20],

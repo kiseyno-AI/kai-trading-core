@@ -33,6 +33,7 @@ from app.market_data_store import advisory_eod_collection_lock
 logger = logging.getLogger(__name__)
 
 MISSING_BAR_REPAIR_MARKETS = ('KOSPI', 'KOSDAQ')
+MISSING_BAR_INSERT_BATCH_SIZE = 200
 MINIMUM_MARKET_MEMBERSHIP = {
     'KOSPI': 700,
     'KOSDAQ': 1200,
@@ -54,6 +55,15 @@ FUNDAMENTAL_COLUMNS = {
     'DPS': 'dps',
 }
 FUNDAMENTAL_OPTIONAL_SECURITY_GROUPS = frozenset({'RT', 'IF', 'MF', 'DR', 'FS'})
+
+
+def _missing_bar_insert_batches(
+    values: Sequence[dict[str, Any]],
+) -> Iterable[Sequence[dict[str, Any]]]:
+    """Bound INSERT statement size while retaining one outer transaction."""
+
+    for offset in range(0, len(values), MISSING_BAR_INSERT_BATCH_SIZE):
+        yield values[offset : offset + MISSING_BAR_INSERT_BATCH_SIZE]
 
 
 @dataclass(frozen=True)
@@ -480,15 +490,18 @@ def repair_missing_daily_price_bars(
                 }
                 for bar in missing_bars
             ]
-            statement = (
-                pg_insert(DailyPriceBar)
-                .values(values)
-                .on_conflict_do_nothing(
-                    constraint='uq_daily_price_bars_symbol_trade_date'
+            for value_batch in _missing_bar_insert_batches(values):
+                statement = (
+                    pg_insert(DailyPriceBar)
+                    .values(value_batch)
+                    .on_conflict_do_nothing(
+                        constraint='uq_daily_price_bars_symbol_trade_date'
+                    )
+                    .returning(DailyPriceBar.symbol_id)
                 )
-                .returning(DailyPriceBar.symbol_id)
-            )
-            inserted_count = len(session.execute(statement).scalars().all())
+                inserted_count += len(
+                    session.execute(statement).scalars().all()
+                )
             if inserted_count != len(missing_bars):
                 raise RuntimeError(
                     'missing-bar insert count changed after coverage validation'

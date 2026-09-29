@@ -5,6 +5,9 @@ from typing import Any, Sequence
 
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.daily_pipeline_stages import DailyPipelineStageService, STAGE_DEFINITIONS
+from app.eod.pykrx_pipeline_runner import (
+    should_skip_point_in_time_current_only_stage,
+)
 from app.signals.market_risk_filter import (
     MARKET_RISK_FILTER_SOURCE,
     daily_market_risk_filter_service,
@@ -20,6 +23,8 @@ def build_prior_date_current_only_stage_skip(
     stage_id: str,
     market_date: str,
     current_market_date: str | date | None = None,
+    market: Any | None = None,
+    previous_trading_date: str | date | None = None,
 ) -> dict[str, Any] | None:
     target_text = str(market_date).strip()
     target_date = (
@@ -28,7 +33,8 @@ def build_prior_date_current_only_stage_skip(
         else date.fromisoformat(target_text)
     )
     if current_market_date is None:
-        current_market_date = str(get_market_state().server_time)[:10]
+        market = market if market is not None else get_market_state()
+        current_market_date = str(market.server_time)[:10]
     current_text = str(current_market_date).strip()[:10]
     current_date = (
         datetime.strptime(current_text, '%Y%m%d').date()
@@ -36,6 +42,14 @@ def build_prior_date_current_only_stage_skip(
         else date.fromisoformat(current_text)
     )
     if target_date >= current_date:
+        return None
+    if not should_skip_point_in_time_current_only_stage(
+        stage_id=stage_id,
+        market_date=target_date,
+        market=market,
+        current_market_date=current_date,
+        previous_trading_date=previous_trading_date,
+    ):
         return None
     return {
         'triggered': False,
@@ -85,6 +99,8 @@ async def run_tracked_market_risk_filter(
     *,
     market_date: str,
     current_market_date: str | date | None = None,
+    market: Any | None = None,
+    previous_trading_date: str | date | None = None,
     symbols: Sequence[str] | None = None,
     source: str = MARKET_RISK_FILTER_SOURCE,
     market_code: str = DEFAULT_MARKET_CODE,
@@ -98,6 +114,8 @@ async def run_tracked_market_risk_filter(
         stage_id=stage_id,
         market_date=market_date,
         current_market_date=current_market_date,
+        market=market,
+        previous_trading_date=previous_trading_date,
     )
     if safety_skip is not None:
         return safety_skip

@@ -55,6 +55,7 @@ from app.eod.pykrx_pipeline_runner import (
     _run_daily_next_open_execution_plan_followup,
     _run_daily_signal_decider_evaluation_followup,
     _run_daily_signal_decider_followup,
+    should_skip_point_in_time_current_only_stage,
 )
 from app.market.clock import KST, MarketState
 from app.repositories.eod_run_repository import AutoEODRecoveryTarget
@@ -77,6 +78,70 @@ class _AnySymbolTurnoverFrame:
 
 
 class PykrxPipelineResultStatusTests(TestCase):
+    def test_preopen_previous_session_market_risk_is_not_safety_skipped(
+        self,
+    ) -> None:
+        market = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-09-29T08:30:00+09:00',
+            session_open_at='2026-09-29T09:00:00+09:00',
+            session_close_at='2026-09-29T15:30:00+09:00',
+        )
+
+        self.assertFalse(
+            should_skip_point_in_time_current_only_stage(
+                stage_id='market_risk_filter',
+                market_date='2026-09-28',
+                market=market,
+                previous_trading_date=date(2026, 9, 28),
+            )
+        )
+
+    def test_preopen_older_market_risk_remains_safety_skipped(self) -> None:
+        market = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-09-29T08:30:00+09:00',
+            session_open_at='2026-09-29T09:00:00+09:00',
+            session_close_at='2026-09-29T15:30:00+09:00',
+        )
+
+        self.assertTrue(
+            should_skip_point_in_time_current_only_stage(
+                stage_id='market_risk_filter',
+                market_date='2026-09-25',
+                market=market,
+                previous_trading_date=date(2026, 9, 28),
+            )
+        )
+
+    def test_open_session_previous_market_risk_remains_safety_skipped(
+        self,
+    ) -> None:
+        market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-09-29T09:00:01+09:00',
+            session_open_at='2026-09-29T09:00:00+09:00',
+            session_close_at='2026-09-29T15:30:00+09:00',
+        )
+
+        self.assertTrue(
+            should_skip_point_in_time_current_only_stage(
+                stage_id='market_risk_filter',
+                market_date='2026-09-28',
+                market=market,
+                previous_trading_date=date(2026, 9, 28),
+            )
+        )
+
     def test_fast_path_prerequisite_bypass_default_is_disabled(self) -> None:
         self.assertFalse(
             Settings.model_fields[
@@ -1731,6 +1796,11 @@ class PykrxBackfillServiceTests(TestCase):
                     server_time='2026-09-14T10:00:00+09:00',
                 ),
             ),
+            patch(
+                'app.eod.pykrx_pipeline_runner.'
+                'should_skip_point_in_time_current_only_stage',
+                wraps=should_skip_point_in_time_current_only_stage,
+            ) as current_only_stage_policy,
             patch.object(
                 service,
                 'fetch_recent_universe_snapshot',
@@ -1826,6 +1896,10 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['status'], 'completed')
         self.assertTrue(result['market_risk_filter']['safe_skip'])
+        current_only_stage_policy.assert_called_once_with(
+            stage_id='market_risk_filter',
+            market_date='2026-09-11',
+        )
         persist_universe.assert_not_called()
         rebuild_kis_risk.assert_not_called()
         collect_enrichment.assert_called_once_with(

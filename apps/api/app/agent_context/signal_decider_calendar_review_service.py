@@ -21,6 +21,9 @@ from app.agent_context.signal_decider_loop_service import (
     _resolve_review_horizons,
     signal_decider_loop_service,
 )
+from app.agent_context.signal_decider_snapshot_validity import (
+    is_decision_snapshot_valid_for_source_date,
+)
 from app.core.settings import settings
 from app.db import session_scope as _base_session_scope
 from app.db_models import SignalDeciderCalendarReviewItem, SignalDeciderCalendarReviewRun
@@ -504,6 +507,11 @@ class SignalDeciderCalendarReviewService:
                 symbols=normalized_symbols or None,
                 dedupe_feedback_results=True,
             )
+            snapshot_rows = [
+                row
+                for row in snapshot_rows
+                if is_decision_snapshot_valid_for_source_date(row)
+            ]
             upsert_items: list[dict[str, Any]] = []
             for primary_horizon_days in normalized_primary_horizons:
                 detail_items = self.loop_service.build_review_items(

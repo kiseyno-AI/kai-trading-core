@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import sys
 from typing import Any
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, false, func, or_, select
 
 from app.db import session_scope
 from app.db_models import (
@@ -464,6 +465,66 @@ def _expected_price_counts(
     return {row[0]: int(row[1]) for row in rows}
 
 
+def _causal_raw_dependency_watermarks(
+    session: Any,
+    *,
+    required_dates: Sequence[date],
+) -> dict[date, datetime]:
+    """Return the latest repaired raw input that can affect each output date.
+
+    A raw row from a later trade date cannot invalidate an earlier derived
+    output.  A repaired earlier row can, however, affect later rolling
+    technical and factor outputs.  The running maximum therefore preserves
+    that forward dependency without applying the newest timestamp backward to
+    unrelated historical dates.
+    """
+
+    rows = session.execute(
+        select(
+            DailyPriceBar.trade_date,
+            func.max(DailyPriceBar.captured_at),
+        )
+        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+        .where(
+            DailyPriceBar.trade_date.in_(required_dates),
+            Symbol.market.in_(SUPPORTED_MARKETS),
+        )
+        .group_by(DailyPriceBar.trade_date)
+    ).all()
+    per_date = {
+        market_date: captured_at
+        for market_date, captured_at in rows
+        if captured_at is not None
+    }
+    running_watermark: datetime | None = None
+    result: dict[date, datetime] = {}
+    for market_date in sorted(set(required_dates)):
+        current = per_date.get(market_date)
+        if current is not None and (
+            running_watermark is None or current > running_watermark
+        ):
+            running_watermark = current
+        if running_watermark is not None:
+            result[market_date] = running_watermark
+    return result
+
+
+def _fresh_after_causal_dependency_condition(
+    *,
+    market_date_column: Any,
+    updated_at_column: Any,
+    raw_dependency_watermarks: dict[date, datetime],
+) -> Any:
+    conditions = [
+        and_(
+            market_date_column == market_date,
+            updated_at_column >= watermark,
+        )
+        for market_date, watermark in raw_dependency_watermarks.items()
+    ]
+    return or_(*conditions) if conditions else false()
+
+
 def _full_coverage_stage_evidence(
     session: Any,
     *,
@@ -471,7 +532,7 @@ def _full_coverage_stage_evidence(
     required_dates: Sequence[date],
     expected_counts: dict[date, int],
     rebuilt_after: datetime,
-    raw_dependency_watermark: datetime,
+    raw_dependency_watermarks: dict[date, datetime],
 ) -> dict[str, Any]:
     fresh_row = case((model.updated_at >= rebuilt_after, 1))
     fresh_after_raw_row = case(
@@ -484,7 +545,14 @@ def _full_coverage_stage_evidence(
         )
     )
     fresh_after_dependency_row = case(
-        (model.updated_at >= raw_dependency_watermark, 1)
+        (
+            _fresh_after_causal_dependency_condition(
+                market_date_column=model.market_date,
+                updated_at_column=model.updated_at,
+                raw_dependency_watermarks=raw_dependency_watermarks,
+            ),
+            1,
+        )
     )
     rows = session.execute(
         select(
@@ -580,7 +648,7 @@ def _exact_factor_stage_evidence(
     model: Any,
     required_dates: Sequence[date],
     factor_rebuild_metadata: dict[str, Any],
-    raw_dependency_watermark: datetime,
+    raw_dependency_watermarks: dict[date, datetime],
 ) -> dict[str, Any]:
     date_scopes = dict(factor_rebuild_metadata.get('dates') or {})
     issues: list[dict[str, Any]] = []
@@ -647,10 +715,12 @@ def _exact_factor_stage_evidence(
             and row[3] is not None
             and row[1] >= row[3]
         )
+        raw_dependency_watermark = raw_dependency_watermarks.get(market_date)
         fresh_after_dependency = sum(
             1
             for row in rows
             if row[1] is not None
+            and raw_dependency_watermark is not None
             and row[1] >= raw_dependency_watermark
         )
         observed_input_sha256, input_row_count = (
@@ -668,6 +738,11 @@ def _exact_factor_stage_evidence(
             'fresh_after_rebuild': fresh_after_rebuild,
             'fresh_after_raw': fresh_after_raw,
             'fresh_after_dependency': fresh_after_dependency,
+            'raw_dependency_watermark': (
+                raw_dependency_watermark.isoformat()
+                if raw_dependency_watermark is not None
+                else None
+            ),
             'input_row_count': input_row_count,
             'expected_membership_sha256': expected_membership_sha256,
             'observed_membership_sha256': observed_membership_sha256,
@@ -705,7 +780,7 @@ def _trending_evidence(
     *,
     required_dates: Sequence[date],
     rebuilt_after: datetime,
-    raw_dependency_watermark: datetime,
+    raw_dependency_watermarks: dict[date, datetime],
 ) -> dict[str, Any]:
     fresh_row = case((DailyTrendingRank.updated_at >= rebuilt_after, 1))
     fresh_after_raw_row = case(
@@ -718,7 +793,14 @@ def _trending_evidence(
         )
     )
     fresh_after_dependency_row = case(
-        (DailyTrendingRank.updated_at >= raw_dependency_watermark, 1)
+        (
+            _fresh_after_causal_dependency_condition(
+                market_date_column=DailyTrendingRank.market_date,
+                updated_at_column=DailyTrendingRank.updated_at,
+                raw_dependency_watermarks=raw_dependency_watermarks,
+            ),
+            1,
+        )
     )
     top_absolute_rank = case(
         (
@@ -1209,12 +1291,30 @@ def _evaluation_rebuild_evidence(
     }
 
 
+def _cached_verification_evidence(
+    cache: dict[tuple[Any, ...], Any],
+    key: tuple[Any, ...],
+    factory: Callable[[], Any],
+) -> Any:
+    if key not in cache:
+        cache[key] = factory()
+    return deepcopy(cache[key])
+
+
 def _collect_batch_verification(
     session: Any,
     *,
     batch: DailyPriceBarRepairBatch,
+    evidence_cache: dict[tuple[Any, ...], Any] | None = None,
+    newest_created_at_by_dates: dict[tuple[date, ...], datetime] | None = None,
 ) -> dict[str, Any]:
     required_dates = _normalize_required_dates(batch.required_rebuild_trade_dates)
+    cache = evidence_cache if evidence_cache is not None else {}
+    newest_created_at = (
+        newest_created_at_by_dates.get(required_dates, batch.created_at)
+        if newest_created_at_by_dates is not None
+        else batch.created_at
+    )
     issues: list[str] = []
     if not required_dates:
         issues.append('required_rebuild_trade_dates_empty')
@@ -1231,9 +1331,13 @@ def _collect_batch_verification(
     if audit_count != int(batch.repaired_row_count):
         issues.append('repair_audit_count_mismatch')
 
-    expected_counts = _expected_price_counts(
-        session,
-        required_dates=required_dates,
+    expected_counts = _cached_verification_evidence(
+        cache,
+        ('expected_price_counts', required_dates),
+        lambda: _expected_price_counts(
+            session,
+            required_dates=required_dates,
+        ),
     )
     missing_price_dates = [
         market_date.isoformat()
@@ -1243,51 +1347,133 @@ def _collect_batch_verification(
     if missing_price_dates:
         issues.append('required_price_dates_missing')
 
-    raw_dependency_watermark = session.scalar(
-        select(func.max(DailyPriceBar.captured_at))
-        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-        .where(
-            DailyPriceBar.trade_date.in_(required_dates),
-            Symbol.market.in_(SUPPORTED_MARKETS),
-        )
+    raw_dependency_watermarks = _cached_verification_evidence(
+        cache,
+        ('raw_dependency_watermarks', required_dates),
+        lambda: _causal_raw_dependency_watermarks(
+            session,
+            required_dates=required_dates,
+        ),
+    )
+    raw_dependency_watermark = (
+        max(raw_dependency_watermarks.values())
+        if raw_dependency_watermarks
+        else None
     )
     if raw_dependency_watermark is None:
         issues.append('required_price_dependency_watermark_missing')
         raw_dependency_watermark = datetime.now(timezone.utc)
 
+    expected_count_key = tuple(sorted(expected_counts.items()))
+    watermark_key = tuple(sorted(raw_dependency_watermarks.items()))
     stages: dict[str, dict[str, Any]] = {}
     for stage_id, model in REQUIRED_PRICE_COVERAGE_MODELS:
-        evidence = _full_coverage_stage_evidence(
-            session,
-            model=model,
-            required_dates=required_dates,
-            expected_counts=expected_counts,
-            rebuilt_after=batch.created_at,
-            raw_dependency_watermark=raw_dependency_watermark,
+        strict_key = (
+            'full_coverage_stage',
+            stage_id,
+            model,
+            required_dates,
+            expected_count_key,
+            watermark_key,
+            newest_created_at,
         )
+        evidence = _cached_verification_evidence(
+            cache,
+            strict_key,
+            lambda: _full_coverage_stage_evidence(
+                session,
+                model=model,
+                required_dates=required_dates,
+                expected_counts=expected_counts,
+                rebuilt_after=newest_created_at,
+                raw_dependency_watermarks=raw_dependency_watermarks,
+            ),
+        )
+        # A ready result at the newest threshold has every row fresh, so the
+        # evidence is identical for older batches.  On failure, retain each
+        # batch's original freshness result by checking its own threshold.
+        if not evidence['ready'] and batch.created_at != newest_created_at:
+            evidence = _cached_verification_evidence(
+                cache,
+                (
+                    'full_coverage_stage',
+                    stage_id,
+                    model,
+                    required_dates,
+                    expected_count_key,
+                    watermark_key,
+                    batch.created_at,
+                ),
+                lambda: _full_coverage_stage_evidence(
+                    session,
+                    model=model,
+                    required_dates=required_dates,
+                    expected_counts=expected_counts,
+                    rebuilt_after=batch.created_at,
+                    raw_dependency_watermarks=raw_dependency_watermarks,
+                ),
+            )
         stages[stage_id] = evidence
         if not evidence['ready']:
             issues.append(f'{stage_id}_incomplete_or_stale')
 
     factor_rebuild_metadata = dict(batch.factor_rebuild_metadata or {})
+    factor_metadata_key = json.dumps(
+        factor_rebuild_metadata,
+        ensure_ascii=True,
+        separators=(',', ':'),
+        sort_keys=True,
+    )
     for stage_id, model in REQUIRED_EXACT_FACTOR_MODELS:
-        evidence = _exact_factor_stage_evidence(
-            session,
-            model=model,
-            required_dates=required_dates,
-            factor_rebuild_metadata=factor_rebuild_metadata,
-            raw_dependency_watermark=raw_dependency_watermark,
+        evidence = _cached_verification_evidence(
+            cache,
+            (
+                'exact_factor_stage',
+                stage_id,
+                model,
+                required_dates,
+                factor_metadata_key,
+                watermark_key,
+            ),
+            lambda: _exact_factor_stage_evidence(
+                session,
+                model=model,
+                required_dates=required_dates,
+                factor_rebuild_metadata=factor_rebuild_metadata,
+                raw_dependency_watermarks=raw_dependency_watermarks,
+            ),
         )
         stages[stage_id] = evidence
         if not evidence['ready']:
             issues.append(f'{stage_id}_incomplete_or_stale')
 
-    trending = _trending_evidence(
-        session,
-        required_dates=required_dates,
-        rebuilt_after=batch.created_at,
-        raw_dependency_watermark=raw_dependency_watermark,
+    trending = _cached_verification_evidence(
+        cache,
+        ('trending', required_dates, watermark_key, newest_created_at),
+        lambda: _trending_evidence(
+            session,
+            required_dates=required_dates,
+            rebuilt_after=newest_created_at,
+            raw_dependency_watermarks=raw_dependency_watermarks,
+        ),
     )
+    # Trending freshness has the same monotonic threshold property above.
+    if not trending['ready'] and batch.created_at != newest_created_at:
+        trending = _cached_verification_evidence(
+            cache,
+            (
+                'trending',
+                required_dates,
+                watermark_key,
+                batch.created_at,
+            ),
+            lambda: _trending_evidence(
+                session,
+                required_dates=required_dates,
+                rebuilt_after=batch.created_at,
+                raw_dependency_watermarks=raw_dependency_watermarks,
+            ),
+        )
     stages['trending_ranks'] = trending
     if not trending['ready']:
         issues.append('trending_ranks_incomplete_or_stale')
@@ -1325,6 +1511,10 @@ def _collect_batch_verification(
             for item in required_dates
         },
         'raw_dependency_watermark': raw_dependency_watermark.isoformat(),
+        'raw_dependency_watermarks': {
+            market_date.isoformat(): watermark.isoformat()
+            for market_date, watermark in raw_dependency_watermarks.items()
+        },
         'missing_price_dates': missing_price_dates,
         'stages': stages,
         'issues': issues,
@@ -1797,8 +1987,25 @@ def _verify_pending_price_bar_rebuilds_locked(
                 'batches': [],
             }
 
+        evidence_cache: dict[tuple[Any, ...], Any] = {}
+        newest_created_at_by_dates: dict[tuple[date, ...], datetime] = {}
+        for batch in batches:
+            required_dates = _normalize_required_dates(
+                batch.required_rebuild_trade_dates
+            )
+            newest_created_at = newest_created_at_by_dates.get(required_dates)
+            if (
+                newest_created_at is None
+                or batch.created_at > newest_created_at
+            ):
+                newest_created_at_by_dates[required_dates] = batch.created_at
         evidence = [
-            _collect_batch_verification(session, batch=batch)
+            _collect_batch_verification(
+                session,
+                batch=batch,
+                evidence_cache=evidence_cache,
+                newest_created_at_by_dates=newest_created_at_by_dates,
+            )
             for batch in batches
         ]
         all_ready = all(item['ready'] for item in evidence)

@@ -1,7 +1,7 @@
 import threading
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
@@ -805,6 +805,78 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             market_date='2026-09-11',
             symbols=['099999'],
         )
+
+    def test_preopen_recovery_runs_previous_session_market_risk_stages(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        market = MagicMock(
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            current_calendar_date=None,
+            server_time='2026-09-29T08:30:00+09:00',
+        )
+        call_kwargs = {
+            'market_date': '2026-09-28',
+            'symbols': ['005930'],
+            'markets': ['KOSPI'],
+            'force': False,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+            'point_in_time_recovery': True,
+        }
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.eod.pykrx_pipeline_runner.previous_krx_trading_date',
+                return_value=datetime(2026, 9, 28).date(),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_market_risk_snapshot_service.collect_for_market_date',
+                new=AsyncMock(
+                    return_value={
+                        'snapshots_persisted': 1,
+                        'snapshots_failed': 0,
+                    }
+                ),
+            ) as collect_snapshots,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_market_risk_filter_service.rebuild_for_market_date',
+                new=AsyncMock(
+                    return_value={
+                        'results_persisted': 1,
+                        'results_failed': 0,
+                    }
+                ),
+            ) as rebuild_filters,
+        ):
+            snapshot_result = service._execute_stage(
+                stage_id='market_risk_snapshots',
+                **call_kwargs,
+            )
+            filter_result = service._execute_stage(
+                stage_id='market_risk_filter',
+                **call_kwargs,
+            )
+
+        self.assertEqual(snapshot_result['snapshots_persisted'], 1)
+        self.assertEqual(filter_result['results_persisted'], 1)
+        collect_snapshots.assert_awaited_once()
+        rebuild_filters.assert_awaited_once()
 
     def test_production_boundaries_auto_promote_prior_date_current_only_skip(
         self,

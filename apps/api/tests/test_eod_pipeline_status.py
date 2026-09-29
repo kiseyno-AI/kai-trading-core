@@ -1285,6 +1285,162 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'no_decision_ready_rows',
         )
 
+    def test_fresher_low_risk_rows_replace_stale_zero_ready_history(self):
+        market_date = '2026-09-23'
+        official_item = _completed_official_stage(
+            run_id=475,
+            stage_id='low_risk_factors',
+            market_date=market_date,
+            processed=2_678,
+            total=2_678,
+            updated_at='2026-09-24T00:00:00+00:00',
+        )
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'results_persisted': 2_678,
+                'results_failed': 0,
+                'summary': {
+                    'requested_symbol_count': 2_678,
+                    'matched_symbol_count': 2_678,
+                    'insufficient_history_count': 2_678,
+                    'ready_count': 0,
+                },
+            }
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_678,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'low_risk_factors': official_item,
+            },
+            price_bar_count_loader=lambda **_: 2_678,
+            row_count_stage_counts_loader=lambda **_: {
+                'low_risk_factors': {
+                    'persisted': 2_678,
+                    'updated_at': '2026-09-27T22:54:27+00:00',
+                    'decision_ready_count': 1_587,
+                    'insufficient_history_count': 1_091,
+                    'latest_decision_ready_at': '2026-09-27T22:54:27+00:00',
+                },
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['low_risk_factors']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['details']['decision_ready_count'], 1_587)
+        self.assertEqual(stage['details']['insufficient_history_count'], 1_091)
+
+    def test_newer_unready_row_does_not_make_older_ready_rows_fresh(self):
+        market_date = '2026-09-23'
+        official_item = _completed_official_stage(
+            run_id=475,
+            stage_id='low_risk_factors',
+            market_date=market_date,
+            processed=2_678,
+            total=2_678,
+            updated_at='2026-09-24T00:00:00+00:00',
+        )
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'results_persisted': 2_678,
+                'results_failed': 0,
+                'summary': {
+                    'requested_symbol_count': 2_678,
+                    'matched_symbol_count': 2_678,
+                    'insufficient_history_count': 2_678,
+                    'ready_count': 0,
+                },
+            }
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_678,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'low_risk_factors': official_item,
+            },
+            price_bar_count_loader=lambda **_: 2_678,
+            row_count_stage_counts_loader=lambda **_: {
+                'low_risk_factors': {
+                    'persisted': 2_678,
+                    'updated_at': '2026-09-27T22:54:27+00:00',
+                    'decision_ready_count': 1_587,
+                    'insufficient_history_count': 1_091,
+                    'latest_decision_ready_at': '2026-09-23T22:54:27+00:00',
+                },
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['low_risk_factors']
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['details']['gate_reason'], 'no_decision_ready_rows')
+
+    def test_fresher_ready_rows_replace_zero_ready_current_official_run(self):
+        market_date = '2026-09-23'
+        official_item = _completed_official_stage(
+            run_id=475,
+            stage_id='low_risk_factors',
+            market_date=market_date,
+            processed=2_678,
+            total=2_678,
+            updated_at='2026-09-24T00:00:00+00:00',
+        )
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'results_persisted': 2_678,
+                'results_failed': 0,
+                'summary': {
+                    'requested_symbol_count': 2_678,
+                    'matched_symbol_count': 2_678,
+                    'insufficient_history_count': 2_678,
+                    'ready_count': 0,
+                },
+            }
+        }
+        official_run = {
+            **official_item['run'],
+            'stages': {'low_risk_factors': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_678,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 2_678,
+            row_count_stage_counts_loader=lambda **_: {
+                'low_risk_factors': {
+                    'persisted': 2_678,
+                    'updated_at': '2026-09-27T22:54:27+00:00',
+                    'decision_ready_count': 1_587,
+                    'insufficient_history_count': 1_091,
+                    'latest_decision_ready_at': '2026-09-27T22:54:27+00:00',
+                },
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['low_risk_factors']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['details']['decision_ready_count'], 1_587)
+
     def test_completed_zero_scope_history_is_blocked_by_incomplete_context(self):
         market_date = '2026-09-22'
         signal_decider_item = _completed_official_stage(
@@ -1983,6 +2139,183 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ['fundamentals_daily_refresh'],
         )
         self.assertIsNone(result['stages']['advanced_value_factors']['completed_at'])
+
+    def test_completed_official_factor_is_not_replaced_by_stale_dependency_wait(self):
+        market_date = '2026-09-28'
+        updated_at = '2026-09-28T20:00:00+00:00'
+        fundamentals_item = _completed_official_stage(
+            run_id=480,
+            stage_id='fundamentals_daily_refresh',
+            market_date=market_date,
+            processed=0,
+            total=0,
+            updated_at=updated_at,
+        )
+        fundamentals_item['stage']['details'] = {
+            'result_summary': {
+                'triggered': False,
+                'skipped': True,
+                'safe_skip': True,
+                'reason': 'point_in_time_recovery_current_only_stage',
+            }
+        }
+        affected_stage_ids = (
+            'piotroski_filter',
+            'advanced_value_factors',
+            'unified_value_factors',
+            'quality_factors',
+            'composite_factors',
+        )
+        stage_history = {
+            'fundamentals_daily_refresh': fundamentals_item,
+            **{
+                stage_id: _completed_official_stage(
+                    run_id=480,
+                    stage_id=stage_id,
+                    market_date=market_date,
+                    processed=3,
+                    total=3,
+                    updated_at=updated_at,
+                )
+                for stage_id in affected_stage_ids
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {
+                'price_collection': {'persisted': 3, 'updated_at': updated_at},
+            },
+            live_symbol_count_loader=lambda: 3,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: stage_history,
+            price_bar_count_loader=lambda **_: 3,
+            row_count_stage_counts_loader=lambda **_: {
+                stage_id: {'persisted': 3, 'updated_at': updated_at}
+                for stage_id in (
+                    'piotroski_filter',
+                    *DEFAULT_FACTOR_STAGE_ORDER,
+                )
+            },
+            pykrx_enrichment_loader=lambda **_: _full_pykrx_enrichment_coverage(
+                symbol_count=3,
+                market_count=2,
+                updated_at=updated_at,
+            ),
+        )
+
+        result = service.read(market_date=market_date)
+
+        for stage_id in affected_stage_ids:
+            with self.subTest(stage_id=stage_id):
+                factor_stage = result['stages'][stage_id]
+                self.assertEqual(factor_stage['status'], 'completed')
+                self.assertEqual(
+                    factor_stage['details']['mode'],
+                    'official_daily_pipeline_run_state',
+                )
+                self.assertEqual(
+                    factor_stage['details'].get('blocking_stages', []),
+                    [],
+                )
+
+    def test_completed_eod_progress_factor_is_not_replaced_by_stale_dependency_wait(self):
+        market_date = '2026-09-28'
+        updated_at = '2026-09-28T20:00:00+00:00'
+        affected_stage_ids = (
+            'piotroski_filter',
+            'advanced_value_factors',
+            'unified_value_factors',
+            'quality_factors',
+            'composite_factors',
+        )
+        completed_progress = {
+            'status': 'completed',
+            'processed': 3,
+            'total': 3,
+            'succeeded': 3,
+            'failed': 0,
+            'updated_at': updated_at,
+            'result_summary': {'results_persisted': 3, 'results_failed': 0},
+        }
+        pykrx_run = {
+            'id': 552,
+            'market': 'KRX',
+            'trade_date': market_date,
+            'source': 'pykrx',
+            'trigger': 'internal_ops_cli',
+            'status': 'completed',
+            'symbols_total': 3,
+            'symbols_succeeded': 3,
+            'symbols_failed': 0,
+            'error_message': None,
+            'started_at': updated_at,
+            'completed_at': updated_at,
+            'run_metadata': {
+                'mode': 'daily_auto',
+                'last_progress_at': updated_at,
+                'stage_progress': {
+                    'fundamentals_daily_refresh': {
+                        'status': 'completed',
+                        'processed': 0,
+                        'total': 0,
+                        'succeeded': 0,
+                        'failed': 0,
+                        'updated_at': updated_at,
+                        'result_summary': {
+                            'triggered': False,
+                            'skipped': True,
+                            'safe_skip': True,
+                            'reason': 'point_in_time_recovery_current_only_stage',
+                        },
+                    },
+                    **{
+                        stage_id: dict(completed_progress)
+                        for stage_id in affected_stage_ids
+                    },
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {
+                'price_collection': {'persisted': 3, 'updated_at': updated_at},
+            },
+            live_symbol_count_loader=lambda: 3,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 3,
+            row_count_stage_counts_loader=lambda **_: {
+                stage_id: {'persisted': 3, 'updated_at': updated_at}
+                for stage_id in (
+                    'piotroski_filter',
+                    *DEFAULT_FACTOR_STAGE_ORDER,
+                )
+            },
+            pykrx_enrichment_loader=lambda **_: _full_pykrx_enrichment_coverage(
+                symbol_count=3,
+                market_count=2,
+                updated_at=updated_at,
+            ),
+        )
+
+        result = service.read(market_date=market_date)
+
+        for stage_id in affected_stage_ids:
+            with self.subTest(stage_id=stage_id):
+                factor_stage = result['stages'][stage_id]
+                self.assertEqual(factor_stage['status'], 'completed')
+                self.assertEqual(
+                    factor_stage['details']['mode'],
+                    'eod_collection_run_stage_progress',
+                )
+                self.assertEqual(
+                    factor_stage['details'].get('blocking_stages', []),
+                    [],
+                )
 
     def test_read_prefers_stored_price_bar_count_when_price_stage_metadata_is_stale(self):
         pykrx_run = {

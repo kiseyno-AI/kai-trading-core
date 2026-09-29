@@ -29,6 +29,7 @@ from app.market.session import (
     async_build_market_session_metadata,
     async_get_krx_calendar_day,
     async_latest_krx_trading_date,
+    async_previous_krx_trading_date,
 )
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FACTOR_SOURCE,
@@ -91,6 +92,31 @@ async def _resolve_pykrx_market_date(
             f'{requested_date.isoformat()} is a {session_status}'
         )
     return requested_date.isoformat()
+
+
+async def _resolve_preopen_previous_trading_date(
+    *,
+    market_date: str,
+    market_state: object,
+) -> date | None:
+    if (
+        str(getattr(market_state, 'state', '') or '').upper() != 'PREOPEN'
+        or getattr(market_state, 'is_open', None) is True
+    ):
+        return None
+    current_market_date = _parse_pykrx_market_date(
+        str(getattr(market_state, 'server_time', ''))[:10],
+        field_name='current_market_date',
+    )
+    if _parse_pykrx_market_date(
+        market_date,
+        field_name='market_date',
+    ) >= current_market_date:
+        return None
+    return await async_previous_krx_trading_date(
+        current_market_date,
+        allow_fallback=True,
+    )
 
 
 class EODPipelineRunRequest(BaseModel):
@@ -520,10 +546,16 @@ async def compute_daily_market_risk_filters(
 ) -> dict:
     try:
         market_state = await async_get_market_state()
+        previous_trading_date = await _resolve_preopen_previous_trading_date(
+            market_date=market_date,
+            market_state=market_state,
+        )
         parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
         return await run_tracked_market_risk_filter(
             market_date=market_date,
             current_market_date=str(market_state.server_time)[:10],
+            market=market_state,
+            previous_trading_date=previous_trading_date,
             symbols=parsed_symbols,
             source=source,
             market_code=market_code,
@@ -546,10 +578,16 @@ async def collect_daily_market_risk_snapshots(
 ) -> dict:
     try:
         market_state = await async_get_market_state()
+        previous_trading_date = await _resolve_preopen_previous_trading_date(
+            market_date=market_date,
+            market_state=market_state,
+        )
         safety_skip = build_prior_date_current_only_stage_skip(
             stage_id='market_risk_snapshots',
             market_date=market_date,
             current_market_date=str(market_state.server_time)[:10],
+            market=market_state,
+            previous_trading_date=previous_trading_date,
         )
         if safety_skip is not None:
             return safety_skip

@@ -487,14 +487,35 @@ def _load_row_count_stage_counts(
             or 0
         )
         for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
-            persisted, updated_at = session.execute(
-                select(
-                    func.count(model.id),
-                    func.max(model.captured_at),
+            aggregate_columns = [
+                func.count(model.id),
+                func.max(model.captured_at),
+            ]
+            if stage_id == 'low_risk_factors':
+                decision_ready = model.low_risk_classification.in_(
+                    (
+                        'eligible',
+                        'watchlist',
+                        'ineligible',
+                        'liquidity_excluded',
+                    )
                 )
+                aggregate_columns.extend(
+                    (
+                        func.count(model.id).filter(decision_ready),
+                        func.count(model.id).filter(
+                            model.low_risk_classification
+                            == 'insufficient_history'
+                        ),
+                        func.max(model.captured_at).filter(decision_ready),
+                    )
+                )
+            aggregate = session.execute(
+                select(*aggregate_columns)
                 .select_from(model)
                 .where(model.market_date == normalized_market_date)
             ).one()
+            persisted, updated_at = aggregate[:2]
             persisted_count = int(persisted or 0)
             if not include_missing_diagnostics:
                 missing_diagnostics = {
@@ -523,6 +544,23 @@ def _load_row_count_stage_counts(
                 'updated_at': updated_at.isoformat() if updated_at else None,
                 **missing_diagnostics,
             }
+            if stage_id == 'low_risk_factors':
+                ready_count, insufficient_history_count, latest_ready_at = (
+                    aggregate[2:]
+                )
+                counts[stage_id].update(
+                    {
+                        'decision_ready_count': int(ready_count or 0),
+                        'insufficient_history_count': int(
+                            insufficient_history_count or 0
+                        ),
+                        'latest_decision_ready_at': (
+                            latest_ready_at.isoformat()
+                            if latest_ready_at
+                            else None
+                        ),
+                    }
+                )
     return counts
 
 
@@ -1004,6 +1042,12 @@ class EODPipelineStatusService:
             )
         for stage_id, stored_stage in stored_row_count_stage_overrides.items():
             if stage_id in stages:
+                if self._stored_dependency_wait_is_stale(
+                    stored_stage=stored_stage,
+                    current_stage=stages[stage_id],
+                    current_stages=stages,
+                ):
+                    continue
                 current_details = (
                     stages[stage_id].get('details')
                     if isinstance(stages[stage_id].get('details'), dict)
@@ -1011,6 +1055,10 @@ class EODPipelineStatusService:
                 )
                 if daily_pipeline_result_has_no_ready_content(
                     current_details.get('result_summary')
+                ) and not self._should_preserve_stored_coverage_stage(
+                    stage_id=stage_id,
+                    fallback_stage=stored_stage,
+                    official_stage=stages[stage_id],
                 ):
                     continue
                 stages[stage_id] = stored_stage
@@ -1049,6 +1097,66 @@ class EODPipelineStatusService:
             'stages': stages,
             'official_run': self._build_official_run_summary(official_run),
         }
+
+    @staticmethod
+    def _stored_dependency_wait_is_stale(
+        *,
+        stored_stage: dict[str, Any],
+        current_stage: dict[str, Any],
+        current_stages: dict[str, dict[str, Any]],
+    ) -> bool:
+        stored_details = (
+            stored_stage.get('details')
+            if isinstance(stored_stage.get('details'), dict)
+            else {}
+        )
+        current_details = (
+            current_stage.get('details')
+            if isinstance(current_stage.get('details'), dict)
+            else {}
+        )
+        blocking_stages = stored_details.get('blocking_stages')
+        failed_blocking_stages = stored_details.get('failed_blocking_stages')
+        persisted = int(
+            stored_details.get('rows_persisted')
+            or stored_stage.get('succeeded')
+            or 0
+        )
+        expected = int(
+            stored_details.get('expected_rows')
+            or stored_stage.get('total')
+            or 0
+        )
+        current_mode = str(current_details.get('mode') or '').strip()
+        if (
+            str(stored_stage.get('status') or '').strip().lower() != 'pending'
+            or str(stored_stage.get('gate_status') or '').strip().lower()
+            != 'waiting'
+            or not isinstance(blocking_stages, list)
+            or not blocking_stages
+            or (isinstance(failed_blocking_stages, list) and failed_blocking_stages)
+            or persisted <= 0
+            or expected <= 0
+            or persisted < expected
+            or str(current_stage.get('status') or '').strip().lower()
+            != 'completed'
+            or current_mode
+            not in {
+                'official_daily_pipeline_run_state',
+                'eod_collection_run_stage_progress',
+            }
+            or daily_pipeline_result_has_no_ready_content(
+                current_details.get('result_summary')
+            )
+        ):
+            return False
+        return all(
+            str((current_stages.get(stage_id) or {}).get('status') or '')
+            .strip()
+            .lower()
+            == 'completed'
+            for stage_id in blocking_stages
+        )
 
     @staticmethod
     def _normalize_stage_contract(stages: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1548,6 +1656,34 @@ class EODPipelineStatusService:
             and isinstance(official_stage.get('details'), dict)
             else {}
         )
+        latest_decision_ready_at = _parse_iso_timestamp(
+            _coerce_iso_timestamp(details.get('latest_decision_ready_at')) or ''
+        )
+        official_updated_at = _parse_iso_timestamp(
+            _coerce_iso_timestamp(
+                (official_stage or {}).get('updated_at')
+                or (official_stage or {}).get('completed_at')
+            )
+            or ''
+        )
+        fresher_stored_low_risk_rows_are_ready = bool(
+            stage_id == 'low_risk_factors'
+            and latest_decision_ready_at is not None
+            and official_updated_at is not None
+            and latest_decision_ready_at > official_updated_at
+            and _coerce_int(details.get('decision_ready_count')) > 0
+        )
+        if fresher_stored_low_risk_rows_are_ready:
+            return (
+                str(fallback_stage.get('status') or '').strip().lower()
+                == 'completed'
+                and int(
+                    details.get('rows_persisted')
+                    or fallback_stage.get('succeeded')
+                    or 0
+                )
+                > 0
+            )
         if daily_pipeline_result_has_no_ready_content(
             official_details.get('result_summary')
         ):
@@ -2924,6 +3060,21 @@ class EODPipelineStatusService:
             'missing_symbol_details_sample': missing_symbol_details_sample,
             'missing_sample_limit': aggregate.get('missing_sample_limit') or ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
             'feedback_scope_gap': feedback_scope_gap,
+            'decision_ready_count': (
+                _coerce_int(aggregate.get('decision_ready_count'))
+                if stage_id == 'low_risk_factors'
+                else None
+            ),
+            'insufficient_history_count': (
+                _coerce_int(aggregate.get('insufficient_history_count'))
+                if stage_id == 'low_risk_factors'
+                else None
+            ),
+            'latest_decision_ready_at': (
+                _coerce_iso_timestamp(aggregate.get('latest_decision_ready_at'))
+                if stage_id == 'low_risk_factors'
+                else None
+            ),
         }
 
     @staticmethod
