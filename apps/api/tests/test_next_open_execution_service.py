@@ -398,6 +398,7 @@ def test_scheduler_refresh_requests_compact_response() -> None:
         trigger='preopen_scheduler',
         force=False,
         _compact_response=True,
+        _live_market_snapshot_loop=None,
     )
 
 
