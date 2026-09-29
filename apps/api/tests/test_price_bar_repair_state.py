@@ -206,7 +206,7 @@ class PriceBarRepairFactorEvidenceTests(unittest.TestCase):
         expected_membership_hash = market_membership_sha256(expected_symbols)
         self.assertEqual(result['updated_batch_count'], 1)
         session_scope_mock.assert_called_once_with(
-            statement_timeout_ms=60_000,
+            statement_timeout_ms=300_000,
         )
         self.assertEqual(
             result['ranking_membership_sha256'],
@@ -542,7 +542,7 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
         self.assertEqual(result['updated_batch_count'], 1)
         self.assertEqual(
             session_scope_calls,
-            [{'statement_timeout_ms': 60_000}] * 3,
+            [{'statement_timeout_ms': 300_000}] * 3,
         )
         self.assertEqual(
             lock_calls,
@@ -708,7 +708,7 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
         self.assertEqual(result['pending_batch_count'], 1)
         verify_locked.assert_not_called()
 
-    def test_locked_verifier_uses_bounded_repair_timeout(self) -> None:
+    def test_locked_verifier_uses_configured_repair_timeout(self) -> None:
         session = MagicMock()
         session.scalars.return_value.all.return_value = []
         session_scope_calls: list[dict] = []
@@ -718,16 +718,23 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
             session_scope_calls.append(kwargs)
             yield session
 
-        with patch(
-            'app.eod.price_bar_repair_state.session_scope',
-            side_effect=fake_session_scope,
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.session_scope',
+                side_effect=fake_session_scope,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.settings.'
+                'price_bar_repair_db_statement_timeout_ms',
+                420_000,
+            ),
         ):
             result = _verify_pending_price_bar_rebuilds_locked(apply=False)
 
         self.assertEqual(result['status'], 'ready')
         self.assertEqual(
             session_scope_calls,
-            [{'statement_timeout_ms': 60_000}],
+            [{'statement_timeout_ms': 420_000}],
         )
 
     def test_locked_verifier_shares_ready_global_evidence_at_newest_threshold(

@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     agent_feedback_db_lock_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
     signal_decider_db_statement_timeout_ms: int = Field(default=300_000, ge=3_000, le=900_000)
     signal_decider_db_lock_timeout_ms: int = Field(default=30_000, ge=1_000, le=120_000)
+    price_bar_repair_db_statement_timeout_ms: int = Field(
+        default=300_000,
+        ge=60_000,
+        le=900_000,
+    )
     db_pool_watchdog_enabled: bool = False
     db_pool_watchdog_cancel_enabled: bool = False
     db_pool_watchdog_interval_seconds: float = 10.0

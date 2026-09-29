@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy import and_, case, false, func, or_, select
 
+from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
     DailyActionSummary,
@@ -44,7 +45,6 @@ from app.repositories.eod_run_repository import advisory_eod_collection_locks
 
 
 SUPPORTED_MARKETS = ('KOSPI', 'KOSDAQ')
-REPAIR_STATE_STATEMENT_TIMEOUT_MS = 60_000
 REQUIRED_TRENDING_PERIODS = ('1d', '5d', '20d')
 REQUIRED_PRICE_COVERAGE_MODELS = (
     ('price_contexts', DailyPriceContext),
@@ -380,7 +380,9 @@ def record_pending_exact_factor_rebuild(
     ranking_membership_sha256 = market_membership_sha256(normalized_symbols)
 
     with session_scope(
-        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+        statement_timeout_ms=(
+            settings.price_bar_repair_db_statement_timeout_ms
+        ),
     ) as session:
         pending_batches = session.scalars(
             select(DailyPriceBarRepairBatch)
@@ -1624,7 +1626,9 @@ def _rebuild_pending_price_dependent_evaluations_locked(
     )
 
     with session_scope(
-        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+        statement_timeout_ms=(
+            settings.price_bar_repair_db_statement_timeout_ms
+        ),
     ) as session:
         existing_evaluation_versions = {
             str(item)
@@ -1670,7 +1674,9 @@ def _rebuild_pending_price_dependent_evaluations_locked(
             )
         )
         with session_scope(
-            statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+            statement_timeout_ms=(
+                settings.price_bar_repair_db_statement_timeout_ms
+            ),
         ) as session:
             (
                 signal_sha256,
@@ -1886,7 +1892,9 @@ def _rebuild_pending_price_dependent_evaluations_locked(
     }
 
     with session_scope(
-        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+        statement_timeout_ms=(
+            settings.price_bar_repair_db_statement_timeout_ms
+        ),
     ) as session:
         batches = session.scalars(
             select(DailyPriceBarRepairBatch)
@@ -1964,7 +1972,9 @@ def _verify_pending_price_bar_rebuilds_locked(
 ) -> dict[str, Any]:
     completed_at = datetime.now(timezone.utc)
     with session_scope(
-        statement_timeout_ms=REPAIR_STATE_STATEMENT_TIMEOUT_MS,
+        statement_timeout_ms=(
+            settings.price_bar_repair_db_statement_timeout_ms
+        ),
     ) as session:
         statement = (
             select(DailyPriceBarRepairBatch)
