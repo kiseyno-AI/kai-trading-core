@@ -1141,6 +1141,7 @@ class FakeFundamentalsRepository:
         stock_codes,
         fs_div=None,
         captured_before=None,
+        receipt_date_to=None,
     ):
         assert stock_codes == ['005930', '000660']
         assert fs_div == 'CFS'
@@ -1152,6 +1153,7 @@ class FakeFundamentalsRepository:
             30,
             tzinfo=timezone.utc,
         )
+        assert receipt_date_to == date(2026, 4, 8)
         return [
             {
                 'rcept_no': '20250312000123',
@@ -1561,6 +1563,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 stock_codes,
                 fs_div=None,
                 captured_before=None,
+                receipt_date_to=None,
             ):
                 return []
 
@@ -3331,6 +3334,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 stock_codes,
                 fs_div=None,
                 captured_before=None,
+                receipt_date_to=None,
             ):
                 return []
 
@@ -3468,6 +3472,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 stock_codes,
                 fs_div=None,
                 captured_before=None,
+                receipt_date_to=None,
             ):
                 return []
 
@@ -3640,6 +3645,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 stock_codes,
                 fs_div=None,
                 captured_before=None,
+                receipt_date_to=None,
             ):
                 return []
 
@@ -4527,6 +4533,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 stock_codes,
                 fs_div=None,
                 captured_before=None,
+                receipt_date_to=None,
             ):
                 return []
 
@@ -4590,6 +4597,7 @@ class AgentContextReadServiceTests(unittest.TestCase):
                 stock_codes,
                 fs_div=None,
                 captured_before=None,
+                receipt_date_to=None,
             ):
                 return []
 

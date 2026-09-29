@@ -14,7 +14,9 @@ from app.db import session_scope
 from app.db_models import (
     DartDisclosureEvent,
     DartFundamentalsCaptureRun,
+    DartFundamentalsHighlight,
     DartFundamentalsRefreshRun,
+    DartFundamentalsRow,
     DartFundamentalsSnapshot,
 )
 from sqlalchemy import delete, select
@@ -137,7 +139,7 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         self,
         *,
         stock_code: str,
-        receipt_date: date,
+        receipt_date: date | None,
         capture_status: str,
         business_year: int,
         report_code: str = '11011',
@@ -355,6 +357,128 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
 
         self.assertEqual([row['id'] for row in rows], [corrected_ofs_id])
         self.assertEqual(rows[0]['fs_div'], 'OFS')
+
+    def test_summary_loads_detail_only_for_latest_snapshot_per_symbol(self):
+        stock_code = f'T{uuid4().hex[:10]}'
+        _, older_snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2025, 4, 7),
+            capture_status='captured',
+            business_year=2024,
+        )
+        _, latest_snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2025,
+        )
+        _, future_snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2027, 4, 7),
+            capture_status='captured',
+            business_year=2026,
+        )
+        with session_scope() as session:
+            for snapshot_id, amount in (
+                (older_snapshot_id, 100),
+                (latest_snapshot_id, 200),
+                (future_snapshot_id, 300),
+            ):
+                session.add(
+                    DartFundamentalsHighlight(
+                        snapshot_id=snapshot_id,
+                        metric_key='revenue',
+                        metric_type='amount',
+                        current_amount=amount,
+                    )
+                )
+                session.add(
+                    DartFundamentalsRow(
+                        snapshot_id=snapshot_id,
+                        row_key='revenue',
+                        current_amount=amount,
+                        row_order=1,
+                        payload={},
+                    )
+                )
+
+        summary_rows = self.repository.list_stored_fundamentals_summary(
+            stock_codes=[stock_code],
+            fs_div='CFS',
+            receipt_date_to=date(2026, 4, 7),
+        )
+
+        self.assertEqual(
+            [row['id'] for row in summary_rows],
+            [latest_snapshot_id, older_snapshot_id],
+        )
+        self.assertEqual(summary_rows[0]['statement_row_count'], 1)
+        self.assertEqual(
+            summary_rows[0]['highlights'][0]['current_amount'],
+            200,
+        )
+        self.assertEqual(summary_rows[1]['statement_row_count'], 0)
+        self.assertEqual(summary_rows[1]['highlights'], [])
+
+        full_rows = self.repository.list_stored_fundamentals(
+            stock_codes=[stock_code],
+            fs_div='CFS',
+        )
+        full_by_id = {row['id']: row for row in full_rows}
+        self.assertEqual(
+            full_by_id[older_snapshot_id]['highlights'][0]['current_amount'],
+            100,
+        )
+        self.assertEqual(
+            len(full_by_id[older_snapshot_id]['statement_rows']),
+            1,
+        )
+
+    def test_summary_receipt_cutoff_preserves_direct_backfill_without_date(self):
+        stock_code = f'T{uuid4().hex[:10]}'
+        self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2025,
+            rcept_no='20260318000001',
+        )
+        _, backfill_snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=None,
+            capture_status='captured',
+            business_year=2025,
+            rcept_no=f'db-{stock_code}-2025-11011-CFS',
+        )
+        with session_scope() as session:
+            session.add(
+                DartFundamentalsHighlight(
+                    snapshot_id=backfill_snapshot_id,
+                    metric_key='revenue',
+                    metric_type='amount',
+                    current_amount=200,
+                )
+            )
+            session.add(
+                DartFundamentalsRow(
+                    snapshot_id=backfill_snapshot_id,
+                    row_key='revenue',
+                    current_amount=200,
+                    row_order=1,
+                    payload={},
+                )
+            )
+
+        rows = self.repository.list_stored_fundamentals_summary(
+            stock_codes=[stock_code],
+            fs_div='CFS',
+            receipt_date_to=date(2026, 4, 8),
+        )
+
+        self.assertEqual([row['id'] for row in rows], [backfill_snapshot_id])
+        self.assertIsNone(rows[0]['disclosure']['receipt_date'])
+        self.assertEqual(rows[0]['statement_row_count'], 1)
+        self.assertEqual(rows[0]['highlights'][0]['current_amount'], 200)
 
     def test_retry_fingerprint_uses_same_canonical_period_snapshots_as_dispatch(
         self,

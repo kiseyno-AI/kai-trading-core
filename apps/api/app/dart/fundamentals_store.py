@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import case, delete, func, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -798,6 +798,7 @@ class DartFundamentalsRepository:
         return self._list_stored_fundamentals(
             stock_codes=stock_codes,
             fs_div=fs_div,
+            receipt_date_to=None,
             include_statement_rows=True,
         )
 
@@ -807,12 +808,14 @@ class DartFundamentalsRepository:
         stock_codes: list[str],
         fs_div: str | None = None,
         captured_before: datetime | str | None = None,
+        receipt_date_to: date | None = None,
         session: Any | None = None,
     ) -> list[dict[str, Any]]:
         return self._list_stored_fundamentals(
             stock_codes=stock_codes,
             fs_div=fs_div,
             captured_before=captured_before,
+            receipt_date_to=receipt_date_to,
             include_statement_rows=False,
             session=session,
         )
@@ -823,6 +826,7 @@ class DartFundamentalsRepository:
         stock_codes: list[str],
         fs_div: str | None = None,
         captured_before: datetime | str | None = None,
+        receipt_date_to: date | None,
         include_statement_rows: bool,
         session: Any | None = None,
     ) -> list[dict[str, Any]]:
@@ -854,6 +858,13 @@ class DartFundamentalsRepository:
                 stmt = stmt.where(
                     DartFundamentalsSnapshot.captured_at
                     < _normalize_capture_cutoff(captured_before)
+                )
+            if receipt_date_to is not None:
+                stmt = stmt.where(
+                    or_(
+                        DartDisclosureEvent.receipt_date.is_(None),
+                        DartDisclosureEvent.receipt_date <= receipt_date_to,
+                    )
                 )
 
             snapshot_rows = active_session.execute(
@@ -888,14 +899,32 @@ class DartFundamentalsRepository:
             snapshot_rows = selected_snapshot_rows
 
             snapshot_ids = [snapshot.id for snapshot, _event in snapshot_rows]
+            detail_snapshot_ids = snapshot_ids
+            if not include_statement_rows:
+                # Agent-context summaries retain every canonical period for
+                # history metadata, but only the newest period per symbol is
+                # expanded into highlights and statement counts downstream.
+                # Limiting detail reads here avoids random I/O across the full
+                # multi-year DART history during durable-input revalidation.
+                detail_snapshot_ids = []
+                detail_loaded_symbols: set[str | None] = set()
+                for snapshot, _event in snapshot_rows:
+                    if snapshot.stock_code in detail_loaded_symbols:
+                        continue
+                    detail_loaded_symbols.add(snapshot.stock_code)
+                    detail_snapshot_ids.append(snapshot.id)
             highlight_rows = active_session.execute(
                 select(DartFundamentalsHighlight)
-                .where(DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids))
+                .where(
+                    DartFundamentalsHighlight.snapshot_id.in_(
+                        detail_snapshot_ids
+                    )
+                )
                 .order_by(DartFundamentalsHighlight.snapshot_id.asc(), DartFundamentalsHighlight.metric_key.asc())
             ).scalars()
             statement_row_counts = active_session.execute(
                 select(DartFundamentalsRow.snapshot_id, func.count())
-                .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
+                .where(DartFundamentalsRow.snapshot_id.in_(detail_snapshot_ids))
                 .group_by(DartFundamentalsRow.snapshot_id)
             ).all()
 

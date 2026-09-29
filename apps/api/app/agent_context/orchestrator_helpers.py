@@ -266,6 +266,9 @@ def _restore_nested_key(
 def _restore_legacy_replay_metadata(
     projected: dict[str, Any],
     expected_source_context: dict[str, Any] | None,
+    *,
+    restore_company_identifier: bool = True,
+    restore_replay_clocks: bool = True,
 ) -> dict[str, Any]:
     result = deepcopy(projected)
     if not isinstance(expected_source_context, dict):
@@ -273,6 +276,21 @@ def _restore_legacy_replay_metadata(
     persisted_context = expected_source_context.get('symbol_day_context')
     if not isinstance(persisted_context, dict):
         persisted_context = expected_source_context
+
+    if restore_company_identifier:
+        expected_company = persisted_context.get('company')
+        current_company = result.get('company')
+        if (
+            isinstance(expected_company, dict)
+            and isinstance(current_company, dict)
+            and 'standard_code' in expected_company
+        ):
+            current_company['standard_code'] = deepcopy(
+                expected_company['standard_code']
+            )
+
+    if not restore_replay_clocks:
+        return result
 
     expected_provenance = persisted_context.get('context_provenance')
     current_provenance = result.get('context_provenance')
@@ -298,6 +316,82 @@ def _restore_legacy_replay_metadata(
             expected_eligibility,
             'evaluated_at',
         )
+    return result
+
+
+def _restore_post_decision_evaluation_metadata(
+    projected: dict[str, Any],
+    expected_source_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Freeze evaluation-derived eligibility metadata at decision time.
+
+    Signal-decider evaluations are intentionally written after the decision
+    snapshot and may later be upserted.  Their global diagnostic counts and
+    forced-inclusion explanation must therefore replay from the persisted
+    request, while every current eligibility gate and non-evaluation reason
+    remains authoritative.
+    """
+    result = deepcopy(projected)
+    if not isinstance(expected_source_context, dict):
+        return result
+    persisted_context = expected_source_context.get('symbol_day_context')
+    if not isinstance(persisted_context, dict):
+        persisted_context = expected_source_context
+
+    expected_eligibility = persisted_context.get(
+        'agent_feedback_eligibility'
+    )
+    current_eligibility = result.get('agent_feedback_eligibility')
+    if not isinstance(expected_eligibility, dict) or not isinstance(
+        current_eligibility, dict
+    ):
+        return result
+
+    expected_candidate_cap = expected_eligibility.get('candidate_cap')
+    current_candidate_cap = current_eligibility.get('candidate_cap')
+    if isinstance(expected_candidate_cap, dict) and isinstance(
+        current_candidate_cap, dict
+    ):
+        expected_diagnostics = expected_candidate_cap.get(
+            'forced_source_diagnostics'
+        )
+        current_diagnostics = current_candidate_cap.get(
+            'forced_source_diagnostics'
+        )
+        if isinstance(expected_diagnostics, dict) and isinstance(
+            current_diagnostics, dict
+        ):
+            diagnostic_key = 'prior_missed_opportunities'
+            if diagnostic_key in expected_diagnostics:
+                current_diagnostics[diagnostic_key] = deepcopy(
+                    expected_diagnostics[diagnostic_key]
+                )
+            else:
+                current_diagnostics.pop(diagnostic_key, None)
+
+    expected_reasons = expected_eligibility.get(
+        'forced_inclusion_reasons'
+    )
+    current_reasons = current_eligibility.get('forced_inclusion_reasons')
+    if isinstance(expected_reasons, list) and isinstance(current_reasons, list):
+        evaluation_source = 'signal_decider_evaluations'
+        restored_reasons = [
+            deepcopy(reason)
+            for reason in current_reasons
+            if not (
+                isinstance(reason, dict)
+                and reason.get('source') == evaluation_source
+            )
+        ]
+        persisted_evaluation_reasons = [
+            (index, deepcopy(reason))
+            for index, reason in enumerate(expected_reasons)
+            if isinstance(reason, dict)
+            and reason.get('source') == evaluation_source
+        ]
+        for index, reason in persisted_evaluation_reasons:
+            restored_reasons.insert(min(index, len(restored_reasons)), reason)
+        current_eligibility['forced_inclusion_reasons'] = restored_reasons
     return result
 
 
@@ -335,7 +429,7 @@ def _durable_decider_source_context(item: dict[str, Any]) -> dict[str, Any]:
         projected['company'] = {
             key: value
             for key, value in company.items()
-            if key not in {'last_refreshed_at', 'source'}
+            if key not in {'last_refreshed_at', 'source', 'standard_code'}
         }
 
     def stable_external_news(value: Any) -> Any:
@@ -412,33 +506,74 @@ def durable_decider_source_context_fingerprint_matches(
     ``knowledge_cutoff_applied`` invocation marker. The knowledge boundary is
     independently bound by ``source_knowledge_cutoff_fingerprint``, so the
     marker itself is not source data. They also included replay timestamps from
-    signal-feature provenance and evaluation evidence. Reconstructing only those
-    legacy metadata values from the persisted request keeps every material field
-    in the current projection and therefore still rejects real source changes.
+    signal-feature provenance and evaluation evidence, plus the exchange master
+    ``standard_code`` identifier that can be hydrated after EOD. Post-decision
+    evaluation upserts can also change their own forced-inclusion explanation
+    and global diagnostic count. Reconstructing only those persisted metadata
+    values keeps every current eligibility gate and other material field in the
+    projection, so real source changes are still rejected.
     """
     if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
         return False
     if expected_fingerprint == observed_fingerprint:
         return True
 
-    projected = _restore_legacy_replay_metadata(
-        _durable_decider_source_context(refreshed_source_context),
-        expected_source_context,
-    )
-    legacy_projections = [projected]
-    macro_context = projected.get('macro_context')
-    freshness = (
-        macro_context.get('freshness')
-        if isinstance(macro_context, dict)
-        else None
-    )
-    if isinstance(freshness, dict):
-        for marker in (False, None):
-            legacy_projection = deepcopy(projected)
-            legacy_projection['macro_context']['freshness'][
-                'knowledge_cutoff_applied'
-            ] = marker
-            legacy_projections.append(legacy_projection)
+    projected = _durable_decider_source_context(refreshed_source_context)
+    legacy_metadata_variants = [
+        projected,
+        _restore_legacy_replay_metadata(
+            projected,
+            expected_source_context,
+            restore_company_identifier=True,
+            restore_replay_clocks=False,
+        ),
+        _restore_legacy_replay_metadata(
+            projected,
+            expected_source_context,
+            restore_company_identifier=False,
+            restore_replay_clocks=True,
+        ),
+        _restore_legacy_replay_metadata(
+            projected,
+            expected_source_context,
+        ),
+    ]
+    evaluation_metadata_variants: list[dict[str, Any]] = []
+    for metadata_variant in legacy_metadata_variants:
+        restored_evaluation_metadata = (
+            _restore_post_decision_evaluation_metadata(
+                metadata_variant,
+                expected_source_context,
+            )
+        )
+        evaluation_metadata_variants.extend(
+            [
+                restored_evaluation_metadata,
+                _strip_durable_replay_metadata(
+                    restored_evaluation_metadata
+                ),
+            ]
+        )
+    metadata_variants = [
+        *legacy_metadata_variants,
+        *evaluation_metadata_variants,
+    ]
+    legacy_projections = []
+    for metadata_variant in metadata_variants:
+        legacy_projections.append(metadata_variant)
+        macro_context = metadata_variant.get('macro_context')
+        freshness = (
+            macro_context.get('freshness')
+            if isinstance(macro_context, dict)
+            else None
+        )
+        if isinstance(freshness, dict):
+            for marker in (False, None):
+                legacy_projection = deepcopy(metadata_variant)
+                legacy_projection['macro_context']['freshness'][
+                    'knowledge_cutoff_applied'
+                ] = marker
+                legacy_projections.append(legacy_projection)
     legacy_fingerprints = {
         build_decider_source_context_generation(legacy_projection)[
             'fingerprint'
