@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sqlalchemy import create_engine, delete, event, func, select, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import engine, session_scope
@@ -17,6 +18,7 @@ from app.db_models import (
     Symbol,
 )
 from app.repositories.eod_run_repository import (
+    _load_pipeline_recovery_candidates,
     AutoEODRecoveryTarget,
     advisory_eod_collection_lock,
     advisory_eod_collection_locks,
@@ -368,6 +370,36 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
     def _session_scope(self):
         with self.session_factory.begin() as session:
             yield session
+
+    def test_repair_marker_projection_preserves_raw_json_types(self) -> None:
+        session = MagicMock()
+        session.execute.return_value = []
+
+        self.assertEqual(
+            _load_pipeline_recovery_candidates(
+                session,
+                market_dates=[date(2026, 9, 17)],
+            ),
+            [],
+        )
+
+        statement = session.execute.call_args.args[0]
+        compiled = str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={'literal_binds': True},
+            )
+        )
+        self.assertNotIn(
+            "CAST(daily_pipeline_runs.run_metadata ->> "
+            "'summary_cutoff_contract_repair_version' AS INTEGER)",
+            compiled,
+        )
+        self.assertNotIn(
+            "CAST(daily_pipeline_runs.run_metadata ->> "
+            "'summary_cutoff_contract_repair_resume_count' AS INTEGER)",
+            compiled,
+        )
 
     def test_lower_bound_excludes_stale_debt_and_keeps_recent_recovery(
         self,
@@ -1428,6 +1460,343 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
 
         self.assertEqual(exhausted_result, '2026-09-14')
         self.assertEqual(price_result, '2026-09-07')
+
+    def test_exhausted_legacy_cutoff_repair_is_selected_exactly_once(
+        self,
+    ) -> None:
+        market_date = date(2026, 9, 17)
+        started_at = datetime(2026, 9, 18, tzinfo=timezone.utc)
+        stage_ids = (
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        )
+
+        def add_legacy_cutoff_block(
+            session: Session,
+            *,
+            eod_run_id: int,
+            minute: int,
+        ) -> DailyPipelineRun:
+            pipeline_run = DailyPipelineRun(
+                market_date=market_date,
+                trigger='auto_eod_followup_resume',
+                status='blocked',
+                current_stage='signal_decider_evaluations',
+                started_at=started_at + timedelta(minutes=minute),
+                completed_at=started_at + timedelta(minutes=minute + 1),
+                run_metadata={
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'reused_eod_collection_run_id': eod_run_id,
+                    'resume_from_stage': 'signal_decider',
+                    'resolved_stages': list(stage_ids),
+                    'stage_statuses': {
+                        stage_id: 'blocked' for stage_id in stage_ids
+                    },
+                    'symbols': ['005930'],
+                    'feedback_knowledge_cutoff': {
+                        'ready': False,
+                        'reason': 'summary_run_missing',
+                        'source_run_id': None,
+                        'feedback_scope_mode': 'broad_feedback_universe',
+                    },
+                },
+            )
+            session.add(pipeline_run)
+            session.flush()
+            stage_summaries = {
+                'signal_decider': {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'summary_knowledge_cutoff_unavailable',
+                    'knowledge_cutoff_resolution': {
+                        'ready': False,
+                        'reason': 'summary_run_missing',
+                        'source_run_id': None,
+                        'feedback_scope_mode': 'broad_feedback_universe',
+                    },
+                },
+                'next_open_execution_plan': {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'signal_decider_stage_incomplete',
+                    'upstream_status': 'blocked',
+                },
+                'signal_decider_evaluations': {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'declared_dependencies_incomplete',
+                    'incomplete_dependencies': ['signal_decider'],
+                },
+            }
+            session.add_all(
+                [
+                    DailyPipelineStageRun(
+                        pipeline_run_id=pipeline_run.id,
+                        market_date=market_date,
+                        stage_id=stage_id,
+                        status='blocked',
+                        processed=0,
+                        total=0,
+                        succeeded=0,
+                        failed=0,
+                        remaining=0,
+                        source_run_ids={},
+                        details={
+                            'result_summary': stage_summaries[stage_id]
+                        },
+                    )
+                    for stage_id in stage_ids
+                ]
+            )
+            return pipeline_run
+
+        with self.session_factory.begin() as session:
+            eod_run = EODCollectionRun(
+                market='KRX',
+                trade_date=market_date,
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=1,
+                symbols_succeeded=1,
+                symbols_failed=0,
+                started_at=started_at,
+                run_metadata={
+                    'mode': 'daily_auto',
+                    'markets': ['KOSPI'],
+                    'requested_symbols': ['005930'],
+                    'stage_progress': {
+                        'agent_feedback_summaries': {
+                            'status': 'completed',
+                            'source_run_ids': {
+                                'agent_feedback_run_id': (
+                                    'feedback-cycle-summary'
+                                ),
+                            },
+                            'result_summary': {
+                                'status': 'completed',
+                                'run_id': 'feedback-cycle-summary',
+                                'feedback_scope_mode': (
+                                    'decider_scope_fast_path'
+                                ),
+                                'requested_symbols': None,
+                            },
+                        },
+                    },
+                },
+            )
+            session.add(eod_run)
+            session.flush()
+            for attempt in range(4):
+                session.add(
+                    DailyPipelineRun(
+                        market_date=market_date,
+                        trigger='auto_eod_followup_resume',
+                        status='failed',
+                        current_stage='technical_snapshots',
+                        started_at=started_at + timedelta(minutes=attempt),
+                        completed_at=(
+                            started_at + timedelta(minutes=attempt + 1)
+                        ),
+                        run_metadata={
+                            'reused_eod_collection_run_id': eod_run.id,
+                        },
+                    )
+                )
+            add_legacy_cutoff_block(
+                session,
+                eod_run_id=eod_run.id,
+                minute=4,
+            )
+            eod_run_id = int(eod_run.id)
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=market_date.isoformat(),
+                on_or_before=market_date.isoformat(),
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=eod_run_id,
+            ),
+        )
+
+        with self.session_factory.begin() as session:
+            consumed_repair = add_legacy_cutoff_block(
+                session,
+                eod_run_id=eod_run_id,
+                minute=5,
+            )
+            consumed_repair_id = int(consumed_repair.id)
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            consumed = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=market_date.isoformat(),
+                on_or_before=market_date.isoformat(),
+            )
+
+        self.assertIsNone(consumed)
+
+        with self.session_factory.begin() as session:
+            interrupted_repair = session.get(
+                DailyPipelineRun,
+                consumed_repair_id,
+            )
+            interrupted_repair.status = 'interrupted'
+            interrupted_repair.current_stage = 'signal_decider'
+            interrupted_repair.run_metadata = {
+                **interrupted_repair.run_metadata,
+                'summary_cutoff_contract_repair_version': 1,
+                'summary_cutoff_contract_repair_proof': {
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': None,
+                },
+                'stage_statuses': {'signal_decider': 'interrupted'},
+            }
+            stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun).where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == consumed_repair_id
+                    )
+                ).scalars()
+            )
+            for stage_row in stage_rows:
+                if stage_row.stage_id != 'signal_decider':
+                    session.delete(stage_row)
+                    continue
+                stage_row.status = 'interrupted'
+                stage_row.total = 1
+                stage_row.remaining = 1
+                stage_row.source_run_ids = {}
+                stage_row.details = {}
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            interrupted_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+
+        self.assertEqual(
+            interrupted_target,
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=eod_run_id,
+            ),
+        )
+
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, eod_run_id)
+            run_metadata = dict(eod_run.run_metadata)
+            stage_progress = dict(run_metadata['stage_progress'])
+            summary_stage = dict(
+                stage_progress['agent_feedback_summaries']
+            )
+            summary_stage['source_run_ids'] = {
+                'agent_feedback_run_id': 'different-summary-source'
+            }
+            summary_stage['result_summary'] = {
+                **summary_stage['result_summary'],
+                'run_id': 'different-summary-source',
+            }
+            stage_progress['agent_feedback_summaries'] = summary_stage
+            run_metadata['stage_progress'] = stage_progress
+            eod_run.run_metadata = run_metadata
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            changed_proof = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+
+        self.assertIsNone(changed_proof)
+
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, eod_run_id)
+            run_metadata = dict(eod_run.run_metadata)
+            stage_progress = dict(run_metadata['stage_progress'])
+            summary_stage = dict(
+                stage_progress['agent_feedback_summaries']
+            )
+            summary_stage['source_run_ids'] = {
+                'agent_feedback_run_id': 'feedback-cycle-summary'
+            }
+            summary_stage['result_summary'] = {
+                **summary_stage['result_summary'],
+                'run_id': 'feedback-cycle-summary',
+            }
+            stage_progress['agent_feedback_summaries'] = summary_stage
+            run_metadata['stage_progress'] = stage_progress
+            eod_run.run_metadata = run_metadata
+
+        with self.session_factory.begin() as session:
+            interrupted_repair = session.get(
+                DailyPipelineRun,
+                consumed_repair_id,
+            )
+            interrupted_repair.run_metadata = {
+                **interrupted_repair.run_metadata,
+                'summary_cutoff_contract_repair_version': '1',
+                'summary_cutoff_contract_repair_resume_count': '0',
+            }
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            string_marker = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+
+        self.assertIsNone(string_marker)
+
+        with self.session_factory.begin() as session:
+            interrupted_repair = session.get(
+                DailyPipelineRun,
+                consumed_repair_id,
+            )
+            interrupted_repair.run_metadata = {
+                **interrupted_repair.run_metadata,
+                'summary_cutoff_contract_repair_version': 1,
+                'summary_cutoff_contract_repair_resume_count': 1,
+            }
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            already_resumed = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+
+        self.assertIsNone(already_resumed)
 
     def test_exhausted_feedback_lease_loss_continuation_remains_selectable(
         self,

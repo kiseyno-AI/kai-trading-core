@@ -22,7 +22,9 @@ from app.eod.pykrx_backfill import (
     PykrxSymbol,
     _call_pykrx,
     _feedback_suffix_has_stale_prerequisite_ordering,
+    _is_summary_cutoff_contract_repair_candidate,
     _is_terminal_followup_continuation_candidate,
+    _select_summary_cutoff_proof,
     _signal_features_have_stale_prerequisite_ordering,
 )
 from app.eod.pykrx_import import (
@@ -34,6 +36,10 @@ from app.eod.market_membership import (
     validate_market_membership_snapshot,
 )
 from app.eod.pykrx_pipeline_support import build_daily_retry_context
+from app.eod.summary_cutoff_contract import (
+    is_resumable_summary_cutoff_contract_repair,
+    summary_cutoff_proof_from_stage,
+)
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
@@ -43,6 +49,7 @@ from app.eod.pykrx_pipeline_runner import (
     _classify_pykrx_enrichment_categories,
     _enrich_bars_with_market_turnover,
     _execute_factor_stage_with_heartbeat,
+    _extract_followup_source_run_ids,
     _extract_result_counts,
     _merge_inherited_downstream_scope,
     _normalize_stage_status,
@@ -864,6 +871,59 @@ class _FakeDeduplicatingDailyPipelineRunStateService(_FakeDailyPipelineRunStateS
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_latest_pipeline_summary_proof_fails_closed_before_eod_fallback(
+        self,
+    ) -> None:
+        eod_summary = {
+            'status': 'completed',
+            'source_run_ids': {
+                'agent_feedback_run_id': 'older-summary',
+            },
+            'result_summary': {
+                'status': 'completed',
+                'run_id': 'older-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': ['005930'],
+            },
+        }
+        conflicting_latest = {
+            'status': 'completed',
+            'source_run_ids': {
+                'agent_feedback_run_id': 'latest-summary',
+            },
+            'details': {
+                'result_summary': {
+                    'run_id': 'different-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': ['005930'],
+                },
+            },
+        }
+
+        self.assertIsNone(
+            _select_summary_cutoff_proof(
+                pipeline_stages={
+                    'agent_feedback_summaries': conflicting_latest,
+                },
+                eod_stage_progress={
+                    'agent_feedback_summaries': eod_summary,
+                },
+            )
+        )
+        self.assertEqual(
+            _select_summary_cutoff_proof(
+                pipeline_stages={},
+                eod_stage_progress={
+                    'agent_feedback_summaries': eod_summary,
+                },
+            ),
+            {
+                'source_run_id': 'older-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': ['005930'],
+            },
+        )
+
     def test_market_turnover_enrichment_rejects_invalid_turnover_but_preserves_zero_volume_bar(self) -> None:
         frames = {
             '20260402': pd.DataFrame({'거래대금': [0]}, index=['005930']),
@@ -1205,6 +1265,23 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
 
+    def test_extract_followup_source_run_ids_maps_feedback_result_run_id(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _extract_followup_source_run_ids(
+                stage_id='agent_feedback_summaries',
+                result={
+                    'run_id': 'feedback-cycle-summary',
+                    'source_run_ids': {'parent_run_id': 'daily-run'},
+                },
+            ),
+            {
+                'parent_run_id': 'daily-run',
+                'agent_feedback_run_id': 'feedback-cycle-summary',
+            },
+        )
+
     def test_extract_result_counts_includes_every_next_open_plan_outcome(self) -> None:
         counts = _extract_result_counts(
             {
@@ -1267,6 +1344,47 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             fake_run_state_service.finish_runs[-1]['run_metadata']['stage_statuses'],
             {'signal_decider_evaluations': 'partial'},
+        )
+
+    def test_auto_tracker_preserves_feedback_child_run_id_on_final_update(
+        self,
+    ) -> None:
+        state_service = _FakeDailyPipelineRunStateService()
+        tracker = _OfficialDailyPipelineTracker(
+            service=state_service,
+            log_fetch=MagicMock(),
+        )
+        tracker.start(
+            market_date='2026-04-03',
+            trigger='auto_close_scheduler',
+            requested_stages=['agent_feedback_summaries'],
+            resolved_stages=['agent_feedback_summaries'],
+            eod_run_id=7,
+            run_metadata={'mode': 'daily_auto'},
+        )
+
+        tracker.update_stage(
+            stage='agent_feedback_summaries',
+            status='running',
+            current_step='role_started',
+            current_activity='Summarizer started',
+            source_run_ids={
+                'agent_feedback_run_id': 'feedback-cycle-summary'
+            },
+        )
+        tracker.update_stage(
+            stage='agent_feedback_summaries',
+            status='completed',
+            current_step='agent_feedback_summaries_completed',
+            current_activity='Completed agent feedback summaries',
+        )
+
+        self.assertEqual(
+            state_service.stage_updates[-1]['source_run_ids'],
+            {
+                'eod_run_id': 7,
+                'agent_feedback_run_id': 'feedback-cycle-summary',
+            },
         )
 
     def test_auto_tracker_retries_terminal_checkpoint(self) -> None:
@@ -4505,6 +4623,21 @@ class PykrxBackfillServiceTests(TestCase):
                 },
             },
         }
+        latest_eod_run['run_metadata']['stage_progress'][
+            'agent_feedback_summaries'
+        ] = {
+            'status': 'completed',
+            'source_run_ids': {
+                'eod_run_id': 7,
+                'agent_feedback_run_id': 'feedback-cycle-summary',
+            },
+            'result_summary': {
+                'status': 'completed',
+                'run_id': 'feedback-cycle-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': None,
+            },
+        }
 
         with (
             patch(
@@ -4554,6 +4687,14 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             recovery_call['symbols'],
             ['005930', '000660'],
+        )
+        self.assertEqual(
+            recovery_call['summary_cutoff_proof'],
+            {
+                'source_run_id': 'feedback-cycle-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': None,
+            },
         )
 
     def test_recovery_resumes_from_unsafe_skipped_stage(self) -> None:
@@ -6374,6 +6515,634 @@ class PykrxBackfillServiceTests(TestCase):
         resume_followups.assert_not_called()
         run_collection.assert_not_called()
 
+    def test_cutoff_contract_block_gets_one_repair_attempt_after_limit(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'current_stage': 'signal_decider_evaluations',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'reused_eod_collection_run_id': 7,
+                'resume_from_stage': 'signal_decider',
+                'feedback_knowledge_cutoff': {
+                    'ready': False,
+                    'reason': 'summary_run_missing',
+                    'source_run_id': None,
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                },
+                'stage_statuses': {
+                    'signal_decider': 'blocked',
+                    'next_open_execution_plan': 'blocked',
+                    'signal_decider_evaluations': 'blocked',
+                },
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'blocked',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {},
+                    'details': {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': (
+                                'summary_knowledge_cutoff_unavailable'
+                            ),
+                            'knowledge_cutoff_resolution': {
+                                'ready': False,
+                                'reason': 'summary_run_missing',
+                                'source_run_id': None,
+                                'feedback_scope_mode': (
+                                    'broad_feedback_universe'
+                                ),
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {},
+                    'details': {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': 'signal_decider_stage_incomplete',
+                            'upstream_status': 'blocked',
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {},
+                    'details': {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            },
+        }
+        latest_eod_run = {
+            'id': 7,
+            'status': 'completed',
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': ['005930'],
+                'stage_progress': {
+                    'agent_feedback_summaries': {
+                        'status': 'completed',
+                        'source_run_ids': {
+                            'eod_run_id': 7,
+                            'agent_feedback_run_id': (
+                                'feedback-cycle-summary'
+                            ),
+                        },
+                        'result_summary': {
+                            'status': 'completed',
+                            'run_id': 'feedback-cycle-summary',
+                            'feedback_scope_mode': (
+                                'decider_scope_fast_path'
+                            ),
+                            'requested_symbols': None,
+                        },
+                    }
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=5,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                side_effect=AssertionError(
+                    'cutoff repair must reuse the proven summary scope'
+                ),
+            ),
+            patch.object(
+                service,
+                '_resolve_point_in_time_followup_membership',
+                side_effect=AssertionError(
+                    'cutoff repair must not rebuild historical membership'
+                ),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'blocked',
+                    'pipeline_run_id': 97,
+                },
+            ) as resume_followups,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertTrue(
+            result['followup_recovery']['cutoff_contract_repair']
+        )
+        self.assertEqual(result['followup_recovery']['attempt'], 6)
+        self.assertEqual(result['followup_recovery']['max_attempts'], 6)
+        resume_followups.assert_called_once()
+        recovery_call = resume_followups.call_args.kwargs
+        self.assertEqual(recovery_call['resume_from_stage'], 'signal_decider')
+        self.assertTrue(
+            recovery_call['summary_cutoff_contract_repair']
+        )
+        self.assertTrue(recovery_call['point_in_time_recovery'])
+        self.assertEqual(
+            recovery_call['summary_cutoff_proof'],
+            {
+                'source_run_id': 'feedback-cycle-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': None,
+            },
+        )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+            ) as second_resume,
+        ):
+            second = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+            )
+
+        self.assertFalse(second['triggered'])
+        self.assertEqual(second['reason'], 'followup_recovery_limit_reached')
+        self.assertEqual(second['followup_recovery']['max_attempts'], 6)
+        second_resume.assert_not_called()
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=8,
+            ),
+        ):
+            over_counted = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+            )
+
+        self.assertFalse(over_counted['triggered'])
+        self.assertEqual(
+            over_counted['reason'],
+            'followup_recovery_limit_reached',
+        )
+        self.assertEqual(
+            over_counted['followup_recovery']['max_attempts'],
+            6,
+        )
+
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+        }
+        processed_work = deepcopy(latest_pipeline_run)
+        processed_work['stages']['signal_decider']['processed'] = 1
+        self.assertFalse(
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=processed_work,
+                summary_cutoff_proof=proof,
+                price_retry_symbols=set(),
+            )
+        )
+        missing_count = deepcopy(latest_pipeline_run)
+        missing_count['stages']['signal_decider'].pop('processed')
+        self.assertFalse(
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=missing_count,
+                summary_cutoff_proof=proof,
+                price_retry_symbols=set(),
+            )
+        )
+        missing_sources = deepcopy(latest_pipeline_run)
+        missing_sources['stages']['signal_decider'].pop(
+            'source_run_ids'
+        )
+        self.assertFalse(
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=missing_sources,
+                summary_cutoff_proof=proof,
+                price_retry_symbols=set(),
+            )
+        )
+        mismatched_status_evidence = deepcopy(latest_pipeline_run)
+        mismatched_status_evidence['run_metadata']['stage_statuses'][
+            'signal_decider'
+        ] = 'failed'
+        self.assertFalse(
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=mismatched_status_evidence,
+                summary_cutoff_proof=proof,
+                price_retry_symbols=set(),
+            )
+        )
+        incomplete_summary = deepcopy(latest_pipeline_run)
+        incomplete_summary['run_metadata']['feedback_knowledge_cutoff'][
+            'reason'
+        ] = 'summary_run_incomplete'
+        self.assertFalse(
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=incomplete_summary,
+                summary_cutoff_proof=proof,
+                price_retry_symbols=set(),
+            )
+        )
+        self.assertFalse(
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=latest_pipeline_run,
+                summary_cutoff_proof={
+                    **proof,
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                },
+                price_retry_symbols=set(),
+            )
+        )
+        self.assertFalse(
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=latest_pipeline_run,
+                summary_cutoff_proof=proof,
+                price_retry_symbols={'005930'},
+            )
+        )
+
+    def test_resumable_cutoff_contract_repair_rejects_gapped_stage_set(
+        self,
+    ) -> None:
+        stage_ids = [
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        interrupted_repair = {
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'interrupted',
+            'current_stage': 'signal_decider',
+            'run_metadata': {
+                'resolved_stages': stage_ids,
+                'summary_cutoff_contract_repair_version': 1,
+                'summary_cutoff_contract_repair_proof': {
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': None,
+                },
+            },
+            'stages': {
+                stage_id: {
+                    'status': 'pending',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {},
+                    'details': {},
+                }
+                for stage_id in (stage_ids[0], stage_ids[2])
+            },
+        }
+
+        self.assertFalse(
+            is_resumable_summary_cutoff_contract_repair(
+                interrupted_repair
+            )
+        )
+        misaligned_current_stage = deepcopy(interrupted_repair)
+        misaligned_current_stage['stages'] = {
+            stage_ids[0]: interrupted_repair['stages'][stage_ids[0]]
+        }
+        misaligned_current_stage['current_stage'] = stage_ids[2]
+        self.assertFalse(
+            is_resumable_summary_cutoff_contract_repair(
+                misaligned_current_stage
+            )
+        )
+        missing_first_stage = deepcopy(interrupted_repair)
+        missing_first_stage['stages'] = {}
+        missing_first_stage['current_stage'] = stage_ids[0]
+        self.assertFalse(
+            is_resumable_summary_cutoff_contract_repair(
+                missing_first_stage
+            )
+        )
+        unreachable_two_stage_prefix = deepcopy(interrupted_repair)
+        unreachable_two_stage_prefix['stages'] = {
+            stage_id: {
+                'status': 'pending',
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
+                'failed': 0,
+                'remaining': 0,
+                'source_run_ids': {},
+                'details': {},
+            }
+            for stage_id in stage_ids[:2]
+        }
+        unreachable_two_stage_prefix['current_stage'] = stage_ids[1]
+        self.assertFalse(
+            is_resumable_summary_cutoff_contract_repair(
+                unreachable_two_stage_prefix
+            )
+        )
+
+    def test_summary_cutoff_proof_rejects_noncanonical_persisted_scope(
+        self,
+    ) -> None:
+        stage = {
+            'status': 'completed',
+            'source_run_ids': {
+                'agent_feedback_run_id': 'feedback-cycle-summary'
+            },
+            'result_summary': {
+                'status': 'completed',
+                'run_id': 'feedback-cycle-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': ['005930'],
+            },
+        }
+
+        self.assertEqual(
+            summary_cutoff_proof_from_stage(stage),
+            {
+                'source_run_id': 'feedback-cycle-summary',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': ['005930'],
+            },
+        )
+        for malformed_scope in (
+            [],
+            ['005930', '005930'],
+            ['5930'],
+        ):
+            malformed_stage = deepcopy(stage)
+            malformed_stage['result_summary'][
+                'requested_symbols'
+            ] = malformed_scope
+            self.assertIsNone(
+                summary_cutoff_proof_from_stage(malformed_stage)
+            )
+
+        incomplete_summary = deepcopy(stage)
+        incomplete_summary['result_summary']['status'] = 'partial'
+        self.assertIsNone(
+            summary_cutoff_proof_from_stage(incomplete_summary)
+        )
+
+    def test_interrupted_cutoff_contract_repair_resumes_sixth_run_in_place(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+        }
+        stage_ids = [
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        interrupted_repair = {
+            'id': 97,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'interrupted',
+            'current_stage': 'signal_decider',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resolved_stages': stage_ids,
+                'reused_eod_collection_run_id': 7,
+                'resume_from_stage': 'signal_decider',
+                'symbols': None,
+                'markets': ['KOSPI'],
+                'force': False,
+                'fs_div': 'CFS',
+                'symbol_limit': None,
+                'symbol_offset': 0,
+                'capture_limit': 500,
+                'retry_cycles': None,
+                'feedback_max_cycles': 3,
+                'feedback_outer_batch_size': 20,
+                'reuse_existing_feedback': True,
+                'bypass_prerequisite_gate': False,
+                'point_in_time_recovery': True,
+                'summary_cutoff_contract_repair_version': 1,
+                'summary_cutoff_contract_repair_proof': proof,
+            },
+            'stages': {
+                stage_id: {
+                    'status': (
+                        'interrupted'
+                        if stage_id == 'signal_decider'
+                        else 'pending'
+                    ),
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {},
+                    'details': {},
+                }
+                for stage_id in stage_ids[:1]
+            },
+        }
+        interrupted_repair['stages']['signal_decider'].update(
+            {'total': 1, 'remaining': 1}
+        )
+        latest_eod_run = {
+            'id': 7,
+            'status': 'completed',
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': ['005930'],
+                'stage_progress': {
+                    'agent_feedback_summaries': {
+                        'status': 'completed',
+                        'source_run_ids': {
+                            'agent_feedback_run_id': (
+                                'feedback-cycle-summary'
+                            ),
+                        },
+                        'result_summary': {
+                            'status': 'completed',
+                            'run_id': 'feedback-cycle-summary',
+                            'feedback_scope_mode': (
+                                'decider_scope_fast_path'
+                            ),
+                            'requested_symbols': None,
+                        },
+                    },
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=interrupted_repair,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                side_effect=AssertionError(
+                    'in-place repair resume must reuse persisted scope'
+                ),
+            ),
+            patch.object(
+                service,
+                '_resolve_point_in_time_followup_membership',
+                side_effect=AssertionError(
+                    'repair resume must not rebuild historical membership'
+                ),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'completed',
+                    'pipeline_run_id': 97,
+                },
+            ) as resume_followups,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 97,
+                    'status': 'completed',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+                return_value={'updated': True},
+            ),
+        ):
+            interrupted_repair['completed_at'] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            backed_off = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+            self.assertEqual(backed_off['reason'], 'followup_recovery_backoff')
+            self.assertEqual(
+                backed_off['followup_recovery']['max_attempts'],
+                6,
+            )
+            resume_followups.assert_not_called()
+            interrupted_repair['completed_at'] = (
+                '2026-04-03T08:00:00+00:00'
+            )
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(result['followup_recovery']['attempt'], 6)
+        self.assertEqual(result['followup_recovery']['max_attempts'], 6)
+        self.assertTrue(
+            result['followup_recovery'][
+                'cutoff_contract_repair_resumed_in_place'
+            ]
+        )
+        recovery_call = resume_followups.call_args.kwargs
+        self.assertEqual(recovery_call['existing_pipeline_run_id'], 97)
+        self.assertTrue(
+            recovery_call['summary_cutoff_contract_repair']
+        )
+        self.assertTrue(recovery_call['point_in_time_recovery'])
+        self.assertEqual(recovery_call['summary_cutoff_proof'], proof)
+
     def test_terminal_continuation_prefix_uses_shared_outcome_semantics(
         self,
     ) -> None:
@@ -6943,7 +7712,7 @@ class PykrxBackfillServiceTests(TestCase):
                     'next_open_execution_plan',
                     'signal_decider_evaluations',
                 ],
-                'symbols': ['005930'],
+                'symbols': ['005930', '000660'],
                 'markets': ['KOSPI'],
                 'force': False,
                 'fs_div': 'CFS',
@@ -6993,7 +7762,7 @@ class PykrxBackfillServiceTests(TestCase):
                         'knowledge_cutoff_at': (
                             '2026-04-03T06:30:00+00:00'
                         ),
-                        'feedback_scope_mode': 'broad_feedback_universe',
+                        'feedback_scope_mode': 'decider_scope_fast_path',
                         'requested_symbols': ['005930'],
                         'requested_symbol_count': 1,
                     },
@@ -7027,6 +7796,67 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertTrue(
             _is_terminal_followup_continuation_candidate(claimed_run)
+        )
+
+        outside_parent_scope = deepcopy(claimed_run)
+        outside_parent_scope['run_metadata'][
+            'terminal_continuation_evidence'
+        ]['summary_proof']['requested_symbols'] = ['035420']
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(
+                outside_parent_scope
+            )
+        )
+
+        duplicated_summary_scope = deepcopy(claimed_run)
+        duplicated_summary_scope['run_metadata'][
+            'terminal_continuation_evidence'
+        ]['summary_proof'].update(
+            {
+                'requested_symbols': ['005930', '005930'],
+                'requested_symbol_count': 2,
+            }
+        )
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(
+                duplicated_summary_scope
+            )
+        )
+
+        unsupported_summary_scope = deepcopy(claimed_run)
+        unsupported_summary_scope['run_metadata'][
+            'terminal_continuation_evidence'
+        ]['summary_proof']['feedback_scope_mode'] = 'unknown_scope'
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(
+                unsupported_summary_scope
+            )
+        )
+
+        result_lineage_only = deepcopy(claimed_run)
+        archived_summary = result_lineage_only['run_metadata'][
+            'terminal_continuation_evidence'
+        ]['suffix_stages']['agent_feedback_summaries']
+        archived_summary['source_run_ids'] = {'eod_run_id': 7}
+        archived_summary['details'] = {
+            'result_summary': {'run_id': 'feedback-cycle-summary'}
+        }
+        self.assertTrue(
+            _is_terminal_followup_continuation_candidate(
+                result_lineage_only
+            )
+        )
+
+        conflicting_result_lineage = deepcopy(result_lineage_only)
+        conflicting_result_lineage['run_metadata'][
+            'terminal_continuation_evidence'
+        ]['suffix_stages']['agent_feedback_summaries'][
+            'source_run_ids'
+        ] = {'run_id': 'another-feedback-cycle'}
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(
+                conflicting_result_lineage
+            )
         )
 
         duplicate_suffix = deepcopy(claimed_run)

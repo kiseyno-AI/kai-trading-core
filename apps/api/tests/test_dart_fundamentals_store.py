@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
 
+from app.agent_context.reuse_service import AgentContextReuseService
 from app.dart.fundamentals_store import (
     DartFundamentalsRepository,
     eligible_fundamentals_fs_divs,
@@ -354,6 +355,59 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
 
         self.assertEqual([row['id'] for row in rows], [corrected_ofs_id])
         self.assertEqual(rows[0]['fs_div'], 'OFS')
+
+    def test_retry_fingerprint_uses_same_canonical_period_snapshots_as_dispatch(
+        self,
+    ):
+        stock_code = f'T{uuid4().hex[:10]}'.upper()
+        self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2025,
+            report_code='11011',
+            rcept_no='20260407000001',
+        )
+        _, latest_snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 4, 7),
+            capture_status='captured',
+            business_year=2025,
+            report_code='11011',
+            rcept_no='20260407000002',
+        )
+
+        canonical_rows = self.repository.list_stored_fundamentals_summary(
+            stock_codes=[stock_code],
+            fs_div='CFS',
+        )
+        fingerprint_payload = (
+            AgentContextReuseService()
+            .build_fundamental_input_fingerprint_payload(
+                market_date=date(2026, 4, 14),
+                symbol=stock_code,
+                fs_div='CFS',
+                disclosures_limit=0,
+            )
+        )
+        fingerprint_fundamentals = fingerprint_payload['input'][
+            'finalized_dispatch_context'
+        ]['fundamentals']
+
+        self.assertEqual(
+            [row['id'] for row in canonical_rows],
+            [latest_snapshot_id],
+        )
+        self.assertEqual(
+            fingerprint_fundamentals['history_summary']['entries'],
+            len(canonical_rows),
+        )
+        self.assertEqual(
+            fingerprint_fundamentals['latest_snapshot']['filing'][
+                'rcept_no'
+            ],
+            canonical_rows[0]['rcept_no'],
+        )
 
     def test_fail_stale_capture_runs_uses_last_progress_at_when_present(self):
         now = datetime.now(timezone.utc)

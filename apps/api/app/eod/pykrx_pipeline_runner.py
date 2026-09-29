@@ -607,6 +607,27 @@ def _compact_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _extract_followup_source_run_ids(
+    *,
+    stage_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    source_run_ids = (
+        dict(result['source_run_ids'])
+        if isinstance(result.get('source_run_ids'), dict)
+        else {}
+    )
+    if (
+        stage_id in {'agent_feedback_summaries', 'signal_decider'}
+        and result.get('run_id') is not None
+    ):
+        source_run_ids.setdefault(
+            'agent_feedback_run_id',
+            result['run_id'],
+        )
+    return source_run_ids
+
+
 def _resolve_auto_daily_tracked_stages(
     *,
     selected_stages: Sequence[str] | None,
@@ -631,6 +652,7 @@ class _OfficialDailyPipelineTracker:
         self.market_date: str | None = None
         self.eod_run_id: int | None = None
         self.stage_statuses: dict[str, str] = {}
+        self.stage_source_run_ids: dict[str, dict[str, Any]] = {}
         self.enabled = service is not None
 
     def _log_tracking_failure(self, *, stage: str, exc: Exception, **extra: Any) -> None:
@@ -725,9 +747,14 @@ class _OfficialDailyPipelineTracker:
             return
         normalized_status = _normalize_stage_status(status)
         self.stage_statuses[stage] = normalized_status
-        merged_source_run_ids = {'eod_run_id': self.eod_run_id} if self.eod_run_id is not None else {}
+        merged_source_run_ids = dict(
+            self.stage_source_run_ids.get(stage, {})
+        )
+        if self.eod_run_id is not None:
+            merged_source_run_ids['eod_run_id'] = self.eod_run_id
         if source_run_ids:
             merged_source_run_ids.update(source_run_ids)
+        self.stage_source_run_ids[stage] = dict(merged_source_run_ids)
         merged_details = {
             'mode': 'auto_eod_pipeline_tracking',
             'progress_source': 'auto_eod_stage_progress',
@@ -3186,10 +3213,9 @@ def run_market_data_pipeline(
             total=counts['total'],
             succeeded=counts['succeeded'],
             failed=counts['failed'],
-            source_run_ids=(
-                stage_result.get('source_run_ids')
-                if isinstance(stage_result.get('source_run_ids'), dict)
-                else None
+            source_run_ids=_extract_followup_source_run_ids(
+                stage_id=stage_id,
+                result=stage_result,
             ),
             extra={'result_summary': _compact_result_summary(stage_result)},
         )

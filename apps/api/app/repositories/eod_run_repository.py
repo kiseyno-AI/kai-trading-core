@@ -33,6 +33,11 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_marker_is_valid,
     terminal_continuation_resume_is_unconsumed,
 )
+from app.eod.summary_cutoff_contract import (
+    is_resumable_summary_cutoff_contract_repair,
+    is_summary_cutoff_contract_repair_candidate,
+    summary_cutoff_proof_from_stage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -672,6 +677,10 @@ def _load_eod_recovery_metadata(
                 'daily_pipeline_run_id'
             ),
             metadata['markets'].label('markets'),
+            metadata['requested_symbols'].label('requested_symbols'),
+            metadata['stage_progress']['agent_feedback_summaries'].label(
+                'feedback_summary_stage'
+            ),
         ).where(EODCollectionRun.id.in_(tuple(candidate_by_id)))
     )
     for row in rows:
@@ -690,6 +699,8 @@ def _load_eod_recovery_metadata(
                 ),
                 'daily_pipeline_run_id': row.daily_pipeline_run_id,
                 'markets': row.markets,
+                'requested_symbols': row.requested_symbols,
+                'feedback_summary_stage': row.feedback_summary_stage,
             }
         )
 
@@ -836,6 +847,19 @@ def _load_pipeline_recovery_candidates(
             metadata['resume_from_stage']
             .as_string()
             .label('resume_from_stage'),
+            metadata['feedback_knowledge_cutoff'].label(
+                'feedback_knowledge_cutoff'
+            ),
+            metadata['synthetic_recovery_parent']
+            .as_boolean()
+            .label('synthetic_recovery_parent'),
+            metadata['summary_cutoff_contract_repair_version']
+            .label('summary_cutoff_contract_repair_version'),
+            metadata['summary_cutoff_contract_repair_proof'].label(
+                'summary_cutoff_contract_repair_proof'
+            ),
+            metadata['summary_cutoff_contract_repair_resume_count']
+            .label('summary_cutoff_contract_repair_resume_count'),
         )
         .where(DailyPipelineRun.market_date.in_(tuple(market_dates)))
         .order_by(
@@ -901,6 +925,21 @@ def _load_pipeline_recovery_candidates(
                     row.terminal_continuation_feedback_lease_loss_run_id
                 ),
                 'resume_from_stage': row.resume_from_stage,
+                'feedback_knowledge_cutoff': (
+                    row.feedback_knowledge_cutoff
+                ),
+                'synthetic_recovery_parent': (
+                    row.synthetic_recovery_parent
+                ),
+                'summary_cutoff_contract_repair_version': (
+                    row.summary_cutoff_contract_repair_version
+                ),
+                'summary_cutoff_contract_repair_proof': (
+                    row.summary_cutoff_contract_repair_proof
+                ),
+                'summary_cutoff_contract_repair_resume_count': (
+                    row.summary_cutoff_contract_repair_resume_count
+                ),
             },
         )
         for row in rows
@@ -1539,6 +1578,98 @@ def _followup_recovery_is_satisfied_for_convergence(
     )
 
 
+def _followup_recovery_is_legacy_cutoff_contract_repair(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    eod_run: _EODRecoveryCandidate,
+    has_price_recovery_scope: bool,
+) -> bool:
+    summary_proof = summary_cutoff_proof_from_stage(
+        eod_run.run_metadata.get('feedback_summary_stage')
+    )
+    if summary_proof is None:
+        return False
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+        if str(stage_row.stage_id or '').strip()
+    }
+    return is_summary_cutoff_contract_repair_candidate(
+        pipeline_run={
+            'id': pipeline_run.id,
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'run_metadata': pipeline_run.run_metadata,
+            'stages': stages,
+        },
+        summary_cutoff_proof=summary_proof,
+        price_retry_symbols=(
+            ('price_retry_scope',) if has_price_recovery_scope else ()
+        ),
+    )
+
+
+def _followup_recovery_is_resumable_cutoff_contract_repair(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    eod_run: _EODRecoveryCandidate,
+) -> bool:
+    current_summary_proof = summary_cutoff_proof_from_stage(
+        eod_run.run_metadata.get('feedback_summary_stage')
+    )
+    persisted_repair_proof = pipeline_run.run_metadata.get(
+        'summary_cutoff_contract_repair_proof'
+    )
+    if not (
+        current_summary_proof is not None
+        and isinstance(persisted_repair_proof, Mapping)
+        and dict(persisted_repair_proof) == current_summary_proof
+    ):
+        return False
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+        if str(stage_row.stage_id or '').strip()
+    }
+    return is_resumable_summary_cutoff_contract_repair(
+        {
+            'id': pipeline_run.id,
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'run_metadata': pipeline_run.run_metadata,
+            'stages': stages,
+        }
+    )
+
+
 def _normalized_datetime(value: str | datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -1912,6 +2043,23 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                 if (
                     latest_recovery is not None
                     and followup_attempts
+                    == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+                    and _followup_recovery_is_legacy_cutoff_contract_repair(
+                        session,
+                        pipeline_run=latest_recovery,
+                        eod_run=eod_row,
+                        has_price_recovery_scope=(
+                            eod_has_price_recovery_scope
+                        ),
+                    )
+                ):
+                    return AutoEODRecoveryTarget(
+                        trade_date=eod_row.trade_date.isoformat(),
+                        eod_run_id=eod_row.id,
+                    )
+                if (
+                    latest_recovery is not None
+                    and followup_attempts
                     == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD + 1
                     and (
                         _followup_recovery_is_reclaimable_feedback_lease_loss(
@@ -1921,6 +2069,11 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                         or _followup_recovery_is_resumable_terminal_continuation(
                             session,
                             pipeline_run=latest_recovery,
+                        )
+                        or _followup_recovery_is_resumable_cutoff_contract_repair(
+                            session,
+                            pipeline_run=latest_recovery,
+                            eod_run=eod_row,
                         )
                     )
                 ):
@@ -2010,13 +2163,42 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                             linked_pipeline
                         )
                     )
-            if (
-                pipeline_is_incomplete
-                and _count_auto_followup_recovery_attempts(
+            followup_attempts = (
+                _count_auto_followup_recovery_attempts(
                     session,
                     eod_run=eod_row,
                 )
+                if pipeline_is_incomplete
+                else 0
+            )
+            legacy_cutoff_repair = bool(
+                pipeline_is_incomplete
+                and linked_pipeline is not None
+                and followup_attempts
+                == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+                and _followup_recovery_is_legacy_cutoff_contract_repair(
+                    session,
+                    pipeline_run=linked_pipeline,
+                    eod_run=eod_row,
+                    has_price_recovery_scope=eod_has_price_recovery_scope,
+                )
+            )
+            resumable_cutoff_repair = bool(
+                pipeline_is_incomplete
+                and linked_pipeline is not None
+                and followup_attempts
+                == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD + 1
+                and _followup_recovery_is_resumable_cutoff_contract_repair(
+                    session,
+                    pipeline_run=linked_pipeline,
+                    eod_run=eod_row,
+                )
+            )
+            if pipeline_is_incomplete and (
+                followup_attempts
                 < _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+                or legacy_cutoff_repair
+                or resumable_cutoff_repair
             ):
                 return AutoEODRecoveryTarget(
                     trade_date=eod_row.trade_date.isoformat(),

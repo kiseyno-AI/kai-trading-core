@@ -14,6 +14,10 @@ from app.agent_context.derived_contexts import daily_price_context_service
 from app.agent_context.prerequisite_service import (
     FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
 )
+from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import (
@@ -32,6 +36,14 @@ from app.eod.market_membership import (
 from app.eod.pykrx_pipeline_support import (
     build_daily_retry_context,
     build_daily_skip_result,
+)
+from app.eod.summary_cutoff_contract import (
+    is_resumable_summary_cutoff_contract_repair,
+    is_summary_cutoff_contract_repair_candidate as _is_summary_cutoff_contract_repair_candidate,
+    stage_result_summary as _stage_result_summary,
+    summary_cutoff_contract_repair_marker_is_valid,
+    summary_cutoff_proof_from_stage as _summary_cutoff_proof_from_stage,
+    summary_scope_matches_parent,
 )
 from app.eod.pykrx_import import (
     import_pykrx_stock,
@@ -260,14 +272,20 @@ def _dedupe_symbol_codes(symbols: Sequence[object]) -> list[str]:
     return list(deduped.keys())
 
 
-def _stage_result_summary(stage: object) -> Mapping[str, Any]:
-    if not isinstance(stage, Mapping):
-        return {}
-    details = stage.get('details')
-    if not isinstance(details, Mapping):
-        return {}
-    result_summary = details.get('result_summary')
-    return result_summary if isinstance(result_summary, Mapping) else {}
+def _select_summary_cutoff_proof(
+    *,
+    pipeline_stages: Mapping[str, Any],
+    eod_stage_progress: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Prefer the newest summary and never mask its invalid lineage."""
+
+    if 'agent_feedback_summaries' in pipeline_stages:
+        return _summary_cutoff_proof_from_stage(
+            pipeline_stages.get('agent_feedback_summaries')
+        )
+    return _summary_cutoff_proof_from_stage(
+        eod_stage_progress.get('agent_feedback_summaries')
+    )
 
 
 def _is_retryable_missing_upstream_decider_failure(stage: object) -> bool:
@@ -388,6 +406,20 @@ def _is_terminal_followup_continuation_candidate(
         ordered_run_ids = lineage_evidence.get(
             'ordered_pipeline_run_ids'
         )
+        summary_scope_mode = str(
+            summary_proof.get('feedback_scope_mode') or ''
+        ).strip()
+        raw_summary_symbols = summary_proof.get('requested_symbols')
+        summary_symbols = (
+            _dedupe_symbol_codes(raw_summary_symbols)
+            if isinstance(raw_summary_symbols, list)
+            else []
+        )
+        summary_scope_matches_execution = summary_scope_matches_parent(
+            feedback_scope_mode=summary_scope_mode,
+            summary_symbols=raw_summary_symbols,
+            parent_symbols=run_metadata.get('symbols'),
+        )
         if not (
             run_metadata.get('terminal_continuation_version') == 1
             and str(
@@ -432,16 +464,18 @@ def _is_terminal_followup_continuation_candidate(
                 summary_proof.get('knowledge_cutoff_at')
             )
             is not None
-            and str(
-                summary_proof.get('feedback_scope_mode') or ''
-            ).strip()
-            == 'broad_feedback_universe'
+            and summary_scope_mode
+            in {
+                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            }
+            and isinstance(raw_summary_symbols, list)
+            and raw_summary_symbols == summary_symbols
             and evidence_int(
                 summary_proof.get('requested_symbol_count')
             )
-            == len(_dedupe_symbol_codes(run_metadata.get('symbols') or []))
-            and summary_proof.get('requested_symbols')
-            == _dedupe_symbol_codes(run_metadata.get('symbols') or [])
+            == len(summary_symbols)
+            and summary_scope_matches_execution
         ):
             return False
     else:
@@ -658,6 +692,11 @@ def _is_terminal_followup_continuation_candidate(
             for key in ('agent_feedback_run_id', 'run_id')
             if str(summary_source_run_ids.get(key) or '').strip()
         }
+        summary_result_run_id = str(
+            _stage_result_summary(summaries).get('run_id') or ''
+        ).strip()
+        if summary_result_run_id:
+            summary_source_ids.add(summary_result_run_id)
         if summary_source_ids != {
             str(summary_proof.get('source_run_id') or '').strip()
         }:
@@ -2373,6 +2412,18 @@ class PykrxBackfillService:
             else {}
         )
         stage_rows = pipeline_run.get('stages') if isinstance(pipeline_run.get('stages'), dict) else {}
+        latest_eod_stage_progress = (
+            latest_eod_metadata.get('stage_progress')
+            if isinstance(
+                latest_eod_metadata.get('stage_progress'),
+                Mapping,
+            )
+            else {}
+        )
+        summary_cutoff_proof = _select_summary_cutoff_proof(
+            pipeline_stages=stage_rows,
+            eod_stage_progress=latest_eod_stage_progress,
+        )
         resolved_stage_ids = {
             str(stage_id).strip()
             for stage_id in (run_metadata.get('resolved_stages') or stage_rows.keys())
@@ -2626,6 +2677,35 @@ class PykrxBackfillService:
             }
             return result
 
+        cutoff_contract_repair_eligible = (
+            _is_summary_cutoff_contract_repair_candidate(
+                pipeline_run=pipeline_run,
+                summary_cutoff_proof=summary_cutoff_proof,
+                price_retry_symbols=price_retry_symbols,
+            )
+        )
+        cutoff_contract_repair = bool(
+            cutoff_contract_repair_eligible
+            and recovery_attempts
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+            and repair_checkpoint is None
+        )
+        persisted_cutoff_repair_proof = run_metadata.get(
+            'summary_cutoff_contract_repair_proof'
+        )
+        cutoff_contract_repair_resume = bool(
+            recovery_attempts
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
+            and repair_checkpoint is None
+            and is_resumable_summary_cutoff_contract_repair(pipeline_run)
+            and isinstance(persisted_cutoff_repair_proof, Mapping)
+            and dict(persisted_cutoff_repair_proof)
+            == summary_cutoff_proof
+        )
+        cutoff_contract_repair_proven = bool(
+            cutoff_contract_repair_eligible
+            or summary_cutoff_contract_repair_marker_is_valid(run_metadata)
+        )
         terminal_continuation_in_place = bool(
             recovery_attempts
             == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE + 1
@@ -2637,6 +2717,8 @@ class PykrxBackfillService:
             >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
             and repair_checkpoint is None
             and not terminal_continuation_in_place
+            and not cutoff_contract_repair
+            and not cutoff_contract_repair_resume
         ):
             result = build_daily_skip_result(
                 reason='followup_recovery_limit_reached',
@@ -2646,7 +2728,10 @@ class PykrxBackfillService:
             )
             result['followup_recovery'] = {
                 'attempts': recovery_attempts,
-                'max_attempts': MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE,
+                'max_attempts': (
+                    MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                    + (1 if cutoff_contract_repair_proven else 0)
+                ),
                 'resume_from_stage': incomplete_stages[0],
             }
             return result
@@ -2674,7 +2759,10 @@ class PykrxBackfillService:
                 )
                 result['followup_recovery'] = {
                     'attempts': recovery_attempts,
-                    'max_attempts': MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE,
+                    'max_attempts': (
+                        MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                        + (1 if cutoff_contract_repair_proven else 0)
+                    ),
                     'retry_after_seconds': retry_after_seconds,
                     'resume_from_stage': incomplete_stages[0],
                 }
@@ -2682,6 +2770,8 @@ class PykrxBackfillService:
 
         current_price_scope_preflight_required = bool(
             not terminal_continuation_in_place
+            and not cutoff_contract_repair
+            and not cutoff_contract_repair_resume
             and not point_in_time_recovery
             and not price_retry_symbols
             and (
@@ -2735,6 +2825,8 @@ class PykrxBackfillService:
 
         if (
             not terminal_continuation_in_place
+            and not cutoff_contract_repair
+            and not cutoff_contract_repair_resume
             and point_in_time_recovery
             and not point_in_time_membership_symbols
         ):
@@ -2817,6 +2909,18 @@ class PykrxBackfillService:
                 provider_admission_fence_owned
             ),
         }
+        if (
+            summary_cutoff_proof is not None
+            and 'signal_decider' in recovery_stages
+            and 'agent_feedback_summaries' not in recovery_stages
+        ):
+            recovery_kwargs['summary_cutoff_proof'] = summary_cutoff_proof
+        if cutoff_contract_repair or cutoff_contract_repair_resume:
+            recovery_kwargs['summary_cutoff_contract_repair'] = True
+        if cutoff_contract_repair_resume:
+            recovery_kwargs['existing_pipeline_run_id'] = int(
+                pipeline_run['id']
+            )
         if terminal_continuation_in_place:
             recovery_kwargs['existing_pipeline_run_id'] = int(
                 pipeline_run['id']
@@ -2841,6 +2945,11 @@ class PykrxBackfillService:
             recovery_symbols = _dedupe_symbol_codes(
                 run_metadata.get('symbols') or []
             )
+        elif cutoff_contract_repair or cutoff_contract_repair_resume:
+            # The decider stage resolves and locks the exact completed
+            # summary scope. Rebuilding a historical market membership here
+            # can neither strengthen that proof nor safely broaden it.
+            recovery_symbols = []
         elif point_in_time_recovery and downstream_retry_symbols:
             recovery_symbols = downstream_retry_symbols
         elif recovering_safe_downstream_scope:
@@ -2921,6 +3030,7 @@ class PykrxBackfillService:
             'attempt': (
                 recovery_attempts
                 if terminal_continuation_in_place
+                or cutoff_contract_repair_resume
                 else recovery_attempts + 1
             ),
             'max_attempts': (
@@ -2931,7 +3041,13 @@ class PykrxBackfillService:
                 )
                 if terminal_continuation_in_place
                 else MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
-                + (1 if repair_checkpoint is not None else 0)
+                + (
+                    1
+                    if repair_checkpoint is not None
+                    or cutoff_contract_repair
+                    or cutoff_contract_repair_resume
+                    else 0
+                )
             ),
             'resumed_from_pipeline_run_id': pipeline_run.get('id'),
             'reused_eod_collection_run_id': latest_eod_run.get('id'),
@@ -2951,6 +3067,14 @@ class PykrxBackfillService:
         if terminal_continuation_in_place:
             recovery_result['followup_recovery'][
                 'terminal_continuation_in_place'
+            ] = True
+        if cutoff_contract_repair:
+            recovery_result['followup_recovery'][
+                'cutoff_contract_repair'
+            ] = True
+        if cutoff_contract_repair_resume:
+            recovery_result['followup_recovery'][
+                'cutoff_contract_repair_resumed_in_place'
             ] = True
         if repair_checkpoint is not None:
             recovery_result['followup_recovery'][

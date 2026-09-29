@@ -387,7 +387,7 @@ python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market
 
 Use `RUNBOOK.md` for the full command catalog, stage dependencies, overnight runners, and recovery procedures.
 
-The automatic close pipeline records price collection and every downstream stage separately. Once price collection is terminal, a failed fundamentals, factor, news, feedback, decider, plan, or evaluation stage is resumed from the first incomplete follow-up without downloading prices again. Follow-up recovery waits at least five minutes between attempts and stops after five attempts for the trade date; the skip reason and recovery metadata remain visible in the run result.
+The automatic close pipeline records price collection and every downstream stage separately. Once price collection is terminal, a failed fundamentals, factor, news, feedback, decider, plan, or evaluation stage is resumed from the first incomplete follow-up without downloading prices again. A decider-only recovery reuses the exact completed summary run, its persisted feedback scope, knowledge cutoff, financial-statement division, and the symbol intersection actually completed by every summarizer instead of searching a different scope. Follow-up recovery waits at least five minutes between attempts and normally stops after five attempts for the exact EOD lineage; a legacy zero-work block caused only by the retired summary-scope lookup contract receives one bounded repair attempt. If that sixth repair is interrupted before durable work, it reclaims the same pipeline row and locked summary source rather than consuming another attempt or rebuilding historical membership. The skip reason and recovery metadata remain visible in the run result.
 
 The default daily stage order is:
 

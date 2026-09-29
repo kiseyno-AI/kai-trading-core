@@ -11,6 +11,7 @@ from app.agent_context.lease_loss_evidence import (
 )
 from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
 from app.core.settings import settings
 from app.db import session_scope
@@ -30,6 +31,13 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_lease_loss_resume_lineage_is_valid,
     terminal_continuation_marker_is_valid,
     terminal_continuation_resume_is_unconsumed,
+)
+from app.eod.summary_cutoff_contract import (
+    LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    is_resumable_summary_cutoff_contract_repair,
+    normalize_symbol_codes,
+    summary_cutoff_proof_from_stage,
+    summary_scope_matches_parent,
 )
 from app.repositories.eod_run_repository import (
     daily_price_bar_has_current_eod_run_provenance,
@@ -205,11 +213,93 @@ def _terminal_continuation_execution_context_error(
     return None
 
 
+def _summary_cutoff_contract_repair_execution_context_error(
+    metadata: Mapping[str, Any],
+    *,
+    reused_eod_collection_run_id: int,
+) -> str | None:
+    """Return the first unsafe persisted repair input before reclaiming it."""
+
+    if (
+        str(metadata.get('entrypoint') or '').strip()
+        != 'daily_pipeline_stage_service.run'
+    ):
+        return 'entrypoint'
+    persisted_eod_run_id = metadata.get('reused_eod_collection_run_id')
+    if not (
+        type(persisted_eod_run_id) is int
+        and persisted_eod_run_id == reused_eod_collection_run_id
+    ):
+        return 'reused_eod_collection_run_id'
+    if str(metadata.get('resume_from_stage') or '').strip() != (
+        LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+    ):
+        return 'resume_from_stage'
+
+    raw_symbols = metadata.get('symbols')
+    if raw_symbols is not None and (
+        not isinstance(raw_symbols, list)
+        or not raw_symbols
+        or list(raw_symbols) != normalize_symbol_codes(raw_symbols)
+    ):
+        return 'symbols'
+
+    raw_markets = metadata.get('markets')
+    if not isinstance(raw_markets, list) or not raw_markets:
+        return 'markets'
+    normalized_markets = [
+        str(market or '').strip().upper() for market in raw_markets
+    ]
+    if (
+        any(not market for market in normalized_markets)
+        or normalized_markets != list(raw_markets)
+        or len(normalized_markets) != len(set(normalized_markets))
+    ):
+        return 'markets'
+
+    for field in (
+        'force',
+        'bypass_prerequisite_gate',
+        'reuse_existing_feedback',
+        'point_in_time_recovery',
+    ):
+        if not isinstance(metadata.get(field), bool):
+            return field
+
+    if metadata.get('fs_div') not in {
+        'CFS',
+        'OFS',
+    }:
+        return 'fs_div'
+
+    integer_constraints = {
+        'symbol_limit': (1, True),
+        'symbol_offset': (0, False),
+        'capture_limit': (1, False),
+        'retry_cycles': (1, True),
+        'feedback_max_cycles': (1, False),
+        'feedback_outer_batch_size': (1, False),
+    }
+    for field, (minimum, optional) in integer_constraints.items():
+        if field not in metadata:
+            return field
+        raw_value = metadata[field]
+        if raw_value is None:
+            if optional:
+                continue
+            return field
+        if type(raw_value) is not int or raw_value < minimum:
+            return field
+    return None
+
+
 def _resolve_terminal_summary_knowledge_cutoff(
     *,
     market_date: date,
     source_run_id: str,
-    requested_symbols: Sequence[str],
+    feedback_scope_mode: str,
+    requested_symbols: Sequence[str] | None,
+    fs_div: str,
     source_run_session: Any,
 ) -> dict[str, Any]:
     """Lock and resolve summary proof before spending the one-shot claim."""
@@ -217,15 +307,10 @@ def _resolve_terminal_summary_knowledge_cutoff(
     from app.agent_context.retry_service import (
         resolve_latest_completed_summary_knowledge_cutoff,
     )
-    from app.agent_context.run_modes import (
-        FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
-    )
-
     return resolve_latest_completed_summary_knowledge_cutoff(
         market_date=market_date,
-        feedback_scope_mode=(
-            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
-        ),
+        feedback_scope_mode=feedback_scope_mode,
+        fs_div=fs_div,
         source_run_id=source_run_id,
         requested_symbols=requested_symbols,
         source_run_session=source_run_session,
@@ -964,6 +1049,353 @@ class DailyPipelineRunStateService:
             ).scalars()
             return sum(1 for _ in run_ids)
 
+    def claim_summary_cutoff_contract_repair_resume(
+        self,
+        *,
+        pipeline_run_id: int,
+        market_date: str | date,
+        reused_eod_collection_run_id: int,
+    ) -> dict[str, Any]:
+        """Reclaim the marked sixth repair only while it has zero work."""
+
+        normalized_pipeline_run_id = int(pipeline_run_id)
+        normalized_eod_run_id = int(reused_eod_collection_run_id)
+        normalized_market_date = _normalize_market_date(market_date)
+
+        def reject(reason: str, **extra: Any) -> dict[str, Any]:
+            return {
+                'claimed': False,
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'reason': reason,
+                **extra,
+            }
+
+        if normalized_pipeline_run_id <= 0 or normalized_eod_run_id <= 0:
+            return reject('cutoff_contract_repair_identity_invalid')
+
+        now = _utcnow()
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
+        ) as session:
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                {
+                    'source_key': 20_001,
+                    'trade_key': int(
+                        normalized_market_date.strftime('%Y%m%d')
+                    ),
+                },
+            )
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == normalized_pipeline_run_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if run_row is None:
+                return reject('pipeline_run_not_found')
+            if (
+                run_row.market_date != normalized_market_date
+                or str(run_row.trigger or '').strip()
+                != 'auto_eod_followup_resume'
+            ):
+                return reject('cutoff_contract_repair_context_mismatch')
+
+            metadata = (
+                dict(run_row.run_metadata)
+                if isinstance(run_row.run_metadata, Mapping)
+                else {}
+            )
+            try:
+                persisted_eod_run_id = int(
+                    metadata.get('reused_eod_collection_run_id') or 0
+                )
+            except (TypeError, ValueError):
+                persisted_eod_run_id = 0
+            if persisted_eod_run_id != normalized_eod_run_id:
+                return reject('eod_lineage_mismatch')
+
+            eod_run = session.get(
+                EODCollectionRun,
+                normalized_eod_run_id,
+                with_for_update=True,
+            )
+            if not (
+                eod_run is not None
+                and str(eod_run.market or '').strip().upper() == 'KRX'
+                and str(eod_run.source or '').strip().lower() == 'pykrx'
+                and eod_run.trade_date == normalized_market_date
+            ):
+                return reject('eod_lineage_context_mismatch')
+
+            execution_context_error = (
+                _summary_cutoff_contract_repair_execution_context_error(
+                    metadata,
+                    reused_eod_collection_run_id=normalized_eod_run_id,
+                )
+            )
+            if execution_context_error is not None:
+                return reject(
+                    'cutoff_contract_repair_execution_context_invalid',
+                    field=execution_context_error,
+                )
+
+            eod_metadata = (
+                eod_run.run_metadata
+                if isinstance(eod_run.run_metadata, Mapping)
+                else {}
+            )
+            eod_stage_progress = (
+                eod_metadata.get('stage_progress')
+                if isinstance(eod_metadata.get('stage_progress'), Mapping)
+                else {}
+            )
+            current_summary_proof = summary_cutoff_proof_from_stage(
+                eod_stage_progress.get('agent_feedback_summaries')
+            )
+            persisted_repair_proof = metadata.get(
+                'summary_cutoff_contract_repair_proof'
+            )
+            if not (
+                current_summary_proof is not None
+                and isinstance(persisted_repair_proof, Mapping)
+                and dict(persisted_repair_proof)
+                == current_summary_proof
+            ):
+                return reject('eod_summary_cutoff_proof_mismatch')
+
+            lineage_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.trigger
+                        == 'auto_eod_followup_resume',
+                        DailyPipelineRun.run_metadata[
+                            'reused_eod_collection_run_id'
+                        ].as_integer()
+                        == normalized_eod_run_id,
+                    )
+                    .order_by(
+                        DailyPipelineRun.started_at.asc(),
+                        DailyPipelineRun.id.asc(),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            lineage_run_ids = [int(row.id) for row in lineage_rows]
+            if not (
+                len(lineage_run_ids)
+                == TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT
+                and lineage_run_ids[-1:] == [normalized_pipeline_run_id]
+            ):
+                return reject(
+                    'cutoff_contract_repair_lineage_mismatch',
+                    observed_run_count=len(lineage_run_ids),
+                )
+
+            active_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.status.in_(
+                            ACTIVE_DAILY_PIPELINE_STATUSES
+                        ),
+                        DailyPipelineRun.id != normalized_pipeline_run_id,
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            if active_rows:
+                return reject('overlapping_run_already_active')
+
+            status = str(run_row.status or '').strip().lower()
+            if status == 'running':
+                last_activity_at = _as_utc_datetime(
+                    run_row.updated_at or run_row.started_at
+                )
+                stale_after = timedelta(
+                    minutes=max(
+                        1,
+                        int(
+                            settings.eod_auto_pykrx_stale_run_minutes or 30
+                        ),
+                    )
+                )
+                if (
+                    last_activity_at is None
+                    or now - last_activity_at < stale_after
+                ):
+                    return reject(
+                        'cutoff_contract_repair_still_active',
+                        status=status,
+                    )
+
+            stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == normalized_pipeline_run_id
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            serialized_stages = {
+                str(stage.stage_id or '').strip(): self._serialize_stage(
+                    stage
+                )
+                for stage in stage_rows
+                if str(stage.stage_id or '').strip()
+            }
+            if not is_resumable_summary_cutoff_contract_repair(
+                {
+                    'id': run_row.id,
+                    'trigger': run_row.trigger,
+                    'status': run_row.status,
+                    'current_stage': run_row.current_stage,
+                    'run_metadata': metadata,
+                    'stages': serialized_stages,
+                }
+            ):
+                return reject(
+                    'cutoff_contract_repair_progress_invalid',
+                    status=status,
+                )
+
+            repair_proof = dict(
+                metadata['summary_cutoff_contract_repair_proof']
+            )
+            repair_source_run_id = str(
+                repair_proof.get('source_run_id') or ''
+            ).strip()
+            repair_scope_mode = str(
+                repair_proof.get('feedback_scope_mode') or ''
+            ).strip()
+            cutoff_resolution = _resolve_terminal_summary_knowledge_cutoff(
+                market_date=normalized_market_date,
+                source_run_id=repair_source_run_id,
+                feedback_scope_mode=repair_scope_mode,
+                requested_symbols=repair_proof.get('requested_symbols'),
+                fs_div=str(metadata.get('fs_div') or ''),
+                source_run_session=session,
+            )
+            compact_cutoff_resolution = {
+                'ready': cutoff_resolution.get('ready') is True,
+                'reason': cutoff_resolution.get('reason'),
+                'knowledge_cutoff_at': cutoff_resolution.get(
+                    'knowledge_cutoff_at'
+                ),
+                'source_run_id': cutoff_resolution.get('source_run_id'),
+                'feedback_scope_mode': cutoff_resolution.get(
+                    'feedback_scope_mode'
+                ),
+                'requested_symbols': cutoff_resolution.get(
+                    'requested_symbols'
+                ),
+            }
+            if not compact_cutoff_resolution['ready']:
+                return reject(
+                    'summary_knowledge_cutoff_unavailable',
+                    status=status,
+                    knowledge_cutoff_resolution={
+                        key: value
+                        for key, value in compact_cutoff_resolution.items()
+                        if key != 'knowledge_cutoff_at'
+                    },
+                )
+            resolved_proof_symbols = compact_cutoff_resolution[
+                'requested_symbols'
+            ]
+            resolved_cutoff_at = compact_cutoff_resolution[
+                'knowledge_cutoff_at'
+            ]
+            if not (
+                compact_cutoff_resolution['source_run_id']
+                == repair_source_run_id
+                and isinstance(resolved_cutoff_at, datetime)
+                and resolved_cutoff_at.tzinfo is not None
+                and resolved_cutoff_at.utcoffset() is not None
+                and compact_cutoff_resolution['feedback_scope_mode']
+                == repair_scope_mode
+                and isinstance(resolved_proof_symbols, list)
+                and resolved_proof_symbols
+                and resolved_proof_symbols
+                == normalize_symbol_codes(resolved_proof_symbols)
+            ):
+                return reject(
+                    'summary_knowledge_cutoff_proof_mismatch',
+                    status=status,
+                )
+            parent_symbols = metadata.get('symbols')
+            if parent_symbols is not None and not summary_scope_matches_parent(
+                feedback_scope_mode=repair_scope_mode,
+                summary_symbols=resolved_proof_symbols,
+                parent_symbols=parent_symbols,
+            ):
+                return reject(
+                    'summary_symbol_scope_mismatch',
+                    status=status,
+                )
+            metadata.update(
+                {
+                    'summary_cutoff_contract_repair_resume_count': 1,
+                    'summary_cutoff_contract_repair_resumed_at': (
+                        now.isoformat()
+                    ),
+                    'summary_cutoff_contract_repair_resumed_from_status': (
+                        status
+                    ),
+                    'stage_statuses': {
+                        stage_id: 'pending'
+                        for stage_id in LEGACY_CUTOFF_REPAIR_STAGE_IDS
+                    },
+                    'resumable': True,
+                }
+            )
+            for stage_row in stage_rows:
+                stage_row.status = 'pending'
+                stage_row.processed = 0
+                stage_row.total = 0
+                stage_row.succeeded = 0
+                stage_row.failed = 0
+                stage_row.remaining = 0
+                stage_row.current_step = 'cutoff_contract_repair_pending'
+                stage_row.current_activity = (
+                    'Pending exact summary cutoff contract repair'
+                )
+                stage_row.current_symbol = None
+                stage_row.current_period = None
+                stage_row.started_at = now
+                stage_row.completed_at = None
+                stage_row.error_message = None
+                stage_row.source_run_ids = {}
+                stage_row.details = {}
+                stage_row.updated_at = now
+
+            run_row.status = 'running'
+            run_row.current_stage = LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+            run_row.completed_at = None
+            run_row.error_message = None
+            run_row.updated_at = now
+            run_row.run_metadata = metadata
+            session.flush()
+            return {
+                'claimed': True,
+                'resumed': True,
+                'reason': 'cutoff_contract_repair_reclaimed',
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'summary_cutoff_proof': repair_proof,
+                'pipeline_run': self._serialize_run(
+                    run_row,
+                    stage_rows,
+                ),
+                'knowledge_cutoff_resolution': compact_cutoff_resolution,
+            }
+
     def claim_terminal_continuation(
         self,
         *,
@@ -1348,9 +1780,49 @@ class DailyPipelineRunStateService:
                 for key in ('agent_feedback_run_id', 'run_id')
                 if str(summary_source_run_ids.get(key) or '').strip()
             }
+            summary_details = (
+                summary_stage.details
+                if isinstance(summary_stage.details, Mapping)
+                else {}
+            )
+            summary_result = (
+                summary_details.get('result_summary')
+                if isinstance(
+                    summary_details.get('result_summary'),
+                    Mapping,
+                )
+                else {}
+            )
+            summary_result_run_id = str(
+                summary_result.get('run_id') or ''
+            ).strip()
+            if summary_result_run_id:
+                summary_source_ids.add(summary_result_run_id)
             if len(summary_source_ids) != 1:
                 return reject(
                     'summary_source_run_id_unavailable',
+                    status=current_status,
+                )
+            summary_feedback_scope_mode = str(
+                summary_result.get('feedback_scope_mode') or ''
+            ).strip()
+            if summary_feedback_scope_mode not in {
+                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            }:
+                return reject(
+                    'summary_feedback_scope_mode_unavailable',
+                    status=current_status,
+                )
+            summary_requested_symbols = summary_result.get(
+                'requested_symbols'
+            )
+            if summary_requested_symbols is not None and not isinstance(
+                summary_requested_symbols,
+                (list, tuple),
+            ):
+                return reject(
+                    'summary_symbol_scope_invalid',
                     status=current_status,
                 )
 
@@ -1499,7 +1971,9 @@ class DailyPipelineRunStateService:
                 _resolve_terminal_summary_knowledge_cutoff(
                     market_date=normalized_market_date,
                     source_run_id=summary_source_run_id,
-                    requested_symbols=raw_symbols,
+                    feedback_scope_mode=summary_feedback_scope_mode,
+                    requested_symbols=summary_requested_symbols,
+                    fs_div=str(metadata.get('fs_div') or ''),
                     source_run_session=session,
                 )
             )
@@ -1512,6 +1986,9 @@ class DailyPipelineRunStateService:
                 'source_run_id': cutoff_resolution.get('source_run_id'),
                 'feedback_scope_mode': cutoff_resolution.get(
                     'feedback_scope_mode'
+                ),
+                'requested_symbols': cutoff_resolution.get(
+                    'requested_symbols'
                 ),
             }
             if not compact_cutoff_resolution['ready']:
@@ -1530,9 +2007,26 @@ class DailyPipelineRunStateService:
                 compact_cutoff_resolution['source_run_id']
                 != summary_source_run_id
                 or compact_cutoff_resolution['knowledge_cutoff_at'] is None
+                or compact_cutoff_resolution['feedback_scope_mode']
+                != summary_feedback_scope_mode
+                or not isinstance(
+                    compact_cutoff_resolution['requested_symbols'],
+                    list,
+                )
             ):
                 return reject(
                     'summary_knowledge_cutoff_proof_mismatch',
+                    status=current_status,
+                )
+            if not summary_scope_matches_parent(
+                feedback_scope_mode=summary_feedback_scope_mode,
+                summary_symbols=compact_cutoff_resolution[
+                    'requested_symbols'
+                ],
+                parent_symbols=raw_symbols,
+            ):
+                return reject(
+                    'summary_symbol_scope_mismatch',
                     status=current_status,
                 )
             summary_proof = {
@@ -1540,8 +2034,12 @@ class DailyPipelineRunStateService:
                 'knowledge_cutoff_at': _iso(
                     compact_cutoff_resolution['knowledge_cutoff_at']
                 ),
-                'requested_symbols': list(raw_symbols),
-                'requested_symbol_count': len(raw_symbols),
+                'requested_symbols': list(
+                    compact_cutoff_resolution['requested_symbols']
+                ),
+                'requested_symbol_count': len(
+                    compact_cutoff_resolution['requested_symbols']
+                ),
             }
 
             suffix_stage_evidence = {
@@ -2107,6 +2605,25 @@ class DailyPipelineRunStateService:
             for key in ('agent_feedback_run_id', 'run_id')
             if str(archived_summary_sources.get(key) or '').strip()
         }
+        archived_summary_result = (
+            archived_summary.get('details', {}).get('result_summary')
+            if isinstance(archived_summary, Mapping)
+            and isinstance(archived_summary.get('details'), Mapping)
+            and isinstance(
+                archived_summary.get('details', {}).get(
+                    'result_summary'
+                ),
+                Mapping,
+            )
+            else {}
+        )
+        archived_summary_result_run_id = str(
+            archived_summary_result.get('run_id') or ''
+        ).strip()
+        if archived_summary_result_run_id:
+            archived_summary_source_ids.add(
+                archived_summary_result_run_id
+            )
         archived_decider_result = (
             archived_decider.get('details', {}).get('result_summary')
             if isinstance(archived_decider, Mapping)
@@ -2243,6 +2760,15 @@ class DailyPipelineRunStateService:
         summary_source_run_id = str(
             summary_proof.get('source_run_id') or ''
         ).strip()
+        summary_feedback_scope_mode = str(
+            summary_proof.get('feedback_scope_mode') or ''
+        ).strip()
+        summary_requested_symbols = summary_proof.get(
+            'requested_symbols'
+        )
+        summary_requested_symbol_count = summary_proof.get(
+            'requested_symbol_count'
+        )
         persisted_cutoff = _parse_utc_datetime(
             summary_proof.get('knowledge_cutoff_at')
         )
@@ -2250,13 +2776,25 @@ class DailyPipelineRunStateService:
             summary_source_run_id
             and persisted_cutoff is not None
             and archived_summary_source_ids == {summary_source_run_id}
+            and summary_feedback_scope_mode
+            in {
+                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            }
+            and isinstance(summary_requested_symbols, list)
+            and isinstance(summary_requested_symbol_count, int)
+            and not isinstance(summary_requested_symbol_count, bool)
+            and summary_requested_symbol_count
+            == len(summary_requested_symbols)
         ):
             return reject('summary_knowledge_cutoff_proof_mismatch')
 
         cutoff_resolution = _resolve_terminal_summary_knowledge_cutoff(
             market_date=normalized_market_date,
             source_run_id=summary_source_run_id,
-            requested_symbols=raw_symbols,
+            feedback_scope_mode=summary_feedback_scope_mode,
+            requested_symbols=summary_requested_symbols,
+            fs_div=str(metadata.get('fs_div') or ''),
             source_run_session=session,
         )
         resolved_cutoff = _parse_utc_datetime(
@@ -2270,6 +2808,9 @@ class DailyPipelineRunStateService:
             'feedback_scope_mode': cutoff_resolution.get(
                 'feedback_scope_mode'
             ),
+            'requested_symbols': cutoff_resolution.get(
+                'requested_symbols'
+            ),
         }
         if not (
             compact_cutoff_resolution['ready']
@@ -2277,16 +2818,9 @@ class DailyPipelineRunStateService:
             == summary_source_run_id
             and resolved_cutoff == persisted_cutoff
             and compact_cutoff_resolution['feedback_scope_mode']
-            == summary_proof.get('feedback_scope_mode')
-            and isinstance(
-                summary_proof.get('requested_symbol_count'), int
-            )
-            and not isinstance(
-                summary_proof.get('requested_symbol_count'), bool
-            )
-            and summary_proof.get('requested_symbol_count')
-            == len(raw_symbols)
-            and summary_proof.get('requested_symbols') == raw_symbols
+            == summary_feedback_scope_mode
+            and compact_cutoff_resolution['requested_symbols']
+            == summary_requested_symbols
         ):
             return reject('summary_knowledge_cutoff_proof_mismatch')
 
