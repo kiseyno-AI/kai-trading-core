@@ -1740,6 +1740,7 @@ class AgentContextReuseService:
                 stock_codes=[symbol],
                 fs_div=fs_div,
                 captured_before=knowledge_cutoff_at,
+                receipt_date_to=market_date,
                 session=session,
             )
         )

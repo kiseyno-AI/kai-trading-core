@@ -6870,6 +6870,7 @@ class AgentContextReadService:
                 stock_codes=normalized_symbols,
                 fs_div=normalized_fs_div,
                 captured_before=external_news_knowledge_cutoff_at,
+                receipt_date_to=normalized_market_date,
             )
         except SQLAlchemyError:
             dart_storage_unavailable = True

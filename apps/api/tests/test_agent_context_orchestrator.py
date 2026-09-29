@@ -472,6 +472,292 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
             build_durable_decider_input_generation(source_context=replayed),
         )
 
+    def test_identifier_hydration_does_not_revoke_durable_generation(self):
+        original = self._source_context()
+        original['company']['standard_code'] = None
+        replayed = deepcopy(original)
+        replayed['company']['standard_code'] = 'KR7005930003'
+
+        expected = build_durable_decider_input_generation(
+            source_context=original
+        )
+        self.assertEqual(
+            expected,
+            build_durable_decider_input_generation(source_context=replayed),
+        )
+
+        changed_facts = deepcopy(replayed)
+        changed_facts['company']['is_active'] = False
+        self.assertNotEqual(
+            expected,
+            build_durable_decider_input_generation(
+                source_context=changed_facts
+            ),
+        )
+
+    def test_legacy_identifier_hydration_matches_only_same_company_facts(self):
+        legacy_source = {
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+            'company': {
+                'name': 'Samsung Electronics',
+                'market': 'KOSPI',
+                'standard_code': None,
+            },
+        }
+        refreshed = deepcopy(legacy_source)
+        refreshed['company']['standard_code'] = 'KR7005930003'
+        legacy_fingerprint = build_decider_source_context_generation(
+            legacy_source
+        )['fingerprint']
+        observed_fingerprint = build_durable_decider_input_generation(
+            source_context=refreshed
+        )['source_context_fingerprint']
+
+        self.assertTrue(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=legacy_fingerprint,
+                observed_fingerprint=observed_fingerprint,
+                refreshed_source_context=refreshed,
+                expected_source_context={
+                    'symbol_day_context': legacy_source,
+                },
+            )
+        )
+
+        changed_facts = deepcopy(refreshed)
+        changed_facts['company']['market'] = 'KOSDAQ'
+        self.assertFalse(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=legacy_fingerprint,
+                observed_fingerprint=(
+                    build_durable_decider_input_generation(
+                        source_context=changed_facts
+                    )['source_context_fingerprint']
+                ),
+                refreshed_source_context=changed_facts,
+                expected_source_context={
+                    'symbol_day_context': legacy_source,
+                },
+            )
+        )
+
+    def test_legacy_metadata_schema_variants_match_independently(self):
+        persisted = {
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+            'company': {
+                'name': 'Samsung Electronics',
+                'market': 'KOSPI',
+                'is_active': True,
+                'standard_code': None,
+            },
+            'context_provenance': {
+                'signal_features': {
+                    'freshness_status': 'stale',
+                    'latest_available_market_date': '2026-04-22',
+                    'latest_available_timestamp': '2026-04-23T02:20:59+09:00',
+                }
+            },
+            'agent_feedback_eligibility': {
+                'eligible': True,
+                'candidate_rank': 2,
+                'forced_inclusion_reasons': [
+                    {
+                        'details': {
+                            'evaluated_at': '2026-04-23T02:27:59+09:00',
+                            'outcome_label': 'missed_upside',
+                        }
+                    }
+                ],
+            },
+        }
+        refreshed = deepcopy(persisted)
+        refreshed['company']['standard_code'] = 'KR7005930003'
+        refreshed['context_provenance']['signal_features'][
+            'latest_available_timestamp'
+        ] = '2026-04-23T11:58:07+09:00'
+        refreshed['agent_feedback_eligibility'][
+            'forced_inclusion_reasons'
+        ][0]['details']['evaluated_at'] = '2026-04-23T12:03:41+09:00'
+
+        identifier_only = deepcopy(persisted)
+        identifier_only['context_provenance']['signal_features'].pop(
+            'latest_available_timestamp'
+        )
+        identifier_only['agent_feedback_eligibility'][
+            'forced_inclusion_reasons'
+        ][0]['details'].pop('evaluated_at')
+        replay_clocks_only = deepcopy(persisted)
+        replay_clocks_only['company'].pop('standard_code')
+        legacy_variants = [
+            identifier_only,
+            replay_clocks_only,
+            persisted,
+        ]
+        expected_fingerprints = [
+            build_decider_source_context_generation(variant)['fingerprint']
+            for variant in legacy_variants
+        ]
+        observed_fingerprint = build_durable_decider_input_generation(
+            source_context=refreshed
+        )['source_context_fingerprint']
+
+        for expected_fingerprint in expected_fingerprints:
+            with self.subTest(expected_fingerprint=expected_fingerprint):
+                self.assertTrue(
+                    durable_decider_source_context_fingerprint_matches(
+                        expected_fingerprint=expected_fingerprint,
+                        observed_fingerprint=observed_fingerprint,
+                        refreshed_source_context=refreshed,
+                        expected_source_context={
+                            'symbol_day_context': persisted,
+                        },
+                    )
+                )
+
+        changed_facts = deepcopy(refreshed)
+        changed_facts['company']['market'] = 'KOSDAQ'
+        changed_observed_fingerprint = (
+            build_durable_decider_input_generation(
+                source_context=changed_facts
+            )['source_context_fingerprint']
+        )
+        for expected_fingerprint in expected_fingerprints:
+            with self.subTest(
+                changed_expected_fingerprint=expected_fingerprint
+            ):
+                self.assertFalse(
+                    durable_decider_source_context_fingerprint_matches(
+                        expected_fingerprint=expected_fingerprint,
+                        observed_fingerprint=changed_observed_fingerprint,
+                        refreshed_source_context=changed_facts,
+                        expected_source_context={
+                            'symbol_day_context': persisted,
+                        },
+                    )
+                )
+
+    def test_post_decision_evaluation_churn_preserves_only_original_metadata(
+        self,
+    ):
+        persisted = {
+            'symbol': '005930',
+            'market_date': '2026-04-23',
+            'agent_feedback_eligibility': {
+                'eligible': True,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'status': 'soft_penalized_forced_included',
+                'filter_signals': {
+                    'market_risk_filter': {'risk_state': 'normal'},
+                },
+                'candidate_cap': {
+                    'forced_source_diagnostics': {
+                        'prior_missed_opportunities': {
+                            'status': 'loaded',
+                            'matched_symbols': 11,
+                        }
+                    }
+                },
+                'forced_inclusion_reasons': [
+                    {
+                        'code': 'prior_positive_decider_action',
+                        'source': 'agent_context_feedback',
+                        'details': {'action': 'watch_for_trigger'},
+                    },
+                    {
+                        'code': 'prior_missed_opportunity_after_wait_or_reject',
+                        'source': 'signal_decider_evaluations',
+                        'details': {
+                            'source_market_date': '2026-04-20',
+                            'grade_score': 0.7,
+                            'evaluated_at': '2026-04-23T05:00:00+00:00',
+                        },
+                    },
+                ],
+            },
+        }
+        refreshed = deepcopy(persisted)
+        refreshed['agent_feedback_eligibility']['candidate_cap'][
+            'forced_source_diagnostics'
+        ]['prior_missed_opportunities']['matched_symbols'] = 12
+        refreshed['agent_feedback_eligibility']['forced_inclusion_reasons'][
+            1
+        ]['details'] = {
+            'source_market_date': '2026-04-21',
+            'grade_score': 0.9,
+            'evaluated_at': '2026-04-24T05:00:00+00:00',
+        }
+        expected_fingerprint = build_durable_decider_input_generation(
+            source_context=persisted
+        )['source_context_fingerprint']
+
+        def matches(source_context):
+            return durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=expected_fingerprint,
+                observed_fingerprint=(
+                    build_durable_decider_input_generation(
+                        source_context=source_context
+                    )['source_context_fingerprint']
+                ),
+                refreshed_source_context=source_context,
+                expected_source_context={
+                    'symbol_day_context': persisted,
+                },
+            )
+
+        self.assertTrue(matches(refreshed))
+
+        persisted_before_evaluation = deepcopy(persisted)
+        persisted_before_evaluation['agent_feedback_eligibility'][
+            'forced_inclusion_reasons'
+        ].pop()
+        refreshed_after_evaluation = deepcopy(persisted_before_evaluation)
+        refreshed_after_evaluation['agent_feedback_eligibility'][
+            'candidate_cap'
+        ]['forced_source_diagnostics']['prior_missed_opportunities'][
+            'matched_symbols'
+        ] = 12
+        refreshed_after_evaluation['agent_feedback_eligibility'][
+            'forced_inclusion_reasons'
+        ].append(
+            deepcopy(
+                refreshed['agent_feedback_eligibility'][
+                    'forced_inclusion_reasons'
+                ][1]
+            )
+        )
+        self.assertTrue(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=(
+                    build_durable_decider_input_generation(
+                        source_context=persisted_before_evaluation
+                    )['source_context_fingerprint']
+                ),
+                observed_fingerprint=(
+                    build_durable_decider_input_generation(
+                        source_context=refreshed_after_evaluation
+                    )['source_context_fingerprint']
+                ),
+                refreshed_source_context=refreshed_after_evaluation,
+                expected_source_context={
+                    'symbol_day_context': persisted_before_evaluation,
+                },
+            )
+        )
+
+        changed_gate = deepcopy(refreshed)
+        changed_gate['agent_feedback_eligibility']['eligible'] = False
+        changed_gate['agent_feedback_eligibility']['hard_blocked'] = True
+        self.assertFalse(matches(changed_gate))
+
+        changed_non_evaluation_reason = deepcopy(refreshed)
+        changed_non_evaluation_reason['agent_feedback_eligibility'][
+            'forced_inclusion_reasons'
+        ][0]['details']['action'] = 'buy'
+        self.assertFalse(matches(changed_non_evaluation_reason))
+
     def test_legacy_replay_timestamp_fingerprint_matches_only_same_facts(self):
         legacy_source = {
             'symbol': '005930',
