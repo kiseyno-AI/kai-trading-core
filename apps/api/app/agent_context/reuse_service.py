@@ -325,6 +325,31 @@ def _normalized_evidence_datetime(value: Any) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _latest_evidence_rows_by_key(
+    rows: Sequence[Any],
+) -> dict[tuple[str, str], Any]:
+    latest_by_key: dict[tuple[str, str], Any] = {}
+    for row in rows:
+        key = (str(row.symbol), str(row.agent_name))
+        current = latest_by_key.get(key)
+        row_order = (
+            _normalized_evidence_datetime(getattr(row, 'received_at', None)),
+            int(getattr(row, 'id', 0) or 0),
+        )
+        if current is None:
+            latest_by_key[key] = row
+            continue
+        current_order = (
+            _normalized_evidence_datetime(
+                getattr(current, 'received_at', None)
+            ),
+            int(getattr(current, 'id', 0) or 0),
+        )
+        if row_order > current_order:
+            latest_by_key[key] = row
+    return latest_by_key
+
+
 def _normalize_knowledge_cutoff_at(value: datetime | str) -> datetime:
     parsed = value
     if isinstance(value, str):
@@ -1055,9 +1080,14 @@ class AgentContextReuseService:
                     AgentContextFeedback.symbol.in_(chunk),
                     AgentContextFeedback.agent_name.in_(agent_names),
                 )
+                .order_by(
+                    AgentContextFeedback.received_at.asc(),
+                    AgentContextFeedback.id.asc(),
+                )
             ).all()
-            for row in feedback_rows:
-                same_day_feedback_map[(row.symbol, row.agent_name)] = row
+            same_day_feedback_map.update(
+                _latest_evidence_rows_by_key(feedback_rows)
+            )
 
             failure_rows = session.execute(
                 select(
@@ -1077,9 +1107,14 @@ class AgentContextReuseService:
                     AgentContextFeedbackFailure.symbol.in_(chunk),
                     AgentContextFeedbackFailure.agent_name.in_(agent_names),
                 )
+                .order_by(
+                    AgentContextFeedbackFailure.received_at.asc(),
+                    AgentContextFeedbackFailure.id.asc(),
+                )
             ).all()
-            for row in failure_rows:
-                same_day_failure_map[(row.symbol, row.agent_name)] = row
+            same_day_failure_map.update(
+                _latest_evidence_rows_by_key(failure_rows)
+            )
 
         def load_prior_rows(
             *,

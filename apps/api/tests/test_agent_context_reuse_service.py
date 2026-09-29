@@ -1,6 +1,6 @@
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -89,6 +89,14 @@ class _RowsResult:
 
     def scalars(self):
         return _EmptyScalars()
+
+
+class _SequencedRowsSession:
+    def __init__(self, *row_batches):
+        self._results = iter(_RowsResult(rows) for rows in row_batches)
+
+    def execute(self, _statement):
+        return next(self._results)
 
 
 class _CutoffReuseSession:
@@ -261,6 +269,63 @@ def _fundamental_cutoff_reuse_session_scope():
 
 
 class FundamentalReuseServiceTests(unittest.TestCase):
+    def test_static_feedback_state_selects_latest_same_day_rows_independent_of_result_order(
+        self,
+    ):
+        service = AgentContextReuseService()
+        market_date = date(2026, 4, 16)
+        key = ('005930', 'technical-summarizer')
+        earlier_at = datetime(2026, 4, 16, 6, 0, tzinfo=timezone.utc)
+        latest_at = datetime(2026, 4, 16, 6, 5, tzinfo=timezone.utc)
+
+        def evidence_row(row_id, received_at):
+            return SimpleNamespace(
+                id=row_id,
+                market_date=market_date,
+                symbol=key[0],
+                agent_name=key[1],
+                received_at=received_at,
+            )
+
+        feedback_rows = (
+            evidence_row(101, earlier_at),
+            evidence_row(102, latest_at),
+            evidence_row(103, latest_at),
+        )
+        failure_rows = (
+            evidence_row(201, earlier_at),
+            evidence_row(202, latest_at),
+            evidence_row(203, latest_at),
+        )
+
+        for feedback_order, failure_order in (
+            (feedback_rows, tuple(reversed(failure_rows))),
+            (tuple(reversed(feedback_rows)), failure_rows),
+        ):
+            with self.subTest(
+                feedback_ids=[row.id for row in feedback_order],
+                failure_ids=[row.id for row in failure_order],
+            ):
+                static_inputs = FeedbackReuseStaticInputs(
+                    prior_feedback_by_key={key: None},
+                    prior_failure_by_key={key: None},
+                )
+                latest_feedback, latest_failure = (
+                    service._load_latest_feedback_state(
+                        session=_SequencedRowsSession(
+                            feedback_order,
+                            failure_order,
+                        ),
+                        market_date=market_date,
+                        symbols=[key[0]],
+                        roles=[key[1]],
+                        static_inputs=static_inputs,
+                    )
+                )
+
+                self.assertEqual(latest_feedback[key].id, 103)
+                self.assertEqual(latest_failure[key].id, 203)
+
     def test_context_fingerprint_hashes_visible_context_not_filter_literals(self):
         def build_context(
             *,
