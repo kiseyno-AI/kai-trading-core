@@ -544,6 +544,13 @@ async def compute_daily_market_risk_filters(
     source: str = MARKET_RISK_FILTER_SOURCE,
     market_code: str = 'J',
 ) -> dict:
+    """Compute KIS-backed risk filters for today or the prior PREOPEN session.
+
+    A prior date is normally a point-in-time safe skip. The only exception is
+    the immediately previous KRX trading session while today's market is still
+    PREOPEN; that bounded recovery may call KIS and persist snapshots and filter
+    rows. Older dates and every prior-date request after the open remain no-ops.
+    """
     try:
         market_state = await async_get_market_state()
         previous_trading_date = await _resolve_preopen_previous_trading_date(
@@ -576,6 +583,13 @@ async def collect_daily_market_risk_snapshots(
     source: str = MARKET_RISK_SNAPSHOT_SOURCE,
     market_code: str = 'J',
 ) -> dict:
+    """Collect KIS risk snapshots for today or the prior PREOPEN session.
+
+    A prior date is normally a point-in-time safe skip. The only exception is
+    the immediately previous KRX trading session while today's market is still
+    PREOPEN; that bounded recovery may call KIS and persist snapshot rows.
+    Older dates and every prior-date request after the open remain no-ops.
+    """
     try:
         market_state = await async_get_market_state()
         previous_trading_date = await _resolve_preopen_previous_trading_date(
