@@ -4710,7 +4710,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('data_quality_warnings_present', block_codes)
         self.assertIn('decision_input_quality_liquidity_turnover_hard_block', block_codes)
 
-    def test_refresh_plan_items_hard_blocks_same_market_date_structured_close_mismatch(self) -> None:
+    def test_refresh_plan_items_keeps_watch_candidate_for_same_market_date_structured_close_mismatch(
+        self,
+    ) -> None:
         snapshot_id = self._seed_short_term_snapshot(symbol='005930')
         self._attach_modern_quality_envelope(snapshot_id=snapshot_id)
         with session_scope() as session:
@@ -4756,8 +4758,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = result['items'][0]
         block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
-        self.assertIn('structured_close_price_mismatch', block_codes)
+        warning_codes = {reason['code'] for reason in item['validation']['warnings']}
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertNotIn('structured_close_price_mismatch', block_codes)
+        self.assertIn('structured_close_price_mismatch', warning_codes)
 
     def test_refresh_plan_items_ignores_structured_close_from_different_market_date(self) -> None:
         snapshot_id = self._seed_short_term_snapshot(symbol='005930')

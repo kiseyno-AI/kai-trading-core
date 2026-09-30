@@ -6933,18 +6933,25 @@ class SignalDeciderNextOpenExecutionService:
                 f"{item['source']}={item['close_price']}"
                 for item in close_price_mismatch['conflicts']
             )
-            blocking_reasons.append(
-                _reason(
-                    'structured_close_price_mismatch',
-                    (
-                        'Same-market-date structured close prices disagree: '
-                        f"{close_price_mismatch['canonical_source']}="
-                        f"{close_price_mismatch['canonical_close_price']}; "
-                        f'{conflict_summary} '
-                        f"({close_price_mismatch['market_date']})."
-                    ),
-                )
+            close_price_mismatch_reason = _reason(
+                'structured_close_price_mismatch',
+                (
+                    'Same-market-date structured close prices disagree: '
+                    f"{close_price_mismatch['canonical_source']}="
+                    f"{close_price_mismatch['canonical_close_price']}; "
+                    f'{conflict_summary} '
+                    f"({close_price_mismatch['market_date']})."
+                ),
             )
+            # A trigger-gated short-term watch is priced from the live quote at
+            # execution time.  Conflicting historical close fields are useful
+            # diagnostics, but must not prevent Exec from monitoring the
+            # declared trigger/chase range.  Unconditional next-open buys keep
+            # the fail-closed behavior.
+            if handoff_intent == 'intraday_watch_buy':
+                warnings.append(close_price_mismatch_reason)
+            else:
+                blocking_reasons.append(close_price_mismatch_reason)
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
             snapshot.specialist_disagreement_payload
         ):
