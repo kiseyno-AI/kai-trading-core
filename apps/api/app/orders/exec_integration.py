@@ -1797,6 +1797,7 @@ def _delta_dispatch_batch_key(rows: Sequence[SignalDeciderExecutionPlanItem]) ->
                     str(row.decision_snapshot_id),
                     str(row.symbol),
                     str(validation.get('preopen_policy_fingerprint') or ''),
+                    str(validation.get('dispatch_generation_nonce') or ''),
                     str(revocation.get('replacement_decision_snapshot_id') or ''),
                 )
             )

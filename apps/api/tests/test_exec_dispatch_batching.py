@@ -186,6 +186,11 @@ def test_delta_dispatch_batch_key_is_stable_and_changes_with_feedback_snapshot()
         'preopen_policy_fingerprint': 'next_open_preopen_policy_v1:changed',
     }
     assert _delta_dispatch_batch_key([policy_revision, second]) != key
+    redispatch_generation = _row(1, 101, '005930')
+    redispatch_generation.validation_payload = {
+        'dispatch_generation_nonce': 'incident-recovery-2',
+    }
+    assert _delta_dispatch_batch_key([redispatch_generation, second]) != key
 
 
 def test_delta_dispatch_plan_id_keeps_suffix_within_exec_contract_limit() -> None:
