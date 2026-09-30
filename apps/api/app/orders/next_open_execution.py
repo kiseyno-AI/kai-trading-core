@@ -2707,11 +2707,16 @@ class SignalDeciderNextOpenExecutionService:
                 snapshot_context, snapshot_load_error = (
                     _load_live_market_snapshot_context()
                 )
+            # This inspection invokes durable source revalidation below.  Do
+            # not hold row locks across that nested validation: the validator
+            # uses an independent session and may need the same plan rows,
+            # which otherwise self-deadlocks until the statement timeout.  The
+            # activation ACK path re-locks and rechecks every revision before
+            # it persists authority.
             rows = session.execute(
                 select(SignalDeciderExecutionPlanItem)
                 .where(SignalDeciderExecutionPlanItem.id.in_(row_ids))
                 .order_by(SignalDeciderExecutionPlanItem.id.asc())
-                .with_for_update(read=True)
             ).scalars().all()
             current_scope_state = self._load_latest_decider_scope_state(
                 source_market_date=source_market_date,
