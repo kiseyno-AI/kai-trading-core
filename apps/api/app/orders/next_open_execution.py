@@ -3009,7 +3009,12 @@ class SignalDeciderNextOpenExecutionService:
                         reason_code = 'current_live_market_risk_off'
                         replacement_action = 'reject'
                         replacement_actionable = False
-                    elif reason_code is None and authority_action == 'block_new_buy':
+                    elif (
+                        reason_code is None
+                        and authority_action == 'block_new_buy'
+                        and row_validation.get('handoff_intent')
+                        != 'intraday_watch_buy'
+                    ):
                         reason_code = 'current_live_market_evidence_unavailable'
                         replacement_action = 'reject'
                         replacement_actionable = False
