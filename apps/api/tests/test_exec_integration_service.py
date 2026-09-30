@@ -51,6 +51,8 @@ from app.orders.exec_integration import (
     _delegated_gate_codes,
     _delegated_gate_observed_at,
     _delegated_gates,
+    _delta_dispatch_batch_key,
+    _delta_dispatch_plan_id,
     _fingerprint_exec_plan,
     _json_safe,
     _row_readback_revision_binding,
@@ -7833,6 +7835,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'alignment_signal_decider_decision_snapshot_id': 991,
             }
 
+        signal_rows = [
+            row
+            for row in self.service._load_next_open_rows(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+            )
+            if row.decision_agent_name == 'signal-decider'
+        ]
         result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
             refresh_plan=False,
@@ -7849,7 +7859,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(by_agent), {'signal-decider', 'short-term-decider'})
         signal_payload = by_agent['signal-decider']
         short_payload = by_agent['short-term-decider']
-        self.assertEqual(signal_payload['plan_id'], f'core-signal_decider-20260430-{self.account_reference.replace(":", "_").replace("-", "_")}')
+        base_plan_id = f'core-signal_decider-20260430-{self.account_reference.replace(":", "_").replace("-", "_")}'
+        self.assertEqual(
+            signal_payload['plan_id'],
+            _delta_dispatch_plan_id(
+                base_plan_id,
+                _delta_dispatch_batch_key(signal_rows),
+            ),
+        )
         self.assertEqual(short_payload['metadata']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_payload['strategy_run_id'], f'short-term-decider:2026-04-30:{self.account_reference.replace(":", "_").replace("-", "_")}')
         signal_entry = signal_payload['items'][0]
