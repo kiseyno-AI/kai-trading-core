@@ -8568,15 +8568,15 @@ class SignalDeciderExecIntegrationService:
             f'core-{_sanitize_key(decision_agent_name)}-{first_row.target_trade_date.strftime("%Y%m%d")}-'
             f'{_sanitize_key(first_row.account_reference)}'
         )
-        effective_batch_key = delta_batch_key
-        if effective_batch_key is None and any(
-            isinstance(row.submission_payload, dict)
-            and bool(row.submission_payload.get('revision_history'))
-            for row in rows
-        ):
-            effective_batch_key = _delta_dispatch_batch_key(rows)
-        if effective_batch_key:
-            plan_id = _delta_dispatch_plan_id(plan_id, effective_batch_key)
+        # Exec treats plan_id as an idempotency key.  The candidate set can
+        # legitimately change during the same trading day (for example after
+        # fresh market evidence arrives), so the account/day base id alone is
+        # not a stable identity for the submitted material.  Always bind the
+        # id to the exact row generation.  Replays of the same generation keep
+        # the same id, while a changed candidate set cannot collide with an
+        # earlier rejected or quarantined Exec plan.
+        effective_batch_key = delta_batch_key or _delta_dispatch_batch_key(rows)
+        plan_id = _delta_dispatch_plan_id(plan_id, effective_batch_key)
         runtime_mode = _normalize_optional_text(settings.signal_decider_exec_runtime_mode, lowercase=True) or 'mock'
         dispatch_source = EXECUTION_HANDOFF_SOURCE
         if runtime_mode == 'live':
