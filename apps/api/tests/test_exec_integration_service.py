@@ -4986,6 +4986,112 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'execution_activation_fence_busy',
         )
 
+    async def test_pre_activation_new_generation_does_not_revoke_replacement(
+        self,
+    ) -> None:
+        original_inspect = (
+            signal_decider_next_open_execution_service
+            .inspect_dispatch_authority_generation
+        )
+        inspect_call_count = 0
+
+        def inspect_with_new_generation(**kwargs):
+            nonlocal inspect_call_count
+            inspect_call_count += 1
+            if inspect_call_count == 3:
+                return {
+                    'status': 'valid',
+                    'generation_fingerprint': 'f' * 64,
+                    'reason_code': 'latest_snapshot_replaced',
+                    'replacement_action': 'watch_for_trigger',
+                    'replacement_actionable': True,
+                }
+            return original_inspect(**kwargs)
+
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            'inspect_dispatch_authority_generation',
+            side_effect=inspect_with_new_generation,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_pre_activation_new_generation',
+            )
+
+        self.assertEqual(self.client.activation_calls, [])
+        self.assertEqual(self.client.revocation_calls, [])
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'accepted')
+        self.assertEqual(group['activation_status'], 'superseded_generation')
+        self.assertEqual(
+            group['activation_error']['code'],
+            'execution_activation_generation_superseded',
+        )
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertNotIn(
+                row.execution_status,
+                {'revocation_pending', 'revocation_manual_review', 'revoked'},
+            )
+
+    async def test_post_activation_new_generation_does_not_poison_replacement(
+        self,
+    ) -> None:
+        original_inspect = (
+            signal_decider_next_open_execution_service
+            .inspect_dispatch_authority_generation
+        )
+        inspect_call_count = 0
+
+        def inspect_with_new_generation_after_activation(**kwargs):
+            nonlocal inspect_call_count
+            inspect_call_count += 1
+            if inspect_call_count == 4:
+                return {
+                    'status': 'valid',
+                    'generation_fingerprint': 'e' * 64,
+                    'reason_code': 'latest_snapshot_replaced',
+                    'replacement_action': 'watch_for_trigger',
+                    'replacement_actionable': True,
+                }
+            return original_inspect(**kwargs)
+
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            'inspect_dispatch_authority_generation',
+            side_effect=inspect_with_new_generation_after_activation,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_post_activation_new_generation',
+            )
+
+        self.assertEqual(len(self.client.activation_calls), 1)
+        self.assertEqual(self.client.revocation_calls, [])
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'accepted')
+        self.assertEqual(group['activation_status'], 'superseded_generation')
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertNotIn(
+                row.execution_status,
+                {'revocation_pending', 'revocation_manual_review', 'revoked'},
+            )
+
     async def test_transient_dispatch_ack_persistence_contention_converges(
         self,
     ) -> None:
@@ -5273,7 +5379,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'activated',
             )
 
-    async def test_durable_activation_fence_busy_after_remote_ack_revokes(
+    async def test_durable_activation_fence_busy_keeps_replacement_eligible(
         self,
     ) -> None:
         with patch.object(
@@ -5298,18 +5404,20 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             persist_ack.call_count,
             CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS,
         )
-        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(self.client.revocation_calls, [])
         self.assertEqual(
-            result['dispatch']['groups'][0]['dispatch_status'],
-            'revocation_pending',
+            result['dispatch']['groups'][0]['activation_status'],
+            'superseded_generation',
         )
         with session_scope() as session:
             row = session.get(
                 SignalDeciderExecutionPlanItem,
                 self.plan_item_id,
             )
-            self.assertEqual(row.execution_status, 'revoked')
-            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertNotIn(
+                row.execution_status,
+                {'revocation_pending', 'revocation_manual_review', 'revoked'},
+            )
 
     async def test_restart_revokes_quarantined_plan_when_core_revision_changed(
         self,

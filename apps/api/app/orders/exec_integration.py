@@ -1532,6 +1532,29 @@ def _dispatch_authority_generation_conflict(
     }
 
 
+def _is_actionable_generation_replacement(
+    conflict: dict[str, Any] | None,
+) -> bool:
+    return bool(
+        conflict is not None
+        and conflict.get('reason_code') == 'latest_snapshot_replaced'
+        and conflict.get('replacement_actionable') is True
+    )
+
+
+def _is_superseded_activation_error(exc: Exception) -> bool:
+    """Return whether activation failed because a newer Core generation won.
+
+    These failures are convergence signals, not evidence that live market data
+    is unavailable.  Mapping them to the market-evidence revocation path would
+    poison the replacement generation and can permanently remove an otherwise
+    valid watch candidate from Exec monitoring.
+    """
+    if isinstance(exc, _PlanRefreshRevisionConflict):
+        return True
+    return False
+
+
 def _row_readback_revision_binding(
     row: SignalDeciderExecutionPlanItem,
 ) -> dict[str, Any]:
@@ -3146,13 +3169,11 @@ class SignalDeciderExecIntegrationService:
                     revision_fingerprints=revision_fingerprints,
                 )
             )
-            if (
-                _dispatch_authority_generation_conflict(
-                    before=expected_generation,
-                    after=generation_before,
-                )
-                is not None
-            ):
+            generation_conflict = _dispatch_authority_generation_conflict(
+                before=expected_generation,
+                after=generation_before,
+            )
+            if generation_conflict is not None:
                 if (
                     generation_before.get('error_type')
                     == '_PlanRefreshRevisionConflict'
@@ -3166,6 +3187,23 @@ class SignalDeciderExecIntegrationService:
                                 message=(
                                     'Core activation fence is busy; the Exec '
                                     'plan remains quarantined for retry.'
+                                ),
+                                retryable=True,
+                            ),
+                        },
+                        [],
+                    )
+                if _is_actionable_generation_replacement(generation_conflict):
+                    return (
+                        {
+                            **persisted_group_result,
+                            'activation_status': 'superseded_generation',
+                            'activation_error': _serialize_error(
+                                code='execution_activation_generation_superseded',
+                                message=(
+                                    'A newer actionable Core generation replaced '
+                                    'the accepted Exec plan before activation; the '
+                                    'replacement remains eligible for redispatch.'
                                 ),
                                 retryable=True,
                             ),
@@ -3196,15 +3234,32 @@ class SignalDeciderExecIntegrationService:
                     retry_plan_refresh_conflict=True,
                 )
             )
-            if (
-                _dispatch_authority_generation_conflict(
-                    before=expected_generation,
-                    after=generation_after,
-                )
-                is not None
-            ):
-                raise ValueError(
-                    'Core activation authority changed during activation POST'
+            generation_conflict = _dispatch_authority_generation_conflict(
+                before=expected_generation,
+                after=generation_after,
+            )
+            if generation_conflict is not None:
+                if not _is_actionable_generation_replacement(
+                    generation_conflict
+                ):
+                    raise ValueError(
+                        'Core activation authority changed during activation POST'
+                    )
+                return (
+                    {
+                        **persisted_group_result,
+                        'activation_status': 'superseded_generation',
+                        'activation_error': _serialize_error(
+                            code='execution_activation_generation_superseded',
+                            message=(
+                                'A newer Core authority generation replaced the '
+                                'plan during activation; do not poison the newer '
+                                'generation with a market-evidence revocation.'
+                            ),
+                            retryable=True,
+                        ),
+                    },
+                    [],
                 )
             await _retry_plan_refresh_revision_conflict(
                 lambda: self._persist_core_activation_ack(
@@ -3214,7 +3269,25 @@ class SignalDeciderExecIntegrationService:
                     response_payload=activation_response,
                 )
             )
-        except Exception as exc:  # noqa: BLE001 - activated BUY must be revoked on uncertainty
+        except Exception as exc:  # noqa: BLE001 - classify stale generation separately
+            if _is_superseded_activation_error(exc):
+                return (
+                    {
+                        **persisted_group_result,
+                        'activation_status': 'superseded_generation',
+                        'activation_error': _serialize_error(
+                            code='execution_activation_generation_superseded',
+                            message=str(exc),
+                            retryable=True,
+                            status_code=(
+                                exc.status_code
+                                if isinstance(exc, SignalDeciderExecClientError)
+                                else None
+                            ),
+                        ),
+                    },
+                    [],
+                )
             error = (
                 _serialize_error(
                     code=exc.code,
@@ -3458,13 +3531,11 @@ class SignalDeciderExecIntegrationService:
                     revision_fingerprints=revision_fingerprints,
                 )
             )
-            if (
-                _dispatch_authority_generation_conflict(
-                    before=expected_generation,
-                    after=generation_before,
-                )
-                is not None
-            ):
+            generation_conflict = _dispatch_authority_generation_conflict(
+                before=expected_generation,
+                after=generation_before,
+            )
+            if generation_conflict is not None:
                 if (
                     generation_before.get('error_type')
                     == '_PlanRefreshRevisionConflict'
@@ -3477,7 +3548,16 @@ class SignalDeciderExecIntegrationService:
                         }
                     )
                     continue
-                await fail_closed(reason_code='authority_generation_changed')
+                if _is_actionable_generation_replacement(generation_conflict):
+                    results.append(
+                        {
+                            'plan_id': plan_id,
+                            'status': 'superseded_generation',
+                            'reason_code': 'authority_generation_changed',
+                        }
+                    )
+                else:
+                    await fail_closed(reason_code='authority_generation_changed')
                 continue
 
             try:
@@ -3498,16 +3578,27 @@ class SignalDeciderExecIntegrationService:
                         retry_plan_refresh_conflict=True,
                     )
                 )
-                if (
-                    _dispatch_authority_generation_conflict(
-                        before=expected_generation,
-                        after=generation_after,
-                    )
-                    is not None
-                ):
-                    await fail_closed(
-                        reason_code='post_activation_authority_changed'
-                    )
+                generation_conflict = _dispatch_authority_generation_conflict(
+                    before=expected_generation,
+                    after=generation_after,
+                )
+                if generation_conflict is not None:
+                    if _is_actionable_generation_replacement(
+                        generation_conflict
+                    ):
+                        results.append(
+                            {
+                                'plan_id': plan_id,
+                                'status': 'superseded_generation',
+                                'reason_code': (
+                                    'post_activation_authority_changed'
+                                ),
+                            }
+                        )
+                    else:
+                        await fail_closed(
+                            reason_code='post_activation_authority_changed'
+                        )
                     continue
                 await _retry_plan_refresh_revision_conflict(
                     lambda: self._persist_core_activation_ack(
@@ -3517,7 +3608,16 @@ class SignalDeciderExecIntegrationService:
                         response_payload=activation_response,
                     )
                 )
-            except Exception as exc:  # noqa: BLE001 - recovered BUY stays fail closed
+            except Exception as exc:  # noqa: BLE001 - stale generations converge forward
+                if _is_superseded_activation_error(exc):
+                    results.append(
+                        {
+                            'plan_id': plan_id,
+                            'status': 'superseded_generation',
+                            'reason_code': 'activation_generation_superseded',
+                        }
+                    )
+                    continue
                 error = (
                     _serialize_error(
                         code=exc.code,
