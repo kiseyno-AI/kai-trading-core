@@ -1248,6 +1248,63 @@ class NextOpenRefreshUnitTests(unittest.TestCase):
 
 
 class AgentContextCompletenessUnitTests(unittest.TestCase):
+    def test_candidate_scope_uses_only_roles_selected_for_each_symbol(self) -> None:
+        source_market_date = date(2026, 9, 30)
+        source_run = {
+            'run_id': 'feedback-cycle-2026-09-30-role-scoped',
+            'status': 'completed',
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'role_symbol_scopes': {
+                    'short-term-decider': ['005930'],
+                    'signal-decider': ['000660'],
+                },
+            },
+        }
+        short_snapshot = object()
+        signal_snapshot = object()
+        scope_state = {
+            'source_run': source_run,
+            'source_role_symbol_scopes': {
+                'short-term-decider': ['005930'],
+                'signal-decider': ['000660'],
+            },
+            'selected_by_key': {
+                ('005930', 'short-term-decider'): short_snapshot,
+                ('000660', 'signal-decider'): signal_snapshot,
+            },
+            'authoritative_run_id_by_key': {
+                ('005930', 'short-term-decider'): source_run['run_id'],
+                ('000660', 'signal-decider'): source_run['run_id'],
+            },
+            'failures_by_key': {},
+            'run_snapshots': [source_run],
+            'evidenced_scope_keys': {
+                ('005930', 'short-term-decider'),
+                ('000660', 'signal-decider'),
+            },
+        }
+        service = SignalDeciderNextOpenExecutionService()
+
+        result = service._build_agent_context_completeness_context(
+            source_market_date=source_market_date,
+            candidate_symbols=['005930', '000660'],
+            scope_state=scope_state,
+        )
+
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['evaluation_scope_count'], 2)
+        self.assertEqual(result['completed_scope_count'], 2)
+        self.assertEqual(result['out_of_cohort_scopes'], [])
+        self.assertEqual(
+            result['_candidate_contexts_by_symbol']['005930']['evaluation_scope_count'],
+            1,
+        )
+        self.assertEqual(
+            result['_candidate_contexts_by_symbol']['000660']['evaluation_scope_count'],
+            1,
+        )
+
     def test_empty_candidate_scope_uses_source_decision_cohort(self) -> None:
         source_market_date = date(2026, 9, 11)
         latest_run = {
@@ -8943,6 +9000,60 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             item['validation']['current_live_market_authority']['action'],
             'allow',
+        )
+
+    def test_open_refresh_uses_fresh_market_leg_when_unrelated_refresh_leg_failed(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        live_snapshot = self._live_market_snapshot_context(
+            observed_at=datetime(
+                2026,
+                4,
+                30,
+                9,
+                9,
+                30,
+                tzinfo=timezone(timedelta(hours=9)),
+            ),
+            advancers=650,
+            unchanged=50,
+            decliners=250,
+            partial=True,
+        )
+        live_snapshot['last_refresh_status'] = 'error'
+        live_snapshot['payload']['missing_fields'] = ['usd_krw.rate']
+        live_snapshot['payload']['legs']['flow']['status'] = 'ready'
+        live_snapshot['payload']['legs']['fx']['status'] = 'missing'
+        open_service = self._service(
+            state='OPEN',
+            server_time='2026-04-30T09:10:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.orders.next_open_execution.load_current_market_snapshot_context',
+                return_value=live_snapshot,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            result = open_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='unrelated_refresh_leg_failed',
+            )
+
+        item = result['items'][0]
+        self.assertEqual(
+            item['validation']['current_live_market_authority']['action'],
+            'allow',
+        )
+        self.assertNotIn(
+            'current_live_market_evidence_unavailable',
+            {
+                reason['code']
+                for reason in item['validation']['blocking_reasons']
+            },
         )
 
     def test_open_refresh_revokes_accepted_authority_for_ambiguous_krx_market(self) -> None:

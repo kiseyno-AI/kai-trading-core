@@ -2771,9 +2771,6 @@ def _build_market_open_drive_context(
         return unavailable('snapshot_source_table_invalid', 'snapshot.source_table', phase=phase)
     if str(source_payload.get('snapshot_status') or '').strip().lower() not in {'ready', 'partial', 'stale'}:
         return unavailable('snapshot_status_invalid', 'snapshot.snapshot_status', phase=phase)
-    if str(source_payload.get('last_refresh_status') or '').strip().lower() not in {'success', 'degraded'}:
-        return unavailable('snapshot_refresh_status_invalid', 'snapshot.last_refresh_status', phase=phase)
-
     snapshot_payload = _maybe_dict(source_payload.get('payload'))
     if str(snapshot_payload.get('status') or '').strip().lower() not in {'ready', 'partial', 'stale'}:
         return unavailable('snapshot_payload_status_invalid', 'snapshot.payload.status', phase=phase)

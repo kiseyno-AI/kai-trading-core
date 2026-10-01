@@ -3478,8 +3478,9 @@ class SignalDeciderNextOpenExecutionService:
             payload_scope_keys = (
                 {
                     (symbol, agent_name)
-                    for symbol in payload_symbols
-                    for agent_name in required_agents
+                    for symbol, agent_name in selected_by_key
+                    if symbol in payload_symbols
+                    and agent_name in required_agents
                 }
                 if payload_symbols
                 else set(source_scope_keys)
