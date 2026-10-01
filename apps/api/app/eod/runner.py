@@ -25,6 +25,7 @@ MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(9, 0)
 MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(14, 31)
 NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY = 'signal_decider_next_open_execution_refresh_plan_if_due'
 OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY = 'signal_decider_exec_dispatch_open_plan'
+BUY_AUTHORITY_REVOCATION_CONSECUTIVE_FAILURE_THRESHOLD = 3
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
@@ -50,6 +51,7 @@ class EODBackgroundRunner:
         self._blocking_step_tasks: dict[str, asyncio.Task] = {}
         self._async_step_tasks: dict[str, asyncio.Task] = {}
         self._last_open_drive_market_snapshot_refresh_at: datetime | None = None
+        self._buy_authority_critical_failures: dict[str, int] = {}
 
     @staticmethod
     def _open_drive_market_time(market: object) -> datetime | None:
@@ -288,6 +290,17 @@ class EODBackgroundRunner:
         try:
             await awaitable
         except Exception:
+            failure_count = self._buy_authority_critical_failures.get(name, 0) + 1
+            self._buy_authority_critical_failures[name] = failure_count
+            if failure_count < BUY_AUTHORITY_REVOCATION_CONSECUTIVE_FAILURE_THRESHOLD:
+                logger.warning(
+                    'Deferring delegated BUY authority revocation after transient '
+                    'critical-step failure: %s (%s/%s)',
+                    name,
+                    failure_count,
+                    BUY_AUTHORITY_REVOCATION_CONSECUTIVE_FAILURE_THRESHOLD,
+                )
+                raise
             trigger = f'background_runner:{name}_failed'
             try:
                 await signal_decider_exec_integration_service.revoke_delegated_buys_for_unavailable_market_evidence(
@@ -301,6 +314,8 @@ class EODBackgroundRunner:
                     revocation_exc,
                 )
             raise
+        else:
+            self._buy_authority_critical_failures.pop(name, None)
 
     async def _run_loop(self) -> None:
         live_market_snapshot_loop = asyncio.get_running_loop()

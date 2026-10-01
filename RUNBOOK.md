@@ -486,6 +486,7 @@ Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or 
 ## Market snapshot notes
 
 - `GET /market/snapshot` is a production-facing dashboard dependency and now resolves KIS reads against the real domain by default, even when the broader process still uses `KIS_USE_MOCK=true` for other flows.
+- During an open session, a single transient master/snapshot/plan-refresh exception stops that cycle from creating new BUY authority but does not revoke already delegated BUY watches. Revocation is staged after three consecutive failures of the same critical step; one successful run resets that step's failure streak. This preserves fail-closed dispatch while preventing a one-off KIS transport failure from collapsing the live watch set.
 - Keep `MARKET_SNAPSHOT_KIS_USE_REAL=true` unless you intentionally want deploy preflight and smoke-check to fail the market snapshot path.
 - Required deploy-time secrets for the route are `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KOREAEXIM_API_KEY`.
 - Use `GET /broker/kis/health` to inspect `market_snapshot_runtime` when deploy preflight or smoke-check reports a market snapshot readiness failure.
