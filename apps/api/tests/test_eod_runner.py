@@ -13,6 +13,113 @@ from app.market.clock import MarketState
 
 
 class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_critical_failure_does_not_revoke_delegated_buys(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T11:05:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+
+        async def fail_once() -> None:
+            raise RuntimeError('temporary provider failure')
+
+        with patch(
+            'app.eod.runner.signal_decider_exec_integration_service.'
+            'revoke_delegated_buys_for_unavailable_market_evidence',
+            new=AsyncMock(),
+        ) as revoke_delegated_buys:
+            with self.assertRaisesRegex(RuntimeError, 'temporary provider failure'):
+                await runner._run_buy_authority_critical_step(
+                    name='market_snapshot_refresh_if_due',
+                    market=market,
+                    awaitable=fail_once(),
+                )
+
+        revoke_delegated_buys.assert_not_awaited()
+        self.assertEqual(
+            runner._buy_authority_critical_failures['market_snapshot_refresh_if_due'],
+            1,
+        )
+
+    async def test_third_consecutive_critical_failure_revokes_delegated_buys(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T11:05:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+
+        async def fail() -> None:
+            raise RuntimeError('persistent provider failure')
+
+        with patch(
+            'app.eod.runner.signal_decider_exec_integration_service.'
+            'revoke_delegated_buys_for_unavailable_market_evidence',
+            new=AsyncMock(),
+        ) as revoke_delegated_buys:
+            for _ in range(3):
+                with self.assertRaisesRegex(RuntimeError, 'persistent provider failure'):
+                    await runner._run_buy_authority_critical_step(
+                        name='market_snapshot_refresh_if_due',
+                        market=market,
+                        awaitable=fail(),
+                    )
+
+        revoke_delegated_buys.assert_awaited_once_with(
+            target_trade_date='2026-04-30',
+            trigger='background_runner:market_snapshot_refresh_if_due_failed',
+        )
+
+    async def test_successful_critical_step_resets_failure_streak(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T11:05:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+
+        async def fail() -> None:
+            raise RuntimeError('temporary provider failure')
+
+        async def succeed() -> None:
+            return None
+
+        with patch(
+            'app.eod.runner.signal_decider_exec_integration_service.'
+            'revoke_delegated_buys_for_unavailable_market_evidence',
+            new=AsyncMock(),
+        ) as revoke_delegated_buys:
+            with self.assertRaises(RuntimeError):
+                await runner._run_buy_authority_critical_step(
+                    name='market_snapshot_refresh_if_due',
+                    market=market,
+                    awaitable=fail(),
+                )
+            await runner._run_buy_authority_critical_step(
+                name='market_snapshot_refresh_if_due',
+                market=market,
+                awaitable=succeed(),
+            )
+
+        revoke_delegated_buys.assert_not_awaited()
+        self.assertNotIn(
+            'market_snapshot_refresh_if_due',
+            runner._buy_authority_critical_failures,
+        )
+
     def test_open_drive_poll_interval_cannot_undersample_refresh_buckets(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=900)
         open_market = MarketState(
@@ -294,10 +401,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             refresh_snapshot.assert_not_awaited()
             run_execution.assert_not_awaited()
             run_intraday_auto_sell.assert_not_awaited()
-            revoke_delegated_buys.assert_awaited_once_with(
-                target_trade_date='2026-04-30',
-                trigger='background_runner:refresh_master_if_due_failed',
-            )
+            revoke_delegated_buys.assert_not_awaited()
         finally:
             release_master.set()
             if runner._blocking_step_tasks:
@@ -358,10 +462,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
             refresh_plan.assert_not_called()
             dispatch_plan.assert_not_awaited()
-            revoke_delegated_buys.assert_awaited_once_with(
-                target_trade_date='2026-04-30',
-                trigger='background_runner:market_snapshot_refresh_if_due_failed',
-            )
+            revoke_delegated_buys.assert_not_awaited()
         finally:
             release_snapshot.set()
 
@@ -417,13 +518,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 await runner._run_loop()
 
             dispatch_plan.assert_not_awaited()
-            revoke_delegated_buys.assert_awaited_once_with(
-                target_trade_date='2026-04-30',
-                trigger=(
-                    'background_runner:'
-                    'signal_decider_next_open_execution_refresh_plan_if_due_failed'
-                ),
-            )
+            revoke_delegated_buys.assert_not_awaited()
         finally:
             release_plan.set()
             if runner._blocking_step_tasks:
@@ -484,13 +579,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
             refresh_plan.assert_not_called()
             dispatch_plan.assert_not_awaited()
-            revoke_delegated_buys.assert_awaited_once_with(
-                target_trade_date='2026-04-30',
-                trigger=(
-                    'background_runner:'
-                    'signal_decider_open_execution_refresh_plan_if_due_failed'
-                ),
-            )
+            revoke_delegated_buys.assert_not_awaited()
         finally:
             release_plan.set()
             await preopen_plan_task
