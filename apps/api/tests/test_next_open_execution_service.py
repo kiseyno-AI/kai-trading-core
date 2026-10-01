@@ -8454,6 +8454,26 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             failure_source='market_snapshot_refresh_if_due_failed',
         )
         self.assertEqual(staged, {'staged_count': 1, 'pending_count': 1})
+        with session_scope() as session:
+            pending_row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            original_revocation = copy.deepcopy(
+                pending_row.submission_payload['revocation']
+            )
+            preopen_service._stage_terminal_revocation(
+                row=pending_row,
+                replacement_snapshot=None,
+                replacement_observation_id='observation:newer-generation',
+                replacement_action='watch_for_trigger',
+                reason={
+                    'code': 'latest_snapshot_replaced',
+                    'message': 'newer planner generation',
+                },
+                now=datetime.now(timezone.utc),
+            )
+            self.assertEqual(
+                pending_row.submission_payload['revocation'],
+                original_revocation,
+            )
         pending = preopen_service.list_plan_items(
             target_trade_date=self.target_trade_date,
         )['items'][0]
