@@ -7834,11 +7834,10 @@ class SignalDeciderNextOpenExecutionService:
         )
         if not replacement_revision_id:
             raise ValueError('terminal revocation requires a stable replacement revision identity')
-        if (
-            row.execution_status == EXECUTION_STATUS_REVOCATION_PENDING
-            and str(existing_revocation.get('replacement_decision_snapshot_id') or '')
-            == replacement_revision_id
-        ):
+        if row.execution_status == EXECUTION_STATUS_REVOCATION_PENDING:
+            # The pending payload is a remote idempotency contract. A later
+            # planner generation must not rewrite its replacement identity or
+            # action before Exec acknowledges the original revocation.
             return
 
         prior_row_authority_fingerprint = _execution_plan_row_authority_fingerprint(

@@ -5409,6 +5409,21 @@ class SignalDeciderExecIntegrationService:
                 results.append({'row_id': row.id, 'status': 'not_configured'})
                 continue
             try:
+                replacement_action = revocation.get('replacement_action')
+                if (
+                    revocation.get('reason_code')
+                    == 'current_live_market_evidence_unavailable'
+                    and str(
+                        revocation.get('replacement_observation_id') or ''
+                    ).startswith(
+                        'observation:current_live_market_evidence_unavailable:'
+                    )
+                ):
+                    # Repair revocations created before pending contracts were
+                    # made immutable. Market-evidence loss always revokes to
+                    # reject; a later actionable planner generation may have
+                    # overwritten this field while the ACK was outstanding.
+                    replacement_action = 'reject'
                 request_payload = serialize_execution_revocation_payload(
                     {
                         'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
@@ -5420,7 +5435,7 @@ class SignalDeciderExecIntegrationService:
                         'replacement_decision_snapshot_id': revocation.get(
                             'replacement_decision_snapshot_id'
                         ),
-                        'replacement_action': revocation.get('replacement_action'),
+                        'replacement_action': replacement_action,
                         'items': [
                             {
                                 'core_item_key': link.get('core_item_key'),
