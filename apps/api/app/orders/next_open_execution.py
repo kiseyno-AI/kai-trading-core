@@ -199,8 +199,17 @@ SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
 SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
 SHORT_TERM_WATCH_DELEGATED_ENTRY_QUALITY_BLOCK_CODES = frozenset(
     {
+        'signal_decider_reject_veto',
+        'signal_decider_wait_blocks_scalp_buy',
+        'short_term_downtrend_or_breakdown_block',
+        'short_term_ret20_deep_negative_block',
+        'short_term_high_atr_weak_trend_block',
+        'short_term_high_atr_chase_block',
+        'short_term_buy_quality_score_block',
+        'short_term_very_weak_relative_strength_block',
         'short_term_liquidity_floor_block',
         'short_term_reward_risk_ratio_block',
+        'short_term_scalp_requires_continuation_setup',
     }
 )
 UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE = 'KIS:00000000-00'
@@ -4423,9 +4432,15 @@ class SignalDeciderNextOpenExecutionService:
                             )
                             continue
                         authority_action = current_live_market_authority.get('action')
+                        monitor_only_watch = bool(
+                            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                            and (_row_validation_payload(row).get('handoff_intent'))
+                            == 'intraday_watch_buy'
+                        )
                         if (
                             planned_side == 'buy'
                             and authority_action in {'reject', 'block_new_buy'}
+                            and not monitor_only_watch
                         ):
                             revocation_reason_code = (
                                 'current_live_market_risk_off'
@@ -4498,7 +4513,11 @@ class SignalDeciderNextOpenExecutionService:
                             current_live_market_authority
                         )
                         authority_action = current_live_market_authority.get('action')
-                        if authority_action == 'reject':
+                        monitor_only_watch = bool(
+                            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                            and validation.get('handoff_intent') == 'intraday_watch_buy'
+                        )
+                        if authority_action == 'reject' and not monitor_only_watch:
                             validation['blocking_reasons'] = [
                                 *(validation.get('blocking_reasons') or []),
                                 _reason(
@@ -4507,13 +4526,22 @@ class SignalDeciderNextOpenExecutionService:
                                     'new BUY authority is blocked.',
                                 ),
                             ]
-                        elif authority_action != 'allow':
+                        elif authority_action != 'allow' and not monitor_only_watch:
                             validation['blocking_reasons'] = [
                                 *(validation.get('blocking_reasons') or []),
                                 _reason(
                                     'current_live_market_evidence_unavailable',
                                     'The open-session live market breadth proof is unavailable, stale, '
                                     'or ambiguous; new BUY authority fails closed.',
+                                ),
+                            ]
+                        elif authority_action != 'allow':
+                            validation['warnings'] = [
+                                *(validation.get('warnings') or []),
+                                _reason(
+                                    'current_live_market_buy_authority_delegated_to_exec_watch',
+                                    'Live market BUY authority is unavailable or risk-off; keep monitoring the '
+                                    'trigger-gated candidate while Exec continues to block order submission.',
                                 ),
                             ]
                     if account_target_blocking_reasons:
@@ -7201,12 +7229,19 @@ class SignalDeciderNextOpenExecutionService:
                 )
             if estimated_reference_price is not None and estimated_reference_price > 0 and chase_limit_price is not None:
                 if Decimal(str(estimated_reference_price)) > chase_limit_price:
-                    blocking_reasons.append(
-                        _reason(
-                            'reference_price_above_chase_limit',
-                            'Latest available reference price is already above short-term chase_limit_price.',
-                        )
+                    reason = _reason(
+                        'reference_price_above_chase_limit',
+                        'Latest available reference price is already above short-term chase_limit_price.',
                     )
+                    if short_term_tactical_action == 'watch_for_trigger':
+                        warnings.append(
+                            _reason(
+                                'reference_price_above_chase_limit_delegated_to_exec_watch',
+                                f"{reason['message']} Keep monitoring; Exec must not buy above the chase limit.",
+                            )
+                        )
+                    else:
+                        blocking_reasons.append(reason)
                 estimated_reference_price = max(int(estimated_reference_price), int(chase_limit_price))
                 estimated_reference_price_basis = 'max(previous_close,chase_limit_price)'
             if bool(gate_checks.get('decision_support_only')) or not bool(gate_checks.get('allow_execution_logic', False)):
@@ -8070,14 +8105,27 @@ class SignalDeciderNextOpenExecutionService:
                 )
             )
         )
+        monitor_only_watch_recovery = bool(
+            reason_code == 'current_live_market_evidence_unavailable'
+            and revocation.get('replacement_action') == 'watch_for_trigger'
+            and revocation.get('replacement_actionable') is True
+            and _row_validation_payload(row).get('handoff_intent')
+            == 'intraday_watch_buy'
+        )
 
         if (
             revocation.get('schema_version') != 'core_execution_revocation_state_v1'
             or revocation.get('status') != 'acknowledged'
             or revocation.get('ack_status') != 'revoked'
             or not (market_evidence_recovered or agent_context_recovered)
-            or revocation.get('replacement_action') != 'reject'
-            or revocation.get('replacement_actionable') is not False
+            or (
+                not monitor_only_watch_recovery
+                and revocation.get('replacement_action') != 'reject'
+            )
+            or (
+                not monitor_only_watch_recovery
+                and revocation.get('replacement_actionable') is not False
+            )
             or not replacement_revision_id
             or not replacement_revision_id.startswith(
                 f'observation:{reason_code}:'

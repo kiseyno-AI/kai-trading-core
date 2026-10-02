@@ -4,7 +4,7 @@
 
 `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE` remains `report_only`. A mode change requires an explicit configuration update and API restart.
 
-- `report_only`: records the conflict and preserves requested quantity.
+- `report_only`: records the conflict and preserves trigger-gated monitoring. It does not grant BUY authority; Exec must still pass trigger-time quote, chase-limit, quality, market-authority, portfolio, pause, and kill-switch gates before submitting an order.
 - `hard_block`: makes a non-override conflict ineligible and sets final quantity to zero.
 - `downsize_probe`: deterministically caps final quantity at `SIGNAL_DECIDER_WAIT_CONFLICT_PROBE_QUANTITY` without increasing a smaller request.
 - `disabled`: retains an explicit disabled audit state.
@@ -39,6 +39,10 @@ The report exposes these checks under `promotion_readiness`:
 - manual approval for any live configuration change.
 
 Passing the numeric checks does not activate enforcement automatically. Keep `report_only` unless all checks pass and the operational owner explicitly approves either `hard_block` or `downsize_probe`.
+
+## Monitoring is not BUY authority
+
+For `watch_for_trigger` / `intraday_watch_buy` rows, Core delegates entry-quality concerns to Exec as monitoring warnings instead of removing the symbol from monitoring. A weak setup, WAIT/reject disagreement, price already above the chase limit, or unavailable/risk-off live market BUY authority may prevent an order, but it must not revoke the monitor itself. Structural contract failures such as missing trigger, chase limit, target, stop, account route, or invalid target/stop ordering still block handoff because Exec cannot monitor those rows safely.
 
 ## Issue #547 regression week
 
