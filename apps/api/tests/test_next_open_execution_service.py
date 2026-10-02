@@ -7687,8 +7687,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quality['return_percentile'], '0.2')
         self.assertEqual(quality['volume_percentile'], '0.2')
         self.assertIn(
-            'short_term_very_weak_relative_strength_block',
-            {reason['code'] for reason in item['validation']['blocking_reasons']},
+            'short_term_very_weak_relative_strength_block_delegated_to_exec_watch',
+            {warning['code'] for warning in item['validation']['warnings']},
         )
 
     def test_short_term_gate_blocks_invalid_objective_percentiles(self) -> None:
