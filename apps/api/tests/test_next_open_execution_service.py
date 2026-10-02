@@ -3192,17 +3192,18 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             if row['account_reference'] == self.account_reference
             and row['decision_agent_name'] == 'short-term-decider'
         )
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(
             item['validation']['decision_authority']['scope'],
             'same_day_intraday_watch',
         )
-        self.assertIn(
+        self.assertNotIn(
             'current_live_market_risk_off',
-            {
-                reason['code']
-                for reason in item['validation']['blocking_reasons']
-            },
+            {reason['code'] for reason in item['validation']['blocking_reasons']},
+        )
+        self.assertIn(
+            'current_live_market_buy_authority_delegated_to_exec_watch',
+            {warning['code'] for warning in item['validation']['warnings']},
         )
 
     def test_closed_refresh_keeps_late_watch_tombstoned(self) -> None:
@@ -7445,7 +7446,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
         self.assertEqual(item['validation']['blocking_reasons'][0]['code'], 'trigger_price_missing')
 
-    def test_refresh_plan_items_keeps_non_recheckable_watch_quality_blocks_in_core(self) -> None:
+    def test_refresh_plan_items_delegates_watch_quality_blocks_to_exec_monitoring(self) -> None:
         snapshot_id = self._seed_short_term_snapshot(
             symbol='000660',
             tactical_action='watch_for_trigger',
@@ -7481,15 +7482,16 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = next(item for item in result['items'] if item['symbol'] == '000660')
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
-        self.assertFalse(item['handoff_active'])
-        self.assertFalse(item['exec_monitoring_active'])
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertTrue(item['handoff_active'])
+        self.assertTrue(item['exec_monitoring_active'])
         block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
-        self.assertIn('short_term_buy_quality_score_block', block_codes)
+        self.assertNotIn('short_term_buy_quality_score_block', block_codes)
         warning_codes = {warning['code'] for warning in item['validation']['warnings']}
+        self.assertIn('short_term_buy_quality_score_block_delegated_to_exec_watch', warning_codes)
         self.assertIn('short_term_liquidity_floor_block_delegated_to_exec_watch', warning_codes)
 
-    def test_watch_delegation_set_contains_only_dynamic_liquidity_and_reward_risk(self) -> None:
+    def test_watch_delegation_keeps_monitoring_active_for_entry_quality_blocks(self) -> None:
         blocks = [
             {'code': code, 'message': code}
             for code in (
@@ -7509,24 +7511,20 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             warnings=[],
         )
 
-        self.assertEqual(
-            {block['code'] for block in remaining},
-            {
-                'short_term_buy_quality_score_block',
-                'short_term_high_atr_chase_block',
-                'short_term_high_atr_weak_trend_block',
-                'short_term_very_weak_relative_strength_block',
-            },
-        )
+        self.assertEqual(remaining, [])
         self.assertEqual(
             {warning['code'] for warning in warnings},
             {
                 'short_term_liquidity_floor_block_delegated_to_exec_watch',
                 'short_term_reward_risk_ratio_block_delegated_to_exec_watch',
+                'short_term_buy_quality_score_block_delegated_to_exec_watch',
+                'short_term_high_atr_chase_block_delegated_to_exec_watch',
+                'short_term_high_atr_weak_trend_block_delegated_to_exec_watch',
+                'short_term_very_weak_relative_strength_block_delegated_to_exec_watch',
             },
         )
 
-    def test_refresh_plan_items_blocks_short_term_rows_above_chase_limit(self) -> None:
+    def test_refresh_plan_items_monitors_short_term_rows_above_chase_limit(self) -> None:
         self._seed_short_term_snapshot(
             symbol='000660',
             tactical_action='watch_for_trigger',
@@ -7545,9 +7543,13 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = next(item for item in result['items'] if item['symbol'] == '000660')
         self.assertEqual(item['decision_agent_name'], 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
-        self.assertFalse(item['handoff_active'])
-        self.assertEqual(item['blocker_reason']['code'], 'reference_price_above_chase_limit')
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertTrue(item['handoff_active'])
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertIn(
+            'reference_price_above_chase_limit_delegated_to_exec_watch',
+            {warning['code'] for warning in item['validation']['warnings']},
+        )
 
     def test_refresh_plan_items_short_term_missing_target_and_stop_are_blocked(self) -> None:
         self._seed_short_term_snapshot(
@@ -7685,8 +7687,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quality['return_percentile'], '0.2')
         self.assertEqual(quality['volume_percentile'], '0.2')
         self.assertIn(
-            'short_term_very_weak_relative_strength_block',
-            {reason['code'] for reason in item['validation']['blocking_reasons']},
+            'short_term_very_weak_relative_strength_block_delegated_to_exec_watch',
+            {warning['code'] for warning in item['validation']['warnings']},
         )
 
     def test_short_term_gate_blocks_invalid_objective_percentiles(self) -> None:
