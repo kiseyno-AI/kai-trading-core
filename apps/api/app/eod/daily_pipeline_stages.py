@@ -1466,6 +1466,9 @@ class DailyPipelineStageService:
                             point_in_time_recovery=(
                                 point_in_time_recovery
                             ),
+                            provider_admission_fence_owned=(
+                                provider_admission_fence_owned
+                            ),
                             run_id=reused_eod_collection_run_id,
                             progress_callback=(
                                 self._build_progress_callback(
@@ -2330,6 +2333,7 @@ class DailyPipelineStageService:
         feedback_knowledge_cutoff_at: datetime | None = None,
         feedback_cutoff_resolution: dict[str, Any] | None = None,
         point_in_time_recovery: bool = False,
+        provider_admission_fence_owned: bool = False,
         run_id: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
@@ -2380,6 +2384,8 @@ class DailyPipelineStageService:
             }
             if point_in_time_recovery:
                 enrichment_kwargs['point_in_time_recovery'] = True
+            if provider_admission_fence_owned:
+                enrichment_kwargs['daily_price_bar_lock_owned'] = True
             result = self.pykrx_enrichment_service.collect_for_market_date(
                 **enrichment_kwargs
             )
