@@ -165,6 +165,28 @@ EXECUTION_ACTIVATION_SCHEMA_VERSION = 'execution_handoff_activation_v1'
 EXECUTION_ACTIVATION_CAPABILITY = 'core_confirmed_activation_v1'
 CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS = 6
 CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS = 0.025
+EXEC_DECIDER_HANDOFF_MAX_BYTES = 12 * 1024
+EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES = 32 * 1024
+EXEC_EXIT_RISK_CONTEXT_MAX_BYTES = 8 * 1024
+EXEC_PROTECTIVE_EXIT_RISK_CONTEXT_ESSENTIAL_KEYS = (
+    '_core_activation',
+    'trigger_rule',
+    'schema_version',
+    'agent_name',
+    'decision_agent_name',
+    'core_plan_item_id',
+    'account_reference',
+    'target_trade_date',
+    'source_market_date',
+    'decision_snapshot_id',
+    'decision_run_id',
+    'target_price',
+    'stop_loss_price',
+    'confidence_score_10',
+    'conviction_score_10',
+    'market_regime_context',
+    'decider_handoff_context_digest',
+)
 
 REMOTE_FETCH_STATUS_OK = 'ok'
 REMOTE_FETCH_STATUS_DISABLED = 'disabled'
@@ -570,6 +592,117 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _dispatch_json_size(value: Any) -> int:
+    return len(
+        json.dumps(
+            _json_safe(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    )
+
+
+def _dispatch_payload_digest(value: Any) -> str:
+    encoded = json.dumps(
+        _json_safe(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _compact_dispatch_value(value: Any, *, depth: int = 0) -> Any:
+    safe = _json_safe(value)
+    if isinstance(safe, str):
+        if len(safe) <= 512:
+            return safe
+        return {
+            'preview': safe[:512],
+            'truncated': True,
+            'original_length': len(safe),
+        }
+    if isinstance(safe, list):
+        if depth >= 3:
+            return {
+                'projection_digest': _dispatch_payload_digest(safe),
+                'omitted_item_count': len(safe),
+            }
+        compacted = [
+            _compact_dispatch_value(item, depth=depth + 1)
+            for item in safe[:8]
+        ]
+        if len(safe) > 8:
+            compacted.append({'omitted_item_count': len(safe) - 8})
+        return compacted
+    if isinstance(safe, dict):
+        if depth >= 3:
+            return {
+                'projection_digest': _dispatch_payload_digest(safe),
+                'omitted_key_count': len(safe),
+            }
+        compacted: dict[str, Any] = {}
+        for index, (key, item) in enumerate(safe.items()):
+            if index >= 24:
+                compacted['omitted_key_count'] = len(safe) - 24
+                break
+            compacted[str(key)] = _compact_dispatch_value(
+                item,
+                depth=depth + 1,
+            )
+        return compacted
+    return safe
+
+
+def _bounded_dispatch_object(
+    payload: dict[str, Any],
+    *,
+    max_bytes: int,
+    label: str,
+    essential_keys: Sequence[str],
+) -> dict[str, Any]:
+    safe_payload = _json_safe(payload)
+    if not isinstance(safe_payload, dict):
+        raise SignalDeciderExecPayloadContractError(
+            f'{label} must be a JSON object'
+        )
+    original_size = _dispatch_json_size(safe_payload)
+    if original_size <= max_bytes:
+        return safe_payload
+
+    compacted = _compact_dispatch_value(safe_payload)
+    if not isinstance(compacted, dict):
+        compacted = {}
+    compacted['dispatch_projection'] = {
+        'schema_version': 'exec_dispatch_projection_v1',
+        'source_digest': _dispatch_payload_digest(safe_payload),
+        'source_size_bytes': original_size,
+    }
+    required_projection_keys = {
+        key for key in essential_keys if key in safe_payload
+    }
+    if (
+        required_projection_keys.issubset(compacted)
+        and _dispatch_json_size(compacted) <= max_bytes
+    ):
+        return compacted
+
+    reduced = {
+        key: _compact_dispatch_value(safe_payload[key], depth=1)
+        for key in essential_keys
+        if key in safe_payload
+    }
+    reduced['dispatch_projection'] = compacted['dispatch_projection']
+    final_size = _dispatch_json_size(reduced)
+    if final_size > max_bytes:
+        raise SignalDeciderExecPayloadContractError(
+            f'{label} exceeds bounded projection budget: '
+            f'{final_size}>{max_bytes}'
+        )
+    return reduced
 
 
 def _serialize_error(*, code: str, message: str, retryable: bool = False, status_code: int | None = None) -> dict[str, Any]:
@@ -1028,11 +1161,42 @@ def _bind_core_confirmed_activation(
                 'core-confirmed activation requires object execution plan items'
             )
         risk_context = item.get('risk_context')
-        item['risk_context'] = {
-            **(risk_context if isinstance(risk_context, dict) else {}),
-            '_core_activation': copy.deepcopy(binding),
-        }
-    return serialize_execution_plan_dispatch_payload(candidate)
+        risk_context = risk_context if isinstance(risk_context, dict) else {}
+        item_intent = _normalize_optional_text(item.get('intent'), lowercase=True)
+        if item_intent in {EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL}:
+            trigger_rule = _normalize_optional_text(
+                risk_context.get('trigger_rule'),
+                lowercase=True,
+            )
+            if trigger_rule != item_intent:
+                raise SignalDeciderExecPayloadContractError(
+                    'protective exit risk context must bind its trigger rule'
+                )
+            item['risk_context'] = _bounded_dispatch_object(
+                {
+                    '_core_activation': copy.deepcopy(binding),
+                    'trigger_rule': trigger_rule,
+                    **{
+                        key: copy.deepcopy(value)
+                        for key, value in risk_context.items()
+                        if key not in {'_core_activation', 'trigger_rule'}
+                    },
+                },
+                max_bytes=EXEC_EXIT_RISK_CONTEXT_MAX_BYTES,
+                label='exec_protective_exit_risk_context',
+                essential_keys=(
+                    EXEC_PROTECTIVE_EXIT_RISK_CONTEXT_ESSENTIAL_KEYS
+                ),
+            )
+        else:
+            item['risk_context'] = {
+                **risk_context,
+                '_core_activation': copy.deepcopy(binding),
+            }
+    try:
+        return serialize_execution_plan_dispatch_payload(candidate)
+    except ValueError as exc:
+        raise SignalDeciderExecPayloadContractError(str(exc)) from exc
 
 
 def _core_activation_binding_from_plan(
@@ -1124,7 +1288,7 @@ def _build_execution_activation_payload(
         'authority_generation_fingerprint': binding[
             'authority_generation_fingerprint'
         ],
-        'requested_at': _utcnow().isoformat(),
+        'requested_at': str(plan_payload['requested_at']),
         'items': [
             {
                 'core_item_key': str(item['core_item_key']),
@@ -1346,6 +1510,10 @@ def _build_pending_core_activation_request(
     request_total_counts = {
         summary.get('total_item_count') for summary in request_summaries
     }
+    activation_requested_ats = {
+        _normalize_optional_text(summary.get('requested_at'))
+        for summary in request_summaries
+    }
     response_total_counts = {
         summary.get('total_item_count') for summary in response_summaries
     }
@@ -1357,6 +1525,8 @@ def _build_pending_core_activation_request(
     }
     if (
         len(request_total_counts) != 1
+        or None in activation_requested_ats
+        or len(activation_requested_ats) != 1
         or len(response_total_counts) != 1
         or len(accepted_item_counts) != 1
         or rejected_item_counts != {0}
@@ -1466,7 +1636,7 @@ def _build_pending_core_activation_request(
             'authority_generation_fingerprint': (
                 authority_generation_fingerprint
             ),
-            'requested_at': _utcnow().isoformat(),
+            'requested_at': str(next(iter(activation_requested_ats))),
             'items': activation_items,
         },
         revision_fingerprints,
@@ -3288,6 +3458,23 @@ class SignalDeciderExecIntegrationService:
                     },
                     [],
                 )
+            if isinstance(exc, SignalDeciderExecClientError) and exc.retryable:
+                return (
+                    {
+                        **persisted_group_result,
+                        'activation_status': 'pending',
+                        'activation_error': _serialize_error(
+                            code=exc.code,
+                            message=str(exc),
+                            retryable=True,
+                            status_code=exc.status_code,
+                        ),
+                        'activation_request_created': (
+                            activation_request is not None
+                        ),
+                    },
+                    [],
+                )
             error = (
                 _serialize_error(
                     code=exc.code,
@@ -3615,6 +3802,21 @@ class SignalDeciderExecIntegrationService:
                             'plan_id': plan_id,
                             'status': 'superseded_generation',
                             'reason_code': 'activation_generation_superseded',
+                        }
+                    )
+                    continue
+                if isinstance(exc, SignalDeciderExecClientError) and exc.retryable:
+                    results.append(
+                        {
+                            'plan_id': plan_id,
+                            'status': 'activation_pending',
+                            'reason_code': 'activation_transport_retryable',
+                            'error': _serialize_error(
+                                code=exc.code,
+                                message=str(exc),
+                                retryable=True,
+                                status_code=exc.status_code,
+                            ),
                         }
                     )
                     continue
@@ -8804,7 +9006,7 @@ class SignalDeciderExecIntegrationService:
                 or ('pending_trigger_limit' if is_short_term else 'next_open_market')
             )
             core_entry_key = f'core-plan-{row.id}:{entry_intent}'
-            decider_handoff_context = self._build_decider_handoff_context(
+            full_decider_handoff_context = self._build_decider_handoff_context(
                 row=row,
                 snapshot=snapshot,
                 traceability=traceability,
@@ -8812,13 +9014,13 @@ class SignalDeciderExecIntegrationService:
                 decision_traceability=decision_traceability,
             )
             decision_input_quality_context = (
-                decider_handoff_context.get('decision_input_quality_context')
-                if isinstance(decider_handoff_context.get('decision_input_quality_context'), dict)
+                full_decider_handoff_context.get('decision_input_quality_context')
+                if isinstance(full_decider_handoff_context.get('decision_input_quality_context'), dict)
                 else {}
             )
             market_regime_context = (
-                decider_handoff_context.get('market_regime_context')
-                if isinstance(decider_handoff_context.get('market_regime_context'), dict)
+                full_decider_handoff_context.get('market_regime_context')
+                if isinstance(full_decider_handoff_context.get('market_regime_context'), dict)
                 else {}
             )
             market_regime_sizing_policy = _build_market_regime_sizing_policy(market_regime_context)
@@ -8894,9 +9096,101 @@ class SignalDeciderExecIntegrationService:
                     'reason': 'general_signal_decider_uses_decider_holding_context_no_short_term_forced_close',
                 }
             )
+            decider_handoff_context_digest = _dispatch_payload_digest(
+                full_decider_handoff_context
+            )
+            decider_handoff_context = _bounded_dispatch_object(
+                full_decider_handoff_context,
+                max_bytes=EXEC_DECIDER_HANDOFF_MAX_BYTES,
+                label='exec_decider_handoff_context',
+                essential_keys=(
+                    'schema_version',
+                    'classification',
+                    'symbol',
+                    'target_trade_date',
+                    'source_market_date',
+                    'traceability',
+                    'decider_input_context',
+                    'market_regime_context',
+                    'decision_input_quality_context',
+                    'decider_output',
+                    'eod_pre_decider_enrichment_metadata',
+                ),
+            )
+            validation_projection = _bounded_dispatch_object(
+                validation,
+                max_bytes=6 * 1024,
+                label='exec_validation_context',
+                essential_keys=(
+                    'blocking_reasons',
+                    'warnings',
+                    'short_term_entry_quality',
+                    'performance_gate',
+                    'alignment_gate',
+                    'signal_decider_alignment',
+                    'alignment_gate_action',
+                    'alignment_gate_reason',
+                    'alignment_signal_decider_decision_snapshot_id',
+                    'pricing_note',
+                ),
+            )
+            traceability_projection = _bounded_dispatch_object(
+                decision_traceability,
+                max_bytes=4 * 1024,
+                label='exec_decision_traceability',
+                essential_keys=(
+                    'schema_version',
+                    'gate_checks',
+                    'decision_provenance',
+                    'model_identity',
+                ),
+            )
+            decision_input_quality_projection = _bounded_dispatch_object(
+                decision_input_quality_context,
+                max_bytes=6 * 1024,
+                label='exec_decision_input_quality_context',
+                essential_keys=(
+                    'schema_version',
+                    'overall_status',
+                    'execution_feasibility',
+                    'final_judgment',
+                    'confidence_adjustment',
+                ),
+            )
+            market_regime_projection = _bounded_dispatch_object(
+                market_regime_context,
+                max_bytes=4 * 1024,
+                label='exec_market_regime_context',
+                essential_keys=(
+                    'schema_version',
+                    'market_regime',
+                    'posture',
+                    'reason_code',
+                    'recommended_exec_action',
+                    'recommended_sizing_multiplier',
+                    'market_breadth',
+                    'sector_context',
+                ),
+            )
+            execution_feasibility_projection = _bounded_dispatch_object(
+                execution_feasibility_context,
+                max_bytes=3 * 1024,
+                label='exec_execution_feasibility_context',
+                essential_keys=(
+                    'status',
+                    'score',
+                    'expected_slippage_bps',
+                    'expected_slippage_basis',
+                    'expected_slippage_status',
+                    'expected_slippage_reason',
+                    'liquidity_tier',
+                    'max_safe_notional_krw',
+                    'sizing_hints',
+                ),
+            )
             common_risk_context = {
                 'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
-                'classification': decider_handoff_context['classification'],
+                'classification': full_decider_handoff_context['classification'],
                 'agent_name': row_decision_agent_name,
                 'decision_agent_name': row_decision_agent_name,
                 'core_plan_item_id': row.id,
@@ -8951,13 +9245,17 @@ class SignalDeciderExecIntegrationService:
                 'entry_execution_mode': entry_execution_mode,
                 'monitoring_candidate': bool(is_short_term),
                 'monitoring_intent': entry_intent if is_short_term else None,
-                'validation': validation,
-                'traceability': decision_traceability,
+                'decider_handoff_context_digest': decider_handoff_context_digest,
+            }
+            entry_common_risk_context = {
+                **common_risk_context,
+                'validation': validation_projection,
+                'traceability': traceability_projection,
                 'decider_handoff_context': decider_handoff_context,
-                'market_regime_context': market_regime_context,
+                'market_regime_context': market_regime_projection,
                 'market_regime_sizing_policy': market_regime_sizing_policy,
-                'decision_input_quality_context': decision_input_quality_context,
-                'execution_feasibility_context': execution_feasibility_context,
+                'decision_input_quality_context': decision_input_quality_projection,
+                'execution_feasibility_context': execution_feasibility_projection,
             }
             enforced_probe = bool(
                 is_short_term
@@ -9028,6 +9326,101 @@ class SignalDeciderExecIntegrationService:
                     'quantity_multiplier_valid_until': market_regime_sizing_policy['valid_until'],
                 }
             )
+            entry_risk_context = _bounded_dispatch_object(
+                {
+                    **entry_common_risk_context,
+                    'delegated_gate_codes': delegated_gate_codes,
+                    'delegated_gate_confirmation_required': delegated_gate_confirmation_required,
+                    'delegated_gates': delegated_gates,
+                    'entry_price_basis': snapshot.entry_price_basis if snapshot is not None else 'next_open',
+                    'expected_return_pct': _to_json_number(
+                        _safe_decimal(snapshot.expected_return_pct if snapshot else None)
+                    ),
+                    'confidence_score_10': _to_json_number(
+                        _safe_decimal(snapshot.confidence_score_10 if snapshot is not None else None)
+                    ),
+                    'conviction_score_10': _to_json_number(
+                        _safe_decimal(snapshot.conviction_score_10 if snapshot is not None else None)
+                    ),
+                    'thesis_summary': snapshot.thesis_summary if snapshot is not None else None,
+                    'supporting_evidence': snapshot.supporting_evidence_payload if snapshot is not None else [],
+                    'decision_risks': snapshot.decision_risks_payload if snapshot is not None else [],
+                    'invalidation_conditions': snapshot.invalidation_conditions_payload if snapshot is not None else [],
+                    'data_quality_warnings': snapshot.data_quality_warnings_payload if snapshot is not None else [],
+                    'response_summary': response_summary if isinstance(response_summary, dict) else None,
+                    'response_payload_summary': (
+                        response_payload_summary
+                        if isinstance(response_payload_summary, dict)
+                        else None
+                    ),
+                },
+                max_bytes=EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES,
+                label='exec_entry_risk_context',
+                essential_keys=(
+                    'schema_version',
+                    'classification',
+                    'agent_name',
+                    'decision_agent_name',
+                    'core_plan_item_id',
+                    'core_client_order_id',
+                    'account_reference',
+                    'account_label',
+                    'target_trade_date',
+                    'source_market_date',
+                    'policy_version',
+                    'decision_snapshot_id',
+                    'decision_run_id',
+                    'target_price',
+                    'stop_loss_price',
+                    'allocation_budget_krw',
+                    'entry_execution_mode',
+                    'delegated_gate_codes',
+                    'delegated_gate_confirmation_required',
+                    'delegated_gates',
+                    'validation',
+                    'decider_handoff_context',
+                    'decider_handoff_context_digest',
+                    'market_regime_context',
+                    'market_regime_sizing_policy',
+                    'decision_input_quality_context',
+                    'execution_feasibility_context',
+                    'expected_return_pct',
+                    'confidence_score_10',
+                    'conviction_score_10',
+                    'thesis_summary',
+                    'supporting_evidence',
+                    'decision_risks',
+                ),
+            )
+            full_protective_exit_risk_context = {
+                'schema_version': EXEC_SOURCE_SCHEMA_VERSION,
+                'agent_name': row_decision_agent_name,
+                'decision_agent_name': row_decision_agent_name,
+                'core_plan_item_id': row.id,
+                'account_reference': row.account_reference,
+                'account_label': row.account_label,
+                'target_trade_date': row.target_trade_date.isoformat(),
+                'source_market_date': row.source_market_date.isoformat(),
+                'policy_version': row.policy_version,
+                'decision_snapshot_id': row.decision_snapshot_id,
+                'decision_run_id': traceability.get('decision_run_id'),
+                'target_price': target_price,
+                'stop_loss_price': stop_loss_price,
+                'expected_return_pct': _to_json_number(
+                    _safe_decimal(snapshot.expected_return_pct if snapshot else None)
+                ),
+                'confidence_score_10': _to_json_number(
+                    _safe_decimal(snapshot.confidence_score_10 if snapshot is not None else None)
+                ),
+                'conviction_score_10': _to_json_number(
+                    _safe_decimal(snapshot.conviction_score_10 if snapshot is not None else None)
+                ),
+                'thesis_summary': snapshot.thesis_summary if snapshot is not None else None,
+                'supporting_evidence': snapshot.supporting_evidence_payload if snapshot is not None else [],
+                'decision_risks': snapshot.decision_risks_payload if snapshot is not None else [],
+                'market_regime_context': market_regime_projection,
+                'decider_handoff_context_digest': decider_handoff_context_digest,
+            }
             entry_item = {
                 'core_item_key': core_entry_key,
                 'source_plan_item_id': core_entry_key,
@@ -9045,27 +9438,7 @@ class SignalDeciderExecIntegrationService:
                 'limit_price': _to_json_number(_safe_decimal(chase_limit_price)) if is_short_term else None,
                 'trigger_price': _to_json_number(_safe_decimal(trigger_price)) if is_short_term else None,
                 'time_in_force': row.planned_time_in_force,
-                'risk_context': {
-                    **common_risk_context,
-                    'delegated_gate_codes': delegated_gate_codes,
-                    'delegated_gate_confirmation_required': delegated_gate_confirmation_required,
-                    'delegated_gates': delegated_gates,
-                    'entry_price_basis': snapshot.entry_price_basis if snapshot is not None else 'next_open',
-                    'expected_return_pct': _to_json_number(_safe_decimal(snapshot.expected_return_pct if snapshot else None)),
-                    'confidence_score_10': _to_json_number(
-                        _safe_decimal(snapshot.confidence_score_10 if snapshot is not None else None)
-                    ),
-                    'conviction_score_10': _to_json_number(
-                        _safe_decimal(snapshot.conviction_score_10 if snapshot is not None else None)
-                    ),
-                    'thesis_summary': snapshot.thesis_summary if snapshot is not None else None,
-                    'supporting_evidence': snapshot.supporting_evidence_payload if snapshot is not None else [],
-                    'decision_risks': snapshot.decision_risks_payload if snapshot is not None else [],
-                    'invalidation_conditions': snapshot.invalidation_conditions_payload if snapshot is not None else [],
-                    'data_quality_warnings': snapshot.data_quality_warnings_payload if snapshot is not None else [],
-                    'response_summary': response_summary if isinstance(response_summary, dict) else None,
-                    'response_payload_summary': response_payload_summary if isinstance(response_payload_summary, dict) else None,
-                },
+                'risk_context': entry_risk_context,
                 'decision_snapshot_id': str(row.decision_snapshot_id),
             }
             items.append(entry_item)
@@ -9111,10 +9484,17 @@ class SignalDeciderExecIntegrationService:
                         'limit_price': None,
                         'trigger_price': target_price,
                         'time_in_force': row.planned_time_in_force,
-                        'risk_context': {
-                            **common_risk_context,
-                            'trigger_rule': EXEC_INTENT_TARGET_SELL,
-                        },
+                        'risk_context': _bounded_dispatch_object(
+                            {
+                                'trigger_rule': EXEC_INTENT_TARGET_SELL,
+                                **full_protective_exit_risk_context,
+                            },
+                            max_bytes=EXEC_EXIT_RISK_CONTEXT_MAX_BYTES,
+                            label='exec_target_exit_risk_context',
+                            essential_keys=(
+                                EXEC_PROTECTIVE_EXIT_RISK_CONTEXT_ESSENTIAL_KEYS
+                            ),
+                        ),
                         'decision_snapshot_id': str(row.decision_snapshot_id),
                     }
                 )
@@ -9151,10 +9531,17 @@ class SignalDeciderExecIntegrationService:
                         'limit_price': None,
                         'trigger_price': stop_loss_price,
                         'time_in_force': row.planned_time_in_force,
-                        'risk_context': {
-                            **common_risk_context,
-                            'trigger_rule': EXEC_INTENT_STOP_SELL,
-                        },
+                        'risk_context': _bounded_dispatch_object(
+                            {
+                                'trigger_rule': EXEC_INTENT_STOP_SELL,
+                                **full_protective_exit_risk_context,
+                            },
+                            max_bytes=EXEC_EXIT_RISK_CONTEXT_MAX_BYTES,
+                            label='exec_stop_exit_risk_context',
+                            essential_keys=(
+                                EXEC_PROTECTIVE_EXIT_RISK_CONTEXT_ESSENTIAL_KEYS
+                            ),
+                        ),
                         'decision_snapshot_id': str(row.decision_snapshot_id),
                     }
                 )
@@ -9194,7 +9581,11 @@ class SignalDeciderExecIntegrationService:
                 'dispatch_batch_key': effective_batch_key,
             },
         }
-        return serialize_execution_plan_dispatch_payload(payload), row_links
+        try:
+            serialized_payload = serialize_execution_plan_dispatch_payload(payload)
+        except ValueError as exc:
+            raise SignalDeciderExecPayloadContractError(str(exc)) from exc
+        return serialized_payload, row_links
 
     def _rows_match_existing_dispatch(
         self,
@@ -9312,6 +9703,10 @@ class SignalDeciderExecIntegrationService:
                         != existing_exec.get('prior_eligibility_status')
                     )
                 )
+                authority_fingerprint_changed = bool(
+                    current_revision_fingerprint
+                    != submitted_revision_fingerprint
+                )
                 attempt = {
                     'attempted_at': now.isoformat(),
                     'trigger': trigger,
@@ -9416,7 +9811,7 @@ class SignalDeciderExecIntegrationService:
                         'observed_at': now.isoformat(),
                         'reason_code': (
                             'ambiguous_remote_acceptance_after_core_revision'
-                            if row_revision_changed
+                            if authority_fingerprint_changed
                             else 'ambiguous_remote_acceptance'
                         ),
                         'submitted_dispatch_revision_fingerprint': (

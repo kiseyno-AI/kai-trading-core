@@ -794,6 +794,241 @@ def enforce_json_size(payload: dict[str, Any], *, max_bytes: int, label: str) ->
     return fallback
 
 
+def _selected_json_fields(value: Any, keys: Sequence[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: copy.deepcopy(_json_safe(value.get(key)))
+        for key in keys
+        if key in value and value.get(key) is not None
+    }
+
+
+def _compact_revision_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    compact = _selected_json_fields(
+        value,
+        (
+            'decision_snapshot_id',
+            'decision_agent_name',
+            'symbol',
+            'execution_status',
+            'eligibility_status',
+            'archived_at',
+            'reason_code',
+        ),
+    )
+    dispatch = value.get('dispatch_evidence')
+    if isinstance(dispatch, dict):
+        compact_dispatch = _selected_json_fields(
+            dispatch,
+            (
+                'plan_id',
+                'plan_fingerprint',
+                'dispatch_revision_fingerprint',
+                'dispatch_material_fingerprint',
+                'dispatch_status',
+                'destination_binding',
+                'contract_proof',
+            ),
+        )
+        if isinstance(dispatch.get('item_links'), list):
+            compact_dispatch['item_links'] = copy.deepcopy(
+                _json_safe(dispatch.get('item_links'))
+            )
+        compact['dispatch_evidence'] = compact_dispatch
+    return compact or None
+
+
+def _compact_revocation_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    compact = _selected_json_fields(
+        value,
+        (
+            'schema_version',
+            'status',
+            'reason_code',
+            'requested_at',
+            'acknowledged_at',
+            'prior_decision_snapshot_id',
+            'replacement_decision_snapshot_id',
+            'replacement_observation_id',
+            'replacement_action',
+            'replacement_actionable',
+            'plan_id',
+            'failure_source',
+            'destination_binding',
+            'prior_dispatch_revision_fingerprint',
+            'replacement_dispatch_revision_fingerprint',
+            'prior_authority_generation_fingerprint',
+            'replacement_authority_generation_fingerprint',
+            'prior_row_authority_fingerprint',
+            'revoked_row_authority_fingerprint',
+        ),
+    )
+    if isinstance(value.get('item_links'), list):
+        compact['item_links'] = copy.deepcopy(_json_safe(value.get('item_links')))
+    request = value.get('request')
+    if isinstance(request, dict):
+        compact_request = _selected_json_fields(
+            request,
+            (
+                'schema_version',
+                'plan_id',
+                'reason_code',
+                'replacement_decision_snapshot_id',
+                'replacement_observation_id',
+                'requested_at',
+            ),
+        )
+        if isinstance(request.get('items'), list):
+            compact_request['items'] = copy.deepcopy(_json_safe(request.get('items')))
+        compact['request'] = compact_request
+    response = value.get('response')
+    if isinstance(response, dict):
+        compact_response = _selected_json_fields(
+            response,
+            (
+                'schema_version',
+                'plan_id',
+                'execution_plan_id',
+                'status',
+                'contract_ack',
+                'reason_code',
+                'accepted_count',
+                'rejected_count',
+                'revoked_count',
+            ),
+        )
+        if isinstance(response.get('item_acks'), list):
+            compact_response['item_acks'] = copy.deepcopy(
+                _json_safe(response.get('item_acks'))
+            )
+        compact['response'] = compact_response
+    return compact or None
+
+
+def _compact_dispatch_reconciliation(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    compact = _selected_json_fields(
+        value,
+        (
+            'schema_version',
+            'status',
+            'reason_code',
+            'requested_at',
+            'reconciled_at',
+            'observed_at',
+            'trigger',
+            'plan_id',
+            'plan_fingerprint',
+            'submitted_dispatch_revision_fingerprint',
+            'current_dispatch_revision_fingerprint',
+            'dispatch_material_fingerprint',
+            'raw_dispatch_status',
+            'destination_binding',
+            'expected_destination',
+            'active_destination',
+            'remote_authority_created',
+            'requeued_at',
+            'requeue_trigger',
+        ),
+    )
+    error = summarize_error(value.get('error'))
+    if error:
+        compact['error'] = error
+    return compact or None
+
+
+def _compact_pending_activation_request_summary(
+    value: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    compact = _selected_json_fields(
+        value,
+        (
+            'schema_version',
+            'plan_id',
+            'requested_at',
+            'total_item_count',
+            'row_item_count',
+        ),
+    )
+    row_items = value.get('row_items')
+    if isinstance(row_items, list):
+        compact['row_items'] = [
+            item
+            for raw_item in row_items
+            if (
+                item := _selected_json_fields(
+                    raw_item,
+                    ('core_item_key', 'decision_snapshot_id'),
+                )
+            )
+        ]
+    metadata = value.get('metadata')
+    if isinstance(metadata, dict):
+        compact['metadata'] = copy.deepcopy(_json_safe(metadata))
+    return compact or None
+
+
+def _compact_pending_activation_response_summary(
+    value: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    compact = _selected_json_fields(
+        value,
+        (
+            'schema_version',
+            'execution_plan_id',
+            'accepted_item_count',
+            'rejected_item_count',
+            'total_item_count',
+            'row_item_count',
+        ),
+    )
+    row_items = value.get('row_items')
+    if isinstance(row_items, list):
+        compact['row_items'] = [
+            item
+            for raw_item in row_items
+            if (
+                item := _selected_json_fields(
+                    raw_item,
+                    (
+                        'core_item_key',
+                        'execution_plan_id',
+                        'execution_plan_item_id',
+                    ),
+                )
+            )
+        ]
+    contract_ack = value.get('contract_ack')
+    if isinstance(contract_ack, dict):
+        compact['contract_ack'] = copy.deepcopy(_json_safe(contract_ack))
+    return compact or None
+
+
+def _with_field_if_fits(
+    target: dict[str, Any],
+    key: str,
+    value: Any,
+    *,
+    max_bytes: int,
+) -> bool:
+    candidate = copy.deepcopy(target)
+    candidate[key] = value
+    if json_size_bytes(candidate) > max_bytes:
+        return False
+    target[key] = value
+    return True
+
+
 def slim_signal_decider_exec_submission_payload(
     payload: Any,
     *,
@@ -824,7 +1059,7 @@ def slim_signal_decider_exec_submission_payload(
         for item in (exec_dispatch.get('item_links') or [])
         if (compact := compact_exec_item_link(item))
     ]
-    slimmed_exec: dict[str, Any] = {
+    critical_exec: dict[str, Any] = {
         'plan_id': exec_dispatch.get('plan_id'),
         'plan_fingerprint': exec_dispatch.get('plan_fingerprint'),
         'dispatch_revision_fingerprint': exec_dispatch.get(
@@ -837,51 +1072,76 @@ def slim_signal_decider_exec_submission_payload(
         'dispatch_status': exec_dispatch.get('dispatch_status'),
         'prior_execution_status': exec_dispatch.get('prior_execution_status'),
         'prior_eligibility_status': exec_dispatch.get('prior_eligibility_status'),
-        'last_attempt_at': exec_dispatch.get('last_attempt_at'),
-        'last_success_at': exec_dispatch.get('last_success_at'),
         'last_error': summarize_error(exec_dispatch.get('last_error')),
         'item_links': item_links,
-        'attempts': [_shallow_slim(item) for item in (exec_dispatch.get('attempts') or [])[-5:]],
     }
     contract_proof = exec_dispatch.get('contract_proof')
     if isinstance(contract_proof, dict):
-        slimmed_exec['contract_proof'] = _shallow_slim(contract_proof)
+        critical_exec['contract_proof'] = copy.deepcopy(_json_safe(contract_proof))
     destination_binding = exec_dispatch.get('destination_binding')
     if isinstance(destination_binding, dict):
-        slimmed_exec['destination_binding'] = _shallow_slim(destination_binding)
+        critical_exec['destination_binding'] = copy.deepcopy(
+            _json_safe(destination_binding)
+        )
     authority_generation_before = exec_dispatch.get('authority_generation_before')
     if isinstance(authority_generation_before, dict):
-        slimmed_exec['authority_generation_before'] = _shallow_slim(
-            authority_generation_before
+        critical_exec['authority_generation_before'] = copy.deepcopy(
+            _json_safe(authority_generation_before)
         )
+
     request_summary = exec_dispatch.get('last_request_summary')
     if not isinstance(request_summary, dict):
         request_summary = compact_exec_request_summary(
             exec_dispatch.get('last_request_payload'),
             item_links=item_links,
         )
-    if isinstance(request_summary, dict):
-        slimmed_exec['last_request_summary'] = request_summary
     response_summary = exec_dispatch.get('last_response_summary')
     if not isinstance(response_summary, dict):
         response_summary = compact_exec_response_summary(
             exec_dispatch.get('last_response_payload'),
             item_links=item_links,
         )
-    if isinstance(response_summary, dict):
-        slimmed_exec['last_response_summary'] = response_summary
+    core_activation = (
+        contract_proof.get('core_activation')
+        if isinstance(contract_proof, dict)
+        and isinstance(contract_proof.get('core_activation'), dict)
+        else {}
+    )
+    pending_activation = (
+        _normalize_text(core_activation.get('status'), lowercase=True)
+        == 'pending'
+    )
+    if pending_activation:
+        compact_request_summary = _compact_pending_activation_request_summary(
+            request_summary
+        )
+        compact_response_summary = _compact_pending_activation_response_summary(
+            response_summary
+        )
+        if compact_request_summary is not None:
+            critical_exec['last_request_summary'] = compact_request_summary
+        if compact_response_summary is not None:
+            critical_exec['last_response_summary'] = compact_response_summary
+
+    optional_exec: dict[str, Any] = {
+        'last_attempt_at': exec_dispatch.get('last_attempt_at'),
+        'last_success_at': exec_dispatch.get('last_success_at'),
+        'attempts': [
+            _shallow_slim(item)
+            for item in (exec_dispatch.get('attempts') or [])[-5:]
+        ],
+    }
+    if isinstance(request_summary, dict) and not pending_activation:
+        optional_exec['last_request_summary'] = request_summary
+    if isinstance(response_summary, dict) and not pending_activation:
+        optional_exec['last_response_summary'] = response_summary
     readback = compact_exec_readback(exec_dispatch.get('readback'))
     if readback:
-        slimmed_exec['readback'] = readback
+        optional_exec['readback'] = readback
     core_state_sync = exec_dispatch.get('core_state_sync')
     if isinstance(core_state_sync, dict):
-        slimmed_exec['core_state_sync'] = _shallow_slim(core_state_sync)
+        optional_exec['core_state_sync'] = _shallow_slim(core_state_sync)
 
-    slimmed_payload = {
-        'mode': payload.get('mode') or 'exec_dispatch',
-        'latest': _shallow_slim(payload.get('latest')),
-        'exec_dispatch': slimmed_exec,
-    }
     raw_lifecycle_payload: dict[str, Any] = {}
     for lifecycle_key, expected_type in (
         ('revision_history', list),
@@ -898,64 +1158,101 @@ def slim_signal_decider_exec_submission_payload(
                     else raw_lifecycle_evidence
                 )
             )
-    lifecycle_payload = copy.deepcopy(raw_lifecycle_payload)
-    if json_size_bytes(lifecycle_payload) > max_bytes // 2:
-        lifecycle_payload = {
-            key: _shallow_slim(value)
-            for key, value in raw_lifecycle_payload.items()
-        }
-        raw_revocation = raw_lifecycle_payload.get('revocation')
-        compact_revocation = lifecycle_payload.get('revocation')
-        if isinstance(raw_revocation, dict) and isinstance(compact_revocation, dict):
-            compact_revocation['item_links'] = copy.deepcopy(
-                raw_revocation.get('item_links') or []
-            )
-        for raw_revision, compact_revision in zip(
-            raw_lifecycle_payload.get('revision_history') or [],
-            lifecycle_payload.get('revision_history') or [],
-            strict=True,
-        ):
-            if not isinstance(raw_revision, dict) or not isinstance(
-                compact_revision, dict
-            ):
-                continue
-            raw_dispatch = raw_revision.get('dispatch_evidence')
-            compact_dispatch = compact_revision.get('dispatch_evidence')
-            if isinstance(raw_dispatch, dict) and isinstance(compact_dispatch, dict):
-                compact_dispatch['item_links'] = copy.deepcopy(
-                    raw_dispatch.get('item_links') or []
-                )
-        for raw_record, compact_record in zip(
-            raw_lifecycle_payload.get('revocation_history') or [],
-            lifecycle_payload.get('revocation_history') or [],
-            strict=True,
-        ):
-            if not isinstance(raw_record, dict) or not isinstance(compact_record, dict):
-                continue
-            raw_request = raw_record.get('request')
-            compact_request = compact_record.get('request')
-            if isinstance(raw_request, dict) and isinstance(compact_request, dict):
-                compact_request['items'] = copy.deepcopy(raw_request.get('items') or [])
-            raw_response = raw_record.get('response')
-            compact_response = compact_record.get('response')
-            if isinstance(raw_response, dict) and isinstance(compact_response, dict):
-                compact_response['item_acks'] = copy.deepcopy(
-                    raw_response.get('item_acks') or []
-                )
-    lifecycle_reserve = json_size_bytes(lifecycle_payload) + 256
-    slimmed_payload = enforce_json_size(
-        slimmed_payload,
-        max_bytes=max(max_bytes - lifecycle_reserve, 1024),
-        label='signal_decider_submission_payload',
+    active_revocation = None
+    raw_revocation = raw_lifecycle_payload.get('revocation')
+    if (
+        isinstance(raw_revocation, dict)
+        and _normalize_text(raw_revocation.get('status'), lowercase=True)
+        == 'pending'
+    ):
+        active_revocation = _compact_revocation_record(raw_revocation)
+    reconciliation = _compact_dispatch_reconciliation(
+        raw_lifecycle_payload.get('dispatch_reconciliation')
     )
-    slimmed_payload.update(lifecycle_payload)
+
+    slimmed_payload: dict[str, Any] = {
+        'mode': payload.get('mode') or 'exec_dispatch',
+        'exec_dispatch': critical_exec,
+    }
+    if active_revocation is not None:
+        slimmed_payload['revocation'] = active_revocation
+    if reconciliation is not None:
+        slimmed_payload['dispatch_reconciliation'] = reconciliation
+    latest = _shallow_slim(payload.get('latest'))
+    if json_size_bytes(slimmed_payload) > max_bytes:
+        raise ValueError(
+            'active exec dispatch, activation replay, or lifecycle recovery proof '
+            f'exceeds the submission payload budget ({max_bytes} bytes)'
+        )
+
+    full_candidate = copy.deepcopy(slimmed_payload)
+    full_candidate['exec_dispatch'].update(
+        {key: value for key, value in optional_exec.items() if value is not None}
+    )
+    if latest is not None:
+        full_candidate['latest'] = latest
+    full_candidate.update(raw_lifecycle_payload)
+    if json_size_bytes(full_candidate) <= max_bytes:
+        slimmed_payload = full_candidate
+    else:
+        if latest is not None:
+            _with_field_if_fits(
+                slimmed_payload,
+                'latest',
+                latest,
+                max_bytes=max_bytes,
+            )
+        for key, value in optional_exec.items():
+            if value is None:
+                continue
+            candidate_exec = copy.deepcopy(slimmed_payload['exec_dispatch'])
+            candidate_exec[key] = value
+            _with_field_if_fits(
+                slimmed_payload,
+                'exec_dispatch',
+                candidate_exec,
+                max_bytes=max_bytes,
+            )
+        revocation = _compact_revocation_record(raw_lifecycle_payload.get('revocation'))
+        if revocation and active_revocation is None:
+            _with_field_if_fits(
+                slimmed_payload,
+                'revocation',
+                revocation,
+                max_bytes=max_bytes,
+            )
+        for history_key, compact_record in (
+            ('revision_history', _compact_revision_record),
+            ('revocation_history', _compact_revocation_record),
+        ):
+            raw_history = raw_lifecycle_payload.get(history_key)
+            if not isinstance(raw_history, list):
+                continue
+            compact_history = [
+                record
+                for item in raw_history[-2:]
+                if (record := compact_record(item))
+            ]
+            while compact_history and not _with_field_if_fits(
+                slimmed_payload,
+                history_key,
+                compact_history,
+                max_bytes=max_bytes,
+            ):
+                compact_history = compact_history[1:]
+
     slimmed_size = json_size_bytes(slimmed_payload)
+    if slimmed_size > max_bytes:
+        raise ValueError(
+            f'slimmed exec submission payload exceeds {max_bytes} bytes: '
+            f'{slimmed_size}'
+        )
     return SubmissionPayloadSlimmingResult(
         payload=slimmed_payload,
         changed=slimmed_payload != payload,
         original_size_bytes=original_size,
         slimmed_size_bytes=slimmed_size,
-        truncated=bool(slimmed_payload.get('storage_slimming')),
+        truncated=slimmed_payload != payload,
     )
 
 

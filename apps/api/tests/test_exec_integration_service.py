@@ -36,6 +36,7 @@ from app.market.session import (
 from app.orders.exec_integration import (
     CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS,
     EXEC_ENTRY_BUY_INTENTS,
+    EXEC_EXIT_RISK_CONTEXT_MAX_BYTES,
     EXEC_INTENT_INTRADAY_WATCH_BUY,
     EXEC_INTENT_NEXT_OPEN_BUY,
     EXEC_INTENT_STOP_SELL,
@@ -45,6 +46,8 @@ from app.orders.exec_integration import (
     SignalDeciderExecClientError,
     SignalDeciderExecIntegrationService,
     SignalDeciderExecPayloadContractError,
+    _bind_core_confirmed_activation,
+    _bounded_dispatch_object,
     _build_market_regime_sizing_policy,
     _collect_items,
     _delegated_gate_contract_error,
@@ -60,6 +63,7 @@ from app.orders.exec_integration import (
     _row_has_accepted_exec_dispatch,
 )
 from app.orders.execution_handoff_contract import (
+    EXECUTION_PLAN_DISPATCH_MAX_BYTES,
     EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
     EXECUTION_HANDOFF_CAPABILITY,
     EXECUTION_HANDOFF_CONTRACT_VERSION,
@@ -383,6 +387,48 @@ def test_exec_payload_json_normalization_removes_nonfinite_values() -> None:
         'float_infinity': None,
     }
     json.dumps(normalized, allow_nan=False)
+
+
+def test_bounded_dispatch_projection_never_drops_late_essential_keys() -> None:
+    payload = {
+        **{f'nonessential_{index}': f'value-{index}' for index in range(30)},
+        'delegated_gate_codes': ['delegated_live_cost_gate'],
+        'delegated_gate_confirmation_required': True,
+        'decider_handoff_context_digest': 'd' * 64,
+        'oversized_diagnostic': 'x' * 8_000,
+    }
+
+    projected = _bounded_dispatch_object(
+        payload,
+        max_bytes=2 * 1024,
+        label='test_entry_risk_context',
+        essential_keys=(
+            'delegated_gate_codes',
+            'delegated_gate_confirmation_required',
+            'decider_handoff_context_digest',
+        ),
+    )
+
+    assert projected['delegated_gate_codes'] == ['delegated_live_cost_gate']
+    assert projected['delegated_gate_confirmation_required'] is True
+    assert projected['decider_handoff_context_digest'] == 'd' * 64
+    assert len(json.dumps(projected, separators=(',', ':')).encode('utf-8')) <= 2 * 1024
+
+
+def test_bounded_dispatch_projection_fails_closed_when_essentials_exceed_budget() -> None:
+    essential_keys = tuple(f'identity_{index}' for index in range(8))
+    payload = {key: 'x' * 2_000 for key in essential_keys}
+
+    with unittest.TestCase().assertRaisesRegex(
+        SignalDeciderExecPayloadContractError,
+        'exceeds bounded projection budget',
+    ):
+        _bounded_dispatch_object(
+            payload,
+            max_bytes=2 * 1024,
+            label='test_protective_exit_risk_context',
+            essential_keys=essential_keys,
+        )
 
 
 def test_v4_dispatch_contract_requires_exact_schema_and_capability() -> None:
@@ -4125,6 +4171,111 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.submission_payload['revocation']['status'], 'pending')
             self.assertNotIn('revocation_history', row.submission_payload)
 
+    async def test_known_manual_review_reason_persists_terminal_revocation_ack(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_manual_review_revocation',
+        )
+        self.client.post_calls.clear()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            submission = copy.deepcopy(row.submission_payload)
+            exec_dispatch = submission['exec_dispatch']
+            item_links = copy.deepcopy(exec_dispatch['item_links'])
+            plan_id = exec_dispatch['plan_id']
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'revocation_pending'
+            row.submitted_at = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+            row.submission_payload = {
+                **submission,
+                'revocation': {
+                    'status': 'pending',
+                    'reason_code': 'current_live_market_evidence_unavailable',
+                    'requested_at': '2026-04-30T00:00:00+00:00',
+                    'prior_decision_snapshot_id': str(self.snapshot_id),
+                    'replacement_decision_snapshot_id': (
+                        'observation:evidence-unavailable:manual-review'
+                    ),
+                    'replacement_action': 'reject',
+                    'replacement_actionable': False,
+                    'plan_id': plan_id,
+                    'destination_binding': copy.deepcopy(
+                        exec_dispatch['destination_binding']
+                    ),
+                    'item_links': item_links,
+                },
+            }
+
+        original_revoke = self.client.post_execution_plan_revocation
+
+        async def respond_manual_review(payload: dict) -> dict:
+            accepted_response = await original_revoke(payload)
+            manual_review_response = {
+                **accepted_response,
+                'contract_ack': {
+                    **accepted_response['contract_ack'],
+                    'status': 'manual_review_required',
+                },
+                'item_acks': [
+                    {
+                        **item,
+                        'status': (
+                            'manual_review_required'
+                            if item['core_item_key'].endswith(':next_open_buy')
+                            else 'preserved_protective_exit'
+                        ),
+                    }
+                    for item in accepted_response['item_acks']
+                ],
+                'reason_code': 'broker_commit_or_exposure_possible',
+                'revoked_item_count': 0,
+                'manual_review_item_count': 1,
+                'preserved_item_count': 2,
+            }
+            raise SignalDeciderExecClientError(
+                'Exec requires manual review',
+                code='conflict',
+                retryable=False,
+                status_code=409,
+                payload=manual_review_response,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_revocation',
+            side_effect=respond_manual_review,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=True,
+                trigger='test_manual_review_revocation',
+            )
+
+        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['revoked_group_count'], 0)
+        self.assertEqual(result['summary']['revocation_manual_review_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(
+                row.submission_payload['revocation']['status'],
+                'manual_review_required',
+            )
+            self.assertEqual(
+                row.submission_payload['revocation_history'][-1]['response'][
+                    'reason_code'
+                ],
+                'broker_commit_or_exposure_possible',
+            )
+
     async def test_revocation_not_found_ack_enters_manual_review_and_blocks_replacement(self) -> None:
         await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
@@ -4280,6 +4431,58 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             self.assertEqual(row.execution_status, 'revocation_pending')
             self.assertEqual(row.submission_payload, pending_submission)
+
+    async def test_equal_authority_fingerprint_is_not_labeled_after_core_revision(
+        self,
+    ) -> None:
+        detached_rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        snapshots = self.service._load_snapshots(detached_rows)
+        payload, row_links = self.service._build_exec_plan_payload(
+            rows=detached_rows,
+            snapshots=snapshots,
+            trigger='equal_revision_failure_test',
+        )
+        dispatch_revision_fingerprints = {
+            int(row.id): _row_dispatch_revision_fingerprint(row)
+            for row in detached_rows
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.eligibility_status = 'blocked'
+            row.execution_status = 'submitted'
+            row.submission_payload = {'marker': 'status-only-transition'}
+
+        self.service._persist_dispatch_failure(
+            rows=detached_rows,
+            submitted_revision_fingerprints=dispatch_revision_fingerprints,
+            row_links=row_links,
+            plan_id=payload['plan_id'],
+            fingerprint=_fingerprint_exec_plan(payload),
+            payload=payload,
+            trigger='equal_revision_failure_test',
+            status='unavailable',
+            error={
+                'code': 'unavailable',
+                'message': 'ambiguous remote result',
+                'retryable': True,
+            },
+            remote_acceptance_ambiguous=True,
+        )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            reconciliation = row.submission_payload['dispatch_reconciliation']
+            self.assertEqual(
+                reconciliation['submitted_dispatch_revision_fingerprint'],
+                reconciliation['current_dispatch_revision_fingerprint'],
+            )
+            self.assertEqual(
+                reconciliation['reason_code'],
+                'ambiguous_remote_acceptance',
+            )
 
     async def test_dispatch_ack_revokes_remote_authority_after_material_row_revision(self) -> None:
         original_post_execution_plan = self.client.post_execution_plan
@@ -4722,7 +4925,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'latest_snapshot_not_actionable',
             )
 
-    async def test_activation_transport_failure_revokes_ambiguous_remote_authority(
+    async def test_activation_transport_failure_stays_pending_and_retries_exact_activation(
         self,
     ) -> None:
         async def fail_after_activation_request(payload: dict) -> dict:
@@ -4748,23 +4951,53 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 trigger='test_activation_transport_failure',
             )
 
-        self.assertEqual(self.client.dispatch_events, ['plan', 'activation', 'revocation'])
+        self.assertEqual(self.client.dispatch_events, ['plan', 'activation'])
         self.assertEqual(len(self.client.activation_calls), 1)
-        self.assertEqual(len(self.client.revocation_calls), 1)
+        self.assertEqual(self.client.revocation_calls, [])
         self.assertEqual(
             result['dispatch']['groups'][0]['dispatch_status'],
-            'revocation_pending',
+            'accepted',
+        )
+        self.assertEqual(
+            result['dispatch']['groups'][0]['activation_status'],
+            'pending',
         )
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
-            self.assertEqual(row.execution_status, 'revoked')
-            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertNotEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.eligibility_status, 'eligible')
             self.assertEqual(
-                row.submission_payload['revocation']['reason_code'],
-                'current_live_market_evidence_unavailable',
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'pending',
+            )
+            self.assertNotIn('revocation', row.submission_payload)
+
+        first_activation_request = copy.deepcopy(self.client.activation_calls[0])
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            dry_run=False,
+            force=False,
+            trigger='test_activation_transport_retry',
+        )
+
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(len(self.client.activation_calls), 2)
+        self.assertEqual(self.client.activation_calls[1], first_activation_request)
+        self.assertEqual(self.client.revocation_calls, [])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'activated',
             )
 
-    async def test_activation_failure_revokes_only_the_failed_plan_cohort(
+    async def test_activation_transport_failure_keeps_only_failed_plan_cohort_pending(
         self,
     ) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
@@ -4810,7 +5043,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 SignalDeciderExecutionPlanItem,
                 short_plan_item_id,
             )
-            self.assertEqual(failed_row.execution_status, 'revoked')
+            self.assertNotEqual(failed_row.execution_status, 'revoked')
+            self.assertEqual(
+                failed_row.submission_payload['exec_dispatch']['contract_proof'][
+                    'core_activation'
+                ]['status'],
+                'pending',
+            )
             self.assertNotEqual(unrelated_row.execution_status, 'revoked')
             self.assertEqual(
                 unrelated_row.submission_payload['exec_dispatch'][
@@ -4818,14 +5057,40 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 ]['core_activation']['status'],
                 'activated',
             )
+        self.assertEqual(self.client.revocation_calls, [])
+
+    async def test_activation_material_ack_mismatch_remains_fail_closed(
+        self,
+    ) -> None:
+        original_activation = self.client.post_execution_plan_activation
+
+        async def mismatched_material_ack(payload: dict) -> dict:
+            response = await original_activation(payload)
+            response['contract_ack']['dispatch_material_fingerprint'] = 'f' * 64
+            return response
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_activation',
+            side_effect=mismatched_material_ack,
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='test_activation_material_ack_mismatch',
+            )
+
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'revocation_pending')
+        self.assertEqual(group['activation_status'], 'failed_closed')
         self.assertEqual(len(self.client.revocation_calls), 1)
-        self.assertEqual(
-            {
-                item['decision_snapshot_id']
-                for item in self.client.revocation_calls[0]['items']
-            },
-            {str(self.snapshot_id)},
-        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(row.eligibility_status, 'blocked')
 
     async def test_restart_activates_exact_quarantined_plan_without_reposting(
         self,
@@ -6167,6 +6432,138 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('decider_input_context', payload_text)
                 self.assertNotIn('raw_request_payload', payload_text)
                 self.assertNotIn('last_request_payload', payload_text)
+
+    def test_exec_plan_wire_payload_is_bounded_for_36_candidates_and_exits_use_compact_risk_context(self) -> None:
+        bulky_decider_context = {
+            'decider_input_context': {
+                'raw_request_payload': {'blob': 'x' * 20_000},
+            },
+            'symbol_day_context': {
+                'company': {'market': 'KOSPI'},
+                'pre_decider_enrichment_context': {
+                    'schema_version': 'pre_decider_enrichment_v1',
+                    'large_provider_payload': 'y' * 20_000,
+                },
+            },
+        }
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+            snapshot.request_payload = {
+                'signal_decider_policy': self._signal_decider_policy_request_fixture(),
+                **copy.deepcopy(bulky_decider_context),
+            }
+            snapshot.input_feature_snapshot_payload = {'large_feature_blob': 'z' * 20_000}
+
+        for index in range(1, 36):
+            symbol = f'{900000 + index:06d}'
+            self._seed_signal_candidate(
+                symbol=symbol,
+                name_ko=f'Payload candidate {index}',
+                decision_run_id=f'wire-budget-run-{index}',
+                client_order_id=f'SDNO-20260430-{symbol}',
+                request_payload={
+                    'signal_decider_policy': self._signal_decider_policy_request_fixture(),
+                    **copy.deepcopy(bulky_decider_context),
+                },
+                input_feature_snapshot_payload={'large_feature_blob': 'z' * 20_000},
+            )
+
+        rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        snapshots = self.service._load_snapshots(rows)
+
+        payload, _ = self.service._build_exec_plan_payload(
+            rows=rows,
+            snapshots=snapshots,
+            trigger='wire_budget_regression',
+        )
+
+        self.assertEqual(len(rows), 36)
+        self.assertEqual(len(payload['items']), 108)
+        self.assertLessEqual(json_size_bytes(payload), EXECUTION_PLAN_DISPATCH_MAX_BYTES)
+        entries = [item for item in payload['items'] if item['side'] == 'buy']
+        exits = [item for item in payload['items'] if item['side'] == 'sell']
+        self.assertEqual(len(entries), 36)
+        self.assertEqual(len(exits), 72)
+        for entry in entries:
+            self.assertIn('decider_handoff_context', entry['risk_context'])
+            self.assertIn('decider_handoff_context_digest', entry['risk_context'])
+        for protective_exit in exits:
+            risk_context = protective_exit['risk_context']
+            self.assertNotIn('decider_handoff_context', risk_context)
+            self.assertNotIn('validation', risk_context)
+            self.assertNotIn('traceability', risk_context)
+            self.assertNotIn('decision_input_quality_context', risk_context)
+            self.assertNotIn('execution_feasibility_context', risk_context)
+            self.assertRegex(
+                risk_context['decider_handoff_context_digest'],
+                r'^[0-9a-f]{64}$',
+            )
+            self.assertIn('account_reference', risk_context)
+            self.assertIn('target_price', risk_context)
+            self.assertIn('stop_loss_price', risk_context)
+
+    def test_protective_exit_final_risk_context_includes_trigger_within_budget(self) -> None:
+        with session_scope() as session:
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                self.snapshot_id,
+            )
+            # The context including trigger_rule fits just under 8 KiB, while
+            # the later Core-activation binding pushes the wire value over.
+            snapshot.thesis_summary = 'x' * 6_300
+
+        rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        payload, _ = self.service._build_exec_plan_payload(
+            rows=rows,
+            snapshots=self.service._load_snapshots(rows),
+            trigger='protective_exit_context_budget_regression',
+        )
+        payload = _bind_core_confirmed_activation(
+            payload,
+            authority_generation={
+                'status': 'valid',
+                'generation_fingerprint': 'a' * 64,
+            },
+        )
+
+        protective_exits = [
+            item for item in payload['items'] if item['side'] == 'sell'
+        ]
+        self.assertEqual(len(protective_exits), 2)
+        self.assertEqual(
+            {item['risk_context']['trigger_rule'] for item in protective_exits},
+            {EXEC_INTENT_TARGET_SELL, EXEC_INTENT_STOP_SELL},
+        )
+        for item in protective_exits:
+            risk_context = item['risk_context']
+            self.assertLessEqual(
+                json_size_bytes(risk_context),
+                EXEC_EXIT_RISK_CONTEXT_MAX_BYTES,
+            )
+            self.assertEqual(
+                risk_context['core_plan_item_id'],
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                risk_context['account_reference'],
+                self.account_reference,
+            )
+            self.assertEqual(
+                risk_context['decision_snapshot_id'],
+                self.snapshot_id,
+            )
+            self.assertEqual(
+                risk_context['_core_activation'][
+                    'authority_generation_fingerprint'
+                ],
+                'a' * 64,
+            )
 
     async def test_dispatch_next_open_plan_signal_agent_quantity_marks_submitted(self) -> None:
         self.client.agent_approved_quantities_by_agent['signal-decider'] = '5'

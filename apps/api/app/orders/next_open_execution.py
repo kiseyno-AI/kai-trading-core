@@ -8560,7 +8560,12 @@ class SignalDeciderNextOpenExecutionService:
                 1 for row in rows if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE
             ),
             'monitor_candidate_symbol_count': len(monitor_candidate_symbols),
-            'planned_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_PLANNED),
+            'planned_count': sum(
+                1
+                for row in rows
+                if row.execution_status == EXECUTION_STATUS_PLANNED
+                and row.eligibility_status == ELIGIBILITY_ELIGIBLE
+            ),
             'awaiting_trigger_count': sum(
                 1 for row in rows if row.execution_status == EXECUTION_STATUS_AWAITING_TRIGGER
             ),
