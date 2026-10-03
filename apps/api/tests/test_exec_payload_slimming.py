@@ -509,3 +509,305 @@ def test_oversized_lifecycle_evidence_keeps_revocation_bindings_actionable() -> 
         for item in item_links
     ]
     assert json_size_bytes(result.payload) <= SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES
+
+
+def test_incident_shaped_lifecycle_history_never_evicts_active_dispatch_proof() -> None:
+    destination_binding = {
+        'schema_version': 'core_exec_destination_binding_v1',
+        'contract_version': 'execution_handoff_contract_v4',
+        'base_url': 'https://exec.example.test',
+        'runtime_mode': 'live',
+        'dispatch_source': 'kai-trading-core',
+        'account_reference': 'KIS:98123456-01',
+        'destination_fingerprint': 'd' * 64,
+    }
+    item_links = [
+        {
+            'core_item_key': f'core-plan-17717:{intent}',
+            'intent': intent,
+            'side': 'buy' if intent == 'intraday_watch_buy' else 'sell',
+            'symbol': '005930',
+            'exec_plan_id': 'exec-plan-new',
+            'exec_plan_item_id': f'exec-item-{index}',
+            'remote_status': 'accepted',
+        }
+        for index, intent in enumerate(
+            ('intraday_watch_buy', 'target_sell', 'stop_sell'),
+            start=1,
+        )
+    ]
+    contract_proof = {
+        'schema_version': 'core_exec_dispatch_proof_v2',
+        'execution_plan_id': 'exec-plan-new',
+        'dispatch_material_fingerprint': 'c' * 64,
+        'submitted_core_item_keys': [
+            item['core_item_key'] for item in item_links
+        ],
+        'destination_binding': destination_binding,
+        'core_activation': {
+            'schema_version': 'core_execution_activation_binding_v1',
+            'mode': 'core_confirmed',
+            'authority_generation_fingerprint': 'e' * 64,
+            'status': 'pending',
+            'dispatch_material_fingerprint': 'c' * 64,
+        },
+    }
+    oversized_history = [
+        {
+            'decision_snapshot_id': str(100 + generation),
+            'execution_status': 'revoked',
+            **{
+                f'diagnostic_{index}': f'generation-{generation}-' + ('x' * 2_000)
+                for index in range(30)
+            },
+        }
+        for generation in range(5)
+    ]
+    result = slim_signal_decider_exec_submission_payload(
+        {
+            'mode': 'exec_dispatch',
+            'latest': {'dispatch_status': 'pending_remote_ack'},
+            'exec_dispatch': {
+                'plan_id': 'exec-plan-new',
+                'plan_fingerprint': 'a' * 64,
+                'dispatch_revision_fingerprint': 'b' * 64,
+                'dispatch_material_fingerprint': 'c' * 64,
+                'dispatch_status': 'pending_remote_ack',
+                'prior_execution_status': 'planned',
+                'prior_eligibility_status': 'eligible',
+                'destination_binding': destination_binding,
+                'contract_proof': contract_proof,
+                'item_links': item_links,
+                'last_request_payload': {'raw_context': 'r' * 100_000},
+            },
+            'revision_history': oversized_history,
+            'revocation': {
+                'status': 'acknowledged',
+                'reason_code': 'current_live_market_evidence_unavailable',
+                'plan_id': 'exec-plan-old',
+                'item_links': item_links,
+                **{
+                    f'diagnostic_{index}': 'v' * 2_000
+                    for index in range(30)
+                },
+            },
+            'revocation_history': oversized_history,
+            'dispatch_reconciliation': {
+                'status': 'manual_review_required',
+                'reason_code': 'ambiguous_remote_acceptance_after_core_revision',
+                **{
+                    f'diagnostic_{index}': 'q' * 2_000
+                    for index in range(30)
+                },
+            },
+        }
+    )
+
+    assert result.payload is not None
+    assert json_size_bytes(result.payload) <= SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES
+    active_dispatch = result.payload['exec_dispatch']
+    assert active_dispatch['plan_id'] == 'exec-plan-new'
+    assert active_dispatch['dispatch_status'] == 'pending_remote_ack'
+    assert active_dispatch['dispatch_revision_fingerprint'] == 'b' * 64
+    assert active_dispatch['dispatch_material_fingerprint'] == 'c' * 64
+    assert active_dispatch['destination_binding'] == destination_binding
+    assert active_dispatch['contract_proof'] == contract_proof
+    assert active_dispatch['item_links'] == item_links
+    assert len(result.payload.get('revision_history') or []) < len(oversized_history)
+
+
+def test_pending_revocation_and_recovery_evidence_precede_optional_diagnostics() -> None:
+    destination_binding = {
+        'schema_version': 'core_exec_destination_binding_v1',
+        'contract_version': 'execution_handoff_contract_v4',
+        'base_url': 'https://exec.example.test:443',
+        'runtime_mode': 'live',
+        'dispatch_source': 'kai-trading-core',
+        'account_reference': 'KIS:98123456-01',
+        'destination_fingerprint': 'd' * 64,
+    }
+    item_links = [
+        {
+            'core_item_key': f'core-plan-17717:{intent}',
+            'intent': intent,
+            'side': 'buy' if intent == 'intraday_watch_buy' else 'sell',
+            'symbol': '005930',
+            'exec_plan_id': 'exec-plan-active',
+            'exec_plan_item_id': f'exec-item-{index}',
+            'remote_status': 'accepted',
+        }
+        for index, intent in enumerate(
+            ('intraday_watch_buy', 'target_sell', 'stop_sell'),
+            start=1,
+        )
+    ]
+    reconciliation = {
+        'status': 'manual_review_required',
+        'reason_code': 'ambiguous_remote_acceptance',
+        'observed_at': '2026-10-02T00:10:00+00:00',
+        'plan_id': 'exec-plan-active',
+        'plan_fingerprint': 'a' * 64,
+        'submitted_dispatch_revision_fingerprint': 'b' * 64,
+        'current_dispatch_revision_fingerprint': 'b' * 64,
+        'error': {
+            'code': 'unavailable',
+            'message': 'activation response was lost',
+            'retryable': True,
+        },
+    }
+    result = slim_signal_decider_exec_submission_payload(
+        {
+            'mode': 'exec_dispatch',
+            'exec_dispatch': {
+                'plan_id': 'exec-plan-active',
+                'plan_fingerprint': 'a' * 64,
+                'dispatch_revision_fingerprint': 'b' * 64,
+                'dispatch_material_fingerprint': 'c' * 64,
+                'dispatch_status': 'accepted',
+                'prior_execution_status': 'planned',
+                'prior_eligibility_status': 'monitor_candidate',
+                'destination_binding': destination_binding,
+                'contract_proof': {
+                    'schema_version': 'core_exec_dispatch_proof_v2',
+                    'execution_plan_id': 'exec-plan-active',
+                    'dispatch_material_fingerprint': 'c' * 64,
+                    'submitted_core_item_keys': [
+                        item['core_item_key'] for item in item_links
+                    ],
+                },
+                'item_links': item_links,
+                # This diagnostic is deliberately large enough to crowd out
+                # lifecycle state when optional fields are admitted first.
+                'last_request_summary': {
+                    f'diagnostic_{index}': 'x' * 465
+                    for index in range(50)
+                },
+            },
+            'revocation': {
+                'schema_version': 'core_execution_revocation_state_v1',
+                'status': 'pending',
+                'reason_code': 'current_live_market_evidence_unavailable',
+                'requested_at': '2026-10-02T00:11:00+00:00',
+                'prior_decision_snapshot_id': '17717',
+                'replacement_decision_snapshot_id': '17718',
+                'replacement_observation_id': (
+                    'observation:current_live_market_evidence_unavailable:test'
+                ),
+                'replacement_action': 'reject',
+                'replacement_actionable': False,
+                'plan_id': 'exec-plan-active',
+                'destination_binding': destination_binding,
+                'item_links': item_links,
+            },
+            'dispatch_reconciliation': reconciliation,
+        }
+    )
+
+    assert result.payload is not None
+    assert json_size_bytes(result.payload) <= SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES
+    assert result.payload['revocation']['status'] == 'pending'
+    assert result.payload['revocation']['destination_binding'] == destination_binding
+    assert result.payload['revocation']['item_links'] == item_links
+    assert result.payload['dispatch_reconciliation']['reason_code'] == (
+        'ambiguous_remote_acceptance'
+    )
+    assert result.payload['dispatch_reconciliation']['error']['retryable'] is True
+
+
+def test_pending_activation_exact_replay_evidence_is_non_evictable() -> None:
+    item_links = [
+        {
+            'core_item_key': 'core-plan-17717:intraday_watch_buy',
+            'intent': 'intraday_watch_buy',
+            'side': 'buy',
+            'symbol': '005930',
+            'exec_plan_id': 'exec-plan-active',
+            'exec_plan_item_id': 'exec-item-1',
+            'remote_status': 'accepted',
+        }
+    ]
+    requested_at = '2026-10-02T00:00:00+00:00'
+    request_summary = {
+        'schema_version': 'exec_dispatch_request_summary_v1',
+        'plan_id': 'core-plan-active',
+        'requested_at': requested_at,
+        'total_item_count': 1,
+        'row_item_count': 1,
+        'row_items': [
+            {
+                'core_item_key': item_links[0]['core_item_key'],
+                'decision_snapshot_id': '17717',
+            }
+        ],
+        'metadata': {
+            'dispatch_material_fingerprint': 'c' * 64,
+        },
+        'diagnostic_blob': 'r' * 14_000,
+    }
+    response_summary = {
+        'schema_version': 'exec_dispatch_response_summary_v1',
+        'execution_plan_id': 'exec-plan-active',
+        'accepted_item_count': 1,
+        'rejected_item_count': 0,
+        'total_item_count': 1,
+        'row_item_count': 1,
+        'row_items': [
+            {
+                'core_item_key': item_links[0]['core_item_key'],
+                'execution_plan_id': 'exec-plan-active',
+                'execution_plan_item_id': 'exec-item-1',
+            }
+        ],
+        'contract_ack': {
+            'status': 'accepted',
+            'dispatch_material_fingerprint': 'c' * 64,
+        },
+        'diagnostic_blob': 's' * 14_000,
+    }
+    result = slim_signal_decider_exec_submission_payload(
+        {
+            'mode': 'exec_dispatch',
+            'exec_dispatch': {
+                'plan_id': 'core-plan-active',
+                'plan_fingerprint': 'a' * 64,
+                'dispatch_revision_fingerprint': 'b' * 64,
+                'dispatch_material_fingerprint': 'c' * 64,
+                'dispatch_status': 'accepted',
+                'destination_binding': {'base_url': 'https://exec.example.test'},
+                'contract_proof': {
+                    'schema_version': 'core_exec_dispatch_proof_v2',
+                    'execution_plan_id': 'exec-plan-active',
+                    'dispatch_material_fingerprint': 'c' * 64,
+                    'submitted_core_item_keys': [item_links[0]['core_item_key']],
+                    'core_activation': {
+                        'schema_version': 'core_execution_activation_binding_v1',
+                        'mode': 'core_confirmed',
+                        'authority_generation_fingerprint': 'e' * 64,
+                        'status': 'pending',
+                        'dispatch_material_fingerprint': 'c' * 64,
+                    },
+                },
+                'item_links': item_links,
+                'last_request_summary': request_summary,
+                'last_response_summary': response_summary,
+            },
+        }
+    )
+
+    assert result.payload is not None
+    assert json_size_bytes(result.payload) <= SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES
+    replay_request = result.payload['exec_dispatch']['last_request_summary']
+    replay_response = result.payload['exec_dispatch']['last_response_summary']
+    assert replay_request['plan_id'] == 'core-plan-active'
+    assert replay_request['requested_at'] == requested_at
+    assert replay_request['total_item_count'] == 1
+    assert replay_request['row_item_count'] == 1
+    assert replay_request['row_items'] == request_summary['row_items']
+    assert replay_request['metadata'] == request_summary['metadata']
+    assert replay_response['execution_plan_id'] == 'exec-plan-active'
+    assert replay_response['accepted_item_count'] == 1
+    assert replay_response['rejected_item_count'] == 0
+    assert replay_response['total_item_count'] == 1
+    assert replay_response['row_item_count'] == 1
+    assert replay_response['row_items'] == response_summary['row_items']
+    assert replay_response['contract_ack'] == response_summary['contract_ack']

@@ -14,10 +14,18 @@ EXECUTION_HANDOFF_CONTRACT_VERSION = 'execution_handoff_contract_v4'
 EXECUTION_HANDOFF_SOURCE = 'kai-trading-core'
 LEGACY_EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION = 'signal_decider_exec_plan_v2'
 EXECUTION_PLAN_DISPATCH_SCHEMA_VERSION = 'signal_decider_exec_plan_v4'
+EXECUTION_PLAN_DISPATCH_MAX_BYTES = 2 * 1024 * 1024
 EXECUTION_HANDOFF_CAPABILITY = 'delegated_final_full_cost_gate_recheck_v1'
 EXECUTION_HANDOFF_ACK_SCHEMA_VERSION = 'execution_handoff_ack_v4'
 EXECUTION_REVOCATION_SCHEMA_VERSION = 'execution_handoff_revocation_v4'
 EXECUTION_REVOCATION_CAPABILITY = 'atomic_pre_submission_revocation_v1'
+EXECUTION_REVOCATION_MANUAL_REVIEW_REASON_CODES = frozenset(
+    {
+        'broker_commit_or_exposure_possible',
+        'persisted_v4_contract_not_proven',
+        'revocation_item_binding_mismatch',
+    }
+)
 EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION = 'exec_agent_decider_handoff_v1'
 EXECUTION_RUNTIME_DASHBOARD_READ_MODEL_SCHEMA_VERSION = 'execution_runtime_dashboard_read_model_v1'
 EXECUTION_RUNTIME_TODAY_ACTIVITY_SCHEMA_VERSION = 'execution_runtime_today_activity_v1'
@@ -732,7 +740,15 @@ def serialize_execution_plan_dispatch_payload(payload: dict[str, Any]) -> dict[s
     validated['metadata']['dispatch_material_fingerprint'] = (
         execution_plan_dispatch_material_fingerprint(validated)
     )
-    return _dump(ExecutionPlanDispatchPayload, validated)
+    model = ExecutionPlanDispatchPayload.model_validate(validated)
+    serialized = model.model_dump(mode='python', exclude_unset=True)
+    serialized_size = len(model.model_dump_json(exclude_unset=True).encode('utf-8'))
+    if serialized_size > EXECUTION_PLAN_DISPATCH_MAX_BYTES:
+        raise ValueError(
+            'execution plan dispatch payload exceeds wire-size budget: '
+            f'{serialized_size}>{EXECUTION_PLAN_DISPATCH_MAX_BYTES}'
+        )
+    return serialized
 
 
 def validate_execution_plan_dispatch_ack(
@@ -802,11 +818,20 @@ def validate_execution_revocation_ack(
     parsed = ExecutionRevocationAckPayload.model_validate(payload)
     if parsed.plan_id != plan_id or parsed.contract_ack.plan_id != plan_id:
         raise ValueError('execution revocation ACK plan_id mismatch')
+    header_status = parsed.contract_ack.status
+    expected_reason_is_valid = bool(
+        isinstance(expected_reason_code, str)
+        and expected_reason_code
+        and expected_reason_code.strip() == expected_reason_code
+    )
+    reason_matches_contract = (
+        parsed.reason_code in EXECUTION_REVOCATION_MANUAL_REVIEW_REASON_CODES
+        if header_status == 'manual_review_required'
+        else parsed.reason_code == expected_reason_code
+    )
     if (
-        not isinstance(expected_reason_code, str)
-        or not expected_reason_code
-        or expected_reason_code.strip() != expected_reason_code
-        or parsed.reason_code != expected_reason_code
+        not expected_reason_is_valid
+        or not reason_matches_contract
     ):
         raise ValueError('execution revocation ACK reason_code mismatch')
     submitted_keys = list(submitted_core_item_keys)
@@ -819,7 +844,6 @@ def validate_execution_revocation_ack(
         ack_by_key[item.core_item_key] = item.model_dump(mode='python')
     if set(ack_by_key) != set(submitted_keys):
         raise ValueError('execution revocation ACK must bind every submitted core_item_key exactly once')
-    header_status = parsed.contract_ack.status
     statuses = [str(item['status']) for item in ack_by_key.values()]
     submitted_by_key = {
         str(item.get('core_item_key')): item

@@ -342,6 +342,159 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                 expected_reason_code='current_live_market_risk_off',
             )
 
+    def test_manual_review_ack_accepts_known_fail_closed_outcome_reason(self) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'exec-plan-v4',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'manual_review_required',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'manual_review_required',
+                    'execution_plan_id': 'exec-plan-v4',
+                    'execution_plan_item_id': 'exec-entry',
+                }
+            ],
+            'reason_code': 'broker_commit_or_exposure_possible',
+            'revoked_item_count': 0,
+            'manual_review_item_count': 1,
+            'preserved_item_count': 0,
+        }
+
+        status, _ = validate_execution_revocation_ack(
+            payload,
+            plan_id='plan-v4',
+            submitted_core_item_keys=['entry'],
+            submitted_items=[
+                {
+                    'core_item_key': 'entry',
+                    'side': 'buy',
+                    'intent': 'next_open_buy',
+                    'exec_plan_id': 'exec-plan-v4',
+                    'exec_plan_item_id': 'exec-entry',
+                }
+            ],
+            expected_reason_code='current_live_market_evidence_unavailable',
+        )
+
+        self.assertEqual(status, 'manual_review_required')
+
+    def test_manual_review_contract_failures_require_exact_plan_identity(self) -> None:
+        for reason_code in (
+            'persisted_v4_contract_not_proven',
+            'revocation_item_binding_mismatch',
+        ):
+            with self.subTest(reason_code=reason_code):
+                payload = {
+                    'plan_id': 'plan-v4',
+                    'execution_plan_id': 'exec-plan-v4',
+                    'contract_ack': {
+                        'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                        'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                        'capability': EXECUTION_REVOCATION_CAPABILITY,
+                        'plan_id': 'plan-v4',
+                        'status': 'manual_review_required',
+                    },
+                    'item_acks': [
+                        {
+                            'core_item_key': 'entry',
+                            'status': 'manual_review_required',
+                            'execution_plan_id': 'exec-plan-v4',
+                            'execution_plan_item_id': 'exec-entry',
+                        }
+                    ],
+                    'reason_code': reason_code,
+                    'revoked_item_count': 0,
+                    'manual_review_item_count': 1,
+                    'preserved_item_count': 0,
+                }
+                submitted_items = [
+                    {
+                        'core_item_key': 'entry',
+                        'side': 'buy',
+                        'intent': 'next_open_buy',
+                        'exec_plan_id': 'exec-plan-v4',
+                        'exec_plan_item_id': 'exec-entry',
+                    }
+                ]
+
+                status, _ = validate_execution_revocation_ack(
+                    payload,
+                    plan_id='plan-v4',
+                    submitted_core_item_keys=['entry'],
+                    submitted_items=submitted_items,
+                    expected_reason_code='current_live_market_evidence_unavailable',
+                )
+                self.assertEqual(status, 'manual_review_required')
+
+                for location in ('top_level', 'item'):
+                    invalid = copy.deepcopy(payload)
+                    if location == 'top_level':
+                        invalid['execution_plan_id'] = None
+                    else:
+                        invalid['item_acks'][0]['execution_plan_id'] = None
+                    with self.subTest(location=location), self.assertRaisesRegex(
+                        ValueError,
+                        'plan identity',
+                    ):
+                        validate_execution_revocation_ack(
+                            invalid,
+                            plan_id='plan-v4',
+                            submitted_core_item_keys=['entry'],
+                            submitted_items=submitted_items,
+                            expected_reason_code=(
+                                'current_live_market_evidence_unavailable'
+                            ),
+                        )
+
+    def test_manual_review_ack_rejects_unknown_outcome_reason(self) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'exec-plan-v4',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'manual_review_required',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'manual_review_required',
+                    'execution_plan_id': 'exec-plan-v4',
+                    'execution_plan_item_id': 'exec-entry',
+                }
+            ],
+            'reason_code': 'unexpected_remote_manual_review_reason',
+            'revoked_item_count': 0,
+            'manual_review_item_count': 1,
+            'preserved_item_count': 0,
+        }
+
+        with self.assertRaisesRegex(ValueError, 'reason_code'):
+            validate_execution_revocation_ack(
+                payload,
+                plan_id='plan-v4',
+                submitted_core_item_keys=['entry'],
+                submitted_items=[
+                    {
+                        'core_item_key': 'entry',
+                        'side': 'buy',
+                        'intent': 'next_open_buy',
+                        'exec_plan_id': 'exec-plan-v4',
+                        'exec_plan_item_id': 'exec-entry',
+                    }
+                ],
+                expected_reason_code='current_live_market_evidence_unavailable',
+            )
+
     def _dispatch_payload(self, *, schema_version: str, item: dict) -> dict:
         return {
             'plan_id': 'test-plan',
