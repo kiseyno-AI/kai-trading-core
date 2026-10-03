@@ -3488,6 +3488,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'pykrx_enrichment',
                     'technical_snapshots',
                 ],
+                provider_admission_fence_owned=True,
             )
 
         self.assertEqual(result['stages']['price_collection']['status'], 'completed')
@@ -3497,6 +3498,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertTrue(
             enrichment_service.collect_for_market_date.call_args.kwargs[
                 'use_full_market_coverage'
+            ]
+        )
+        self.assertTrue(
+            enrichment_service.collect_for_market_date.call_args.kwargs[
+                'daily_price_bar_lock_owned'
             ]
         )
 
