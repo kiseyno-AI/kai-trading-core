@@ -35,6 +35,8 @@ from app.market.session import (
 )
 from app.orders.exec_integration import (
     CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS,
+    EXEC_DECIDER_HANDOFF_MAX_BYTES,
+    EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES,
     EXEC_ENTRY_BUY_INTENTS,
     EXEC_EXIT_RISK_CONTEXT_MAX_BYTES,
     EXEC_INTENT_INTRADAY_WATCH_BUY,
@@ -429,6 +431,105 @@ def test_bounded_dispatch_projection_fails_closed_when_essentials_exceed_budget(
             label='test_protective_exit_risk_context',
             essential_keys=essential_keys,
         )
+
+
+def test_bounded_dispatch_projection_digests_nested_essential_contexts() -> None:
+    def wide_context(prefix: str) -> dict[str, dict[str, str]]:
+        return {
+            f'{prefix}_section_{section_index}': {
+                f'field_{field_index}': (
+                    f'{prefix}-{section_index}-{field_index}-' + ('x' * 600)
+                )
+                for field_index in range(24)
+            }
+            for section_index in range(8)
+        }
+
+    payload = {
+        'schema_version': 'exec_agent_decider_handoff_v1',
+        'classification': 'delegated_for_exec_agent_sizing',
+        'symbol': '005930',
+        'target_trade_date': '2026-10-06',
+        'source_market_date': '2026-10-02',
+        'traceability': wide_context('traceability'),
+        'decider_input_context': wide_context('input'),
+        'market_regime_context': wide_context('regime'),
+        'decision_input_quality_context': wide_context('quality'),
+        'decider_output': wide_context('output'),
+        'eod_pre_decider_enrichment_metadata': wide_context('enrichment'),
+    }
+
+    projected = _bounded_dispatch_object(
+        payload,
+        max_bytes=12 * 1024,
+        label='exec_decider_handoff_context',
+        essential_keys=tuple(payload),
+        compact_nested_keys=(
+            'traceability',
+            'decider_input_context',
+            'market_regime_context',
+            'decision_input_quality_context',
+            'decider_output',
+            'eod_pre_decider_enrichment_metadata',
+        ),
+    )
+
+    assert projected['schema_version'] == 'exec_agent_decider_handoff_v1'
+    assert projected['classification'] == 'delegated_for_exec_agent_sizing'
+    assert projected['symbol'] == '005930'
+    assert projected['target_trade_date'] == '2026-10-06'
+    assert projected['source_market_date'] == '2026-10-02'
+    assert projected['dispatch_projection']['source_size_bytes'] > 12 * 1024
+    assert len(json.dumps(projected, separators=(',', ':')).encode('utf-8')) <= 12 * 1024
+    assert projected['decider_input_context']['input_section_0']['projection_digest']
+
+
+def test_bounded_dispatch_projection_preserves_prebounded_essential_context() -> None:
+    flow_context = {
+        'investor_flow': {
+            'symbol_flow': {
+                'investor_groups': {
+                    'foreign': {'net_value_krw': 1_250_000_000},
+                },
+            },
+        },
+        'short_selling': {
+            'short_volume': {'short_volume_ratio_pct': 2.1},
+        },
+        'sector_peers': {
+            'peers': [
+                {
+                    'symbol': f'{index:06d}',
+                    'change_pct': 1.8,
+                    'provider_evidence': 'e' * 240,
+                }
+                for index in range(16)
+            ],
+        },
+    }
+    payload = {
+        'schema_version': 'entry_risk_v1',
+        'flow_short_sector_context': flow_context,
+        'advisory_context': {
+            f'section_{index}': {'detail': 'x' * 1_000}
+            for index in range(24)
+        },
+    }
+
+    projected = _bounded_dispatch_object(
+        payload,
+        max_bytes=12 * 1024,
+        label='entry_risk_context',
+        essential_keys=tuple(payload),
+        compact_nested_keys=('advisory_context',),
+        preserve_bounded_keys=('flow_short_sector_context',),
+    )
+
+    assert projected['flow_short_sector_context'] == flow_context
+    assert 'projection_digest' not in json.dumps(
+        projected['flow_short_sector_context']
+    )
+    assert len(json.dumps(projected, separators=(',', ':')).encode('utf-8')) <= 12 * 1024
 
 
 def test_v4_dispatch_contract_requires_exact_schema_and_capability() -> None:
@@ -6504,6 +6605,218 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('account_reference', risk_context)
             self.assertIn('target_price', risk_context)
             self.assertIn('stop_loss_price', risk_context)
+
+    def test_short_term_watch_handoff_compacts_wide_nested_decider_context(self) -> None:
+        flow_short_sector_context = {
+            'status': 'available',
+            'investor_flow': {
+                'status': 'available',
+                'symbol_flow': {
+                    'investor_groups': {
+                        'foreign': {'net_value_krw': 1_250_000_000},
+                    },
+                },
+                'market_flow': {
+                    'investor_groups': [
+                        {'name': 'foreign', 'net_value_krw': 8_500_000_000},
+                    ],
+                },
+            },
+            'short_selling': {
+                'status': 'available',
+                'short_volume': {'short_volume_ratio_pct': 2.1},
+                'short_balance': {'short_balance_ratio_pct': 1.4},
+            },
+            'sector_peers': {
+                'status': 'available',
+                'relative_state': 'leading',
+                'sector_name': 'Semiconductors',
+                'peer_count': 1,
+                'peers': [{'symbol': '000660', 'change_pct': 1.8}],
+            },
+            'market_breadth': {
+                'status': 'available',
+                'breadth_state': 'constructive',
+            },
+        }
+        request_payload = {
+            'symbol_day_context': {
+                'company': {'market': 'KOSPI'},
+                'pre_decider_enrichment_context': {
+                    'schema_version': 'pre_decider_enrichment_v1',
+                    'flow_short_sector_context': flow_short_sector_context,
+                },
+            },
+            **{
+                f'request_section_{index}': 'r' * 600
+                for index in range(24)
+            },
+        }
+        input_features = {
+            f'feature_section_{index}': 'f' * 600
+            for index in range(24)
+        }
+        response_payload_extra = {
+            f'response_section_{index}': 'o' * 600
+            for index in range(24)
+        }
+        short_snapshot_id = self._seed_short_term_snapshot(
+            request_payload=request_payload,
+            input_feature_snapshot_payload=input_features,
+            response_payload_extra=response_payload_extra,
+        )
+        short_plan_item_id = self._seed_short_term_plan_item(
+            snapshot_id=short_snapshot_id,
+        )
+        with session_scope() as session:
+            short_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            self.assertIsNotNone(short_row)
+            short_row.eligibility_status = 'monitor_candidate'
+            short_row.execution_status = 'awaiting_trigger'
+            short_row.traceability_payload = {
+                **(short_row.traceability_payload or {}),
+                'signal_decider_alignment': 'wait_conflict_block',
+                'alignment_gate_action': 'report_only_block_candidate',
+                'alignment_gate_reason': 'signal_decider_wait_conflict',
+                'alignment_signal_decider_decision_snapshot_id': 991,
+                'final_enforcement_decision': 'allowed_report_only',
+                'requested_quantity': 29,
+                'final_quantity': 29,
+                'alignment_gate': {
+                    'signal_decider_alignment': 'wait_conflict_block',
+                    'alignment_gate_action': 'report_only_block_candidate',
+                    'signal_decider_action': 'wait',
+                    'enforcement_decision': 'allowed_report_only',
+                    'requested_quantity': 29,
+                    'final_quantity': 29,
+                },
+            }
+            short_snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                short_snapshot_id,
+            )
+            self.assertIsNotNone(short_snapshot)
+            short_snapshot.supporting_evidence_payload = [
+                f'wide-evidence-{index}-' + ('e' * 1_000)
+                for index in range(40)
+            ]
+            short_snapshot.data_quality_warnings_payload = [
+                'Intraday order-book evidence requires a live recheck.',
+            ]
+
+        rows = [
+            row
+            for row in self.service._load_next_open_rows(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+            )
+            if row.id == short_plan_item_id
+        ]
+        payload, _ = self.service._build_exec_plan_payload(
+            rows=rows,
+            snapshots=self.service._load_snapshots(rows),
+            trigger='wide_short_term_watch_regression',
+        )
+
+        self.assertEqual(len(payload['items']), 3)
+        self.assertLessEqual(
+            json_size_bytes(payload),
+            EXECUTION_PLAN_DISPATCH_MAX_BYTES,
+        )
+        entry = next(item for item in payload['items'] if item['side'] == 'buy')
+        handoff = entry['risk_context']['decider_handoff_context']
+        self.assertEqual(handoff['symbol'], self.symbol)
+        self.assertEqual(handoff['target_trade_date'], '2026-04-30')
+        self.assertEqual(handoff['source_market_date'], '2026-04-29')
+        self.assertIn('dispatch_projection', handoff)
+        self.assertLessEqual(
+            json_size_bytes(handoff),
+            EXEC_DECIDER_HANDOFF_MAX_BYTES,
+        )
+        self.assertRegex(
+            entry['risk_context']['decider_handoff_context_digest'],
+            r'^[0-9a-f]{64}$',
+        )
+        self.assertEqual(
+            entry['risk_context']['flow_short_sector_context'],
+            flow_short_sector_context,
+        )
+        self.assertNotIn(
+            'projection_digest',
+            json.dumps(entry['risk_context']['flow_short_sector_context']),
+        )
+        self.assertEqual(
+            entry['risk_context']['signal_decider_alignment'],
+            'wait_conflict_block',
+        )
+        self.assertEqual(
+            entry['risk_context']['alignment_gate_action'],
+            'report_only_block_candidate',
+        )
+        self.assertEqual(
+            entry['risk_context']['alignment_gate_reason'],
+            'signal_decider_wait_conflict',
+        )
+        self.assertEqual(
+            entry['risk_context'][
+                'alignment_signal_decider_decision_snapshot_id'
+            ],
+            991,
+        )
+        self.assertEqual(
+            entry['risk_context']['final_enforcement_decision'],
+            'allowed_report_only',
+        )
+        self.assertEqual(entry['risk_context']['requested_quantity'], '29')
+        self.assertEqual(entry['risk_context']['final_quantity'], '29')
+        self.assertEqual(
+            entry['risk_context']['data_quality_warnings'],
+            ['Intraday order-book evidence requires a live recheck.'],
+        )
+        activated_payload = _bind_core_confirmed_activation(
+            payload,
+            authority_generation={
+                'status': 'valid',
+                'generation_fingerprint': 'a' * 64,
+            },
+        )
+        activated_entry = next(
+            item for item in activated_payload['items'] if item['side'] == 'buy'
+        )
+        self.assertLessEqual(
+            json_size_bytes(activated_entry['risk_context']),
+            EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES,
+        )
+
+    def test_entry_activation_fails_closed_when_binding_exceeds_risk_budget(self) -> None:
+        rows = self.service._load_next_open_rows(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+        )
+        payload, _ = self.service._build_exec_plan_payload(
+            rows=rows,
+            snapshots=self.service._load_snapshots(rows),
+            trigger='entry_activation_budget_regression',
+        )
+        entry = next(item for item in payload['items'] if item['side'] == 'buy')
+        entry['risk_context']['oversized_after_activation'] = (
+            'x' * EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES
+        )
+
+        with self.assertRaisesRegex(
+            SignalDeciderExecPayloadContractError,
+            'exec_entry_risk_context exceeds bounded projection budget',
+        ):
+            _bind_core_confirmed_activation(
+                payload,
+                authority_generation={
+                    'status': 'valid',
+                    'generation_fingerprint': 'a' * 64,
+                },
+            )
 
     def test_protective_exit_final_risk_context_includes_trigger_within_budget(self) -> None:
         with session_scope() as session:
