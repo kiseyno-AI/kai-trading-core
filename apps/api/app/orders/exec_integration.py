@@ -166,6 +166,7 @@ EXECUTION_ACTIVATION_CAPABILITY = 'core_confirmed_activation_v1'
 CORE_ACTIVATION_FENCE_RETRY_ATTEMPTS = 6
 CORE_ACTIVATION_FENCE_RETRY_DELAY_SECONDS = 0.025
 EXEC_DECIDER_HANDOFF_MAX_BYTES = 12 * 1024
+EXEC_FLOW_SHORT_SECTOR_CONTEXT_MAX_BYTES = 8 * 1024
 EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES = 32 * 1024
 EXEC_EXIT_RISK_CONTEXT_MAX_BYTES = 8 * 1024
 EXEC_PROTECTIVE_EXIT_RISK_CONTEXT_ESSENTIAL_KEYS = (
@@ -663,6 +664,8 @@ def _bounded_dispatch_object(
     max_bytes: int,
     label: str,
     essential_keys: Sequence[str],
+    compact_nested_keys: Sequence[str] = (),
+    preserve_bounded_keys: Sequence[str] = (),
 ) -> dict[str, Any]:
     safe_payload = _json_safe(payload)
     if not isinstance(safe_payload, dict):
@@ -681,6 +684,9 @@ def _bounded_dispatch_object(
         'source_digest': _dispatch_payload_digest(safe_payload),
         'source_size_bytes': original_size,
     }
+    for key in preserve_bounded_keys:
+        if key in safe_payload:
+            compacted[key] = copy.deepcopy(safe_payload[key])
     required_projection_keys = {
         key for key in essential_keys if key in safe_payload
     }
@@ -690,19 +696,39 @@ def _bounded_dispatch_object(
     ):
         return compacted
 
-    reduced = {
-        key: _compact_dispatch_value(safe_payload[key], depth=1)
-        for key in essential_keys
-        if key in safe_payload
-    }
+    reduced = {}
+    for key in essential_keys:
+        if key not in safe_payload:
+            continue
+        reduced[key] = (
+            copy.deepcopy(safe_payload[key])
+            if key in preserve_bounded_keys
+            else _compact_dispatch_value(safe_payload[key], depth=1)
+        )
     reduced['dispatch_projection'] = compacted['dispatch_projection']
     final_size = _dispatch_json_size(reduced)
+    if final_size <= max_bytes:
+        return reduced
+
+    # Some advisory contexts are deliberately nested and can outgrow the
+    # transport budget even after the normal bounded projection.  Callers
+    # must opt specific keys into one additional projection level so identity
+    # and executable safety structures (for example delegated gates) retain
+    # their full shape and continue to fail closed when they do not fit.
+    nested_compacted = copy.deepcopy(reduced)
+    for key in compact_nested_keys:
+        if key in preserve_bounded_keys:
+            continue
+        value = safe_payload.get(key)
+        if isinstance(value, (dict, list)):
+            nested_compacted[key] = _compact_dispatch_value(value, depth=2)
+    final_size = _dispatch_json_size(nested_compacted)
     if final_size > max_bytes:
         raise SignalDeciderExecPayloadContractError(
             f'{label} exceeds bounded projection budget: '
             f'{final_size}>{max_bytes}'
         )
-    return reduced
+    return nested_compacted
 
 
 def _serialize_error(*, code: str, message: str, retryable: bool = False, status_code: int | None = None) -> dict[str, Any]:
@@ -1189,10 +1215,17 @@ def _bind_core_confirmed_activation(
                 ),
             )
         else:
-            item['risk_context'] = {
+            activated_risk_context = {
                 **risk_context,
                 '_core_activation': copy.deepcopy(binding),
             }
+            activated_size = _dispatch_json_size(activated_risk_context)
+            if activated_size > EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES:
+                raise SignalDeciderExecPayloadContractError(
+                    'exec_entry_risk_context exceeds bounded projection budget: '
+                    f'{activated_size}>{EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES}'
+                )
+            item['risk_context'] = activated_risk_context
     try:
         return serialize_execution_plan_dispatch_payload(candidate)
     except ValueError as exc:
@@ -9029,6 +9062,52 @@ class SignalDeciderExecIntegrationService:
                 if isinstance(decision_input_quality_context.get('execution_feasibility'), dict)
                 else {}
             )
+            decider_input_context = (
+                full_decider_handoff_context.get('decider_input_context')
+                if isinstance(full_decider_handoff_context.get('decider_input_context'), dict)
+                else {}
+            )
+            pre_decider_enrichment_context = (
+                decider_input_context.get('pre_decider_enrichment_context')
+                if isinstance(decider_input_context.get('pre_decider_enrichment_context'), dict)
+                else {}
+            )
+            raw_flow_short_sector_context = pre_decider_enrichment_context.get(
+                'flow_short_sector_context'
+            )
+            if not isinstance(raw_flow_short_sector_context, dict):
+                raw_flow_short_sector_context = {
+                    output_key: pre_decider_enrichment_context[source_key]
+                    for source_key, output_key in (
+                        ('investor_flow_context', 'investor_flow'),
+                        ('short_selling_context', 'short_selling'),
+                        ('sector_peer_context', 'sector_peers'),
+                        ('sector_peers_context', 'sector_peers'),
+                    )
+                    if isinstance(pre_decider_enrichment_context.get(source_key), dict)
+                }
+            flow_short_sector_context = (
+                _bounded_dispatch_object(
+                    raw_flow_short_sector_context,
+                    max_bytes=EXEC_FLOW_SHORT_SECTOR_CONTEXT_MAX_BYTES,
+                    label='exec_flow_short_sector_context',
+                    essential_keys=(
+                        'status',
+                        'investor_flow',
+                        'short_selling',
+                        'sector_peers',
+                        'market_breadth',
+                    ),
+                    compact_nested_keys=(
+                        'investor_flow',
+                        'short_selling',
+                        'sector_peers',
+                        'market_breadth',
+                    ),
+                )
+                if raw_flow_short_sector_context
+                else None
+            )
             requested_delegated_gate_codes = _delegated_gate_codes(
                 validation,
                 decision_agent_name=row_decision_agent_name,
@@ -9116,6 +9195,14 @@ class SignalDeciderExecIntegrationService:
                     'decider_output',
                     'eod_pre_decider_enrichment_metadata',
                 ),
+                compact_nested_keys=(
+                    'traceability',
+                    'decider_input_context',
+                    'market_regime_context',
+                    'decision_input_quality_context',
+                    'decider_output',
+                    'eod_pre_decider_enrichment_metadata',
+                ),
             )
             validation_projection = _bounded_dispatch_object(
                 validation,
@@ -9132,6 +9219,11 @@ class SignalDeciderExecIntegrationService:
                     'alignment_gate_reason',
                     'alignment_signal_decider_decision_snapshot_id',
                     'pricing_note',
+                ),
+                compact_nested_keys=(
+                    'short_term_entry_quality',
+                    'performance_gate',
+                    'alignment_gate',
                 ),
             )
             traceability_projection = _bounded_dispatch_object(
@@ -9256,6 +9348,11 @@ class SignalDeciderExecIntegrationService:
                 'market_regime_sizing_policy': market_regime_sizing_policy,
                 'decision_input_quality_context': decision_input_quality_projection,
                 'execution_feasibility_context': execution_feasibility_projection,
+                **(
+                    {'flow_short_sector_context': flow_short_sector_context}
+                    if flow_short_sector_context is not None
+                    else {}
+                ),
             }
             enforced_probe = bool(
                 is_short_term
@@ -9373,6 +9470,13 @@ class SignalDeciderExecIntegrationService:
                     'target_price',
                     'stop_loss_price',
                     'allocation_budget_krw',
+                    'signal_decider_alignment',
+                    'alignment_gate_action',
+                    'alignment_gate_reason',
+                    'alignment_signal_decider_decision_snapshot_id',
+                    'final_enforcement_decision',
+                    'requested_quantity',
+                    'final_quantity',
                     'entry_execution_mode',
                     'delegated_gate_codes',
                     'delegated_gate_confirmation_required',
@@ -9384,12 +9488,26 @@ class SignalDeciderExecIntegrationService:
                     'market_regime_sizing_policy',
                     'decision_input_quality_context',
                     'execution_feasibility_context',
+                    'flow_short_sector_context',
                     'expected_return_pct',
                     'confidence_score_10',
                     'conviction_score_10',
                     'thesis_summary',
                     'supporting_evidence',
                     'decision_risks',
+                    'data_quality_warnings',
+                ),
+                compact_nested_keys=(
+                    'validation',
+                    'traceability',
+                    'decider_handoff_context',
+                    'market_regime_context',
+                    'decision_input_quality_context',
+                    'execution_feasibility_context',
+                ),
+                preserve_bounded_keys=(
+                    'flow_short_sector_context',
+                    'data_quality_warnings',
                 ),
             )
             full_protective_exit_risk_context = {
