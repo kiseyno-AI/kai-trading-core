@@ -15,6 +15,7 @@ from unittest.mock import patch
 from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import (
+    build_decider_input_generation,
     build_decider_source_context_generation,
     build_durable_decider_input_generation,
     build_response_storage_payload,
@@ -441,6 +442,46 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
                 source_context=with_explicit_cutoff,
                 source_knowledge_cutoff_at='2026-04-23T06:30:00+00:00',
             ),
+        )
+
+    def test_market_collection_clock_does_not_revoke_input_generation(self):
+        market_context = {
+            'status': 'stale',
+            'as_of': '2026-10-06T15:32:00+09:00',
+            'fx': {
+                'usdkrw': {
+                    'value': 1358.5,
+                    'effective_date': '2026-10-06',
+                    'fallback_applied': True,
+                    'captured_at': '2026-10-07T02:56:00+09:00',
+                }
+            },
+        }
+        refreshed_context = deepcopy(market_context)
+        refreshed_context['fx']['usdkrw']['captured_at'] = (
+            '2026-10-07T03:56:00+09:00'
+        )
+
+        def generation(context: dict) -> dict:
+            return build_decider_input_generation(
+                source_context={'symbol': '005930'},
+                market_context=context,
+                policy_context={},
+                previous_decision_context={},
+                upstream_summaries={},
+                upstream_traceability={},
+            )
+
+        self.assertEqual(
+            generation(market_context),
+            generation(refreshed_context),
+        )
+
+        changed_value = deepcopy(refreshed_context)
+        changed_value['fx']['usdkrw']['value'] = 1360.0
+        self.assertNotEqual(
+            generation(market_context),
+            generation(changed_value),
         )
 
     def test_replay_timestamps_do_not_revoke_durable_generation(self):
