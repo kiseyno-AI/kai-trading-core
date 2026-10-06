@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+from pathlib import Path
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass
@@ -38,12 +42,27 @@ class AgentFeedbackSessionCleanupService:
             emit_lifecycle_hooks=target.emit_lifecycle_hooks,
         )
         if result.get('ok') is True and isinstance(result.get('deleted'), bool):
+            binding_cleanup = self._prune_cleared_codex_binding(
+                agent_name=target.agent_name,
+                session_key=target.session_key,
+            )
+            if binding_cleanup.get('status') == 'failed':
+                failed_result = {**result, 'binding_cleanup': binding_cleanup}
+                failure = self._record_failure(target=target, result=failed_result)
+                return {
+                    'status': 'failed',
+                    'session_key': target.session_key,
+                    'result': failed_result,
+                    'binding_cleanup': binding_cleanup,
+                    'failure': failure,
+                }
             self._clear_failure(session_key=target.session_key)
             return {
                 'status': 'deleted',
                 'outcome': 'deleted' if result.get('deleted') else 'already_absent',
                 'session_key': target.session_key,
                 'result': result,
+                'binding_cleanup': binding_cleanup,
             }
         failure = self._record_failure(target=target, result=result)
         return {
@@ -51,6 +70,55 @@ class AgentFeedbackSessionCleanupService:
             'session_key': target.session_key,
             'result': result,
             'failure': failure,
+        }
+
+    @staticmethod
+    def _codex_binding_entry_key(*, agent_name: str, session_key: str) -> str:
+        digest = base64.urlsafe_b64encode(
+            hashlib.sha256(session_key.strip().encode('utf-8')).digest()
+        ).decode('ascii').rstrip('=')
+        return f'session-key:{agent_name.strip().lower()}:{digest}'
+
+    def _prune_cleared_codex_binding(
+        self,
+        *,
+        agent_name: str,
+        session_key: str,
+    ) -> dict[str, Any]:
+        state_root = Path(settings.openclaw_state_dir).expanduser()
+        db_path = state_root / 'state' / 'openclaw.sqlite'
+        if not db_path.is_file():
+            return {
+                'status': 'unavailable',
+                'reason': 'openclaw_state_database_missing',
+            }
+        entry_key = self._codex_binding_entry_key(
+            agent_name=agent_name,
+            session_key=session_key,
+        )
+        try:
+            with sqlite3.connect(db_path, timeout=5.0) as connection:
+                cursor = connection.execute(
+                    '''
+                    DELETE FROM plugin_state_entries
+                    WHERE plugin_id = ?
+                      AND namespace = ?
+                      AND entry_key = ?
+                      AND json_extract(value_json, '$.state') = 'cleared'
+                    ''',
+                    ('codex', 'app-server-thread-bindings', entry_key),
+                )
+                deleted = cursor.rowcount
+        except (OSError, sqlite3.Error) as exc:
+            return {
+                'status': 'failed',
+                'reason': 'openclaw_cleared_binding_prune_failed',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+            }
+        return {
+            'status': 'deleted' if deleted else 'already_absent',
+            'deleted': deleted,
         }
 
     def enqueue_deferred(

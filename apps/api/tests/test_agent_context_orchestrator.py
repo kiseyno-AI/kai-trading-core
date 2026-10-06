@@ -8390,6 +8390,60 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(error_log['failure_kind'], 'openclaw_transport_timeout')
         self.assertEqual(error_log['failure_mode'], 'openclaw_transport_timeout')
 
+    def test_openclaw_batch_dispatch_circuit_breaks_plugin_state_capacity_error(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        capacity_message = (
+            'Plugin state namespace app-server-thread-bindings for codex '
+            'reached its 50000-row limit.'
+        )
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=2,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(500, {'error': capacity_message}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        batch_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'request_run_id': 'symbol-run-2026-04-14-abc123',
+                'dispatch_id': dispatch_id,
+                'session_slot': 1,
+                'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+        ]
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                client = OpenClawAgentClient()
+                for _ in range(2):
+                    with self.assertRaises(orchestrator_module.AgentDispatchTerminalError) as raised:
+                        client.dispatch_batch(
+                            spec=orchestrator_module.DISPATCH_SPECS[0],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            batch_items=batch_items,
+                        )
+                    self.assertEqual(
+                        raised.exception.details['failure_kind'],
+                        'openclaw_plugin_state_capacity_exhausted',
+                    )
+                    self.assertFalse(raised.exception.details['retryable'])
+
+        self.assertEqual(len(http_calls), 1)
+
     def test_openclaw_batch_dispatch_classifies_non_json_http_response(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
         http_calls = []

@@ -1,4 +1,6 @@
 import subprocess
+import sqlite3
+import tempfile
 import unittest
 import uuid
 from datetime import UTC, date, datetime, timedelta
@@ -140,6 +142,11 @@ Run "openclaw doctor --fix" to remove stale entries.
 
         with (
             patch.object(service, '_invoke_delete', return_value={'ok': True, 'deleted': False}),
+            patch.object(
+                service,
+                '_prune_cleared_codex_binding',
+                return_value={'status': 'already_absent', 'deleted': 0},
+            ),
             patch.object(service, '_clear_failure') as clear_failure,
             patch.object(service, '_record_failure') as record_failure,
         ):
@@ -149,6 +156,74 @@ Run "openclaw doctor --fix" to remove stale entries.
         self.assertEqual(result['outcome'], 'already_absent')
         clear_failure.assert_called_once_with(session_key=target.session_key)
         record_failure.assert_not_called()
+
+    def test_delete_now_prunes_only_matching_cleared_codex_binding(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        target = SessionCleanupTarget(
+            market_date=date(2026, 9, 11),
+            symbol='005930',
+            agent_name='eod-summarizer',
+            run_id='feedback-run-01',
+            session_key='agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+        )
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            db_path = session_cleanup_module.Path(state_dir) / 'state' / 'openclaw.sqlite'
+            db_path.parent.mkdir(parents=True)
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    '''
+                    CREATE TABLE plugin_state_entries (
+                      plugin_id TEXT NOT NULL,
+                      namespace TEXT NOT NULL,
+                      entry_key TEXT NOT NULL,
+                      value_json TEXT NOT NULL,
+                      created_at INTEGER NOT NULL,
+                      expires_at INTEGER,
+                      PRIMARY KEY (plugin_id, namespace, entry_key)
+                    )
+                    '''
+                )
+                matching_key = service._codex_binding_entry_key(
+                    agent_name=target.agent_name,
+                    session_key=target.session_key,
+                )
+                connection.executemany(
+                    '''
+                    INSERT INTO plugin_state_entries
+                      (plugin_id, namespace, entry_key, value_json, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, 1, NULL)
+                    ''',
+                    [
+                        (
+                            'codex',
+                            'app-server-thread-bindings',
+                            matching_key,
+                            '{"version":1,"state":"cleared","retired":true}',
+                        ),
+                        (
+                            'codex',
+                            'app-server-thread-bindings',
+                            'session-key:eod-summarizer:unrelated',
+                            '{"version":1,"state":"active","binding":{"threadId":"keep"}}',
+                        ),
+                    ],
+                )
+
+            with (
+                patch.object(service, '_invoke_delete', return_value={'ok': True, 'deleted': True}),
+                patch.object(service, '_clear_failure'),
+                patch.object(session_cleanup_module.settings, 'openclaw_state_dir', state_dir),
+            ):
+                result = service.delete_now(target=target)
+
+            self.assertEqual(result['binding_cleanup']['status'], 'deleted')
+            with sqlite3.connect(db_path) as connection:
+                rows = connection.execute(
+                    'SELECT entry_key FROM plugin_state_entries ORDER BY entry_key'
+                ).fetchall()
+
+        self.assertEqual(rows, [('session-key:eod-summarizer:unrelated',)])
 
     def test_invoke_delete_keeps_already_absent_success_error_free(self) -> None:
         service = AgentFeedbackSessionCleanupService()

@@ -409,6 +409,44 @@ class OpenClawAgentClient:
         )
         self.max_retries = max(0, settings.openclaw_agent_max_retries)
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
+        self._circuit_breaker_lock = threading.Lock()
+        self._circuit_breaker_error: tuple[str, dict[str, Any]] | None = None
+
+    @staticmethod
+    def _plugin_state_capacity_error(
+        response: httpx.Response,
+    ) -> AgentDispatchTerminalError | None:
+        response_text = response.text[:1000]
+        normalized = response_text.lower()
+        if (
+            'app-server-thread-bindings' not in normalized
+            or 'row limit' not in normalized
+        ):
+            return None
+        return AgentDispatchTerminalError(
+            'OpenClaw Codex app-server binding state capacity is exhausted',
+            details={
+                'failure_kind': (
+                    FeedbackFailureKind.OPENCLAW_PLUGIN_STATE_CAPACITY_EXHAUSTED.value
+                ),
+                'failure_status': 'capacity/exhausted',
+                'failure_category': 'capacity',
+                'response_status_code': response.status_code,
+                'response_text_excerpt': response_text[:300],
+                'retryable': False,
+            },
+        )
+
+    def _raise_if_circuit_broken(self) -> None:
+        with self._circuit_breaker_lock:
+            stored = self._circuit_breaker_error
+        if stored is not None:
+            message, details = stored
+            raise AgentDispatchTerminalError(message, details=dict(details))
+
+    def _trip_circuit_breaker(self, error: AgentDispatchTerminalError) -> None:
+        with self._circuit_breaker_lock:
+            self._circuit_breaker_error = (str(error), dict(error.details))
 
     def _tool_invoke_url(self) -> str:
         parsed = urlparse(self.base_url)
@@ -1420,6 +1458,7 @@ class OpenClawAgentClient:
         )
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
+        self._raise_if_circuit_broken()
         url = f'{self.base_url}/v1/responses'
         request_session_key = str(payload.get('session_key') or f"agent:{spec.agent_name}:feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}")
         expected_model = expected_decider_model(spec.role, settings_obj=settings)
@@ -1488,6 +1527,10 @@ class OpenClawAgentClient:
                         'OpenClaw runtime contract changed during failed dispatch attempt',
                         details={'runtime_contract': runtime_contract},
                     )
+                capacity_error = self._plugin_state_capacity_error(response)
+                if capacity_error is not None:
+                    self._trip_circuit_breaker(capacity_error)
+                    raise capacity_error
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
                 if response.status_code in (408, 409, 429):
@@ -1774,6 +1817,7 @@ class OpenClawAgentClient:
         market_date: date,
         batch_items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
+        self._raise_if_circuit_broken()
         url = f'{self.base_url}/v1/responses'
         expected_model = expected_decider_model(spec.role, settings_obj=settings)
         requested_model_identity = build_requested_model_identity(
@@ -1826,6 +1870,7 @@ class OpenClawAgentClient:
                 'input': prompt_text,
             }
             try:
+                self._raise_if_circuit_broken()
                 request_session_key = fixed_session_key
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
@@ -1882,6 +1927,10 @@ class OpenClawAgentClient:
                         'OpenClaw runtime contract changed during failed batch dispatch attempt',
                         details={'runtime_contract': runtime_contract},
                     )
+                capacity_error = self._plugin_state_capacity_error(response)
+                if capacity_error is not None:
+                    self._trip_circuit_breaker(capacity_error)
+                    raise capacity_error
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')
                 if response.status_code in (408, 409, 429):
@@ -6610,6 +6659,10 @@ class AgentFeedbackOrchestrator:
                                     staged_batch_outcomes = True
                                 except Exception as exc:
                                     error_details = exc.details if isinstance(exc, AgentDispatchError) else {}
+                                    retryable_dispatch_error = not isinstance(
+                                        exc,
+                                        AgentDispatchTerminalError,
+                                    )
                                     for source_item in batch:
                                         dispatch_context = _resolve_batch_dispatch_context(
                                             batch_result=None,
@@ -6627,7 +6680,7 @@ class AgentFeedbackOrchestrator:
                                             agent_name=spec.agent_name,
                                             symbol=source_item['symbol'],
                                             error=f'{type(exc).__name__}: {exc}',
-                                            retryable=True,
+                                            retryable=retryable_dispatch_error,
                                             failure_kind=(
                                                 str(error_details.get('failure_kind'))
                                                 if isinstance(error_details, dict) and error_details.get('failure_kind')
@@ -6673,7 +6726,7 @@ class AgentFeedbackOrchestrator:
                                             role,
                                             source_item['symbol'],
                                             f'{type(exc).__name__}: {exc}',
-                                            True,
+                                            retryable_dispatch_error,
                                             failure_kind=(
                                                 str(error_details.get('failure_kind'))
                                                 if isinstance(error_details, dict) and error_details.get('failure_kind')
