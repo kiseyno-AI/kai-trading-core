@@ -2749,6 +2749,14 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             latest_run_loader.call_args.kwargs['request_modes'],
             [DAILY_RETRY_CYCLE_MODE],
         )
+        self.assertEqual(
+            latest_run_loader.call_args.kwargs['requested_roles'],
+            [
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+            ],
+        )
         progress_loader.assert_called_once()
         self.assertIsNone(progress_loader.call_args.kwargs.get('symbols'))
         self.assertEqual(
