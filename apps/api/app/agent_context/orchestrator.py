@@ -411,6 +411,8 @@ class OpenClawAgentClient:
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
         self._circuit_breaker_lock = threading.Lock()
         self._circuit_breaker_error: tuple[str, dict[str, Any]] | None = None
+        self._circuit_breaker_run_id: str | None = None
+        self._circuit_breaker_reprobe_run_id: str | None = None
 
     @staticmethod
     def _plugin_state_capacity_error(
@@ -437,16 +439,50 @@ class OpenClawAgentClient:
             },
         )
 
-    def _raise_if_circuit_broken(self) -> None:
+    def _raise_if_circuit_broken(self, *, request_run_id: str | None) -> bool:
+        normalized_run_id = str(request_run_id or '').strip() or None
         with self._circuit_breaker_lock:
             stored = self._circuit_breaker_error
+            if (
+                stored is not None
+                and normalized_run_id is not None
+                and normalized_run_id != self._circuit_breaker_run_id
+                and self._circuit_breaker_reprobe_run_id is None
+            ):
+                self._circuit_breaker_reprobe_run_id = normalized_run_id
+                return True
         if stored is not None:
             message, details = stored
             raise AgentDispatchTerminalError(message, details=dict(details))
+        return False
 
-    def _trip_circuit_breaker(self, error: AgentDispatchTerminalError) -> None:
+    def _trip_circuit_breaker(
+        self,
+        error: AgentDispatchTerminalError,
+        *,
+        request_run_id: str | None,
+    ) -> None:
         with self._circuit_breaker_lock:
             self._circuit_breaker_error = (str(error), dict(error.details))
+            self._circuit_breaker_run_id = str(request_run_id or '').strip() or None
+            self._circuit_breaker_reprobe_run_id = None
+
+    def _finish_circuit_breaker_reprobe(
+        self,
+        *,
+        request_run_id: str | None,
+        recovered: bool,
+    ) -> None:
+        normalized_run_id = str(request_run_id or '').strip() or None
+        with self._circuit_breaker_lock:
+            if self._circuit_breaker_reprobe_run_id != normalized_run_id:
+                return
+            if recovered:
+                self._circuit_breaker_error = None
+                self._circuit_breaker_run_id = None
+            else:
+                self._circuit_breaker_run_id = normalized_run_id
+            self._circuit_breaker_reprobe_run_id = None
 
     def _tool_invoke_url(self) -> str:
         parsed = urlparse(self.base_url)
@@ -1458,9 +1494,11 @@ class OpenClawAgentClient:
         )
 
     def dispatch(self, *, spec: AgentDispatchSpec, payload: dict[str, Any]) -> dict[str, Any]:
-        self._raise_if_circuit_broken()
         url = f'{self.base_url}/v1/responses'
         request_session_key = str(payload.get('session_key') or f"agent:{spec.agent_name}:feedback/{spec.agent_name}/{payload.get('request_id') or uuid.uuid4().hex}")
+        request_run_id = (
+            str(payload.get('request_run_id') or request_session_key).strip() or None
+        )
         expected_model = expected_decider_model(spec.role, settings_obj=settings)
         requested_model_identity = build_requested_model_identity(
             role=spec.role,
@@ -1475,12 +1513,17 @@ class OpenClawAgentClient:
         last_error_details: dict[str, Any] | None = None
         retry_contract_anchor: dict[str, Any] | None = None
         dispatch_started_at: datetime | None = None
+        capacity_reprobe = False
         while attempt <= self.max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             if dispatch_started_at is None:
                 dispatch_started_at = started_at
             try:
+                if not capacity_reprobe:
+                    capacity_reprobe = self._raise_if_circuit_broken(
+                        request_run_id=request_run_id,
+                    )
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
                     'x-openclaw-agent-id': spec.agent_name,
@@ -1529,7 +1572,10 @@ class OpenClawAgentClient:
                     )
                 capacity_error = self._plugin_state_capacity_error(response)
                 if capacity_error is not None:
-                    self._trip_circuit_breaker(capacity_error)
+                    self._trip_circuit_breaker(
+                        capacity_error,
+                        request_run_id=request_run_id,
+                    )
                     raise capacity_error
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
@@ -1575,6 +1621,12 @@ class OpenClawAgentClient:
                     expected_model=expected_model,
                     runtime_contract=runtime_contract,
                 )
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=request_run_id,
+                        recovered=True,
+                    )
+                    capacity_reprobe = False
                 return {
                     'ok': True,
                     'attempt': attempt,
@@ -1594,6 +1646,12 @@ class OpenClawAgentClient:
                     },
                 }
             except AgentDispatchTerminalError as exc:
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=request_run_id,
+                        recovered=False,
+                    )
+                    capacity_reprobe = False
                 log_agent_feedback_event(
                     'dispatch_single_response_error',
                     status='terminal',
@@ -1607,6 +1665,12 @@ class OpenClawAgentClient:
                 )
                 raise
             except Exception as exc:  # noqa: BLE001
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=request_run_id,
+                        recovered=False,
+                    )
+                    capacity_reprobe = False
                 last_error = exc
                 log_agent_feedback_event(
                     'dispatch_single_response_error',
@@ -1817,7 +1881,6 @@ class OpenClawAgentClient:
         market_date: date,
         batch_items: Sequence[dict[str, Any]],
     ) -> dict[str, Any]:
-        self._raise_if_circuit_broken()
         url = f'{self.base_url}/v1/responses'
         expected_model = expected_decider_model(spec.role, settings_obj=settings)
         requested_model_identity = build_requested_model_identity(
@@ -1837,10 +1900,12 @@ class OpenClawAgentClient:
         if dispatch_id is None:
             slot_token = slot if slot is not None else 0
             dispatch_id = f'{request_run_id or "adhoc-run"}:{spec.role}:slot-{slot_token}:{uuid.uuid4().hex[:8]}'
+        circuit_breaker_run_id = str(request_run_id or dispatch_id).strip() or None
         attempt = 0
         last_error: Exception | None = None
         retry_contract_anchor: dict[str, Any] | None = None
         dispatch_started_at: datetime | None = None
+        capacity_reprobe = False
         while attempt <= self.max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
@@ -1870,7 +1935,10 @@ class OpenClawAgentClient:
                 'input': prompt_text,
             }
             try:
-                self._raise_if_circuit_broken()
+                if not capacity_reprobe:
+                    capacity_reprobe = self._raise_if_circuit_broken(
+                        request_run_id=circuit_breaker_run_id,
+                    )
                 request_session_key = fixed_session_key
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
@@ -1929,7 +1997,10 @@ class OpenClawAgentClient:
                     )
                 capacity_error = self._plugin_state_capacity_error(response)
                 if capacity_error is not None:
-                    self._trip_circuit_breaker(capacity_error)
+                    self._trip_circuit_breaker(
+                        capacity_error,
+                        request_run_id=circuit_breaker_run_id,
+                    )
                     raise capacity_error
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')
@@ -2211,6 +2282,12 @@ class OpenClawAgentClient:
                         response_correlation=response_correlation,
                         reuse_signal='stale_or_ambiguous_session_reuse',
                     )
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=circuit_breaker_run_id,
+                        recovered=True,
+                    )
+                    capacity_reprobe = False
                 return {
                     'ok': True,
                     'attempt': attempt,
@@ -2236,8 +2313,20 @@ class OpenClawAgentClient:
                     'model_identity': model_identity,
                 }
             except AgentDispatchTerminalError:
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=circuit_breaker_run_id,
+                        recovered=False,
+                    )
+                    capacity_reprobe = False
                 raise
             except Exception as exc:  # noqa: BLE001
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=circuit_breaker_run_id,
+                        recovered=False,
+                    )
+                    capacity_reprobe = False
                 last_error = exc
                 error_type = type(exc).__name__
                 error_message = str(exc)

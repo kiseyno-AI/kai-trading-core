@@ -8485,6 +8485,151 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(len(http_calls), 1)
 
+    def test_openclaw_batch_dispatch_reprobes_capacity_on_subsequent_run(self):
+        http_calls = []
+        capacity_message = (
+            'Plugin state namespace app-server-thread-bindings for codex '
+            'reached its 50000-row limit.'
+        )
+        recovered_payload = {
+            'id': 'resp-recovered',
+            'status': 'completed',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [
+                        {
+                            'type': 'output_text',
+                            'text': json.dumps(
+                                {
+                                    'items': [
+                                        {
+                                            'symbol': '005930',
+                                            'feedback': {
+                                                'role': 'eod-summarizer',
+                                                'summary': 'Capacity recovered.',
+                                                'confidence': 0.7,
+                                                'risk_flags': [],
+                                                'details': {},
+                                                'improvement_notes': [],
+                                            },
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        responses = [
+            FakeHTTPResponse(500, {'error': capacity_message}),
+            FakeHTTPResponse(500, {'error': 'temporary gateway failure'}),
+            FakeHTTPResponse(200, recovered_payload),
+            FakeHTTPResponse(200, recovered_payload),
+            FakeHTTPResponse(500, {'error': capacity_message}),
+            FakeHTTPResponse(200, recovered_payload),
+        ]
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=responses.pop(0),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        def batch_items(scope: str, *, include_run_id: bool = True) -> list[dict]:
+            item = {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'dispatch_id': f'{scope}:eod-summarizer:slot-1:batch-1',
+                'session_slot': 1,
+                'session_key': f'agent:eod-summarizer:{scope}:slot-01',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+            if include_run_id:
+                item['request_run_id'] = scope
+            return [item]
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                client = OpenClawAgentClient()
+                with self.assertRaises(orchestrator_module.AgentDispatchTerminalError):
+                    client.dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=batch_items('run-capacity'),
+                    )
+                with self.assertRaises(orchestrator_module.AgentDispatchTerminalError):
+                    client.dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=batch_items('run-capacity'),
+                    )
+
+                with patch.object(
+                    client,
+                    '_build_batch_message',
+                    side_effect=orchestrator_module.AgentDispatchTerminalError(
+                        'local prompt construction failed'
+                    ),
+                ):
+                    with self.assertRaises(orchestrator_module.AgentDispatchTerminalError):
+                        client.dispatch_batch(
+                            spec=orchestrator_module.DISPATCH_SPECS[0],
+                            market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                            batch_items=batch_items('run-local-preflight-failure'),
+                        )
+
+                with self.assertRaises(orchestrator_module.AgentDispatchRetryableError):
+                    client.dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=batch_items('run-failed-reprobe'),
+                    )
+                with self.assertRaises(orchestrator_module.AgentDispatchTerminalError):
+                    client.dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=batch_items('run-failed-reprobe'),
+                    )
+
+                recovered = client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=batch_items('run-recovery-probe'),
+                )
+                after_recovery = client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=batch_items('run-after-recovery'),
+                )
+                with self.assertRaises(orchestrator_module.AgentDispatchTerminalError):
+                    client.dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=batch_items('adhoc-capacity', include_run_id=False),
+                    )
+                adhoc_recovered = client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=batch_items('adhoc-recovery', include_run_id=False),
+                )
+
+        self.assertTrue(recovered['ok'])
+        self.assertTrue(after_recovery['ok'])
+        self.assertTrue(adhoc_recovered['ok'])
+        self.assertEqual(len(http_calls), 6)
+
     def test_openclaw_batch_dispatch_classifies_non_json_http_response(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
         http_calls = []
