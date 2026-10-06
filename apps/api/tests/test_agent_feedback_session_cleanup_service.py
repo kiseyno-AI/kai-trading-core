@@ -144,7 +144,7 @@ Run "openclaw doctor --fix" to remove stale entries.
             patch.object(service, '_invoke_delete', return_value={'ok': True, 'deleted': False}),
             patch.object(
                 service,
-                '_prune_cleared_codex_binding',
+                '_prune_codex_binding',
                 return_value={'status': 'already_absent', 'deleted': 0},
             ),
             patch.object(service, '_clear_failure') as clear_failure,
@@ -157,7 +157,7 @@ Run "openclaw doctor --fix" to remove stale entries.
         clear_failure.assert_called_once_with(session_key=target.session_key)
         record_failure.assert_not_called()
 
-    def test_delete_now_prunes_only_matching_cleared_codex_binding(self) -> None:
+    def test_delete_now_prunes_only_matching_codex_binding(self) -> None:
         service = AgentFeedbackSessionCleanupService()
         target = SessionCleanupTarget(
             market_date=date(2026, 9, 11),
@@ -199,7 +199,7 @@ Run "openclaw doctor --fix" to remove stale entries.
                             'codex',
                             'app-server-thread-bindings',
                             matching_key,
-                            '{"version":1,"state":"cleared","retired":true}',
+                            '{"version":1,"state":"active","binding":{"threadId":"deleted"}}',
                         ),
                         (
                             'codex',
@@ -307,7 +307,14 @@ Run "openclaw doctor --fix" to remove stale entries.
         ]
 
         try:
-            with patch.object(service, '_invoke_delete') as invoke_delete:
+            with (
+                patch.object(service, '_invoke_delete') as invoke_delete,
+                patch.object(
+                    service,
+                    '_prune_codex_bindings',
+                    return_value={'status': 'deleted', 'deleted': 2},
+                ) as prune_bindings,
+            ):
                 result = service.enqueue_deferred(
                     targets=targets,
                     reason='cleanup_time_budget_exhausted',
@@ -338,6 +345,8 @@ Run "openclaw doctor --fix" to remove stale entries.
             self.assertTrue(all(row['last_attempt_at'] is None for row in persisted))
             self.assertTrue(all(row['next_attempt_at'] is not None for row in persisted))
             self.assertTrue(all(row['last_error'] == 'cleanup_time_budget_exhausted' for row in persisted))
+            self.assertEqual(result['binding_cleanup'], {'status': 'deleted', 'deleted': 2})
+            prune_bindings.assert_called_once_with(targets=targets)
             invoke_delete.assert_not_called()
         finally:
             with session_scope() as session:
