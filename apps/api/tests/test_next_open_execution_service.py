@@ -86,6 +86,8 @@ from app.orders.next_open_execution import (
     _snapshot_generation_authority_changes,
     _snapshot_generation_authority_fingerprint,
     _set_plan_refresh_transaction_timeouts,
+    _short_term_objective_gate_features,
+    _structured_close_price_mismatch,
     _preopen_plan_covers_latest_snapshots,
     _previous_trading_day,
     _to_decimal,
@@ -153,6 +155,122 @@ def test_normalize_objective_percentile_requires_finite_bounded_units() -> None:
         ('-Infinity', 'percent'),
     ):
         assert _normalize_objective_percentile(value, unit=unit) is None
+
+
+def test_short_term_objective_features_preserve_raw_turnover_from_real_payload_shape() -> None:
+    snapshot = SimpleNamespace(
+        symbol='005930',
+        market_date=date(2026, 10, 6),
+        request_payload={
+            'symbol_day_context': {
+                'technical_snapshot': {'breakout_20d': True},
+                'action_summary': {'summary_payload': {'setup_state': 'continuation'}},
+                'market_relative_context': {
+                    'relative_strength': {
+                        'return_percentile': 0.82,
+                        'volume_percentile': 0.71,
+                    }
+                },
+            },
+            'liquidity_context': {
+                'turnover': {
+                    'status': 'available',
+                    'trading_value_source': 'estimated',
+                    'estimated_trading_value_krw': 7_500_000_000,
+                }
+            },
+            'pre_decider_enrichment_context': {
+                'trading_value': {
+                    'status': 'available',
+                    'source': 'pykrx',
+                    'trading_value_source': 'raw',
+                    'raw_trading_value_krw': 8_400_000_000,
+                    'trading_value_krw': 8_400_000_000,
+                }
+            },
+            'decision_input_quality_context': {
+                'final_judgment': {'buy_quality_score': 72, 'decision_band': 'watch'},
+            },
+        },
+        response_payload={},
+    )
+
+    features = _short_term_objective_gate_features(snapshot)
+
+    assert features['raw_trading_value_krw'] == Decimal('8400000000')
+    assert features['trading_value_source'] == 'raw'
+    assert features['trading_value_evidence_path'] == (
+        'pre_decider_enrichment_context.trading_value.raw_trading_value_krw'
+    )
+    assert features['trading_value_provider'] == 'pykrx'
+
+
+def test_structured_close_mismatch_exposes_source_and_adjustment_basis() -> None:
+    snapshot = SimpleNamespace(
+        symbol='005930',
+        market_date=date(2026, 10, 6),
+        request_payload={
+            'symbol_day_context': {
+                'market_date': '2026-10-06',
+                'price_context': {
+                    'trade_date': '2026-10-06',
+                    'close_price': 50_000,
+                    'price_source': 'daily_price_bars',
+                    'adjusted': False,
+                },
+            },
+            'sector_peer_context': {
+                'market_date': '2026-10-06',
+                    'close_price': 51_000,
+                'price_source': 'pykrx',
+                'adjusted': True,
+            },
+        },
+        response_payload={},
+    )
+
+    mismatch = _structured_close_price_mismatch(snapshot)
+
+    assert mismatch is not None
+    assert mismatch['comparison_status'] == 'price_basis_mismatch_fail_closed'
+    assert mismatch['material_difference_tolerance_bps'] == '100'
+    assert mismatch['canonical_price_evidence'] == {
+        'source': 'daily_price_bars',
+        'adjustment_basis': 'unadjusted',
+        'basis_explicit': True,
+    }
+    assert mismatch['conflicts'][0]['price_evidence'] == {
+        'source': 'pykrx',
+        'adjustment_basis': 'adjusted',
+        'basis_explicit': True,
+    }
+
+
+def test_structured_close_mismatch_ignores_same_basis_sub_tolerance_difference() -> None:
+    snapshot = SimpleNamespace(
+        symbol='005930',
+        market_date=date(2026, 10, 6),
+        request_payload={
+            'symbol_day_context': {
+                'market_date': '2026-10-06',
+                'price_context': {
+                    'trade_date': '2026-10-06',
+                    'close_price': 50_000,
+                    'price_source': 'daily_price_bars',
+                    'adjusted': False,
+                },
+            },
+            'sector_peer_context': {
+                'market_date': '2026-10-06',
+                'close_price': 50_025,
+                'price_source': 'pykrx',
+                'adjusted': False,
+            },
+        },
+        response_payload={},
+    )
+
+    assert _structured_close_price_mismatch(snapshot) is None
 
 
 def test_dispatch_authority_source_locks_use_one_deadlock_safe_order() -> None:
@@ -4768,7 +4886,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('data_quality_warnings_present', block_codes)
         self.assertIn('decision_input_quality_liquidity_turnover_hard_block', block_codes)
 
-    def test_refresh_plan_items_keeps_watch_candidate_for_same_market_date_structured_close_mismatch(
+    def test_refresh_plan_items_fails_closed_for_same_market_date_structured_close_mismatch(
         self,
     ) -> None:
         snapshot_id = self._seed_short_term_snapshot(symbol='005930')
@@ -4783,6 +4901,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     'price_context': {
                         'trade_date': self.market_date.isoformat(),
                         'close_price': 50_000,
+                        'price_source': 'daily_price_bars',
+                        'adjusted': False,
                     },
                 }
             )
@@ -4791,7 +4911,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     'symbol_day_context': symbol_day_context,
                     'sector_peer_context': {
                         'market_date': self.market_date.isoformat(),
-                        'close_price': 50_500,
+                        'close_price': 51_000,
+                        'price_source': 'pykrx',
+                        'adjusted': False,
                     },
                     'valuation_context': {
                         'market_date': self.market_date.isoformat(),
@@ -4816,10 +4938,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = result['items'][0]
         block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
-        warning_codes = {reason['code'] for reason in item['validation']['warnings']}
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
-        self.assertNotIn('structured_close_price_mismatch', block_codes)
-        self.assertIn('structured_close_price_mismatch', warning_codes)
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertIn('structured_close_price_mismatch', block_codes)
+        mismatch = next(
+            reason
+            for reason in item['validation']['blocking_reasons']
+            if reason['code'] == 'structured_close_price_mismatch'
+        )
+        self.assertEqual(mismatch['comparison_status'], 'price_value_mismatch')
 
     def test_refresh_plan_items_ignores_structured_close_from_different_market_date(self) -> None:
         snapshot_id = self._seed_short_term_snapshot(symbol='005930')

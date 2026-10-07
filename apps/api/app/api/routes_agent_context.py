@@ -215,6 +215,10 @@ class DeciderEvaluationComputeRequest(BaseModel):
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=500)
     window_days: int = Field(default=5, ge=1, le=30)
     force_recompute: bool = False
+    fee_bps: float | None = Field(default=None, ge=0, le=1000)
+    slippage_bps: float | None = Field(default=None, ge=0, le=1000)
+    tax_bps: float | None = Field(default=None, ge=0, le=1000)
+    enable_shadow_avoid_chase_rule: bool = False
 
     @model_validator(mode='after')
     def validate_window(self) -> 'DeciderEvaluationComputeRequest':
@@ -1513,6 +1517,10 @@ async def compute_decider_post_decision_evaluations(payload: DeciderEvaluationCo
             symbols=payload.symbols,
             window_days=payload.window_days,
             force_recompute=payload.force_recompute,
+            fee_bps=payload.fee_bps,
+            slippage_bps=payload.slippage_bps,
+            tax_bps=payload.tax_bps,
+            enable_shadow_avoid_chase_rule=payload.enable_shadow_avoid_chase_rule,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1529,6 +1537,7 @@ async def list_decider_post_decision_evaluations(
     symbols: list[str] | None = Query(default=None),
     outcome_labels: list[str] | None = Query(default=None),
     window_days: int = Query(default=5, ge=1, le=30),
+    include_history: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict:
     try:
@@ -1541,6 +1550,7 @@ async def list_decider_post_decision_evaluations(
             symbols=symbols,
             outcome_labels=outcome_labels,
             window_days=window_days,
+            include_history=include_history,
             limit=limit,
         )
     except ValueError as exc:

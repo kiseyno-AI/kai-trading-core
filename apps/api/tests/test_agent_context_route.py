@@ -1871,6 +1871,10 @@ class AgentContextRouteTests(unittest.TestCase):
                     'agent_names': ['signal-decider', 'short-term-decider'],
                     'symbols': ['005930'],
                     'window_days': 5,
+                    'fee_bps': 10,
+                    'slippage_bps': 20,
+                    'tax_bps': 18,
+                    'enable_shadow_avoid_chase_rule': True,
                 },
             )
         finally:
@@ -1882,6 +1886,10 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.compute_args['agent_names'], ['signal-decider', 'short-term-decider'])
         self.assertEqual(fake_service.compute_args['symbols'], ['005930'])
         self.assertEqual(fake_service.compute_args['window_days'], 5)
+        self.assertEqual(fake_service.compute_args['fee_bps'], 10.0)
+        self.assertEqual(fake_service.compute_args['slippage_bps'], 20.0)
+        self.assertEqual(fake_service.compute_args['tax_bps'], 18.0)
+        self.assertTrue(fake_service.compute_args['enable_shadow_avoid_chase_rule'])
         self.assertEqual(response.json()['summary']['evaluations_upserted'], 2)
 
     def test_list_decider_evaluations_route_calls_service(self):
@@ -1899,6 +1907,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     ('symbols', '005930'),
                     ('outcome_labels', 'target_hit_before_stop'),
                     ('window_days', '5'),
+                    ('include_history', 'true'),
                     ('limit', '25'),
                 ],
             )
@@ -1911,6 +1920,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.list_args['symbols'], ['005930'])
         self.assertEqual(fake_service.list_args['outcome_labels'], ['target_hit_before_stop'])
         self.assertEqual(fake_service.list_args['window_days'], 5)
+        self.assertTrue(fake_service.list_args['include_history'])
         self.assertEqual(fake_service.list_args['limit'], 25)
         self.assertEqual(response.json()['items'][0]['outcome_label'], 'target_hit_before_stop')
 

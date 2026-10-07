@@ -196,6 +196,10 @@ SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
 SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
 SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
 SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
+# Daily contexts can be captured at slightly different points in the same session.
+# Only a material (>1%) same-date divergence is execution-blocking; smaller drift
+# remains below this fail-closed boundary until all producers publish a basis flag.
+STRUCTURED_CLOSE_MISMATCH_TOLERANCE_BPS = Decimal('100')
 SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
 SHORT_TERM_WATCH_DELEGATED_ENTRY_QUALITY_BLOCK_CODES = frozenset(
     {
@@ -1524,6 +1528,48 @@ def _context_market_date(
     return default
 
 
+def _normalize_price_evidence(
+    price_payload: dict[str, Any],
+    enclosing_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    enclosing = enclosing_payload if isinstance(enclosing_payload, dict) else {}
+    source = _normalize_optional_text(
+        price_payload.get('price_source')
+        or price_payload.get('source')
+        or enclosing.get('price_source')
+        or enclosing.get('source')
+    )
+    explicit_basis = None
+    for payload in (price_payload, enclosing):
+        for key in ('adjustment_basis', 'price_adjustment_basis'):
+            value = _normalize_optional_text(payload.get(key))
+            if value is not None:
+                normalized = value.lower()
+                if normalized in {'adjusted', 'split_adjusted', 'total_return_adjusted'}:
+                    explicit_basis = 'adjusted'
+                elif normalized in {'raw', 'unadjusted', 'as_traded'}:
+                    explicit_basis = 'unadjusted'
+                else:
+                    explicit_basis = 'unknown'
+                break
+        if explicit_basis is not None:
+            break
+        for key in ('adjusted', 'is_adjusted', 'price_adjusted'):
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if isinstance(value, bool):
+                explicit_basis = 'adjusted' if value else 'unadjusted'
+            break
+        if explicit_basis is not None:
+            break
+    return {
+        'source': source or 'unknown',
+        'adjustment_basis': explicit_basis or 'unknown',
+        'basis_explicit': explicit_basis is not None,
+    }
+
+
 def _structured_close_price_mismatch(
     snapshot: SignalDeciderDecisionSnapshot,
 ) -> dict[str, Any] | None:
@@ -1549,6 +1595,7 @@ def _structured_close_price_mismatch(
     )
     if canonical_close is None or canonical_close <= 0 or canonical_date != snapshot.market_date:
         return None
+    canonical_evidence = _normalize_price_evidence(price_context, symbol_day_context)
 
     def request_context(key: str) -> dict[str, Any]:
         context = request_payload.get(key)
@@ -1579,7 +1626,7 @@ def _structured_close_price_mismatch(
         ),
         ('liquidity_context.turnover.close_price', turnover_context, liquidity_context),
     )
-    conflicts: list[dict[str, str]] = []
+    conflicts: list[dict[str, Any]] = []
     for source, price_payload, enclosing_payload in candidates:
         close_price = _to_decimal(price_payload.get('close_price'))
         source_date = _context_market_date(
@@ -1594,19 +1641,51 @@ def _structured_close_price_mismatch(
             or close_price == canonical_close
         ):
             continue
+        difference_bps = (
+            abs(close_price - canonical_close)
+            / canonical_close
+            * Decimal('10000')
+        )
+        if difference_bps <= STRUCTURED_CLOSE_MISMATCH_TOLERANCE_BPS:
+            continue
+        price_evidence = _normalize_price_evidence(price_payload, enclosing_payload)
+        canonical_basis = canonical_evidence['adjustment_basis']
+        source_basis = price_evidence['adjustment_basis']
+        comparison_status = (
+            'price_basis_unverified_fail_closed'
+            if 'unknown' in {canonical_basis, source_basis}
+            else 'price_basis_mismatch_fail_closed'
+            if canonical_basis != source_basis
+            else 'price_value_mismatch'
+        )
         conflicts.append(
             {
                 'source': source,
                 'close_price': _decimal_to_text(close_price) or str(close_price),
                 'market_date': source_date.isoformat(),
+                'price_evidence': price_evidence,
+                'comparison_status': comparison_status,
+                'difference_bps': _decimal_to_text(difference_bps),
             }
         )
     if not conflicts:
         return None
+    comparison_status = (
+        'price_basis_unverified_fail_closed'
+        if any(conflict['comparison_status'] == 'price_basis_unverified_fail_closed' for conflict in conflicts)
+        else 'price_basis_mismatch_fail_closed'
+        if any(conflict['comparison_status'] == 'price_basis_mismatch_fail_closed' for conflict in conflicts)
+        else 'price_value_mismatch'
+    )
     return {
         'canonical_source': 'symbol_day_context.price_context.close_price',
         'canonical_close_price': _decimal_to_text(canonical_close) or str(canonical_close),
+        'canonical_price_evidence': canonical_evidence,
         'market_date': canonical_date.isoformat(),
+        'comparison_status': comparison_status,
+        'material_difference_tolerance_bps': _decimal_to_text(
+            STRUCTURED_CLOSE_MISMATCH_TOLERANCE_BPS
+        ),
         'conflicts': conflicts,
     }
 
@@ -1813,6 +1892,41 @@ def _normalize_objective_percentile(value: Any, *, unit: Any = None) -> Decimal 
     return parsed if parsed <= Decimal('1') else None
 
 
+def _resolve_raw_trading_value_evidence(
+    *,
+    liquidity_turnover: dict[str, Any],
+    pre_decider_trading_value: dict[str, Any],
+) -> tuple[Decimal | None, str | None, str | None, str | None]:
+    candidates = (
+        (
+            'liquidity_context.turnover.raw_trading_value_krw',
+            liquidity_turnover,
+        ),
+        (
+            'pre_decider_enrichment_context.trading_value.raw_trading_value_krw',
+            pre_decider_trading_value,
+        ),
+    )
+    fallback_source: str | None = None
+    fallback_provider: str | None = None
+    for evidence_path, payload in candidates:
+        source = _normalize_optional_text(
+            payload.get('trading_value_source') or payload.get('source')
+        )
+        provider = _normalize_optional_text(
+            payload.get('provider')
+            or payload.get('source_provider')
+            or payload.get('source')
+        )
+        if fallback_source is None and source is not None:
+            fallback_source = source
+            fallback_provider = provider
+        raw_value = _to_decimal(payload.get('raw_trading_value_krw'))
+        if str(source or '').lower() == 'raw' and raw_value is not None and raw_value >= 0:
+            return raw_value, 'raw', evidence_path, provider
+    return None, fallback_source, None, fallback_provider
+
+
 def _short_term_objective_gate_features(
     snapshot: SignalDeciderDecisionSnapshot,
 ) -> dict[str, Any]:
@@ -1869,10 +1983,10 @@ def _short_term_objective_gate_features(
         if isinstance(symbol_day_context.get('liquidity_context'), dict)
         else {}
     )
-    trading_value = (
+    liquidity_turnover = (
         liquidity_context.get('turnover')
         if isinstance(liquidity_context.get('turnover'), dict)
-        else pre_decider_trading_value
+        else {}
     )
     decision_input_quality = (
         request_payload.get('decision_input_quality_context')
@@ -1912,13 +2026,14 @@ def _short_term_objective_gate_features(
             in {'confirmed', 'continuation', 'breakout', 'pullback_support', 'reclaim'}
         )
     )
-    trading_value_source = _normalize_optional_text(
-        trading_value.get('source') or trading_value.get('trading_value_source')
-    )
-    raw_trading_value_krw = (
-        _to_decimal(trading_value.get('raw_trading_value_krw'))
-        if str(trading_value_source or '').lower() == 'raw'
-        else None
+    (
+        raw_trading_value_krw,
+        trading_value_source,
+        trading_value_evidence_path,
+        trading_value_provider,
+    ) = _resolve_raw_trading_value_evidence(
+        liquidity_turnover=liquidity_turnover,
+        pre_decider_trading_value=pre_decider_trading_value,
     )
     return {
         'atr_pct_14': _to_decimal(technical.get('atr_pct_14')),
@@ -1936,6 +2051,8 @@ def _short_term_objective_gate_features(
         'buy_quality_score': _to_decimal(final_judgment.get('buy_quality_score')),
         'decision_band': _normalize_optional_text(final_judgment.get('decision_band')),
         'trading_value_source': trading_value_source,
+        'trading_value_evidence_path': trading_value_evidence_path,
+        'trading_value_provider': trading_value_provider,
         'trend_state': normalized_trend_state,
         'setup_state': normalized_setup_state,
         'continuation_setup_detected': continuation_setup_detected,
@@ -6972,25 +7089,23 @@ class SignalDeciderNextOpenExecutionService:
                 f"{item['source']}={item['close_price']}"
                 for item in close_price_mismatch['conflicts']
             )
-            close_price_mismatch_reason = _reason(
-                'structured_close_price_mismatch',
-                (
+            close_price_mismatch_reason = {
+                'code': 'structured_close_price_mismatch',
+                'message': (
                     'Same-market-date structured close prices disagree: '
                     f"{close_price_mismatch['canonical_source']}="
                     f"{close_price_mismatch['canonical_close_price']}; "
                     f'{conflict_summary} '
                     f"({close_price_mismatch['market_date']})."
                 ),
-            )
-            # A trigger-gated short-term watch is priced from the live quote at
-            # execution time.  Conflicting historical close fields are useful
-            # diagnostics, but must not prevent Exec from monitoring the
-            # declared trigger/chase range.  Unconditional next-open buys keep
-            # the fail-closed behavior.
-            if handoff_intent == 'intraday_watch_buy':
-                warnings.append(close_price_mismatch_reason)
-            else:
-                blocking_reasons.append(close_price_mismatch_reason)
+                'comparison_status': close_price_mismatch['comparison_status'],
+                'material_difference_tolerance_bps': close_price_mismatch[
+                    'material_difference_tolerance_bps'
+                ],
+                'canonical_price_evidence': close_price_mismatch['canonical_price_evidence'],
+                'conflicts': close_price_mismatch['conflicts'],
+            }
+            blocking_reasons.append(close_price_mismatch_reason)
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
             snapshot.specialist_disagreement_payload
         ):
