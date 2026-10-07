@@ -5,6 +5,12 @@ Computes or refreshes the generic durable 5-trading-day post-decision evaluation
 
 By default the compute route now gates on same-day feedback prerequisites for the requested date window. If fundamentals, filtering, or factor/scoring stages are still pending or blocked for the relevant market date, the response returns `summary.status=waiting|blocked`, `summary.gated=true`, and a `prerequisites` block instead of refreshing evaluations. Operators can bypass that check with `force_recompute=true`.
 
+The current slice supports only `window_days=5`. For each agent/date/symbol
+cohort, compute selects the newest feedback revision before checking snapshot
+validity. An invalid newest revision is excluded and increments
+`summary.latest_authority_rows_excluded_invalid`; it never revives an older valid
+decision as current authority.
+
 ## Example request
 ```http
 POST /agent-context/decider/evaluations/compute
@@ -24,13 +30,26 @@ Content-Type: application/json
 ```
 
 The three cost inputs are independently optional for compatibility. The
-response reports whether every component was supplied and identifies any
-missing components. The avoid-chase rule is report-only and never grants live
-execution authority.
+response reports `costs_explicit`, `cost_inputs_provided`, and
+`missing_cost_components`. A partially specified ledger carries
+`partial_cost_assumption_missing:<components>`; an all-zero effective cost
+assumption carries `zero_cost_assumption_may_overstate_paper_return`.
 
-Short-term `watch_for_trigger` evaluations become terminal only after five
-complete daily OHLC bars are available. Until then, both an untriggered watch
-and a triggered but unresolved watch return
+The optional `short_term_avoid_chase_shadow_v1` rule is report-only and never
+grants live execution authority. It is eligible only when enabled for an
+`avoid_chase` decision and every gate passes: `wait_reason.code` is
+`extended_entry_price`; market regime is `normal`; return percentile is at least
+`0.75`; the setup is `breakout_20d` or one of `confirmed`, `continuation`,
+`breakout`, `pullback_support`, and `reclaim`, with no `breakdown_20d`;
+reward/risk is at least `2.0`; and raw-source trading value is at least KRW
+`3,000,000,000`.
+
+Short-term `watch_for_trigger` evaluations validate their levels before the
+five-bar maturity gate. Missing or non-positive levels, or anything other than
+`stop < trigger <= chase_limit < target`, immediately returns
+`outcome_label="invalid_no_price_levels"`, even before five bars exist. With
+valid levels, both an untriggered watch and a triggered but unresolved watch
+remain immature until five complete daily OHLC bars are available and return
 `outcome_label="invalid_missing_price_data"`,
 `metadata.price_window_complete=false`, and `metadata.paper_ledger=null`.
 Only a complete five-bar window with no valid trigger may return
