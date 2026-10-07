@@ -1523,6 +1523,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertTrue(result['triggered'])
         self.assertEqual(result['market_date'], '2026-04-03')
         enrich_recent_classification.assert_called_once_with(
+            market_date='2026-04-03',
             lookback_days=ANY,
             limit=1000,
         )

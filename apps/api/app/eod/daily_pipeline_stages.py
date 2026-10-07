@@ -2857,6 +2857,7 @@ class DailyPipelineStageService:
         if stage_id == 'external_news_enrich':
             return external_news_service.enrich_recent_classification(
                 symbols=symbols,
+                market_date=market_date,
                 lookback_days=settings.external_news_context_lookback_days,
                 limit=symbol_limit or 1000,
             )

@@ -159,8 +159,8 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 ### persisted downstream outputs
 
 - `signal_features` can be inferred as `completed` from same-date `daily_signal_features` rows.
-- `external_news_collect` can be inferred as `completed` from same-date `external_news_items` collected rows.
-- `external_news_enrich` is based on the current material/noise/source-status contract in stored news rows: fully contract-classified rows are `completed`, partially contract-classified rows are `partial`, and rows that only have legacy or missing classifier payloads keep the enrich stage `pending` with reason metadata. Status details include contract-classified and legacy-classified counts.
+- `external_news_collect` can be inferred as `completed` from distinct immutable articles whose `external_news_item_symbols.associated_at` falls within the same Seoul market date.
+- `external_news_enrich` is based on append-only current-version classification sidecars for that associated article cohort: fully contract-classified rows are `completed`, partially contract-classified rows are `partial`, and rows that only have older-version or missing sidecars keep the enrich stage `pending` with reason metadata. The daily stage also classifies old articles newly attributed to an in-scope symbol during the half-open Seoul market-day association window, without treating another symbol's association as eligibility. Status details include contract-classified and legacy-classified counts.
 - `macro_context_refresh` evaluates cooldown per enabled series. Inside the global interval it refreshes only missing or individually due series and exposes them under `retry_scope`; `reason=macro_context_refresh_not_due` is satisfied only when every enabled series is still recent.
 - `signal_decider` can be inferred as `completed` from same-date `agent_context_feedback` rows for `agent_name=signal-decider` and/or same-date `signal_decider_decision_snapshots`.
 - These persisted-output inferences are storage availability signals. They do not silently relax prerequisite gates.

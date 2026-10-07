@@ -264,6 +264,94 @@ def test_recent_external_news_anchors_lookback_and_forwards_knowledge_cutoff() -
 
 
 class ExternalNewsServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_enrichment_market_date_forwards_frozen_kst_association_window(self) -> None:
+        service = ExternalNewsService(provider=FakeExternalNewsProvider())
+        cases = (
+            (
+                'current_day',
+                datetime(2026, 10, 7, 5, 30, tzinfo=timezone.utc),
+                datetime(2026, 10, 7, 5, 30, tzinfo=timezone.utc),
+            ),
+            (
+                'historical_day',
+                datetime(2026, 10, 8, 1, 0, tzinfo=timezone.utc),
+                datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc),
+            ),
+        )
+        for label, captured_at, expected_end in cases:
+            with self.subTest(label=label):
+                with (
+                    patch(
+                        'app.external_news.service._utcnow',
+                        return_value=captured_at,
+                    ),
+                    patch(
+                        'app.external_news.service.enrich_recent_external_news_classification',
+                        return_value={'status': 'completed'},
+                    ) as enrich,
+                ):
+                    result = service.enrich_recent_classification(
+                        symbols=['000660'],
+                        market_date='2026-10-07',
+                        lookback_days=14,
+                        limit=1000,
+                    )
+
+                self.assertEqual(result['status'], 'completed')
+                enrich.assert_called_once_with(
+                    symbols=['000660'],
+                    lookback_days=14,
+                    limit=1000,
+                    association_start=datetime(
+                        2026, 10, 6, 15, 0, tzinfo=timezone.utc
+                    ),
+                    association_end=expected_end,
+                )
+
+    def test_enrichment_market_date_fails_fast_before_storage_on_invalid_date(self) -> None:
+        service = ExternalNewsService(provider=FakeExternalNewsProvider())
+
+        with patch(
+            'app.external_news.service.enrich_recent_external_news_classification',
+            side_effect=AssertionError('storage must not be called'),
+        ) as enrich:
+            with self.assertRaises(ValueError):
+                service.enrich_recent_classification(
+                    market_date='2026-02-30',
+                )
+
+        enrich.assert_not_called()
+
+    def test_enrichment_storage_failure_logs_only_bounded_context(self) -> None:
+        service = ExternalNewsService(provider=FakeExternalNewsProvider())
+
+        with (
+            patch(
+                'app.external_news.service.enrich_recent_external_news_classification',
+                side_effect=RuntimeError('database query failed'),
+            ),
+            patch('app.external_news.service.logger') as logger,
+        ):
+            result = service.enrich_recent_classification(
+                symbols=['000660', '005930'],
+                market_date='2026-10-07',
+                lookback_days=14,
+                limit=1000,
+            )
+
+        self.assertEqual(result['status'], 'unavailable')
+        logger.error.assert_called_once_with(
+            'External news classification enrichment failed.',
+            extra={
+                'market_date': '2026-10-07',
+                'requested_symbol_count': 2,
+                'lookback_days': 14,
+                'limit': 1000,
+                'error_class': 'RuntimeError',
+            },
+        )
+        logger.exception.assert_not_called()
+
     async def test_collect_is_disabled_without_provider_credentials_before_symbol_lookup(self) -> None:
         provider = FakeExternalNewsProvider(enabled=False)
         service = ExternalNewsService(provider=provider)

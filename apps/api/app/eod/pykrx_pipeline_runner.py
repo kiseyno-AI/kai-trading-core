@@ -1116,6 +1116,7 @@ def _run_daily_external_news_enrichment_followup(*, market_date: str, enabled: b
     from app.external_news.service import external_news_service
 
     result = external_news_service.enrich_recent_classification(
+        market_date=market_date,
         lookback_days=settings.external_news_context_lookback_days,
         limit=1000,
     )
