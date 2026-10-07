@@ -808,7 +808,7 @@ Authorization: Bearer <token>
 
 ---
 
-# 3. DART APIs
+# 3. External Data APIs
 
 ## 3.1 `GET /disclosures/dart/fundamentals/history`
 Returns stored DART fundamentals history for one or more symbols.
@@ -901,14 +901,81 @@ Authorization: Bearer <token>
 
 ---
 
+## 3.4 External news APIs
+
+### `GET /external/news/health`
+
+Returns collection-provider configuration status without fetching or reading news.
+
+```http
+GET /external/news/health
+Authorization: Bearer <token>
+```
+
+```json
+{
+  "provider": "naver_news_search",
+  "enabled": true,
+  "status": "available",
+  "reason": null
+}
+```
+
+### `POST /external/news/collect`
+
+Collects news for a required comma-separated `symbols` query. `display` defaults
+to `10` and must be between `1` and `100`.
+
+```http
+POST /external/news/collect?symbols=005930,000660&display=5
+Authorization: Bearer <token>
+```
+
+The response contains provider status, `requested_symbols`, aggregate counts,
+and one result per requested symbol. A symbol missing from the symbol master is
+reported as a per-item `status="skipped"` result. Missing provider credentials
+return a normal `status="disabled"` payload; an enabled-provider runtime failure
+returns HTTP 502.
+
+### `GET /external/news`
+
+Reads the latest persisted operator view. `symbols` is an optional
+comma-separated filter; `limit` defaults to `100` and must be between `1` and
+`1000`.
+
+```http
+GET /external/news?symbols=005930,000660&limit=100
+Authorization: Bearer <token>
+```
+
+Each item is association-shaped and includes its `symbol`, immutable article
+fields, first-known `associated_at`, and the latest sidecar's
+`classification_provenance`; classification fields are populated only when that
+selected sidecar satisfies the schema contract. Article observations are immutable, symbol
+associations preserve their first-known timestamp, and classifier changes append
+new `external_news_item_classifications` sidecars.
+
+This direct route is a current persisted read and does not accept a historical
+knowledge cutoff. Reproducible point-in-time consumers must use
+`GET /agent-context/symbol-day`: publication, collection, first-known symbol
+association, and selected classification timestamps must all be strictly earlier
+than its exclusive `knowledge_cutoff_at`. The historical read selects the latest
+sidecar strictly before that cutoff and exposes classification only when that
+selected sidecar is schema-valid; it may use an older classifier version. EOD
+`external_news_enrich` readiness is stricter and requires the current
+`CLASSIFIER_VERSION` plus the full classification schema.
+
+---
+
 # 4. Aggregate Context API
 
 ## 4.1 `GET /agent-context/symbol-day`
 Returns a symbol/day aggregate payload combining multiple stored datasets.
 
-`knowledge_cutoff_at` is an optional timezone-aware, exclusive upper bound for stored news publication and
-collection timestamps. When omitted for a past KRX date, the service uses 15:30 KST on that date; current or
-future dates are capped at request time, and an explicit future or timezone-naive cutoff is rejected.
+`knowledge_cutoff_at` is an optional timezone-aware, exclusive upper bound for stored news publication,
+collection, first-known symbol association, and selected classification timestamps. All four observations use
+strict `<` semantics. When omitted for a past KRX date, the service uses 15:30 KST on that date; current or future
+dates are capped at request time, and an explicit future or timezone-naive cutoff is rejected.
 
 ### Example request
 ```http
@@ -1219,6 +1286,54 @@ Authorization: Bearer <token>
           "source_provider": "dart"
         }
       },
+      "recent_external_news": {
+        "status": "empty",
+        "reason": "no_recent_external_news_found",
+        "provider": {
+          "provider": "naver_news_search",
+          "enabled": false,
+          "status": "disabled",
+          "reason": "naver_search_credentials_missing",
+          "context_enabled": true,
+          "storage_read_enabled": true,
+          "collection_enabled": false
+        },
+        "lookback_days": 14,
+        "knowledge_cutoff_at": "2026-04-09T06:30:00+00:00",
+        "knowledge_cutoff_source": "default_krx_regular_session_close",
+        "item_count": 0,
+        "contract": {
+          "schema_version": "recent_external_news_context_v2",
+          "materiality_values": ["material", "noise", "unknown"],
+          "access_status_values": ["full_text", "headline_only", "paywalled", "fetch_failed"],
+          "price_forecast_prohibited": true,
+          "material_items_first": true,
+          "noise_filter_bounded": true
+        },
+        "material_items": [],
+        "unknown_items": [],
+        "noise_filter": {
+          "status": "empty",
+          "bounded": true,
+          "item_count": 0,
+          "included_count": 0,
+          "omitted_count": 0,
+          "items": []
+        },
+        "items": [],
+        "freshness_provenance": {
+          "freshness_status": "missing",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["missing"],
+          "source_tables": [
+            "external_news_items",
+            "external_news_item_symbols",
+            "external_news_item_classifications"
+          ],
+          "source_provider": "naver_news_search",
+          "knowledge_cutoff_operator": "<"
+        }
+      },
       "availability": {
         "company": true,
         "quote_context": true,
@@ -1229,7 +1344,8 @@ Authorization: Bearer <token>
         "market_relative_context": true,
         "persisted_factor_rows": true,
         "fundamentals": false,
-        "recent_disclosures": false
+        "recent_disclosures": false,
+        "recent_external_news": false
       },
       "context_completeness": {
         "factor_rows": {
@@ -1284,6 +1400,17 @@ Authorization: Bearer <token>
           "provenance_status": "provider_sourced",
           "issue_types": ["missing"]
         },
+        "recent_external_news": {
+          "freshness_status": "missing",
+          "provenance_status": "provider_sourced",
+          "issue_types": ["missing"],
+          "source_tables": [
+            "external_news_items",
+            "external_news_item_symbols",
+            "external_news_item_classifications"
+          ],
+          "knowledge_cutoff_operator": "<"
+        },
         "factor_rows": {
           "advanced_value": {
             "freshness_status": "fresh",
@@ -1311,6 +1438,7 @@ It is a composed read payload intended for:
 `intraday_execution_context` and the provider-backed optional PyKRX blocks (`market_relative_context`, `sector_peer_context`, `market_breadth_context`, `investor_flow_context`, `short_selling_context`, and `valuation_context`) also stay object-shaped when requested-date data is missing. Missingness is represented with explicit `status`, `reason`, nested unavailable sub-blocks where relevant, and `freshness_provenance`.
 Major blocks now also expose `freshness_provenance`, and the top-level `context_provenance` mirror remains available alongside the current block payload. Consumers should interpret `stale` and `available_but_old` as "stored evidence exists but predates the requested market date", not as a missing-data case.
 `persisted_factor_rows` keeps compact snapshots of stored factor families, `market_relative_context` derives same-market breadth and return/volume percentiles from stored `daily_price_bars`, and `context_completeness` separates present rows, genuinely missing rows, null submetrics, sparse signal-feature coverage, and the currently unavailable sector/industry peer-mapping lane.
+`recent_external_news` follows `recent_external_news_context_v2`. `status="available"` means point-in-time eligible observations were read, `status="empty"` with `reason="no_recent_external_news_found"` is neutral optional-context absence, and `status="unavailable"` means the context or storage read is unavailable. Missing collection credentials do not disable reads of already persisted observations. Items are material-first, preserve unknown materiality separately, retain only bounded noise under `noise_filter`, and expose classifier, access, and source provenance. News alone is never a price forecast, and headline-only, paywalled, or fetch-failed evidence must not be represented as if full article text was read.
 
 ### Important availability semantics
 Expected decider-facing context blocks are status-first objects, not raw `null`, even when requested-date data is missing.
@@ -1322,7 +1450,8 @@ For example, a company may have:
 - `market_relative_context.status = "unavailable"`,
 - `signal_features` absent,
 - `fundamentals.latest_snapshot` absent,
-- `recent_disclosures.items` empty.
+- `recent_disclosures.items` empty,
+- `recent_external_news.status = "empty"` for neutral absence or `"unavailable"` for a context/storage failure.
 
 Clients must not assume every nested fact field is populated just because the wrapper object exists. Use each block's `status`, `reason`, `missing_fields`, and `freshness_provenance` before interpreting absent inner values.
 
@@ -1497,8 +1626,9 @@ Dispatches the requested role sequence for an explicit symbol set. With
 queued; with `true`, it returns the completed orchestration payload.
 
 `knowledge_cutoff_at` has the same semantics as the symbol-day read: it must be
-timezone-aware and is an exclusive upper bound for news publication and
-collection timestamps in every role input. A historical KRX date defaults to
+timezone-aware and is an exclusive upper bound for news publication, collection,
+first-known symbol association, and selected classification timestamps in every
+role input. A historical KRX date defaults to
 15:30 KST when omitted; a historical US date uses the actual XNYS session
 close, and mixed KRX/US requests require an explicit cutoff. When the field is
 omitted, current or future dates use request time; a timezone-naive or
@@ -1571,8 +1701,9 @@ Runs bounded retry cycles over incomplete feedback. An explicit `symbols` list
 limits the run to that set; omitting it selects the persisted eligible scope.
 
 `knowledge_cutoff_at` must be timezone-aware and remains fixed across every
-cycle and role in the run. It is the exclusive upper bound for news publication
-and collection timestamps. When omitted, historical KRX dates use 15:30 KST;
+cycle and role in the run. News publication, collection, first-known symbol
+association, and selected classification observations must each be strictly
+earlier than that exclusive bound. When omitted, historical KRX dates use 15:30 KST;
 historical US dates use the actual XNYS session close, and mixed-market scopes
 require an explicit cutoff. When the field is omitted, current or future dates
 use request time. Naive or explicitly future values fail with HTTP 400 rather
@@ -1647,6 +1778,7 @@ Content-Type: application/json
 - `fs_div` is optional, accepts `CFS` or `OFS` case-insensitively, and defaults to the configured DART statement scope. Core stores the normalized value and keeps it unchanged across retry cycles and durable resume.
 - `status` may be `waiting` or `blocked` with `gated=true` and a `prerequisites` object when source stages are incomplete.
 - `feedback_scope_mode` is either `decider_scope_fast_path` or `broad_feedback_universe`.
+- Automatic decider recovery derives one non-empty completed scope from the exact intersection of `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer` role scopes, then uses that same scope for both `short-term-decider` and `signal-decider`. Authority requires a terminal zero-failure summarizer run with exact role/count evidence, a `completed_summarizer_intersection_v1` proof whose completed symbols are a subset of its admitted parent scope, and—when child lineage is present—`agent_feedback_child_run_lineage_v1` with the selected `parent_run_id`. Missing, malformed, conflicting, empty, or out-of-parent evidence fails closed.
 
 ---
 
@@ -1656,14 +1788,16 @@ operator-initiated follow-up recovery. It has the same response contract; its
 `outer_batch_size` request limit is 500 rather than 200.
 
 `knowledge_cutoff_at` is normalized once and the same instant is propagated to
-the retry configuration and all role inputs. It must include a timezone offset,
-is exclusive for news publication and collection time, and stays fixed for the
-whole follow-up. When omitted, current or future dates use request time. The
+the retry configuration and all role inputs. It must include a timezone offset;
+news publication, collection, first-known symbol association, and selected
+classification observations must each be strictly earlier than the bound, which
+stays fixed for the whole follow-up. When omitted, current or future dates use request time. The
 same 15:30 KST historical default and HTTP 400 rejection rules apply;
 historical US dates use the actual XNYS close, mixed-market scopes require an
 explicit value, and invalid explicit values fail with HTTP 400.
 
-The same exact normalized-cutoff reuse, resume, and active-run join rules as
+The same exact normalized-cutoff reuse, resume, active-run join, completed
+three-summarizer intersection, and parent/child lineage rules as
 `/feedback/retry-cycles` apply to follow-up requests.
 
 ### Example request
@@ -1759,18 +1893,32 @@ cost is zero, it also carries `zero_cost_assumption_may_overstate_paper_return`.
 }
 ```
 
+The current evaluation slice supports only `window_days=5`; any other value is
+rejected.
+
 Short-term `watch_for_trigger` paper outcomes respect trigger, chase limit,
 target, and stop levels. If target and stop are both reachable in one daily bar,
-the ledger applies the conservative stop-first result. The optional
-`extended_entry_price` / `avoid_chase` shadow rule is report-only and never
-changes live execution authority.
+the ledger applies the conservative stop-first result.
 
-A `decider_post_decision_eval_v3` short-term evaluation is not terminal until
-all five daily bars in the observation window contain complete OHLC data.
-Before then, an untriggered watch or a triggered but unresolved watch returns
-`invalid_missing_price_data`, sets `metadata.price_window_complete=false`, and
-keeps `metadata.paper_ledger=null`; it does not publish a premature `no_entry`
-or partial-window `window_close` result. After a complete five-bar window, an
+The optional `short_term_avoid_chase_shadow_v1` rule is report-only and never
+changes live execution authority. It is eligible only when the feature is enabled
+for an `avoid_chase` decision and every gate passes: `wait_reason.code` is
+`extended_entry_price`; market regime is `normal`; return percentile is at least
+`0.75`; the setup is a `breakout_20d` or a `confirmed`, `continuation`,
+`breakout`, `pullback_support`, or `reclaim` setup without `breakdown_20d`;
+reward/risk is at least `2.0`; and raw-source trading value is at least KRW
+`3,000,000,000`.
+
+`decider_post_decision_eval_v3` validates short-term price levels before applying
+the maturity gate. Missing or non-positive levels, or anything other than
+`stop < trigger <= chase_limit < target`, immediately returns
+`invalid_no_price_levels` even when fewer than five bars exist. With valid levels,
+the evaluation is not terminal until all five daily bars in the observation
+window contain complete OHLC data. Before then, an untriggered watch or a
+triggered but unresolved watch returns `invalid_missing_price_data`, sets
+`metadata.price_window_complete=false`, and keeps
+`metadata.paper_ledger=null`; it does not publish a premature `no_entry` or
+partial-window `window_close` result. After a complete five-bar window, an
 untriggered watch may resolve to `neither_hit_within_5d` with
 `exit_reason="no_entry"`.
 
