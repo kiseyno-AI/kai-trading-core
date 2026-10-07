@@ -15,9 +15,29 @@ Content-Type: application/json
   "market_date_to": "2026-04-23",
   "agent_names": ["signal-decider", "short-term-decider"],
   "symbols": ["005930"],
-  "window_days": 5
+  "window_days": 5,
+  "fee_bps": 10,
+  "slippage_bps": 20,
+  "tax_bps": 18,
+  "enable_shadow_avoid_chase_rule": false
 }
 ```
+
+The three cost inputs are independently optional for compatibility. The
+response reports whether every component was supplied and identifies any
+missing components. The avoid-chase rule is report-only and never grants live
+execution authority.
+
+Short-term `watch_for_trigger` evaluations become terminal only after five
+complete daily OHLC bars are available. Until then, both an untriggered watch
+and a triggered but unresolved watch return
+`outcome_label="invalid_missing_price_data"`,
+`metadata.price_window_complete=false`, and `metadata.paper_ledger=null`.
+Only a complete five-bar window with no valid trigger may return
+`neither_hit_within_5d` with paper-ledger `exit_reason="no_entry"`.
+This maturity contract is identified by
+`evaluation_engine_version="decider_post_decision_eval_v3"` in the request
+echo and `metadata.schema_version` on each refreshed row.
 
 ## Example response
 ```json
@@ -37,11 +57,11 @@ Content-Type: application/json
 # GET /agent-context/decider/evaluations
 
 ## Summary
-Reads the stored generic decider post-decision evaluation rows back with explicit source references, labels, and compact metadata that the UI can render directly.
+Reads the stored generic decider post-decision evaluation rows back with explicit source references, labels, and compact metadata that the UI can render directly. The default `include_history=false` selects the latest canonical revision for each agent/date/symbol/window cohort; `include_history=true` returns durable superseded revisions for audit.
 
 ## Example request
 ```http
-GET /agent-context/decider/evaluations?market_date=2026-04-23&agent_names=signal-decider&symbols=005930&window_days=5
+GET /agent-context/decider/evaluations?market_date=2026-04-23&agent_names=signal-decider&symbols=005930&window_days=5&include_history=false
 ```
 
 ## Example response
