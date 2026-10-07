@@ -128,6 +128,22 @@ PERSISTED_OUTPUT_FALLBACK_MODES = {
     'derived_from_external_news_items',
     'derived_from_signal_decider_outputs',
 }
+RECOVERABLE_PERSISTED_OUTPUT_STAGE_IDS = {
+    'signal_features',
+    'external_news_collect',
+    'external_news_enrich',
+}
+RECOVERABLE_STAGE_HISTORY_IDS = {
+    *RECOVERABLE_PERSISTED_OUTPUT_STAGE_IDS,
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+}
+EXACT_COMPLETED_RECOVERY_STAGE_HISTORY_IDS = {
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+}
 OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES = {
     'running',
     'partial',
@@ -1426,6 +1442,12 @@ class EODPipelineStatusService:
     ) -> bool:
         progress_status = _normalize_status(str(progress.get('status') or '')) or 'pending'
         fallback_status = str(fallback_stage.get('status') or '').strip().lower()
+        if EODPipelineStatusService._recovery_state_is_newer(
+            stage_id=stage_id,
+            candidate=fallback_stage,
+            current=progress,
+        ):
+            return False
         if EODPipelineStatusService._should_preserve_stored_coverage_stage(
             stage_id=stage_id,
             fallback_stage=fallback_stage,
@@ -1601,9 +1623,16 @@ class EODPipelineStatusService:
             official_stage = official_stages.get(stage_id)
             if not isinstance(official_stage, dict):
                 continue
+            fallback_stage = stages.get(stage_id) or {}
+            if self._recovery_state_is_newer(
+                stage_id=stage_id,
+                candidate=fallback_stage,
+                current=official_stage,
+            ):
+                continue
             if self._should_preserve_stored_coverage_stage(
                 stage_id=stage_id,
-                fallback_stage=stages.get(stage_id) or {},
+                fallback_stage=fallback_stage,
                 official_stage=official_stage,
             ):
                 continue
@@ -1612,7 +1641,7 @@ class EODPipelineStatusService:
                 market_date=market_date,
                 official_run=official_run,
                 official_stage=official_stage,
-                fallback_stage=stages.get(stage_id) or {},
+                fallback_stage=fallback_stage,
             )
         return overlaid
 
@@ -1640,6 +1669,7 @@ class EODPipelineStatusService:
             ):
                 continue
             if not self._should_overlay_official_stage_history(
+                stage_id=stage_id,
                 fallback_stage=fallback_stage,
                 official_stage=official_stage,
             ):
@@ -1715,6 +1745,7 @@ class EODPipelineStatusService:
     @staticmethod
     def _should_overlay_official_stage_history(
         *,
+        stage_id: str,
         fallback_stage: dict[str, Any],
         official_stage: dict[str, Any],
     ) -> bool:
@@ -1723,6 +1754,37 @@ class EODPipelineStatusService:
             if isinstance(official_stage.get('details'), dict)
             else {}
         )
+        if EODPipelineStatusService._recovery_state_is_newer(
+            stage_id=stage_id,
+            candidate=fallback_stage,
+            current=official_stage,
+        ):
+            return False
+        fallback_details = (
+            fallback_stage.get('details')
+            if isinstance(fallback_stage.get('details'), dict)
+            else {}
+        )
+        official_status = str(
+            official_stage.get('status') or ''
+        ).strip().lower()
+        if (
+            stage_id in RECOVERABLE_STAGE_HISTORY_IDS
+            and (
+                official_status == 'completed'
+                or (
+                    stage_id != 'agent_feedback_summaries'
+                    and official_status == 'partial'
+                )
+            )
+            and EODPipelineStatusService._recovery_state_is_newer(
+                stage_id=stage_id,
+                candidate=official_stage,
+                current=fallback_stage,
+                candidate_is_history=True,
+            )
+        ):
+            return True
         if daily_pipeline_result_has_no_ready_content(
             official_details.get('result_summary')
         ):
@@ -1730,12 +1792,102 @@ class EODPipelineStatusService:
         fallback_status = str(fallback_stage.get('status') or '').strip().lower()
         if fallback_status == 'pending':
             return True
-        official_status = str(official_stage.get('status') or '').strip().lower()
         if official_status not in OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES:
             return False
-        fallback_details = fallback_stage.get('details') if isinstance(fallback_stage.get('details'), dict) else {}
         fallback_mode = str(fallback_details.get('mode') or '').strip()
         return fallback_mode in PERSISTED_OUTPUT_FALLBACK_MODES
+
+    @staticmethod
+    def _recovery_state_is_newer(
+        *,
+        stage_id: str,
+        candidate: dict[str, Any],
+        current: dict[str, Any],
+        candidate_is_history: bool = False,
+    ) -> bool:
+        details = (
+            candidate.get('details')
+            if isinstance(candidate.get('details'), dict)
+            else {}
+        )
+        source_run_ids = (
+            candidate.get('source_run_ids')
+            if isinstance(candidate.get('source_run_ids'), dict)
+            else {}
+        )
+        candidate_status = str(candidate.get('status') or '').strip().lower()
+        history_evidence = (
+            candidate_is_history
+            or str(details.get('progress_source') or '').strip()
+            == 'official_stage_history'
+        )
+        if history_evidence:
+            evidence_is_recovery = (
+                stage_id in RECOVERABLE_STAGE_HISTORY_IDS
+                and candidate_status == 'completed'
+            ) or (
+                stage_id in RECOVERABLE_PERSISTED_OUTPUT_STAGE_IDS
+                and candidate_status == 'partial'
+            )
+            if stage_id in EXACT_COMPLETED_RECOVERY_STAGE_HISTORY_IDS:
+                total = _coerce_int(candidate.get('total'))
+                evidence_is_recovery = bool(
+                    evidence_is_recovery
+                    and total > 0
+                    and _coerce_int(candidate.get('processed')) == total
+                    and _coerce_int(candidate.get('succeeded')) == total
+                    and _coerce_int(candidate.get('failed')) == 0
+                    and _coerce_int(candidate.get('remaining')) == 0
+                )
+        elif (
+            stage_id in RECOVERABLE_PERSISTED_OUTPUT_STAGE_IDS
+            and str(details.get('mode') or '').strip()
+            in PERSISTED_OUTPUT_FALLBACK_MODES
+        ):
+            persisted_count = {
+                'signal_features': details.get('rows_persisted'),
+                'external_news_collect': details.get('items_persisted'),
+                'external_news_enrich': details.get('items_persisted'),
+            }.get(stage_id)
+            evidence_is_recovery = _coerce_int(persisted_count) > 0
+        elif (
+            stage_id == 'agent_feedback_summaries'
+            and str(details.get('mode') or '').strip()
+            == 'agent_feedback_run_state'
+            and candidate_status == 'completed'
+        ):
+            total = _coerce_int(candidate.get('total'))
+            evidence_is_recovery = bool(
+                str(source_run_ids.get('feedback_run_id') or '').strip()
+                and total > 0
+                and _coerce_int(candidate.get('processed')) == total
+                and _coerce_int(candidate.get('succeeded')) == total
+                and _coerce_int(candidate.get('failed')) == 0
+                and _coerce_int(candidate.get('remaining')) == 0
+            )
+        else:
+            evidence_is_recovery = False
+        if not evidence_is_recovery:
+            return False
+        candidate_updated_at = _parse_iso_timestamp(
+            _coerce_iso_timestamp(
+                candidate.get('updated_at')
+                or candidate.get('completed_at')
+            )
+            or ''
+        )
+        current_updated_at = _parse_iso_timestamp(
+            _coerce_iso_timestamp(
+                current.get('updated_at')
+                or current.get('completed_at')
+            )
+            or ''
+        )
+        return (
+            candidate_updated_at is not None
+            and current_updated_at is not None
+            and candidate_updated_at > current_updated_at
+        )
 
     def _build_official_stage(
         self,

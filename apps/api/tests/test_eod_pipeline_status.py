@@ -235,6 +235,54 @@ def _incomplete_official_stage(
     }
 
 
+def _blocked_downstream_output_eod_run(
+    *,
+    market_date: str,
+    updated_at: str,
+) -> dict:
+    blocked_progress = {
+        'status': 'blocked',
+        'processed': 0,
+        'total': 0,
+        'succeeded': 0,
+        'failed': 0,
+        'updated_at': updated_at,
+        'result_summary': {
+            'triggered': False,
+            'status': 'blocked',
+            'reason': 'inherited_downstream_recovery_pending',
+            'market_date': market_date,
+        },
+    }
+    return {
+        'id': 561,
+        'market': 'KRX',
+        'trade_date': market_date,
+        'source': 'pykrx',
+        'trigger': 'auto_close_scheduler',
+        'status': 'completed_with_errors',
+        'symbols_total': 1,
+        'symbols_succeeded': 1,
+        'symbols_failed': 0,
+        'error_message': 'Inherited downstream recovery remains pending.',
+        'started_at': updated_at,
+        'completed_at': updated_at,
+        'run_metadata': {
+            'mode': 'daily_auto',
+            'last_progress_at': updated_at,
+            'stage_progress': {
+                stage_id: dict(blocked_progress)
+                for stage_id in (
+                    'signal_features',
+                    'external_news_collect',
+                    'external_news_enrich',
+                    'agent_feedback_summaries',
+                )
+            },
+        },
+    }
+
+
 class EODPipelineStatusServiceTests(unittest.TestCase):
     def test_pykrx_stage_counts_not_applicable_categories_as_satisfied(self):
         coverage = _full_pykrx_enrichment_coverage(
@@ -3251,6 +3299,626 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 self.assertEqual(stage['details']['progress_source'], 'official_stage_history')
                 self.assertEqual(result['current_stage'], 'signal_features')
                 self.assertEqual(result['stages']['signal_decider_evaluations']['status'], 'completed')
+
+    def test_read_prefers_newer_persisted_outputs_over_older_blocked_eod_progress(self):
+        market_date = '2026-10-07'
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: _blocked_downstream_output_eod_run(
+                market_date=market_date,
+                updated_at='2026-10-07T12:34:45+00:00',
+            ),
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2_703,
+                'updated_at': '2026-10-07T13:46:33+00:00',
+            },
+            external_news_counts_loader=lambda **_: {
+                'items': 259,
+                'symbols': 77,
+                'classified_items': 193,
+                'updated_at': '2026-10-07T13:56:17+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        signal_features = result['stages']['signal_features']
+        self.assertEqual(signal_features['status'], 'completed')
+        self.assertEqual(signal_features['details']['rows_persisted'], 2_703)
+        external_news_collect = result['stages']['external_news_collect']
+        self.assertEqual(external_news_collect['status'], 'completed')
+        self.assertEqual(
+            external_news_collect['details']['items_persisted'],
+            259,
+        )
+        external_news_enrich = result['stages']['external_news_enrich']
+        self.assertEqual(external_news_enrich['status'], 'partial')
+        self.assertEqual(
+            external_news_enrich['details']['classified_items'],
+            193,
+        )
+
+    def test_read_prefers_newer_recovery_history_over_older_blocked_eod_progress(self):
+        market_date = '2026-10-07'
+        recovered_at = '2026-10-07T13:56:20+00:00'
+        enrich_history = _incomplete_official_stage(
+            run_id=513,
+            stage_id='external_news_enrich',
+            market_date=market_date,
+            status='partial',
+            updated_at=recovered_at,
+            succeeded=193,
+            failed=66,
+        )
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: _blocked_downstream_output_eod_run(
+                market_date=market_date,
+                updated_at='2026-10-07T12:34:45+00:00',
+            ),
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'signal_features': _completed_official_stage(
+                    run_id=512,
+                    stage_id='signal_features',
+                    market_date=market_date,
+                    processed=2_703,
+                    total=2_703,
+                    updated_at='2026-10-07T13:46:36+00:00',
+                ),
+                'external_news_collect': _completed_official_stage(
+                    run_id=513,
+                    stage_id='external_news_collect',
+                    market_date=market_date,
+                    processed=201,
+                    total=201,
+                    updated_at=recovered_at,
+                ),
+                'external_news_enrich': enrich_history,
+            },
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2_703,
+                'updated_at': '2026-10-07T12:00:00+00:00',
+            },
+            external_news_counts_loader=lambda **_: {
+                'items': 259,
+                'symbols': 77,
+                'classified_items': 193,
+                'updated_at': '2026-10-07T12:00:00+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        self.assertEqual(result['stages']['signal_features']['status'], 'completed')
+        self.assertEqual(
+            result['stages']['external_news_collect']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['external_news_enrich']['status'],
+            'partial',
+        )
+        for stage_id in (
+            'signal_features',
+            'external_news_collect',
+            'external_news_enrich',
+        ):
+            self.assertNotEqual(
+                result['stages'][stage_id]['source_run_ids'],
+                {'eod_run_id': 561},
+            )
+
+    def test_read_prefers_newer_completed_decision_history_over_stale_blocked_overlays(self):
+        market_date = '2026-10-07'
+        for stage_id in ('signal_decider', 'next_open_execution_plan'):
+            for stale_overlay in ('live_progress', 'latest_official_run'):
+                with self.subTest(stage_id=stage_id, stale_overlay=stale_overlay):
+                    completed_history = _completed_official_stage(
+                        run_id=516,
+                        stage_id=stage_id,
+                        market_date=market_date,
+                        processed=115,
+                        total=115,
+                        updated_at='2026-10-07T14:00:00+00:00',
+                    )
+                    blocked = _incomplete_official_stage(
+                        run_id=511,
+                        stage_id=stage_id,
+                        market_date=market_date,
+                        status='blocked',
+                        updated_at='2026-10-07T13:00:00+00:00',
+                        succeeded=0,
+                        failed=0,
+                    )
+                    blocked['stage']['details'] = {
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'blocked',
+                            'reason': 'inherited_downstream_recovery_pending',
+                        }
+                    }
+                    eod_run = None
+                    latest_official_run = None
+                    if stale_overlay == 'live_progress':
+                        eod_run = _blocked_downstream_output_eod_run(
+                            market_date=market_date,
+                            updated_at='2026-10-07T13:00:00+00:00',
+                        )
+                        eod_run['run_metadata']['stage_progress'][stage_id] = {
+                            **blocked['stage'],
+                            'status': 'blocked',
+                        }
+                    else:
+                        latest_official_run = {
+                            **blocked['run'],
+                            'stages': {stage_id: blocked['stage']},
+                        }
+                    stage_history = {stage_id: completed_history}
+                    if stage_id == 'next_open_execution_plan':
+                        stage_history['signal_decider'] = _completed_official_stage(
+                            run_id=516,
+                            stage_id='signal_decider',
+                            market_date=market_date,
+                            processed=115,
+                            total=115,
+                            updated_at='2026-10-07T13:59:00+00:00',
+                        )
+                    service = EODPipelineStatusService(
+                        market_state_loader=lambda: _FakeMarketState(),
+                        pykrx_run_loader=lambda **_: eod_run,
+                        pykrx_stage_counts_loader=lambda *_: {},
+                        live_symbol_count_loader=lambda: 2_703,
+                        fundamentals_refresh_loader=lambda **_: None,
+                        official_run_loader=lambda **_: latest_official_run,
+                        official_stage_history_loader=lambda **_: stage_history,
+                    )
+
+                    result = service.read(market_date=market_date)
+
+                    stage = result['stages'][stage_id]
+                    self.assertEqual(stage['status'], 'completed')
+                    self.assertEqual(stage['processed'], 115)
+                    self.assertEqual(stage['total'], 115)
+                    self.assertEqual(
+                        stage['details']['progress_source'],
+                        'official_stage_history',
+                    )
+
+    def test_read_keeps_newer_blocked_eod_progress_over_older_persisted_outputs(self):
+        market_date = '2026-10-07'
+        old_history = _completed_official_stage(
+            run_id=509,
+            stage_id='signal_features',
+            market_date=market_date,
+            processed=2_703,
+            total=2_703,
+            updated_at='2026-10-07T12:15:00+00:00',
+        )
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: _blocked_downstream_output_eod_run(
+                market_date=market_date,
+                updated_at='2026-10-07T13:00:00+00:00',
+            ),
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'signal_features': old_history,
+            },
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2_703,
+                'updated_at': '2026-10-07T12:00:00+00:00',
+            },
+            external_news_counts_loader=lambda **_: {
+                'items': 259,
+                'symbols': 77,
+                'classified_items': 193,
+                'updated_at': '2026-10-07T12:00:00+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        for stage_id in (
+            'signal_features',
+            'external_news_collect',
+            'external_news_enrich',
+        ):
+            stage = result['stages'][stage_id]
+            self.assertEqual(stage['status'], 'blocked')
+            self.assertEqual(stage['source_run_ids'], {'eod_run_id': 561})
+            self.assertEqual(
+                stage['details']['progress_source'],
+                'live_run_metadata',
+            )
+
+    def test_read_prefers_newer_persisted_output_over_older_blocked_history(self):
+        market_date = '2026-10-07'
+        blocked_history = _incomplete_official_stage(
+            run_id=510,
+            stage_id='signal_features',
+            market_date=market_date,
+            status='blocked',
+            updated_at='2026-10-07T12:34:45+00:00',
+            succeeded=0,
+            failed=0,
+        )
+        blocked_history['stage']['details'] = {
+            'result_summary': {
+                'triggered': False,
+                'status': 'blocked',
+                'reason': 'inherited_downstream_recovery_pending',
+            }
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'signal_features': blocked_history,
+            },
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2_703,
+                'updated_at': '2026-10-07T13:46:33+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['signal_features']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['details']['rows_persisted'], 2_703)
+        self.assertEqual(
+            stage['details']['mode'],
+            'derived_from_daily_signal_features',
+        )
+
+    def test_read_prefers_newer_recovery_history_over_older_latest_official_stage(self):
+        market_date = '2026-10-07'
+        recovered_history = _completed_official_stage(
+            run_id=512,
+            stage_id='signal_features',
+            market_date=market_date,
+            processed=2_703,
+            total=2_703,
+            updated_at='2026-10-07T14:00:00+00:00',
+        )
+        older_blocked = _incomplete_official_stage(
+            run_id=511,
+            stage_id='signal_features',
+            market_date=market_date,
+            status='blocked',
+            updated_at='2026-10-07T13:00:00+00:00',
+            succeeded=0,
+            failed=0,
+        )
+        older_blocked['stage']['details'] = {
+            'result_summary': {
+                'triggered': False,
+                'status': 'blocked',
+                'reason': 'declared_dependencies_incomplete',
+            }
+        }
+        latest_official_run = {
+            **older_blocked['run'],
+            'stages': {'signal_features': older_blocked['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: latest_official_run,
+            official_stage_history_loader=lambda **_: {
+                'signal_features': recovered_history,
+            },
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2_703,
+                'updated_at': '2026-10-07T12:00:00+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['signal_features']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['details']['progress_source'], 'official_stage_history')
+
+    def test_read_keeps_blocked_progress_when_output_freshness_is_not_proven(self):
+        market_date = '2026-10-07'
+        cases = (
+            ('equal', '2026-10-07T13:00:00+00:00', '2026-10-07T13:00:00+00:00'),
+            ('persisted_missing', None, '2026-10-07T13:00:00+00:00'),
+            ('blocked_missing', '2026-10-07T13:00:00+00:00', None),
+            ('persisted_invalid', 'not-a-timestamp', '2026-10-07T13:00:00+00:00'),
+            ('blocked_invalid', '2026-10-07T13:00:00+00:00', 'not-a-timestamp'),
+        )
+        for label, persisted_updated_at, blocked_updated_at in cases:
+            with self.subTest(label=label):
+                service = EODPipelineStatusService(
+                    market_state_loader=lambda: _FakeMarketState(),
+                    pykrx_run_loader=lambda **_: _blocked_downstream_output_eod_run(
+                        market_date=market_date,
+                        updated_at=blocked_updated_at,
+                    ),
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 2_703,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    official_stage_history_loader=lambda **_: {},
+                    signal_feature_counts_loader=lambda **_: {
+                        'persisted': 2_703,
+                        'updated_at': persisted_updated_at,
+                    },
+                )
+
+                result = service.read(market_date=market_date)
+
+                stage = result['stages']['signal_features']
+                self.assertEqual(stage['status'], 'blocked')
+                self.assertEqual(stage['source_run_ids'], {'eod_run_id': 561})
+
+    def test_read_does_not_use_started_at_as_terminal_blocked_freshness(self):
+        market_date = '2026-10-07'
+        blocked_history = _incomplete_official_stage(
+            run_id=510,
+            stage_id='signal_features',
+            market_date=market_date,
+            status='blocked',
+            updated_at='2026-10-07T13:00:00+00:00',
+            succeeded=0,
+            failed=0,
+        )
+        blocked_history['stage']['updated_at'] = None
+        blocked_history['stage']['completed_at'] = None
+        blocked_history['stage']['details'] = {
+            'result_summary': {
+                'triggered': False,
+                'status': 'blocked',
+                'reason': 'inherited_downstream_recovery_pending',
+            }
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'signal_features': blocked_history,
+            },
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2_703,
+                'updated_at': '2026-10-07T14:00:00+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['signal_features']
+        self.assertEqual(stage['status'], 'blocked')
+        self.assertEqual(stage['details']['progress_source'], 'official_stage_history')
+
+    def test_read_does_not_treat_partial_signal_decider_rows_as_recovery_evidence(self):
+        market_date = '2026-10-07'
+        eod_run = _blocked_downstream_output_eod_run(
+            market_date=market_date,
+            updated_at='2026-10-07T13:00:00+00:00',
+        )
+        eod_run['run_metadata']['stage_progress']['signal_decider'] = {
+            'status': 'blocked',
+            'processed': 0,
+            'total': 115,
+            'succeeded': 0,
+            'failed': 0,
+            'updated_at': '2026-10-07T13:00:00+00:00',
+            'result_summary': {
+                'triggered': False,
+                'status': 'blocked',
+                'reason': 'summary_run_symbol_scope_mismatch',
+                'market_date': market_date,
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: eod_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            signal_decider_counts_loader=lambda **_: {
+                'feedback_rows': 65,
+                'feedback_symbols': 65,
+                'decision_snapshots': 65,
+                'decision_snapshot_symbols': 65,
+                'updated_at': '2026-10-07T14:00:00+00:00',
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['signal_decider']
+        self.assertEqual(stage['status'], 'blocked')
+        self.assertEqual(stage['total'], 115)
+        self.assertEqual(stage['source_run_ids'], {'eod_run_id': 561})
+        self.assertEqual(stage['details']['progress_source'], 'live_run_metadata')
+
+    def test_read_prefers_newer_completed_feedback_history_over_older_blocked_progress(self):
+        market_date = '2026-10-07'
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: _blocked_downstream_output_eod_run(
+                market_date=market_date,
+                updated_at='2026-10-07T12:34:45+00:00',
+            ),
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {
+                'agent_feedback_summaries': _completed_official_stage(
+                    run_id=514,
+                    stage_id='agent_feedback_summaries',
+                    market_date=market_date,
+                    processed=470,
+                    total=470,
+                    updated_at='2026-10-07T16:08:53+00:00',
+                ),
+            },
+        )
+
+        result = service.read(
+            market_date=market_date,
+            include_feedback_context=False,
+            include_feedback_stage=False,
+        )
+
+        stage = result['stages']['agent_feedback_summaries']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['processed'], 470)
+        self.assertEqual(stage['details']['progress_source'], 'official_stage_history')
+
+    def test_read_keeps_feedback_blocked_when_completed_freshness_is_not_proven(self):
+        market_date = '2026-10-07'
+        cases = (
+            ('older', 'completed', '2026-10-07T12:00:00+00:00'),
+            ('equal', 'completed', '2026-10-07T13:00:00+00:00'),
+            ('missing', 'completed', None),
+            ('invalid', 'completed', 'not-a-timestamp'),
+            ('incomplete_newer', 'partial', '2026-10-07T14:00:00+00:00'),
+        )
+        for label, history_status, history_updated_at in cases:
+            with self.subTest(label=label):
+                if history_status == 'completed':
+                    history = _completed_official_stage(
+                        run_id=514,
+                        stage_id='agent_feedback_summaries',
+                        market_date=market_date,
+                        processed=470,
+                        total=470,
+                        updated_at=history_updated_at,
+                    )
+                else:
+                    history = _incomplete_official_stage(
+                        run_id=514,
+                        stage_id='agent_feedback_summaries',
+                        market_date=market_date,
+                        status=history_status,
+                        updated_at=history_updated_at,
+                        succeeded=469,
+                        failed=1,
+                    )
+                service = EODPipelineStatusService(
+                    market_state_loader=lambda: _FakeMarketState(),
+                    pykrx_run_loader=lambda **_: _blocked_downstream_output_eod_run(
+                        market_date=market_date,
+                        updated_at='2026-10-07T13:00:00+00:00',
+                    ),
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 2_703,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    official_stage_history_loader=lambda **_: {
+                        'agent_feedback_summaries': history,
+                    },
+                )
+
+                result = service.read(
+                    market_date=market_date,
+                    include_feedback_context=False,
+                    include_feedback_stage=False,
+                )
+
+                stage = result['stages']['agent_feedback_summaries']
+                self.assertEqual(stage['status'], 'blocked')
+                self.assertEqual(stage['source_run_ids'], {'eod_run_id': 561})
+
+    def test_read_preserves_newer_completed_feedback_context_over_stale_blocked_overlays(self):
+        market_date = '2026-10-07'
+        blocked_history = _incomplete_official_stage(
+            run_id=510,
+            stage_id='agent_feedback_summaries',
+            market_date=market_date,
+            status='blocked',
+            updated_at='2026-10-07T13:00:00+00:00',
+            succeeded=0,
+            failed=0,
+        )
+        blocked_history['stage']['details'] = {
+            'result_summary': {
+                'triggered': False,
+                'status': 'blocked',
+                'reason': 'inherited_downstream_recovery_pending',
+            }
+        }
+        latest_official_run = {
+            **blocked_history['run'],
+            'stages': {
+                'agent_feedback_summaries': blocked_history['stage'],
+            },
+        }
+        feedback_run = {
+            'source': 'persisted_feedback_run',
+            'run_id': 'feedback-cycle-2026-10-07-f83cb89026',
+            'status': 'completed',
+            'requested_symbols': ['005930'],
+            'summary': {
+                'run_status': 'completed',
+                'run_table_status': 'completed',
+                'failed_items': 0,
+                'completed_feedback_count': 470,
+                'expected_feedback_count': 470,
+                'latest_feedback_at': '2026-10-07T14:00:00+00:00',
+                'run_completed_at': '2026-10-07T14:00:00+00:00',
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: _blocked_downstream_output_eod_run(
+                market_date=market_date,
+                updated_at='2026-10-07T12:34:45+00:00',
+            ),
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: latest_official_run,
+            official_stage_history_loader=lambda **_: {
+                'agent_feedback_summaries': blocked_history,
+            },
+            feedback_run_loader=lambda **_: feedback_run,
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['agent_feedback_summaries']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['processed'], 470)
+        self.assertEqual(stage['total'], 470)
+        self.assertEqual(stage['succeeded'], 470)
+        self.assertEqual(stage['failed'], 0)
+        self.assertEqual(stage['remaining'], 0)
+        self.assertEqual(
+            stage['source_run_ids'],
+            {'feedback_run_id': 'feedback-cycle-2026-10-07-f83cb89026'},
+        )
+        self.assertEqual(stage['details']['mode'], 'agent_feedback_run_state')
 
     def test_read_reports_external_news_enrich_pending_when_persisted_items_are_unclassified(self):
         service = EODPipelineStatusService(
