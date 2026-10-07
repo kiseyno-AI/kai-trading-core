@@ -137,11 +137,13 @@ RECOVERABLE_STAGE_HISTORY_IDS = {
     *RECOVERABLE_PERSISTED_OUTPUT_STAGE_IDS,
     'agent_feedback_summaries',
     'signal_decider',
+    'signal_decider_evaluations',
     'next_open_execution_plan',
 }
 EXACT_COMPLETED_RECOVERY_STAGE_HISTORY_IDS = {
     'agent_feedback_summaries',
     'signal_decider',
+    'signal_decider_evaluations',
     'next_open_execution_plan',
 }
 OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES = {
@@ -685,6 +687,132 @@ def _coerce_int(*values: Any, default: int = 0) -> int:
         except (TypeError, ValueError):
             continue
     return default
+
+
+def _strict_non_negative_int(
+    payload: dict[str, Any],
+    key: str,
+) -> int | None:
+    if key not in payload:
+        return None
+    value = payload.get(key)
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    return None
+
+
+def _strict_positive_unique_ints(value: Any) -> tuple[int, ...] | None:
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    normalized: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            return None
+        normalized.append(item)
+    if len(set(normalized)) != len(normalized):
+        return None
+    return tuple(normalized)
+
+
+def _recovery_payload_has_rejected_control_marker(
+    *payloads: dict[str, Any],
+) -> bool:
+    for payload in payloads:
+        safe_skip = payload.get('safe_skip')
+        skipped = payload.get('skipped')
+        triggered = payload.get('triggered')
+        if safe_skip is True or str(safe_skip).strip().lower() == 'true':
+            return True
+        if skipped is True or str(skipped).strip().lower() == 'true':
+            return True
+        if triggered is False or str(triggered).strip().lower() == 'false':
+            return True
+    return False
+
+
+def _recovery_payload_has_invalid_optional_controls(
+    payload: dict[str, Any],
+) -> bool:
+    expected_booleans = {
+        'safe_skip': False,
+        'skipped': False,
+        'triggered': True,
+    }
+    for key, expected in expected_booleans.items():
+        if key in payload and payload.get(key) is not expected:
+            return True
+    if (
+        'warning_count' in payload
+        and _strict_non_negative_int(payload, 'warning_count') != 0
+    ):
+        return True
+    if 'warnings' in payload:
+        warnings = payload.get('warnings')
+        if not isinstance(warnings, (list, tuple, set, dict)) or bool(
+            warnings
+        ):
+            return True
+    return False
+
+
+def _recovery_optional_counts_are_strict_zero(
+    payload: dict[str, Any],
+    keys: tuple[str, ...],
+) -> bool:
+    return all(
+        key not in payload or _strict_non_negative_int(payload, key) == 0
+        for key in keys
+    )
+
+
+def _recovery_optional_collection_is_strict_empty(
+    payload: dict[str, Any],
+    key: str,
+) -> bool:
+    if key not in payload:
+        return True
+    value = payload.get(key)
+    return isinstance(value, (list, tuple, set, dict)) and not value
+
+
+def _recovery_payload_has_reported_failure(payload: dict[str, Any]) -> bool:
+    for key in (
+        'failed',
+        'failed_count',
+        'failed_items',
+        'error_count',
+        'errors',
+        'error',
+        'error_message',
+        'not_computed_count',
+    ):
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value is None or value is False:
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            if value:
+                return True
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                continue
+            try:
+                if int(stripped) != 0:
+                    return True
+            except ValueError:
+                return True
+            continue
+        try:
+            if int(value) != 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
 
 
 def _coerce_iso_timestamp(value: Any) -> str | None:
@@ -1790,12 +1918,649 @@ class EODPipelineStatusService:
         ):
             return True
         fallback_status = str(fallback_stage.get('status') or '').strip().lower()
+        result_summary = (
+            official_details.get('result_summary')
+            if isinstance(official_details.get('result_summary'), dict)
+            else {}
+        )
+        if (
+            fallback_status == 'pending'
+            and result_summary
+            and DailyPipelineStageService._resolve_result_status(
+                result_summary
+            )
+            in {'partial', 'blocked', 'waiting'}
+        ):
+            return True
+        if (
+            stage_id in EXACT_COMPLETED_RECOVERY_STAGE_HISTORY_IDS
+            and official_status == 'completed'
+            and not EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id=stage_id,
+                candidate=official_stage,
+            )
+        ):
+            return False
         if fallback_status == 'pending':
             return True
         if official_status not in OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES:
             return False
         fallback_mode = str(fallback_details.get('mode') or '').strip()
         return fallback_mode in PERSISTED_OUTPUT_FALLBACK_MODES
+
+    @staticmethod
+    def _signal_decider_has_legacy_completion_proof(
+        result: dict[str, Any],
+    ) -> bool:
+        progress = (
+            result.get('progress')
+            if isinstance(result.get('progress'), dict)
+            else {}
+        )
+        summary = (
+            progress.get('summary')
+            if isinstance(progress.get('summary'), dict)
+            else {}
+        )
+        progress_result = (
+            progress.get('result')
+            if isinstance(progress.get('result'), dict)
+            else {}
+        )
+        role_results = (
+            progress_result.get('roles')
+            if isinstance(progress_result.get('roles'), dict)
+            else {}
+        )
+        role_progress = (
+            summary.get('role_progress')
+            if isinstance(summary.get('role_progress'), dict)
+            else {}
+        )
+        cycle_status = summary.get('cycle_status')
+        if (
+            _recovery_payload_has_rejected_control_marker(
+                result,
+                progress_result,
+                summary,
+            )
+            or _recovery_payload_has_invalid_optional_controls(result)
+            or _recovery_payload_has_invalid_optional_controls(
+                progress_result
+            )
+            or _recovery_payload_has_invalid_optional_controls(summary)
+            or str(result.get('status') or '').strip().lower() != 'completed'
+            or result.get('completed') is not True
+            or str(summary.get('run_status') or '').strip().lower()
+            != 'completed'
+            or str(summary.get('run_table_status') or '').strip().lower()
+            != 'completed'
+            or not isinstance(cycle_status, str)
+            or cycle_status.strip().lower() != 'completed'
+            or _strict_non_negative_int(result, 'final_pending') != 0
+            or _recovery_payload_has_reported_failure(result)
+            or _recovery_payload_has_reported_failure(progress_result)
+            or _recovery_payload_has_reported_failure(summary)
+            or not role_progress
+            or not role_results
+            or set(role_results) != set(role_progress)
+        ):
+            return False
+
+        expected = _strict_non_negative_int(
+            summary,
+            'expected_feedback_count',
+        )
+        completed = _strict_non_negative_int(
+            summary,
+            'completed_feedback_count',
+        )
+        failed = _strict_non_negative_int(summary, 'failed_items')
+        if (
+            expected is None
+            or completed is None
+            or failed != 0
+            or expected <= 0
+            or completed != expected
+        ):
+            return False
+        if not _recovery_optional_counts_are_strict_zero(
+            summary,
+            (
+                'pending_failure_count',
+                'pending_feedback_count',
+                'buffered_failure_count',
+                'flushed_failure_count',
+            ),
+        ):
+            return False
+        if not _recovery_optional_collection_is_strict_empty(
+            summary,
+            'failure_groups',
+        ):
+            return False
+        for pending_key in (
+            'in_progress_symbols',
+            'pending_symbols',
+            'retry_pending_symbols',
+            'partial_symbols',
+        ):
+            if (
+                pending_key in summary
+                and _strict_non_negative_int(summary, pending_key) != 0
+            ):
+                return False
+        if not _recovery_optional_collection_is_strict_empty(
+            summary,
+            'remaining_roles',
+        ):
+            return False
+
+        completed_roles = summary.get('completed_roles')
+        if not isinstance(completed_roles, (list, tuple, set)):
+            return False
+        if (
+            any(
+                not isinstance(role, str) or not role.strip()
+                for role in completed_roles
+            )
+            or len(completed_roles) != len(set(completed_roles))
+            or set(completed_roles) != set(role_results)
+        ):
+            return False
+
+        if 'is_live' in summary and summary.get('is_live') is not False:
+            return False
+        if 'current_role' in summary and summary.get('current_role') is not None:
+            return False
+        for terminal_count_key in (
+            'computed_feedback_count',
+            'terminal_feedback_count',
+        ):
+            if (
+                terminal_count_key in summary
+                and _strict_non_negative_int(summary, terminal_count_key)
+                != completed
+            ):
+                return False
+        for failure_timestamp_key in (
+            'first_failed_feedback_at',
+            'latest_failed_feedback_at',
+        ):
+            if (
+                failure_timestamp_key in summary
+                and summary.get(failure_timestamp_key) is not None
+            ):
+                return False
+        if 'run_completed_at' in summary:
+            run_completed_at = summary.get('run_completed_at')
+            if not isinstance(run_completed_at, str) or not run_completed_at.strip():
+                return False
+
+        role_expected = 0
+        role_completed = 0
+        for role, role_state in role_progress.items():
+            role_result = role_results.get(role)
+            if not isinstance(role_state, dict) or not isinstance(
+                role_result,
+                dict,
+            ):
+                return False
+            total_symbols = _strict_non_negative_int(
+                role_state,
+                'total_symbols',
+            )
+            processed_symbols = _strict_non_negative_int(
+                role_state,
+                'processed_symbols',
+            )
+            completed_symbols = _strict_non_negative_int(
+                role_state,
+                'completed_symbols',
+            )
+            requested_count = _strict_non_negative_int(
+                role_result,
+                'requested_count',
+            )
+            completed_count = _strict_non_negative_int(
+                role_result,
+                'completed_count',
+            )
+            error_count = _strict_non_negative_int(
+                role_result,
+                'error_count',
+            )
+            if (
+                str(role_state.get('status') or '').strip().lower()
+                != 'completed'
+                or str(role_state.get('boundary_status') or '')
+                .strip()
+                .lower()
+                != 'completed'
+                or _recovery_payload_has_reported_failure(role_state)
+                or _recovery_payload_has_reported_failure(role_result)
+                or (
+                    'failed_items' in role_state
+                    and _strict_non_negative_int(
+                        role_state,
+                        'failed_items',
+                    )
+                    != 0
+                )
+                or total_symbols is None
+                or total_symbols <= 0
+                or processed_symbols != total_symbols
+                or completed_symbols != total_symbols
+                or requested_count != total_symbols
+                or completed_count != completed_symbols
+                or error_count != 0
+            ):
+                return False
+            for pending_key in (
+                'in_progress_symbols',
+                'pending_symbols',
+                'retry_pending_symbols',
+                'partial_symbols',
+            ):
+                if (
+                    pending_key in role_state
+                    and _strict_non_negative_int(
+                        role_state,
+                        pending_key,
+                    )
+                    != 0
+                ):
+                    return False
+            role_expected += total_symbols
+            role_completed += completed_symbols
+        return role_expected == expected and role_completed == completed
+
+    @staticmethod
+    def _evaluation_refresh_completion_signature(
+        *,
+        request: dict[str, Any],
+        summary: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        coverage = (
+            summary.get('coverage')
+            if isinstance(summary.get('coverage'), dict)
+            else {}
+        )
+        if (
+            str(summary.get('status') or '').strip().lower() != 'completed'
+            or _recovery_payload_has_rejected_control_marker(summary)
+            or _recovery_payload_has_invalid_optional_controls(summary)
+            or _recovery_payload_has_reported_failure(summary)
+            or _recovery_payload_has_reported_failure(coverage)
+        ):
+            return None
+
+        horizons = _strict_positive_unique_ints(request.get('horizons'))
+        decisions_considered = _strict_non_negative_int(
+            summary,
+            'decisions_considered',
+        )
+        if (
+            horizons is None
+            or decisions_considered is None
+            or decisions_considered <= 0
+        ):
+            return None
+        expected = decisions_considered * len(horizons)
+        outcomes = _strict_non_negative_int(summary, 'outcomes_upserted')
+        evaluations = _strict_non_negative_int(
+            summary,
+            'evaluations_upserted',
+        )
+        coverage_count = _strict_non_negative_int(coverage, 'count')
+        if (
+            outcomes != expected
+            or evaluations != expected
+            or coverage_count != expected
+        ):
+            return None
+
+        component_keys = (
+            'computed_count',
+            'pending_maturity_count',
+            'insufficient_price_data_count',
+            'not_computed_count',
+        )
+        components: dict[str, int] = {}
+        for key in component_keys:
+            coverage_value = _strict_non_negative_int(coverage, key)
+            summary_value = _strict_non_negative_int(summary, key)
+            if coverage_value is None or summary_value != coverage_value:
+                return None
+            components[key] = coverage_value
+        if sum(components.values()) != expected:
+            return None
+        if components['computed_count'] <= 0:
+            return None
+
+        graded_count = _strict_non_negative_int(summary, 'graded_count')
+        if 'graded_count' in summary and graded_count != components[
+            'computed_count'
+        ]:
+            return None
+        pending_count = _strict_non_negative_int(summary, 'pending_count')
+        if (
+            'pending_count' in summary
+            and pending_count != expected - components['computed_count']
+        ):
+            return None
+        return {
+            'horizons': horizons,
+            'decisions_considered': decisions_considered,
+            'expected': expected,
+            **components,
+        }
+
+    @staticmethod
+    def _signal_decider_evaluations_has_legacy_wrapper_completion_proof(
+        *,
+        result: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> bool:
+        outer_summary = (
+            result.get('summary')
+            if isinstance(result.get('summary'), dict)
+            else {}
+        )
+        direct_refresh = (
+            result.get('evaluation_refresh')
+            if isinstance(result.get('evaluation_refresh'), dict)
+            else {}
+        )
+        refresh_request = (
+            direct_refresh.get('request')
+            if isinstance(direct_refresh.get('request'), dict)
+            else {}
+        )
+        direct_refresh_summary = (
+            direct_refresh.get('summary')
+            if isinstance(direct_refresh.get('summary'), dict)
+            else {}
+        )
+        nested_refresh_summary = (
+            outer_summary.get('evaluation_refresh')
+            if isinstance(outer_summary.get('evaluation_refresh'), dict)
+            else {}
+        )
+        if (
+            str(result.get('status') or '').strip().lower() != 'completed'
+            or str(outer_summary.get('status') or '').strip().lower()
+            != 'completed'
+            or not direct_refresh_summary
+            or not nested_refresh_summary
+            or _recovery_payload_has_rejected_control_marker(
+                result,
+                outer_summary,
+                direct_refresh,
+                direct_refresh_summary,
+                nested_refresh_summary,
+            )
+            or _recovery_payload_has_invalid_optional_controls(result)
+            or _recovery_payload_has_invalid_optional_controls(outer_summary)
+            or _recovery_payload_has_invalid_optional_controls(direct_refresh)
+            or _recovery_payload_has_reported_failure(result)
+            or _recovery_payload_has_reported_failure(outer_summary)
+            or _recovery_payload_has_reported_failure(direct_refresh)
+        ):
+            return False
+
+        direct_signature = EODPipelineStatusService._evaluation_refresh_completion_signature(
+            request=refresh_request,
+            summary=direct_refresh_summary,
+        )
+        nested_signature = EODPipelineStatusService._evaluation_refresh_completion_signature(
+            request=refresh_request,
+            summary=nested_refresh_summary,
+        )
+        if direct_signature is None or nested_signature != direct_signature:
+            return False
+        for key in (
+            'computed_count',
+            'pending_maturity_count',
+            'insufficient_price_data_count',
+            'not_computed_count',
+        ):
+            if _strict_non_negative_int(outer_summary, key) != direct_signature[
+                key
+            ]:
+                return False
+
+        calendar_refresh = result.get('calendar_refresh')
+        if calendar_refresh is not None:
+            if not isinstance(calendar_refresh, dict):
+                return False
+            if (
+                _recovery_payload_has_invalid_optional_controls(
+                    calendar_refresh
+                )
+                or _recovery_payload_has_reported_failure(calendar_refresh)
+            ):
+                return False
+            calendar_request = (
+                calendar_refresh.get('request')
+                if isinstance(calendar_refresh.get('request'), dict)
+                else {}
+            )
+            calendar_summary = (
+                calendar_refresh.get('summary')
+                if isinstance(calendar_refresh.get('summary'), dict)
+                else {}
+            )
+            if _recovery_payload_has_invalid_optional_controls(
+                calendar_summary
+            ):
+                return False
+            calendar_evaluation_summary = (
+                calendar_summary.get('evaluation_refresh')
+                if isinstance(calendar_summary.get('evaluation_refresh'), dict)
+                else {}
+            )
+            calendar_signature = EODPipelineStatusService._evaluation_refresh_completion_signature(
+                request=calendar_request,
+                summary=calendar_evaluation_summary,
+            )
+            if calendar_signature != direct_signature:
+                return False
+            primary_horizon_count = _strict_non_negative_int(
+                calendar_summary,
+                'primary_horizon_count',
+            )
+            if (
+                'primary_horizon_count' in calendar_summary
+                and primary_horizon_count
+                != len(direct_signature['horizons'])
+            ):
+                return False
+
+            calendar_run = calendar_refresh.get('run')
+            if calendar_run is not None:
+                if not isinstance(calendar_run, dict):
+                    return False
+                run_summary = (
+                    calendar_run.get('summary')
+                    if isinstance(calendar_run.get('summary'), dict)
+                    else {}
+                )
+                if _recovery_payload_has_invalid_optional_controls(
+                    run_summary
+                ):
+                    return False
+                run_evaluation_summary = (
+                    run_summary.get('evaluation_refresh')
+                    if isinstance(run_summary.get('evaluation_refresh'), dict)
+                    else {}
+                )
+                run_request = {'horizons': calendar_run.get('horizons')}
+                run_signature = EODPipelineStatusService._evaluation_refresh_completion_signature(
+                    request=run_request,
+                    summary=run_evaluation_summary,
+                )
+                if (
+                    str(calendar_run.get('status') or '')
+                    .strip()
+                    .lower()
+                    != 'completed'
+                    or _recovery_payload_has_invalid_optional_controls(
+                        calendar_run
+                    )
+                    or _recovery_payload_has_reported_failure(calendar_run)
+                    or run_signature != direct_signature
+                ):
+                    return False
+
+        outer_calendar = outer_summary.get('calendar_refresh')
+        if outer_calendar is not None:
+            if not isinstance(outer_calendar, dict):
+                return False
+            if _recovery_payload_has_invalid_optional_controls(
+                outer_calendar
+            ):
+                return False
+            outer_calendar_evaluation = outer_calendar.get(
+                'evaluation_refresh'
+            )
+            if not isinstance(outer_calendar_evaluation, dict):
+                return False
+            outer_calendar_signature = EODPipelineStatusService._evaluation_refresh_completion_signature(
+                request=refresh_request,
+                summary=outer_calendar_evaluation,
+            )
+            if outer_calendar_signature != direct_signature:
+                return False
+
+        computed_count = direct_signature['computed_count']
+        return bool(
+            _strict_non_negative_int(candidate, 'processed') == computed_count
+            and _strict_non_negative_int(candidate, 'total') == computed_count
+            and _strict_non_negative_int(candidate, 'succeeded')
+            == computed_count
+            and _strict_non_negative_int(candidate, 'failed') == 0
+            and _strict_non_negative_int(candidate, 'remaining') == 0
+        )
+
+    @staticmethod
+    def _signal_decider_evaluations_has_legacy_completion_proof(
+        result: dict[str, Any],
+    ) -> bool:
+        request = (
+            result.get('request')
+            if isinstance(result.get('request'), dict)
+            else {}
+        )
+        summary = (
+            result.get('summary')
+            if isinstance(result.get('summary'), dict)
+            else {}
+        )
+        raw_result_status = str(result.get('status') or '').strip().lower()
+        if (
+            not summary
+            or _recovery_payload_has_rejected_control_marker(result)
+            or _recovery_payload_has_invalid_optional_controls(result)
+            or (
+                raw_result_status
+                and raw_result_status != 'completed'
+            )
+            or _recovery_payload_has_reported_failure(result)
+        ):
+            return False
+        return (
+            EODPipelineStatusService._evaluation_refresh_completion_signature(
+                request=request,
+                summary=summary,
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _history_stage_has_authoritative_completion(
+        *,
+        stage_id: str,
+        candidate: dict[str, Any],
+    ) -> bool:
+        if str(candidate.get('status') or '').strip().lower() != 'completed':
+            return False
+        details = (
+            candidate.get('details')
+            if isinstance(candidate.get('details'), dict)
+            else {}
+        )
+        has_result_summary = 'result_summary' in details
+        result = (
+            details.get('result_summary')
+            if isinstance(details.get('result_summary'), dict)
+            else {}
+        )
+        nested_summary = (
+            result.get('summary')
+            if isinstance(result.get('summary'), dict)
+            else {}
+        )
+        if _recovery_payload_has_rejected_control_marker(
+            result,
+            nested_summary,
+        ):
+            return False
+        for payload in (result, nested_summary):
+            status = str(payload.get('status') or '').strip().lower()
+            if status and status not in {'complete', 'completed', 'ok'}:
+                return False
+
+        total = _coerce_int(candidate.get('total'))
+        has_exact_counts = bool(
+            total > 0
+            and _coerce_int(candidate.get('processed')) == total
+            and _coerce_int(candidate.get('succeeded')) == total
+            and _coerce_int(candidate.get('failed')) == 0
+            and _coerce_int(candidate.get('remaining')) == 0
+        )
+        if has_exact_counts:
+            if has_result_summary and stage_id == 'signal_decider':
+                return EODPipelineStatusService._signal_decider_has_legacy_completion_proof(
+                    result
+                )
+            if (
+                has_result_summary
+                and stage_id == 'signal_decider_evaluations'
+            ):
+                # Pre-canonical maintenance runs wrap the full evaluation proof
+                # under summary.evaluation_refresh and persist computed coverage,
+                # rather than total evaluation writes, as the stage count.
+                if 'evaluation_refresh' in nested_summary:
+                    return EODPipelineStatusService._signal_decider_evaluations_has_legacy_wrapper_completion_proof(
+                        result=result,
+                        candidate=candidate,
+                    )
+                return EODPipelineStatusService._signal_decider_evaluations_has_legacy_completion_proof(
+                    result
+                )
+            return True
+        has_legacy_zero_counts = all(
+            _coerce_int(candidate.get(key)) == 0
+            for key in (
+                'processed',
+                'total',
+                'succeeded',
+                'failed',
+                'remaining',
+            )
+        )
+        if not has_legacy_zero_counts or not result:
+            return False
+        if stage_id == 'signal_decider':
+            return EODPipelineStatusService._signal_decider_has_legacy_completion_proof(
+                result
+            )
+        if stage_id == 'signal_decider_evaluations':
+            return EODPipelineStatusService._signal_decider_evaluations_has_legacy_completion_proof(
+                result
+            )
+        return False
 
     @staticmethod
     def _recovery_state_is_newer(
@@ -1830,14 +2595,12 @@ class EODPipelineStatusService:
                 and candidate_status == 'partial'
             )
             if stage_id in EXACT_COMPLETED_RECOVERY_STAGE_HISTORY_IDS:
-                total = _coerce_int(candidate.get('total'))
                 evidence_is_recovery = bool(
                     evidence_is_recovery
-                    and total > 0
-                    and _coerce_int(candidate.get('processed')) == total
-                    and _coerce_int(candidate.get('succeeded')) == total
-                    and _coerce_int(candidate.get('failed')) == 0
-                    and _coerce_int(candidate.get('remaining')) == 0
+                    and EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id=stage_id,
+                        candidate=candidate,
+                    )
                 )
         elif (
             stage_id in RECOVERABLE_PERSISTED_OUTPUT_STAGE_IDS
@@ -1916,6 +2679,7 @@ class EODPipelineStatusService:
             processed=progress_source.get('processed'),
         )
         official_details = dict(official_stage.get('details') or {})
+        has_result_summary = 'result_summary' in official_details
         result_summary = (
             official_details.get('result_summary')
             if isinstance(official_details.get('result_summary'), dict)
@@ -1935,6 +2699,18 @@ class EODPipelineStatusService:
         )
         if status_repaired_from_result_summary:
             status = result_summary_status
+        status_repaired_for_non_authoritative_result = (
+            stored_status == 'completed'
+            and stage_id
+            in {'signal_decider', 'signal_decider_evaluations'}
+            and has_result_summary
+            and not self._history_stage_has_authoritative_completion(
+                stage_id=stage_id,
+                candidate=official_stage,
+            )
+        )
+        if status_repaired_for_non_authoritative_result:
+            status = 'partial'
         should_repair_legacy_counts = (
             counts.processed == 0
             and counts.succeeded == 0
@@ -1969,6 +2745,27 @@ class EODPipelineStatusService:
             )
             if feedback_counts['total'] > 0:
                 counts = build_stage_counts(**feedback_counts)
+        if (
+            stage_id in {'signal_decider', 'signal_decider_evaluations'}
+            and stored_status == 'completed'
+            and result_summary
+            and should_repair_legacy_counts
+            and self._history_stage_has_authoritative_completion(
+                stage_id=stage_id,
+                candidate=official_stage,
+            )
+        ):
+            semantic_counts = DailyPipelineStageService._extract_stage_counts(
+                stage_id=stage_id,
+                result=result_summary,
+            )
+            if (
+                semantic_counts['total'] > 0
+                and semantic_counts['processed'] == semantic_counts['total']
+                and semantic_counts['succeeded'] == semantic_counts['total']
+                and semantic_counts['failed'] == 0
+            ):
+                counts = build_stage_counts(**semantic_counts)
         status_repaired_for_incomplete_counts = (
             stored_status == 'completed'
             and (counts.failed > 0 or counts.remaining > 0)
@@ -2018,12 +2815,20 @@ class EODPipelineStatusService:
         if uses_fallback_coverage_diagnostics:
             details['coverage_diagnostics_source'] = 'stage_specific_fallback'
             details['coverage_diagnostics_updated_at'] = fallback_stage.get('updated_at')
-        if status_repaired_for_incomplete_counts or status_repaired_from_result_summary:
+        if (
+            status_repaired_for_incomplete_counts
+            or status_repaired_from_result_summary
+            or status_repaired_for_non_authoritative_result
+        ):
             details['status_repaired_from'] = 'completed'
             details['status_repair_reason'] = (
                 'incomplete_terminal_counts'
                 if status_repaired_for_incomplete_counts
-                else 'incomplete_result_summary'
+                else (
+                    'non_authoritative_terminal_result'
+                    if status_repaired_for_non_authoritative_result
+                    else 'incomplete_result_summary'
+                )
             )
         details['mode'] = 'official_daily_pipeline_run_state'
         details['pipeline_run_id'] = official_run.get('id')
@@ -2035,7 +2840,11 @@ class EODPipelineStatusService:
         current_activity = official_stage.get('current_activity')
         if use_fallback_progress:
             current_activity = fallback_stage.get('current_activity') or current_activity
-        if status_repaired_for_incomplete_counts or status_repaired_from_result_summary:
+        if (
+            status_repaired_for_incomplete_counts
+            or status_repaired_from_result_summary
+            or status_repaired_for_non_authoritative_result
+        ):
             current_activity = (
                 f'Completed with {counts.failed} failed items.'
                 if counts.failed > 0

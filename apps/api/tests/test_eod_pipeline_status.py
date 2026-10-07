@@ -1,8 +1,10 @@
 import unittest
+from copy import deepcopy
 from contextlib import contextmanager
 from unittest.mock import call, patch
 
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
     DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
@@ -281,6 +283,230 @@ def _blocked_downstream_output_eod_run(
             },
         },
     }
+
+
+def _legacy_completed_signal_decider_stage(
+    *,
+    market_date: str,
+    updated_at: str,
+    expected: int = 160,
+    completed: int = 160,
+) -> dict[str, dict]:
+    item = _completed_official_stage(
+        run_id=516,
+        stage_id='signal_decider',
+        market_date=market_date,
+        processed=0,
+        total=0,
+        updated_at=updated_at,
+    )
+    item['stage']['details'] = {
+        'result_summary': {
+            'status': 'completed',
+            'completed': True,
+            'final_pending': 0,
+            'progress': {
+                'result': {
+                    'roles': {
+                        'short-term-decider': {
+                            'requested_count': expected // 2,
+                            'completed_count': completed // 2,
+                            'error_count': 0,
+                        },
+                        'signal-decider': {
+                            'requested_count': expected - (expected // 2),
+                            'completed_count': completed - (completed // 2),
+                            'error_count': 0,
+                        },
+                    },
+                },
+                'summary': {
+                    'run_status': 'completed',
+                    'run_table_status': 'completed',
+                    'cycle_status': 'completed',
+                    'expected_feedback_count': expected,
+                    'completed_feedback_count': completed,
+                    'computed_feedback_count': completed,
+                    'terminal_feedback_count': completed,
+                    'failed_items': 0,
+                    'pending_failure_count': 0,
+                    'pending_feedback_count': 0,
+                    'buffered_failure_count': 0,
+                    'flushed_failure_count': 0,
+                    'failure_groups': {},
+                    'pending_symbols': 0,
+                    'remaining_roles': [],
+                    'completed_roles': [
+                        'short-term-decider',
+                        'signal-decider',
+                    ],
+                    'is_live': False,
+                    'current_role': None,
+                    'role_progress': {
+                        'short-term-decider': {
+                            'status': 'completed',
+                            'boundary_status': 'completed',
+                            'total_symbols': expected // 2,
+                            'processed_symbols': completed // 2,
+                            'completed_symbols': completed // 2,
+                            'pending_symbols': 0,
+                            'retry_pending_symbols': 0,
+                            'failed_items': 0,
+                        },
+                        'signal-decider': {
+                            'status': 'completed',
+                            'boundary_status': 'completed',
+                            'total_symbols': expected - (expected // 2),
+                            'processed_symbols': completed - (completed // 2),
+                            'completed_symbols': completed - (completed // 2),
+                            'pending_symbols': 0,
+                            'retry_pending_symbols': 0,
+                            'failed_items': 0,
+                        },
+                    },
+                },
+            },
+        },
+    }
+    return item
+
+
+def _legacy_completed_signal_decider_evaluations_stage(
+    *,
+    market_date: str,
+    updated_at: str,
+    outcomes_upserted: int = 3_840,
+    evaluations_upserted: int = 3_840,
+) -> dict[str, dict]:
+    item = _completed_official_stage(
+        run_id=516,
+        stage_id='signal_decider_evaluations',
+        market_date=market_date,
+        processed=0,
+        total=0,
+        updated_at=updated_at,
+    )
+    item['stage']['details'] = {
+        'result_summary': {
+            'request': {
+                'horizons': [1, 3, 5, 10],
+            },
+            'summary': {
+                'status': 'completed',
+                'decisions_considered': 960,
+                'outcomes_upserted': outcomes_upserted,
+                'evaluations_upserted': evaluations_upserted,
+                'coverage': {
+                    'count': 3_840,
+                    'computed_count': 2_284,
+                    'pending_maturity_count': 1_550,
+                    'insufficient_price_data_count': 6,
+                    'not_computed_count': 0,
+                },
+                'computed_count': 2_284,
+                'pending_maturity_count': 1_550,
+                'insufficient_price_data_count': 6,
+                'not_computed_count': 0,
+                'graded_count': 2_284,
+                'pending_count': 1_556,
+                'warning_count': 0,
+                'warnings': [],
+            },
+        },
+    }
+    return item
+
+
+def _legacy_wrapped_signal_decider_evaluations_stage(
+    *,
+    market_date: str,
+    updated_at: str,
+) -> dict[str, dict]:
+    nested_refresh_summary = {
+        'status': 'completed',
+        'decisions_considered': 930,
+        'outcomes_upserted': 3_720,
+        'evaluations_upserted': 3_720,
+        'graded_count': 2_843,
+        'pending_count': 877,
+        'coverage': {
+            'count': 3_720,
+            'computed_count': 2_843,
+            'pending_maturity_count': 869,
+            'insufficient_price_data_count': 8,
+            'not_computed_count': 0,
+        },
+        'computed_count': 2_843,
+        'pending_maturity_count': 869,
+        'insufficient_price_data_count': 8,
+        'not_computed_count': 0,
+        'warning_count': 0,
+        'warnings': [],
+    }
+    evaluation_request = {
+        'market_date_from': '2026-08-31',
+        'market_date_to': market_date,
+        'horizons': [1, 3, 5, 10],
+    }
+    calendar_refresh = {
+        'request': {
+            'market_date_from': '2026-09-09',
+            'market_date_to': market_date,
+            'horizons': [1, 3, 5, 10],
+        },
+        'summary': {
+            'decision_count': 374,
+            'review_rows_upserted': 1_496,
+            'primary_horizon_count': 4,
+            'evaluation_refresh': deepcopy(nested_refresh_summary),
+        },
+        'run': {
+            'id': 122,
+            'status': 'completed',
+            'horizons': [1, 3, 5, 10],
+            'summary': {
+                'evaluation_refresh': deepcopy(nested_refresh_summary),
+            },
+            'error_message': None,
+        },
+    }
+    item = _completed_official_stage(
+        run_id=491,
+        stage_id='signal_decider_evaluations',
+        market_date=market_date,
+        processed=2_843,
+        total=2_843,
+        updated_at=updated_at,
+    )
+    item['stage']['details'] = {
+        'result_summary': {
+            'status': 'completed',
+            'triggered': True,
+            'warnings': [],
+            'request': {
+                'as_of_market_date': market_date,
+                'horizons': None,
+                'refresh_calendar': True,
+            },
+            'evaluation_refresh': {
+                'request': evaluation_request,
+                'summary': deepcopy(nested_refresh_summary),
+            },
+            'calendar_refresh': calendar_refresh,
+            'summary': {
+                'status': 'completed',
+                'computed_count': 2_843,
+                'pending_maturity_count': 869,
+                'insufficient_price_data_count': 8,
+                'not_computed_count': 0,
+                'evaluation_refresh': deepcopy(nested_refresh_summary),
+                'warning_count': 0,
+                'warnings': [],
+                'calendar_refresh': deepcopy(calendar_refresh['summary']),
+            },
+        },
+    }
+    return item
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
@@ -3416,6 +3642,907 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 result['stages'][stage_id]['source_run_ids'],
                 {'eod_run_id': 561},
             )
+
+    def test_read_recovers_real_shaped_legacy_decision_history_before_newer_unrelated_safe_skip(
+        self,
+    ) -> None:
+        market_date = '2026-10-07'
+        blocked_at = '2026-10-07T13:00:00+00:00'
+        recovered_at = '2026-10-07T21:07:57+00:00'
+        unrelated_at = '2026-10-07T22:09:07+00:00'
+        eod_run = _blocked_downstream_output_eod_run(
+            market_date=market_date,
+            updated_at=blocked_at,
+        )
+        for stage_id in (
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ):
+            eod_run['run_metadata']['stage_progress'][stage_id] = {
+                'status': 'blocked',
+                'processed': 65 if stage_id == 'signal_decider' else 0,
+                'total': 115 if stage_id == 'signal_decider' else 0,
+                'succeeded': 65 if stage_id == 'signal_decider' else 0,
+                'failed': 0,
+                'updated_at': blocked_at,
+                'result_summary': {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'summary_run_symbol_scope_mismatch',
+                    'market_date': market_date,
+                },
+            }
+
+        unrelated_history = _completed_official_stage(
+            run_id=517,
+            stage_id='external_news_enrich',
+            market_date=market_date,
+            processed=0,
+            total=0,
+            updated_at=unrelated_at,
+        )
+        unrelated_history['stage']['details'] = {
+            'result_summary': {
+                'triggered': False,
+                'skipped': True,
+                'safe_skip': True,
+                'status': 'skipped',
+                'reason': 'point_in_time_recovery_current_only_stage',
+                'market_date': market_date,
+                'stage': 'external_news_enrich',
+            }
+        }
+        latest_official_run = {
+            **unrelated_history['run'],
+            'stages': {
+                'external_news_enrich': unrelated_history['stage'],
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: eod_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2_703,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: latest_official_run,
+            official_stage_history_loader=lambda **_: {
+                'signal_decider': _legacy_completed_signal_decider_stage(
+                    market_date=market_date,
+                    updated_at=recovered_at,
+                ),
+                'next_open_execution_plan': _completed_official_stage(
+                    run_id=516,
+                    stage_id='next_open_execution_plan',
+                    market_date=market_date,
+                    processed=5,
+                    total=5,
+                    updated_at=recovered_at,
+                ),
+                'signal_decider_evaluations': (
+                    _legacy_completed_signal_decider_evaluations_stage(
+                        market_date=market_date,
+                        updated_at=recovered_at,
+                    )
+                ),
+                'external_news_enrich': unrelated_history,
+            },
+        )
+
+        result = service.read(market_date=market_date)
+
+        expected_counts = {
+            'signal_decider': 160,
+            'next_open_execution_plan': 5,
+            'signal_decider_evaluations': 3_840,
+        }
+        for stage_id, expected_count in expected_counts.items():
+            with self.subTest(stage_id=stage_id):
+                stage = result['stages'][stage_id]
+                self.assertEqual(stage['status'], 'completed')
+                self.assertEqual(stage['processed'], expected_count)
+                self.assertEqual(stage['total'], expected_count)
+                self.assertEqual(stage['succeeded'], expected_count)
+                self.assertEqual(stage['failed'], 0)
+                self.assertEqual(
+                    stage['details']['progress_source'],
+                    'official_stage_history',
+                )
+
+    def test_legacy_zero_count_decision_history_requires_stage_specific_semantic_proof(
+        self,
+    ) -> None:
+        market_date = '2026-10-07'
+        current = {
+            'status': 'blocked',
+            'processed': 65,
+            'total': 115,
+            'succeeded': 65,
+            'failed': 0,
+            'remaining': 50,
+            'updated_at': '2026-10-07T13:00:00+00:00',
+        }
+        decider_factory = lambda: _legacy_completed_signal_decider_stage(
+            market_date=market_date,
+            updated_at='2026-10-07T14:00:00+00:00',
+        )['stage']
+        evaluation_factory = lambda: (
+            _legacy_completed_signal_decider_evaluations_stage(
+                market_date=market_date,
+                updated_at='2026-10-07T14:00:00+00:00',
+            )['stage']
+        )
+
+        cases: list[tuple[str, str, dict]] = []
+        for marker, value in (
+            ('safe_skip', True),
+            ('skipped', True),
+            ('triggered', False),
+        ):
+            decider = decider_factory()
+            decider['details']['result_summary'][marker] = value
+            cases.append((f'decider_{marker}', 'signal_decider', decider))
+            evaluations = evaluation_factory()
+            evaluations['details']['result_summary'][marker] = value
+            cases.append(
+                (
+                    f'evaluations_{marker}',
+                    'signal_decider_evaluations',
+                    evaluations,
+                )
+            )
+
+        empty_decider = decider_factory()
+        empty_decider['details']['result_summary'] = {}
+        cases.append(('decider_empty', 'signal_decider', empty_decider))
+        malformed_evaluations = evaluation_factory()
+        malformed_evaluations['details']['result_summary'] = {'summary': []}
+        cases.append(
+            (
+                'evaluations_malformed',
+                'signal_decider_evaluations',
+                malformed_evaluations,
+            )
+        )
+        for status in ('incomplete', 'partial', 'failed', 'pending'):
+            decider = decider_factory()
+            decider['details']['result_summary']['status'] = status
+            cases.append((f'decider_{status}', 'signal_decider', decider))
+            evaluations = evaluation_factory()
+            evaluations['details']['result_summary']['summary']['status'] = status
+            cases.append(
+                (
+                    f'evaluations_{status}',
+                    'signal_decider_evaluations',
+                    evaluations,
+                )
+            )
+
+        pending_decider = decider_factory()
+        pending_decider['details']['result_summary']['final_pending'] = 1
+        cases.append(('decider_final_pending', 'signal_decider', pending_decider))
+        failed_decider = decider_factory()
+        failed_decider['details']['result_summary']['progress']['summary'][
+            'failed_items'
+        ] = 1
+        cases.append(('decider_failed_items', 'signal_decider', failed_decider))
+        role_pending_decider = decider_factory()
+        role_pending_decider['details']['result_summary']['progress']['summary'][
+            'role_progress'
+        ]['signal-decider']['status'] = 'pending'
+        cases.append(
+            ('decider_role_pending', 'signal_decider', role_pending_decider)
+        )
+        raw_scope_mismatch = _legacy_completed_signal_decider_stage(
+            market_date=market_date,
+            updated_at='2026-10-07T14:00:00+00:00',
+            expected=115,
+            completed=65,
+        )['stage']
+        cases.append(
+            ('decider_raw_65_of_115', 'signal_decider', raw_scope_mismatch)
+        )
+        evaluation_scope_mismatch = (
+            _legacy_completed_signal_decider_evaluations_stage(
+                market_date=market_date,
+                updated_at='2026-10-07T14:00:00+00:00',
+                outcomes_upserted=115,
+                evaluations_upserted=65,
+            )['stage']
+        )
+        cases.append(
+            (
+                'evaluations_raw_65_of_115',
+                'signal_decider_evaluations',
+                evaluation_scope_mismatch,
+            )
+        )
+
+        for label, stage_id, candidate in cases:
+            with self.subTest(label=label):
+                self.assertFalse(
+                    EODPipelineStatusService._recovery_state_is_newer(
+                        stage_id=stage_id,
+                        candidate=candidate,
+                        current=current,
+                        candidate_is_history=True,
+                    )
+                )
+
+    def test_legacy_semantic_recovery_requires_strictly_newer_terminal_timestamp(
+        self,
+    ) -> None:
+        market_date = '2026-10-07'
+        timestamp_cases = (
+            ('newer', '2026-10-07T14:00:00+00:00', True),
+            ('equal', '2026-10-07T13:00:00+00:00', False),
+            ('older', '2026-10-07T12:00:00+00:00', False),
+            ('missing', None, False),
+            ('invalid', 'not-a-timestamp', False),
+        )
+        current = {
+            'status': 'blocked',
+            'processed': 65,
+            'total': 115,
+            'succeeded': 65,
+            'failed': 0,
+            'remaining': 50,
+            'updated_at': '2026-10-07T13:00:00+00:00',
+        }
+        for stage_id, factory in (
+            ('signal_decider', _legacy_completed_signal_decider_stage),
+            (
+                'signal_decider_evaluations',
+                _legacy_completed_signal_decider_evaluations_stage,
+            ),
+        ):
+            for label, candidate_updated_at, expected in timestamp_cases:
+                with self.subTest(stage_id=stage_id, label=label):
+                    candidate = factory(
+                        market_date=market_date,
+                        updated_at=(
+                            candidate_updated_at
+                            or '2026-10-07T14:00:00+00:00'
+                        ),
+                    )['stage']
+                    if candidate_updated_at is None:
+                        candidate['updated_at'] = None
+                        candidate['completed_at'] = None
+                    self.assertEqual(
+                        EODPipelineStatusService._recovery_state_is_newer(
+                            stage_id=stage_id,
+                            candidate=candidate,
+                            current=current,
+                            candidate_is_history=True,
+                        ),
+                        expected,
+                    )
+
+    def test_legacy_evaluation_proof_rejects_self_consistent_truncation_and_invalid_denominators(
+        self,
+    ) -> None:
+        market_date = '2026-10-07'
+        current = {
+            'status': 'blocked',
+            'processed': 0,
+            'total': 3_840,
+            'succeeded': 0,
+            'failed': 0,
+            'remaining': 3_840,
+            'updated_at': '2026-10-07T13:00:00+00:00',
+        }
+
+        cases: list[tuple[str, dict]] = []
+        truncated = _legacy_completed_signal_decider_evaluations_stage(
+            market_date=market_date,
+            updated_at='2026-10-07T14:00:00+00:00',
+            outcomes_upserted=65,
+            evaluations_upserted=65,
+        )['stage']
+        cases.append(('self_consistent_65_of_3840', truncated))
+
+        for label, horizons in (
+            ('missing_horizons', None),
+            ('malformed_horizons', '1,3,5,10'),
+            ('duplicate_horizons', [1, 1, 3, 5]),
+        ):
+            candidate = _legacy_completed_signal_decider_evaluations_stage(
+                market_date=market_date,
+                updated_at='2026-10-07T14:00:00+00:00',
+            )['stage']
+            request = candidate['details']['result_summary']['request']
+            if horizons is None:
+                request.pop('horizons')
+            else:
+                request['horizons'] = horizons
+            cases.append((label, candidate))
+
+        coverage_mismatch = (
+            _legacy_completed_signal_decider_evaluations_stage(
+                market_date=market_date,
+                updated_at='2026-10-07T14:00:00+00:00',
+            )['stage']
+        )
+        coverage_mismatch['details']['result_summary']['summary']['coverage'][
+            'count'
+        ] = 65
+        cases.append(('coverage_count_mismatch', coverage_mismatch))
+
+        coverage_components_mismatch = (
+            _legacy_completed_signal_decider_evaluations_stage(
+                market_date=market_date,
+                updated_at='2026-10-07T14:00:00+00:00',
+            )['stage']
+        )
+        coverage_components_mismatch['details']['result_summary']['summary'][
+            'coverage'
+        ]['insufficient_price_data_count'] = 5
+        cases.append(
+            ('coverage_components_mismatch', coverage_components_mismatch)
+        )
+
+        for label, candidate in cases:
+            with self.subTest(label=label):
+                self.assertFalse(
+                    EODPipelineStatusService._recovery_state_is_newer(
+                        stage_id='signal_decider_evaluations',
+                        candidate=candidate,
+                        current=current,
+                        candidate_is_history=True,
+                    )
+                )
+
+    def test_legacy_decider_proof_rejects_summary_shrunk_below_role_requests(
+        self,
+    ) -> None:
+        candidate = _legacy_completed_signal_decider_stage(
+            market_date='2026-10-07',
+            updated_at='2026-10-07T14:00:00+00:00',
+            expected=65,
+            completed=65,
+        )['stage']
+        role_results = candidate['details']['result_summary']['progress'][
+            'result'
+        ]['roles']
+        role_results['short-term-decider'].update(
+            requested_count=80,
+            completed_count=80,
+        )
+        role_results['signal-decider'].update(
+            requested_count=80,
+            completed_count=80,
+        )
+
+        self.assertFalse(
+            EODPipelineStatusService._recovery_state_is_newer(
+                stage_id='signal_decider',
+                candidate=candidate,
+                current={
+                    'status': 'blocked',
+                    'processed': 65,
+                    'total': 160,
+                    'succeeded': 65,
+                    'failed': 0,
+                    'remaining': 95,
+                    'updated_at': '2026-10-07T13:00:00+00:00',
+                },
+                candidate_is_history=True,
+            )
+        )
+
+    def test_real_shaped_legacy_evaluation_wrapper_remains_completed(
+        self,
+    ) -> None:
+        item = _legacy_wrapped_signal_decider_evaluations_stage(
+            market_date='2026-09-30',
+            updated_at='2026-10-01T16:55:34+00:00',
+        )
+        candidate = item['stage']
+
+        self.assertTrue(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='signal_decider_evaluations',
+                candidate=candidate,
+            )
+        )
+        built_stage = EODPipelineStatusService()._build_official_stage(
+            stage_id='signal_decider_evaluations',
+            market_date='2026-09-30',
+            official_run=item['run'],
+            official_stage=candidate,
+            fallback_stage={
+                'status': 'pending',
+                'details': {},
+                'source_run_ids': {},
+            },
+        )
+
+        self.assertEqual(built_stage['status'], 'completed')
+        self.assertEqual(built_stage['processed'], 2_843)
+        self.assertEqual(built_stage['total'], 2_843)
+        self.assertEqual(built_stage['succeeded'], 2_843)
+        self.assertEqual(built_stage['failed'], 0)
+
+    def test_malformed_legacy_evaluation_wrapper_is_not_authoritative(
+        self,
+    ) -> None:
+        item = _legacy_wrapped_signal_decider_evaluations_stage(
+            market_date='2026-09-30',
+            updated_at='2026-10-01T16:55:34+00:00',
+        )
+        candidate = item['stage']
+        candidate['details']['result_summary']['summary'][
+            'evaluation_refresh'
+        ]['coverage']['computed_count'] = 2_842
+
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='signal_decider_evaluations',
+                candidate=candidate,
+            )
+        )
+        built_stage = EODPipelineStatusService()._build_official_stage(
+            stage_id='signal_decider_evaluations',
+            market_date='2026-09-30',
+            official_run=item['run'],
+            official_stage=candidate,
+            fallback_stage={
+                'status': 'pending',
+                'details': {},
+                'source_run_ids': {},
+            },
+        )
+
+        self.assertEqual(built_stage['status'], 'partial')
+
+    def test_legacy_evaluation_wrapper_rejects_malformed_optional_controls(
+        self,
+    ) -> None:
+        cases = (
+            ('result_warnings', ('warnings',), 'warn'),
+            ('summary_warning_count', ('summary', 'warning_count'), '0'),
+            (
+                'calendar_primary_horizon_count',
+                ('calendar_refresh', 'summary', 'primary_horizon_count'),
+                '4',
+            ),
+        )
+        for label, path, value in cases:
+            with self.subTest(label=label):
+                item = _legacy_wrapped_signal_decider_evaluations_stage(
+                    market_date='2026-09-30',
+                    updated_at='2026-10-01T16:55:34+00:00',
+                )
+                candidate = item['stage']
+                payload = candidate['details']['result_summary']
+                cursor = payload
+                for key in path[:-1]:
+                    cursor = cursor[key]
+                cursor[path[-1]] = value
+
+                self.assertFalse(
+                    EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id='signal_decider_evaluations',
+                        candidate=candidate,
+                    )
+                )
+                built_stage = EODPipelineStatusService()._build_official_stage(
+                    stage_id='signal_decider_evaluations',
+                    market_date='2026-09-30',
+                    official_run=item['run'],
+                    official_stage=candidate,
+                    fallback_stage={
+                        'status': 'pending',
+                        'details': {},
+                        'source_run_ids': {},
+                    },
+                )
+                self.assertEqual(built_stage['status'], 'partial')
+
+    def test_canonical_evaluation_proof_rejects_malformed_coverage_and_warnings(
+        self,
+    ) -> None:
+        delete = object()
+        cases = (
+            ('coverage_removed', ('summary', 'coverage'), delete),
+            (
+                'coverage_components_removed',
+                ('summary', 'coverage'),
+                {'count': 3_840},
+            ),
+            (
+                'coverage_component_partial',
+                ('summary', 'coverage', 'computed_count'),
+                delete,
+            ),
+            ('warnings_scalar', ('summary', 'warnings'), 'warn'),
+            ('warning_count_string', ('summary', 'warning_count'), '0'),
+        )
+        for label, path, value in cases:
+            with self.subTest(label=label):
+                item = _legacy_completed_signal_decider_evaluations_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )
+                candidate = item['stage']
+                payload = candidate['details']['result_summary']
+                cursor = payload
+                for key in path[:-1]:
+                    cursor = cursor[key]
+                if value is delete:
+                    cursor.pop(path[-1])
+                else:
+                    cursor[path[-1]] = value
+
+                self.assertFalse(
+                    EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id='signal_decider_evaluations',
+                        candidate=candidate,
+                    )
+                )
+                built_stage = EODPipelineStatusService()._build_official_stage(
+                    stage_id='signal_decider_evaluations',
+                    market_date='2026-10-07',
+                    official_run=item['run'],
+                    official_stage=candidate,
+                    fallback_stage={
+                        'status': 'pending',
+                        'details': {},
+                        'source_run_ids': {},
+                    },
+                )
+                self.assertEqual(built_stage['status'], 'partial')
+
+    def test_canonical_evaluation_proof_requires_root_components_to_match_coverage(
+        self,
+    ) -> None:
+        delete = object()
+        cases = (
+            ('root_component_missing', 'computed_count', delete),
+            ('root_component_string', 'pending_maturity_count', '1550'),
+            ('root_component_mismatch', 'insufficient_price_data_count', 5),
+        )
+        for label, key, value in cases:
+            with self.subTest(label=label):
+                item = _legacy_completed_signal_decider_evaluations_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )
+                candidate = item['stage']
+                summary = candidate['details']['result_summary']['summary']
+                if value is delete:
+                    summary.pop(key)
+                else:
+                    summary[key] = value
+
+                self.assertFalse(
+                    EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id='signal_decider_evaluations',
+                        candidate=candidate,
+                    )
+                )
+                built_stage = EODPipelineStatusService()._build_official_stage(
+                    stage_id='signal_decider_evaluations',
+                    market_date='2026-10-07',
+                    official_run=item['run'],
+                    official_stage=candidate,
+                    fallback_stage={
+                        'status': 'pending',
+                        'details': {},
+                        'source_run_ids': {},
+                    },
+                )
+                self.assertEqual(built_stage['status'], 'partial')
+
+    def test_canonical_evaluation_proof_requires_consistent_grade_and_pending_counts(
+        self,
+    ) -> None:
+        cases = (
+            ('graded_count_mismatch', 'graded_count', 1),
+            ('graded_count_string', 'graded_count', '2284'),
+            ('pending_count_mismatch', 'pending_count', 1),
+            ('pending_count_string', 'pending_count', '1556'),
+        )
+        for label, key, value in cases:
+            with self.subTest(label=label):
+                item = _legacy_completed_signal_decider_evaluations_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )
+                candidate = item['stage']
+                candidate['details']['result_summary']['summary'][key] = value
+
+                self.assertFalse(
+                    EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id='signal_decider_evaluations',
+                        candidate=candidate,
+                    )
+                )
+                built_stage = EODPipelineStatusService()._build_official_stage(
+                    stage_id='signal_decider_evaluations',
+                    market_date='2026-10-07',
+                    official_run=item['run'],
+                    official_stage=candidate,
+                    fallback_stage={
+                        'status': 'pending',
+                        'details': {},
+                        'source_run_ids': {},
+                    },
+                )
+                self.assertEqual(built_stage['status'], 'partial')
+
+    def test_canonical_decider_proof_rejects_malformed_pending_counter(
+        self,
+    ) -> None:
+        item = _legacy_completed_signal_decider_stage(
+            market_date='2026-10-07',
+            updated_at='2026-10-07T14:00:00+00:00',
+        )
+        candidate = item['stage']
+        candidate['details']['result_summary']['progress']['summary'][
+            'role_progress'
+        ]['signal-decider']['pending_symbols'] = 'bad'
+
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='signal_decider',
+                candidate=candidate,
+            )
+        )
+        built_stage = EODPipelineStatusService()._build_official_stage(
+            stage_id='signal_decider',
+            market_date='2026-10-07',
+            official_run=item['run'],
+            official_stage=candidate,
+            fallback_stage={
+                'status': 'pending',
+                'details': {},
+                'source_run_ids': {},
+            },
+        )
+
+        self.assertEqual(built_stage['status'], 'partial')
+
+    def test_canonical_decider_proof_rejects_contradictory_terminal_controls(
+        self,
+    ) -> None:
+        cases = (
+            ('pending_failure_count', 'pending_failure_count', '0'),
+            ('pending_feedback_count', 'pending_feedback_count', 1),
+            ('buffered_failure_count', 'buffered_failure_count', '0'),
+            ('flushed_failure_count', 'flushed_failure_count', 1),
+            ('failure_groups', 'failure_groups', {'timeout': 1}),
+            ('cycle_status', 'cycle_status', 'pending'),
+            ('completed_roles', 'completed_roles', ['signal-decider']),
+            ('remaining_roles', 'remaining_roles', ['signal-decider']),
+            ('is_live', 'is_live', True),
+            ('current_role', 'current_role', 'signal-decider'),
+            ('computed_feedback_count', 'computed_feedback_count', 159),
+            ('terminal_feedback_count', 'terminal_feedback_count', 159),
+        )
+        for label, key, value in cases:
+            with self.subTest(label=label):
+                item = _legacy_completed_signal_decider_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )
+                candidate = item['stage']
+                summary = candidate['details']['result_summary']['progress'][
+                    'summary'
+                ]
+                summary[key] = value
+
+                self.assertFalse(
+                    EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id='signal_decider',
+                        candidate=candidate,
+                    )
+                )
+                built_stage = EODPipelineStatusService()._build_official_stage(
+                    stage_id='signal_decider',
+                    market_date='2026-10-07',
+                    official_run=item['run'],
+                    official_stage=candidate,
+                    fallback_stage={
+                        'status': 'pending',
+                        'details': {},
+                        'source_run_ids': {},
+                    },
+                )
+                self.assertEqual(built_stage['status'], 'partial')
+
+    def test_future_decision_counts_cannot_bypass_semantic_history_authority(
+        self,
+    ) -> None:
+        decider_without_role_results = {
+            'status': 'completed',
+            'completed': True,
+            'final_pending': 0,
+            'progress': {
+                'summary': {
+                    'run_status': 'completed',
+                    'run_table_status': 'completed',
+                    'expected_feedback_count': 65,
+                    'completed_feedback_count': 65,
+                    'failed_items': 0,
+                    'role_progress': {
+                        'signal-decider': {
+                            'status': 'completed',
+                            'boundary_status': 'completed',
+                            'total_symbols': 65,
+                            'processed_symbols': 65,
+                            'completed_symbols': 65,
+                            'failed_items': 0,
+                        },
+                    },
+                },
+            },
+        }
+        decider_with_non_integer_request = (
+            _legacy_completed_signal_decider_stage(
+                market_date='2026-10-07',
+                updated_at='2026-10-07T15:00:00+00:00',
+                expected=65,
+                completed=65,
+            )['stage']['details']['result_summary']
+        )
+        decider_with_non_integer_request['progress']['result']['roles'][
+            'short-term-decider'
+        ]['requested_count'] = '32'
+
+        evaluation_cases: list[tuple[str, dict]] = []
+        for label, horizons in (
+            ('missing_horizons', None),
+            ('malformed_horizons', '1,3,5,10'),
+            ('duplicate_horizons', [1, 1, 3, 5]),
+        ):
+            result = {
+                'request': {},
+                'summary': {
+                    'status': 'completed',
+                    'decisions_considered': 960,
+                    'outcomes_upserted': 65,
+                    'evaluations_upserted': 65,
+                    'coverage': {
+                        'count': 65,
+                        'computed_count': 65,
+                        'pending_maturity_count': 0,
+                        'insufficient_price_data_count': 0,
+                        'not_computed_count': 0,
+                    },
+                    'not_computed_count': 0,
+                    'warning_count': 0,
+                    'warnings': [],
+                },
+            }
+            if horizons is not None:
+                result['request']['horizons'] = horizons
+            evaluation_cases.append((label, result))
+
+        evaluation_cases.append(
+            (
+                'coverage_count_mismatch',
+                {
+                    'request': {'horizons': [1, 3, 5, 10]},
+                    'summary': {
+                        'status': 'completed',
+                        'decisions_considered': 960,
+                        'outcomes_upserted': 3_840,
+                        'evaluations_upserted': 3_840,
+                        'coverage': {
+                            'count': 65,
+                            'computed_count': 65,
+                            'pending_maturity_count': 0,
+                            'insufficient_price_data_count': 0,
+                            'not_computed_count': 0,
+                        },
+                        'not_computed_count': 0,
+                        'warning_count': 0,
+                        'warnings': [],
+                    },
+                },
+            )
+        )
+        non_integer_decisions = (
+            _legacy_completed_signal_decider_evaluations_stage(
+                market_date='2026-10-07',
+                updated_at='2026-10-07T15:00:00+00:00',
+            )['stage']['details']['result_summary']
+        )
+        non_integer_decisions['summary']['decisions_considered'] = '960'
+        evaluation_cases.append(
+            ('non_integer_decisions_considered', non_integer_decisions)
+        )
+        non_integer_coverage = (
+            _legacy_completed_signal_decider_evaluations_stage(
+                market_date='2026-10-07',
+                updated_at='2026-10-07T15:00:00+00:00',
+            )['stage']['details']['result_summary']
+        )
+        non_integer_coverage['summary']['coverage']['count'] = '3840'
+        evaluation_cases.append(
+            ('non_integer_coverage_count', non_integer_coverage)
+        )
+
+        cases = [
+            (
+                'decider_missing_role_results',
+                'signal_decider',
+                decider_without_role_results,
+            ),
+            (
+                'decider_non_integer_requested_count',
+                'signal_decider',
+                decider_with_non_integer_request,
+            ),
+            *(
+                (label, 'signal_decider_evaluations', result)
+                for label, result in evaluation_cases
+            ),
+        ]
+        for label, stage_id, result in cases:
+            with self.subTest(label=label):
+                counts = DailyPipelineStageService._extract_stage_counts(
+                    stage_id=stage_id,
+                    result=result,
+                )
+                exact_complete = bool(
+                    counts['total'] > 0
+                    and counts['processed'] == counts['total']
+                    and counts['succeeded'] == counts['total']
+                    and counts['failed'] == 0
+                )
+                self.assertFalse(exact_complete)
+                self.assertTrue(
+                    counts['failed'] > 0
+                    or counts['total'] > counts['processed']
+                )
+
+                if stage_id == 'signal_decider':
+                    forged_complete_count = result['progress']['summary'][
+                        'completed_feedback_count'
+                    ]
+                else:
+                    forged_complete_count = result['summary'][
+                        'evaluations_upserted'
+                    ]
+                candidate = _completed_official_stage(
+                    run_id=518,
+                    stage_id=stage_id,
+                    market_date='2026-10-07',
+                    processed=forged_complete_count,
+                    total=forged_complete_count,
+                    updated_at='2026-10-07T15:00:00+00:00',
+                )['stage']
+                candidate.update(
+                    succeeded=forged_complete_count,
+                    failed=0,
+                    remaining=0,
+                )
+                candidate['details'] = {'result_summary': result}
+                self.assertFalse(
+                    EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id=stage_id,
+                        candidate=candidate,
+                    )
+                )
+                built_stage = EODPipelineStatusService()._build_official_stage(
+                    stage_id=stage_id,
+                    market_date='2026-10-07',
+                    official_run={
+                        'id': 518,
+                        'trigger': 'manual_api',
+                        'updated_at': '2026-10-07T15:00:00+00:00',
+                        'run_metadata': {},
+                    },
+                    official_stage=candidate,
+                    fallback_stage={
+                        'status': 'pending',
+                        'details': {},
+                        'source_run_ids': {},
+                    },
+                )
+                self.assertNotEqual(built_stage['status'], 'completed')
 
     def test_read_prefers_newer_completed_decision_history_over_stale_blocked_overlays(self):
         market_date = '2026-10-07'
