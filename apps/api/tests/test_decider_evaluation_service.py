@@ -31,8 +31,10 @@ class _ScalarResult:
 class _EvaluationSession:
     def __init__(self, scalar_results):
         self.scalar_results = iter(scalar_results)
+        self.statements = []
 
-    def execute(self, _statement):
+    def execute(self, statement):
+        self.statements.append(statement)
         return _ScalarResult(next(self.scalar_results))
 
 
@@ -104,6 +106,27 @@ class DeciderPostDecisionEvaluationRepositoryTests(unittest.TestCase):
             )
 
         self.assertEqual(result[0]['evaluation_id'], 91)
+        self.assertIn('agent_context_feedback', str(session.statements[0]))
+        self.assertIn('received_at DESC', str(session.statements[0]))
+
+    def test_list_include_history_preserves_all_durable_revisions(self):
+        session = _EvaluationSession([[]])
+
+        @contextmanager
+        def session_scope():
+            yield session
+
+        with patch(
+            'app.agent_context.decider_evaluation_service.session_scope',
+            session_scope,
+        ):
+            result = DeciderPostDecisionEvaluationRepository().list_evaluations(
+                market_date=date(2026, 9, 23),
+                include_history=True,
+            )
+
+        self.assertEqual(result, [])
+        self.assertNotIn('agent_context_feedback', str(session.statements[0]))
 
 
 def _feedback_source(
@@ -253,6 +276,33 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['feedback_rows_considered'], 0)
         self.assertEqual(result['summary']['evaluations_upserted'], 0)
         self.assertEqual(repository.upserted_items, [])
+
+    def test_compute_evaluations_does_not_revive_older_revision_when_latest_is_invalid(self):
+        older = _feedback_source(feedback_id=12, decision_snapshot_id=85)
+        latest = _feedback_source(feedback_id=13, decision_snapshot_id=86)
+        latest['received_at'] = datetime(2026, 4, 24, 0, 0, tzinfo=timezone.utc)
+        latest['feedback_received_at'] = latest['received_at']
+        latest['created_at'] = latest['received_at']
+        repository = FakeDeciderEvaluationRepository([older, latest])
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: [],
+        )
+
+        with patch(
+            'app.agent_context.signal_decider_snapshot_validity.next_krx_trading_date',
+            return_value=date(2026, 4, 24),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-23',
+                market_date_to='2026-04-23',
+            )
+
+        self.assertEqual(result['summary']['feedback_rows_loaded'], 2)
+        self.assertEqual(result['summary']['duplicate_revisions_ignored'], 1)
+        self.assertEqual(result['summary']['latest_authority_rows_excluded_invalid'], 1)
+        self.assertEqual(result['summary']['feedback_rows_considered'], 0)
+        self.assertEqual(result['items'], [])
 
     def test_compute_evaluations_marks_target_hit_before_stop(self):
         repository = FakeDeciderEvaluationRepository([_feedback_source()])
@@ -488,6 +538,42 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         self.assertTrue(ledger['costs_nonzero'])
         self.assertEqual(ledger['cost_warnings'], [])
         self.assertLess(ledger['net_return_pct'], ledger['gross_return_pct'])
+
+    def test_short_term_watch_paper_ledger_warns_when_cost_inputs_are_partial(self):
+        source = _feedback_source(
+            feedback_id=26,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+        )
+        repository = FakeDeciderEvaluationRepository([source])
+        bars = [
+            _bar('2026-04-24', 100, 104, 98, 103),
+            _bar('2026-04-25', 103, 106, 101, 105),
+            _bar('2026-04-28', 105, 106, 102, 104),
+            _bar('2026-04-29', 104, 105, 102, 103),
+            _bar('2026-04-30', 103, 104, 101, 102),
+        ]
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: bars,
+        )
+
+        result = service.compute_evaluations(
+            market_date_from='2026-04-23',
+            market_date_to='2026-04-23',
+            agent_names=['short-term-decider'],
+            fee_bps=10,
+        )
+
+        ledger = result['items'][0]['metadata']['paper_ledger']
+        self.assertFalse(result['request']['costs_explicit'])
+        self.assertEqual(
+            result['request']['cost_inputs_provided'],
+            {'fee': True, 'slippage': False, 'tax': False},
+        )
+        self.assertFalse(ledger['costs_explicit'])
+        self.assertEqual(ledger['missing_cost_components'], ['slippage', 'tax'])
+        self.assertIn('partial_cost_assumption_missing:slippage,tax', ledger['cost_warnings'])
 
     def test_short_term_watch_does_not_enter_above_chase_limit(self):
         source = _feedback_source(

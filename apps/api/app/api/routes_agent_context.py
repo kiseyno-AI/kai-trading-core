@@ -1537,6 +1537,7 @@ async def list_decider_post_decision_evaluations(
     symbols: list[str] | None = Query(default=None),
     outcome_labels: list[str] | None = Query(default=None),
     window_days: int = Query(default=5, ge=1, le=30),
+    include_history: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict:
     try:
@@ -1549,6 +1550,7 @@ async def list_decider_post_decision_evaluations(
             symbols=symbols,
             outcome_labels=outcome_labels,
             window_days=window_days,
+            include_history=include_history,
             limit=limit,
         )
     except ValueError as exc:

@@ -552,34 +552,38 @@ class DeciderPostDecisionEvaluationRepository:
         symbols: Sequence[str] | None = None,
         outcome_labels: Sequence[str] | None = None,
         window_days: int = DEFAULT_DECIDER_EVALUATION_WINDOW_DAYS,
+        include_history: bool = False,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         with session_scope() as session:
-            candidate = aliased(DeciderPostDecisionEvaluation)
-            candidate_feedback = aliased(AgentContextFeedback)
-            latest_cohort_evaluation_id = (
-                select(candidate.id)
-                .join(candidate_feedback, candidate_feedback.id == candidate.feedback_id)
-                .where(
-                    candidate.agent_name == DeciderPostDecisionEvaluation.agent_name,
-                    candidate.market_date == DeciderPostDecisionEvaluation.market_date,
-                    candidate.symbol == DeciderPostDecisionEvaluation.symbol,
-                    candidate.window_days == DeciderPostDecisionEvaluation.window_days,
-                )
-                .order_by(
-                    candidate_feedback.received_at.desc(),
-                    candidate.decision_snapshot_id.desc().nullslast(),
-                    candidate.feedback_id.desc(),
-                    candidate.id.desc(),
-                )
-                .limit(1)
-                .correlate(DeciderPostDecisionEvaluation)
-                .scalar_subquery()
-            )
             stmt = select(DeciderPostDecisionEvaluation).where(
-                DeciderPostDecisionEvaluation.window_days == int(window_days),
-                DeciderPostDecisionEvaluation.id == latest_cohort_evaluation_id,
+                DeciderPostDecisionEvaluation.window_days == int(window_days)
             )
+            if not include_history:
+                candidate = aliased(DeciderPostDecisionEvaluation)
+                candidate_feedback = aliased(AgentContextFeedback)
+                latest_cohort_evaluation_id = (
+                    select(candidate.id)
+                    .join(candidate_feedback, candidate_feedback.id == candidate.feedback_id)
+                    .where(
+                        candidate.agent_name == DeciderPostDecisionEvaluation.agent_name,
+                        candidate.market_date == DeciderPostDecisionEvaluation.market_date,
+                        candidate.symbol == DeciderPostDecisionEvaluation.symbol,
+                        candidate.window_days == DeciderPostDecisionEvaluation.window_days,
+                    )
+                    .order_by(
+                        candidate_feedback.received_at.desc(),
+                        candidate.decision_snapshot_id.desc().nullslast(),
+                        candidate.feedback_id.desc(),
+                        candidate.id.desc(),
+                    )
+                    .limit(1)
+                    .correlate(DeciderPostDecisionEvaluation)
+                    .scalar_subquery()
+                )
+                stmt = stmt.where(
+                    DeciderPostDecisionEvaluation.id == latest_cohort_evaluation_id
+                )
             if market_date is not None:
                 stmt = stmt.where(DeciderPostDecisionEvaluation.market_date == market_date)
             if market_date_from is not None:
@@ -632,12 +636,24 @@ class DeciderPostDecisionEvaluationService:
         resolved_window_days = self._normalize_window_days(window_days)
         normalized_agent_names = _normalize_agent_names(agent_names)
         normalized_symbols = _normalize_symbols(symbols)
-        costs_explicit = any(value is not None for value in (fee_bps, slippage_bps, tax_bps))
+        cost_inputs_provided = {
+            'fee': fee_bps is not None,
+            'slippage': slippage_bps is not None,
+            'tax': tax_bps is not None,
+        }
+        costs_explicit = all(cost_inputs_provided.values())
+        missing_cost_components = [
+            component
+            for component, provided in cost_inputs_provided.items()
+            if not provided
+        ]
         cost_assumptions = {
             'fee_bps': _normalize_non_negative_bps(0 if fee_bps is None else fee_bps, field='fee_bps'),
             'slippage_bps': _normalize_non_negative_bps(0 if slippage_bps is None else slippage_bps, field='slippage_bps'),
             'tax_bps': _normalize_non_negative_bps(0 if tax_bps is None else tax_bps, field='tax_bps'),
             'costs_explicit': costs_explicit,
+            'cost_inputs_provided': cost_inputs_provided,
+            'missing_cost_components': missing_cost_components,
         }
         source_rows = self.repository.list_feedback_sources(
             market_date_from=normalized_from,
@@ -646,15 +662,18 @@ class DeciderPostDecisionEvaluationService:
             symbols=normalized_symbols or None,
         )
         feedback_rows_loaded = len(source_rows)
+        source_rows = self._dedupe_latest_revisions(source_rows)
+        duplicate_revisions_ignored = feedback_rows_loaded - len(source_rows)
+        latest_authority_rows_before_validity = len(source_rows)
         source_rows = [
             source_row
             for source_row in source_rows
             if source_row.get('decision_snapshot_id') is None
             or is_decision_snapshot_valid_for_source_date(source_row)
         ]
-        valid_rows_before_dedupe = len(source_rows)
-        source_rows = self._dedupe_latest_revisions(source_rows)
-        duplicate_revisions_ignored = valid_rows_before_dedupe - len(source_rows)
+        latest_authority_rows_excluded_invalid = (
+            latest_authority_rows_before_validity - len(source_rows)
+        )
         evaluation_items = [
             self._build_evaluation_item(
                 source_row=source_row,
@@ -680,6 +699,8 @@ class DeciderPostDecisionEvaluationService:
                     'tax': float(cost_assumptions['tax_bps']),
                 },
                 'costs_explicit': costs_explicit,
+                'cost_inputs_provided': cost_inputs_provided,
+                'missing_cost_components': missing_cost_components,
                 'costs_nonzero': any(
                     cost_assumptions[key] > 0
                     for key in ('fee_bps', 'slippage_bps', 'tax_bps')
@@ -689,6 +710,9 @@ class DeciderPostDecisionEvaluationService:
             'summary': {
                 'feedback_rows_loaded': feedback_rows_loaded,
                 'duplicate_revisions_ignored': duplicate_revisions_ignored,
+                'latest_authority_rows_excluded_invalid': (
+                    latest_authority_rows_excluded_invalid
+                ),
                 'feedback_rows_considered': len(source_rows),
                 'evaluations_upserted': len(persisted),
                 'outcome_label_counts': self._count_by_key(persisted, key='outcome_label'),
@@ -753,6 +777,7 @@ class DeciderPostDecisionEvaluationService:
         symbols: Sequence[str] | None = None,
         outcome_labels: Sequence[str] | None = None,
         window_days: int = DEFAULT_DECIDER_EVALUATION_WINDOW_DAYS,
+        include_history: bool = False,
         limit: int = 50,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date) if market_date is not None else None
@@ -777,6 +802,7 @@ class DeciderPostDecisionEvaluationService:
             symbols=normalized_symbols or None,
             outcome_labels=normalized_outcome_labels or None,
             window_days=resolved_window_days,
+            include_history=include_history,
             limit=resolved_limit,
         )
         return {
@@ -788,6 +814,10 @@ class DeciderPostDecisionEvaluationService:
                 'symbols': normalized_symbols,
                 'outcome_labels': normalized_outcome_labels,
                 'window_days': resolved_window_days,
+                'include_history': bool(include_history),
+                'revision_read_mode': (
+                    'durable_history' if include_history else 'latest_canonical'
+                ),
                 'limit': resolved_limit,
             },
             'summary': {
@@ -1149,6 +1179,32 @@ class DeciderPostDecisionEvaluationService:
             cost_assumptions[key] > 0
             for key in ('fee_bps', 'slippage_bps', 'tax_bps')
         )
+        cost_inputs_provided = cost_assumptions.get('cost_inputs_provided')
+        cost_inputs_provided = (
+            cost_inputs_provided
+            if isinstance(cost_inputs_provided, dict)
+            else {'fee': False, 'slippage': False, 'tax': False}
+        )
+        missing_cost_components = cost_assumptions.get('missing_cost_components')
+        missing_cost_components = (
+            list(missing_cost_components)
+            if isinstance(missing_cost_components, list)
+            else [
+                component
+                for component, provided in cost_inputs_provided.items()
+                if not provided
+            ]
+        )
+        partially_explicit = any(cost_inputs_provided.values()) and not all(
+            cost_inputs_provided.values()
+        )
+        cost_warnings = []
+        if not costs_nonzero:
+            cost_warnings.append('zero_cost_assumption_may_overstate_paper_return')
+        if partially_explicit:
+            cost_warnings.append(
+                'partial_cost_assumption_missing:' + ','.join(missing_cost_components)
+            )
         payload: dict[str, Any] = {
             'schema_version': PAPER_LEDGER_SCHEMA_VERSION,
             'mode': 'paper_report_only',
@@ -1162,10 +1218,10 @@ class DeciderPostDecisionEvaluationService:
             'same_bar_policy': 'stop_first',
             'cost_assumptions_bps': costs,
             'costs_explicit': bool(cost_assumptions.get('costs_explicit')),
+            'cost_inputs_provided': cost_inputs_provided,
+            'missing_cost_components': missing_cost_components,
             'costs_nonzero': costs_nonzero,
-            'cost_warnings': (
-                [] if costs_nonzero else ['zero_cost_assumption_may_overstate_paper_return']
-            ),
+            'cost_warnings': cost_warnings,
             'cost_convention': 'fee_each_side_slippage_each_side_tax_on_exit',
             'exit_reason': (
                 'stop_loss_hit'

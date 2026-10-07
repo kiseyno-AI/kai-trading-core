@@ -1729,6 +1729,61 @@ follow-up retries and continuation resume.
 
 ---
 
+## 4.8 `POST /agent-context/decider/evaluations/compute`
+
+Computes the durable five-trading-day post-decision evaluation for the latest
+authoritative feedback revision in each agent, market-date, and symbol cohort.
+Revision selection happens before snapshot-validity filtering. Therefore, an
+invalid newest revision excludes the cohort and increments
+`summary.latest_authority_rows_excluded_invalid`; Core never revives an older
+valid decision as current authority.
+
+`fee_bps`, `slippage_bps`, and `tax_bps` are independently optional for
+backward compatibility. The response sets `request.costs_explicit=true` only
+when all three are supplied and publishes `cost_inputs_provided` plus
+`missing_cost_components`. A partially specified paper ledger contains a
+`partial_cost_assumption_missing:<components>` warning. When every effective
+cost is zero, it also carries `zero_cost_assumption_may_overstate_paper_return`.
+
+```json
+{
+  "market_date_from": "2026-04-20",
+  "market_date_to": "2026-04-23",
+  "agent_names": ["short-term-decider"],
+  "symbols": ["005930"],
+  "window_days": 5,
+  "fee_bps": 10,
+  "slippage_bps": 20,
+  "tax_bps": 18,
+  "enable_shadow_avoid_chase_rule": false
+}
+```
+
+Short-term `watch_for_trigger` paper outcomes respect trigger, chase limit,
+target, and stop levels. If target and stop are both reachable in one daily bar,
+the ledger applies the conservative stop-first result. The optional
+`extended_entry_price` / `avoid_chase` shadow rule is report-only and never
+changes live execution authority.
+
+## 4.9 `GET /agent-context/decider/evaluations`
+
+The default `include_history=false` response returns only the latest canonical
+evaluation revision for each agent, market-date, symbol, and window cohort.
+`summary.count` counts this canonical result set, not all stored rows. Set
+`include_history=true` to retrieve every matching durable revision for audit or
+legacy history consumers. Superseded rows are never deleted; the flag changes
+only read selection.
+
+```http
+GET /agent-context/decider/evaluations?market_date=2026-04-23&agent_names=short-term-decider&symbols=005930&window_days=5&include_history=false
+```
+
+The response echoes `request.include_history` and reports
+`request.revision_read_mode` as `latest_canonical` or `durable_history` so a
+consumer can interpret `summary.count` without inference.
+
+---
+
 # 5. Execution Handoff / Runtime Contract
 
 Core's execution handoff boundary is versioned in code at

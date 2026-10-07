@@ -1907,6 +1907,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     ('symbols', '005930'),
                     ('outcome_labels', 'target_hit_before_stop'),
                     ('window_days', '5'),
+                    ('include_history', 'true'),
                     ('limit', '25'),
                 ],
             )
@@ -1919,6 +1920,7 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.list_args['symbols'], ['005930'])
         self.assertEqual(fake_service.list_args['outcome_labels'], ['target_hit_before_stop'])
         self.assertEqual(fake_service.list_args['window_days'], 5)
+        self.assertTrue(fake_service.list_args['include_history'])
         self.assertEqual(fake_service.list_args['limit'], 25)
         self.assertEqual(response.json()['items'][0]['outcome_label'], 'target_hit_before_stop')
 
