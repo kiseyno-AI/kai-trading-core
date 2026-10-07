@@ -177,7 +177,13 @@ def _feedback_source(
     }
 
 
-def _bar(trade_date: str, open_price: int, high_price: int, low_price: int, close_price: int) -> dict:
+def _bar(
+    trade_date: str,
+    open_price: int,
+    high_price: int,
+    low_price: int,
+    close_price: int | None,
+) -> dict:
     return {
         'trade_date': trade_date,
         'open_price': open_price,
@@ -602,6 +608,107 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         self.assertIsNone(item['entry_trade_date'])
         self.assertIsNone(item['entry_price'])
         self.assertEqual(item['metadata']['paper_ledger']['exit_reason'], 'no_entry')
+
+    def test_short_term_watch_waits_for_complete_window_before_no_entry_outcome(self):
+        source = _feedback_source(
+            feedback_id=27,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+        )
+        repository = FakeDeciderEvaluationRepository([source])
+        bars = [
+            _bar('2026-04-24', 100, 100, 98, 99),
+            _bar('2026-04-25', 99, 100, 97, 98),
+            _bar('2026-04-28', 98, 100, 96, 97),
+        ]
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: bars,
+        )
+
+        result = service.compute_evaluations(
+            market_date_from='2026-04-23',
+            market_date_to='2026-04-23',
+            agent_names=['short-term-decider'],
+        )
+
+        item = result['items'][0]
+        self.assertEqual(
+            result['request']['evaluation_engine_version'],
+            'decider_post_decision_eval_v3',
+        )
+        self.assertEqual(item['outcome_label'], OUTCOME_INVALID_MISSING_DATA)
+        self.assertIn('incomplete_next_5_trading_days', item['data_quality_warnings'])
+        self.assertEqual(
+            item['metadata']['schema_version'],
+            'decider_post_decision_eval_v3',
+        )
+        self.assertFalse(item['metadata']['price_window_complete'])
+        self.assertIsNone(item['metadata']['paper_ledger'])
+
+    def test_short_term_watch_does_not_close_triggered_trade_before_window_is_complete(self):
+        source = _feedback_source(
+            feedback_id=28,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+        )
+        repository = FakeDeciderEvaluationRepository([source])
+        bars = [
+            _bar('2026-04-24', 100, 102, 98, 101),
+            _bar('2026-04-25', 101, 103, 99, 102),
+            _bar('2026-04-28', 102, 104, 100, 103),
+        ]
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: bars,
+        )
+
+        result = service.compute_evaluations(
+            market_date_from='2026-04-23',
+            market_date_to='2026-04-23',
+            agent_names=['short-term-decider'],
+        )
+
+        item = result['items'][0]
+        self.assertEqual(item['outcome_label'], OUTCOME_INVALID_MISSING_DATA)
+        self.assertEqual(item['entry_price'], 101)
+        self.assertIn('incomplete_next_5_trading_days', item['data_quality_warnings'])
+        self.assertFalse(item['metadata']['price_window_complete'])
+        self.assertIsNone(item['metadata']['paper_ledger'])
+
+    def test_short_term_watch_waits_when_observation_window_has_incomplete_ohlc(self):
+        source = _feedback_source(
+            feedback_id=29,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+        )
+        repository = FakeDeciderEvaluationRepository([source])
+        bars = [
+            _bar('2026-04-24', 100, 100, 98, 99),
+            _bar('2026-04-25', 99, 100, 97, 98),
+            _bar('2026-04-28', 98, 100, 96, None),
+            _bar('2026-04-29', 97, 100, 95, 96),
+            _bar('2026-04-30', 96, 100, 94, 95),
+        ]
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: bars,
+        )
+
+        result = service.compute_evaluations(
+            market_date_from='2026-04-23',
+            market_date_to='2026-04-23',
+            agent_names=['short-term-decider'],
+        )
+
+        item = result['items'][0]
+        self.assertEqual(item['outcome_label'], OUTCOME_INVALID_MISSING_DATA)
+        self.assertNotIn('incomplete_next_5_trading_days', item['data_quality_warnings'])
+        self.assertIn('incomplete_ohlc_in_observed_window', item['data_quality_warnings'])
+        self.assertEqual(item['metadata']['observed_bars_count'], 5)
+        self.assertEqual(item['metadata']['usable_bars_count'], 4)
+        self.assertFalse(item['metadata']['price_window_complete'])
+        self.assertIsNone(item['metadata']['paper_ledger'])
 
     def test_short_term_watch_rejects_missing_exit_levels_before_entry_scan(self):
         source = _feedback_source(

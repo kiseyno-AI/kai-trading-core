@@ -22,7 +22,7 @@ from app.db_models import (
 from app.market_data_store import load_daily_bars_for_symbol_range
 
 DEFAULT_DECIDER_EVALUATION_WINDOW_DAYS = 5
-DECIDER_EVALUATION_ENGINE_VERSION = 'decider_post_decision_eval_v2'
+DECIDER_EVALUATION_ENGINE_VERSION = 'decider_post_decision_eval_v3'
 SUPPORTED_DECIDER_AGENT_NAMES: tuple[str, ...] = DECISION_SUPPORT_AGENT_NAMES
 BUY_ACTION = 'buy'
 NON_ENTER_NOW_ACTIONS = {'wait', 'reject'}
@@ -903,6 +903,10 @@ class DeciderPostDecisionEvaluationService:
             window_days=window_days,
         )
         usable_bars = [bar for bar in future_bars if _bar_has_complete_ohlc(bar)]
+        price_window_complete = (
+            len(future_bars) == window_days
+            and len(usable_bars) == window_days
+        )
         short_term_watch = (
             str(source_row.get('agent_name') or '').strip().lower() == 'short-term-decider'
             and (
@@ -987,6 +991,15 @@ class DeciderPostDecisionEvaluationService:
                 'Short-term paper evaluation requires stop < trigger <= chase limit < target '
                 'with all four prices positive.'
             )
+        elif short_term_watch and not price_window_complete:
+            if len(future_bars) < window_days:
+                computed_warnings.append('incomplete_next_5_trading_days')
+            if len(usable_bars) < len(future_bars):
+                computed_warnings.append('incomplete_ohlc_in_observed_window')
+            outcome_label = OUTCOME_INVALID_MISSING_DATA
+            outcome_reason = (
+                f'Stored daily_price_bars did not provide a complete next {window_days}-trading-day OHLC window.'
+            )
         elif short_term_watch and watch_entry_index is None:
             outcome_label = OUTCOME_NEITHER_HIT
             outcome_reason = f'Trigger was not reachable within the chase limit during the next {window_days} trading days.'
@@ -1052,7 +1065,7 @@ class DeciderPostDecisionEvaluationService:
                 outcome_label = OUTCOME_NEITHER_HIT
                 outcome_reason = f'Neither target nor stop-loss was touched within the next {window_days} trading days.'
         paper_ledger = None
-        if short_term_watch:
+        if short_term_watch and outcome_label != OUTCOME_INVALID_MISSING_DATA:
             exit_price = (
                 stop_loss_price
                 if outcome_label == OUTCOME_STOP_HIT
@@ -1086,7 +1099,7 @@ class DeciderPostDecisionEvaluationService:
             'observed_bars_count': len(future_bars),
             'usable_bars_count': len(usable_bars),
             'required_bars_count': window_days,
-            'price_window_complete': len(future_bars) == window_days and len(usable_bars) == window_days,
+            'price_window_complete': price_window_complete,
             'observed_trade_dates': [
                 _normalize_optional_text(bar.get('trade_date'))
                 for bar in future_bars
