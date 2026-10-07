@@ -117,7 +117,7 @@ class KisKrxTradingCalendarProvider:
         *,
         client: KISCalendarClientProtocol | None = None,
         cache: InMemoryKrxCalendarCache | None = None,
-        max_pages: int = 10,
+        max_pages: int = 1,
         max_scan_days: int = DEFAULT_KRX_CALENDAR_SCAN_DAYS,
     ) -> None:
         self._client = client
