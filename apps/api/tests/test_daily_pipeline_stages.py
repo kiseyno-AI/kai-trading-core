@@ -7,6 +7,7 @@ from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGE
 from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
+from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.daily_pipeline_state import _build_stage_duration_details
 from app.eod.daily_pipeline_stages import (
@@ -3770,6 +3771,38 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'force': True,
                 'trigger': 'daily_pipeline_stage',
             },
+        )
+
+    def test_execute_stage_forwards_market_date_to_external_news_enrichment(self) -> None:
+        service = DailyPipelineStageService()
+
+        with patch(
+            'app.eod.daily_pipeline_stages.external_news_service.enrich_recent_classification',
+            return_value={'status': 'completed', 'items_inspected': 2},
+        ) as enrich:
+            result = service._execute_stage(
+                stage_id='external_news_enrich',
+                market_date='2026-10-07',
+                symbols=['005930', '000660'],
+                markets=[],
+                force=False,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=100,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        enrich.assert_called_once_with(
+            symbols=['005930', '000660'],
+            market_date='2026-10-07',
+            lookback_days=settings.external_news_context_lookback_days,
+            limit=100,
         )
 
     def test_technical_stage_repairs_price_contexts_for_the_same_scope(

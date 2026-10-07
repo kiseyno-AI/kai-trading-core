@@ -20,6 +20,7 @@ from app.eod.pipeline_status import _load_external_news_counts
 from app.external_news.provider import ExternalNewsItem
 from app.external_news.store import (
     _build_external_news_classification_insert_statement,
+    _build_external_news_enrichment_candidate_statement,
     _build_external_news_insert_statement,
     _build_external_news_symbol_insert_statement,
     _find_existing_news_item,
@@ -120,6 +121,42 @@ class ExternalNewsAssociationMigrationTests(unittest.TestCase):
                 self.assertIn('DO NOTHING', association_sql)
                 self.assertIn('ON CONFLICT', classification_sql)
                 self.assertIn('DO NOTHING', classification_sql)
+
+    def test_symbol_scoped_enrichment_query_uses_correlated_exists_without_distinct(self):
+        association_start = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+        association_end = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
+
+        statement = _build_external_news_enrichment_candidate_statement(
+            symbols=['000660'],
+            since=datetime(2026, 9, 23, tzinfo=timezone.utc),
+            association_start=association_start,
+            association_end=association_end,
+        )
+
+        compiled = statement.compile(dialect=postgresql.dialect())
+        sql = str(compiled)
+        self.assertIn('EXISTS (SELECT', sql)
+        self.assertIn('external_news_item_symbols.associated_at >=', sql)
+        self.assertIn('external_news_item_symbols.associated_at <', sql)
+        self.assertIn('symbols.symbol IN', sql)
+        self.assertNotIn('SELECT DISTINCT', sql)
+        self.assertIn(association_start, compiled.params.values())
+        self.assertIn(association_end, compiled.params.values())
+
+    def test_enrichment_query_accepts_empty_frozen_current_day_window(self):
+        captured_at_midnight = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+
+        statement = _build_external_news_enrichment_candidate_statement(
+            symbols=['000660'],
+            since=datetime(2026, 9, 23, tzinfo=timezone.utc),
+            association_start=captured_at_midnight,
+            association_end=captured_at_midnight,
+        )
+
+        self.assertNotIn(
+            'SELECT DISTINCT',
+            str(statement.compile(dialect=postgresql.dialect())),
+        )
 
     def test_sqlite_upgrade_backfills_original_attribution_and_supports_down_up(self):
         migration = _load_migration()
@@ -499,6 +536,207 @@ class ExternalNewsAssociationStoreTests(unittest.TestCase):
             ).all()
         self.assertEqual(stored_payload, legacy_payload)
         self.assertEqual(len(stored_versions), 1)
+
+    def test_enrichment_includes_old_article_newly_associated_in_market_day_scope(self):
+        now = datetime(2026, 10, 8, tzinfo=timezone.utc)
+        association_start = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+        association_end = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
+        old_observation_at = now - timedelta(days=30)
+        with self.session_factory.begin() as session:
+            samsung = session.scalars(
+                select(Symbol).where(Symbol.symbol == '005930')
+            ).one()
+            hynix = session.scalars(
+                select(Symbol).where(Symbol.symbol == '000660')
+            ).one()
+            naver = Symbol(
+                symbol='035420',
+                name_ko='Naver',
+                market='KOSPI',
+                source_payload={},
+            )
+            session.add(naver)
+            session.flush()
+            articles = [
+                StoredExternalNewsItem(
+                    symbol_id=samsung.id,
+                    provider='fake_news',
+                    provider_item_id=f'old-{label}',
+                    source='fake_news',
+                    title=f'old article {label}',
+                    url=f'https://example.test/news/old-{label}',
+                    published_at=old_observation_at,
+                    collected_at=old_observation_at,
+                    payload={},
+                )
+                for label in (
+                    'new-association',
+                    'unrelated',
+                    'out-of-window',
+                    'cross-symbol-window',
+                    'end-boundary',
+                )
+            ]
+            session.add_all(articles)
+            session.flush()
+            session.add_all(
+                [
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=articles[0].id,
+                        symbol_id=hynix.id,
+                        associated_at=association_start,
+                    ),
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=articles[0].id,
+                        symbol_id=samsung.id,
+                        associated_at=association_start + timedelta(hours=2),
+                    ),
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=articles[1].id,
+                        symbol_id=naver.id,
+                        associated_at=association_start + timedelta(hours=1),
+                    ),
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=articles[2].id,
+                        symbol_id=hynix.id,
+                        associated_at=association_start - timedelta(microseconds=1),
+                    ),
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=articles[3].id,
+                        symbol_id=hynix.id,
+                        associated_at=association_start - timedelta(days=1),
+                    ),
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=articles[3].id,
+                        symbol_id=naver.id,
+                        associated_at=association_start + timedelta(hours=1),
+                    ),
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=articles[4].id,
+                        symbol_id=hynix.id,
+                        associated_at=association_end,
+                    ),
+                ]
+            )
+            eligible_article_id = int(articles[0].id)
+
+        with (
+            patch('app.external_news.store.session_scope', self._session_scope),
+            patch('app.external_news.store._utcnow', return_value=now),
+        ):
+            first = enrich_recent_external_news_classification(
+                symbols=['000660', '005930'],
+                lookback_days=14,
+                association_start=association_start,
+                association_end=association_end,
+            )
+            repeated = enrich_recent_external_news_classification(
+                symbols=['000660', '005930'],
+                lookback_days=14,
+                association_start=association_start,
+                association_end=association_end,
+            )
+
+        with self.session_factory() as session:
+            classified_item_ids = session.scalars(
+                select(ExternalNewsItemClassification.external_news_item_id)
+            ).all()
+        self.assertEqual(first['items_inspected'], 1)
+        self.assertEqual(first['classification_versions_inserted'], 1)
+        self.assertEqual(repeated['items_inspected'], 0)
+        self.assertEqual(repeated['classification_versions_inserted'], 0)
+        self.assertEqual(classified_item_ids, [eligible_article_id])
+
+    def test_enrichment_prioritizes_market_day_associations_before_recent_articles(self):
+        now = datetime(2026, 10, 8, tzinfo=timezone.utc)
+        association_start = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+        association_end = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
+        with self.session_factory.begin() as session:
+            symbol = session.scalars(
+                select(Symbol).where(Symbol.symbol == '000660')
+            ).one()
+            old_association = StoredExternalNewsItem(
+                symbol_id=symbol.id,
+                provider='fake_news',
+                provider_item_id='priority-old-association',
+                source='fake_news',
+                title='old article associated on market day',
+                url='https://example.test/news/priority-old-association',
+                published_at=now - timedelta(days=30),
+                collected_at=now - timedelta(days=30),
+                payload={},
+            )
+            recent_article = StoredExternalNewsItem(
+                symbol_id=symbol.id,
+                provider='fake_news',
+                provider_item_id='priority-recent-article',
+                source='fake_news',
+                title='recent article',
+                url='https://example.test/news/priority-recent-article',
+                published_at=now - timedelta(hours=1),
+                collected_at=now - timedelta(hours=1),
+                payload={},
+            )
+            session.add_all([old_association, recent_article])
+            session.flush()
+            session.add_all(
+                [
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=old_association.id,
+                        symbol_id=symbol.id,
+                        associated_at=association_start + timedelta(hours=1),
+                    ),
+                    ExternalNewsItemSymbol(
+                        external_news_item_id=recent_article.id,
+                        symbol_id=symbol.id,
+                        associated_at=association_start - timedelta(days=1),
+                    ),
+                ]
+            )
+            old_association_id = int(old_association.id)
+            recent_article_id = int(recent_article.id)
+
+        with (
+            patch('app.external_news.store.session_scope', self._session_scope),
+            patch('app.external_news.store._utcnow', return_value=now),
+        ):
+            first = enrich_recent_external_news_classification(
+                symbols=['000660'],
+                lookback_days=14,
+                limit=1,
+                association_start=association_start,
+                association_end=association_end,
+            )
+            with self.session_factory() as session:
+                first_item_ids = session.scalars(
+                    select(ExternalNewsItemClassification.external_news_item_id)
+                ).all()
+            second = enrich_recent_external_news_classification(
+                symbols=['000660'],
+                lookback_days=14,
+                limit=1,
+                association_start=association_start,
+                association_end=association_end,
+            )
+            third = enrich_recent_external_news_classification(
+                symbols=['000660'],
+                lookback_days=14,
+                limit=1,
+                association_start=association_start,
+                association_end=association_end,
+            )
+
+        self.assertEqual(first['status'], 'partial')
+        self.assertEqual(first_item_ids, [old_association_id])
+        self.assertEqual(second['classification_versions_inserted'], 1)
+        self.assertEqual(third['items_inspected'], 0)
+        with self.session_factory() as session:
+            final_item_ids = set(
+                session.scalars(
+                    select(ExternalNewsItemClassification.external_news_item_id)
+                ).all()
+            )
+        self.assertEqual(final_item_ids, {old_association_id, recent_article_id})
 
     def test_embedded_legacy_classification_is_not_visible_until_timestamped_sidecar_exists(self):
         observed_at = datetime(2026, 5, 8, 6, 0, tzinfo=timezone.utc)

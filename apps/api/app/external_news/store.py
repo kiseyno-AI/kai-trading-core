@@ -478,11 +478,89 @@ def list_external_news_items(
         ]
 
 
+def _build_external_news_enrichment_candidate_statement(
+    *,
+    symbols: Sequence[str] | None,
+    since: datetime,
+    association_start: datetime | None = None,
+    association_end: datetime | None = None,
+):
+    if (association_start is None) != (association_end is None):
+        raise ValueError('association_start and association_end must be provided together')
+    if (
+        association_start is not None
+        and association_end is not None
+        and association_end < association_start
+    ):
+        raise ValueError('association_end must not precede association_start')
+
+    resolved_symbols = list(dict.fromkeys(symbols or []))
+    current_version_exists = (
+        select(ExternalNewsItemClassification.id)
+        .where(
+            ExternalNewsItemClassification.external_news_item_id
+            == ExternalNewsItem.id,
+            ExternalNewsItemClassification.classifier_version
+            == CLASSIFIER_VERSION,
+        )
+        .exists()
+    )
+    article_is_recent = or_(
+        ExternalNewsItem.published_at >= since,
+        and_(
+            ExternalNewsItem.published_at.is_(None),
+            ExternalNewsItem.collected_at >= since,
+        ),
+    )
+
+    def _association_exists(*, within_window: bool):
+        association_stmt = select(
+            ExternalNewsItemSymbol.external_news_item_id
+        ).where(
+            ExternalNewsItemSymbol.external_news_item_id == ExternalNewsItem.id,
+        )
+        if resolved_symbols:
+            association_stmt = association_stmt.join(
+                Symbol,
+                Symbol.id == ExternalNewsItemSymbol.symbol_id,
+            ).where(Symbol.symbol.in_(resolved_symbols))
+        if within_window:
+            association_stmt = association_stmt.where(
+                ExternalNewsItemSymbol.associated_at >= association_start,
+                ExternalNewsItemSymbol.associated_at < association_end,
+            )
+        return association_stmt.correlate(ExternalNewsItem).exists()
+
+    association_window_exists = None
+    eligibility = [article_is_recent]
+    if association_start is not None:
+        association_window_exists = _association_exists(within_window=True)
+        eligibility.append(association_window_exists)
+    stmt = select(ExternalNewsItem).where(
+        ~current_version_exists,
+        or_(*eligibility),
+    )
+    if resolved_symbols:
+        stmt = stmt.where(_association_exists(within_window=False))
+    ordering = []
+    if association_window_exists is not None:
+        ordering.append(desc(association_window_exists))
+    ordering.extend(
+        (
+            desc(ExternalNewsItem.published_at).nullslast(),
+            desc(ExternalNewsItem.collected_at),
+        )
+    )
+    return stmt.order_by(*ordering)
+
+
 def enrich_recent_external_news_classification(
     *,
     symbols: Sequence[str] | None = None,
     lookback_days: int = 14,
     limit: int = 1000,
+    association_start: datetime | None = None,
+    association_end: datetime | None = None,
 ) -> dict[str, Any]:
     now = _utcnow()
     since = now - timedelta(days=lookback_days)
@@ -491,40 +569,12 @@ def enrich_recent_external_news_classification(
     inserted_versions = 0
     failed_item_ids: list[int] = []
     with session_scope() as session:
-        current_version_exists = (
-            select(ExternalNewsItemClassification.id)
-            .where(
-                ExternalNewsItemClassification.external_news_item_id
-                == ExternalNewsItem.id,
-                ExternalNewsItemClassification.classifier_version
-                == CLASSIFIER_VERSION,
-            )
-            .exists()
+        stmt = _build_external_news_enrichment_candidate_statement(
+            symbols=symbols,
+            since=since,
+            association_start=association_start,
+            association_end=association_end,
         )
-        stmt = (
-            select(ExternalNewsItem)
-            .where(
-                or_(
-                    ExternalNewsItem.published_at >= since,
-                    and_(
-                        ExternalNewsItem.published_at.is_(None),
-                        ExternalNewsItem.collected_at >= since,
-                    ),
-                ),
-                ~current_version_exists,
-            )
-            .order_by(desc(ExternalNewsItem.published_at).nullslast(), desc(ExternalNewsItem.collected_at))
-        )
-        if symbols:
-            stmt = (
-                stmt.join(
-                    ExternalNewsItemSymbol,
-                    ExternalNewsItemSymbol.external_news_item_id == ExternalNewsItem.id,
-                )
-                .join(Symbol, Symbol.id == ExternalNewsItemSymbol.symbol_id)
-                .where(Symbol.symbol.in_(list(symbols)))
-                .distinct()
-            )
         candidate_rows = session.execute(stmt.limit(resolved_limit + 1)).scalars().all()
         has_more = len(candidate_rows) > resolved_limit
         rows = candidate_rows[:resolved_limit]

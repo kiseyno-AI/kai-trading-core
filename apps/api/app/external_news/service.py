@@ -1,14 +1,56 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timezone
+import logging
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
 from app.core.settings import settings
 from app.external_news.provider import ExternalNewsProvider, NaverNewsSearchProvider
 from app.external_news.store import enrich_recent_external_news_classification, list_external_news_items, persist_external_news_items
 from app.market_data_store import load_symbols
+
+
+logger = logging.getLogger(__name__)
+SEOUL_TZ = ZoneInfo('Asia/Seoul')
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _association_window_for_market_date(
+    market_date: str | date,
+    *,
+    captured_at: datetime,
+) -> tuple[datetime, datetime]:
+    normalized_date = (
+        market_date
+        if isinstance(market_date, date)
+        else date.fromisoformat(str(market_date))
+    )
+    captured_utc = captured_at.astimezone(timezone.utc)
+    captured_seoul_date = captured_utc.astimezone(SEOUL_TZ).date()
+    if normalized_date > captured_seoul_date:
+        raise ValueError('market_date must not be later than the current Seoul date')
+    start = datetime.combine(normalized_date, time.min, tzinfo=SEOUL_TZ).astimezone(
+        timezone.utc
+    )
+    next_midnight = (
+        datetime.combine(
+            normalized_date + timedelta(days=1),
+            time.min,
+            tzinfo=SEOUL_TZ,
+        ).astimezone(timezone.utc)
+    )
+    end = (
+        min(next_midnight, captured_utc)
+        if normalized_date == captured_seoul_date
+        else next_midnight
+    )
+    return start, end
 
 
 def _normalize_symbols(symbols: Sequence[str] | str | None) -> list[str]:
@@ -158,18 +200,51 @@ class ExternalNewsService:
         self,
         *,
         symbols: Sequence[str] | str | None = None,
+        market_date: str | date | None = None,
         lookback_days: int | None = None,
         limit: int = 1000,
     ) -> dict[str, Any]:
         normalized_symbols = _normalize_symbols(symbols)
+        association_start = None
+        association_end = None
+        normalized_market_date = None
+        if market_date is not None:
+            normalized_market_date = (
+                market_date
+                if isinstance(market_date, date)
+                else date.fromisoformat(str(market_date))
+            )
+            association_start, association_end = _association_window_for_market_date(
+                normalized_market_date,
+                captured_at=_utcnow(),
+            )
         provider_status = self.provider_status()
+        resolved_lookback_days = (
+            lookback_days or settings.external_news_context_lookback_days
+        )
         try:
             result = enrich_recent_external_news_classification(
                 symbols=normalized_symbols or None,
-                lookback_days=lookback_days or settings.external_news_context_lookback_days,
+                lookback_days=resolved_lookback_days,
                 limit=limit,
+                association_start=association_start,
+                association_end=association_end,
             )
         except Exception as exc:
+            logger.error(
+                'External news classification enrichment failed.',
+                extra={
+                    'market_date': (
+                        normalized_market_date.isoformat()
+                        if normalized_market_date is not None
+                        else None
+                    ),
+                    'requested_symbol_count': len(normalized_symbols),
+                    'lookback_days': resolved_lookback_days,
+                    'limit': int(limit),
+                    'error_class': exc.__class__.__name__,
+                },
+            )
             return {
                 'status': 'unavailable',
                 'reason': 'external_news_storage_unavailable',
