@@ -18,6 +18,8 @@ from app.agent_context.prerequisite_service import (
 )
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
@@ -38,7 +40,8 @@ from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.summary_cutoff_contract import (
     LEGACY_CUTOFF_REPAIR_STAGE_IDS,
     SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION,
-    summary_scope_matches_parent,
+    completed_summary_scope_matches_parent,
+    summary_cutoff_proof_from_stage,
 )
 from app.eod.master import refresh_master_if_due
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -826,13 +829,18 @@ class DailyPipelineStageService:
                     and claimed_cutoff_symbols
                     and (
                         resolved_symbols is None
-                        or summary_scope_matches_parent(
+                        or completed_summary_scope_matches_parent(
                             feedback_scope_mode=(
                                 claimed_cutoff_resolution.get(
                                     'feedback_scope_mode'
                                 )
                             ),
-                            summary_symbols=claimed_cutoff_symbols,
+                            completed_symbols=claimed_cutoff_symbols,
+                            completed_scope_proof=(
+                                claimed_cutoff_resolution.get(
+                                    'completed_scope_proof'
+                                )
+                            ),
                             parent_symbols=resolved_symbols,
                         )
                     )
@@ -945,50 +953,6 @@ class DailyPipelineStageService:
             feedback_cutoff_resolution = continuation_claim.get(
                 'knowledge_cutoff_resolution'
             )
-            terminal_cutoff_symbols = (
-                feedback_cutoff_resolution.get('requested_symbols')
-                if isinstance(feedback_cutoff_resolution, dict)
-                else None
-            )
-            if not (
-                isinstance(feedback_cutoff_resolution, dict)
-                and feedback_cutoff_resolution.get('ready')
-                and feedback_cutoff_resolution.get(
-                    'knowledge_cutoff_at'
-                )
-                is not None
-                and feedback_cutoff_resolution.get('source_run_id')
-                == terminal_summary_source_run_id
-                and isinstance(terminal_cutoff_symbols, list)
-                and terminal_cutoff_symbols
-                and (
-                    resolved_symbols is None
-                    or summary_scope_matches_parent(
-                        feedback_scope_mode=(
-                            feedback_cutoff_resolution.get(
-                                'feedback_scope_mode'
-                            )
-                        ),
-                        summary_symbols=terminal_cutoff_symbols,
-                        parent_symbols=resolved_symbols,
-                    )
-                )
-            ):
-                self._finish_run_preserving_primary_error(
-                    pipeline_run_id=int(existing_pipeline_run_id),
-                    status='failed',
-                    error_message=(
-                        'terminal continuation claim returned invalid '
-                        'summary cutoff proof'
-                    ),
-                )
-                raise RuntimeError(
-                    'terminal continuation claim returned invalid '
-                    'summary cutoff proof'
-                )
-            feedback_knowledge_cutoff_at = (
-                feedback_cutoff_resolution['knowledge_cutoff_at']
-            )
             raw_persisted_stage_outcomes = continuation_claim.get(
                 'persisted_stage_outcomes',
                 {},
@@ -1022,6 +986,97 @@ class DailyPipelineStageService:
                     'terminal continuation claim returned a '
                     'noncontiguous persisted stage prefix'
                 )
+            effective_summary_source_run_id = (
+                terminal_summary_source_run_id
+            )
+            effective_summary_scope_mode: str | None = None
+            if persisted_stage_ids[:1] == ['agent_feedback_summaries']:
+                persisted_summary_outcome = raw_persisted_stage_outcomes[
+                    'agent_feedback_summaries'
+                ]
+                if str(
+                    persisted_summary_outcome.get('status') or ''
+                ).strip().lower() == 'completed':
+                    persisted_summary_proof = (
+                        summary_cutoff_proof_from_stage(
+                            persisted_summary_outcome
+                        )
+                    )
+                    if persisted_summary_proof is None:
+                        self._finish_run_preserving_primary_error(
+                            pipeline_run_id=int(existing_pipeline_run_id),
+                            status='failed',
+                            error_message=(
+                                'terminal continuation claim returned invalid '
+                                'persisted summary evidence'
+                            ),
+                        )
+                        raise RuntimeError(
+                            'terminal continuation claim returned invalid '
+                            'persisted summary evidence'
+                        )
+                    effective_summary_source_run_id = str(
+                        persisted_summary_proof['source_run_id']
+                    ).strip()
+                    effective_summary_scope_mode = str(
+                        persisted_summary_proof['feedback_scope_mode']
+                    ).strip()
+            terminal_cutoff_symbols = (
+                feedback_cutoff_resolution.get('requested_symbols')
+                if isinstance(feedback_cutoff_resolution, dict)
+                else None
+            )
+            if not (
+                isinstance(feedback_cutoff_resolution, dict)
+                and feedback_cutoff_resolution.get('ready')
+                and feedback_cutoff_resolution.get(
+                    'knowledge_cutoff_at'
+                )
+                is not None
+                and feedback_cutoff_resolution.get('source_run_id')
+                == effective_summary_source_run_id
+                and (
+                    effective_summary_scope_mode is None
+                    or feedback_cutoff_resolution.get(
+                        'feedback_scope_mode'
+                    )
+                    == effective_summary_scope_mode
+                )
+                and isinstance(terminal_cutoff_symbols, list)
+                and terminal_cutoff_symbols
+                and (
+                    resolved_symbols is None
+                    or completed_summary_scope_matches_parent(
+                        feedback_scope_mode=(
+                            feedback_cutoff_resolution.get(
+                                'feedback_scope_mode'
+                            )
+                        ),
+                        completed_symbols=terminal_cutoff_symbols,
+                        completed_scope_proof=(
+                            feedback_cutoff_resolution.get(
+                                'completed_scope_proof'
+                            )
+                        ),
+                        parent_symbols=resolved_symbols,
+                    )
+                )
+            ):
+                self._finish_run_preserving_primary_error(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    status='failed',
+                    error_message=(
+                        'terminal continuation claim returned invalid '
+                        'summary cutoff proof'
+                    ),
+                )
+                raise RuntimeError(
+                    'terminal continuation claim returned invalid '
+                    'summary cutoff proof'
+                )
+            feedback_knowledge_cutoff_at = (
+                feedback_cutoff_resolution['knowledge_cutoff_at']
+            )
             for stage_id in persisted_stage_ids:
                 persisted_outcome = raw_persisted_stage_outcomes[
                     stage_id
@@ -1171,6 +1226,48 @@ class DailyPipelineStageService:
                 continue
             stage_symbols = resolved_symbols
             if (
+                stage_id == 'signal_decider'
+                and isinstance(feedback_cutoff_resolution, dict)
+                and feedback_cutoff_resolution.get('ready') is True
+                and str(
+                    feedback_cutoff_resolution.get('source_run_id') or ''
+                ).strip()
+            ):
+                completed_summary_symbols = (
+                    feedback_cutoff_resolution.get('requested_symbols')
+                )
+                if (
+                    isinstance(completed_summary_symbols, list)
+                    and completed_summary_symbols
+                    and completed_summary_scope_matches_parent(
+                        feedback_scope_mode=(
+                            feedback_cutoff_resolution.get(
+                                'feedback_scope_mode'
+                            )
+                        ),
+                        completed_symbols=completed_summary_symbols,
+                        completed_scope_proof=(
+                            feedback_cutoff_resolution.get(
+                                'completed_scope_proof'
+                            )
+                        ),
+                        parent_symbols=resolved_symbols,
+                    )
+                ):
+                    stage_symbols = list(completed_summary_symbols)
+                else:
+                    feedback_knowledge_cutoff_at = None
+                    feedback_cutoff_resolution = {
+                        **feedback_cutoff_resolution,
+                        'ready': False,
+                        'reason': (
+                            'summary_run_symbol_scope_mismatch'
+                            if isinstance(completed_summary_symbols, list)
+                            and completed_summary_symbols
+                            else 'summary_run_symbol_scope_unavailable'
+                        ),
+                    }
+            if (
                 existing_pipeline_run_id is not None
                 and stage_id == 'signal_decider'
                 and isinstance(feedback_cutoff_resolution, dict)
@@ -1252,7 +1349,14 @@ class DailyPipelineStageService:
                 if stage_id in {
                     'agent_feedback_summaries',
                     'signal_decider',
-                } and feedback_knowledge_cutoff_at is None:
+                } and feedback_knowledge_cutoff_at is None and not (
+                    stage_id == 'signal_decider'
+                    and isinstance(feedback_cutoff_resolution, dict)
+                    and str(
+                        feedback_cutoff_resolution.get('source_run_id') or ''
+                    ).strip()
+                    and feedback_cutoff_resolution.get('ready') is False
+                ):
                     if (
                         stage_id == 'agent_feedback_summaries'
                         and existing_pipeline_run_id is None
@@ -1351,6 +1455,120 @@ class DailyPipelineStageService:
                                     ),
                                 )
                             )
+                            if (
+                                stage_id == 'signal_decider'
+                                and not proof_source_run_id
+                                and feedback_cutoff_resolution.get('ready')
+                                is True
+                                and str(
+                                    feedback_cutoff_resolution.get(
+                                        'source_run_id'
+                                    )
+                                    or ''
+                                ).strip()
+                                and not isinstance(
+                                    feedback_cutoff_resolution.get(
+                                        'completed_scope_proof'
+                                    ),
+                                    dict,
+                                )
+                            ):
+                                latest_resolution = dict(
+                                    feedback_cutoff_resolution
+                                )
+                                latest_source_run_id = str(
+                                    latest_resolution['source_run_id']
+                                ).strip()
+                                latest_scope_mode = str(
+                                    latest_resolution.get(
+                                        'feedback_scope_mode'
+                                    )
+                                    or ''
+                                ).strip()
+                                latest_admitted_symbols = (
+                                    latest_resolution.get(
+                                        'requested_symbols'
+                                    )
+                                )
+                                if not (
+                                    latest_scope_mode
+                                    in {
+                                        FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                                    }
+                                    and isinstance(
+                                        latest_admitted_symbols,
+                                        list,
+                                    )
+                                    and latest_admitted_symbols
+                                ):
+                                    feedback_cutoff_resolution = {
+                                        **latest_resolution,
+                                        'ready': False,
+                                        'reason': (
+                                            'summary_run_symbol_scope_unavailable'
+                                        ),
+                                    }
+                                else:
+                                    exact_resolution = (
+                                        resolve_latest_completed_summary_knowledge_cutoff(
+                                            market_date=date.fromisoformat(
+                                                resolved_market_date
+                                            ),
+                                            feedback_scope_mode=(
+                                                latest_scope_mode
+                                            ),
+                                            fs_div=resolved_fs_div,
+                                            source_run_id=(
+                                                latest_source_run_id
+                                            ),
+                                            requested_symbols=list(
+                                                latest_admitted_symbols
+                                            ),
+                                        )
+                                    )
+                                    exact_source_run_id = str(
+                                        exact_resolution.get(
+                                            'source_run_id'
+                                        )
+                                        or ''
+                                    ).strip()
+                                    exact_scope_mode = str(
+                                        exact_resolution.get(
+                                            'feedback_scope_mode'
+                                        )
+                                        or ''
+                                    ).strip()
+                                    if not (
+                                        exact_resolution.get('ready')
+                                        is True
+                                        and exact_source_run_id
+                                        == latest_source_run_id
+                                        and exact_scope_mode
+                                        == latest_scope_mode
+                                        and exact_resolution.get(
+                                            'knowledge_cutoff_at'
+                                        )
+                                        == latest_resolution.get(
+                                            'knowledge_cutoff_at'
+                                        )
+                                    ):
+                                        feedback_cutoff_resolution = {
+                                            **exact_resolution,
+                                            'ready': False,
+                                            'reason': (
+                                                exact_resolution.get(
+                                                    'reason'
+                                                )
+                                                or (
+                                                    'summary_exact_source_mismatch'
+                                                )
+                                            ),
+                                        }
+                                    else:
+                                        feedback_cutoff_resolution = (
+                                            exact_resolution
+                                        )
                         if feedback_cutoff_resolution.get('ready'):
                             feedback_knowledge_cutoff_at = (
                                 feedback_cutoff_resolution.get(
@@ -1381,17 +1599,19 @@ class DailyPipelineStageService:
                             proof_scope_is_valid = bool(
                                 isinstance(resolved_proof_symbols, list)
                                 and resolved_proof_symbols
-                                and (
-                                    not resolved_symbols
-                                    or summary_scope_matches_parent(
-                                        feedback_scope_mode=(
-                                            resolved_proof_scope
-                                        ),
-                                        summary_symbols=(
-                                            resolved_proof_symbols
-                                        ),
-                                        parent_symbols=resolved_symbols,
-                                    )
+                                and completed_summary_scope_matches_parent(
+                                    feedback_scope_mode=(
+                                        resolved_proof_scope
+                                    ),
+                                    completed_symbols=(
+                                        resolved_proof_symbols
+                                    ),
+                                    completed_scope_proof=(
+                                        feedback_cutoff_resolution.get(
+                                            'completed_scope_proof'
+                                        )
+                                    ),
+                                    parent_symbols=resolved_symbols,
                                 )
                             )
                             if exact_decider_scope and not proof_scope_is_valid:
@@ -1549,6 +1769,81 @@ class DailyPipelineStageService:
                     outcome=stage_outcomes[stage_id],
                     result=stage_result,
                 )
+                if (
+                    stage_id == 'agent_feedback_summaries'
+                    and 'signal_decider' in resolved_stages
+                    and self._dependency_outcome_is_satisfied(
+                        stage_outcomes[stage_id]
+                    )
+                ):
+                    summary_source_run_id = str(
+                        stage_result.get('run_id') or ''
+                    ).strip()
+                    summary_scope_mode = str(
+                        stage_result.get('feedback_scope_mode') or ''
+                    ).strip()
+                    summary_requested_symbols = stage_result.get(
+                        'requested_symbols'
+                    )
+                    if not (
+                        summary_source_run_id
+                        and summary_scope_mode
+                        in {
+                            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                        }
+                        and (
+                            summary_requested_symbols is None
+                            or isinstance(summary_requested_symbols, list)
+                        )
+                    ):
+                        feedback_cutoff_resolution = {
+                            'ready': False,
+                            'reason': 'summary_cutoff_proof_unavailable',
+                            'knowledge_cutoff_at': None,
+                            'source_run_id': summary_source_run_id or None,
+                            'feedback_scope_mode': summary_scope_mode or None,
+                        }
+                        feedback_knowledge_cutoff_at = None
+                    else:
+                        same_run_cutoff_resolution = (
+                            resolve_latest_completed_summary_knowledge_cutoff(
+                                market_date=date.fromisoformat(
+                                    resolved_market_date
+                                ),
+                                feedback_scope_mode=summary_scope_mode,
+                                fs_div=resolved_fs_div,
+                                source_run_id=summary_source_run_id,
+                                requested_symbols=(
+                                    list(summary_requested_symbols)
+                                    if summary_requested_symbols is not None
+                                    else None
+                                ),
+                            )
+                        )
+                        if (
+                            same_run_cutoff_resolution.get('ready')
+                            and same_run_cutoff_resolution.get(
+                                'knowledge_cutoff_at'
+                            )
+                            != feedback_knowledge_cutoff_at
+                        ):
+                            same_run_cutoff_resolution = {
+                                **same_run_cutoff_resolution,
+                                'ready': False,
+                                'reason': 'summary_cutoff_mismatch',
+                                'knowledge_cutoff_at': None,
+                            }
+                        feedback_cutoff_resolution = (
+                            same_run_cutoff_resolution
+                        )
+                        feedback_knowledge_cutoff_at = (
+                            same_run_cutoff_resolution.get(
+                                'knowledge_cutoff_at'
+                            )
+                            if same_run_cutoff_resolution.get('ready')
+                            else None
+                        )
             except Exception as exc:
                 if (
                     stage_heartbeat is not None
@@ -2610,6 +2905,63 @@ class DailyPipelineStageService:
                 feedback_knowledge_cutoff_at
                 or datetime.now(timezone.utc)
             )
+            scope_authority: dict[str, Any] | None = None
+            if (
+                stage_id == 'signal_decider'
+                and isinstance(feedback_cutoff_resolution, dict)
+                and feedback_cutoff_resolution.get('ready') is True
+                and str(
+                    feedback_cutoff_resolution.get('source_run_id') or ''
+                ).strip()
+                and completed_summary_scope_matches_parent(
+                    feedback_scope_mode=(
+                        feedback_cutoff_resolution.get(
+                            'feedback_scope_mode'
+                        )
+                    ),
+                    completed_symbols=symbols,
+                    completed_scope_proof=(
+                        feedback_cutoff_resolution.get(
+                            'completed_scope_proof'
+                        )
+                    ),
+                    parent_symbols=None,
+                )
+            ):
+                scope_authority = {
+                    'schema_version': (
+                        FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+                    ),
+                    'kind': (
+                        FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+                    ),
+                    'source_summary_run_id': str(
+                        feedback_cutoff_resolution['source_run_id']
+                    ).strip(),
+                    'source_feedback_scope_mode': str(
+                        feedback_cutoff_resolution.get(
+                            'feedback_scope_mode'
+                        )
+                        or ''
+                    ).strip(),
+                    'decision_feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'knowledge_cutoff_at': (
+                        resolved_feedback_cutoff.isoformat()
+                        if hasattr(
+                            resolved_feedback_cutoff,
+                            'isoformat',
+                        )
+                        else str(resolved_feedback_cutoff)
+                    ),
+                    'fs_div': fs_div,
+                    'completed_scope_proof': dict(
+                        feedback_cutoff_resolution[
+                            'completed_scope_proof'
+                        ]
+                    ),
+                }
             result = self.feedback_retry_service.run_retry_cycles(
                 config=FeedbackRetryCycleConfig(
                     market_date=date.fromisoformat(market_date),
@@ -2628,6 +2980,7 @@ class DailyPipelineStageService:
                     max_cycles=feedback_max_cycles,
                     outer_batch_size=feedback_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
+                    scope_authority=scope_authority,
                     progress_callback=progress_callback,
                 ),
                 # A forced pipeline recovery must bypass stale prerequisite

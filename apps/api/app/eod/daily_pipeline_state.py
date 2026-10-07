@@ -34,10 +34,10 @@ from app.eod.daily_pipeline_outcomes import (
 )
 from app.eod.summary_cutoff_contract import (
     LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    completed_summary_scope_matches_parent,
     is_resumable_summary_cutoff_contract_repair,
     normalize_symbol_codes,
     summary_cutoff_proof_from_stage,
-    summary_scope_matches_parent,
 )
 from app.repositories.eod_run_repository import (
     daily_price_bar_has_current_eod_run_provenance,
@@ -1296,6 +1296,9 @@ class DailyPipelineRunStateService:
                 'requested_symbols': cutoff_resolution.get(
                     'requested_symbols'
                 ),
+                'completed_scope_proof': cutoff_resolution.get(
+                    'completed_scope_proof'
+                ),
             }
             if not compact_cutoff_resolution['ready']:
                 return reject(
@@ -1331,9 +1334,12 @@ class DailyPipelineRunStateService:
                     status=status,
                 )
             parent_symbols = metadata.get('symbols')
-            if parent_symbols is not None and not summary_scope_matches_parent(
+            if not completed_summary_scope_matches_parent(
                 feedback_scope_mode=repair_scope_mode,
-                summary_symbols=resolved_proof_symbols,
+                completed_symbols=resolved_proof_symbols,
+                completed_scope_proof=compact_cutoff_resolution.get(
+                    'completed_scope_proof'
+                ),
                 parent_symbols=parent_symbols,
             ):
                 return reject(
@@ -1990,6 +1996,9 @@ class DailyPipelineRunStateService:
                 'requested_symbols': cutoff_resolution.get(
                     'requested_symbols'
                 ),
+                'completed_scope_proof': cutoff_resolution.get(
+                    'completed_scope_proof'
+                ),
             }
             if not compact_cutoff_resolution['ready']:
                 return reject(
@@ -2018,11 +2027,14 @@ class DailyPipelineRunStateService:
                     'summary_knowledge_cutoff_proof_mismatch',
                     status=current_status,
                 )
-            if not summary_scope_matches_parent(
+            if not completed_summary_scope_matches_parent(
                 feedback_scope_mode=summary_feedback_scope_mode,
-                summary_symbols=compact_cutoff_resolution[
+                completed_symbols=compact_cutoff_resolution[
                     'requested_symbols'
                 ],
+                completed_scope_proof=compact_cutoff_resolution.get(
+                    'completed_scope_proof'
+                ),
                 parent_symbols=raw_symbols,
             ):
                 return reject(
@@ -2430,22 +2442,23 @@ class DailyPipelineRunStateService:
                 )
                 or ''
             ).strip()
-            exact_lease_resume_origin = (
+            repeated_resume_lineage_is_valid = (
                 terminal_continuation_lease_loss_resume_lineage_is_valid(
                     metadata
                 )
             )
-            if persisted_lease_child_run_id and not exact_lease_resume_origin:
+            if (
+                persisted_lease_child_run_id
+                and not repeated_resume_lineage_is_valid
+            ):
                 return reject(
                     'terminal_continuation_failed_lease_loss_ineligible'
                 )
-            if exact_lease_resume_origin:
+            if (
+                persisted_lease_child_run_id
+                and repeated_resume_lineage_is_valid
+            ):
                 failed_lease_child_run_id = persisted_lease_child_run_id
-            if exact_lease_resume_origin and not failed_lease_child_run_id:
-                return reject(
-                    'terminal_continuation_failed_lease_loss_evidence_invalid',
-                    field='child_run_id',
-                )
 
         metadata_prefix_size = 0
         metadata_pending_seen = False
@@ -2789,11 +2802,49 @@ class DailyPipelineRunStateService:
         ):
             return reject('summary_knowledge_cutoff_proof_mismatch')
 
+        persisted_scope_proof_present = (
+            'completed_scope_proof' in summary_proof
+        )
+        persisted_scope_proof = summary_proof.get(
+            'completed_scope_proof'
+        )
+        if persisted_scope_proof_present:
+            if not completed_summary_scope_matches_parent(
+                feedback_scope_mode=summary_feedback_scope_mode,
+                completed_symbols=summary_requested_symbols,
+                completed_scope_proof=persisted_scope_proof,
+                parent_symbols=raw_symbols,
+            ):
+                return reject('summary_knowledge_cutoff_proof_mismatch')
+            resolver_requested_symbols = persisted_scope_proof.get(
+                'admitted_symbols'
+            )
+        else:
+            normalized_summary_symbols = normalize_symbol_codes(
+                summary_requested_symbols
+            )
+            normalized_parent_symbols = normalize_symbol_codes(raw_symbols)
+            if not (
+                normalized_summary_symbols
+                and normalized_parent_symbols
+                and summary_requested_symbols
+                == normalized_summary_symbols
+                and raw_symbols == normalized_parent_symbols
+                and set(normalized_summary_symbols).issubset(
+                    normalized_parent_symbols
+                )
+            ):
+                return reject('summary_knowledge_cutoff_proof_mismatch')
+            # Version-1 continuation claims predate completed-scope proofs.
+            # Resolve the exact source without treating the completed subset
+            # as that source run's broader admitted request scope.
+            resolver_requested_symbols = None
+
         cutoff_resolution = _resolve_terminal_summary_knowledge_cutoff(
             market_date=normalized_market_date,
             source_run_id=summary_source_run_id,
             feedback_scope_mode=summary_feedback_scope_mode,
-            requested_symbols=summary_requested_symbols,
+            requested_symbols=resolver_requested_symbols,
             fs_div=str(metadata.get('fs_div') or ''),
             source_run_session=session,
         )
@@ -2811,6 +2862,9 @@ class DailyPipelineRunStateService:
             'requested_symbols': cutoff_resolution.get(
                 'requested_symbols'
             ),
+            'completed_scope_proof': cutoff_resolution.get(
+                'completed_scope_proof'
+            ),
         }
         if not (
             compact_cutoff_resolution['ready']
@@ -2821,37 +2875,34 @@ class DailyPipelineRunStateService:
             == summary_feedback_scope_mode
             and compact_cutoff_resolution['requested_symbols']
             == summary_requested_symbols
+            and completed_summary_scope_matches_parent(
+                feedback_scope_mode=summary_feedback_scope_mode,
+                completed_symbols=compact_cutoff_resolution[
+                    'requested_symbols'
+                ],
+                completed_scope_proof=compact_cutoff_resolution.get(
+                    'completed_scope_proof'
+                ),
+                parent_symbols=raw_symbols,
+            )
+            and (
+                not persisted_scope_proof_present
+                or compact_cutoff_resolution.get(
+                    'completed_scope_proof'
+                )
+                == persisted_scope_proof
+            )
         ):
             return reject('summary_knowledge_cutoff_proof_mismatch')
-
-        if failed_lease_child_run_id:
-            failed_child_run = session.execute(
-                select(AgentContextFeedbackRun)
-                .where(
-                    AgentContextFeedbackRun.run_id
-                    == failed_lease_child_run_id
-                )
-                .with_for_update()
-            ).scalar_one_or_none()
-            failed_child_error = (
-                terminal_feedback_lease_loss_evidence_error(
-                    child_run=failed_child_run,
-                    child_run_id=failed_lease_child_run_id,
-                    market_date=normalized_market_date,
-                    metadata=metadata,
-                    knowledge_cutoff_at=persisted_cutoff,
-                )
-            )
-            if failed_child_error is not None:
-                return reject(
-                    'terminal_continuation_failed_lease_loss_evidence_invalid',
-                    field=failed_child_error,
-                )
+        original_compact_cutoff_resolution = dict(
+            compact_cutoff_resolution
+        )
 
         feedback_stage_ids = {
             'agent_feedback_summaries',
             'signal_decider',
         }
+        refreshed_summary_proof: dict[str, Any] | None = None
         for stage_id in satisfied_prefix:
             stage_row = stage_rows_by_id[stage_id]
             stage_status = str(stage_row.status or '').strip().lower()
@@ -2905,6 +2956,20 @@ class DailyPipelineRunStateService:
                     market_date=normalized_market_date,
                     metadata=metadata,
                     knowledge_cutoff_at=persisted_cutoff,
+                    completed_summary_proof=(
+                        refreshed_summary_proof
+                        if stage_id == 'signal_decider'
+                        else None
+                    ),
+                    expected_summary_source_run_id=(
+                        str(
+                            refreshed_summary_proof.get('source_run_id')
+                            or ''
+                        ).strip()
+                        if stage_id == 'signal_decider'
+                        and refreshed_summary_proof is not None
+                        else None
+                    ),
                 )
             )
             if child_evidence_error is not None:
@@ -2913,6 +2978,194 @@ class DailyPipelineRunStateService:
                     stage_id=stage_id,
                     field=child_evidence_error,
                 )
+
+            if stage_id != 'agent_feedback_summaries':
+                continue
+            stage_details = (
+                stage_row.details
+                if isinstance(stage_row.details, Mapping)
+                else {}
+            )
+            stage_result_summary = (
+                stage_details.get('result_summary')
+                if isinstance(
+                    stage_details.get('result_summary'),
+                    Mapping,
+                )
+                else {}
+            )
+            child_request_payload = (
+                child_run.request_payload
+                if isinstance(child_run.request_payload, Mapping)
+                else {}
+            )
+            refreshed_scope_mode = str(
+                stage_result_summary.get('feedback_scope_mode') or ''
+            ).strip()
+            refreshed_admitted_symbols = child_request_payload.get(
+                'requested_symbols'
+            )
+            if not (
+                str(stage_result_summary.get('status') or '')
+                .strip()
+                .lower()
+                == 'completed'
+                and str(stage_result_summary.get('run_id') or '').strip()
+                == child_run_id
+                and refreshed_scope_mode
+                == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+                and isinstance(refreshed_admitted_symbols, list)
+                and refreshed_admitted_symbols
+                == raw_symbols
+            ):
+                return reject(
+                    'terminal_continuation_feedback_prefix_evidence_invalid',
+                    stage_id=stage_id,
+                    field='result_summary_scope',
+                )
+
+            refreshed_cutoff_resolution = (
+                _resolve_terminal_summary_knowledge_cutoff(
+                    market_date=normalized_market_date,
+                    source_run_id=child_run_id,
+                    feedback_scope_mode=refreshed_scope_mode,
+                    requested_symbols=refreshed_admitted_symbols,
+                    fs_div=str(metadata.get('fs_div') or ''),
+                    source_run_session=session,
+                )
+            )
+            refreshed_cutoff = _parse_utc_datetime(
+                refreshed_cutoff_resolution.get('knowledge_cutoff_at')
+            )
+            refreshed_compact_resolution = {
+                'ready': bool(
+                    refreshed_cutoff_resolution.get('ready')
+                ),
+                'reason': refreshed_cutoff_resolution.get('reason'),
+                'knowledge_cutoff_at': refreshed_cutoff,
+                'source_run_id': refreshed_cutoff_resolution.get(
+                    'source_run_id'
+                ),
+                'feedback_scope_mode': refreshed_cutoff_resolution.get(
+                    'feedback_scope_mode'
+                ),
+                'requested_symbols': refreshed_cutoff_resolution.get(
+                    'requested_symbols'
+                ),
+                'completed_scope_proof': (
+                    refreshed_cutoff_resolution.get(
+                        'completed_scope_proof'
+                    )
+                ),
+            }
+            refreshed_completed_symbols = (
+                refreshed_compact_resolution['requested_symbols']
+            )
+            if not (
+                refreshed_compact_resolution['ready']
+                and refreshed_compact_resolution['source_run_id']
+                == child_run_id
+                and refreshed_cutoff == persisted_cutoff
+                and refreshed_compact_resolution[
+                    'feedback_scope_mode'
+                ]
+                == refreshed_scope_mode
+                and isinstance(refreshed_completed_symbols, list)
+                and completed_summary_scope_matches_parent(
+                    feedback_scope_mode=refreshed_scope_mode,
+                    completed_symbols=refreshed_completed_symbols,
+                    completed_scope_proof=(
+                        refreshed_compact_resolution.get(
+                            'completed_scope_proof'
+                        )
+                    ),
+                    parent_symbols=raw_symbols,
+                )
+            ):
+                return reject(
+                    'terminal_continuation_feedback_prefix_evidence_invalid',
+                    stage_id=stage_id,
+                    field='summary_cutoff_proof',
+                )
+            compact_cutoff_resolution = refreshed_compact_resolution
+            refreshed_summary_proof = {
+                **refreshed_compact_resolution,
+                'knowledge_cutoff_at': _iso(refreshed_cutoff),
+                'requested_symbols': list(refreshed_completed_symbols),
+                'requested_symbol_count': len(
+                    refreshed_completed_symbols
+                ),
+            }
+
+            if (
+                'completed_prefix_summary_proof'
+                in continuation_evidence
+                and continuation_evidence.get(
+                    'completed_prefix_summary_proof'
+                )
+                != refreshed_summary_proof
+            ):
+                return reject(
+                    'terminal_continuation_feedback_prefix_evidence_invalid',
+                    stage_id=stage_id,
+                    field='completed_prefix_summary_proof',
+                )
+
+        if failed_lease_child_run_id:
+            failed_child_run = session.execute(
+                select(AgentContextFeedbackRun)
+                .where(
+                    AgentContextFeedbackRun.run_id
+                    == failed_lease_child_run_id
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            failed_child_error = (
+                terminal_feedback_lease_loss_evidence_error(
+                    child_run=failed_child_run,
+                    child_run_id=failed_lease_child_run_id,
+                    market_date=normalized_market_date,
+                    metadata=metadata,
+                    knowledge_cutoff_at=persisted_cutoff,
+                    completed_summary_proof=refreshed_summary_proof,
+                    expected_summary_source_run_id=(
+                        str(
+                            refreshed_summary_proof.get('source_run_id')
+                            or ''
+                        ).strip()
+                        if refreshed_summary_proof is not None
+                        else None
+                    ),
+                )
+            )
+            if failed_child_error is not None:
+                return reject(
+                    'terminal_continuation_failed_lease_loss_evidence_invalid',
+                    field=failed_child_error,
+                )
+
+        backfilled_continuation_evidence = dict(continuation_evidence)
+        continuation_evidence_changed = False
+        if not persisted_scope_proof_present:
+            backfilled_summary_proof = dict(summary_proof)
+            backfilled_summary_proof['completed_scope_proof'] = dict(
+                original_compact_cutoff_resolution[
+                    'completed_scope_proof'
+                ]
+            )
+            backfilled_continuation_evidence['summary_proof'] = (
+                backfilled_summary_proof
+            )
+            continuation_evidence_changed = True
+        if refreshed_summary_proof is not None:
+            backfilled_continuation_evidence[
+                'completed_prefix_summary_proof'
+            ] = refreshed_summary_proof
+            continuation_evidence_changed = True
+        if continuation_evidence_changed:
+            metadata['terminal_continuation_evidence'] = (
+                backfilled_continuation_evidence
+            )
 
         resume_count = _as_int(
             metadata.get('terminal_continuation_resume_count')

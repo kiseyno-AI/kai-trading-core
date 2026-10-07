@@ -38,12 +38,12 @@ from app.eod.pykrx_pipeline_support import (
     build_daily_skip_result,
 )
 from app.eod.summary_cutoff_contract import (
+    completed_summary_scope_matches_parent,
     is_resumable_summary_cutoff_contract_repair,
     is_summary_cutoff_contract_repair_candidate as _is_summary_cutoff_contract_repair_candidate,
     stage_result_summary as _stage_result_summary,
     summary_cutoff_contract_repair_marker_is_valid,
     summary_cutoff_proof_from_stage as _summary_cutoff_proof_from_stage,
-    summary_scope_matches_parent,
 )
 from app.eod.pykrx_import import (
     import_pykrx_stock,
@@ -415,11 +415,38 @@ def _is_terminal_followup_continuation_candidate(
             if isinstance(raw_summary_symbols, list)
             else []
         )
-        summary_scope_matches_execution = summary_scope_matches_parent(
-            feedback_scope_mode=summary_scope_mode,
-            summary_symbols=raw_summary_symbols,
-            parent_symbols=run_metadata.get('symbols'),
+        persisted_scope_proof_present = (
+            'completed_scope_proof' in summary_proof
         )
+        if persisted_scope_proof_present:
+            summary_scope_matches_execution = (
+                completed_summary_scope_matches_parent(
+                    feedback_scope_mode=summary_scope_mode,
+                    completed_symbols=raw_summary_symbols,
+                    completed_scope_proof=summary_proof.get(
+                        'completed_scope_proof'
+                    ),
+                    parent_symbols=run_metadata.get('symbols'),
+                )
+            )
+        else:
+            raw_parent_symbols = run_metadata.get('symbols')
+            normalized_parent_symbols = (
+                _dedupe_symbol_codes(raw_parent_symbols)
+                if isinstance(raw_parent_symbols, list)
+                else []
+            )
+            # Legacy version-1 claims did not persist the exact completed
+            # scope proof. This only admits them to the locked repair path;
+            # that path reconstructs and validates the proof by source run.
+            summary_scope_matches_execution = bool(
+                summary_symbols
+                and raw_summary_symbols == summary_symbols
+                and normalized_parent_symbols
+                and set(summary_symbols).issubset(
+                    normalized_parent_symbols
+                )
+            )
         if not (
             run_metadata.get('terminal_continuation_version') == 1
             and str(

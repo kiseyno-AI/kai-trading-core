@@ -2781,6 +2781,76 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertIn('short-term-decider', stage['details']['role_progress'])
         self.assertIn('signal-decider', stage['details']['role_progress'])
 
+    def test_latest_feedback_run_summary_ignores_decider_runtime_state(self):
+        class _DeciderRuntimeState:
+            run_id = 'feedback-cycle-2026-10-07-decider'
+            status = 'partial'
+            requested_symbols = ['005930']
+            requested_roles = ['signal-decider']
+
+            @staticmethod
+            def to_progress_summary():
+                return {
+                    'run_id': 'feedback-cycle-2026-10-07-decider',
+                    'run_status': 'partial',
+                    'completed_feedback_count': 143,
+                    'failed_items': 17,
+                    'expected_feedback_count': 160,
+                }
+
+        summarizer_run = {
+            'run_id': 'feedback-cycle-2026-10-07-summarizers',
+            'status': 'completed',
+            'completed_at': '2026-10-07T05:01:00+00:00',
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': [
+                    'eod-summarizer',
+                    'technical-summarizer',
+                    'fundamental-summarizer',
+                ],
+            },
+        }
+        summarizer_progress = {
+            'summary': {
+                'run_id': 'feedback-cycle-2026-10-07-summarizers',
+                'run_status': 'completed',
+                'completed_feedback_count': 470,
+                'failed_items': 0,
+                'expected_feedback_count': 470,
+            },
+        }
+
+        with patch(
+            'app.agent_context.runtime_state.runtime_feedback_state_store.get_run',
+            return_value=_DeciderRuntimeState(),
+        ), patch(
+            'app.agent_context.run_state_service.agent_context_feedback_run_state_service.find_latest_run',
+            return_value=summarizer_run,
+        ) as latest_run_loader, patch(
+            'app.agent_context.run_state_service.agent_context_feedback_run_state_service.resolve_run_requested_symbols',
+            return_value=['005930', '000660'],
+        ), patch(
+            'app.agent_context.progress_service.agent_context_progress_service.get_feedback_progress',
+            return_value=summarizer_progress,
+        ) as progress_loader:
+            result = _load_latest_feedback_run_summary(market_date='2026-10-07')
+
+        self.assertEqual(result['run_id'], 'feedback-cycle-2026-10-07-summarizers')
+        self.assertEqual(result['summary']['completed_feedback_count'], 470)
+        self.assertEqual(
+            latest_run_loader.call_args.kwargs['requested_roles'],
+            [
+                'eod-summarizer',
+                'technical-summarizer',
+                'fundamental-summarizer',
+            ],
+        )
+        progress_loader.assert_called_once_with(
+            market_date=unittest.mock.ANY,
+            run_id='feedback-cycle-2026-10-07-summarizers',
+        )
+
     def test_read_treats_stored_full_coverage_as_completed_after_scoped_retry_run(self):
         pykrx_run = {
             'id': 401,

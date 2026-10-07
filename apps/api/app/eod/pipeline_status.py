@@ -715,6 +715,18 @@ def _progress_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return dict(payload)
 
 
+def _is_summarizer_feedback_runtime_state(state: Any) -> bool:
+    requested_roles = getattr(state, 'requested_roles', None)
+    if not isinstance(requested_roles, (list, tuple)):
+        return False
+    normalized_roles = sorted(
+        str(role or '').strip()
+        for role in requested_roles
+        if str(role or '').strip()
+    )
+    return normalized_roles == sorted(SUMMARIZER_AGENT_NAMES)
+
+
 def _load_latest_feedback_run_summary(*, market_date: str) -> dict[str, Any] | None:
     normalized_market_date = date.fromisoformat(market_date)
     try:
@@ -723,10 +735,14 @@ def _load_latest_feedback_run_summary(*, market_date: str) -> dict[str, Any] | N
     except Exception:
         return None
 
-    runtime_state = (
-        runtime_feedback_state_store.get_run(normalized_market_date, logical=True)
-        or runtime_feedback_state_store.get_run(normalized_market_date)
+    runtime_state = runtime_feedback_state_store.get_run(
+        normalized_market_date,
+        logical=True,
     )
+    if not _is_summarizer_feedback_runtime_state(runtime_state):
+        runtime_state = runtime_feedback_state_store.get_run(normalized_market_date)
+    if not _is_summarizer_feedback_runtime_state(runtime_state):
+        runtime_state = None
     if runtime_state is not None:
         summary = runtime_state.to_progress_summary()
         requested_symbols = getattr(runtime_state, 'requested_symbols', None)

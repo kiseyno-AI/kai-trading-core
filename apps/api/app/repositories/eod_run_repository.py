@@ -1038,6 +1038,7 @@ def _terminal_continuation_lease_loss_child_is_valid(
     *,
     pipeline_run: _PipelineRecoveryCandidate,
     child_run_id: str,
+    completed_summary_source_run_id: str | None = None,
 ) -> bool:
     metadata = pipeline_run.run_metadata
     evidence = metadata.get('terminal_continuation_evidence')
@@ -1049,6 +1050,15 @@ def _terminal_continuation_lease_loss_child_is_valid(
     )
     knowledge_cutoff_at = _normalized_datetime(
         summary_proof.get('knowledge_cutoff_at')
+    )
+    completed_prefix_summary_proof = (
+        evidence.get('completed_prefix_summary_proof')
+        if isinstance(evidence, Mapping)
+        and isinstance(
+            evidence.get('completed_prefix_summary_proof'),
+            Mapping,
+        )
+        else None
     )
     if knowledge_cutoff_at is None:
         return False
@@ -1063,6 +1073,10 @@ def _terminal_continuation_lease_loss_child_is_valid(
         market_date=pipeline_run.market_date,
         metadata=metadata,
         knowledge_cutoff_at=knowledge_cutoff_at,
+        completed_summary_proof=completed_prefix_summary_proof,
+        expected_summary_source_run_id=(
+            completed_summary_source_run_id
+        ),
     ) is None
 
 
@@ -1088,6 +1102,16 @@ def _terminal_continuation_satisfied_prefix_evidence_is_valid(
         'agent_feedback_summaries',
         'signal_decider',
     }
+    completed_prefix_summary_proof = (
+        evidence.get('completed_prefix_summary_proof')
+        if isinstance(evidence, Mapping)
+        and isinstance(
+            evidence.get('completed_prefix_summary_proof'),
+            Mapping,
+        )
+        else None
+    )
+    completed_summary_source_run_id: str | None = None
     for stage_id in satisfied_prefix:
         stage_row = stage_rows_by_id[stage_id]
         stage_status = str(stage_row.status or '').strip().lower()
@@ -1129,10 +1153,22 @@ def _terminal_continuation_satisfied_prefix_evidence_is_valid(
                 market_date=pipeline_run.market_date,
                 metadata=metadata,
                 knowledge_cutoff_at=knowledge_cutoff_at,
+                completed_summary_proof=(
+                    completed_prefix_summary_proof
+                    if stage_id == 'signal_decider'
+                    else None
+                ),
+                expected_summary_source_run_id=(
+                    completed_summary_source_run_id
+                    if stage_id == 'signal_decider'
+                    else None
+                ),
             )
             is not None
         ):
             return False
+        if stage_id == 'agent_feedback_summaries':
+            completed_summary_source_run_id = child_run_id
     return True
 
 
@@ -1227,6 +1263,21 @@ def _followup_recovery_is_reclaimable_feedback_lease_loss(
         and not str(summary.error_message or '').strip()
     ):
         return False
+    summary_source_run_ids = (
+        summary.source_run_ids
+        if isinstance(summary.source_run_ids, Mapping)
+        else {}
+    )
+    completed_summary_source_ids = {
+        str(summary_source_run_ids.get(key) or '').strip()
+        for key in ('agent_feedback_run_id', 'run_id')
+        if str(summary_source_run_ids.get(key) or '').strip()
+    }
+    if len(completed_summary_source_ids) != 1:
+        return False
+    completed_summary_source_run_id = next(
+        iter(completed_summary_source_ids)
+    )
     decider = stage_rows_by_id['signal_decider']
     child_run_id = terminal_continuation_feedback_lease_loss_run_id(
         pipeline_run={
@@ -1243,6 +1294,7 @@ def _followup_recovery_is_reclaimable_feedback_lease_loss(
         session,
         pipeline_run=pipeline_run,
         child_run_id=child_run_id,
+        completed_summary_source_run_id=completed_summary_source_run_id,
     ):
         return False
 

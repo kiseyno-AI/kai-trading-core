@@ -7,6 +7,12 @@ FEEDBACK_SCOPE_MODES = (
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
 )
+FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION = (
+    'agent_feedback_scope_authority_v1'
+)
+FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION = (
+    'completed_summary_intersection_authoritative_cohort'
+)
 
 
 def normalize_feedback_scope_mode(value: str | None) -> str:

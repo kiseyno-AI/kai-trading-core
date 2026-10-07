@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from copy import deepcopy
 from contextlib import contextmanager
@@ -8,6 +9,9 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.agent_context.lease_loss_evidence import (
+    terminal_feedback_completed_run_evidence_error,
+)
 from app.db_models import DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.daily_pipeline_state import (
@@ -42,6 +46,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             55,
             tzinfo=timezone.utc,
         )
+        self.completed_scope_proof = {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': ['005930'],
+            'admitted_symbols': ['005930'],
+        }
         self.terminal_cutoff_resolver = patch(
             'app.eod.daily_pipeline_state.'
             '_resolve_terminal_summary_knowledge_cutoff',
@@ -54,6 +63,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 ),
                 'feedback_scope_mode': 'decider_scope_fast_path',
                 'requested_symbols': ['005930'],
+                'completed_scope_proof': self.completed_scope_proof,
             },
         )
         self.resolve_terminal_cutoff = (
@@ -368,6 +378,102 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(outcome['succeeded'], 99)
         self.assertEqual(outcome['total'], 100)
         self.assertTrue(daily_pipeline_outcome_is_satisfied(outcome))
+
+    def test_authoritative_decider_completed_evidence_allows_capped_role_subsets(
+        self,
+    ) -> None:
+        parent_symbols = [f'{100000 + index:06d}' for index in range(120)]
+        completed_symbols = parent_symbols[:115]
+        roles = ['short-term-decider', 'signal-decider']
+        role_symbol_scopes = {
+            roles[0]: completed_symbols[:80],
+            roles[1]: completed_symbols[20:100],
+        }
+        cutoff = datetime(2026, 9, 20, 0, 55, tzinfo=timezone.utc)
+        source_run_id = 'agent_feedback_summaries-rerun'
+        decider_run_id = 'signal_decider-rerun'
+        child_run = SimpleNamespace(
+            run_id=decider_run_id,
+            market_date=date(2026, 9, 18),
+            status='completed',
+            completed_at=cutoff + timedelta(minutes=5),
+            failed_count=0,
+            symbols_total=160,
+            completed_count=160,
+            request_payload={
+                'market_date': '2026-09-18',
+                'request_run_id': decider_run_id,
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'roles': roles,
+                'requested_symbols': completed_symbols,
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'admission_scope_by_role': {
+                    role: completed_symbols for role in roles
+                },
+                'role_symbol_scopes': role_symbol_scopes,
+                'role_symbol_counts': {
+                    role: len(role_symbol_scopes[role]) for role in roles
+                },
+                'fs_div': 'CFS',
+                'reuse_existing': True,
+                'force_recompute': False,
+                'knowledge_cutoff_at': cutoff.isoformat(),
+                'admission_knowledge_cutoff_at': cutoff.isoformat(),
+                'requested_knowledge_cutoff_at': cutoff.isoformat(),
+                'scope_authority': {
+                    'schema_version': 'agent_feedback_scope_authority_v1',
+                    'kind': (
+                        'completed_summary_intersection_authoritative_cohort'
+                    ),
+                    'source_summary_run_id': source_run_id,
+                    'source_feedback_scope_mode': (
+                        'broad_feedback_universe'
+                    ),
+                    'decision_feedback_scope_mode': (
+                        'decider_scope_fast_path'
+                    ),
+                    'knowledge_cutoff_at': cutoff.isoformat(),
+                    'fs_div': 'CFS',
+                    'completed_symbols': completed_symbols,
+                    'admitted_symbol_count': len(parent_symbols),
+                    'admitted_symbols_sha256': hashlib.sha256(
+                        '\n'.join(sorted(parent_symbols)).encode('utf-8')
+                    ).hexdigest(),
+                },
+            },
+        )
+        completed_summary_proof = {
+            'ready': True,
+            'reason': 'latest_completed_summary_cutoff',
+            'knowledge_cutoff_at': cutoff.isoformat(),
+            'source_run_id': source_run_id,
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'requested_symbols': completed_symbols,
+            'requested_symbol_count': len(completed_symbols),
+            'completed_scope_proof': {
+                'schema_version': 'completed_summarizer_intersection_v1',
+                'completed_symbols': completed_symbols,
+                'admitted_symbols': parent_symbols,
+            },
+        }
+
+        error = terminal_feedback_completed_run_evidence_error(
+            child_run=child_run,
+            child_run_id=decider_run_id,
+            stage_id='signal_decider',
+            market_date=date(2026, 9, 18),
+            metadata={
+                'symbols': parent_symbols,
+                'fs_div': 'CFS',
+                'reuse_existing_feedback': True,
+                'force': False,
+            },
+            knowledge_cutoff_at=cutoff,
+            completed_summary_proof=completed_summary_proof,
+            expected_summary_source_run_id=source_run_id,
+        )
+
+        self.assertIsNone(error)
 
     def test_converge_terminal_stages_run_derives_completed_and_preserves_audit(
         self,
@@ -2705,6 +2811,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'feedback_scope_mode': 'decider_scope_fast_path',
                 'requested_symbols': ['005930'],
                 'requested_symbol_count': 1,
+                'completed_scope_proof': self.completed_scope_proof,
             },
         )
         for stage in stages[1:]:
@@ -2858,6 +2965,12 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             run.run_metadata['terminal_continuation_evidence'],
             original_evidence,
         )
+        self.assertEqual(
+            resumed['knowledge_cutoff_resolution'][
+                'completed_scope_proof'
+            ],
+            self.completed_scope_proof,
+        )
         self.resolve_terminal_cutoff.assert_called_once_with(
             market_date=date(2026, 9, 18),
             source_run_id='agent_feedback_summaries-prior',
@@ -2992,6 +3105,10 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             )
         self.assertTrue(first['claimed'])
 
+        run.run_metadata['terminal_continuation_evidence'][
+            'summary_proof'
+        ].pop('completed_scope_proof')
+
         run.status = 'interrupted'
         run.updated_at = interrupted_at
         run.completed_at = interrupted_at
@@ -3036,6 +3153,490 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             run.run_metadata['terminal_continuation_resumed_from_status'],
             'interrupted',
         )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_evidence'][
+                'summary_proof'
+            ]['completed_scope_proof'],
+            self.completed_scope_proof,
+        )
+        self.assertEqual(
+            resumed['knowledge_cutoff_resolution'][
+                'completed_scope_proof'
+            ],
+            self.completed_scope_proof,
+        )
+
+    def test_terminal_resume_uses_completed_rerun_summary_scope(self) -> None:
+        claimed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+        interrupted_at = claimed_at + timedelta(minutes=1)
+        old_source_run_id = 'agent_feedback_summaries-prior'
+        rerun_source_run_id = 'agent_feedback_summaries-rerun'
+        parent_symbols = ['005930', '000660']
+        old_intersection = ['005930']
+        rerun_intersection = ['000660']
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        run.run_metadata['symbols'] = parent_symbols
+
+        def resolve_cutoff(**kwargs):
+            source_run_id = kwargs['source_run_id']
+            if source_run_id == old_source_run_id:
+                return {
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'knowledge_cutoff_at': self.terminal_cutoff,
+                    'source_run_id': old_source_run_id,
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': old_intersection,
+                    'completed_scope_proof': {
+                        'schema_version': (
+                            'completed_summarizer_intersection_v1'
+                        ),
+                        'completed_symbols': old_intersection,
+                        'admitted_symbols': parent_symbols,
+                    },
+                }
+            self.assertEqual(source_run_id, rerun_source_run_id)
+            self.assertEqual(
+                kwargs['feedback_scope_mode'],
+                'broad_feedback_universe',
+            )
+            self.assertEqual(kwargs['requested_symbols'], parent_symbols)
+            return {
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': self.terminal_cutoff,
+                'source_run_id': rerun_source_run_id,
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'requested_symbols': rerun_intersection,
+                'completed_scope_proof': {
+                    'schema_version': (
+                        'completed_summarizer_intersection_v1'
+                    ),
+                    'completed_symbols': rerun_intersection,
+                    'admitted_symbols': parent_symbols,
+                },
+            }
+
+        self.resolve_terminal_cutoff.side_effect = resolve_cutoff
+        service = DailyPipelineRunStateService()
+        first_session = self._terminal_continuation_session(
+            run=run,
+            stages=stages,
+            eod_run=eod_run,
+        )
+        first_context = MagicMock()
+        first_context.__enter__.return_value = first_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=first_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=claimed_at,
+            ),
+        ):
+            first = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertTrue(first['claimed'], first)
+        run.run_metadata['terminal_continuation_evidence'][
+            'summary_proof'
+        ].pop('completed_scope_proof')
+
+        summary_stage = stages[1]
+        summary_stage.status = 'completed'
+        summary_stage.processed = 1
+        summary_stage.total = 1
+        summary_stage.succeeded = 1
+        summary_stage.failed = 0
+        summary_stage.remaining = 0
+        summary_stage.current_step = 'agent_feedback_summaries_completed'
+        summary_stage.current_activity = 'Completed rerun summaries'
+        summary_stage.updated_at = interrupted_at
+        summary_stage.completed_at = interrupted_at
+        summary_stage.error_message = None
+        summary_stage.source_run_ids = {'run_id': rerun_source_run_id}
+        summary_stage.details = {
+            'result_summary': {
+                'status': 'completed',
+                'run_id': rerun_source_run_id,
+                'feedback_scope_mode': 'broad_feedback_universe',
+            }
+        }
+        run.status = 'interrupted'
+        run.current_stage = 'agent_feedback_summaries'
+        run.updated_at = interrupted_at
+        run.completed_at = interrupted_at
+        run.run_metadata.update(
+            {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted after summaries.',
+                'interrupted_at': interrupted_at.isoformat(),
+            }
+        )
+        resume_session = self._terminal_continuation_session(
+            run=run,
+            stages=stages,
+            eod_run=eod_run,
+        )
+        summary_child = resume_session.feedback_child_rows[0]
+        summary_roles = summary_child.request_payload['roles']
+        summary_child.request_payload.update(
+            {
+                'requested_symbols': parent_symbols,
+                'admission_scope_by_role': {
+                    role: parent_symbols for role in summary_roles
+                },
+                'role_symbol_scopes': {
+                    role: parent_symbols for role in summary_roles
+                },
+                'role_symbol_counts': {
+                    role: len(parent_symbols) for role in summary_roles
+                },
+            }
+        )
+        summary_child.symbols_total = len(summary_roles) * len(
+            parent_symbols
+        )
+        summary_child.completed_count = summary_child.symbols_total
+        resume_context = MagicMock()
+        resume_context.__enter__.return_value = resume_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=resume_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=interrupted_at + timedelta(minutes=31),
+            ),
+        ):
+            resumed = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(resumed['claimed'], resumed)
+        self.assertEqual(resumed['resume_from_stage'], 'signal_decider')
+        self.assertEqual(
+            resumed['knowledge_cutoff_resolution']['source_run_id'],
+            rerun_source_run_id,
+        )
+        self.assertEqual(
+            resumed['knowledge_cutoff_resolution']['requested_symbols'],
+            rerun_intersection,
+        )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_evidence'][
+                'summary_proof'
+            ]['source_run_id'],
+            old_source_run_id,
+        )
+
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_evidence'][
+                'summary_proof'
+            ]['completed_scope_proof']['completed_symbols'],
+            old_intersection,
+        )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_evidence'][
+                'completed_prefix_summary_proof'
+            ]['completed_scope_proof']['completed_symbols'],
+            rerun_intersection,
+        )
+
+        signal_stage = stages[2]
+        second_interrupted_at = interrupted_at + timedelta(minutes=32)
+        signal_stage.status = 'interrupted'
+        signal_stage.total = 1
+        signal_stage.remaining = 1
+        signal_stage.current_step = 'core_restart_interrupted'
+        signal_stage.current_activity = 'Core restarted again.'
+        signal_stage.updated_at = second_interrupted_at
+        signal_stage.completed_at = second_interrupted_at
+        signal_stage.error_message = 'Core restarted again.'
+        signal_stage.details = {
+            'resumable': True,
+            'interrupted_reason': 'Core restarted again.',
+        }
+        run.status = 'interrupted'
+        run.current_stage = 'signal_decider'
+        run.updated_at = second_interrupted_at
+        run.completed_at = second_interrupted_at
+        run.run_metadata.update(
+            {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted again.',
+                'interrupted_at': second_interrupted_at.isoformat(),
+            }
+        )
+        second_resume_session = self._terminal_continuation_session(
+            run=run,
+            stages=stages,
+            eod_run=eod_run,
+        )
+        second_summary_child = second_resume_session.feedback_child_rows[0]
+        second_summary_child.request_payload = deepcopy(
+            summary_child.request_payload
+        )
+        second_summary_child.symbols_total = summary_child.symbols_total
+        second_summary_child.completed_count = (
+            summary_child.completed_count
+        )
+        second_resume_context = MagicMock()
+        second_resume_context.__enter__.return_value = (
+            second_resume_session
+        )
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=second_resume_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=second_interrupted_at + timedelta(minutes=31),
+            ),
+        ):
+            resumed_again = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(resumed_again['claimed'], resumed_again)
+        self.assertEqual(
+            resumed_again['knowledge_cutoff_resolution']['source_run_id'],
+            rerun_source_run_id,
+        )
+        self.assertEqual(
+            resumed_again['knowledge_cutoff_resolution'][
+                'requested_symbols'
+            ],
+            rerun_intersection,
+        )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_evidence'][
+                'summary_proof'
+            ]['source_run_id'],
+            old_source_run_id,
+        )
+
+        decider_run_id = 'signal_decider-rerun'
+        third_interrupted_at = second_interrupted_at + timedelta(minutes=32)
+        signal_stage.status = 'completed'
+        signal_stage.processed = 2
+        signal_stage.total = 2
+        signal_stage.succeeded = 2
+        signal_stage.failed = 0
+        signal_stage.remaining = 0
+        signal_stage.current_step = 'signal_decider_completed'
+        signal_stage.current_activity = 'Completed rerun decider'
+        signal_stage.updated_at = third_interrupted_at
+        signal_stage.completed_at = third_interrupted_at
+        signal_stage.error_message = None
+        signal_stage.source_run_ids = {'run_id': decider_run_id}
+        signal_stage.details = {
+            'result_summary': {
+                'status': 'completed',
+                'run_id': decider_run_id,
+            }
+        }
+        plan_stage = stages[3]
+        plan_stage.status = 'interrupted'
+        plan_stage.current_step = 'core_restart_interrupted'
+        plan_stage.current_activity = 'Core restarted after decider.'
+        plan_stage.updated_at = third_interrupted_at
+        plan_stage.completed_at = third_interrupted_at
+        plan_stage.error_message = 'Core restarted after decider.'
+        plan_stage.details = {
+            'resumable': True,
+            'interrupted_reason': 'Core restarted after decider.',
+        }
+        run.status = 'interrupted'
+        run.current_stage = 'next_open_execution_plan'
+        run.updated_at = third_interrupted_at
+        run.completed_at = third_interrupted_at
+        run.run_metadata.update(
+            {
+                'resumable': True,
+                'interrupted_reason': 'Core restarted after decider.',
+                'interrupted_at': third_interrupted_at.isoformat(),
+            }
+        )
+        third_resume_session = self._terminal_continuation_session(
+            run=run,
+            stages=stages,
+            eod_run=eod_run,
+        )
+        third_summary_child, third_decider_child = (
+            third_resume_session.feedback_child_rows
+        )
+        third_summary_child.request_payload = deepcopy(
+            summary_child.request_payload
+        )
+        third_summary_child.symbols_total = summary_child.symbols_total
+        third_summary_child.completed_count = summary_child.completed_count
+        decider_roles = third_decider_child.request_payload['roles']
+        admitted_symbols = sorted(parent_symbols)
+        third_decider_child.request_payload.update(
+            {
+                'requested_symbols': rerun_intersection,
+                'admission_scope_by_role': {
+                    role: rerun_intersection for role in decider_roles
+                },
+                'role_symbol_scopes': {
+                    role: rerun_intersection for role in decider_roles
+                },
+                'role_symbol_counts': {
+                    role: len(rerun_intersection) for role in decider_roles
+                },
+                'scope_authority': {
+                    'schema_version': 'agent_feedback_scope_authority_v1',
+                    'kind': (
+                        'completed_summary_intersection_authoritative_cohort'
+                    ),
+                    'source_summary_run_id': rerun_source_run_id,
+                    'source_feedback_scope_mode': (
+                        'broad_feedback_universe'
+                    ),
+                    'decision_feedback_scope_mode': (
+                        'decider_scope_fast_path'
+                    ),
+                    'knowledge_cutoff_at': self.terminal_cutoff.isoformat(),
+                    'fs_div': 'CFS',
+                    'completed_symbols': rerun_intersection,
+                    'admitted_symbol_count': len(admitted_symbols),
+                    'admitted_symbols_sha256': hashlib.sha256(
+                        '\n'.join(admitted_symbols).encode('utf-8')
+                    ).hexdigest(),
+                },
+            }
+        )
+        third_decider_child.symbols_total = len(decider_roles) * len(
+            rerun_intersection
+        )
+        third_decider_child.completed_count = (
+            third_decider_child.symbols_total
+        )
+
+        def tampered_decider_session(
+            *,
+            authority_field: str,
+            authority_value: str,
+        ) -> MagicMock:
+            tampered_session = self._terminal_continuation_session(
+                run=run,
+                stages=stages,
+                eod_run=eod_run,
+            )
+            tampered_summary_child, tampered_decider_child = (
+                tampered_session.feedback_child_rows
+            )
+            tampered_summary_child.request_payload = deepcopy(
+                third_summary_child.request_payload
+            )
+            tampered_summary_child.symbols_total = (
+                third_summary_child.symbols_total
+            )
+            tampered_summary_child.completed_count = (
+                third_summary_child.completed_count
+            )
+            tampered_decider_child.request_payload = deepcopy(
+                third_decider_child.request_payload
+            )
+            tampered_decider_child.request_payload['scope_authority'][
+                authority_field
+            ] = authority_value
+            tampered_decider_child.symbols_total = (
+                third_decider_child.symbols_total
+            )
+            tampered_decider_child.completed_count = (
+                third_decider_child.completed_count
+            )
+            return tampered_session
+
+        for authority_field, authority_value in (
+            ('source_summary_run_id', old_source_run_id),
+            (
+                'knowledge_cutoff_at',
+                (self.terminal_cutoff + timedelta(seconds=1)).isoformat(),
+            ),
+        ):
+            with self.subTest(authority_field=authority_field):
+                tampered_session = tampered_decider_session(
+                    authority_field=authority_field,
+                    authority_value=authority_value,
+                )
+                tampered_context = MagicMock()
+                tampered_context.__enter__.return_value = tampered_session
+                with (
+                    patch(
+                        'app.eod.daily_pipeline_state.session_scope',
+                        return_value=tampered_context,
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_state._utcnow',
+                        return_value=(
+                            third_interrupted_at + timedelta(minutes=31)
+                        ),
+                    ),
+                ):
+                    tampered_result = service.claim_terminal_continuation(
+                        pipeline_run_id=456,
+                        market_date='2026-09-18',
+                        reused_eod_collection_run_id=546,
+                    )
+                self.assertFalse(tampered_result['claimed'])
+                self.assertEqual(
+                    tampered_result['reason'],
+                    'terminal_continuation_feedback_prefix_evidence_invalid',
+                )
+                self.assertEqual(
+                    tampered_result['field'],
+                    'scope_authority',
+                )
+                tampered_session.flush.assert_not_called()
+
+        third_resume_context = MagicMock()
+        third_resume_context.__enter__.return_value = third_resume_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=third_resume_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=third_interrupted_at + timedelta(minutes=31),
+            ),
+        ):
+            resumed_after_decider = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(resumed_after_decider['claimed'], resumed_after_decider)
+        self.assertEqual(
+            resumed_after_decider['resume_from_stage'],
+            'next_open_execution_plan',
+        )
+        self.assertEqual(
+            resumed_after_decider['knowledge_cutoff_resolution'][
+                'source_run_id'
+            ],
+            rerun_source_run_id,
+        )
+        self.assertEqual(
+            run.run_metadata['terminal_continuation_evidence'][
+                'summary_proof'
+            ]['source_run_id'],
+            old_source_run_id,
+        )
 
     def test_claim_terminal_continuation_reclaims_exact_feedback_lease_loss(
         self,
@@ -3043,7 +3644,29 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         claimed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
         failed_at = claimed_at + timedelta(minutes=1)
         run, stages, eod_run = self._terminal_continuation_fixture()
+        parent_symbols = ['005930', '000660']
+        run.run_metadata['symbols'] = parent_symbols
         service = DailyPipelineRunStateService()
+
+        def resolve_cutoff(**kwargs):
+            admitted_symbols = kwargs['requested_symbols'] or ['005930']
+            return {
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': self.terminal_cutoff,
+                'source_run_id': kwargs['source_run_id'],
+                'feedback_scope_mode': kwargs['feedback_scope_mode'],
+                'requested_symbols': ['005930'],
+                'completed_scope_proof': {
+                    'schema_version': (
+                        'completed_summarizer_intersection_v1'
+                    ),
+                    'completed_symbols': ['005930'],
+                    'admitted_symbols': admitted_symbols,
+                },
+            }
+
+        self.resolve_terminal_cutoff.side_effect = resolve_cutoff
 
         first_session = self._terminal_continuation_session(
             run=run,
@@ -3088,7 +3711,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'status': 'completed',
                 'run_id': 'agent_feedback_summaries-continued',
                 'feedback_scope_mode': 'broad_feedback_universe',
-                'requested_symbols': None,
+                'requested_symbols': ['005930'],
             }
         }
 
@@ -3245,6 +3868,22 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'claimed_at': claimed_at.isoformat(),
             'owner_token_hash': 'a' * 64,
         }
+        lease_child.request_payload['scope_authority'] = {
+            'schema_version': 'agent_feedback_scope_authority_v1',
+            'kind': 'completed_summary_intersection_authoritative_cohort',
+            'source_summary_run_id': (
+                'agent_feedback_summaries-continued'
+            ),
+            'source_feedback_scope_mode': 'broad_feedback_universe',
+            'decision_feedback_scope_mode': 'decider_scope_fast_path',
+            'knowledge_cutoff_at': self.terminal_cutoff.isoformat(),
+            'fs_div': 'CFS',
+            'completed_symbols': ['005930'],
+            'admitted_symbol_count': len(parent_symbols),
+            'admitted_symbols_sha256': hashlib.sha256(
+                '\n'.join(sorted(parent_symbols)).encode('utf-8')
+            ).hexdigest(),
+        }
         lease_child.summary_payload = {
             'admission_lease_loss': {
                 'schema_version': (
@@ -3260,6 +3899,23 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             stage_id='agent_feedback_summaries',
             run_id='agent_feedback_summaries-continued',
         )
+        summary_roles = summary_child.request_payload['roles']
+        summary_child.request_payload.update(
+            {
+                'requested_symbols': parent_symbols,
+                'admission_scope_by_role': {
+                    role: parent_symbols for role in summary_roles
+                },
+                'role_symbol_scopes': {
+                    role: parent_symbols for role in summary_roles
+                },
+                'role_symbol_counts': {
+                    role: len(parent_symbols) for role in summary_roles
+                },
+            }
+        )
+        summary_child.symbols_total = len(summary_roles) * len(parent_symbols)
+        summary_child.completed_count = summary_child.symbols_total
 
         def build_resume_session(child: SimpleNamespace) -> MagicMock:
             run_result = MagicMock()
@@ -3285,8 +3941,8 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 lineage_result,
                 active_result,
                 stages_result,
-                lease_child_result,
                 summary_child_result,
+                lease_child_result,
             ]
             session.get.return_value = eod_run
             return session
@@ -3378,7 +4034,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             lease_run_id,
         )
         failed_child_statement = (
-            resume_session.execute.call_args_list[5].args[0]
+            resume_session.execute.call_args_list[6].args[0]
         )
         failed_child_compiled = failed_child_statement.compile()
         self.assertIn(
@@ -3634,6 +4290,26 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'signal_decider_evaluations',
         )
 
+        def resolve_cutoff(**kwargs):
+            admitted_symbols = kwargs['requested_symbols'] or ['005930']
+            return {
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': self.terminal_cutoff,
+                'source_run_id': kwargs['source_run_id'],
+                'feedback_scope_mode': kwargs['feedback_scope_mode'],
+                'requested_symbols': ['005930'],
+                'completed_scope_proof': {
+                    'schema_version': (
+                        'completed_summarizer_intersection_v1'
+                    ),
+                    'completed_symbols': ['005930'],
+                    'admitted_symbols': admitted_symbols,
+                },
+            }
+
+        self.resolve_terminal_cutoff.side_effect = resolve_cutoff
+
         for completed_prefix_size in range(len(suffix_ids)):
             with self.subTest(completed_prefix_size=completed_prefix_size):
                 run, stages, eod_run = self._terminal_continuation_fixture()
@@ -3690,7 +4366,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                                 'feedback_scope_mode': (
                                     'broad_feedback_universe'
                                 ),
-                                'requested_symbols': None,
+                                'requested_symbols': ['005930'],
                             }
                         )
 
@@ -3814,6 +4490,12 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     self.assertEqual(
                         between_result['resume_from_stage'],
                         suffix_ids[1],
+                    )
+                    self.assertEqual(
+                        between_result['knowledge_cutoff_resolution'][
+                            'completed_scope_proof'
+                        ],
+                        self.completed_scope_proof,
                     )
                     self.assertEqual(
                         between_stages[1].stage_id,
@@ -3953,7 +4635,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                         reused_eod_collection_run_id=546,
                     )
 
-                self.assertTrue(resumed['claimed'])
+                self.assertTrue(resumed['claimed'], resumed)
                 self.assertTrue(resumed['resumed'])
                 self.assertEqual(
                     resumed['resume_from_stage'],
@@ -4067,7 +4749,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                                 reused_eod_collection_run_id=546,
                             )
                         )
-                    self.assertTrue(resumed_again['claimed'])
+                    self.assertTrue(resumed_again['claimed'], resumed_again)
                     self.assertEqual(
                         list(resumed_again['persisted_stage_outcomes']),
                         list(suffix_ids[:2]),
@@ -4380,6 +5062,15 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'summary_proof'
             ]['feedback_scope_mode'] = 'requested_symbols'
 
+        def changed_completed_scope_proof(run, stages):
+            run.run_metadata['terminal_continuation_evidence'][
+                'summary_proof'
+            ]['completed_scope_proof'] = {
+                'schema_version': 'completed_summarizer_intersection_v1',
+                'completed_symbols': ['000660'],
+                'admitted_symbols': ['005930'],
+            }
+
         def changed_archived_failure(run, stages):
             evidence = run.run_metadata[
                 'terminal_continuation_evidence'
@@ -4405,6 +5096,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             (
                 'changed feedback scope',
                 changed_scope,
+                'summary_knowledge_cutoff_proof_mismatch',
+            ),
+            (
+                'changed completed scope proof',
+                changed_completed_scope_proof,
                 'summary_knowledge_cutoff_proof_mismatch',
             ),
             (
@@ -4639,6 +5335,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'source_run_id': 'feedback-cycle-summary',
             'feedback_scope_mode': 'decider_scope_fast_path',
             'requested_symbols': ['005930'],
+            'completed_scope_proof': self.completed_scope_proof,
         }
         resumed_at = interrupted_at + timedelta(hours=1)
 

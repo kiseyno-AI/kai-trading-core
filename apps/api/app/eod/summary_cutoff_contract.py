@@ -14,6 +14,9 @@ LEGACY_CUTOFF_REPAIR_STAGE_IDS = (
     'signal_decider_evaluations',
 )
 SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION = 1
+COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION = (
+    'completed_summarizer_intersection_v1'
+)
 
 
 def normalize_symbol_codes(symbols: Sequence[object]) -> list[str]:
@@ -121,6 +124,69 @@ def summary_scope_matches_parent(
     if normalized_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH:
         return set(normalized_summary).issubset(normalized_parent)
     return False
+
+
+def completed_summary_scope_matches_parent(
+    *,
+    feedback_scope_mode: object,
+    completed_symbols: object,
+    completed_scope_proof: object,
+    parent_symbols: object,
+) -> bool:
+    """Validate an exact completed summarizer intersection.
+
+    This is deliberately separate from ``summary_scope_matches_parent``.
+    Raw BROAD scopes must still equal their parent. Only a versioned proof
+    produced while resolving one exact completed summary run may narrow that
+    admitted BROAD scope to the symbols completed by every summarizer.
+    """
+
+    normalized_mode = str(feedback_scope_mode or '').strip()
+    if normalized_mode not in {
+        FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    } or not isinstance(completed_scope_proof, Mapping):
+        return False
+    if (
+        str(completed_scope_proof.get('schema_version') or '').strip()
+        != COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+    ):
+        return False
+    proof_completed_symbols = completed_scope_proof.get(
+        'completed_symbols'
+    )
+    admitted_symbols = completed_scope_proof.get('admitted_symbols')
+    if not all(
+        isinstance(symbols, (list, tuple))
+        for symbols in (
+            completed_symbols,
+            proof_completed_symbols,
+            admitted_symbols,
+        )
+    ):
+        return False
+    normalized_completed = normalize_symbol_codes(completed_symbols)
+    normalized_proof_completed = normalize_symbol_codes(
+        proof_completed_symbols
+    )
+    normalized_admitted = normalize_symbol_codes(admitted_symbols)
+    if not (
+        normalized_completed
+        and normalized_admitted
+        and list(completed_symbols) == normalized_completed
+        and list(proof_completed_symbols) == normalized_proof_completed
+        and list(admitted_symbols) == normalized_admitted
+        and normalized_completed == normalized_proof_completed
+        and set(normalized_completed).issubset(normalized_admitted)
+    ):
+        return False
+    if parent_symbols is None:
+        return True
+    return summary_scope_matches_parent(
+        feedback_scope_mode=normalized_mode,
+        summary_symbols=normalized_admitted,
+        parent_symbols=parent_symbols,
+    )
 
 
 def is_summary_cutoff_contract_repair_candidate(

@@ -50,6 +50,8 @@ from app.agent_context.roles import (
 )
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
     normalize_feedback_scope_mode,
 )
@@ -61,6 +63,9 @@ from app.db_models import (
     AgentContextFeedback,
     AgentContextFeedbackFailure,
     AgentContextFeedbackRun,
+)
+from app.eod.summary_cutoff_contract import (
+    COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION,
 )
 
 EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
@@ -244,6 +249,164 @@ def _previous_run_matches_fs_div(
         return _normalize_feedback_fs_div(prior_fs_div) == effective_fs_div
     except ValueError:
         return False
+
+
+def _normalize_feedback_scope_authority(
+    value: Mapping[str, Any] | None,
+    *,
+    roles: Sequence[str],
+    requested_symbols: Sequence[str] | None,
+    feedback_scope_mode: str,
+    knowledge_cutoff_at: datetime | str,
+    fs_div: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError('scope_authority must be a mapping when provided')
+    if (
+        str(value.get('schema_version') or '').strip()
+        != FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+        or str(value.get('kind') or '').strip()
+        != FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+    ):
+        raise ValueError('scope_authority contract is unsupported')
+    normalized_roles = {
+        str(role or '').strip().lower()
+        for role in roles
+        if str(role or '').strip()
+    }
+    if normalized_roles != set(DECISION_SUPPORT_AGENT_NAMES):
+        raise ValueError(
+            'summary-intersection scope authority requires every '
+            'decision-support role'
+        )
+    if requested_symbols is None:
+        raise ValueError(
+            'summary-intersection scope authority requires explicit symbols'
+        )
+    normalized_requested = sorted(
+        _normalize_optional_symbol_scope(requested_symbols)
+    )
+    if not normalized_requested or len(normalized_requested) != len(
+        requested_symbols
+    ):
+        raise ValueError(
+            'summary-intersection scope authority requires unique symbols'
+        )
+    source_summary_run_id = str(
+        value.get('source_summary_run_id') or ''
+    ).strip()
+    if not source_summary_run_id:
+        raise ValueError(
+            'summary-intersection scope authority requires source run id'
+        )
+    normalized_scope_mode = normalize_feedback_scope_mode(
+        feedback_scope_mode
+    )
+    raw_source_scope_mode = value.get('source_feedback_scope_mode')
+    raw_decision_scope_mode = value.get('decision_feedback_scope_mode')
+    if not all(
+        isinstance(scope_mode, str) and scope_mode.strip()
+        for scope_mode in (
+            raw_source_scope_mode,
+            raw_decision_scope_mode,
+        )
+    ):
+        raise ValueError(
+            'summary-intersection scope authority modes are required'
+        )
+    source_scope_mode = normalize_feedback_scope_mode(
+        raw_source_scope_mode
+    )
+    if normalize_feedback_scope_mode(
+        raw_decision_scope_mode
+    ) != normalized_scope_mode:
+        raise ValueError(
+            'summary-intersection scope authority mode does not match request'
+        )
+    normalized_cutoff = _normalize_admission_knowledge_cutoff(
+        knowledge_cutoff_at
+    )
+    authority_cutoff = _normalize_admission_knowledge_cutoff(
+        value.get('knowledge_cutoff_at')
+    )
+    if authority_cutoff != normalized_cutoff:
+        raise ValueError(
+            'summary-intersection scope authority cutoff does not match request'
+        )
+    normalized_fs_div = _normalize_feedback_fs_div(fs_div)
+    raw_authority_fs_div = value.get('fs_div')
+    if not isinstance(raw_authority_fs_div, str) or not (
+        raw_authority_fs_div.strip()
+    ) or _normalize_feedback_fs_div(raw_authority_fs_div) != normalized_fs_div:
+        raise ValueError(
+            'summary-intersection scope authority fs_div does not match request'
+        )
+    completed_scope_proof = value.get('completed_scope_proof')
+    if not isinstance(completed_scope_proof, Mapping) or (
+        str(completed_scope_proof.get('schema_version') or '').strip()
+        != COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+    ):
+        raise ValueError(
+            'summary-intersection scope authority proof is invalid'
+        )
+    raw_completed_symbols = completed_scope_proof.get(
+        'completed_symbols'
+    )
+    raw_admitted_symbols = completed_scope_proof.get('admitted_symbols')
+    if not isinstance(raw_completed_symbols, list) or not isinstance(
+        raw_admitted_symbols,
+        list,
+    ):
+        raise ValueError(
+            'summary-intersection scope authority proof symbols are invalid'
+        )
+    normalized_completed = sorted(
+        _normalize_optional_symbol_scope(raw_completed_symbols)
+    )
+    normalized_admitted = sorted(
+        _normalize_optional_symbol_scope(raw_admitted_symbols)
+    )
+    if not (
+        normalized_completed == normalized_requested
+        and len(normalized_completed) == len(raw_completed_symbols)
+        and normalized_admitted
+        and len(normalized_admitted) == len(raw_admitted_symbols)
+        and set(normalized_completed).issubset(normalized_admitted)
+    ):
+        raise ValueError(
+            'summary-intersection scope authority proof is outside admission'
+        )
+    return {
+        'schema_version': FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+        'kind': FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+        'source_summary_run_id': source_summary_run_id,
+        'source_feedback_scope_mode': source_scope_mode,
+        'decision_feedback_scope_mode': normalized_scope_mode,
+        'knowledge_cutoff_at': normalized_cutoff,
+        'fs_div': normalized_fs_div,
+        'completed_symbols': normalized_completed,
+        'admitted_symbol_count': len(normalized_admitted),
+        'admitted_symbols_sha256': hashlib.sha256(
+            '\n'.join(normalized_admitted).encode('utf-8')
+        ).hexdigest(),
+    }
+
+
+def _previous_run_matches_scope_authority(
+    previous_run: dict[str, Any] | None,
+    scope_authority: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(previous_run, dict):
+        return False
+    request_payload = previous_run.get('request_payload')
+    if not isinstance(request_payload, dict):
+        return False
+    persisted_authority = request_payload.get('scope_authority')
+    if scope_authority is None:
+        return persisted_authority is None
+    return persisted_authority == dict(scope_authority)
 
 
 def resolve_latest_completed_summary_knowledge_cutoff(
@@ -618,6 +781,13 @@ def resolve_latest_completed_summary_knowledge_cutoff(
                 'reason': 'summary_run_symbol_scope_mismatch',
             }
         base_result['requested_symbols'] = completed_scope
+        base_result['completed_scope_proof'] = {
+            'schema_version': (
+                COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+            ),
+            'completed_symbols': list(completed_scope),
+            'admitted_symbols': list(admitted_scope),
+        }
         exact_summary_item_total = completed_item_totals[0]
 
     status = str(latest_run.get('status') or '').strip().lower()
@@ -819,6 +989,7 @@ def _claim_feedback_retry_run(
     started_at: datetime,
     admission_knowledge_cutoff_at: datetime | str | None = None,
     fs_div: str | None = None,
+    scope_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically claim a durable retry scope without holding a pool slot."""
 
@@ -962,6 +1133,12 @@ def _claim_feedback_retry_run(
                     and normalized_admission_knowledge_cutoff_at
                     == active_knowledge_cutoff_at
                     and normalized_fs_div == active_fs_div
+                    and payload.get('scope_authority')
+                    == (
+                        dict(scope_authority)
+                        if scope_authority is not None
+                        else None
+                    )
                 ),
             }
 
@@ -996,6 +1173,11 @@ def _claim_feedback_retry_run(
                         normalized_admission_knowledge_cutoff_at
                     ),
                     'admission_scope_by_role': admission_scope_payload,
+                    **(
+                        {'scope_authority': dict(scope_authority)}
+                        if scope_authority is not None
+                        else {}
+                    ),
                     'retry_admission': {
                         'schema_version': RETRY_ADMISSION_SCHEMA_VERSION,
                         'claimed_at': now.isoformat(),
@@ -1407,6 +1589,7 @@ class FeedbackRetryCycleConfig:
     outer_batch_size: int = 20
     reuse_existing: bool = True
     force_recompute: bool = False
+    scope_authority: Mapping[str, Any] | None = None
     progress_callback: Callable[..., Any] | None = None
 
 
@@ -3294,6 +3477,14 @@ class AgentFeedbackRetryService:
             if raw_knowledge_cutoff_at is not None
             else None
         )
+        normalized_scope_authority = _normalize_feedback_scope_authority(
+            getattr(config, 'scope_authority', None),
+            roles=roles,
+            requested_symbols=requested_symbols,
+            feedback_scope_mode=feedback_scope_mode,
+            knowledge_cutoff_at=effective_knowledge_cutoff_at,
+            fs_div=resolved_fs_div,
+        )
 
         previous_run = None
         if not bool(force or getattr(config, 'force_recompute', False)):
@@ -3314,6 +3505,9 @@ class AgentFeedbackRetryService:
             ) or not _previous_run_matches_fs_div(
                 previous_run,
                 resolved_fs_div,
+            ) or not _previous_run_matches_scope_authority(
+                previous_run,
+                normalized_scope_authority,
             ):
                 previous_run = None
         request_run_id = (
@@ -3332,6 +3526,7 @@ class AgentFeedbackRetryService:
                 effective_knowledge_cutoff_at.isoformat()
             ),
             fs_div=resolved_fs_div,
+            scope_authority=normalized_scope_authority,
         )
         if not admission['acquired']:
             active_run = admission.get('conflict_run')
@@ -3419,6 +3614,9 @@ class AgentFeedbackRetryService:
                     requested_knowledge_cutoff_at=(
                         requested_knowledge_cutoff_at
                     ),
+                    normalized_scope_authority=(
+                        normalized_scope_authority
+                    ),
                 )
         except Exception as exc:
             _finish_feedback_retry_claim_if_running(
@@ -3450,6 +3648,7 @@ class AgentFeedbackRetryService:
         effective_knowledge_cutoff_at: datetime | None = None,
         knowledge_cutoff_source: str | None = None,
         requested_knowledge_cutoff_at: str | None = None,
+        normalized_scope_authority: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
         resolved_fs_div = _normalize_feedback_fs_div(
@@ -3553,6 +3752,17 @@ class AgentFeedbackRetryService:
                 else None
             )
         knowledge_cutoff_at = effective_knowledge_cutoff_at.isoformat()
+        if normalized_scope_authority is None:
+            normalized_scope_authority = (
+                _normalize_feedback_scope_authority(
+                    getattr(config, 'scope_authority', None),
+                    roles=roles,
+                    requested_symbols=requested_symbols,
+                    feedback_scope_mode=feedback_scope_mode,
+                    knowledge_cutoff_at=knowledge_cutoff_at,
+                    fs_div=resolved_fs_div,
+                )
+            )
         decider_scope_symbols = _ordered_symbol_union(
             [
                 role_symbol_scopes.get(role, ())
@@ -3776,6 +3986,11 @@ class AgentFeedbackRetryService:
             'reuse_existing': config.reuse_existing,
             'force_recompute': effective_force_recompute,
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+            **(
+                {'scope_authority': dict(normalized_scope_authority)}
+                if normalized_scope_authority is not None
+                else {}
+            ),
             'feedback_scope_mode': feedback_scope_mode,
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
@@ -4383,6 +4598,11 @@ class AgentFeedbackRetryService:
             'reuse_existing': config.reuse_existing,
             'force_recompute': effective_force_recompute,
             'feedback_scope_mode': feedback_scope_mode,
+            'scope_authority': (
+                dict(normalized_scope_authority)
+                if normalized_scope_authority is not None
+                else None
+            ),
             'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
             'eligible_symbols': list(eligible_symbols) if requested_symbols is not None else None,
             'skipped_symbols': skipped_symbols,
