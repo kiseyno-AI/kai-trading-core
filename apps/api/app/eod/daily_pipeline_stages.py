@@ -2192,6 +2192,21 @@ class DailyPipelineStageService:
             except (TypeError, ValueError):
                 return 0
 
+        def _strict_non_negative_int(value: Any) -> int | None:
+            if isinstance(value, bool) or value is None:
+                return None
+            if isinstance(value, int):
+                return value if value >= 0 else None
+            return None
+
+        def _failed_contract_counts() -> dict[str, int]:
+            return {
+                'processed': 1,
+                'total': 1,
+                'succeeded': 0,
+                'failed': 1,
+            }
+
         if stage_id == 'agent_feedback_summaries':
             role_progress = DailyPipelineStageService._extract_role_progress(result)
             if role_progress:
@@ -2226,6 +2241,212 @@ class DailyPipelineStageService:
                     failed += role_failed
                 return {
                     'processed': processed,
+                    'total': total,
+                    'succeeded': succeeded,
+                    'failed': failed,
+                }
+        if stage_id == 'signal_decider':
+            progress = (
+                result.get('progress')
+                if isinstance(result.get('progress'), dict)
+                else {}
+            )
+            summary = (
+                progress.get('summary')
+                if isinstance(progress.get('summary'), dict)
+                else {}
+            )
+            result_payload = (
+                progress.get('result')
+                if isinstance(progress.get('result'), dict)
+                else {}
+            )
+            role_results = (
+                result_payload.get('roles')
+                if isinstance(result_payload.get('roles'), dict)
+                else {}
+            )
+            has_summary_counts = any(
+                key in summary
+                for key in (
+                    'expected_feedback_count',
+                    'completed_feedback_count',
+                    'failed_items',
+                )
+            )
+            role_total = role_succeeded = role_failed = 0
+            has_valid_role_denominator = bool(role_results)
+            if has_valid_role_denominator:
+                for role_result in role_results.values():
+                    if not isinstance(role_result, dict):
+                        has_valid_role_denominator = False
+                        break
+                    requested_count = _strict_non_negative_int(
+                        role_result.get('requested_count')
+                    )
+                    completed_count = _strict_non_negative_int(
+                        role_result.get('completed_count')
+                    )
+                    error_count = _strict_non_negative_int(
+                        role_result.get('error_count')
+                    )
+                    if (
+                        requested_count is None
+                        or requested_count <= 0
+                        or completed_count is None
+                        or completed_count > requested_count
+                        or error_count is None
+                        or completed_count + error_count > requested_count
+                    ):
+                        has_valid_role_denominator = False
+                        break
+                    role_total += requested_count
+                    role_succeeded += completed_count
+                    role_failed += error_count
+            if has_summary_counts or role_results:
+                if not has_valid_role_denominator or role_total <= 0:
+                    return _failed_contract_counts()
+                succeeded_candidates: list[int] = []
+                if 'completed_feedback_count' in summary:
+                    succeeded_candidates.append(
+                        max(
+                            _int(summary.get('completed_feedback_count')),
+                            0,
+                        )
+                    )
+                succeeded_candidates.append(role_succeeded)
+                succeeded = (
+                    min(succeeded_candidates)
+                    if succeeded_candidates
+                    else 0
+                )
+                summary_failed = (
+                    max(_int(summary.get('failed_items')), 0)
+                    if 'failed_items' in summary
+                    else 0
+                )
+                failed = max(summary_failed, role_failed)
+                processed = succeeded + failed
+                summary_expected = (
+                    max(_int(summary.get('expected_feedback_count')), 0)
+                    if 'expected_feedback_count' in summary
+                    else 0
+                )
+                return {
+                    'processed': processed,
+                    'total': max(summary_expected, role_total, processed),
+                    'succeeded': succeeded,
+                    'failed': failed,
+                }
+        if stage_id == 'signal_decider_evaluations':
+            request = (
+                result.get('request')
+                if isinstance(result.get('request'), dict)
+                else {}
+            )
+            summary = (
+                result.get('summary')
+                if isinstance(result.get('summary'), dict)
+                else {}
+            )
+            if (
+                'evaluations_upserted' in summary
+                or 'outcomes_upserted' in summary
+            ):
+                evaluations = max(
+                    _int(summary.get('evaluations_upserted')),
+                    0,
+                )
+                outcomes = max(_int(summary.get('outcomes_upserted')), 0)
+                explicit_failed = max(
+                    _int(summary.get('failed_count')),
+                    _int(summary.get('failed_items')),
+                    _int(summary.get('not_computed_count')),
+                    0,
+                )
+                mismatch = (
+                    abs(outcomes - evaluations)
+                    if 'evaluations_upserted' in summary
+                    and 'outcomes_upserted' in summary
+                    else 0
+                )
+                failed = max(explicit_failed, mismatch)
+                succeeded = min(evaluations, outcomes)
+                if 'outcomes_upserted' not in summary:
+                    succeeded = evaluations
+                elif 'evaluations_upserted' not in summary:
+                    succeeded = outcomes
+                horizons = request.get('horizons')
+                valid_horizons = bool(
+                    isinstance(horizons, (list, tuple))
+                    and horizons
+                    and all(
+                        isinstance(horizon, int)
+                        and not isinstance(horizon, bool)
+                        and horizon > 0
+                        for horizon in horizons
+                    )
+                    and len(set(horizons)) == len(horizons)
+                )
+                decisions_considered = (
+                    _strict_non_negative_int(
+                        summary.get('decisions_considered')
+                    )
+                    or 0
+                )
+                request_total = (
+                    decisions_considered * len(horizons)
+                    if valid_horizons and decisions_considered > 0
+                    else 0
+                )
+                coverage = (
+                    summary.get('coverage')
+                    if isinstance(summary.get('coverage'), dict)
+                    else {}
+                )
+                if request_total <= 0:
+                    return _failed_contract_counts()
+                coverage_count = _strict_non_negative_int(
+                    coverage.get('count')
+                )
+                if 'count' in coverage and coverage_count != request_total:
+                    return _failed_contract_counts()
+                coverage_component_keys = (
+                    'computed_count',
+                    'pending_maturity_count',
+                    'insufficient_price_data_count',
+                    'not_computed_count',
+                )
+                present_coverage_components = tuple(
+                    key for key in coverage_component_keys if key in coverage
+                )
+                if present_coverage_components:
+                    component_counts = [
+                        _strict_non_negative_int(coverage.get(key))
+                        for key in coverage_component_keys
+                    ]
+                    if (
+                        len(present_coverage_components)
+                        != len(coverage_component_keys)
+                        or any(count is None for count in component_counts)
+                        or sum(
+                            count
+                            for count in component_counts
+                            if count is not None
+                        )
+                        != request_total
+                    ):
+                        return _failed_contract_counts()
+                coverage_total = coverage_count or 0
+                total = max(
+                    request_total,
+                    coverage_total,
+                    evaluations,
+                    outcomes,
+                    succeeded + failed,
+                )
+                return {
+                    'processed': succeeded + failed,
                     'total': total,
                     'succeeded': succeeded,
                     'failed': failed,

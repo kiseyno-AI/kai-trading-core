@@ -3535,6 +3535,161 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
+    def test_extract_stage_counts_uses_signal_decider_terminal_work(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='signal_decider',
+            result={
+                'status': 'completed',
+                'completed': True,
+                'final_pending': 0,
+                'progress': {
+                    'result': {
+                        'roles': {
+                            'short-term-decider': {
+                                'requested_count': 80,
+                                'completed_count': 80,
+                                'error_count': 0,
+                            },
+                            'signal-decider': {
+                                'requested_count': 80,
+                                'completed_count': 80,
+                                'error_count': 0,
+                            },
+                        },
+                    },
+                    'summary': {
+                        'run_status': 'completed',
+                        'run_table_status': 'completed',
+                        'expected_feedback_count': 160,
+                        'completed_feedback_count': 160,
+                        'failed_items': 0,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 160,
+                'total': 160,
+                'succeeded': 160,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_uses_signal_decider_evaluation_writes(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='signal_decider_evaluations',
+            result={
+                'request': {
+                    'horizons': [1, 3, 5, 10],
+                },
+                'summary': {
+                    'status': 'completed',
+                    'decisions_considered': 960,
+                    'outcomes_upserted': 3_840,
+                    'evaluations_upserted': 3_840,
+                    'not_computed_count': 0,
+                    'warning_count': 0,
+                    'coverage': {
+                        'count': 3_840,
+                        'computed_count': 2_284,
+                        'pending_maturity_count': 1_550,
+                        'insufficient_price_data_count': 6,
+                        'not_computed_count': 0,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 3_840,
+                'total': 3_840,
+                'succeeded': 3_840,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_keeps_decider_request_denominator_when_summary_is_truncated(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='signal_decider',
+            result={
+                'progress': {
+                    'result': {
+                        'roles': {
+                            'short-term-decider': {
+                                'requested_count': 80,
+                                'completed_count': 80,
+                                'error_count': 0,
+                            },
+                            'signal-decider': {
+                                'requested_count': 80,
+                                'completed_count': 80,
+                                'error_count': 0,
+                            },
+                        },
+                    },
+                    'summary': {
+                        'expected_feedback_count': 65,
+                        'completed_feedback_count': 65,
+                        'failed_items': 0,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 65,
+                'total': 160,
+                'succeeded': 65,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_keeps_evaluation_request_denominator_when_writes_are_truncated(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='signal_decider_evaluations',
+            result={
+                'request': {
+                    'horizons': [1, 3, 5, 10],
+                },
+                'summary': {
+                    'decisions_considered': 960,
+                    'outcomes_upserted': 65,
+                    'evaluations_upserted': 65,
+                    'failed_count': 0,
+                    'coverage': {
+                        'count': 3_840,
+                        'computed_count': 2_284,
+                        'pending_maturity_count': 1_550,
+                        'insufficient_price_data_count': 6,
+                        'not_computed_count': 0,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 65,
+                'total': 3_840,
+                'succeeded': 65,
+                'failed': 0,
+            },
+        )
+
     def test_extract_stage_counts_preserves_explicit_zero_eligible_news_scope(self) -> None:
         counts = DailyPipelineStageService._extract_stage_counts(
             stage_id='external_news_collect',
