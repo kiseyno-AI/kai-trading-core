@@ -7798,6 +7798,20 @@ class PykrxBackfillServiceTests(TestCase):
             _is_terminal_followup_continuation_candidate(claimed_run)
         )
 
+        malformed_completed_scope_proof = deepcopy(claimed_run)
+        malformed_completed_scope_proof['run_metadata'][
+            'terminal_continuation_evidence'
+        ]['summary_proof']['completed_scope_proof'] = {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': ['005930'],
+            'admitted_symbols': ['035420'],
+        }
+        self.assertFalse(
+            _is_terminal_followup_continuation_candidate(
+                malformed_completed_scope_proof
+            )
+        )
+
         outside_parent_scope = deepcopy(claimed_run)
         outside_parent_scope['run_metadata'][
             'terminal_continuation_evidence'

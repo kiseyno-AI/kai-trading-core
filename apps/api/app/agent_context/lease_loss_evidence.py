@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import date, datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
@@ -9,8 +10,13 @@ from app.agent_context.roles import (
 )
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
+from app.eod.summary_cutoff_contract import (
+    COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION,
 )
 
 
@@ -53,6 +59,245 @@ def _integer(value: Any) -> int | None:
         return None
 
 
+def _canonical_symbols(value: object, *, sorted_order: bool) -> list[str] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    if not all(isinstance(symbol, str) for symbol in value):
+        return None
+    symbols = [str(symbol).strip() for symbol in value]
+    if (
+        not symbols
+        or any(not symbol for symbol in symbols)
+        or len(symbols) != len(set(symbols))
+    ):
+        return None
+    if sorted_order and symbols != sorted(symbols):
+        return None
+    return symbols
+
+
+def _authoritative_completed_summary_scope(
+    *,
+    request_payload: Mapping[str, Any],
+    parent_symbols: Sequence[str],
+    knowledge_cutoff_at: datetime,
+    fs_div: str,
+    completed_summary_proof: Mapping[str, Any] | None,
+    expected_summary_source_run_id: str | None,
+) -> tuple[list[str] | None, str | None]:
+    """Return the proven decider cohort, preserving legacy absence semantics."""
+
+    if 'scope_authority' not in request_payload:
+        if completed_summary_proof is not None:
+            proof_scope = completed_summary_proof.get(
+                'completed_scope_proof'
+            )
+            proof_requested_symbols = _canonical_symbols(
+                completed_summary_proof.get('requested_symbols'),
+                sorted_order=False,
+            )
+            proof_completed_symbols = (
+                _canonical_symbols(
+                    proof_scope.get('completed_symbols'),
+                    sorted_order=False,
+                )
+                if isinstance(proof_scope, Mapping)
+                else None
+            )
+            proof_admitted_symbols = (
+                _canonical_symbols(
+                    proof_scope.get('admitted_symbols'),
+                    sorted_order=False,
+                )
+                if isinstance(proof_scope, Mapping)
+                else None
+            )
+            proof_scope_mode = str(
+                completed_summary_proof.get('feedback_scope_mode') or ''
+            ).strip()
+            if not (
+                completed_summary_proof.get('ready') is True
+                and isinstance(proof_scope, Mapping)
+                and proof_scope.get('schema_version')
+                == COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+                and proof_requested_symbols
+                and proof_completed_symbols == proof_requested_symbols
+                and proof_admitted_symbols
+                and set(proof_requested_symbols).issubset(
+                    proof_admitted_symbols
+                )
+                and proof_scope_mode
+                in {
+                    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                }
+                and len(proof_requested_symbols) == len(parent_symbols)
+                and set(proof_requested_symbols) == set(parent_symbols)
+                and len(proof_admitted_symbols) == len(parent_symbols)
+                and set(proof_admitted_symbols) == set(parent_symbols)
+                and type(
+                    completed_summary_proof.get(
+                        'requested_symbol_count'
+                    )
+                )
+                is int
+                and completed_summary_proof.get(
+                    'requested_symbol_count'
+                )
+                == len(proof_requested_symbols)
+                and _utc_datetime(
+                    completed_summary_proof.get('knowledge_cutoff_at')
+                )
+                == knowledge_cutoff_at
+                and (
+                    expected_summary_source_run_id is None
+                    or str(
+                        completed_summary_proof.get('source_run_id') or ''
+                    ).strip()
+                    == expected_summary_source_run_id
+                )
+            ):
+                return None, 'scope_authority'
+        return list(parent_symbols), None
+
+    authority = request_payload.get('scope_authority')
+    if not isinstance(authority, Mapping):
+        return None, 'scope_authority'
+    completed_symbols = _canonical_symbols(
+        authority.get('completed_symbols'),
+        sorted_order=True,
+    )
+    parent_scope = _canonical_symbols(parent_symbols, sorted_order=False)
+    source_summary_run_id = str(
+        authority.get('source_summary_run_id') or ''
+    ).strip()
+    source_scope_mode = str(
+        authority.get('source_feedback_scope_mode') or ''
+    ).strip()
+    decision_scope_mode = str(
+        authority.get('decision_feedback_scope_mode') or ''
+    ).strip()
+    authority_fs_div = str(authority.get('fs_div') or '').strip().upper()
+    authority_cutoff = _utc_datetime(authority.get('knowledge_cutoff_at'))
+    if not (
+        authority.get('schema_version')
+        == FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+        and authority.get('kind')
+        == FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+        and source_summary_run_id
+        and (
+            expected_summary_source_run_id is None
+            or source_summary_run_id == expected_summary_source_run_id
+        )
+        and source_scope_mode
+        in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and decision_scope_mode
+        == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+        and completed_symbols
+        and parent_scope
+        and set(completed_symbols).issubset(parent_scope)
+        and authority_cutoff == knowledge_cutoff_at
+        and authority_fs_div == str(fs_div or '').strip().upper()
+    ):
+        return None, 'scope_authority'
+
+    admitted_symbols = sorted(parent_scope)
+    if completed_summary_proof is not None:
+        proof_completed_scope = completed_summary_proof.get(
+            'completed_scope_proof'
+        )
+        proof_requested_symbols = _canonical_symbols(
+            completed_summary_proof.get('requested_symbols'),
+            sorted_order=False,
+        )
+        if not isinstance(proof_completed_scope, Mapping):
+            return None, 'scope_authority'
+        proof_completed_symbols = _canonical_symbols(
+            proof_completed_scope.get('completed_symbols'),
+            sorted_order=False,
+        )
+        proof_admitted_symbols = _canonical_symbols(
+            proof_completed_scope.get('admitted_symbols'),
+            sorted_order=False,
+        )
+        proof_source_run_id = str(
+            completed_summary_proof.get('source_run_id') or ''
+        ).strip()
+        proof_scope_mode = str(
+            completed_summary_proof.get('feedback_scope_mode') or ''
+        ).strip()
+        proof_requested_symbol_count = _integer(
+            completed_summary_proof.get('requested_symbol_count')
+        )
+        if not (
+            completed_summary_proof.get('ready') is True
+            and proof_source_run_id == source_summary_run_id
+            and proof_scope_mode == source_scope_mode
+            and _utc_datetime(
+                completed_summary_proof.get('knowledge_cutoff_at')
+            )
+            == knowledge_cutoff_at
+            and proof_completed_scope.get('schema_version')
+            == COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+            and proof_requested_symbols == completed_symbols
+            and proof_completed_symbols == completed_symbols
+            and proof_admitted_symbols
+            and proof_requested_symbol_count == len(completed_symbols)
+            and set(completed_symbols).issubset(proof_admitted_symbols)
+            and (
+                (
+                    source_scope_mode
+                    == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+                    and len(proof_admitted_symbols) == len(parent_scope)
+                    and set(proof_admitted_symbols) == set(parent_scope)
+                )
+                or (
+                    source_scope_mode
+                    == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    and set(proof_admitted_symbols).issubset(parent_scope)
+                )
+            )
+        ):
+            return None, 'scope_authority'
+        admitted_symbols = sorted(proof_admitted_symbols)
+
+    admitted_symbol_count = authority.get('admitted_symbol_count')
+    admitted_symbols_sha256 = str(
+        authority.get('admitted_symbols_sha256') or ''
+    ).strip().lower()
+    if not (
+        type(admitted_symbol_count) is int
+        and admitted_symbol_count == len(admitted_symbols)
+        and admitted_symbols_sha256
+        == hashlib.sha256(
+            '\n'.join(admitted_symbols).encode('utf-8')
+        ).hexdigest()
+    ):
+        return None, 'scope_authority'
+    return completed_symbols, None
+
+
+def _role_scope_matches(
+    value: object,
+    *,
+    expected_symbols: Sequence[str],
+) -> bool:
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(symbol, str) for symbol in value)
+        or len(value) != len(set(value))
+    ):
+        return False
+    requested_symbol_set = set(expected_symbols)
+    return all(
+        isinstance(symbol, str) and symbol in requested_symbol_set
+        for symbol in value
+    )
+
+
 def terminal_feedback_lease_loss_evidence_error(
     *,
     child_run: object | None,
@@ -60,6 +305,8 @@ def terminal_feedback_lease_loss_evidence_error(
     market_date: date,
     metadata: Mapping[str, Any],
     knowledge_cutoff_at: datetime,
+    completed_summary_proof: Mapping[str, Any] | None = None,
+    expected_summary_source_run_id: str | None = None,
 ) -> str | None:
     """Validate the abandoned feedback parent proving a lease-loss event."""
 
@@ -103,6 +350,16 @@ def terminal_feedback_lease_loss_evidence_error(
         and len(raw_symbols) == len(set(raw_symbols))
     ):
         return 'request_context'
+    expected_symbols, authority_error = _authoritative_completed_summary_scope(
+        request_payload=request_payload,
+        parent_symbols=raw_symbols,
+        knowledge_cutoff_at=knowledge_cutoff_at,
+        fs_div=str(metadata.get('fs_div') or ''),
+        completed_summary_proof=completed_summary_proof,
+        expected_summary_source_run_id=expected_summary_source_run_id,
+    )
+    if authority_error is not None or expected_symbols is None:
+        return authority_error or 'scope_authority'
     expected_roles = list(DECISION_SUPPORT_AGENT_NAMES)
     role_symbol_scopes = request_payload.get('role_symbol_scopes')
     role_symbol_counts = request_payload.get('role_symbol_counts')
@@ -111,11 +368,11 @@ def terminal_feedback_lease_loss_evidence_error(
         and request_payload.get('request_run_id') == child_run_id
         and request_payload.get('mode') == DAILY_RETRY_CYCLE_MODE
         and request_payload.get('roles') == expected_roles
-        and request_payload.get('requested_symbols') == raw_symbols
+        and request_payload.get('requested_symbols') == expected_symbols
         and request_payload.get('feedback_scope_mode')
         == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
         and request_payload.get('admission_scope_by_role')
-        == {role: list(raw_symbols) for role in expected_roles}
+        == {role: list(expected_symbols) for role in expected_roles}
         and str(request_payload.get('fs_div') or '').strip().upper()
         == str(metadata.get('fs_div') or '').strip().upper()
         and request_payload.get('reuse_existing')
@@ -141,16 +398,11 @@ def terminal_feedback_lease_loss_evidence_error(
         and set(role_symbol_counts) == set(expected_roles)
     ):
         return 'request_context'
-    requested_symbol_set = set(raw_symbols)
     if not all(
-        isinstance(role_symbol_scopes.get(role), list)
-        and all(
-            isinstance(symbol, str)
-            and symbol in requested_symbol_set
-            for symbol in role_symbol_scopes[role]
+        _role_scope_matches(
+            role_symbol_scopes.get(role),
+            expected_symbols=expected_symbols,
         )
-        and len(role_symbol_scopes[role])
-        == len(set(role_symbol_scopes[role]))
         and type(role_symbol_counts.get(role)) is int
         and role_symbol_counts[role] == len(role_symbol_scopes[role])
         for role in expected_roles
@@ -211,6 +463,8 @@ def terminal_feedback_completed_run_evidence_error(
     market_date: date,
     metadata: Mapping[str, Any],
     knowledge_cutoff_at: datetime,
+    completed_summary_proof: Mapping[str, Any] | None = None,
+    expected_summary_source_run_id: str | None = None,
 ) -> str | None:
     """Validate a completed feedback child before resuming past its stage."""
 
@@ -256,26 +510,40 @@ def terminal_feedback_completed_run_evidence_error(
     if not isinstance(request_payload, Mapping):
         return 'request_context'
     expected_roles, expected_scope_mode = expectation
+    if stage_id == 'signal_decider':
+        expected_symbols, authority_error = (
+            _authoritative_completed_summary_scope(
+                request_payload=request_payload,
+                parent_symbols=raw_symbols,
+                knowledge_cutoff_at=knowledge_cutoff_at,
+                fs_div=str(metadata.get('fs_div') or ''),
+                completed_summary_proof=completed_summary_proof,
+                expected_summary_source_run_id=(
+                    expected_summary_source_run_id
+                ),
+            )
+        )
+        if authority_error is not None or expected_symbols is None:
+            return authority_error or 'scope_authority'
+    else:
+        if 'scope_authority' in request_payload:
+            return 'scope_authority'
+        expected_symbols = list(raw_symbols)
     expected_admission_scope = {
-        role: list(raw_symbols) for role in expected_roles
+        role: list(expected_symbols) for role in expected_roles
     }
     role_symbol_scopes = request_payload.get('role_symbol_scopes')
     role_symbol_counts = request_payload.get('role_symbol_counts')
-    requested_symbol_set = set(raw_symbols)
     if not (
         isinstance(role_symbol_scopes, Mapping)
         and isinstance(role_symbol_counts, Mapping)
         and set(role_symbol_scopes) == set(expected_roles)
         and set(role_symbol_counts) == set(expected_roles)
         and all(
-            isinstance(role_symbol_scopes.get(role), list)
-            and all(
-                isinstance(symbol, str)
-                and symbol in requested_symbol_set
-                for symbol in role_symbol_scopes[role]
+            _role_scope_matches(
+                role_symbol_scopes.get(role),
+                expected_symbols=expected_symbols,
             )
-            and len(role_symbol_scopes[role])
-            == len(set(role_symbol_scopes[role]))
             and type(role_symbol_counts.get(role)) is int
             and role_symbol_counts[role]
             == len(role_symbol_scopes[role])
@@ -299,7 +567,7 @@ def terminal_feedback_completed_run_evidence_error(
         and request_payload.get('request_run_id') == child_run_id
         and request_payload.get('mode') == DAILY_RETRY_CYCLE_MODE
         and request_payload.get('roles') == expected_roles
-        and request_payload.get('requested_symbols') == raw_symbols
+        and request_payload.get('requested_symbols') == expected_symbols
         and request_payload.get('feedback_scope_mode')
         == expected_scope_mode
         and request_payload.get('admission_scope_by_role')

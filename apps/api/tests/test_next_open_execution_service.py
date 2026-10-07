@@ -1,6 +1,7 @@
 import copy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import json
 from types import SimpleNamespace
 import unittest
@@ -2607,6 +2608,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             dict[str, dict[str, dict[str, object]]] | None
         ) = None,
         scope: str | None = None,
+        scope_authority: dict[str, object] | None = None,
     ) -> None:
         self.feedback_run_ids.append(run_id)
         request_payload = {
@@ -2621,6 +2623,18 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         if scope is not None:
             request_payload['scope'] = scope
+        if scope_authority is not None:
+            request_payload['scope_authority'] = scope_authority
+            request_payload['feedback_scope_mode'] = scope_authority[
+                'decision_feedback_scope_mode'
+            ]
+            request_payload['knowledge_cutoff_at'] = scope_authority[
+                'knowledge_cutoff_at'
+            ]
+            request_payload['admission_knowledge_cutoff_at'] = (
+                scope_authority['knowledge_cutoff_at']
+            )
+            request_payload['fs_div'] = scope_authority['fs_div']
         if parent_run_id is not None:
             request_payload['parent_run_id'] = parent_run_id
         if child_run_lineage:
@@ -5731,6 +5745,175 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result['_candidate_contexts_by_symbol']['000660']['status'],
             'complete',
         )
+
+    def test_summary_intersection_authority_replaces_prior_broad_cohort(
+        self,
+    ) -> None:
+        base_parent = f'base-parent-{uuid4().hex[:8]}'
+        authoritative_parent = f'authoritative-parent-{uuid4().hex[:8]}'
+        authoritative_short = f'authoritative-short-{uuid4().hex[:8]}'
+        authoritative_signal = f'authoritative-signal-{uuid4().hex[:8]}'
+        broad_symbols = ['005930', '000660']
+        completed_symbols = ['005930']
+        self._seed_feedback_run(
+            run_id=base_parent,
+            symbols=broad_symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='active_strategy_aware_prefilter_scoring',
+        )
+        self._seed_feedback_run(
+            run_id=authoritative_parent,
+            symbols=completed_symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+            scope_authority={
+                'schema_version': 'agent_feedback_scope_authority_v1',
+                'kind': (
+                    'completed_summary_intersection_authoritative_cohort'
+                ),
+                'source_summary_run_id': 'summary-source-run',
+                'source_feedback_scope_mode': 'broad_feedback_universe',
+                'decision_feedback_scope_mode': 'decider_scope_fast_path',
+                'knowledge_cutoff_at': '2026-04-29T08:30:00+00:00',
+                'fs_div': 'CFS',
+                'completed_symbols': completed_symbols,
+                'admitted_symbol_count': len(broad_symbols),
+                'admitted_symbols_sha256': hashlib.sha256(
+                    '\n'.join(sorted(broad_symbols)).encode('utf-8')
+                ).hexdigest(),
+            },
+        )
+        self._seed_feedback_run(
+            run_id=authoritative_short,
+            symbols=completed_symbols,
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=authoritative_parent,
+        )
+        self._seed_feedback_run(
+            run_id=authoritative_signal,
+            symbols=completed_symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            parent_run_id=authoritative_parent,
+        )
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            decision_run_id=authoritative_short,
+        )
+        self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=authoritative_signal,
+        )
+
+        scope_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(
+            scope_state['source_role_symbol_scopes'],
+            {
+                'short-term-decider': completed_symbols,
+                'signal-decider': completed_symbols,
+            },
+        )
+        self.assertEqual(
+            {
+                parent['run_id']
+                for parent in scope_state['source_parent_runs']
+            },
+            {authoritative_parent},
+        )
+
+    def test_malformed_summary_intersection_authority_blocks_prior_cohort(
+        self,
+    ) -> None:
+        base_parent = f'base-parent-{uuid4().hex[:8]}'
+        malformed_parent = f'malformed-parent-{uuid4().hex[:8]}'
+        broad_symbols = ['005930', '000660']
+        completed_symbols = ['005930']
+        self._seed_feedback_run(
+            run_id=base_parent,
+            symbols=broad_symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 4, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='active_strategy_aware_prefilter_scoring',
+        )
+        self._seed_feedback_run(
+            run_id=malformed_parent,
+            symbols=completed_symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+            scope_authority={
+                'schema_version': 'agent_feedback_scope_authority_v1',
+                'kind': (
+                    'completed_summary_intersection_authoritative_cohort'
+                ),
+                'source_summary_run_id': 'summary-source-run',
+                'source_feedback_scope_mode': 'broad_feedback_universe',
+                'decision_feedback_scope_mode': 'decider_scope_fast_path',
+                'knowledge_cutoff_at': '2026-04-29T08:30:00+00:00',
+                'fs_div': 'CFS',
+                'completed_symbols': completed_symbols,
+                'admitted_symbol_count': len(broad_symbols),
+                'admitted_symbols_sha256': 'not-a-valid-digest',
+            },
+        )
+
+        scope_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+        )
+
+        self.assertEqual(scope_state['source_role_symbol_scopes'], {})
+        self.assertEqual(scope_state['source_parent_runs'], [])
+
+        malformed_broad_parent = f'malformed-broad-{uuid4().hex[:8]}'
+        self._seed_feedback_run(
+            run_id=malformed_broad_parent,
+            symbols=completed_symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            started_at=datetime(2026, 4, 29, 6, 0, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='active_strategy_aware_prefilter_scoring',
+            scope_authority={
+                'schema_version': 'agent_feedback_scope_authority_v1',
+                'kind': (
+                    'completed_summary_intersection_authoritative_cohort'
+                ),
+                'source_summary_run_id': 'summary-source-run',
+                'source_feedback_scope_mode': 'broad_feedback_universe',
+                'decision_feedback_scope_mode': 'decider_scope_fast_path',
+                'knowledge_cutoff_at': '2026-04-29T08:30:00+00:00',
+                'fs_div': 'CFS',
+                'completed_symbols': completed_symbols,
+                'admitted_symbol_count': len(broad_symbols),
+                'admitted_symbols_sha256': 'not-a-valid-digest',
+            },
+        )
+
+        broad_scope_state = (
+            self._service()._load_latest_decider_scope_state(
+                source_market_date=self.market_date,
+            )
+        )
+
+        self.assertEqual(
+            broad_scope_state['source_role_symbol_scopes'],
+            {},
+        )
+        self.assertEqual(broad_scope_state['source_parent_runs'], [])
 
     def test_abandoned_targeted_parent_blocks_only_its_overlay_symbols(self) -> None:
         base_parent = f'base-parent-{uuid4().hex[:8]}'

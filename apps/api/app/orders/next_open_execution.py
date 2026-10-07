@@ -32,7 +32,13 @@ from app.agent_context.eligibility import AGENT_FEEDBACK_SCOPE_REQUESTED
 from app.agent_context.feedback_failure_taxonomy import build_failure_groups
 from app.agent_context.orchestrator import agent_feedback_orchestrator
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
-from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+from app.agent_context.run_modes import (
+    DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.signal_decider_snapshot_validity import (
     decision_snapshot_observed_at_utc,
@@ -300,6 +306,11 @@ def _load_projected_decider_feedback_runs(
         'reuse_existing',
         'force_recompute',
         'child_run_lineage',
+        'feedback_scope_mode',
+        'fs_div',
+        'knowledge_cutoff_at',
+        'admission_knowledge_cutoff_at',
+        'scope_authority',
     )
     summary_fields = (
         'failed_symbols_by_role',
@@ -5788,16 +5799,117 @@ class SignalDeciderNextOpenExecutionService:
             if set(required_agents).intersection(normalized_roles):
                 source_parent_runs.append(run)
 
-        # A requested-symbol retry is a patch over the most recent broad cohort,
-        # not a replacement for every symbol omitted from that request.  Build a
-        # per-scope parent map from the latest broad parent plus each newer
-        # targeted parent, oldest patch first so the newest patch wins.
+        def scope_authority_state(
+            run: dict[str, Any],
+        ) -> str:
+            payload = request_payload(run)
+            if 'scope_authority' not in payload:
+                return 'absent'
+            authority = payload.get('scope_authority')
+            if not isinstance(authority, dict) or not (
+                str(authority.get('schema_version') or '').strip()
+                == FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+                and str(authority.get('kind') or '').strip()
+                == FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+                and str(
+                    authority.get('source_summary_run_id') or ''
+                ).strip()
+                and str(
+                    authority.get('source_feedback_scope_mode') or ''
+                ).strip()
+                in {
+                    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                }
+                and str(
+                    authority.get('decision_feedback_scope_mode') or ''
+                ).strip()
+                == str(payload.get('feedback_scope_mode') or '').strip()
+                and str(authority.get('knowledge_cutoff_at') or '').strip()
+                == str(
+                    payload.get('admission_knowledge_cutoff_at')
+                    or payload.get('knowledge_cutoff_at')
+                    or ''
+                ).strip()
+                and str(authority.get('fs_div') or '').strip().upper()
+                == str(payload.get('fs_div') or '').strip().upper()
+            ):
+                return 'invalid'
+            completed_symbols = authority.get('completed_symbols')
+            requested_symbols = payload.get('requested_symbols')
+            if not all(
+                isinstance(symbols, list) and symbols
+                for symbols in (
+                    completed_symbols,
+                    requested_symbols,
+                )
+            ):
+                return 'invalid'
+
+            def normalized_symbols(raw_symbols: list[Any]) -> list[str]:
+                return sorted(
+                    {
+                        str(symbol or '').strip().upper()
+                        for symbol in raw_symbols
+                        if str(symbol or '').strip()
+                    }
+                )
+
+            normalized_completed = normalized_symbols(
+                completed_symbols
+            )
+            normalized_requested = normalized_symbols(requested_symbols)
+            admitted_symbol_count = authority.get(
+                'admitted_symbol_count'
+            )
+            admitted_symbols_sha256 = str(
+                authority.get('admitted_symbols_sha256') or ''
+            ).strip()
+            if not (
+                len(normalized_completed) == len(completed_symbols)
+                and len(normalized_requested) == len(requested_symbols)
+                and normalized_completed == normalized_requested
+                and type(admitted_symbol_count) is int
+                and admitted_symbol_count >= len(normalized_completed)
+                and len(admitted_symbols_sha256) == 64
+                and all(
+                    character in '0123456789abcdef'
+                    for character in admitted_symbols_sha256.lower()
+                )
+            ):
+                return 'invalid'
+            role_scopes = self._decider_role_symbol_scopes(run)
+            if not (
+                set(required_agents).issubset(role_scopes)
+                and all(
+                    set(role_scopes[agent_name]).issubset(
+                        normalized_completed
+                    )
+                    for agent_name in required_agents
+                )
+            ):
+                return 'invalid'
+            return 'valid'
+
+        # An ordinary requested-symbol retry is a patch over the most recent
+        # authoritative cohort. A request bounded by a versioned, exact
+        # completed-summary intersection is itself a cohort replacement.
+        # Build a per-scope parent map from that latest authority plus each
+        # newer targeted parent, oldest patch first so the newest patch wins.
         latest_broad_parent_index = next(
             (
                 index
                 for index, run in enumerate(source_parent_runs)
-                if str(request_payload(run).get('scope') or '').strip()
-                != AGENT_FEEDBACK_SCOPE_REQUESTED
+                if (
+                    scope_authority_state(run) == 'valid'
+                    or (
+                        scope_authority_state(run) == 'absent'
+                        and str(
+                            request_payload(run).get('scope') or ''
+                        ).strip()
+                        != AGENT_FEEDBACK_SCOPE_REQUESTED
+                    )
+                )
                 and set(required_agents).issubset(
                     {
                         _normalize_agent_name(role)
@@ -5808,7 +5920,25 @@ class SignalDeciderNextOpenExecutionService:
             ),
             None,
         )
-        if latest_broad_parent_index is None:
+        latest_invalid_authority_index = next(
+            (
+                index
+                for index, run in enumerate(source_parent_runs)
+                if scope_authority_state(run) == 'invalid'
+            ),
+            None,
+        )
+        invalid_authority_blocks_fallback = bool(
+            latest_invalid_authority_index is not None
+            and (
+                latest_broad_parent_index is None
+                or latest_invalid_authority_index
+                < latest_broad_parent_index
+            )
+        )
+        if invalid_authority_blocks_fallback:
+            active_source_parents = []
+        elif latest_broad_parent_index is None:
             active_source_parents = list(reversed(source_parent_runs))
         else:
             active_source_parents = [
@@ -5825,11 +5955,9 @@ class SignalDeciderNextOpenExecutionService:
                 for symbol in symbols:
                     source_parent_by_key[(symbol, agent_name)] = parent
 
-        source_run = (
-            source_parent_runs[0]
-            if source_parent_runs
-            else None
-        )
+        source_run = None
+        if not invalid_authority_blocks_fallback and source_parent_runs:
+            source_run = source_parent_runs[0]
 
         source_role_scopes: dict[str, list[str]] = {
             agent_name: sorted(

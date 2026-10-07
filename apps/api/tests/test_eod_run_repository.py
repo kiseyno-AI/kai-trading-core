@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -1805,6 +1806,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
         started_at = datetime(2026, 9, 20, tzinfo=timezone.utc)
         summary_child_run_id = 'feedback-cycle-2026-09-18-cafebabe00'
         child_run_id = 'feedback-cycle-2026-09-18-deadbeef01'
+        parent_symbols = ['000660', '005930']
         lease_loss_error = (
             f'feedback retry lease ownership lost for {child_run_id} at '
             'before_parent_finalization: '
@@ -1872,7 +1874,7 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         '2026-09-20T00:05:00+00:00'
                     ),
                     'terminal_continuation_evidence': {},
-                    'symbols': ['005930'],
+                    'symbols': parent_symbols,
                     'fs_div': 'CFS',
                     'reuse_existing_feedback': True,
                     'force': False,
@@ -1967,8 +1969,8 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                     run_id=summary_child_run_id,
                     market_date=market_date,
                     status='completed',
-                    symbols_total=3,
-                    completed_count=3,
+                    symbols_total=6,
+                    completed_count=6,
                     failed_count=0,
                     request_payload={
                         'market_date': market_date.isoformat(),
@@ -1979,24 +1981,24 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                             'technical-summarizer',
                             'fundamental-summarizer',
                         ],
-                        'requested_symbols': ['005930'],
+                        'requested_symbols': parent_symbols,
                         'feedback_scope_mode': (
                             'broad_feedback_universe'
                         ),
                         'admission_scope_by_role': {
-                            'eod-summarizer': ['005930'],
-                            'technical-summarizer': ['005930'],
-                            'fundamental-summarizer': ['005930'],
+                            'eod-summarizer': parent_symbols,
+                            'technical-summarizer': parent_symbols,
+                            'fundamental-summarizer': parent_symbols,
                         },
                         'role_symbol_scopes': {
-                            'eod-summarizer': ['005930'],
-                            'technical-summarizer': ['005930'],
-                            'fundamental-summarizer': ['005930'],
+                            'eod-summarizer': parent_symbols,
+                            'technical-summarizer': parent_symbols,
+                            'fundamental-summarizer': parent_symbols,
                         },
                         'role_symbol_counts': {
-                            'eod-summarizer': 1,
-                            'technical-summarizer': 1,
-                            'fundamental-summarizer': 1,
+                            'eod-summarizer': 2,
+                            'technical-summarizer': 2,
+                            'fundamental-summarizer': 2,
                         },
                         'fs_div': 'CFS',
                         'reuse_existing': True,
@@ -2060,6 +2062,33 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         'requested_knowledge_cutoff_at': (
                             '2026-09-20T00:55:00+00:00'
                         ),
+                        'scope_authority': {
+                            'schema_version': (
+                                'agent_feedback_scope_authority_v1'
+                            ),
+                            'kind': (
+                                'completed_summary_intersection_'
+                                'authoritative_cohort'
+                            ),
+                            'source_summary_run_id': summary_child_run_id,
+                            'source_feedback_scope_mode': (
+                                'broad_feedback_universe'
+                            ),
+                            'decision_feedback_scope_mode': (
+                                'decider_scope_fast_path'
+                            ),
+                            'knowledge_cutoff_at': (
+                                '2026-09-20T00:55:00+00:00'
+                            ),
+                            'fs_div': 'CFS',
+                            'completed_symbols': ['005930'],
+                            'admitted_symbol_count': len(parent_symbols),
+                            'admitted_symbols_sha256': hashlib.sha256(
+                                '\n'.join(sorted(parent_symbols)).encode(
+                                    'utf-8'
+                                )
+                            ).hexdigest(),
+                        },
                         'retry_admission': {
                             'schema_version': (
                                 'agent_feedback_retry_admission_v1'
@@ -2440,6 +2469,33 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         'requested_knowledge_cutoff_at': (
                             '2026-09-20T00:55:00+00:00'
                         ),
+                        'scope_authority': {
+                            'schema_version': (
+                                'agent_feedback_scope_authority_v1'
+                            ),
+                            'kind': (
+                                'completed_summary_intersection_'
+                                'authoritative_cohort'
+                            ),
+                            'source_summary_run_id': summary_child_run_id,
+                            'source_feedback_scope_mode': (
+                                'broad_feedback_universe'
+                            ),
+                            'decision_feedback_scope_mode': (
+                                'decider_scope_fast_path'
+                            ),
+                            'knowledge_cutoff_at': (
+                                '2026-09-20T00:55:00+00:00'
+                            ),
+                            'fs_div': 'CFS',
+                            'completed_symbols': ['005930'],
+                            'admitted_symbol_count': len(parent_symbols),
+                            'admitted_symbols_sha256': hashlib.sha256(
+                                '\n'.join(sorted(parent_symbols)).encode(
+                                    'utf-8'
+                                )
+                            ).hexdigest(),
+                        },
                     },
                     summary_payload={},
                     started_at=interrupted_at,
@@ -2464,6 +2520,42 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 eod_run_id=eod_run_id,
             ),
         )
+
+        with self.session_factory.begin() as session:
+            advanced_child_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id
+                    == advanced_child_run_id
+                )
+            ).scalar_one()
+            request_payload = dict(advanced_child_run.request_payload)
+            scope_authority = dict(request_payload['scope_authority'])
+            scope_authority['source_summary_run_id'] = 'foreign-summary-run'
+            request_payload['scope_authority'] = scope_authority
+            advanced_child_run.request_payload = request_payload
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            foreign_authority_target = (
+                load_oldest_outstanding_auto_eod_recovery_target(
+                    on_or_after=market_date.isoformat(),
+                    on_or_before=market_date.isoformat(),
+                )
+            )
+        self.assertIsNone(foreign_authority_target)
+        with self.session_factory.begin() as session:
+            advanced_child_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id
+                    == advanced_child_run_id
+                )
+            ).scalar_one()
+            request_payload = dict(advanced_child_run.request_payload)
+            scope_authority = dict(request_payload['scope_authority'])
+            scope_authority['source_summary_run_id'] = summary_child_run_id
+            request_payload['scope_authority'] = scope_authority
+            advanced_child_run.request_payload = request_payload
 
         with self.session_factory.begin() as session:
             advanced_child_run = session.execute(
