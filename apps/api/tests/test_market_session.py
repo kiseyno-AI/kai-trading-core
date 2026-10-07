@@ -117,6 +117,28 @@ class MarketSessionTests(unittest.TestCase):
         self.assertEqual(client.calls[1]['params']['CTX_AREA_FK'], 'FK-PAGE-2')
         self.assertEqual(client.calls[1]['params']['CTX_AREA_NK'], 'NK-PAGE-2')
 
+    def test_kis_provider_limits_point_lookup_to_one_page_by_default(self):
+        client = FakeCalendarClient(
+            {'output': [{'bass_dt': '20260604', 'opnd_yn': 'Y'}]}
+        )
+        provider = KisKrxTradingCalendarProvider(client=client)
+
+        result = provider.lookup_day(date(2026, 6, 4), allow_fallback=False)
+
+        self.assertTrue(result.is_open)
+        self.assertEqual(client.calls[0]['max_pages'], 1)
+
+    def test_kis_provider_preserves_explicit_point_lookup_page_limit(self):
+        client = FakeCalendarClient(
+            {'output': [{'bass_dt': '20260604', 'opnd_yn': 'Y'}]}
+        )
+        provider = KisKrxTradingCalendarProvider(client=client, max_pages=3)
+
+        result = provider.lookup_day(date(2026, 6, 4), allow_fallback=False)
+
+        self.assertTrue(result.is_open)
+        self.assertEqual(client.calls[0]['max_pages'], 3)
+
     def test_kis_provider_uses_opnd_yn_and_caches_rows(self):
         client = FakeCalendarClient(
             {
