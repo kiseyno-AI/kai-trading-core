@@ -4,7 +4,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_market
-from app.market.snapshot import MarketSnapshotConfigurationError, MarketSnapshotUpstreamError
+from app.market.snapshot import (
+    MarketSnapshotConfigurationError,
+    MarketSnapshotUnavailableError,
+    MarketSnapshotUpstreamError,
+)
 
 
 class FakeMarketSnapshotService:
@@ -125,6 +129,13 @@ class BrokenMarketSnapshotService:
         raise MarketSnapshotUpstreamError('KIS investor-flow payload did not include a usable output row')
 
 
+class MissingProviderTimestampMarketSnapshotService:
+    async def get_market_snapshot(self) -> dict:
+        raise MarketSnapshotUnavailableError(
+            'Market snapshot cache has no provider observation timestamp.'
+        )
+
+
 class MarketRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = FastAPI()
@@ -175,6 +186,15 @@ class MarketRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertIn('MARKET_SNAPSHOT_KIS_USE_REAL', response.json()['detail'])
+
+    def test_market_snapshot_route_maps_missing_provider_timestamp_to_503(self) -> None:
+        routes_market.market_snapshot_service = MissingProviderTimestampMarketSnapshotService()
+
+        client = TestClient(self.app)
+        response = client.get('/market/snapshot')
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn('provider observation timestamp', response.json()['detail'])
 
     def test_market_snapshot_route_maps_upstream_errors_to_502(self) -> None:
         routes_market.market_snapshot_service = BrokenMarketSnapshotService()

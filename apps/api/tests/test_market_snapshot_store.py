@@ -336,6 +336,88 @@ class MarketSnapshotCacheStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(saved.payload, newer_payload)
         self.assertEqual(saved.last_refresh_status, 'degraded')
 
+    def test_valid_prior_session_observation_replaces_legacy_null_as_of_cache(self) -> None:
+        invalid_attempted_at = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
+        invalid_payload = {
+            'as_of': None,
+            'collected_at': '2026-05-01T09:00:00+09:00',
+            'status': 'partial',
+            'markets': {
+                'kospi': {'value': 2700.0, 'provider_observed_at': None},
+                'kosdaq': {'value': 870.0, 'provider_observed_at': None},
+            },
+        }
+        with session_scope() as session:
+            session.add(
+                CurrentMarketSnapshotCache(
+                    cache_key='dashboard',
+                    payload=invalid_payload,
+                    snapshot_status='partial',
+                    as_of=None,
+                    last_refresh_attempted_at=invalid_attempted_at,
+                    last_refresh_succeeded_at=invalid_attempted_at,
+                    last_refresh_status='degraded',
+                    last_refresh_error='provider timestamp unavailable',
+                    refresh_trigger='legacy_preopen_refresh',
+                )
+            )
+
+        prior_session_payload = {
+            'as_of': '2026-04-30T15:30:00+09:00',
+            'collected_at': '2026-05-01T09:05:00+09:00',
+            'status': 'partial',
+            'markets': {
+                'kospi': {
+                    'value': 2710.0,
+                    'provider_observed_at': '2026-04-30T15:30:00+09:00',
+                },
+                'kosdaq': {
+                    'value': 875.0,
+                    'provider_observed_at': '2026-04-30T15:30:00+09:00',
+                },
+            },
+        }
+        saved = self.store.save(
+            payload=prior_session_payload,
+            last_refresh_attempted_at=datetime(2026, 5, 1, 0, 5, tzinfo=timezone.utc),
+            last_refresh_succeeded_at=datetime(2026, 5, 1, 0, 5, tzinfo=timezone.utc),
+            last_refresh_status='degraded',
+            last_refresh_error='prior-session observation is not current-session proof',
+            refresh_trigger='preopen_refresh',
+        )
+
+        self.assertEqual(saved.payload, prior_session_payload)
+        self.assertEqual(saved.as_of, datetime(2026, 4, 30, 6, 30, tzinfo=timezone.utc))
+        self.assertEqual(saved.refresh_trigger, 'preopen_refresh')
+
+    def test_null_as_of_candidate_is_not_persisted_as_a_snapshot(self) -> None:
+        attempted_at = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
+
+        saved = self.store.save(
+            payload={
+                'as_of': None,
+                'collected_at': '2026-05-01T09:00:00+09:00',
+                'status': 'partial',
+                'markets': {
+                    'kospi': {'value': 2700.0, 'provider_observed_at': None},
+                    'kosdaq': {'value': 870.0, 'provider_observed_at': None},
+                },
+            },
+            last_refresh_attempted_at=attempted_at,
+            last_refresh_succeeded_at=attempted_at,
+            last_refresh_status='degraded',
+            last_refresh_error=None,
+            refresh_trigger='missing_provider_timestamp',
+        )
+
+        self.assertIsNone(saved.payload)
+        self.assertIsNone(saved.as_of)
+        self.assertEqual(saved.last_refresh_status, 'error')
+        self.assertEqual(
+            saved.last_refresh_error,
+            'market_snapshot_provider_observation_missing',
+        )
+
     def test_refresh_bucket_claim_is_cross_store_and_first_insert_race_safe(self) -> None:
         bucket_started_at = datetime(2026, 4, 30, 0, 5, tzinfo=timezone.utc)
         attempted_at = datetime(2026, 4, 30, 0, 5, 2, tzinfo=timezone.utc)

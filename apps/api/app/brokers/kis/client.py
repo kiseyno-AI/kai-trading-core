@@ -1111,7 +1111,7 @@ class KISClient:
                 'FID_ETC_CLS_CODE': '0',
                 'FID_INPUT_ISCD': index_code,
                 'FID_INPUT_HOUR_1': '60',
-                'FID_PW_DATA_INCU_YN': 'N',
+                'FID_PW_DATA_INCU_YN': 'Y',
             },
         )
 

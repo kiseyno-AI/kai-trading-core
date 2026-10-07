@@ -19,6 +19,9 @@ Runtime requirements:
 
 Degradation behavior:
 - request-time reads do not call KIS or Korea Exim directly; Core serves the last persisted snapshot
+- the KIS index time-series request includes prior-session rows so a pre-open refresh can retain the latest provider business-date/time proof instead of relying on the collection clock
+- Core never persists or serves a newly built snapshot without a timezone-aware provider `as_of`. A failed refresh preserves a valid last-good snapshot as stale; without one, the route returns `503` until provider evidence is available
+- legacy cache rows with `as_of: null` are treated as immediately due and do not use `collected_at` as an ordering substitute, allowing a valid prior-session observation to repair the cache
 - if Korea Exim returns `result=4` or another USD/KRW-only failure during a background refresh, the endpoint still returns `200` with preserved KIS market rows
 - top-level `status`, `missing_fields`, and `stale_reason` describe whether the snapshot is `ready`, `stale`, or `partial`
 - `usd_krw.status` is `ready`, `stale`, or `missing`; `usd_krw.source` is `live`, `cache`, or `unavailable`
