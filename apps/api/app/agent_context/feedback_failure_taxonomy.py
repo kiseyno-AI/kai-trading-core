@@ -17,6 +17,9 @@ class FeedbackFailureKind(str, Enum):
     OPENCLAW_AUTH_REJECTED = 'openclaw_auth_rejected'
     OPENCLAW_TRANSPORT_TIMEOUT = 'openclaw_transport_timeout'
     OPENCLAW_TRANSPORT_ERROR = 'openclaw_transport_error'
+    OPENCLAW_PLUGIN_STATE_CAPACITY_EXHAUSTED = (
+        'openclaw_plugin_state_capacity_exhausted'
+    )
     OPENCLAW_RESPONSE_INVALID_JSON = 'openclaw_response_invalid_json'
     OPENCLAW_ASSISTANT_NON_JSON = 'openclaw_assistant_non_json'
     OPENCLAW_RESPONSE_CONTRACT = 'openclaw_response_contract'
@@ -36,6 +39,7 @@ class FeedbackFailureStatus(str, Enum):
     AUTH_REJECTED = 'auth/rejected'
     TRANSPORT_TIMEOUT = 'transport/timeout'
     TRANSPORT_ERROR = 'transport/error'
+    CAPACITY_EXHAUSTED = 'capacity/exhausted'
     RESPONSE_INVALID_JSON = 'response/invalid-json'
     RESPONSE_ASSISTANT_NON_JSON = 'response/assistant-non-json'
     RESPONSE_CONTRACT = 'response/contract'
@@ -131,6 +135,22 @@ def classify_feedback_failure(
     context_payload = context if isinstance(context, Mapping) else {}
     summary_payload = summary if isinstance(summary, Mapping) else {}
     status_codes = set(_status_code_values(summary_payload, context_payload))
+
+    if (
+        'openclaw_plugin_state_capacity_exhausted' in haystack
+        or (
+            'app-server-thread-bindings' in haystack
+            and 'row limit' in haystack
+        )
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=(
+                FeedbackFailureKind.OPENCLAW_PLUGIN_STATE_CAPACITY_EXHAUSTED.value
+            ),
+            failure_status=FeedbackFailureStatus.CAPACITY_EXHAUSTED.value,
+            failure_category='capacity',
+            reason='OpenClaw Codex app-server binding state reached its row limit',
+        )
 
     if (
         'fundamental_input_fingerprint_unavailable' in haystack

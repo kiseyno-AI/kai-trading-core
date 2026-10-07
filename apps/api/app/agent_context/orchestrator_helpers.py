@@ -48,6 +48,7 @@ DECIDER_SOURCE_CONTEXT_VOLATILE_KEYS = frozenset(
         'requested_at',
     }
 )
+DECIDER_MARKET_CONTEXT_VOLATILE_KEYS = frozenset({'captured_at'})
 DURABLE_DECIDER_SOURCE_CONTEXT_KEYS = (
     'symbol',
     'market_date',
@@ -193,6 +194,25 @@ def build_decider_source_context_generation(
             'sha256:' + hashlib.sha256(encoded.encode('utf-8')).hexdigest()
         ),
     }
+
+
+def _stable_market_context(value: Any) -> Any:
+    """Remove collection clocks that do not change the market facts.
+
+    Cached fallback providers can refresh ``captured_at`` while returning the
+    same value and effective date. Binding that clock into a decider generation
+    fingerprint makes a long-running dispatch invalidate its own results at a
+    cache boundary even though no decision input changed.
+    """
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_market_context(item)
+            for key, item in value.items()
+            if str(key) not in DECIDER_MARKET_CONTEXT_VOLATILE_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_market_context(item) for item in value]
+    return value
 
 
 def _stable_macro_context(value: Any) -> Any:
@@ -695,7 +715,7 @@ def build_decider_input_generation(
             }
         )['fingerprint'],
         'market_context_fingerprint': build_decider_source_context_generation(
-            market_context
+            _stable_market_context(market_context)
         )['fingerprint'],
         'policy_context_fingerprint': build_decider_source_context_generation(
             policy_context

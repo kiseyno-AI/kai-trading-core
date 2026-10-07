@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
 from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
+from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.core.settings import settings
 from app.db import session_scope
@@ -739,11 +740,13 @@ def _load_latest_feedback_run_summary(*, market_date: str) -> dict[str, Any] | N
 
     run_snapshot = agent_context_feedback_run_state_service.find_latest_run(
         market_date=normalized_market_date,
+        requested_roles=list(SUMMARIZER_AGENT_NAMES),
         request_modes=[DAILY_RETRY_CYCLE_MODE],
     )
     if run_snapshot is None:
         run_snapshot = agent_context_feedback_run_state_service.find_latest_run(
             market_date=normalized_market_date,
+            requested_roles=list(SUMMARIZER_AGENT_NAMES),
         )
     if run_snapshot is None:
         return None
