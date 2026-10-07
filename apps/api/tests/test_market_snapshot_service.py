@@ -13,6 +13,7 @@ from app.market.snapshot import (
     MARKET_SNAPSHOT_TARGETS,
     MarketSnapshotConfigurationError,
     MarketSnapshotService,
+    MarketSnapshotUnavailableError,
     MarketSnapshotUpstreamError,
     _parse_float,
     _parse_int,
@@ -267,7 +268,7 @@ class KISMarketIndexObservationContractTests(unittest.IsolatedAsyncioTestCase):
                     'FID_ETC_CLS_CODE': '0',
                     'FID_INPUT_ISCD': '0001',
                     'FID_INPUT_HOUR_1': '60',
-                    'FID_PW_DATA_INCU_YN': 'N',
+                    'FID_PW_DATA_INCU_YN': 'Y',
                 },
             ),
         )
@@ -822,26 +823,120 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fx_service.calls, [])
         self.assertTrue(service.runtime_status()['ready'])
 
-    async def test_missing_provider_time_proof_preserves_price_but_marks_index_unverified(self) -> None:
+    async def test_missing_provider_time_proof_keeps_cold_cache_unavailable(self) -> None:
         settings.kis_use_mock = False
         settings.market_snapshot_kis_use_real = True
+        cache_store = InMemoryCacheStore()
         service = MarketSnapshotService(
             kis_api_client=FailingIndexObservationKISClient(),
             koreaexim_service=FakeFXService(),
-            cache_store=InMemoryCacheStore(),
+            cache_store=cache_store,
             fx_snapshot_store_instance=self.fx_snapshot_store,
         )
 
-        result = await service.refresh_market_snapshot_if_due(trigger='observation_failure', force=True)
+        with self.assertRaises(MarketSnapshotUpstreamError) as refresh_error:
+            await service.refresh_market_snapshot_if_due(
+                trigger='observation_failure',
+                force=True,
+            )
 
-        self.assertIsNotNone(result)
+        self.assertIn('provider observation timestamp', str(refresh_error.exception))
+        self.assertIsNotNone(cache_store.record)
+        assert cache_store.record is not None
+        self.assertIsNone(cache_store.record.payload)
+        self.assertEqual(cache_store.record.last_refresh_status, 'error')
+        self.assertTrue(service._refresh_is_due(cache_store.record))
+        self.assertIsNone(service._next_refresh_due_at(cache_store.record))
+        with self.assertRaises(MarketSnapshotUnavailableError):
+            await service.get_market_snapshot()
+
+    async def test_missing_provider_time_proof_preserves_last_good_snapshot_as_stale(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        cache_store = InMemoryCacheStore()
+        service = MarketSnapshotService(
+            kis_api_client=FakeKISClient(),
+            koreaexim_service=FakeFXService(),
+            cache_store=cache_store,
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        last_good = await service.refresh_market_snapshot_if_due(
+            trigger='last_good',
+            force=True,
+        )
+        assert last_good is not None
+        service.kis_api_client = FailingIndexObservationKISClient()
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='observation_failure_with_cache',
+            force=True,
+        )
+
         assert result is not None
-        self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['legs']['index']['status'], 'unverified')
-        self.assertEqual(result['markets']['kospi']['value'], 2642.07)
-        self.assertEqual(result['markets']['kospi']['index_leg']['status'], 'unverified')
-        self.assertIsNone(result['markets']['kospi']['provider_observed_at'])
-        self.assertIsNone(result['as_of'])
+        self.assertEqual(result['status'], 'stale')
+        self.assertEqual(result['as_of'], last_good['as_of'])
+        self.assertEqual(
+            result['markets']['kospi']['value'],
+            last_good['markets']['kospi']['value'],
+        )
+        self.assertEqual(
+            result['stale_reason'],
+            'market_snapshot_kis_upstream_error',
+        )
+        self.assertEqual(result['freshness']['last_refresh_status'], 'error')
+
+    async def test_legacy_null_as_of_cache_is_due_and_heals_from_prior_session_row(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        cache_store = InMemoryCacheStore()
+        attempted_at = datetime.fromisoformat('2026-04-29T08:29:00+09:00')
+        cache_store.record = MarketSnapshotCacheRecord(
+            payload={
+                'as_of': None,
+                'collected_at': attempted_at.isoformat(),
+                'status': 'partial',
+                'markets': {
+                    'kospi': {'provider_observed_at': None},
+                    'kosdaq': {'provider_observed_at': None},
+                },
+            },
+            snapshot_status='partial',
+            stale_reason=None,
+            as_of=None,
+            last_refresh_attempted_at=attempted_at,
+            last_refresh_succeeded_at=attempted_at,
+            last_refresh_status='degraded',
+            last_refresh_error='provider timestamp unavailable',
+            refresh_trigger='legacy_preopen_refresh',
+            created_at=attempted_at,
+            updated_at=attempted_at,
+        )
+        client = PriorSessionIndexObservationKISClient()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=cache_store,
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+            refresh_interval_seconds=3600,
+        )
+        service._now = lambda: datetime.fromisoformat('2026-04-29T08:30:00+09:00')
+
+        self.assertTrue(service._refresh_is_due(cache_store.record))
+        self.assertIsNone(service._next_refresh_due_at(cache_store.record))
+        with self.assertRaises(MarketSnapshotUnavailableError):
+            await service.get_market_snapshot()
+
+        result = await service.refresh_market_snapshot_if_due(trigger='heal_legacy_cache')
+
+        assert result is not None
+        self.assertEqual(result['as_of'], '2026-04-28T10:05:00+09:00')
+        self.assertEqual(client.token_calls, 1)
+        self.assertIsNotNone(cache_store.record)
+        assert cache_store.record is not None
+        self.assertEqual(
+            cache_store.record.as_of,
+            datetime.fromisoformat('2026-04-28T10:05:00+09:00'),
+        )
 
     async def test_nonmonotonic_price_move_does_not_invalidate_same_provider_turnover_proof(self) -> None:
         settings.kis_use_mock = False
@@ -935,7 +1030,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['index_leg']['status'], 'unverified')
         self.assertFalse(result['index_leg']['observation_payload_match'])
 
-    async def test_client_collection_time_never_relabels_prior_session_provider_row(self) -> None:
+    async def test_preopen_refresh_uses_prior_session_provider_row_without_relabeling_it(self) -> None:
         settings.kis_use_mock = False
         settings.market_snapshot_kis_use_real = True
         service = MarketSnapshotService(
@@ -944,7 +1039,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             cache_store=InMemoryCacheStore(),
             fx_snapshot_store_instance=self.fx_snapshot_store,
         )
-        service._now = lambda: datetime.fromisoformat('2026-04-29T10:05:20+09:00')
+        service._now = lambda: datetime.fromisoformat('2026-04-29T08:30:20+09:00')
 
         result = await service.refresh_market_snapshot_if_due(
             trigger='prior_session_provenance',
@@ -953,7 +1048,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
 
         assert result is not None
         self.assertEqual(result['as_of'], '2026-04-28T10:05:00+09:00')
-        self.assertEqual(result['collected_at'], '2026-04-29T10:05:20+09:00')
+        self.assertEqual(result['collected_at'], '2026-04-29T08:30:20+09:00')
         self.assertEqual(
             result['markets']['kospi']['provider_business_date'],
             '2026-04-28',

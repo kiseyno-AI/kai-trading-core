@@ -13,6 +13,7 @@ from app.db_models import CurrentMarketSnapshotCache
 MARKET_SNAPSHOT_CACHE_KEY = 'dashboard'
 MARKET_SNAPSHOT_CACHE_WRITE_LOCK_KEY = 0x4B41494D534E4150
 MARKET_SNAPSHOT_OBSERVATION_REGRESSED = 'market_snapshot_observation_regressed'
+MARKET_SNAPSHOT_OBSERVATION_MISSING = 'market_snapshot_provider_observation_missing'
 
 _SNAPSHOT_QUALITY_RANK = {
     'ready': 4,
@@ -52,11 +53,10 @@ def _payload_observation_order(
     if not isinstance(payload, dict):
         return None
     provider_observed_at = _comparable_datetime(payload.get('as_of'))
-    collected_at = _comparable_datetime(payload.get('collected_at'))
-    observation = provider_observed_at or collected_at
-    if observation is None:
+    if provider_observed_at is None:
         return None
-    return observation, collected_at or observation
+    collected_at = _comparable_datetime(payload.get('collected_at'))
+    return provider_observed_at, collected_at or provider_observed_at
 
 
 def _payload_market_observations(
@@ -123,19 +123,19 @@ def _payload_can_replace(
     current: dict[str, Any] | None,
     candidate: dict[str, Any] | None,
 ) -> bool:
+    current_order = _payload_observation_order(current)
+    candidate_order = _payload_observation_order(candidate)
     if current is None:
-        return True
+        return candidate is None or candidate_order is not None
     if candidate is None:
-        return False
+        return current_order is None
     if not _market_observations_do_not_regress(
         current=current,
         candidate=candidate,
     ):
         return False
-    current_order = _payload_observation_order(current)
-    candidate_order = _payload_observation_order(candidate)
     if current_order is None:
-        return candidate_order is not None or _snapshot_quality(candidate) >= _snapshot_quality(current)
+        return candidate_order is not None
     if candidate_order is None:
         return False
     if candidate_order != current_order:
@@ -296,7 +296,12 @@ class MarketSnapshotCacheStore:
             ):
                 row.last_refresh_attempted_at = last_refresh_attempted_at
                 row.last_refresh_status = 'error'
-                row.last_refresh_error = MARKET_SNAPSHOT_OBSERVATION_REGRESSED
+                row.last_refresh_error = (
+                    MARKET_SNAPSHOT_OBSERVATION_MISSING
+                    if isinstance(stored_payload, dict)
+                    and _payload_observation_order(stored_payload) is None
+                    else MARKET_SNAPSHOT_OBSERVATION_REGRESSED
+                )
                 row.refresh_trigger = refresh_trigger
                 session.flush()
                 return self._to_record(row)

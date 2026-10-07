@@ -192,6 +192,19 @@ def _normalize_iso_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _provider_snapshot_as_of(payload: Mapping[str, Any] | None) -> datetime | None:
+    if not isinstance(payload, Mapping):
+        return None
+    observed_at = _normalize_iso_datetime(payload.get('as_of'))
+    if (
+        observed_at is None
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+    ):
+        return None
+    return observed_at
+
+
 def _normalize_market_snapshot_market_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     row = deepcopy(dict(payload))
     has_trading_value_unit = str(payload.get('trading_value_unit') or '').strip() != ''
@@ -351,6 +364,12 @@ class MarketSnapshotService:
         runtime_status = self._runtime_status()
         if not runtime_status.ready:
             raise self._configuration_error()
+
+        if cache_record is not None and isinstance(cache_record.payload, Mapping):
+            raise MarketSnapshotUnavailableError(
+                'Market snapshot cache has no valid provider observation timestamp. '
+                'Wait for the background refresh to recover it.'
+            )
 
         if cache_record is not None and cache_record.last_refresh_error:
             raise MarketSnapshotUnavailableError(
@@ -579,6 +598,10 @@ class MarketSnapshotService:
             ),
             default=None,
         )
+        if provider_observed_at is None:
+            raise MarketSnapshotUpstreamError(
+                'KIS index snapshot did not include a provider observation timestamp'
+            )
         collected_at = self._now()
         for target, row in zip(MARKET_SNAPSHOT_TARGETS, market_rows, strict=True):
             row['breadth_completeness'] = self._build_breadth_completeness(
@@ -1373,7 +1396,10 @@ class MarketSnapshotService:
         *,
         stale_reason: str,
     ) -> dict[str, Any] | None:
-        if not isinstance(cached_payload, dict):
+        if (
+            not isinstance(cached_payload, dict)
+            or _provider_snapshot_as_of(cached_payload) is None
+        ):
             return None
         payload = normalize_market_snapshot_payload(cached_payload)
         payload['status'] = 'stale'
@@ -1389,7 +1415,11 @@ class MarketSnapshotService:
         self,
         cache_record: MarketSnapshotCacheRecord | None,
     ) -> dict[str, Any] | None:
-        if cache_record is None or not isinstance(cache_record.payload, dict):
+        if (
+            cache_record is None
+            or not isinstance(cache_record.payload, dict)
+            or _provider_snapshot_as_of(cache_record.payload) is None
+        ):
             return None
         payload = normalize_market_snapshot_payload(cache_record.payload)
         payload['freshness'] = self._build_freshness_payload(cache_record)
@@ -1401,7 +1431,10 @@ class MarketSnapshotService:
     ) -> dict[str, Any]:
         return {
             'available': True,
-            'has_snapshot': bool(cache_record and cache_record.payload),
+            'has_snapshot': bool(
+                cache_record
+                and _provider_snapshot_as_of(cache_record.payload) is not None
+            ),
             'snapshot_status': cache_record.snapshot_status if cache_record is not None else None,
             'as_of': self._format_datetime(cache_record.as_of) if cache_record is not None else None,
             'last_refresh_attempted_at': (
@@ -1444,7 +1477,10 @@ class MarketSnapshotService:
         return captured_at
 
     def _refresh_is_due(self, cache_record: MarketSnapshotCacheRecord | None) -> bool:
-        if cache_record is None:
+        if (
+            cache_record is None
+            or _provider_snapshot_as_of(cache_record.payload) is None
+        ):
             return True
         if self.refresh_interval_seconds == 0:
             return True
@@ -1465,7 +1501,10 @@ class MarketSnapshotService:
         self,
         cache_record: MarketSnapshotCacheRecord | None,
     ) -> datetime | None:
-        if cache_record is None:
+        if (
+            cache_record is None
+            or _provider_snapshot_as_of(cache_record.payload) is None
+        ):
             return None
         due_candidates: list[datetime] = []
         reference = (
