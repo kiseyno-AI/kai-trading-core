@@ -1765,6 +1765,15 @@ the ledger applies the conservative stop-first result. The optional
 `extended_entry_price` / `avoid_chase` shadow rule is report-only and never
 changes live execution authority.
 
+A `decider_post_decision_eval_v3` short-term evaluation is not terminal until
+all five daily bars in the observation window contain complete OHLC data.
+Before then, an untriggered watch or a triggered but unresolved watch returns
+`invalid_missing_price_data`, sets `metadata.price_window_complete=false`, and
+keeps `metadata.paper_ledger=null`; it does not publish a premature `no_entry`
+or partial-window `window_close` result. After a complete five-bar window, an
+untriggered watch may resolve to `neither_hit_within_5d` with
+`exit_reason="no_entry"`.
+
 ## 4.9 `GET /agent-context/decider/evaluations`
 
 The default `include_history=false` response returns only the latest canonical
