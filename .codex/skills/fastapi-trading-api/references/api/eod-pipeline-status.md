@@ -29,6 +29,19 @@ For `agent_feedback_summaries`, the status reader reconciles stale durable run s
 
 The durable fallback prefers the latest canonical daily-retry parent over a newer narrow child run. A completed stored stage with incomplete role progress is rendered as partial, with total/processed/remaining counts rebuilt from the role scopes. Official `result_summary` fields keep scalar aggregates but replace nested bulk evidence with `result_summary_omissions` metadata on write and read.
 
+When diagnostics provide newer PyKRX enrichment coverage than an official
+stage snapshot, the live coverage fields are authoritative. Core preserves the
+current requested counts, category map, missing/not-applicable/warning
+categories, and `decider_*` gate evidence instead of allowing a stale official
+`waiting` value to overwrite a completed, ready gate.
+
+A child stage that remains stored as `running` after its official parent run is
+terminal is reported as `interrupted`, not active. Its original value remains
+available as `source_status`, while
+`details.orphaned_running_stage=true`, `details.orphan_reason`, and
+`details.parent_run_status` explain the reconciliation. Such an orphan is not
+included in `running_stages` or selected as current live work.
+
 Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may be `skipped` with reason metadata once same-date downstream output exists and there is no active/pre-open official stage row. This prevents `current_stage` from pointing at `master_refresh` after a resumed EOD or agent-stage recovery has already completed.
 
 ## Example request

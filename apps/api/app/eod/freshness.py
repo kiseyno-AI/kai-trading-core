@@ -227,14 +227,17 @@ class EODFreshnessService:
             latest_bar_count > 0
             and candidate_counts.total > 0
             and candidate_counts.total < latest_bar_count
-            and candidate_counts.succeeded == 0
         ):
             fallback = self.best_run_loader(
                 market='KRX',
                 trade_date=trade_date,
                 statuses=statuses or DEFAULT_FRESHNESS_FALLBACK_STATUSES,
             )
-            if fallback is not None:
+            fallback_counts = extract_run_stage_counts(fallback) if fallback else None
+            if fallback_counts is not None and (
+                fallback_counts.total > candidate_counts.total
+                or fallback_counts.succeeded > candidate_counts.succeeded
+            ):
                 return fallback
         return candidate
 

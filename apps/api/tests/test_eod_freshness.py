@@ -146,6 +146,61 @@ def _pykrx_enrichment_coverage(
 
 
 class EODFreshnessServiceTests(unittest.TestCase):
+    def test_latest_freshness_prefers_full_universe_run_over_newer_one_symbol_retry(self):
+        full_run = _latest_run(
+            status='completed',
+            symbols_total=2679,
+            symbols_succeeded=2679,
+            symbols_failed=0,
+            started_at='2026-10-07T06:00:00+00:00',
+            completed_at='2026-10-07T06:45:00+00:00',
+            run_metadata={
+                'mode': 'daily_auto',
+                'last_progress_at': '2026-10-07T06:45:00+00:00',
+            },
+        )
+        retry_run = _latest_run(
+            status='completed',
+            symbols_total=1,
+            symbols_succeeded=1,
+            symbols_failed=0,
+            started_at='2026-10-07T07:00:00+00:00',
+            completed_at='2026-10-07T07:01:00+00:00',
+            run_metadata={
+                'mode': 'daily_auto',
+                'last_progress_at': '2026-10-07T07:01:00+00:00',
+            },
+        )
+        service = EODFreshnessService(
+            market_state_loader=lambda: _FakeMarketState(),
+            latest_run_loader=lambda **_: retry_run,
+            latest_run_rows_loader=lambda **_: [retry_run, full_run],
+            live_symbol_count_loader=lambda: 2679,
+            daily_price_bar_count_loader=lambda _: 2679,
+            daily_technical_snapshot_count_loader=lambda _: 2679,
+            daily_action_summary_count_loader=lambda _: 2679,
+            daily_fundamentals_count_loader=lambda _: {
+                'symbols_succeeded': 0,
+                'symbols_failed': 0,
+                'symbols_total': 0,
+            },
+            fundamentals_today_refresh_loader=lambda _: None,
+            latest_fundamentals_refresh_loader=lambda: None,
+            latest_price_trade_date_loader=lambda: '2026-04-10',
+            latest_price_bar_count_loader=lambda _: 2679,
+            latest_technical_market_date_loader=lambda: '2026-04-10',
+            latest_action_market_date_loader=lambda: '2026-04-10',
+            best_run_loader=lambda **_: full_run,
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['latest']['total'], 2679)
+        self.assertEqual(result['latest']['succeeded'], 2679)
+        self.assertEqual(result['latest']['failed'], 0)
+        self.assertEqual(result['latest']['updated_at'], '2026-10-07T06:45:00+00:00')
+        self.assertEqual(result['latest']['symbols_total'], 2679)
+
     def test_pykrx_freshness_treats_not_applicable_categories_as_satisfied(self):
         coverage = _pykrx_enrichment_coverage(
             market_date='2026-09-18',

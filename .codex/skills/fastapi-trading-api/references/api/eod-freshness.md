@@ -13,6 +13,13 @@ Both `today.pykrx_enrichment` and `latest.pykrx_enrichment` expose PyKRX enrichm
 
 `latest.summary.basis` names the count basis. `latest_eod_run_symbol_universe` means the summary comes from the selected latest `eod_collection_runs` row for that trade date. `stored_price_bars_for_latest_trade_date` is the fallback when stored bars exist but no matching EOD run row is available.
 
+For a date with a completed full-universe run followed by a narrow retry, the
+read layer does not let the newer retry delta replace the representative daily
+summary. When the newest candidate covers fewer symbols than the stored
+same-date price-bar population, Core selects the more complete same-date run by
+run total or success count. For example, a 1-symbol retry cannot replace a
+2,679-symbol daily result.
+
 The response now also includes a top-level `market_session` block with the requested/current calendar date, latest valid trading date, session status, data-expected flags, and `recommendation_basis`. On weekends and holidays, it makes the latest completed trading session explicit without backshifting `today.trade_date`.
 
 ## Example request

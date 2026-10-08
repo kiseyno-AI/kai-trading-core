@@ -315,8 +315,13 @@ def compact_exec_response_item(item: Any) -> dict[str, Any] | None:
         'exec_trace_id',
         'trace_id',
         'request_id',
+        'updated_at',
+        'terminal',
         'reason',
         'reason_code',
+        'reason_family',
+        'rejection_disposition',
+        'retry_after',
         'message',
         'exec_agent_action',
         'agent_action',
@@ -359,6 +364,21 @@ def compact_exec_response_item(item: Any) -> dict[str, Any] | None:
             )
             if agent_sizing.get(key) is not None
         }
+    decision = item.get('decision')
+    if isinstance(decision, dict):
+        compact['decision'] = {
+            key: _truncate_text(decision.get(key), max_chars=256)
+            for key in (
+                'action',
+                'decision',
+                'reason_code',
+                'reason_family',
+                'rejection_disposition',
+                'reason',
+                'retry_after',
+            )
+            if decision.get(key) is not None
+        }
     return compact or None
 
 
@@ -380,7 +400,9 @@ def compact_exec_item_link(link: Any) -> dict[str, Any] | None:
         'limit_price',
         'exec_plan_id',
         'exec_plan_item_id',
+        'ack_status',
         'remote_status',
+        'remote_status_source',
     ):
         if key in link and link.get(key) is not None:
             compact[key] = (
@@ -391,6 +413,9 @@ def compact_exec_item_link(link: Any) -> dict[str, Any] | None:
     response_item = compact_exec_response_item(link.get('response_item'))
     if response_item:
         compact['response_item'] = response_item
+    current_state = compact_exec_response_item(link.get('current_state'))
+    if current_state:
+        compact['current_state'] = current_state
     return compact or None
 
 
@@ -1141,6 +1166,11 @@ def slim_signal_decider_exec_submission_payload(
     core_state_sync = exec_dispatch.get('core_state_sync')
     if isinstance(core_state_sync, dict):
         optional_exec['core_state_sync'] = _shallow_slim(core_state_sync)
+    terminal_state_sync = exec_dispatch.get('terminal_state_sync')
+    if isinstance(terminal_state_sync, dict):
+        optional_exec['terminal_state_sync'] = _shallow_slim(
+            terminal_state_sync
+        )
 
     raw_lifecycle_payload: dict[str, Any] = {}
     for lifecycle_key, expected_type in (

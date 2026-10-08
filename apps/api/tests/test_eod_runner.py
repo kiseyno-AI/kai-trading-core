@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -13,6 +14,48 @@ from app.market.clock import MarketState
 
 
 class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_snapshot_exposes_fresh_runner_heartbeat(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        now = datetime(2026, 10, 7, 5, 0, tzinfo=timezone.utc)
+        runner._running = True
+        runner._started_at = now - timedelta(minutes=10)
+        runner._last_tick_started_at = now - timedelta(seconds=35)
+        runner._last_tick_completed_at = now - timedelta(seconds=30)
+        runner._last_tick_succeeded_at = now - timedelta(seconds=30)
+        runner._tick_count = 12
+
+        snapshot = runner.snapshot(now=now)
+
+        self.assertEqual(snapshot['status'], 'running')
+        self.assertEqual(snapshot['heartbeat_at'], '2026-10-07T04:59:30+00:00')
+        self.assertEqual(snapshot['last_tick']['count'], 12)
+        self.assertEqual(
+            snapshot['last_tick']['started_at'],
+            '2026-10-07T04:59:25+00:00',
+        )
+        self.assertEqual(
+            snapshot['last_tick']['completed_at'],
+            '2026-10-07T04:59:30+00:00',
+        )
+        self.assertEqual(snapshot['staleness']['age_seconds'], 30)
+        self.assertEqual(snapshot['staleness']['stale_after_seconds'], 180)
+        self.assertFalse(snapshot['staleness']['is_stale'])
+
+    def test_snapshot_marks_running_runner_stale_after_three_intervals(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        now = datetime(2026, 10, 7, 5, 0, tzinfo=timezone.utc)
+        runner._running = True
+        runner._started_at = now - timedelta(minutes=10)
+        runner._last_tick_completed_at = now - timedelta(seconds=181)
+        runner._last_tick_succeeded_at = now - timedelta(seconds=181)
+        runner._tick_count = 4
+
+        snapshot = runner.snapshot(now=now)
+
+        self.assertEqual(snapshot['status'], 'stale')
+        self.assertTrue(snapshot['staleness']['is_stale'])
+        self.assertEqual(snapshot['staleness']['age_seconds'], 181)
+
     async def test_transient_critical_failure_does_not_revoke_delegated_buys(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=60)
         market = MarketState(

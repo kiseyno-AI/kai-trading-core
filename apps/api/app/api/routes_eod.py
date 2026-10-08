@@ -19,6 +19,7 @@ from app.eod.master import refresh_master_if_due
 from app.eod.pipeline_status import eod_pipeline_status_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.eod.runner import background_runner
 from app.eod.screening_results import screening_result_read_service
 from app.eod.master_state import master_refresh_state
 from app.eod.service import EOD_SERVICE
@@ -142,10 +143,26 @@ class EODPipelineRunRequest(BaseModel):
 @router.get('/status')
 async def get_eod_status() -> dict:
     market_state = await async_get_market_state()
+    legacy_job = job_state.snapshot()
+    daily_pipeline = auto_pykrx_eod_scheduler.snapshot()
+    runner_status = background_runner.snapshot()
     return {
-        'job': job_state.snapshot(),
+        'job': {
+            **legacy_job,
+            'label': 'Legacy/manual EOD capture',
+            'scope': 'legacy_manual_capture',
+        },
         'master': master_refresh_state.snapshot(),
-        'pykrx_auto': auto_pykrx_eod_scheduler.snapshot(),
+        'pykrx_auto': {
+            **daily_pipeline,
+            'label': 'Current daily pipeline',
+            'scope': 'automatic_daily_pipeline',
+        },
+        'background_runner': {
+            **runner_status,
+            'label': 'Background orchestration runner',
+            'scope': 'runtime_background_orchestration',
+        },
         'market': market_state.__dict__,
         'market_session': await async_build_market_session_metadata(
             requested_date=(market_state.current_calendar_date or market_state.server_time[:10]),
