@@ -6,9 +6,11 @@ from unittest.mock import patch
 
 from app.agent_context.orchestrator_helpers import build_upstream_feedback_bundle
 from app.agent_context.reuse_service import (
+    COMPLETED_SUMMARY_PARENT_REUSE_REASON,
     FUNDAMENTAL_SUMMARY_REUSE_REASON,
     AgentContextReuseService,
     FeedbackReuseStaticInputs,
+    _authoritative_summary_reuse_evidence,
     build_fundamental_input_fingerprint_payload_from_context,
     _extract_fingerprint_payload,
     _failure_supersedes_feedback,
@@ -89,6 +91,137 @@ class _RowsResult:
 
     def scalars(self):
         return _EmptyScalars()
+
+
+class _FlexibleRowsResult:
+    def __init__(self, rows=()):
+        self._rows = list(rows)
+
+    def all(self):
+        return list(self._rows)
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def scalar_one_or_none(self):
+        return self.first()
+
+    def scalar_one(self):
+        return self.first()
+
+
+class _AuthoritativeSummarySession:
+    def __init__(self):
+        market_date = date(2026, 4, 16)
+        cutoff = '2026-04-16T06:30:00+00:00'
+        feedback = SimpleNamespace(
+            id=7,
+            market_date=market_date,
+            symbol='005930',
+            agent_name='eod-summarizer',
+            run_id='valid-feedback-run',
+            summary_payload={},
+            feedback_payload={'summary': 'authoritative summary'},
+            context_payload={},
+            received_at=datetime(
+                2026,
+                4,
+                16,
+                6,
+                32,
+                tzinfo=timezone.utc,
+            ),
+        )
+        failure = SimpleNamespace(
+            id=8,
+            market_date=market_date,
+            symbol='005930',
+            agent_name='eod-summarizer',
+            run_id='abandoned-failure-run',
+            received_at=datetime(
+                2026,
+                4,
+                16,
+                7,
+                2,
+                tzinfo=timezone.utc,
+            ),
+        )
+        summary_parent = SimpleNamespace(
+            status='completed',
+            market_date=market_date,
+            symbols_total=1,
+            completed_count=1,
+            failed_count=0,
+            request_payload={
+                'roles': ['eod-summarizer'],
+                'knowledge_cutoff_at': cutoff,
+                'fs_div': 'CFS',
+            },
+            summary_payload={
+                'reused_symbols_by_role': {
+                    'eod-summarizer': ['005930'],
+                },
+                'reused_feedback_evidence_by_role': {
+                    'eod-summarizer': {
+                        '005930': {
+                            'schema_version': (
+                                'agent_feedback_reuse_evidence_v1'
+                            ),
+                            'feedback_id': 7,
+                            'feedback_run_id': 'valid-feedback-run',
+                            'feedback_received_at': (
+                                '2026-04-16T06:32:00+00:00'
+                            ),
+                        }
+                    }
+                },
+            },
+        )
+        feedback_run = SimpleNamespace(
+            id=11,
+            run_id='valid-feedback-run',
+            started_at=datetime(
+                2026,
+                4,
+                16,
+                6,
+                31,
+                tzinfo=timezone.utc,
+            ),
+            request_payload={'knowledge_cutoff_at': cutoff},
+        )
+        failure_run = SimpleNamespace(
+            id=12,
+            run_id='abandoned-failure-run',
+            started_at=datetime(
+                2026,
+                4,
+                16,
+                7,
+                1,
+                tzinfo=timezone.utc,
+            ),
+            request_payload={'knowledge_cutoff_at': cutoff},
+        )
+        self._results = iter(
+            (
+                _FlexibleRowsResult(
+                    [SimpleNamespace(id=101, symbol='005930')]
+                ),
+                _FlexibleRowsResult([feedback]),
+                _FlexibleRowsResult([failure]),
+                _FlexibleRowsResult([summary_parent]),
+                _FlexibleRowsResult([feedback]),
+                _FlexibleRowsResult([feedback_run, failure_run]),
+            )
+        )
+
+    def execute(self, _statement):
+        return next(self._results)
 
 
 class _SequencedRowsSession:
@@ -269,6 +402,117 @@ def _fundamental_cutoff_reuse_session_scope():
 
 
 class FundamentalReuseServiceTests(unittest.TestCase):
+    def test_completed_summary_parent_evidence_overrides_later_failure_tombstone(
+        self,
+    ):
+        service = AgentContextReuseService()
+
+        @contextmanager
+        def authoritative_session_scope():
+            yield _AuthoritativeSummarySession()
+
+        with (
+            patch(
+                'app.agent_context.reuse_service.session_scope',
+                authoritative_session_scope,
+            ),
+            patch.object(
+                service,
+                '_get_latest_source_updated_at',
+                return_value=None,
+            ),
+        ):
+            decision = service.build_latest_decisions(
+                market_date='2026-04-16',
+                symbols=['005930'],
+                roles=['eod-summarizer'],
+                knowledge_cutoff_at='2026-04-16T06:30:00+00:00',
+                fs_div='CFS',
+                authoritative_summary_run_id='summary-parent-run',
+            )['005930']['eod-summarizer']
+
+        self.assertFalse(decision.should_dispatch)
+        self.assertEqual(
+            decision.reason,
+            COMPLETED_SUMMARY_PARENT_REUSE_REASON,
+        )
+        self.assertEqual(decision.latest_feedback_id, 7)
+        self.assertEqual(
+            decision.latest_feedback['run_id'],
+            'valid-feedback-run',
+        )
+
+    def test_summary_parent_evidence_requires_matching_completed_contract(self):
+        market_date = date(2026, 4, 16)
+        run = SimpleNamespace(
+            status='completed',
+            market_date=market_date,
+            symbols_total=1,
+            completed_count=1,
+            failed_count=0,
+            request_payload={
+                'roles': ['eod-summarizer'],
+                'knowledge_cutoff_at': '2026-04-16T06:30:00+00:00',
+                'fs_div': 'CFS',
+            },
+            summary_payload={
+                'reused_symbols_by_role': {
+                    'eod-summarizer': ['005930'],
+                },
+                'reused_feedback_evidence_by_role': {
+                    'eod-summarizer': {
+                        '005930': {
+                            'schema_version': (
+                                'agent_feedback_reuse_evidence_v1'
+                            ),
+                            'feedback_id': 7,
+                            'feedback_run_id': 'valid-feedback-run',
+                            'feedback_received_at': (
+                                '2026-04-16T06:32:00+00:00'
+                            ),
+                        }
+                    }
+                },
+            },
+        )
+
+        accepted = _authoritative_summary_reuse_evidence(
+            run=run,
+            market_date=market_date,
+            symbols=['005930'],
+            roles=['eod-summarizer'],
+            knowledge_cutoff_at=datetime(
+                2026,
+                4,
+                16,
+                6,
+                30,
+                tzinfo=timezone.utc,
+            ),
+            fs_div='CFS',
+        )
+        rejected = _authoritative_summary_reuse_evidence(
+            run=run,
+            market_date=market_date,
+            symbols=['005930'],
+            roles=['eod-summarizer'],
+            knowledge_cutoff_at=datetime(
+                2026,
+                4,
+                16,
+                6,
+                31,
+                tzinfo=timezone.utc,
+            ),
+            fs_div='CFS',
+        )
+
+        self.assertEqual(
+            accepted[('005930', 'eod-summarizer')]['feedback_id'],
+            7,
+        )
+        self.assertEqual(rejected, {})
+
     def test_static_feedback_state_selects_latest_same_day_rows_independent_of_result_order(
         self,
     ):
