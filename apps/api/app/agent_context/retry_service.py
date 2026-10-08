@@ -4321,6 +4321,19 @@ class AgentFeedbackRetryService:
                                             'outer_batch_size': max(1, int(config.outer_batch_size or 1)),
                                         },
                                     },
+                                    upstream_summary_run_id=(
+                                        str(
+                                            normalized_scope_authority.get(
+                                                'source_summary_run_id'
+                                            )
+                                            or ''
+                                        ).strip()
+                                        if role
+                                        in DECISION_SUPPORT_AGENT_NAMES
+                                        and normalized_scope_authority
+                                        is not None
+                                        else None
+                                    ),
                                 )
                                 dispatch_results.append(dispatch_result)
                                 if chunk_index >= len(dispatch_chunks):

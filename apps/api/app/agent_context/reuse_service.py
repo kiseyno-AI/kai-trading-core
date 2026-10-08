@@ -39,6 +39,9 @@ FUNDAMENTAL_SUMMARY_PROMPT_VERSION = 'fundamental_summarizer_prompt_v1'
 FUNDAMENTAL_SUMMARY_RESPONSE_SCHEMA_VERSION = 'agent_feedback_response_contract_v1'
 FUNDAMENTAL_SUMMARY_REUSE_POLICY_VERSION = 'fundamental_summary_reuse_policy_v2'
 FUNDAMENTAL_SUMMARY_REUSE_REASON = 'reuse_unchanged_fundamental_inputs'
+COMPLETED_SUMMARY_PARENT_REUSE_REASON = (
+    'reuse_completed_summary_parent_evidence'
+)
 FEEDBACK_REUSE_SYMBOL_CHUNK_SIZE = 50
 FEEDBACK_REUSE_KEY_CHUNK_SIZE = 15
 
@@ -372,6 +375,119 @@ def _request_payload_knowledge_cutoff_at(payload: Any) -> datetime | None:
     return None
 
 
+def _authoritative_summary_reuse_evidence(
+    *,
+    run: Any,
+    market_date: date,
+    symbols: Sequence[str],
+    roles: Sequence[str],
+    knowledge_cutoff_at: datetime | None,
+    fs_div: str,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Return only reuse evidence proven by one completed summary parent."""
+
+    if (
+        run is None
+        or str(getattr(run, 'status', '') or '').strip().lower()
+        != 'completed'
+        or getattr(run, 'market_date', None) != market_date
+        or int(getattr(run, 'failed_count', 0) or 0) != 0
+        or int(getattr(run, 'completed_count', 0) or 0)
+        != int(getattr(run, 'symbols_total', 0) or 0)
+    ):
+        return {}
+
+    request_payload = getattr(run, 'request_payload', None)
+    summary_payload = getattr(run, 'summary_payload', None)
+    if not isinstance(request_payload, dict) or not isinstance(
+        summary_payload,
+        dict,
+    ):
+        return {}
+    if _request_payload_knowledge_cutoff_at(
+        request_payload
+    ) != knowledge_cutoff_at:
+        return {}
+    try:
+        parent_fs_div = _resolve_fingerprint_db_fs_div(
+            request_payload.get('fs_div')
+        )
+    except ValueError:
+        return {}
+    if parent_fs_div != fs_div:
+        return {}
+
+    raw_parent_roles = request_payload.get('roles')
+    if not isinstance(raw_parent_roles, list):
+        return {}
+    requested_roles = set(roles)
+    parent_roles = {
+        str(role or '').strip()
+        for role in raw_parent_roles
+        if str(role or '').strip()
+    }
+    if not requested_roles.issubset(parent_roles):
+        return {}
+
+    evidence_by_role = summary_payload.get(
+        'reused_feedback_evidence_by_role'
+    )
+    reused_symbols_by_role = summary_payload.get('reused_symbols_by_role')
+    if not isinstance(evidence_by_role, dict) or not isinstance(
+        reused_symbols_by_role,
+        dict,
+    ):
+        return {}
+
+    requested_symbols = set(symbols)
+    resolved: dict[tuple[str, str], dict[str, Any]] = {}
+    for role in roles:
+        role_evidence = evidence_by_role.get(role)
+        role_reused_symbols = reused_symbols_by_role.get(role)
+        if not isinstance(role_evidence, dict) or not isinstance(
+            role_reused_symbols,
+            list,
+        ):
+            continue
+        proven_symbols = {
+            str(symbol or '').strip().upper()
+            for symbol in role_reused_symbols
+            if str(symbol or '').strip()
+        }
+        for symbol in requested_symbols.intersection(proven_symbols):
+            evidence = role_evidence.get(symbol)
+            if not isinstance(evidence, dict):
+                continue
+            if (
+                str(evidence.get('schema_version') or '').strip()
+                != 'agent_feedback_reuse_evidence_v1'
+            ):
+                continue
+            try:
+                feedback_id = int(evidence.get('feedback_id'))
+            except (TypeError, ValueError):
+                continue
+            feedback_run_id = str(
+                evidence.get('feedback_run_id') or ''
+            ).strip()
+            feedback_received_at = str(
+                evidence.get('feedback_received_at') or ''
+            ).strip()
+            if (
+                feedback_id <= 0
+                or not feedback_run_id
+                or not feedback_received_at
+            ):
+                continue
+            resolved[(symbol, role)] = {
+                **evidence,
+                'feedback_id': feedback_id,
+                'feedback_run_id': feedback_run_id,
+                'feedback_received_at': feedback_received_at,
+            }
+    return resolved
+
+
 def _failure_supersedes_feedback(
     *,
     feedback: Any,
@@ -462,6 +578,7 @@ class AgentContextReuseService:
             Mapping[str, Any],
         ] | None = None,
         static_inputs: FeedbackReuseStaticInputs | None = None,
+        authoritative_summary_run_id: str | None = None,
     ) -> dict[str, dict[str, FeedbackReuseDecision]]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -608,6 +725,68 @@ class AgentContextReuseService:
                         if failure_row is not None:
                             latest_failure_map[(failure_row.symbol, agent_name)] = failure_row
 
+            authoritative_feedback_map: dict[tuple[str, str], Any] = {}
+            normalized_summary_run_id = str(
+                authoritative_summary_run_id or ''
+            ).strip()
+            if normalized_summary_run_id:
+                summary_parent = session.execute(
+                    select(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id
+                        == normalized_summary_run_id
+                    )
+                ).scalar_one_or_none()
+                authoritative_evidence = (
+                    _authoritative_summary_reuse_evidence(
+                        run=summary_parent,
+                        market_date=normalized_market_date,
+                        symbols=normalized_symbols,
+                        roles=requested_roles,
+                        knowledge_cutoff_at=(
+                            normalized_knowledge_cutoff_at
+                        ),
+                        fs_div=normalized_fs_div,
+                    )
+                )
+                feedback_ids = {
+                    int(evidence['feedback_id'])
+                    for evidence in authoritative_evidence.values()
+                }
+                authoritative_rows = (
+                    session.execute(
+                        select(AgentContextFeedback).where(
+                            AgentContextFeedback.id.in_(feedback_ids)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                    if feedback_ids
+                    else []
+                )
+                for row in authoritative_rows:
+                    key = (str(row.symbol), str(row.agent_name))
+                    evidence = authoritative_evidence.get(key)
+                    if evidence is None:
+                        continue
+                    try:
+                        evidence_received_at = (
+                            _normalize_knowledge_cutoff_at(
+                                evidence['feedback_received_at']
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        int(row.id) != int(evidence['feedback_id'])
+                        or row.market_date != normalized_market_date
+                        or str(row.run_id or '').strip()
+                        != evidence['feedback_run_id']
+                        or _normalized_evidence_datetime(row.received_at)
+                        != evidence_received_at
+                    ):
+                        continue
+                    authoritative_feedback_map[key] = row
+
             decision_support_source_by_symbol = (
                 self._load_decision_support_source_updated_at(
                     session=session,
@@ -626,6 +805,7 @@ class AgentContextReuseService:
                 for row in (
                     *latest_feedback_map.values(),
                     *latest_failure_map.values(),
+                    *authoritative_feedback_map.values(),
                 )
                 if str(getattr(row, 'run_id', None) or '').strip()
             }
@@ -771,8 +951,17 @@ class AgentContextReuseService:
                 symbol_id = symbol_id_map.get(symbol)
                 for role in requested_roles:
                     agent_name = ROLE_TO_AGENT[role]
-                    latest_feedback = latest_feedback_map.get((symbol, agent_name))
-                    latest_failure = latest_failure_map.get((symbol, agent_name))
+                    authoritative_feedback = authoritative_feedback_map.get(
+                        (symbol, agent_name)
+                    )
+                    latest_feedback = authoritative_feedback or (
+                        latest_feedback_map.get((symbol, agent_name))
+                    )
+                    latest_failure = (
+                        None
+                        if authoritative_feedback is not None
+                        else latest_failure_map.get((symbol, agent_name))
+                    )
 
                     source_cache_key = (symbol, role)
                     if role in DECISION_SUPPORT_AGENT_NAMES:
@@ -980,6 +1169,11 @@ class AgentContextReuseService:
                     ):
                         should_dispatch = True
                         reason = 'knowledge_cutoff_mismatch'
+                    elif (
+                        authoritative_feedback is not None
+                        and not should_dispatch
+                    ):
+                        reason = COMPLETED_SUMMARY_PARENT_REUSE_REASON
                     decisions[symbol][role] = FeedbackReuseDecision(
                         symbol=symbol,
                         agent_name=agent_name,

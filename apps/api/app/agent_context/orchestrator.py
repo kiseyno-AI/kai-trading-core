@@ -5059,6 +5059,7 @@ class AgentFeedbackOrchestrator:
         auto_scope: bool = False,
         role_symbol_scopes: dict[str, Sequence[str]] | None = None,
         funnel_diagnostics: dict[str, Any] | None = None,
+        upstream_summary_run_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         effective_knowledge_cutoff_at, _knowledge_cutoff_source = (
@@ -5070,6 +5071,9 @@ class AgentFeedbackOrchestrator:
         )
         requested_knowledge_cutoff_at = effective_knowledge_cutoff_at.isoformat()
         normalized_parent_run_id = str(parent_run_id or '').strip() or None
+        normalized_upstream_summary_run_id = str(
+            upstream_summary_run_id or ''
+        ).strip() or None
         specs = self._select_specs(roles=roles)
         requested_role_names = [spec.role for spec in specs]
         requested_symbols = _normalize_requested_symbols(symbols)
@@ -5248,6 +5252,9 @@ class AgentFeedbackOrchestrator:
             },
             'mode': 'role_sequential_runtime_buffered',
             'feedback_scope_mode': feedback_scope_mode,
+            'upstream_summary_run_id': (
+                normalized_upstream_summary_run_id
+            ),
         }
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
@@ -6010,6 +6017,9 @@ class AgentFeedbackOrchestrator:
                         disclosures_limit=source_disclosures_limit,
                         fundamental_input_fingerprint_payloads=(
                             fundamental_input_fingerprint_payloads
+                        ),
+                        authoritative_summary_run_id=(
+                            normalized_upstream_summary_run_id
                         ),
                     )
                     upstream_reuse_decisions = {
