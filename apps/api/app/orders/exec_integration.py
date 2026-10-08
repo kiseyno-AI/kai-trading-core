@@ -78,6 +78,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
     EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
     EXECUTION_STATUS_PLANNED,
+    EXECUTION_STATUS_REVOKED,
     EXECUTION_STATUS_REVOCATION_PENDING,
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
@@ -11735,6 +11736,244 @@ class SignalDeciderExecIntegrationService:
         return values
 
     @classmethod
+    def _acknowledged_revocation_terminal_evidence(
+        cls,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        item_links: Sequence[dict[str, Any]],
+        derived_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if (
+            _normalize_status(row.eligibility_status) != ELIGIBILITY_BLOCKED
+            or _normalize_status(row.execution_status)
+            not in {EXECUTION_STATUS_REVOKED, EXECUTION_STATUS_SUBMIT_FAILED}
+            or _normalize_status(derived_state.get('derived_status'))
+            != UI_BOARD_STATUS_CANCELLED
+        ):
+            return None
+        endpoint_statuses = (
+            derived_state.get('endpoint_statuses')
+            if isinstance(derived_state.get('endpoint_statuses'), dict)
+            else {}
+        )
+        if any(
+            endpoint_statuses.get(endpoint) != REMOTE_FETCH_STATUS_OK
+            for endpoint in ('plans', 'orders', 'executions', 'positions')
+        ):
+            return None
+        if (
+            derived_state.get('has_plan_attributed_fill_evidence') is not False
+            or derived_state.get('matched_order_count') != 0
+            or derived_state.get('matched_execution_count') != 0
+            or derived_state.get('entry_filled_quantity') is not None
+            or derived_state.get('exit_filled_quantity') is not None
+            or bool(derived_state.get('order_status_counts'))
+        ):
+            return None
+        for quantity_key in (
+            'open_quantity',
+            'scoped_position_exposure_quantity',
+            'closed_quantity',
+        ):
+            quantity = _safe_decimal(derived_state.get(quantity_key))
+            if quantity is None or quantity != Decimal('0'):
+                return None
+
+        submission = (
+            row.submission_payload
+            if isinstance(row.submission_payload, dict)
+            else {}
+        )
+        revocation = (
+            submission.get('revocation')
+            if isinstance(submission.get('revocation'), dict)
+            else {}
+        )
+        if (
+            revocation.get('schema_version')
+            != 'core_execution_revocation_state_v1'
+            or revocation.get('status') != 'acknowledged'
+            or revocation.get('ack_status') != 'revoked'
+            or revocation.get('replacement_actionable') is not False
+        ):
+            return None
+        reason_code = _normalize_optional_text(revocation.get('reason_code'))
+        plan_id = _normalize_optional_text(revocation.get('plan_id'))
+        requested_at = _normalize_optional_text(revocation.get('requested_at'))
+        acknowledged_at = _normalize_optional_text(
+            revocation.get('acknowledged_at')
+        )
+        prior_decision_snapshot_id = _normalize_optional_text(
+            revocation.get('prior_decision_snapshot_id')
+        )
+        replacement_id = _normalize_optional_text(
+            revocation.get('replacement_decision_snapshot_id')
+        )
+        replacement_action = _normalize_optional_text(
+            revocation.get('replacement_action')
+        )
+        raw_expected_links = revocation.get('item_links')
+        if not isinstance(raw_expected_links, list):
+            return None
+        expected_links = [
+            link
+            for link in raw_expected_links
+            if isinstance(link, dict)
+        ]
+        if (
+            not reason_code
+            or not plan_id
+            or not requested_at
+            or not acknowledged_at
+            or not prior_decision_snapshot_id
+            or not replacement_id
+            or not replacement_action
+            or not expected_links
+            or len(expected_links) != len(raw_expected_links)
+        ):
+            return None
+
+        def binding(link: dict[str, Any]) -> tuple[str, str, str] | None:
+            core_item_key = _normalize_optional_text(link.get('core_item_key'))
+            exec_plan_id = _normalize_optional_text(link.get('exec_plan_id'))
+            exec_plan_item_id = _normalize_optional_text(
+                link.get('exec_plan_item_id')
+            )
+            if not core_item_key or not exec_plan_id or not exec_plan_item_id:
+                return None
+            return core_item_key, exec_plan_id, exec_plan_item_id
+
+        expected_bindings = [binding(link) for link in expected_links]
+        observed_links = [link for link in item_links if isinstance(link, dict)]
+        observed_bindings = [binding(link) for link in observed_links]
+        if (
+            any(item is None for item in expected_bindings)
+            or any(item is None for item in observed_bindings)
+            or len(observed_links) != len(item_links)
+            or len(set(expected_bindings)) != len(expected_bindings)
+            or len(set(observed_bindings)) != len(observed_bindings)
+            or set(expected_bindings) != set(observed_bindings)
+        ):
+            return None
+        for link in observed_links:
+            current_state = (
+                link.get('current_state')
+                if isinstance(link.get('current_state'), dict)
+                else {}
+            )
+            if (
+                _normalize_status(link.get('remote_status_source'))
+                != 'exec_item_state'
+                or cls._current_exec_link_status(link) != 'revoked'
+                or _normalize_bool(current_state.get('terminal')) is not True
+                or _normalize_optional_text(current_state.get('core_item_key'))
+                != _normalize_optional_text(link.get('core_item_key'))
+                or _normalize_optional_text(
+                    current_state.get('execution_plan_id')
+                )
+                != _normalize_optional_text(link.get('exec_plan_id'))
+                or _normalize_optional_text(
+                    current_state.get('execution_plan_item_id')
+                )
+                != _normalize_optional_text(link.get('exec_plan_item_id'))
+            ):
+                return None
+        if derived_state.get('plan_item_status_counts') != {
+            'revoked': len(observed_links)
+        }:
+            return None
+
+        revocation_history = submission.get('revocation_history')
+        if (
+            not isinstance(revocation_history, list)
+            or not revocation_history
+            or not isinstance(revocation_history[-1], dict)
+        ):
+            return None
+        ack_record = revocation_history[-1]
+        if ack_record.get('acknowledged_at') != revocation.get('acknowledged_at'):
+            return None
+        request_payload = (
+            ack_record.get('request')
+            if isinstance(ack_record.get('request'), dict)
+            else {}
+        )
+        response_payload = (
+            ack_record.get('response')
+            if isinstance(ack_record.get('response'), dict)
+            else {}
+        )
+        try:
+            normalized_request_payload = serialize_execution_revocation_payload(
+                request_payload
+            )
+        except ValueError:
+            return None
+        if normalized_request_payload != request_payload:
+            return None
+        request_payload = normalized_request_payload
+        if (
+            request_payload.get('plan_id') != revocation.get('plan_id')
+            or request_payload.get('reason_code') != revocation.get('reason_code')
+            or request_payload.get('requested_at')
+            != revocation.get('requested_at')
+            or request_payload.get('replacement_decision_snapshot_id')
+            != revocation.get('replacement_decision_snapshot_id')
+            or request_payload.get('replacement_action')
+            != revocation.get('replacement_action')
+        ):
+            return None
+        requested_items = [
+            item
+            for item in (request_payload.get('items') or [])
+            if isinstance(item, dict)
+        ]
+        requested_bindings = [
+            (
+                _normalize_optional_text(item.get('core_item_key')),
+                _normalize_optional_text(item.get('execution_plan_item_id')),
+            )
+            for item in requested_items
+        ]
+        expected_request_bindings = [
+            (
+                _normalize_optional_text(link.get('core_item_key')),
+                _normalize_optional_text(link.get('exec_plan_item_id')),
+            )
+            for link in expected_links
+        ]
+        if (
+            any(None in item for item in requested_bindings)
+            or len(set(requested_bindings)) != len(requested_bindings)
+            or set(requested_bindings) != set(expected_request_bindings)
+            or any(
+                item.get('decision_snapshot_id')
+                != revocation.get('prior_decision_snapshot_id')
+                for item in requested_items
+            )
+        ):
+            return None
+        try:
+            ack_status, _ = validate_execution_revocation_ack(
+                response_payload,
+                plan_id=plan_id,
+                submitted_core_item_keys=[
+                    str(item[0]) for item in requested_bindings
+                ],
+                expected_reason_code=reason_code,
+                submitted_items=expected_links,
+            )
+        except ValueError:
+            return None
+        if ack_status != 'revoked':
+            return None
+        return {
+            'plan_id': plan_id,
+            'reason_code': reason_code,
+            'item_count': len(expected_links),
+        }
+
+    @classmethod
     def _sync_exec_terminal_state(
         cls,
         *,
@@ -11753,6 +11992,11 @@ class SignalDeciderExecIntegrationService:
         )
         if not terminal_links:
             return None
+        acknowledged_revocation = cls._acknowledged_revocation_terminal_evidence(
+            row=row,
+            item_links=item_links,
+            derived_state=derived_state,
+        )
         terminal_link = next(
             (
                 link
@@ -11769,10 +12013,23 @@ class SignalDeciderExecIntegrationService:
             if isinstance(terminal_state.get('decision'), dict)
             else {}
         )
-        reason_code = _normalize_optional_text(decision.get('reason_code')) or terminal_status
-        reason = _normalize_optional_text(decision.get('reason')) or (
-            f'Exec reported terminal item state {terminal_status} before any fill.'
-        )
+        if acknowledged_revocation is not None:
+            terminal_status = 'revoked'
+            reason_code = str(acknowledged_revocation['reason_code'])
+            reason = (
+                'Exec readback exactly matched the acknowledged revocation '
+                'with no order, fill, or position exposure.'
+            )
+            target_execution_status = EXECUTION_STATUS_REVOKED
+        else:
+            reason_code = (
+                _normalize_optional_text(decision.get('reason_code'))
+                or terminal_status
+            )
+            reason = _normalize_optional_text(decision.get('reason')) or (
+                f'Exec reported terminal item state {terminal_status} before any fill.'
+            )
+            target_execution_status = EXECUTION_STATUS_SUBMIT_FAILED
         prior_state = {
             'eligibility_status': row.eligibility_status,
             'execution_status': row.execution_status,
@@ -11787,8 +12044,16 @@ class SignalDeciderExecIntegrationService:
             'core_state_before': prior_state,
             'core_state_after': {
                 'eligibility_status': ELIGIBILITY_BLOCKED,
-                'execution_status': EXECUTION_STATUS_SUBMIT_FAILED,
+                'execution_status': target_execution_status,
             },
+            **(
+                {
+                    'acknowledged_revocation_stable': True,
+                    'acknowledged_revocation': acknowledged_revocation,
+                }
+                if acknowledged_revocation is not None
+                else {}
+            ),
         }
         validation = (
             copy.deepcopy(row.validation_payload)
@@ -11800,7 +12065,7 @@ class SignalDeciderExecIntegrationService:
             for item in (validation.get('blocking_reasons') or [])
             if isinstance(item, dict)
         ]
-        if not any(
+        if acknowledged_revocation is None and not any(
             _normalize_optional_text(item.get('code')) == reason_code
             for item in blocking_reasons
         ):
@@ -11820,7 +12085,7 @@ class SignalDeciderExecIntegrationService:
             else {}
         )
         row.eligibility_status = ELIGIBILITY_BLOCKED
-        row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
+        row.execution_status = target_execution_status
         row.validation_payload = validation
         row.traceability_payload = {
             **traceability,
@@ -12818,6 +13083,8 @@ class SignalDeciderExecIntegrationService:
                 'open_quantity': None,
                 'scoped_position_exposure_quantity': None,
                 'closed_quantity': None,
+                'matched_order_count': len(orders),
+                'matched_execution_count': len(executions),
                 'plan_item_status_counts': {},
                 'order_status_counts': {},
                 'endpoint_statuses': endpoint_statuses,
@@ -12960,6 +13227,8 @@ class SignalDeciderExecIntegrationService:
             ),
             'closed_quantity': _decimal_to_text(sell_quantity if sell_quantity > 0 else Decimal('0')),
             'has_plan_attributed_fill_evidence': has_plan_fill_evidence,
+            'matched_order_count': len(orders),
+            'matched_execution_count': len(executions),
             'plan_item_status_counts': dict(sorted(plan_item_status_counts.items())),
             'order_status_counts': dict(sorted(order_status_counts.items())),
             'endpoint_statuses': endpoint_statuses,
