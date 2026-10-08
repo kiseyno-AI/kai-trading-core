@@ -316,7 +316,6 @@ class DartClient:
                         source='persistent_fallback',
                         corp_code_count=len(persisted),
                         upstream_error_type=type(exc).__name__,
-                        upstream_error_message=str(exc),
                     )
                     return persisted
                 log_fetch_event(
