@@ -4370,6 +4370,7 @@ class SignalDeciderNextOpenExecutionService:
                             target=target,
                             current_live_market_authority=current_live_market_authority,
                             current_agent_context=candidate_agent_context,
+                            current_policy_context=policy_context or {},
                             now=now,
                         ):
                             continue
@@ -8210,6 +8211,101 @@ class SignalDeciderNextOpenExecutionService:
             'revocation': revocation,
         }
 
+    def stage_exec_contract_quarantine_retirement(
+        self,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        item_links: Sequence[dict[str, Any]],
+        quarantine_observed_at: str | None,
+        trigger: str,
+        now: datetime,
+    ) -> None:
+        """Stage exact retirement of an accepted Exec plan quarantined pre-fill."""
+        if row.execution_status in {
+            EXECUTION_STATUS_REVOCATION_PENDING,
+            EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW,
+            EXECUTION_STATUS_REVOKED,
+        }:
+            return
+        submission = (
+            row.submission_payload
+            if isinstance(row.submission_payload, dict)
+            else {}
+        )
+        exec_dispatch = (
+            submission.get('exec_dispatch')
+            if isinstance(submission.get('exec_dispatch'), dict)
+            else {}
+        )
+        accepted_links = exec_dispatch.get('item_links')
+        accepted_bindings = {
+            (
+                _normalize_optional_text(link.get('core_item_key')),
+                _normalize_optional_text(link.get('exec_plan_id')),
+                _normalize_optional_text(link.get('exec_plan_item_id')),
+            )
+            for link in accepted_links or []
+            if isinstance(link, dict)
+        }
+        quarantined_bindings = {
+            (
+                _normalize_optional_text(link.get('core_item_key')),
+                _normalize_optional_text(link.get('exec_plan_id')),
+                _normalize_optional_text(link.get('exec_plan_item_id')),
+            )
+            for link in item_links
+            if isinstance(link, dict)
+        }
+        if (
+            exec_dispatch.get('dispatch_status') != 'accepted'
+            or not accepted_bindings
+            or not quarantined_bindings
+            or None in {value for binding in accepted_bindings for value in binding}
+            or not quarantined_bindings.issubset(accepted_bindings)
+        ):
+            return
+        observation_material = json.dumps(
+            {
+                'plan_id': exec_dispatch.get('plan_id'),
+                'bindings': sorted(quarantined_bindings),
+                'quarantine_observed_at': quarantine_observed_at,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        self._stage_terminal_revocation(
+            row=row,
+            replacement_snapshot=None,
+            replacement_observation_id=(
+                'observation:exec_contract_quarantined:'
+                f'{hashlib.sha256(observation_material.encode("utf-8")).hexdigest()[:20]}'
+            ),
+            replacement_action='reject',
+            reason=_reason(
+                'exec_contract_quarantined',
+                'Exec quarantined the exact accepted BUY contract before any attributed fill; '
+                'the old remote authority must be revoked before a new generation can be considered.',
+            ),
+            now=now,
+        )
+        staged_submission = (
+            copy.deepcopy(row.submission_payload)
+            if isinstance(row.submission_payload, dict)
+            else {}
+        )
+        revocation = (
+            copy.deepcopy(staged_submission.get('revocation'))
+            if isinstance(staged_submission.get('revocation'), dict)
+            else {}
+        )
+        if row.execution_status != EXECUTION_STATUS_REVOCATION_PENDING:
+            return
+        revocation['quarantine_observed_at'] = quarantine_observed_at
+        revocation['quarantine_trigger'] = trigger
+        staged_submission['revocation'] = revocation
+        row.submission_payload = staged_submission
+
     def _recover_acknowledged_market_evidence_revocation(
         self,
         *,
@@ -8218,6 +8314,7 @@ class SignalDeciderNextOpenExecutionService:
         target: NextOpenAccountTarget,
         current_live_market_authority: dict[str, Any],
         current_agent_context: dict[str, Any],
+        current_policy_context: dict[str, Any],
         now: datetime,
     ) -> bool:
         """Retire an ACKed transient BUY authority only after exact revalidation."""
@@ -8320,6 +8417,47 @@ class SignalDeciderNextOpenExecutionService:
             and str(link.get('side') or '').strip().lower() == 'buy'
         }
         reason_code = str(revocation.get('reason_code') or '').strip()
+        quarantine_observed_at = _parse_aware_datetime(
+            revocation.get('quarantine_observed_at')
+        )
+        live_market_observed_at = _parse_aware_datetime(
+            current_live_market_authority.get('observed_at')
+        )
+        row_validation = _row_validation_payload(row)
+        stored_policy_context = (
+            row_validation.get('policy_context')
+            if isinstance(row_validation.get('policy_context'), dict)
+            else {}
+        )
+        stored_agent_context = (
+            row_validation.get('agent_context_completeness')
+            if isinstance(
+                row_validation.get('agent_context_completeness'),
+                dict,
+            )
+            else None
+        )
+        decision_agent_name = _snapshot_agent_name(snapshot)
+        policy_contract_matches = bool(
+            (
+                decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                and stored_policy_context.get('policy_version')
+                == row.policy_version
+                and current_policy_context.get('current_version')
+                == row.policy_version
+                and current_policy_context.get('status') == 'active'
+                and stored_policy_context.get('authority')
+                == current_policy_context.get('policy_authority')
+            )
+            or (
+                decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                and stored_policy_context.get('policy_version')
+                == row.policy_version
+                and stored_policy_context.get('status') is None
+                and stored_policy_context.get('authority') is None
+                and not current_policy_context
+            )
+        )
         market_evidence_recovered = bool(
             reason_code == 'current_live_market_evidence_unavailable'
             and current_live_market_authority.get('schema_version')
@@ -8348,6 +8486,32 @@ class SignalDeciderNextOpenExecutionService:
                 )
             )
         )
+        contract_quarantine_recovered = bool(
+            reason_code == 'exec_contract_quarantined'
+            and _is_actionable_snapshot(snapshot)
+            and row.policy_version == snapshot.policy_version
+            and _agent_context_authority_matches(
+                stored=stored_agent_context,
+                current=current_agent_context,
+            )
+            and policy_contract_matches
+            and quarantine_observed_at is not None
+            and quarantine_observed_at.astimezone(KST).date()
+            == row.target_trade_date
+            and live_market_observed_at is not None
+            and live_market_observed_at.astimezone(KST).date()
+            == row.target_trade_date
+            and live_market_observed_at > quarantine_observed_at
+            and live_market_observed_at <= now
+            and current_live_market_authority.get('schema_version')
+            == CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION
+            and current_live_market_authority.get('applies') is True
+            and current_live_market_authority.get('authoritative') is True
+            and current_live_market_authority.get('status') == 'available'
+            and current_live_market_authority.get('action') == 'allow'
+            and current_live_market_authority.get('market_date')
+            == row.target_trade_date.isoformat()
+        )
         monitor_only_watch_recovery = bool(
             reason_code == 'current_live_market_evidence_unavailable'
             and revocation.get('replacement_action') == 'watch_for_trigger'
@@ -8360,7 +8524,11 @@ class SignalDeciderNextOpenExecutionService:
             revocation.get('schema_version') != 'core_execution_revocation_state_v1'
             or revocation.get('status') != 'acknowledged'
             or revocation.get('ack_status') != 'revoked'
-            or not (market_evidence_recovered or agent_context_recovered)
+            or not (
+                market_evidence_recovered
+                or agent_context_recovered
+                or contract_quarantine_recovered
+            )
             or (
                 not monitor_only_watch_recovery
                 and revocation.get('replacement_action') != 'reject'
@@ -8438,7 +8606,11 @@ class SignalDeciderNextOpenExecutionService:
             archived_dispatch_evidence.update(
                 {
                     'retired_at': now.isoformat(),
-                    'retirement_reason': 'transient_buy_authority_recovered',
+                    'retirement_reason': (
+                        'exec_contract_quarantine_recovered'
+                        if contract_quarantine_recovered
+                        else 'transient_buy_authority_recovered'
+                    ),
                     'recovery_generation': recovery_generation,
                 }
             )
@@ -8450,6 +8622,9 @@ class SignalDeciderNextOpenExecutionService:
             'row_authority_fingerprint': revoked_row_authority_fingerprint,
             'live_market_observed_at': current_live_market_authority.get(
                 'observed_at'
+            ),
+            'quarantine_observed_at': revocation.get(
+                'quarantine_observed_at'
             ),
         }
         submission['revision_history'] = revision_history[

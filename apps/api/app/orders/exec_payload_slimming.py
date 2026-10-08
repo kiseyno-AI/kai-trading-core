@@ -316,6 +316,7 @@ def compact_exec_response_item(item: Any) -> dict[str, Any] | None:
         'trace_id',
         'request_id',
         'updated_at',
+        'observed_at',
         'terminal',
         'reason',
         'reason_code',
@@ -891,6 +892,8 @@ def _compact_revocation_record(value: Any) -> dict[str, Any] | None:
             'replacement_authority_generation_fingerprint',
             'prior_row_authority_fingerprint',
             'revoked_row_authority_fingerprint',
+            'quarantine_observed_at',
+            'quarantine_trigger',
         ),
     )
     if isinstance(value.get('item_links'), list):

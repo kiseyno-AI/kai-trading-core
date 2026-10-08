@@ -78,6 +78,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
     EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
     EXECUTION_STATUS_PLANNED,
+    EXECUTION_STATUS_REVOCATION_PENDING,
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     EXECUTION_WINDOW_NEXT_OPEN,
@@ -2202,6 +2203,20 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _parse_aware_iso_datetime(value: Any) -> datetime | None:
+    text = _normalize_optional_text(value)
+    if not text:
+        return None
+    normalized = text[:-1] + '+00:00' if text.endswith('Z') else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
     return parsed
 
 
@@ -11189,6 +11204,10 @@ class SignalDeciderExecIntegrationService:
                 or nested_plan.get('plan_id')
             )
             parent_decision = cls._exec_state_decision(nested_plan)
+            parent_observed_at = (
+                nested_plan.get('observed_at')
+                or nested_plan.get('updated_at')
+            )
 
             raw_states: list[dict[str, Any]] = []
             for key in (
@@ -11243,6 +11262,11 @@ class SignalDeciderExecIntegrationService:
                         'status': parent_status,
                         'terminal': parent_terminal,
                         **(
+                            {'observed_at': parent_observed_at}
+                            if parent_observed_at is not None
+                            else {}
+                        ),
+                        **(
                             {'decision': copy.deepcopy(parent_decision)}
                             if parent_decision
                             else {}
@@ -11265,6 +11289,8 @@ class SignalDeciderExecIntegrationService:
                 if parent_overrides_items:
                     state['status'] = parent_status
                     state['terminal'] = True
+                    if parent_observed_at is not None:
+                        state['observed_at'] = parent_observed_at
                     item_decision = (
                         state.get('decision')
                         if isinstance(state.get('decision'), dict)
@@ -11542,7 +11568,7 @@ class SignalDeciderExecIntegrationService:
             ):
                 return None
             decision = cls._exec_state_decision(plan)
-            return {
+            state = {
                 'core_item_key': link.get('core_item_key'),
                 'execution_plan_id': link.get('exec_plan_id'),
                 'execution_plan_item_id': link.get('exec_plan_item_id'),
@@ -11550,6 +11576,10 @@ class SignalDeciderExecIntegrationService:
                 'terminal': status in EXEC_PLAN_TERMINAL_STATUSES,
                 **({'decision': decision} if decision else {}),
             }
+            observed_at = plan.get('observed_at') or plan.get('updated_at')
+            if observed_at is not None:
+                state['observed_at'] = observed_at
+            return state
         return None
 
     @classmethod
@@ -11773,6 +11803,72 @@ class SignalDeciderExecIntegrationService:
             'exec_terminal_state_sync': audit,
         }
         return audit
+
+    @classmethod
+    def _contract_quarantine_retirement_evidence(
+        cls,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        item_links: Sequence[dict[str, Any]],
+        derived_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not _row_has_accepted_exec_dispatch(row):
+            return None
+        endpoint_statuses = (
+            derived_state.get('endpoint_statuses')
+            if isinstance(derived_state.get('endpoint_statuses'), dict)
+            else {}
+        )
+        if any(
+            endpoint_statuses.get(endpoint) != REMOTE_FETCH_STATUS_OK
+            for endpoint in ('plans', 'orders', 'executions', 'positions')
+        ):
+            return None
+        if derived_state.get('has_plan_attributed_fill_evidence') is not False:
+            return None
+        open_quantity = _safe_decimal(derived_state.get('open_quantity'))
+        if open_quantity is None or open_quantity != Decimal('0'):
+            return None
+        scoped_position_exposure = _safe_decimal(
+            derived_state.get('scoped_position_exposure_quantity')
+        )
+        if (
+            scoped_position_exposure is None
+            or scoped_position_exposure != Decimal('0')
+        ):
+            return None
+
+        quarantined_entry_links = [
+            link
+            for link in item_links
+            if isinstance(link, dict)
+            and _normalize_optional_text(link.get('intent'), lowercase=True)
+            in EXEC_ENTRY_BUY_INTENTS
+            and cls._current_exec_link_status(link) == 'contract_quarantined'
+            and _normalize_optional_text(link.get('core_item_key'))
+            and _normalize_optional_text(link.get('exec_plan_id'))
+            and _normalize_optional_text(link.get('exec_plan_item_id'))
+        ]
+        if not quarantined_entry_links:
+            return None
+        observed_at_values = [
+            parsed
+            for link in quarantined_entry_links
+            if isinstance(link.get('current_state'), dict)
+            and (
+                parsed := _parse_aware_iso_datetime(
+                    link['current_state'].get('observed_at')
+                    or link['current_state'].get('updated_at')
+                )
+            )
+            is not None
+        ]
+        if len(observed_at_values) != len(quarantined_entry_links):
+            return None
+        return {
+            'quarantine_observed_at': max(observed_at_values).isoformat(),
+            'item_links': quarantined_entry_links,
+        }
 
     @classmethod
     def _is_short_term_watch_buy_row(cls, row: SignalDeciderExecutionPlanItem) -> bool:
@@ -12159,12 +12255,23 @@ class SignalDeciderExecIntegrationService:
                     'derived_state': derived_state,
                 }
                 compact_readback = compact_exec_readback(readback)
-                observed_terminal_state_sync = self._sync_exec_terminal_state(
-                    row=row,
-                    item_links=item_links,
-                    derived_state=derived_state,
-                    now=now,
-                    trigger=trigger,
+                quarantine_retirement = (
+                    self._contract_quarantine_retirement_evidence(
+                        row=row,
+                        item_links=item_links,
+                        derived_state=derived_state,
+                    )
+                )
+                observed_terminal_state_sync = (
+                    None
+                    if quarantine_retirement is not None
+                    else self._sync_exec_terminal_state(
+                        row=row,
+                        item_links=item_links,
+                        derived_state=derived_state,
+                        now=now,
+                        trigger=trigger,
+                    )
                 )
                 terminal_state_sync = (
                     observed_terminal_state_sync
@@ -12227,6 +12334,16 @@ class SignalDeciderExecIntegrationService:
                     'exec_dispatch': exec_dispatch,
                 }
                 row.submission_payload = slim_signal_decider_exec_submission_payload(submission).payload
+                if quarantine_retirement is not None:
+                    signal_decider_next_open_execution_service.stage_exec_contract_quarantine_retirement(
+                        row=row,
+                        item_links=quarantine_retirement['item_links'],
+                        quarantine_observed_at=quarantine_retirement[
+                            'quarantine_observed_at'
+                        ],
+                        trigger=trigger,
+                        now=now,
+                    )
                 applied_row_ids.append(int(row.id))
             session.flush()
         if applied_row_ids:
@@ -12670,6 +12787,7 @@ class SignalDeciderExecIntegrationService:
                 'entry_filled_quantity': None,
                 'exit_filled_quantity': None,
                 'open_quantity': None,
+                'scoped_position_exposure_quantity': None,
                 'closed_quantity': None,
                 'plan_item_status_counts': {},
                 'order_status_counts': {},
@@ -12695,10 +12813,23 @@ class SignalDeciderExecIntegrationService:
         if sell_quantity <= Decimal('0'):
             sell_quantity = self._sum_order_filled_quantity(orders=orders, side='sell')
 
-        position_quantity = Decimal('0')
-        if positions:
-            first_position = positions[0]
-            position_quantity = _safe_decimal(first_position.get('quantity')) or Decimal('0')
+        position_quantities = [
+            _safe_decimal(position.get('quantity'))
+            for position in positions
+        ]
+        scoped_position_exposure_quantity = (
+            sum(
+                (abs(quantity) for quantity in position_quantities),
+                start=Decimal('0'),
+            )
+            if all(quantity is not None for quantity in position_quantities)
+            else None
+        )
+        position_quantity = (
+            position_quantities[0]
+            if position_quantities and position_quantities[0] is not None
+            else Decimal('0')
+        )
 
         item_status_values = [
             status
@@ -12795,6 +12926,9 @@ class SignalDeciderExecIntegrationService:
             'entry_filled_quantity': _decimal_to_text(buy_quantity if buy_quantity > 0 else None),
             'exit_filled_quantity': _decimal_to_text(sell_quantity if sell_quantity > 0 else None),
             'open_quantity': _decimal_to_text(open_quantity if open_quantity > 0 else Decimal('0')),
+            'scoped_position_exposure_quantity': _decimal_to_text(
+                scoped_position_exposure_quantity
+            ),
             'closed_quantity': _decimal_to_text(sell_quantity if sell_quantity > 0 else Decimal('0')),
             'has_plan_attributed_fill_evidence': has_plan_fill_evidence,
             'plan_item_status_counts': dict(sorted(plan_item_status_counts.items())),
