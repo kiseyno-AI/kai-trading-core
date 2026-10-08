@@ -24,6 +24,7 @@ from app.eod.pykrx_backfill import (
     _call_pykrx,
     _feedback_suffix_has_stale_prerequisite_ordering,
     _is_dart_provider_outage_rearm_candidate,
+    _is_retryable_feedback_rearm_candidate,
     _is_summary_cutoff_contract_repair_candidate,
     _is_terminal_followup_continuation_candidate,
     _select_summary_cutoff_proof,
@@ -6517,6 +6518,157 @@ class PykrxBackfillServiceTests(TestCase):
         load_repair_checkpoint.assert_not_called()
         resume_followups.assert_not_called()
         run_collection.assert_not_called()
+
+    def test_retryable_feedback_failure_rearms_after_recovery_limit(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        now = datetime.now(timezone.utc)
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': now.isoformat(),
+            'completed_at': now.isoformat(),
+            'run_metadata': {
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'reused_eod_collection_run_id': 7,
+            },
+            'stages': {
+                'agent_feedback_summaries': {
+                    'status': 'partial',
+                    'details': {
+                        'result_summary': {
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 1,
+                                    'role_progress': {
+                                        'eod-summarizer': {
+                                            'retry_pending_symbols': 1,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    },
+                },
+                'signal_decider': {'status': 'blocked'},
+                'next_open_execution_plan': {'status': 'blocked'},
+                'signal_decider_evaluations': {'status': 'blocked'},
+            },
+        }
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
+        )
+
+        with (
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as resume_followups,
+            patch.object(service, '_run_market_data_pipeline') as run_collection,
+        ):
+            result = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'followup_recovery_backoff')
+        self.assertTrue(
+            result['followup_recovery']['retryable_feedback_rearm']
+        )
+        self.assertTrue(result['followup_recovery']['retry_scheduled'])
+        self.assertEqual(result['followup_recovery']['max_attempts'], 8)
+        resume_followups.assert_not_called()
+        run_collection.assert_not_called()
+
+        with (
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=8,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as capped_resume_followups,
+            patch.object(
+                service,
+                '_run_market_data_pipeline',
+            ) as capped_run_collection,
+        ):
+            capped = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertFalse(capped['triggered'])
+        self.assertEqual(capped['reason'], 'followup_recovery_limit_reached')
+        capped_resume_followups.assert_not_called()
+        capped_run_collection.assert_not_called()
 
     def test_dart_provider_maintenance_waits_then_rearms_after_recovery_limit(
         self,
