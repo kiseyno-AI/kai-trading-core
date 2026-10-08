@@ -1100,7 +1100,17 @@ class EODRouteTests(unittest.TestCase):
                 self.market_session = 'holiday'
 
         client = TestClient(self.app)
-        with patch('app.api.routes_eod.async_get_market_state', return_value=_FakeMarketState()):
+        with (
+            patch('app.api.routes_eod.async_get_market_state', return_value=_FakeMarketState()),
+            patch(
+                'app.api.routes_eod.background_runner.snapshot',
+                return_value={
+                    'status': 'running',
+                    'heartbeat_at': '2026-05-05T03:14:30+00:00',
+                    'staleness': {'is_stale': False},
+                },
+            ),
+        ):
             response = client.get('/eod/status')
 
         self.assertEqual(response.status_code, 200)
@@ -1111,6 +1121,15 @@ class EODRouteTests(unittest.TestCase):
         self.assertEqual(payload['market_session']['status'], 'holiday')
         self.assertEqual(payload['market_session']['latest_valid_trading_date'], '2026-05-04')
         self.assertFalse(payload['market_session']['intraday_data_expected'])
+        self.assertEqual(payload['job']['label'], 'Legacy/manual EOD capture')
+        self.assertEqual(payload['job']['scope'], 'legacy_manual_capture')
+        self.assertEqual(payload['pykrx_auto']['label'], 'Current daily pipeline')
+        self.assertEqual(payload['pykrx_auto']['scope'], 'automatic_daily_pipeline')
+        self.assertEqual(payload['background_runner']['status'], 'running')
+        self.assertEqual(
+            payload['background_runner']['label'],
+            'Background orchestration runner',
+        )
 
     def test_pykrx_backfill_omitted_dates_use_latest_krx_session(self):
         client = TestClient(self.app)

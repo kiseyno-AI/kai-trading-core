@@ -147,6 +147,14 @@ def test_legacy_or_incomplete_accepted_dispatch_is_not_trusted_as_v4_proof() -> 
     assert pending == []
 
 
+def test_live_item_state_cannot_replace_missing_dispatch_ack_status() -> None:
+    row = _row(1, 101, '005930', 'accepted')
+    item_link = row.submission_payload['exec_dispatch']['item_links'][0]
+    item_link['remote_status_source'] = 'exec_item_state'
+
+    assert _row_has_accepted_exec_dispatch(row) is False
+
+
 def test_accepted_dispatch_proof_rejects_duplicate_remote_item_ids() -> None:
     row = _row(1, 101, '005930', 'accepted')
     exec_dispatch = row.submission_payload['exec_dispatch']

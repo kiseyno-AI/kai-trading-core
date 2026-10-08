@@ -52,6 +52,99 @@ class EODBackgroundRunner:
         self._async_step_tasks: dict[str, asyncio.Task] = {}
         self._last_open_drive_market_snapshot_refresh_at: datetime | None = None
         self._buy_authority_critical_failures: dict[str, int] = {}
+        self._started_at: datetime | None = None
+        self._stopped_at: datetime | None = None
+        self._last_tick_started_at: datetime | None = None
+        self._last_tick_completed_at: datetime | None = None
+        self._last_tick_succeeded_at: datetime | None = None
+        self._last_tick_error: dict[str, str] | None = None
+        self._tick_count = 0
+
+    def snapshot(self, *, now: datetime | None = None) -> dict:
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError('runner snapshot timestamp must be timezone-aware')
+        heartbeat_at = (
+            self._last_tick_completed_at
+            or self._last_tick_started_at
+            or self._started_at
+        )
+        heartbeat_age_seconds = (
+            max(int((current - heartbeat_at).total_seconds()), 0)
+            if heartbeat_at is not None
+            else None
+        )
+        stale_after_seconds = max(int(self.interval_seconds) * 3, 180)
+        is_stale = bool(
+            self._running
+            and heartbeat_age_seconds is not None
+            and heartbeat_age_seconds > stale_after_seconds
+        )
+        enabled = bool(
+            settings.background_runner_enabled
+            or settings.eod_auto_pykrx_enabled
+        )
+        if not enabled:
+            status = 'disabled'
+        elif is_stale:
+            status = 'stale'
+        elif self._running:
+            status = 'degraded' if self._last_tick_error else 'running'
+        else:
+            status = 'stopped'
+        return {
+            'enabled': enabled,
+            'runtime_background_enabled': settings.background_runner_enabled,
+            'daily_pipeline_enabled': settings.eod_auto_pykrx_enabled,
+            'status': status,
+            'running': self._running,
+            'task_alive': bool(self._task is not None and not self._task.done()),
+            'interval_seconds': self.interval_seconds,
+            'started_at': self._started_at.isoformat() if self._started_at else None,
+            'stopped_at': self._stopped_at.isoformat() if self._stopped_at else None,
+            'heartbeat_at': heartbeat_at.isoformat() if heartbeat_at else None,
+            'last_tick': {
+                'count': self._tick_count,
+                'started_at': (
+                    self._last_tick_started_at.isoformat()
+                    if self._last_tick_started_at
+                    else None
+                ),
+                'completed_at': (
+                    self._last_tick_completed_at.isoformat()
+                    if self._last_tick_completed_at
+                    else None
+                ),
+                'succeeded_at': (
+                    self._last_tick_succeeded_at.isoformat()
+                    if self._last_tick_succeeded_at
+                    else None
+                ),
+                'error': self._last_tick_error,
+            },
+            'staleness': {
+                'age_seconds': heartbeat_age_seconds,
+                'stale_after_seconds': stale_after_seconds,
+                'is_stale': is_stale,
+            },
+            'in_flight': {
+                'blocking_steps': sorted(
+                    name
+                    for name, task in self._blocking_step_tasks.items()
+                    if not task.done()
+                ),
+                'async_steps': sorted(
+                    name
+                    for name, task in self._async_step_tasks.items()
+                    if not task.done()
+                ),
+            },
+            'timeout_cooldowns': {
+                name: expires_at.isoformat()
+                for name, expires_at in sorted(self._step_timeout_cooldowns.items())
+                if expires_at > current
+            },
+        }
 
     @staticmethod
     def _open_drive_market_time(market: object) -> datetime | None:
@@ -133,10 +226,13 @@ class EODBackgroundRunner:
         if self._task and not self._task.done():
             return
         self._running = True
+        self._started_at = datetime.now(timezone.utc)
+        self._stopped_at = None
         self._task = asyncio.create_task(self._run_loop(), name='eod-background-runner')
 
     async def stop(self) -> None:
         self._running = False
+        self._stopped_at = datetime.now(timezone.utc)
         await auto_pykrx_eod_scheduler.stop()
         # Cancelling an asyncio.to_thread wrapper cannot stop its worker thread.
         # Keep the task registered until its callback observes real completion so
@@ -320,6 +416,10 @@ class EODBackgroundRunner:
     async def _run_loop(self) -> None:
         live_market_snapshot_loop = asyncio.get_running_loop()
         while self._running:
+            self._tick_count += 1
+            self._last_tick_started_at = datetime.now(timezone.utc)
+            self._last_tick_error = None
+            tick_failed = False
             market: object | None = None
             try:
                 market = await async_get_market_state()
@@ -489,7 +589,16 @@ class EODBackgroundRunner:
                         ),
                     )
             except Exception as exc:
+                tick_failed = True
+                self._last_tick_error = {
+                    'type': type(exc).__name__,
+                    'message': str(exc)[:512],
+                }
                 logger.exception('Background runner loop failed: %s', exc)
+            finally:
+                self._last_tick_completed_at = datetime.now(timezone.utc)
+                if not tick_failed and self._running:
+                    self._last_tick_succeeded_at = self._last_tick_completed_at
             await asyncio.sleep(self._next_poll_interval_seconds(market))
 
 

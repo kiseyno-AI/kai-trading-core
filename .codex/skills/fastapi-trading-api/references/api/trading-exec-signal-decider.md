@@ -35,6 +35,18 @@ fill, trigger, and P/L derivation. Plan-scoped positions are fetched with both
 external and internal plan IDs and must include a matching KIS/KRX
 `position_scope_proof` with one non-empty opaque account scope.
 
+Exec v4 `item_acks` are immutable dispatch-acceptance proof, not current item
+state. Core reads current truth from `item_states` and stores it separately as
+each link's `current_state`; the accepted ACK remains unchanged for contract
+verification. The plan-wide `contract_quarantined` state overrides accepted
+ACKs, while item-specific terminal states do not overwrite still-live
+protective exits. Terminal decisions and reason fields are preserved and the
+durable Core row is reconciled to a non-active blocked/submit-failed state.
+Known pending/working v4 statuses remain retryable, and unknown future statuses
+remain `unknown` rather than defaulting to accepted. A `completed_no_trade`
+family uses the entry reason (for example `missed_next_open_window`) ahead of
+its `not_applicable` protective siblings.
+
 ## Example request
 ```http
 GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&symbol=005930&refresh=true

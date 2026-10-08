@@ -933,6 +933,82 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             '2026-05-28T08:40:00+00:00',
         )
 
+    def test_pykrx_live_coverage_overrides_stale_official_gate_details(self):
+        market_date = '2026-05-28'
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=100,
+            market_count=2,
+            updated_at='2026-05-28T08:40:00+00:00',
+        )
+        coverage['categories']['valuation_snapshot'].update(
+            {
+                'present_rows': 96,
+                'expected_rows': 100,
+                'coverage_ratio': 0.96,
+                'coverage_status': 'partial',
+            }
+        )
+        official_item = _completed_official_stage(
+            run_id=387,
+            stage_id='pykrx_enrichment',
+            market_date=market_date,
+            processed=7,
+            total=7,
+            updated_at='2026-05-28T08:45:00+00:00',
+        )
+        official_item['stage']['details'] = {
+            'requested_symbol_count': 1,
+            'categories': {
+                'valuation_snapshot': {
+                    'present_rows': 0,
+                    'expected_rows': 1,
+                    'coverage_status': 'missing',
+                }
+            },
+            'coverage_warning_categories': [],
+            'decider_category_gate_status': 'waiting',
+            'decider_waiting_categories': [{'category': 'valuation_snapshot'}],
+            'decider_warning_categories': [],
+        }
+        official_run = {
+            **official_item['run'],
+            'stages': {'pykrx_enrichment': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 100,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            pykrx_enrichment_loader=lambda **_: coverage,
+        )
+
+        result = service.read(
+            market_date=market_date,
+            include_pykrx_enrichment_coverage=True,
+        )
+
+        stage = result['stages']['pykrx_enrichment']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['details']['requested_symbol_count'], 100)
+        self.assertEqual(
+            stage['details']['categories']['valuation_snapshot']['present_rows'],
+            96,
+        )
+        self.assertEqual(stage['details']['decider_category_gate_status'], 'ready')
+        self.assertEqual(stage['details']['decider_waiting_categories'], [])
+        self.assertEqual(
+            [item['category'] for item in stage['details']['decider_warning_categories']],
+            ['valuation_snapshot'],
+        )
+        self.assertIn('pykrx_enrichment', result['gate_summary']['ready_stage_ids'])
+        self.assertNotIn(
+            'pykrx_enrichment',
+            result['gate_summary']['waiting_stage_ids'],
+        )
+
     def test_load_daily_pipeline_stage_history_filters_stage_market_date_for_history_index(self):
         class _CapturedResult:
             def all(self):
@@ -1157,6 +1233,56 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(stage['total'], 20)
         self.assertEqual(stage['current_symbol'], '005930')
         self.assertEqual(stage['details']['mode'], 'official_daily_pipeline_run_state')
+
+    def test_terminal_parent_run_does_not_report_orphan_stage_as_running(self):
+        official_item = _completed_official_stage(
+            run_id=503,
+            stage_id='market_risk_filter',
+            market_date='2026-04-21',
+            processed=7,
+            total=20,
+            updated_at='2026-04-21T09:30:00+00:00',
+        )
+        official_item['stage'].update(
+            {
+                'status': 'running',
+                'completed_at': None,
+                'remaining': 13,
+                'current_step': 'fetching_kis_market_risk_snapshots',
+                'current_activity': 'Fetching KIS market-risk snapshot for 005930',
+            }
+        )
+        official_run = {
+            **official_item['run'],
+            'status': 'completed',
+            'current_stage': 'market_risk_filter',
+            'stages': {'market_risk_filter': official_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 20,
+            fundamentals_refresh_loader=lambda **_: None,
+            row_count_stage_counts_loader=lambda **_: {
+                'market_risk_filter': {'persisted': 0}
+            },
+            official_run_loader=lambda **_: official_run,
+        )
+
+        result = service.read(market_date='2026-04-21')
+
+        stage = result['stages']['market_risk_filter']
+        self.assertEqual(stage['status'], 'interrupted')
+        self.assertEqual(stage['source_status'], 'running')
+        self.assertEqual(result['running_stages'], 0)
+        self.assertEqual(result['stage_status_counts']['interrupted'], 1)
+        self.assertTrue(stage['details']['orphaned_running_stage'])
+        self.assertEqual(
+            stage['details']['orphan_reason'],
+            'terminal_parent_with_running_stage',
+        )
+        self.assertEqual(stage['details']['parent_run_status'], 'completed')
 
     def test_read_surfaces_interrupted_official_run_as_resumable_stage_state(self):
         official_run = {

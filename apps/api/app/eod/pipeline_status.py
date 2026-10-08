@@ -154,6 +154,18 @@ OFFICIAL_STAGE_HISTORY_INCOMPLETE_STATUSES = {
     'interrupted',
     'abandoned',
 }
+TERMINAL_OFFICIAL_RUN_STATUSES = {
+    'abandoned',
+    'blocked',
+    'cancelled',
+    'completed',
+    'completed_with_errors',
+    'failed',
+    'interrupted',
+    'partial',
+    'skipped',
+    'waiting',
+}
 
 
 def _utcnow_iso() -> str:
@@ -2664,6 +2676,13 @@ class EODPipelineStatusService:
         definition = STAGE_DEFINITIONS[stage_id]
         status = str(official_stage.get('status') or 'pending').strip().lower()
         stored_status = status
+        parent_run_status = str(official_run.get('status') or '').strip().lower()
+        orphaned_running_stage = bool(
+            stored_status == 'running'
+            and parent_run_status in TERMINAL_OFFICIAL_RUN_STATUSES
+        )
+        if orphaned_running_stage:
+            status = 'interrupted'
         fallback_status = str(fallback_stage.get('status') or '').strip().lower()
         use_fallback_progress = (
             status == 'running'
@@ -2782,6 +2801,30 @@ class EODPipelineStatusService:
             if uses_fallback_coverage_diagnostics or no_ready_content
             else official_details
         )
+        if uses_fallback_coverage_diagnostics:
+            authoritative_coverage_details = {
+                key: value
+                for key, value in fallback_details.items()
+                if key
+                in {
+                    'requested_symbol_count',
+                    'requested_market_count',
+                    'categories',
+                    'missing_categories',
+                    'not_applicable_categories',
+                    'coverage_warning_categories',
+                }
+                or key.startswith('decider_')
+            }
+            details.update(authoritative_coverage_details)
+        if orphaned_running_stage:
+            details.update(
+                {
+                    'orphaned_running_stage': True,
+                    'orphan_reason': 'terminal_parent_with_running_stage',
+                    'parent_run_status': parent_run_status,
+                }
+            )
         if no_ready_content:
             details.update(
                 {
@@ -2857,6 +2900,16 @@ class EODPipelineStatusService:
             )
         if status in {'failed', 'interrupted', 'abandoned'} and official_stage.get('error_message'):
             current_activity = official_stage.get('error_message')
+        if orphaned_running_stage:
+            current_activity = (
+                'Stage was still marked running after its parent pipeline run '
+                f'became {parent_run_status}; treating it as interrupted.'
+            )
+        completed_at = official_stage.get('completed_at')
+        if orphaned_running_stage and completed_at is None:
+            completed_at = official_run.get('completed_at') or official_run.get(
+                'updated_at'
+            )
         stage_payload = {
             'task': stage_id,
             'label': definition.label,
@@ -2865,7 +2918,7 @@ class EODPipelineStatusService:
             'market_date': official_stage.get('market_date') or market_date,
             'started_at': official_stage.get('started_at'),
             'updated_at': progress_source.get('updated_at') or official_stage.get('updated_at') or official_run.get('updated_at'),
-            'completed_at': official_stage.get('completed_at'),
+            'completed_at': completed_at,
             'processed': counts.processed,
             'total': counts.total,
             'succeeded': counts.succeeded,

@@ -208,13 +208,94 @@ REMOTE_ACTIVE_STATUSES = {
     'submitted',
     'working',
 }
-REMOTE_FAILED_STATUSES = {'canceled', 'cancelled', 'failed', 'rejected'}
+REMOTE_CANCELLED_STATUSES = {
+    'canceled',
+    'cancelled',
+    'expired',
+    'next_open_buy_expired',
+    'not_applicable',
+    'revoked',
+    'stop_sell_cancelled',
+    'superseded',
+    'target_sell_cancelled',
+    'watch_cancelled',
+    'watch_expired',
+}
+REMOTE_TERMINAL_FAILURE_STATUSES = {
+    'agent_rejected',
+    'broker_order_failed',
+    'broker_order_rejected',
+    'contract_quarantined',
+    'crypto_paper_failed',
+    'crypto_paper_rejected',
+    'declined',
+    'denied',
+    'exec_agent_rejected',
+    'failed',
+    'manual_review_required',
+    'manual_review_resolved_no_exposure',
+    'next_open_buy_failed',
+    'not_approved',
+    'reject',
+    'rejected',
+    'unsupported_semantics',
+    'watch_buy_rejected',
+}
+REMOTE_FAILED_STATUSES = REMOTE_CANCELLED_STATUSES | REMOTE_TERMINAL_FAILURE_STATUSES
 REMOTE_SCHEDULED_STATUSES = {'accepted', 'created', 'pending', 'queued'}
 REMOTE_SUBMITTED_STATUSES = {'open', 'running', 'submitted', 'working'}
 REMOTE_PARTIAL_STATUSES = {'partial', 'partial_fill', 'partially_filled'}
 REMOTE_FILLED_STATUSES = {'complete', 'completed', 'done', 'filled'}
-REMOTE_CANCELLED_STATUSES = {'canceled', 'cancelled'}
-REMOTE_TERMINAL_FAILURE_STATUSES = REMOTE_FAILED_STATUSES - REMOTE_CANCELLED_STATUSES
+EXEC_V4_PENDING_ITEM_STATUSES = {
+    'agent_approved_pending_submit',
+    'agent_delay',
+    'broker_order_retry_pending',
+    'core_activation_pending',
+    'crypto_paper_queued',
+    'crypto_paper_retry_pending',
+    'max_holding_close_sell_pending_config',
+    'max_holding_close_sell_triggered_blocked',
+    'new_buy_blocked',
+    'next_open_buy_pending_configuration',
+    'next_open_buy_retry_pending',
+    'next_open_buy_scheduled',
+    'pending_configuration',
+    'short_term_watch_blocked',
+    'short_term_watcher_pending',
+    'stop_sell_pending_config',
+    'stop_sell_pending_configuration',
+    'stop_sell_triggered_blocked',
+    'target_sell_pending_config',
+    'target_sell_pending_configuration',
+    'target_sell_triggered_blocked',
+    'triggered_pending_agent',
+    'watch_buy_triggered_blocked',
+    'watch_monitoring_pending',
+    'watch_sizing_pending',
+}
+EXEC_V4_WORKING_ITEM_STATUSES = {
+    'broker_order_open',
+    'broker_order_partially_filled',
+    'broker_order_retry_dispatching',
+    'broker_order_submission_pending',
+    'broker_order_submitted',
+    'cancel_pending',
+    'crypto_paper_dispatching',
+    'max_holding_close_sell_monitoring',
+    'max_holding_close_sell_triggered_pending_dispatch',
+    'next_open_buy_dispatching',
+    'next_open_buy_retrying',
+    'partially_filled',
+    'stop_sell_monitoring',
+    'stop_sell_triggered_pending_dispatch',
+    'target_sell_monitoring',
+    'target_sell_triggered_pending_dispatch',
+    'watch_buy_dispatching',
+    'watch_buy_retrying',
+    'watch_buy_submitted',
+    'watch_buy_triggered',
+    'watch_buy_triggered_pending_dispatch',
+}
 
 UI_RUNTIME_STATUS_READY = 'ready'
 UI_RUNTIME_STATUS_DEGRADED = 'degraded'
@@ -242,11 +323,13 @@ EXEC_AGENT_REJECT_ACTIONS = {
     'blocked',
     'cancel',
     'cancelled',
+    'contract_quarantined',
     'decline',
     'declined',
     'denied',
     'deny',
     'expired',
+    'exec_agent_rejected',
     'failed',
     'not_approved',
     'reject',
@@ -272,19 +355,17 @@ EXEC_MONITORING_ACTIVE_STATUSES = {
     'working',
 }
 EXEC_MONITORING_TERMINAL_STATUSES = {
-    'canceled',
-    'cancelled',
     'closed',
-    'declined',
-    'denied',
+    'complete',
+    'completed',
     'done',
-    'expired',
-    'failed',
-    'not_approved',
-    'reject',
-    'rejected',
-    'stop_sell_cancelled',
-    'target_sell_cancelled',
+    'filled',
+} | REMOTE_FAILED_STATUSES
+EXEC_PLAN_TERMINAL_STATUSES = EXEC_MONITORING_TERMINAL_STATUSES | {
+    'completed_no_trade',
+}
+EXEC_PLAN_WIDE_TERMINAL_OVERRIDE_STATUSES = {
+    'contract_quarantined',
 }
 EXEC_AGENT_ACCEPTED_ENTRY_STATUSES = {
     'accepted',
@@ -307,7 +388,7 @@ EXEC_WATCH_STATE_SYNC_WARNING_CODE = 'exec_watch_state_divergence'
 EXEC_WATCH_READBACK_ACTIVE_STATUSES = EXEC_MONITORING_ACTIVE_STATUSES | EXEC_AGENT_ACCEPTED_ENTRY_STATUSES | {
     'watch_buy_submitted',
     'watch_monitoring_pending',
-}
+} | EXEC_V4_PENDING_ITEM_STATUSES | EXEC_V4_WORKING_ITEM_STATUSES
 MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_DEFAULT_MULTIPLIER_CAP = Decimal('1.0')
@@ -1885,6 +1966,20 @@ def _accepted_item_bindings_from_response_summary(
     return bindings
 
 
+def _exec_dispatch_item_ack_status(link: dict[str, Any]) -> str | None:
+    explicit_ack = _normalize_status(
+        link.get('ack_status') or _extract_field(link, 'response_item', 'status')
+    )
+    if explicit_ack:
+        return explicit_ack
+    if _normalize_status(link.get('remote_status_source')) not in {
+        None,
+        'dispatch_ack',
+    }:
+        return None
+    return _normalize_status(link.get('remote_status'))
+
+
 def _row_has_accepted_exec_dispatch(row: SignalDeciderExecutionPlanItem) -> bool:
     submission = row.submission_payload if isinstance(row.submission_payload, dict) else {}
     exec_dispatch = submission.get('exec_dispatch') if isinstance(submission.get('exec_dispatch'), dict) else {}
@@ -2001,7 +2096,7 @@ def _row_has_accepted_exec_dispatch(row: SignalDeciderExecutionPlanItem) -> bool
         and [binding['core_item_key'] for binding in accepted_item_bindings]
         == submitted_keys
         and all(
-            _normalize_status(link.get('remote_status')) == EXEC_DISPATCH_STATUS_ACCEPTED
+            _exec_dispatch_item_ack_status(link) == EXEC_DISPATCH_STATUS_ACCEPTED
             and _normalize_optional_text(link.get('exec_plan_id'))
             and _normalize_optional_text(link.get('exec_plan_item_id'))
             for link in links_by_key.values()
@@ -10725,7 +10820,9 @@ class SignalDeciderExecIntegrationService:
                             **link,
                             'exec_plan_id': _normalize_optional_text(response_item.get('execution_plan_id')),
                             'exec_plan_item_id': _normalize_optional_text(response_item.get('execution_plan_item_id')),
+                            'ack_status': item_status,
                             'remote_status': item_status,
+                            'remote_status_source': 'dispatch_ack',
                             'response_item': compact_exec_response_item(response_item) if response_item else None,
                         }
                     )
@@ -11025,39 +11122,154 @@ class SignalDeciderExecIntegrationService:
             and _normalize_optional_text(payload.get('intent') or payload.get('handoff_intent'))
         )
 
+    @staticmethod
+    def _collect_exec_readback_plans(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        looks_like_direct_plan = bool(
+            _normalize_optional_text(
+                payload.get('execution_plan_id') or payload.get('exec_plan_id')
+            )
+            and any(
+                key in payload
+                for key in ('status', 'contract_ack', 'item_acks', 'item_states')
+            )
+        )
+        if looks_like_direct_plan:
+            return [payload]
+        return _collect_items(payload)
+
+    @staticmethod
+    def _exec_state_decision(payload: dict[str, Any]) -> dict[str, Any]:
+        decision = {
+            key: payload[key]
+            for key in (
+                'action',
+                'decision',
+                'reason_code',
+                'reason_family',
+                'rejection_disposition',
+                'reason',
+                'retry_after',
+            )
+            if payload.get(key) is not None
+        }
+        nested_decision = payload.get('decision')
+        if isinstance(nested_decision, dict):
+            decision = {
+                **nested_decision,
+                **{key: value for key, value in decision.items() if key != 'decision'},
+            }
+        return decision
+
     @classmethod
     def _collect_exec_plan_readback_items(cls, *, plans_result: dict[str, Any]) -> list[dict[str, Any]]:
         payload = plans_result.get('payload') if isinstance(plans_result.get('payload'), dict) else {}
         plan_items: list[dict[str, Any]] = []
+        remote_plans = cls._collect_exec_readback_plans(payload)
 
-        def collect_from(candidate: Any) -> None:
-            if not isinstance(candidate, dict):
-                return
-            nested_items: list[dict[str, Any]] = []
+        for remote_plan in remote_plans:
+            nested_plan = (
+                remote_plan.get('plan')
+                if isinstance(remote_plan.get('plan'), dict)
+                else remote_plan
+            )
+            parent_status = cls._exec_plan_item_status(nested_plan)
+            parent_terminal = parent_status in EXEC_PLAN_TERMINAL_STATUSES
+            parent_overrides_items = (
+                parent_status in EXEC_PLAN_WIDE_TERMINAL_OVERRIDE_STATUSES
+            )
+            parent_execution_plan_id = _normalize_optional_text(
+                nested_plan.get('execution_plan_id')
+                or nested_plan.get('exec_plan_id')
+            )
+            parent_plan_id = _normalize_optional_text(
+                nested_plan.get('external_plan_id')
+                or nested_plan.get('plan_id')
+            )
+            parent_decision = cls._exec_state_decision(nested_plan)
+
+            raw_states: list[dict[str, Any]] = []
             for key in (
+                'item_states',
+                'current_item_states',
                 'items',
-                'item_acks',
                 'plan_items',
                 'execution_plan_items',
                 'execution_items',
-                'orders',
             ):
-                value = candidate.get(key)
+                value = nested_plan.get(key)
                 if isinstance(value, list):
-                    nested_items.extend(item for item in value if isinstance(item, dict))
-            nested_plan = candidate.get('plan') if isinstance(candidate.get('plan'), dict) else None
-            if nested_plan is not None:
-                collect_from(nested_plan)
-            if nested_items:
-                for nested_item in nested_items:
-                    collect_from(nested_item)
-                return
-            if cls._looks_like_exec_plan_item(candidate):
-                plan_items.append(candidate)
+                    raw_states.extend(item for item in value if isinstance(item, dict))
+            if not raw_states and nested_plan is not remote_plan:
+                value = remote_plan.get('item_states')
+                if isinstance(value, list):
+                    raw_states.extend(item for item in value if isinstance(item, dict))
 
-        for item in _collect_items(payload):
-            collect_from(item)
-        collect_from(payload.get('plan') if isinstance(payload, dict) else None)
+            # v4 item_acks are immutable dispatch-acceptance proof. They are used
+            # only as stable identity carriers when the current parent state must
+            # be projected onto every item; their accepted status is never live state.
+            raw_item_acks = nested_plan.get('item_acks')
+            if not isinstance(raw_item_acks, list):
+                raw_item_acks = remote_plan.get('item_acks')
+            if (
+                parent_status
+                and isinstance(raw_item_acks, list)
+                and (parent_overrides_items or (not raw_states and not parent_terminal))
+            ):
+                acknowledged_by_key = {
+                    _normalize_optional_text(item.get('core_item_key')): {
+                        key: item[key]
+                        for key in (
+                            'core_item_key',
+                            'execution_plan_id',
+                            'execution_plan_item_id',
+                        )
+                        if item.get(key) is not None
+                    }
+                    for item in raw_item_acks
+                    if isinstance(item, dict)
+                    and _normalize_optional_text(item.get('core_item_key'))
+                }
+                state_keys = {
+                    _normalize_optional_text(item.get('core_item_key'))
+                    for item in raw_states
+                    if _normalize_optional_text(item.get('core_item_key'))
+                }
+                raw_states.extend(
+                    {
+                        **item,
+                        'status': parent_status,
+                        'terminal': parent_terminal,
+                        **(
+                            {'decision': copy.deepcopy(parent_decision)}
+                            if parent_decision
+                            else {}
+                        ),
+                    }
+                    for key, item in acknowledged_by_key.items()
+                    if key not in state_keys
+                )
+
+            for raw_state in raw_states:
+                state = dict(raw_state)
+                if parent_execution_plan_id and not _normalize_optional_text(
+                    state.get('execution_plan_id') or state.get('exec_plan_id')
+                ):
+                    state['execution_plan_id'] = parent_execution_plan_id
+                if parent_plan_id and not _normalize_optional_text(
+                    state.get('external_plan_id') or state.get('plan_id')
+                ):
+                    state['external_plan_id'] = parent_plan_id
+                if parent_overrides_items:
+                    state['status'] = parent_status
+                    state['terminal'] = True
+                    item_decision = (
+                        state.get('decision')
+                        if isinstance(state.get('decision'), dict)
+                        else {}
+                    )
+                    if item_decision or parent_decision:
+                        state['decision'] = {**item_decision, **parent_decision}
+                plan_items.append(state)
         return plan_items
 
     @staticmethod
@@ -11215,7 +11427,9 @@ class SignalDeciderExecIntegrationService:
                     'exec_plan_item_id': str(
                         response_item['execution_plan_item_id']
                     ),
+                    'ack_status': str(response_item['status']),
                     'remote_status': str(response_item['status']),
+                    'remote_status_source': 'dispatch_ack',
                     'response_item': compact_exec_response_item(response_item),
                 }
             )
@@ -11294,6 +11508,48 @@ class SignalDeciderExecIntegrationService:
         }
 
     @classmethod
+    def _exec_plan_parent_state_for_link(
+        cls,
+        *,
+        link: dict[str, Any],
+        plans_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        payload = (
+            plans_result.get('payload')
+            if isinstance(plans_result.get('payload'), dict)
+            else {}
+        )
+        link_plan_id = _normalize_optional_text(link.get('exec_plan_id'))
+        if not link_plan_id:
+            return None
+        for remote_plan in cls._collect_exec_readback_plans(payload):
+            plan = (
+                remote_plan.get('plan')
+                if isinstance(remote_plan.get('plan'), dict)
+                else remote_plan
+            )
+            if link_plan_id not in cls._exec_plan_ids(plan):
+                continue
+            status = cls._exec_plan_item_status(plan)
+            if not status:
+                return None
+            if (
+                status in EXEC_PLAN_TERMINAL_STATUSES
+                and status not in EXEC_PLAN_WIDE_TERMINAL_OVERRIDE_STATUSES
+            ):
+                return None
+            decision = cls._exec_state_decision(plan)
+            return {
+                'core_item_key': link.get('core_item_key'),
+                'execution_plan_id': link.get('exec_plan_id'),
+                'execution_plan_item_id': link.get('exec_plan_item_id'),
+                'status': status,
+                'terminal': status in EXEC_PLAN_TERMINAL_STATUSES,
+                **({'decision': decision} if decision else {}),
+            }
+        return None
+
+    @classmethod
     def _merge_exec_plan_readback_links(
         cls,
         *,
@@ -11301,12 +11557,6 @@ class SignalDeciderExecIntegrationService:
         plans_result: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         plan_items = cls._collect_exec_plan_readback_items(plans_result=plans_result)
-        if not plan_items:
-            return (
-                [dict(link) for link in item_links if isinstance(link, dict)],
-                [],
-            )
-
         merged_links: list[dict[str, Any]] = []
         identity_mismatches: list[dict[str, Any]] = []
         for raw_link in item_links:
@@ -11319,21 +11569,81 @@ class SignalDeciderExecIntegrationService:
             )
             if identity_mismatch is not None:
                 identity_mismatches.append(identity_mismatch)
+            if matched_item is None and identity_mismatch is None:
+                matched_item = cls._exec_plan_parent_state_for_link(
+                    link=link,
+                    plans_result=plans_result,
+                )
             if matched_item is None:
                 merged_links.append(link)
                 continue
 
             status = cls._exec_plan_item_status(matched_item)
+            existing_status = cls._current_exec_link_status(link)
+            if (
+                existing_status in EXEC_MONITORING_TERMINAL_STATUSES
+                and status not in EXEC_MONITORING_TERMINAL_STATUSES
+            ):
+                merged_links.append(link)
+                continue
             if status:
                 link['remote_status'] = status
-            response_item = dict(link.get('response_item') or {})
+                link['remote_status_source'] = 'exec_item_state'
             compact_item = compact_exec_response_item(matched_item)
             if compact_item:
-                response_item.update(compact_item)
-            if response_item:
-                link['response_item'] = response_item
+                link['current_state'] = compact_item
             merged_links.append(link)
         return merged_links, identity_mismatches
+
+    @staticmethod
+    def _current_exec_link_status(link: dict[str, Any]) -> str | None:
+        current_state = (
+            link.get('current_state')
+            if isinstance(link.get('current_state'), dict)
+            else {}
+        )
+        current_status = _normalize_status(current_state.get('status'))
+        if current_status:
+            return current_status
+        if _normalize_status(link.get('remote_status_source')) == 'exec_item_state':
+            return _normalize_status(link.get('remote_status'))
+        return None
+
+    @classmethod
+    def _terminal_exec_links(
+        cls,
+        *,
+        item_links: Sequence[dict[str, Any]],
+        derived_status: str | None,
+    ) -> list[dict[str, Any]]:
+        terminal_links = [
+            link
+            for link in item_links
+            if isinstance(link, dict)
+            and isinstance(link.get('current_state'), dict)
+            and cls._current_exec_link_status(link)
+            in EXEC_MONITORING_TERMINAL_STATUSES
+        ]
+        preferred_statuses = (
+            REMOTE_TERMINAL_FAILURE_STATUSES
+            if derived_status == 'failed'
+            else REMOTE_CANCELLED_STATUSES
+            if derived_status == UI_BOARD_STATUS_CANCELLED
+            else set()
+        )
+        preferred_links = [
+            link
+            for link in terminal_links
+            if cls._current_exec_link_status(link) in preferred_statuses
+        ]
+        selected = preferred_links or terminal_links
+        return sorted(
+            selected,
+            key=lambda link: (
+                _normalize_optional_text(link.get('intent'), lowercase=True)
+                not in EXEC_ENTRY_BUY_INTENTS
+            ),
+        )
 
     @classmethod
     def _entry_link_active_statuses(cls, *, item_links: Sequence[dict[str, Any]]) -> list[str]:
@@ -11361,6 +11671,105 @@ class SignalDeciderExecIntegrationService:
             return values
         values.append(warning)
         return values
+
+    @classmethod
+    def _sync_exec_terminal_state(
+        cls,
+        *,
+        row: SignalDeciderExecutionPlanItem,
+        item_links: Sequence[dict[str, Any]],
+        derived_state: dict[str, Any],
+        now: datetime,
+        trigger: str,
+    ) -> dict[str, Any] | None:
+        derived_status = _normalize_status(derived_state.get('derived_status'))
+        if derived_status not in {'failed', UI_BOARD_STATUS_CANCELLED}:
+            return None
+        terminal_links = cls._terminal_exec_links(
+            item_links=item_links,
+            derived_status=derived_status,
+        )
+        if not terminal_links:
+            return None
+        terminal_link = next(
+            (
+                link
+                for link in terminal_links
+                if isinstance(link['current_state'].get('decision'), dict)
+                and link['current_state']['decision']
+            ),
+            terminal_links[0],
+        )
+        terminal_state = terminal_link['current_state']
+        terminal_status = cls._exec_plan_item_status(terminal_state) or 'failed'
+        decision = (
+            terminal_state.get('decision')
+            if isinstance(terminal_state.get('decision'), dict)
+            else {}
+        )
+        reason_code = _normalize_optional_text(decision.get('reason_code')) or terminal_status
+        reason = _normalize_optional_text(decision.get('reason')) or (
+            f'Exec reported terminal item state {terminal_status} before any fill.'
+        )
+        prior_state = {
+            'eligibility_status': row.eligibility_status,
+            'execution_status': row.execution_status,
+        }
+        audit = {
+            'schema_version': 'exec_terminal_state_sync_v1',
+            'observed_at': now.isoformat(),
+            'trigger': trigger,
+            'derived_status': derived_status,
+            'terminal_status': terminal_status,
+            'decision': copy.deepcopy(decision) or None,
+            'core_state_before': prior_state,
+            'core_state_after': {
+                'eligibility_status': ELIGIBILITY_BLOCKED,
+                'execution_status': EXECUTION_STATUS_SUBMIT_FAILED,
+            },
+        }
+        validation = (
+            copy.deepcopy(row.validation_payload)
+            if isinstance(row.validation_payload, dict)
+            else {}
+        )
+        blocking_reasons = [
+            item
+            for item in (validation.get('blocking_reasons') or [])
+            if isinstance(item, dict)
+        ]
+        if not any(
+            _normalize_optional_text(item.get('code')) == reason_code
+            for item in blocking_reasons
+        ):
+            blocking_reasons.append(
+                {
+                    'code': reason_code,
+                    'message': reason,
+                    'source': 'exec_item_state',
+                    'terminal_status': terminal_status,
+                }
+            )
+        validation['blocking_reasons'] = blocking_reasons
+        validation['exec_terminal_state_sync'] = audit
+        traceability = (
+            copy.deepcopy(row.traceability_payload)
+            if isinstance(row.traceability_payload, dict)
+            else {}
+        )
+        row.eligibility_status = ELIGIBILITY_BLOCKED
+        row.execution_status = EXECUTION_STATUS_SUBMIT_FAILED
+        row.validation_payload = validation
+        row.traceability_payload = {
+            **traceability,
+            'handoff_active': False,
+            'exec_monitoring_active': False,
+            'exec_agent_approved': False,
+            'approval_state': 'rejected',
+            'exec_agent_reason_code': reason_code,
+            'exec_terminal_state_sync': audit,
+        }
+        return audit
 
     @classmethod
     def _is_short_term_watch_buy_row(cls, row: SignalDeciderExecutionPlanItem) -> bool:
@@ -11747,12 +12156,25 @@ class SignalDeciderExecIntegrationService:
                     'derived_state': derived_state,
                 }
                 compact_readback = compact_exec_readback(readback)
-                core_state_sync = self._sync_short_term_exec_watch_state(
+                observed_terminal_state_sync = self._sync_exec_terminal_state(
                     row=row,
                     item_links=item_links,
+                    derived_state=derived_state,
                     now=now,
                     trigger=trigger,
-                ) or exec_dispatch.get('core_state_sync')
+                )
+                terminal_state_sync = (
+                    observed_terminal_state_sync
+                    or exec_dispatch.get('terminal_state_sync')
+                )
+                core_state_sync = exec_dispatch.get('core_state_sync')
+                if observed_terminal_state_sync is None and terminal_state_sync is None:
+                    core_state_sync = self._sync_short_term_exec_watch_state(
+                        row=row,
+                        item_links=item_links,
+                        now=now,
+                        trigger=trigger,
+                    ) or core_state_sync
                 exec_dispatch = {
                     'plan_id': exec_dispatch.get('plan_id'),
                     'plan_fingerprint': exec_dispatch.get('plan_fingerprint'),
@@ -11793,6 +12215,8 @@ class SignalDeciderExecIntegrationService:
                 }
                 if isinstance(core_state_sync, dict):
                     exec_dispatch['core_state_sync'] = core_state_sync
+                if isinstance(terminal_state_sync, dict):
+                    exec_dispatch['terminal_state_sync'] = terminal_state_sync
                 if contract_proof is not None:
                     exec_dispatch['contract_proof'] = contract_proof
                 submission = {
@@ -12273,12 +12697,25 @@ class SignalDeciderExecIntegrationService:
             first_position = positions[0]
             position_quantity = _safe_decimal(first_position.get('quantity')) or Decimal('0')
 
-        item_statuses = {
-            _normalize_status(link.get('remote_status'))
+        item_status_values = [
+            status
             for link in item_links
-            if _normalize_status(link.get('remote_status'))
+            if isinstance(link, dict)
+            and (status := self._current_exec_link_status(link))
+        ]
+        item_statuses = set(item_status_values)
+        entry_item_statuses = {
+            status
+            for link in item_links
+            if isinstance(link, dict)
+            and _normalize_optional_text(link.get('intent'), lowercase=True)
+            in EXEC_ENTRY_BUY_INTENTS
+            and (status := self._current_exec_link_status(link))
         }
-        plan_item_status_counts = Counter(status for status in item_statuses if status)
+        cancellation_statuses = (entry_item_statuses or item_statuses).union(
+            order_status_counts.keys()
+        )
+        plan_item_status_counts = Counter(item_status_values)
         status_set = item_statuses.union(set(order_status_counts.keys()))
         has_entry_fill_evidence = (
             buy_quantity > Decimal('0')
@@ -12289,22 +12726,66 @@ class SignalDeciderExecIntegrationService:
         has_plan_fill_evidence = has_entry_fill_evidence or has_exit_fill_evidence
         attributed_position_quantity = position_quantity if has_plan_fill_evidence else Decimal('0')
         open_quantity = max(attributed_position_quantity, buy_quantity - sell_quantity)
+        has_retryable_deferred_state = any(
+            (
+                _normalize_status(decision.get('decision')) == 'deferred'
+                or _normalize_status(decision.get('action')) in {'defer', 'retry'}
+            )
+            and self._current_exec_link_status(link)
+            not in EXEC_MONITORING_TERMINAL_STATUSES
+            for link in item_links
+            if isinstance(link, dict)
+            and isinstance(link.get('current_state'), dict)
+            and isinstance(
+                decision := link['current_state'].get('decision'),
+                dict,
+            )
+        )
 
-        derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
+        derived_status = 'unknown'
         if sell_quantity > 0 and (open_quantity <= 0 or (buy_quantity > 0 and sell_quantity >= buy_quantity)):
             derived_status = 'closed'
         elif open_quantity > 0 or has_entry_fill_evidence:
             derived_status = 'open'
         elif any(status in REMOTE_SUBMITTED_STATUSES for status in item_statuses):
             derived_status = 'working'
+        elif item_statuses & EXEC_V4_WORKING_ITEM_STATUSES:
+            derived_status = 'working'
         elif any(status in REMOTE_ACTIVE_STATUSES for status in order_status_counts):
             derived_status = 'working'
-        elif any(status in REMOTE_CANCELLED_STATUSES for status in status_set):
-            derived_status = UI_BOARD_STATUS_CANCELLED
         elif any(status in REMOTE_TERMINAL_FAILURE_STATUSES for status in status_set):
             derived_status = 'failed'
+        elif any(
+            status in REMOTE_CANCELLED_STATUSES
+            for status in cancellation_statuses
+        ):
+            derived_status = UI_BOARD_STATUS_CANCELLED
+        elif has_retryable_deferred_state or bool(
+            item_statuses & EXEC_V4_PENDING_ITEM_STATUSES
+        ):
+            derived_status = 'pending'
         elif any(status in EXEC_WATCH_READBACK_ACTIVE_STATUSES for status in item_statuses):
             derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
+
+        terminal_links = self._terminal_exec_links(
+            item_links=item_links,
+            derived_status=derived_status,
+        )
+        terminal_decision: dict[str, Any] | None = None
+        for link in terminal_links:
+            current_state = (
+                link.get('current_state')
+                if isinstance(link.get('current_state'), dict)
+                else {}
+            )
+            decision = (
+                current_state.get('decision')
+                if isinstance(current_state.get('decision'), dict)
+                else {}
+            )
+            if decision:
+                terminal_decision = copy.deepcopy(decision)
+                break
 
         return {
             'derived_status': derived_status,
@@ -12316,6 +12797,7 @@ class SignalDeciderExecIntegrationService:
             'plan_item_status_counts': dict(sorted(plan_item_status_counts.items())),
             'order_status_counts': dict(sorted(order_status_counts.items())),
             'endpoint_statuses': endpoint_statuses,
+            'terminal_decision': terminal_decision,
         }
 
     @staticmethod
@@ -12987,9 +13469,19 @@ class SignalDeciderExecIntegrationService:
             if _normalize_optional_text(link.get('intent'), lowercase=True) in EXEC_ENTRY_BUY_INTENTS
         ]
         for link in entry_links or links:
+            current_state = (
+                link.get('current_state')
+                if isinstance(link.get('current_state'), dict)
+                else {}
+            )
+            if current_state:
+                yield current_state
+                yield from cls._iter_nested_exec_agent_payloads(current_state)
             response_item = link.get('response_item') if isinstance(link.get('response_item'), dict) else {}
             if response_item:
-                yield response_item
+                # response_item is the immutable dispatch ACK. Its accepted
+                # status is not a current agent decision, but nested sizing
+                # proof from the dispatch response remains authoritative.
                 yield from cls._iter_nested_exec_agent_payloads(response_item)
 
     @classmethod
@@ -13064,9 +13556,15 @@ class SignalDeciderExecIntegrationService:
             if normalized:
                 statuses.add(normalized)
 
-        for key in ('remote_status', 'status', 'plan_item_status', 'decision_status', 'monitoring_status'):
+        if _normalize_status(link.get('remote_status_source')) == 'exec_item_state':
+            add(link.get('remote_status'))
+        for key in ('status', 'plan_item_status', 'decision_status', 'monitoring_status'):
             add(link.get(key))
-        response_item = link.get('response_item') if isinstance(link.get('response_item'), dict) else {}
+        response_item = (
+            link.get('current_state')
+            if isinstance(link.get('current_state'), dict)
+            else {}
+        )
         for key in (
             'status',
             'plan_item_status',
@@ -13105,6 +13603,12 @@ class SignalDeciderExecIntegrationService:
     @classmethod
     def _extract_exec_agent_decision(cls, item: dict[str, Any]) -> dict[str, Any]:
         payloads = list(cls._iter_exec_agent_payloads(item))
+        dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
+        has_terminal_current_state = any(
+            cls._current_exec_link_status(link) in EXEC_MONITORING_TERMINAL_STATUSES
+            for link in dispatch.get('item_links') or []
+            if isinstance(link, dict)
+        )
         approval_values = [
             parsed
             for payload in payloads
@@ -13130,6 +13634,9 @@ class SignalDeciderExecIntegrationService:
 
         approved = any(value is True for value in approval_values)
         rejected = any(value is False for value in approval_values)
+        if has_terminal_current_state:
+            approved = False
+            rejected = True
         if not approved and approved_quantity is not None and not rejected:
             approved = True
         if not approved and not rejected and cls._has_exec_agent_accepted_entry(item):

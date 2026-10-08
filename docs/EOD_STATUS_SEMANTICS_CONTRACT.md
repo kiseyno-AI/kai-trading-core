@@ -24,8 +24,8 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
   `/eod/freshness` derives its default day from the current Seoul server date. `/eod/pipeline/status` uses the market date of the latest persisted official daily run, falling back to the current Seoul date only when no official run exists. Neither route guesses a previous trading day from the calendar.
 - Stored availability and in-flight progress are separate concerns.
   `/eod/freshness` answers what persisted data is available. `/eod/pipeline/status` answers which pipeline stage is currently active and how much work is in progress.
-- Historical backfill rows must not outrank the daily pipeline row when both exist for the same trade date.
-  The preferred EOD run is the first non-`historical_backfill` row for that trade date. Historical rows are only used when no daily row exists.
+- Historical backfill rows must not outrank the representative daily pipeline row when both exist for the same trade date.
+  The preferred EOD run starts with the first non-`historical_backfill` row for that trade date. For `/eod/freshness`, if that newest candidate is a narrow retry whose total is smaller than the same-date stored price-bar population, Core selects a more complete same-date run when it has a larger run total or success count. Historical rows remain fallback-only when no daily row exists.
 
 ## Shared market-session metadata
 
@@ -71,6 +71,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - `latest.trade_date` and `latest.price_trade_date` are anchored to the latest stored daily price-bar trade date.
 - `latest.summary` is scoped to that latest stored price trade date only.
 - `latest.summary.basis=latest_eod_run_symbol_universe` means counts come from the selected `eod_collection_runs` row for that trade date.
+- A newer narrow retry delta does not replace a same-date full-universe summary. For example, a 1-symbol retry remains subordinate to a representative 2,679-symbol run when stored same-date bars prove the broader population.
 - `latest.summary.basis=stored_price_bars_for_latest_trade_date` is the fallback when bars exist for the latest trade date but no matching EOD run row exists. In that fallback, `failed=0` and `total=succeeded`.
 - `latest.updated_at` comes from `run_metadata.last_progress_at` when available, then run timestamps. The stored-bar fallback uses the max `daily_price_bars.captured_at` for that trade date.
 - `latest.eod_status` is derived from the selected latest run plus stored bar availability for the latest trade date.
@@ -128,6 +129,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - A later pykrx stage stays `pending` until that later stage has actually started.
   Persisted completion of earlier stages does not advance later stages by implication alone.
 - If a stage-progress entry still says `running` after the owning run has already ended, that stale running progress must be downgraded to the final run outcome instead of continuing to display as live work.
+- If an official child stage still says `running` after its parent run has reached a terminal status, the child is rendered as `interrupted`, keeps `source_status=running`, and exposes `details.orphaned_running_stage`, `details.orphan_reason`, and `details.parent_run_status`. It is excluded from `running_stages` and current live activity.
 - A stored `completed` agent-feedback stage is downgraded to `partial` when any role-level progress remains pending, running, partial, or has processed fewer symbols than its declared total.
 
 ### fundamentals stage
@@ -178,6 +180,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - Stages that expose downstream readiness include stage-level `gate_status`, `severity`, and `blocking_status` where applicable.
 - The top-level `gate_summary` aggregates those gate statuses separately from physical stage execution/storage status.
 - `pykrx_enrichment.status` can be `completed` while `pykrx_enrichment.gate_status` and `gate_summary.status` are `blocked` when required decider categories are below the minimum coverage ratio. Blocking category details remain visible under `details.decider_blocking_categories`.
+- When diagnostic coverage is newer than a persisted official stage snapshot, its requested counts, category map, missing/not-applicable/warning categories, and `decider_*` gate fields are authoritative. A stale official `waiting` field must not make a completed ready gate appear waiting.
 - The exact required categories are `sector_classification`, `investor_flow_symbol`, `short_selling`, and `valuation_snapshot`. The first three use a minimum coverage ratio of `0.99`; valuation uses `0.95` over the fresh PyKRX KOSPI/KOSDAQ stock universe and counts only direct PyKRX rows with positive market cap and at least one usable valuation metric. Component-level incompleteness remains visible through completeness fields and warning categories even when the category coverage gate is ready. Optional-category gaps are tolerated warnings rather than blockers or full-universe retry debt.
 
 ### overall status

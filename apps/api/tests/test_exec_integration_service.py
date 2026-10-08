@@ -1971,6 +1971,730 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
             },
         )
 
+    def test_unknown_exec_item_state_never_defaults_to_accepted(self) -> None:
+        result = self.service._derive_remote_state(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'remote_status': 'new_exec_state_not_yet_known_to_core',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {
+                        'status': 'new_exec_state_not_yet_known_to_core',
+                    },
+                }
+            ],
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+
+        self.assertEqual(result['derived_status'], 'unknown')
+        self.assertEqual(
+            result['plan_item_status_counts'],
+            {'new_exec_state_not_yet_known_to_core': 1},
+        )
+
+    def test_known_v4_nonterminal_states_have_explicit_semantics(self) -> None:
+        cases = {
+            'next_open_buy_pending_configuration': 'pending',
+            'next_open_buy_scheduled': 'pending',
+            'next_open_buy_retry_pending': 'pending',
+            'agent_delay': 'pending',
+            'next_open_buy_dispatching': 'working',
+            'next_open_buy_retrying': 'working',
+            'broker_order_submission_pending': 'working',
+            'broker_order_submitted': 'working',
+            'partially_filled': 'working',
+            'watch_buy_triggered_pending_dispatch': 'working',
+            'max_holding_close_sell_triggered_blocked': 'pending',
+        }
+
+        for status, expected in cases.items():
+            with self.subTest(status=status):
+                result = self.service._derive_remote_state(
+                    row=SimpleNamespace(symbol='005930'),
+                    item_links=[
+                        {
+                            'intent': 'next_open_buy',
+                            'remote_status': status,
+                            'remote_status_source': 'exec_item_state',
+                            'current_state': {
+                                'status': status,
+                                'terminal': False,
+                            },
+                        }
+                    ],
+                    orders=[],
+                    executions=[],
+                    positions=[],
+                    endpoint_statuses={
+                        'plans': 'ok',
+                        'orders': 'ok',
+                        'executions': 'ok',
+                        'positions': 'ok',
+                    },
+                )
+
+                self.assertEqual(result['derived_status'], expected)
+
+    def test_known_v4_terminal_states_have_explicit_semantics(self) -> None:
+        cases = {
+            'agent_rejected': 'failed',
+            'broker_order_failed': 'failed',
+            'broker_order_rejected': 'failed',
+            'crypto_paper_failed': 'failed',
+            'crypto_paper_rejected': 'failed',
+            'manual_review_required': 'failed',
+            'manual_review_resolved_no_exposure': 'failed',
+            'next_open_buy_failed': 'failed',
+            'unsupported_semantics': 'failed',
+            'watch_buy_rejected': 'failed',
+            'next_open_buy_expired': 'cancelled',
+            'not_applicable': 'cancelled',
+            'revoked': 'cancelled',
+            'superseded': 'cancelled',
+            'watch_cancelled': 'cancelled',
+            'watch_expired': 'cancelled',
+            'filled': 'unknown',
+        }
+
+        for status, expected in cases.items():
+            with self.subTest(status=status):
+                result = self.service._derive_remote_state(
+                    row=SimpleNamespace(symbol='005930'),
+                    item_links=[
+                        {
+                            'intent': 'next_open_buy',
+                            'remote_status': status,
+                            'remote_status_source': 'exec_item_state',
+                            'current_state': {
+                                'status': status,
+                                'terminal': True,
+                            },
+                        }
+                    ],
+                    orders=[],
+                    executions=[],
+                    positions=[],
+                    endpoint_statuses={
+                        'plans': 'ok',
+                        'orders': 'ok',
+                        'executions': 'ok',
+                        'positions': 'ok',
+                    },
+                )
+
+                self.assertEqual(result['derived_status'], expected)
+
+    def test_v4_item_states_are_current_truth_while_item_acks_remain_proof(self) -> None:
+        link = {
+            'core_item_key': 'core-item-1',
+            'exec_plan_id': 'exec-plan-1',
+            'exec_plan_item_id': 'exec-item-1',
+            'ack_status': 'accepted',
+            'remote_status': 'accepted',
+            'remote_status_source': 'dispatch_ack',
+            'response_item': {
+                'core_item_key': 'core-item-1',
+                'execution_plan_id': 'exec-plan-1',
+                'execution_plan_item_id': 'exec-item-1',
+                'status': 'accepted',
+            },
+        }
+        merged, mismatches = self.service._merge_exec_plan_readback_links(
+            item_links=[link],
+            plans_result={
+                'status': 'ok',
+                'payload': {
+                    'items': [
+                        {
+                            'external_plan_id': 'exec-plan-1',
+                            'execution_plan_id': 'exec-plan-1',
+                            'status': 'accepted',
+                            'item_acks': [copy.deepcopy(link['response_item'])],
+                            'item_states': [
+                                {
+                                    'core_item_key': 'core-item-1',
+                                    'execution_plan_item_id': 'exec-item-1',
+                                    'status': 'exec_agent_rejected',
+                                    'updated_at': '2026-10-07T05:00:00+00:00',
+                                    'terminal': True,
+                                    'decision': {
+                                        'action': 'reject',
+                                        'decision': 'rejected',
+                                        'reason_code': 'account_drawdown_gate',
+                                        'reason_family': 'risk_gate',
+                                        'rejection_disposition': 'terminal',
+                                        'reason': 'Account drawdown gate blocked execution.',
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(merged[0]['response_item']['status'], 'accepted')
+        self.assertEqual(merged[0]['ack_status'], 'accepted')
+        self.assertEqual(merged[0]['remote_status'], 'exec_agent_rejected')
+        self.assertEqual(merged[0]['remote_status_source'], 'exec_item_state')
+        self.assertEqual(
+            merged[0]['current_state']['decision']['reason_code'],
+            'account_drawdown_gate',
+        )
+
+    def test_v4_deferred_item_state_remains_retryable_pending(self) -> None:
+        link = {
+            'core_item_key': 'candidate:next_open_buy',
+            'exec_plan_id': 'exec-plan-uuid',
+            'exec_plan_item_id': 'item-uuid',
+            'ack_status': 'accepted',
+            'remote_status': 'accepted',
+            'remote_status_source': 'dispatch_ack',
+            'response_item': {
+                'core_item_key': 'candidate:next_open_buy',
+                'execution_plan_id': 'exec-plan-uuid',
+                'execution_plan_item_id': 'item-uuid',
+                'status': 'accepted',
+            },
+        }
+        merged, mismatches = self.service._merge_exec_plan_readback_links(
+            item_links=[link],
+            plans_result={
+                'status': 'ok',
+                'payload': {
+                    'items': [
+                        {
+                            'execution_plan_id': 'exec-plan-uuid',
+                            'external_plan_id': 'core-plan-id',
+                            'plan_id': 'core-plan-id',
+                            'status': 'running',
+                            'item_acks': [copy.deepcopy(link['response_item'])],
+                            'item_states': [
+                                {
+                                    'core_item_key': 'candidate:next_open_buy',
+                                    'execution_plan_item_id': 'item-uuid',
+                                    'status': 'watch_sizing_pending',
+                                    'updated_at': '2026-10-08T00:00:00+00:00',
+                                    'terminal': False,
+                                    'decision': {
+                                        'action': 'defer',
+                                        'decision': 'deferred',
+                                        'reason_code': 'reward_risk_below_floor',
+                                        'reason_family': 'reward_risk',
+                                        'rejection_disposition': 'defer',
+                                        'reason': 'Reward/risk is below the current floor.',
+                                        'retry_after': '2026-10-08T00:15:00+00:00',
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+        )
+        result = self.service._derive_remote_state(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=merged,
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(result['derived_status'], 'pending')
+        self.assertEqual(
+            merged[0]['current_state']['decision']['retry_after'],
+            '2026-10-08T00:15:00+00:00',
+        )
+
+    def test_v4_new_plan_pending_item_family_is_pending_without_defer_decision(
+        self,
+    ) -> None:
+        states = (
+            ('candidate:next_open_buy', 'entry-item', 'watch_sizing_pending'),
+            ('candidate:target_sell', 'target-item', 'target_sell_pending_config'),
+            ('candidate:stop_sell', 'stop-item', 'stop_sell_pending_config'),
+        )
+        links = [
+            {
+                'core_item_key': core_item_key,
+                'exec_plan_id': 'exec-plan-uuid',
+                'exec_plan_item_id': item_id,
+                'ack_status': 'accepted',
+                'remote_status': 'accepted',
+                'remote_status_source': 'dispatch_ack',
+                'response_item': {
+                    'core_item_key': core_item_key,
+                    'execution_plan_id': 'exec-plan-uuid',
+                    'execution_plan_item_id': item_id,
+                    'status': 'accepted',
+                },
+            }
+            for core_item_key, item_id, _ in states
+        ]
+        merged, mismatches = self.service._merge_exec_plan_readback_links(
+            item_links=links,
+            plans_result={
+                'status': 'ok',
+                'payload': {
+                    'items': [
+                        {
+                            'execution_plan_id': 'exec-plan-uuid',
+                            'external_plan_id': 'core-plan-id',
+                            'plan_id': 'core-plan-id',
+                            'status': 'running',
+                            'item_acks': [
+                                copy.deepcopy(link['response_item'])
+                                for link in links
+                            ],
+                            'item_status_counts': {
+                                'watch_sizing_pending': 1,
+                                'target_sell_pending_config': 1,
+                                'stop_sell_pending_config': 1,
+                            },
+                            'item_states': [
+                                {
+                                    'core_item_key': core_item_key,
+                                    'execution_plan_item_id': item_id,
+                                    'status': status,
+                                    'updated_at': '2026-10-08T00:00:00+00:00',
+                                    'terminal': False,
+                                    'decision': None,
+                                }
+                                for core_item_key, item_id, status in states
+                            ],
+                        }
+                    ]
+                },
+            },
+        )
+        result = self.service._derive_remote_state(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=merged,
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(result['derived_status'], 'pending')
+        self.assertEqual(
+            result['plan_item_status_counts'],
+            {
+                'stop_sell_pending_config': 1,
+                'target_sell_pending_config': 1,
+                'watch_sizing_pending': 1,
+            },
+        )
+
+    def test_v4_completed_no_trade_family_uses_entry_reason_and_becomes_terminal(
+        self,
+    ) -> None:
+        states = (
+            (
+                'candidate:next_open_buy',
+                'next_open_buy',
+                'entry-item',
+                'next_open_buy_expired',
+                {
+                    'action': 'cancel',
+                    'decision': 'expired',
+                    'reason_code': 'missed_next_open_window',
+                    'reason_family': 'execution_window',
+                    'rejection_disposition': 'terminal',
+                    'reason': 'The next-open entry window expired before submission.',
+                },
+            ),
+            (
+                'candidate:target_sell',
+                'target_sell',
+                'target-item',
+                'not_applicable',
+                None,
+            ),
+            (
+                'candidate:stop_sell',
+                'stop_sell',
+                'stop-item',
+                'not_applicable',
+                None,
+            ),
+        )
+        links = [
+            {
+                'core_item_key': core_item_key,
+                'intent': intent,
+                'exec_plan_id': 'exec-plan-uuid',
+                'exec_plan_item_id': item_id,
+                'ack_status': 'accepted',
+                'remote_status': 'accepted',
+                'remote_status_source': 'dispatch_ack',
+                'response_item': {
+                    'core_item_key': core_item_key,
+                    'execution_plan_id': 'exec-plan-uuid',
+                    'execution_plan_item_id': item_id,
+                    'status': 'accepted',
+                },
+            }
+            for core_item_key, intent, item_id, _, _ in states
+        ]
+        merged, mismatches = self.service._merge_exec_plan_readback_links(
+            item_links=links,
+            plans_result={
+                'status': 'ok',
+                'payload': {
+                    'items': [
+                        {
+                            'execution_plan_id': 'exec-plan-uuid',
+                            'external_plan_id': 'core-plan-id',
+                            'status': 'completed_no_trade',
+                            'item_status_counts': {
+                                'next_open_buy_expired': 1,
+                                'not_applicable': 2,
+                            },
+                            'item_states': [
+                                {
+                                    'core_item_key': core_item_key,
+                                    'execution_plan_item_id': item_id,
+                                    'status': status,
+                                    'updated_at': '2026-10-08T00:00:00+00:00',
+                                    'terminal': True,
+                                    'decision': copy.deepcopy(decision),
+                                }
+                                for core_item_key, _, item_id, status, decision in states
+                            ],
+                        }
+                    ]
+                },
+            },
+        )
+        result = self.service._derive_remote_state(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=merged,
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+        row = SimpleNamespace(
+            eligibility_status='eligible',
+            execution_status='delegated_for_exec_agent_sizing',
+            validation_payload={'blocking_reasons': []},
+            traceability_payload={
+                'handoff_active': True,
+                'exec_monitoring_active': True,
+                'exec_agent_approved': True,
+            },
+        )
+        audit = self.service._sync_exec_terminal_state(
+            row=row,
+            item_links=merged,
+            derived_state=result,
+            now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+            trigger='test_completed_no_trade',
+        )
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(result['derived_status'], 'cancelled')
+        self.assertEqual(result['terminal_decision']['reason_code'], 'missed_next_open_window')
+        self.assertEqual(
+            self.service._entry_link_active_statuses(item_links=merged),
+            [],
+        )
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit['terminal_status'], 'next_open_buy_expired')
+        self.assertEqual(audit['decision']['reason_code'], 'missed_next_open_window')
+        self.assertEqual(row.eligibility_status, 'blocked')
+        self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMIT_FAILED)
+        self.assertFalse(row.traceability_payload['exec_monitoring_active'])
+        self.assertFalse(row.traceability_payload['exec_agent_approved'])
+
+    def test_v4_terminal_entry_rejection_outranks_cancelled_siblings(self) -> None:
+        result = self.service._derive_remote_state(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'intent': 'next_open_buy',
+                    'remote_status': 'exec_agent_rejected',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {
+                        'status': 'exec_agent_rejected',
+                        'terminal': True,
+                    },
+                },
+                {
+                    'intent': 'target_sell',
+                    'remote_status': 'not_applicable',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {
+                        'status': 'not_applicable',
+                        'terminal': True,
+                    },
+                },
+                {
+                    'intent': 'stop_sell',
+                    'remote_status': 'not_applicable',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {
+                        'status': 'not_applicable',
+                        'terminal': True,
+                    },
+                },
+            ],
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+
+        self.assertEqual(result['derived_status'], 'failed')
+
+    def test_v4_filled_entry_is_not_cancelled_by_non_applicable_siblings(
+        self,
+    ) -> None:
+        result = self.service._derive_remote_state(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=[
+                {
+                    'intent': 'next_open_buy',
+                    'remote_status': 'filled',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {'status': 'filled', 'terminal': True},
+                },
+                {
+                    'intent': 'target_sell',
+                    'remote_status': 'not_applicable',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {
+                        'status': 'not_applicable',
+                        'terminal': True,
+                    },
+                },
+                {
+                    'intent': 'stop_sell',
+                    'remote_status': 'not_applicable',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {
+                        'status': 'not_applicable',
+                        'terminal': True,
+                    },
+                },
+            ],
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+
+        self.assertEqual(result['derived_status'], 'unknown')
+
+    def test_v4_protective_exit_failure_is_selected_over_filled_entry(self) -> None:
+        links = [
+            {
+                'intent': 'next_open_buy',
+                'remote_status': 'filled',
+                'remote_status_source': 'exec_item_state',
+                'current_state': {'status': 'filled', 'terminal': True},
+            },
+            {
+                'intent': 'target_sell',
+                'remote_status': 'broker_order_failed',
+                'remote_status_source': 'exec_item_state',
+                'current_state': {
+                    'status': 'broker_order_failed',
+                    'terminal': True,
+                    'decision': {
+                        'reason_code': 'protective_exit_submission_failed',
+                    },
+                },
+            },
+        ]
+        result = self.service._derive_remote_state(
+            row=SimpleNamespace(symbol='005930'),
+            item_links=links,
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+        row = SimpleNamespace(
+            eligibility_status='eligible',
+            execution_status='submitted',
+            validation_payload={'blocking_reasons': []},
+            traceability_payload={},
+        )
+        audit = self.service._sync_exec_terminal_state(
+            row=row,
+            item_links=links,
+            derived_state=result,
+            now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+            trigger='test_exit_failure',
+        )
+
+        self.assertEqual(result['derived_status'], 'failed')
+        self.assertEqual(audit['terminal_status'], 'broker_order_failed')
+        self.assertEqual(
+            audit['decision']['reason_code'],
+            'protective_exit_submission_failed',
+        )
+
+    def test_terminal_item_state_cannot_be_reopened_by_later_nonterminal_readback(
+        self,
+    ) -> None:
+        link = {
+            'core_item_key': 'candidate:next_open_buy',
+            'exec_plan_id': 'exec-plan-uuid',
+            'exec_plan_item_id': 'item-uuid',
+            'ack_status': 'accepted',
+            'remote_status': 'contract_quarantined',
+            'remote_status_source': 'exec_item_state',
+            'response_item': {
+                'core_item_key': 'candidate:next_open_buy',
+                'execution_plan_id': 'exec-plan-uuid',
+                'execution_plan_item_id': 'item-uuid',
+                'status': 'accepted',
+            },
+            'current_state': {
+                'core_item_key': 'candidate:next_open_buy',
+                'execution_plan_id': 'exec-plan-uuid',
+                'execution_plan_item_id': 'item-uuid',
+                'status': 'contract_quarantined',
+                'terminal': True,
+                'decision': {
+                    'reason_code': 'execution_contract_identity_invalid',
+                },
+            },
+        }
+
+        merged, mismatches = self.service._merge_exec_plan_readback_links(
+            item_links=[link],
+            plans_result={
+                'status': 'ok',
+                'payload': {
+                    'execution_plan_id': 'exec-plan-uuid',
+                    'external_plan_id': 'core-plan-id',
+                    'status': 'running',
+                    'item_states': [
+                        {
+                            'core_item_key': 'candidate:next_open_buy',
+                            'execution_plan_item_id': 'item-uuid',
+                            'status': 'watch_sizing_pending',
+                            'terminal': False,
+                        }
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(merged[0]['remote_status'], 'contract_quarantined')
+        self.assertEqual(
+            merged[0]['current_state']['decision']['reason_code'],
+            'execution_contract_identity_invalid',
+        )
+
+    def test_parent_manual_review_does_not_overwrite_live_protective_exit_states(
+        self,
+    ) -> None:
+        states = (
+            ('candidate:next_open_buy', 'entry-item', 'manual_review_required'),
+            ('candidate:target_sell', 'target-item', 'target_sell_monitoring'),
+            ('candidate:stop_sell', 'stop-item', 'stop_sell_monitoring'),
+        )
+        links = [
+            {
+                'core_item_key': core_item_key,
+                'exec_plan_id': 'exec-plan-uuid',
+                'exec_plan_item_id': item_id,
+                'ack_status': 'accepted',
+                'remote_status': 'accepted',
+                'remote_status_source': 'dispatch_ack',
+                'response_item': {
+                    'core_item_key': core_item_key,
+                    'execution_plan_id': 'exec-plan-uuid',
+                    'execution_plan_item_id': item_id,
+                    'status': 'accepted',
+                },
+            }
+            for core_item_key, item_id, _ in states
+        ]
+
+        merged, mismatches = self.service._merge_exec_plan_readback_links(
+            item_links=links,
+            plans_result={
+                'status': 'ok',
+                'payload': {
+                    'items': [
+                        {
+                            'execution_plan_id': 'exec-plan-uuid',
+                            'external_plan_id': 'core-plan-id',
+                            'status': 'manual_review_required',
+                            'item_states': [
+                                {
+                                    'core_item_key': core_item_key,
+                                    'execution_plan_item_id': item_id,
+                                    'status': status,
+                                    'terminal': status == 'manual_review_required',
+                                }
+                                for core_item_key, item_id, status in states
+                            ],
+                        }
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(
+            [link['current_state']['status'] for link in merged],
+            [
+                'manual_review_required',
+                'target_sell_monitoring',
+                'stop_sell_monitoring',
+            ],
+        )
+
     def test_exec_runtime_activity_is_unknown_when_activity_summaries_are_omitted(self) -> None:
         runtime = {
             'status': 'ok',
@@ -9986,6 +10710,182 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(_row_has_accepted_exec_dispatch(row))
 
+    async def test_exec_overview_contract_quarantine_overrides_immutable_accepted_item_acks(
+        self,
+    ) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            item_links = copy.deepcopy(
+                row.submission_payload['exec_dispatch']['item_links']
+            )
+
+        self.client.plan_response = {
+            'items': [
+                {
+                    'external_plan_id': plan_id,
+                    'plan_id': plan_id,
+                    'execution_plan_id': item_links[0]['exec_plan_id'],
+                    'status': 'contract_quarantined',
+                    'reason_code': 'execution_contract_identity_invalid',
+                    'reason': 'The accepted handoff was quarantined before execution.',
+                    'item_acks': [
+                        {
+                            **copy.deepcopy(link['response_item']),
+                            'status': 'accepted',
+                        }
+                        for link in item_links
+                    ],
+                }
+            ]
+        }
+        self.client.order_response = {'items': []}
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {'items': []}
+
+        overview = await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            symbol=self.symbol,
+            refresh=True,
+            trigger='test_contract_quarantine',
+        )
+
+        item = overview['items'][0]
+        self.assertEqual(item['remote_state']['derived_status'], 'failed')
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertEqual(item['approval_state'], 'rejected')
+        self.assertEqual(
+            item['exec_agent_reason_code'],
+            'execution_contract_identity_invalid',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMIT_FAILED)
+            current_states = [
+                link.get('current_state')
+                for link in row.submission_payload['exec_dispatch']['item_links']
+            ]
+            self.assertTrue(all(state['status'] == 'contract_quarantined' for state in current_states))
+            self.assertTrue(all(state['terminal'] is True for state in current_states))
+            self.assertTrue(
+                all(
+                    state['decision']['reason_code']
+                    == 'execution_contract_identity_invalid'
+                    and state['decision']['reason']
+                    == 'The accepted handoff was quarantined before execution.'
+                    for state in current_states
+                )
+            )
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+    async def test_exec_overview_completed_no_trade_persists_entry_terminal_reason(
+        self,
+    ) -> None:
+        dispatch_result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+        plan_id = dispatch_result['dispatch']['groups'][0]['plan_id']
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            item_links = copy.deepcopy(
+                row.submission_payload['exec_dispatch']['item_links']
+            )
+
+        item_states = []
+        for link in item_links:
+            is_entry = link.get('intent') in EXEC_ENTRY_BUY_INTENTS
+            item_states.append(
+                {
+                    'core_item_key': link['core_item_key'],
+                    'execution_plan_item_id': link['exec_plan_item_id'],
+                    'status': (
+                        'next_open_buy_expired'
+                        if is_entry
+                        else 'not_applicable'
+                    ),
+                    'updated_at': '2026-10-08T00:00:00+00:00',
+                    'terminal': True,
+                    'decision': (
+                        {
+                            'action': 'cancel',
+                            'decision': 'expired',
+                            'reason_code': 'missed_next_open_window',
+                            'reason_family': 'execution_window',
+                            'rejection_disposition': 'terminal',
+                            'reason': (
+                                'The next-open entry window expired before '
+                                'submission.'
+                            ),
+                        }
+                        if is_entry
+                        else None
+                    ),
+                }
+            )
+        self.client.plan_response = {
+            'items': [
+                {
+                    'external_plan_id': plan_id,
+                    'plan_id': plan_id,
+                    'execution_plan_id': item_links[0]['exec_plan_id'],
+                    'status': 'completed_no_trade',
+                    'item_acks': [
+                        {
+                            **copy.deepcopy(link['response_item']),
+                            'status': 'accepted',
+                        }
+                        for link in item_links
+                    ],
+                    'item_status_counts': {
+                        'next_open_buy_expired': 1,
+                        'not_applicable': len(item_links) - 1,
+                    },
+                    'item_states': item_states,
+                }
+            ]
+        }
+        self.client.order_response = {'items': []}
+        self.client.execution_response = {'items': []}
+        self.client.position_response = {'items': []}
+
+        overview = await self.service.list_signal_decider_exec_overview(
+            target_trade_date=self.target_trade_date,
+            symbol=self.symbol,
+            refresh=True,
+            trigger='test_completed_no_trade',
+        )
+
+        item = overview['items'][0]
+        self.assertEqual(item['remote_state']['derived_status'], 'cancelled')
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertEqual(item['approval_state'], 'rejected')
+        self.assertEqual(item['exec_agent_reason_code'], 'missed_next_open_window')
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMIT_FAILED)
+            dispatch = row.submission_payload['exec_dispatch']
+            self.assertEqual(
+                dispatch['terminal_state_sync']['terminal_status'],
+                'next_open_buy_expired',
+            )
+            self.assertEqual(
+                dispatch['terminal_state_sync']['decision']['reason_code'],
+                'missed_next_open_window',
+            )
+            self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
     async def test_exec_overview_refresh_requests_positions_for_exact_exec_plan(self) -> None:
         dispatch_result = await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
@@ -10456,9 +11356,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                                         'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
                                         'side': 'buy',
                                         'symbol': symbol,
+                                        'ack_status': 'accepted',
                                         'remote_status': entry_status,
-                                        'response_item': {
+                                        'remote_status_source': 'exec_item_state',
+                                        'current_state': {
                                             'status': entry_status,
+                                            'execution_plan_item_id': f'exec-item-watch-{entry_status}',
+                                        },
+                                        'response_item': {
+                                            'status': 'accepted',
                                             'execution_plan_item_id': f'exec-item-watch-{entry_status}',
                                         },
                                     }
