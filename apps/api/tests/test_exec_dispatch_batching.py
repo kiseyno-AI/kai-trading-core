@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 
 from app.orders.exec_integration import (
+    SignalDeciderExecIntegrationService,
     _delta_dispatch_batch_key,
     _delta_dispatch_plan_id,
     _partition_exec_dispatch_rows,
@@ -147,12 +148,59 @@ def test_legacy_or_incomplete_accepted_dispatch_is_not_trusted_as_v4_proof() -> 
     assert pending == []
 
 
-def test_live_item_state_cannot_replace_missing_dispatch_ack_status() -> None:
+def test_historical_readback_overwrite_recovers_ack_from_original_summary() -> None:
     row = _row(1, 101, '005930', 'accepted')
-    item_link = row.submission_payload['exec_dispatch']['item_links'][0]
+    exec_dispatch = row.submission_payload['exec_dispatch']
+    item_link = exec_dispatch['item_links'][0]
+    item_link['remote_status'] = 'watch_sizing_pending'
+    item_link['response_item'] = {
+        'core_item_key': item_link['core_item_key'],
+        'execution_plan_id': item_link['exec_plan_id'],
+        'execution_plan_item_id': item_link['exec_plan_item_id'],
+        'status': 'watch_sizing_pending',
+    }
+
+    assert _row_has_accepted_exec_dispatch(row) is True
+    guarded, pending = _partition_exec_dispatch_rows([row], force=False)
+    assert guarded == [row]
+    assert pending == []
+    assert (
+        SignalDeciderExecIntegrationService._fence_unproven_remote_acceptance(
+            rows=[row],
+            trigger='historical_readback_regression',
+        )
+        == 0
+    )
+
+
+def test_live_item_state_cannot_replace_missing_original_dispatch_ack() -> None:
+    row = _row(1, 101, '005930', 'accepted')
+    exec_dispatch = row.submission_payload['exec_dispatch']
+    item_link = exec_dispatch['item_links'][0]
     item_link['remote_status_source'] = 'exec_item_state'
+    exec_dispatch['last_response_summary']['row_items'][0][
+        'status'
+    ] = 'watch_sizing_pending'
 
     assert _row_has_accepted_exec_dispatch(row) is False
+
+
+def test_explicit_dispatch_ack_conflicts_fail_closed() -> None:
+    conflicting_links = (
+        {'ack_status': 'rejected'},
+        {
+            'remote_status_source': 'dispatch_ack',
+            'remote_status': 'rejected',
+        },
+    )
+
+    for conflicting_link in conflicting_links:
+        row = _row(1, 101, '005930', 'accepted')
+        row.submission_payload['exec_dispatch']['item_links'][0].update(
+            conflicting_link
+        )
+
+        assert _row_has_accepted_exec_dispatch(row) is False
 
 
 def test_accepted_dispatch_proof_rejects_duplicate_remote_item_ids() -> None:
