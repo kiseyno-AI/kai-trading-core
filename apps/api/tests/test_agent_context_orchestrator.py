@@ -6975,11 +6975,13 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         mutate_previous_context = False
         decision_lookup_count = 0
         decision_lookup_calls = []
+        upstream_lookup_calls = []
 
         def build_latest_decisions(**kwargs):
             nonlocal decision_lookup_count
             roles = tuple(kwargs['roles'])
             if set(roles) == set(orchestrator_module.UPSTREAM_SUMMARY_ROLES):
+                upstream_lookup_calls.append(dict(kwargs))
                 return {
                     '005930': {
                         role: SimpleNamespace(
@@ -7095,6 +7097,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                                                         '2026-04-14T08:00:00+00:00'
                                                     ),
                                                     reuse_existing=False,
+                                                    upstream_summary_run_id=(
+                                                        'summary-parent-run'
+                                                    ),
                                                 )
                                                 stable_feedback_count = len(
                                                     feedback_service.bulk_items
@@ -7120,6 +7125,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                                                             'symbol-run-2026-04-14-'
                                                             'changed-prior'
                                                         ),
+                                                        upstream_summary_run_id=(
+                                                            'summary-parent-run'
+                                                        ),
                                                     )
                                                 )
                                                 changed_lookup_calls = list(
@@ -7135,6 +7143,20 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 'feedback_id'
             ],
             501,
+        )
+        self.assertEqual(
+            client.decider_payloads[0]['source_revalidation_request'][
+                'upstream_summary_run_id'
+            ],
+            'summary-parent-run',
+        )
+        self.assertGreaterEqual(len(upstream_lookup_calls), 2)
+        self.assertTrue(
+            all(
+                call['authoritative_summary_run_id']
+                == 'summary-parent-run'
+                for call in upstream_lookup_calls
+            )
         )
         self.assertEqual(
             changed_result['summary']['status'],

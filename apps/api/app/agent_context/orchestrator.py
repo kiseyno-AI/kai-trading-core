@@ -2528,6 +2528,7 @@ class AgentFeedbackOrchestrator:
         allow_persisted_current_run_upstream: bool = False,
         durable_source_generation: bool = False,
         source_knowledge_cutoff_at: str | None = None,
+        authoritative_summary_run_id: str | None = None,
         revalidate_post_decision_material_context: bool = False,
         post_decision_check_at: datetime | None = None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
@@ -2692,6 +2693,9 @@ class AgentFeedbackOrchestrator:
                             for symbol in sorted(persisted_source_symbols)
                             if symbol in refreshed_fundamental_fingerprints
                         },
+                        authoritative_summary_run_id=(
+                            authoritative_summary_run_id
+                        ),
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -3593,6 +3597,11 @@ class AgentFeedbackOrchestrator:
                 ],
                 'eligibility_scope_symbols': raw_eligibility_scope,
                 'source_knowledge_cutoff_at': normalized_knowledge_cutoff,
+                'authoritative_summary_run_id': str(
+                    revalidation_request.get('upstream_summary_run_id')
+                    or ''
+                ).strip()
+                or None,
             }
             group_key = json.dumps(
                 group_material,
@@ -3639,6 +3648,9 @@ class AgentFeedbackOrchestrator:
                         revalidate_post_decision_material_context=True,
                         source_knowledge_cutoff_at=material[
                             'source_knowledge_cutoff_at'
+                        ],
+                        authoritative_summary_run_id=material[
+                            'authoritative_summary_run_id'
                         ],
                     )
             except Exception as exc:  # noqa: BLE001
@@ -3733,6 +3745,7 @@ class AgentFeedbackOrchestrator:
         fs_div: str | None,
         disclosures_limit: int,
         source_knowledge_cutoff_at: str | None,
+        upstream_summary_run_id: str | None,
         reuse_decisions: dict[str, dict[str, Any]],
         previous_decision_context_decisions: dict[str, dict[str, Any]],
         upstream_reuse_decisions: dict[str, dict[str, Any]],
@@ -3938,6 +3951,7 @@ class AgentFeedbackOrchestrator:
                 'fs_div': fs_div,
                 'disclosures_limit': int(disclosures_limit),
                 'knowledge_cutoff_at': source_knowledge_cutoff_at,
+                'upstream_summary_run_id': upstream_summary_run_id,
             }
             payload['decision_input_generation_fence'] = {
                 'schema_version': 'decision_input_generation_fence_v1',
@@ -6183,6 +6197,9 @@ class AgentFeedbackOrchestrator:
                         source_knowledge_cutoff_at=(
                             source_knowledge_cutoff_at
                         ),
+                        upstream_summary_run_id=(
+                            normalized_upstream_summary_run_id
+                        ),
                         reuse_decisions=reuse_decisions,
                         previous_decision_context_decisions=(
                             previous_decision_context_decisions
@@ -6475,6 +6492,9 @@ class AgentFeedbackOrchestrator:
                                                     disclosures_limit=disclosures_limit,
                                                     source_knowledge_cutoff_at=(
                                                         source_knowledge_cutoff_at
+                                                    ),
+                                                    authoritative_summary_run_id=(
+                                                        normalized_upstream_summary_run_id
                                                     ),
                                                 )
                                             )
@@ -7006,6 +7026,9 @@ class AgentFeedbackOrchestrator:
                                 disclosures_limit=disclosures_limit,
                                 source_knowledge_cutoff_at=(
                                     source_knowledge_cutoff_at
+                                ),
+                                authoritative_summary_run_id=(
+                                    normalized_upstream_summary_run_id
                                 ),
                                 revalidate_post_decision_material_context=True,
                                 allow_current_run_feedback=True,
