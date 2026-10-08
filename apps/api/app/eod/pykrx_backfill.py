@@ -1098,6 +1098,25 @@ def _is_retryable_feedback_rearm_candidate(
         if isinstance(result_summary, Mapping)
         else None
     )
+    prerequisites = (
+        result_summary.get('prerequisites')
+        if isinstance(result_summary, Mapping)
+        else None
+    )
+    run_metadata = (
+        pipeline_run.get('run_metadata')
+        if isinstance(pipeline_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    if not (
+        isinstance(prerequisites, Mapping)
+        and prerequisites.get('ready') is True
+        or run_metadata.get(
+            'inherited_feedback_prerequisite_admission'
+        )
+        is True
+    ):
+        return False
     summary = (
         progress.get('summary')
         if isinstance(progress, Mapping)
@@ -3116,6 +3135,14 @@ class PykrxBackfillService:
                 provider_admission_fence_owned
             ),
         }
+        if retryable_feedback_rearm_candidate:
+            # The parent feedback stage already persisted a ready prerequisite
+            # snapshot. Once the suffix-only child becomes the latest run, the
+            # generic status view no longer contains those completed prefix
+            # stages, so preserve that proven admission for this scoped retry.
+            recovery_kwargs[
+                'inherit_feedback_prerequisite_admission'
+            ] = True
         if (
             summary_cutoff_proof is not None
             and 'signal_decider' in recovery_stages

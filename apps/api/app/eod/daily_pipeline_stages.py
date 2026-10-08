@@ -613,6 +613,7 @@ class DailyPipelineStageService:
         reused_eod_collection_run_id: int | None = None,
         point_in_time_recovery: bool = False,
         existing_pipeline_run_id: int | None = None,
+        inherit_feedback_prerequisite_admission: bool = False,
         provider_admission_fence_owned: bool = False,
         summary_cutoff_proof: Mapping[str, Any] | None = None,
         summary_cutoff_contract_repair: bool = False,
@@ -680,9 +681,25 @@ class DailyPipelineStageService:
             for stage_id in feedback_prerequisite_stage_ids
             if stage_id not in resolved_stages
         )
-
+        if inherit_feedback_prerequisite_admission and not (
+            trigger == 'auto_eod_followup_resume'
+            and tuple(resolved_stages)
+            == TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER
+            and resume_from_stage
+            == TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER[0]
+            and reused_eod_collection_run_id is not None
+            and point_in_time_recovery
+            and reuse_existing_feedback
+            and not force
+            and existing_pipeline_run_id is None
+        ):
+            raise ValueError(
+                'feedback prerequisite admission inheritance requires the '
+                'exact point-in-time automatic feedback suffix retry'
+            )
         if (
             existing_pipeline_run_id is None
+            and not inherit_feedback_prerequisite_admission
             and self._requires_persisted_feedback_prerequisite_preflight(
                 resolved_stages,
                 required_stage_ids=feedback_prerequisite_stage_ids,
@@ -1144,6 +1161,9 @@ class DailyPipelineStageService:
                     'reuse_existing_feedback': reuse_existing_feedback,
                     'feedback_force_recompute': bool(force and not reuse_existing_feedback),
                     'bypass_prerequisite_gate': bypass_prerequisite_gate,
+                    'inherited_feedback_prerequisite_admission': (
+                        inherit_feedback_prerequisite_admission
+                    ),
                     'reused_eod_collection_run_id': (
                         int(reused_eod_collection_run_id)
                         if reused_eod_collection_run_id is not None
@@ -1664,6 +1684,7 @@ class DailyPipelineStageService:
                             force=force,
                             bypass_prerequisite_gate=(
                                 bypass_prerequisite_gate
+                                or inherit_feedback_prerequisite_admission
                             ),
                             fs_div=resolved_fs_div,
                             symbol_limit=symbol_limit,
@@ -3095,7 +3116,10 @@ class DailyPipelineStageService:
                     point_in_time_recovery=point_in_time_recovery,
                 ),
             )
-            if not prerequisites['ready']:
+            if (
+                not bypass_prerequisite_gate
+                and not prerequisites['ready']
+            ):
                 return self._build_prerequisite_gate_result(
                     stage_id=stage_id,
                     market_date=market_date,

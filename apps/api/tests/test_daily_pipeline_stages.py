@@ -3233,6 +3233,48 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertTrue(call['bypass_prerequisite_gate'])
         self.assertTrue(call['config'].reuse_existing)
 
+    def test_feedback_rearm_keeps_parent_prerequisite_admission(self) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+        )
+
+        with patch(
+            'app.eod.daily_pipeline_stages.'
+            'agent_feedback_prerequisite_service.'
+            'inspect_feedback_prerequisites',
+            return_value=_feedback_prerequisites(
+                status='blocked',
+                missing_stage_ids=['fundamentals_daily_refresh'],
+            ),
+        ) as inspect_prerequisites:
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                resume_from_stage='agent_feedback_summaries',
+                trigger='auto_eod_followup_resume',
+                point_in_time_recovery=True,
+                inherit_feedback_prerequisite_admission=True,
+                reuse_existing_feedback=True,
+                reused_eod_collection_run_id=7,
+            )
+
+        self.assertEqual(
+            result['stages']['agent_feedback_summaries']['status'],
+            'completed',
+        )
+        self.assertGreaterEqual(inspect_prerequisites.call_count, 2)
+        self.assertGreaterEqual(len(feedback_retry_service.calls), 1)
+        call = feedback_retry_service.calls[0]
+        self.assertFalse(call['force'])
+        self.assertTrue(call['bypass_prerequisite_gate'])
+        self.assertTrue(call['config'].reuse_existing)
+
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()
 
