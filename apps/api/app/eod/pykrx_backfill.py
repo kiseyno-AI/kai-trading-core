@@ -111,6 +111,7 @@ DEFAULT_MARKETS = ('KOSPI', 'KOSDAQ', 'KONEX')
 MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
 AUTO_PYKRX_DAILY_RETRY_MIN_INTERVAL_SECONDS = 5 * 60
 MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE = 5
+MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE = 3
 AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
 AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS = 60 * 60
 AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
@@ -1068,6 +1069,72 @@ def _is_dart_provider_outage_rearm_candidate(
         and str(item.get('error_type') or '') == 'DartAPIError'
         and 'DART request failed [800]' in str(item.get('error') or '')
         for item in lookup_errors
+    )
+
+
+def _is_retryable_feedback_rearm_candidate(
+    pipeline_run: object,
+) -> bool:
+    """Admit another bounded pass when only retryable feedback remains."""
+
+    if not isinstance(pipeline_run, Mapping):
+        return False
+    stages = pipeline_run.get('stages')
+    if not isinstance(stages, Mapping):
+        return False
+    stage = stages.get('agent_feedback_summaries')
+    if not isinstance(stage, Mapping):
+        return False
+    if str(stage.get('status') or '').strip().lower() != 'partial':
+        return False
+    details = stage.get('details')
+    result_summary = (
+        details.get('result_summary')
+        if isinstance(details, Mapping)
+        else None
+    )
+    progress = (
+        result_summary.get('progress')
+        if isinstance(result_summary, Mapping)
+        else None
+    )
+    summary = (
+        progress.get('summary')
+        if isinstance(progress, Mapping)
+        else None
+    )
+    role_progress = (
+        summary.get('role_progress')
+        if isinstance(summary, Mapping)
+        else None
+    )
+    if not isinstance(role_progress, Mapping):
+        return False
+    try:
+        failed_items = int(summary.get('failed_items') or 0)
+        retry_pending_items = sum(
+            int(role.get('retry_pending_symbols') or 0)
+            for role in role_progress.values()
+            if isinstance(role, Mapping)
+        )
+        in_progress_items = sum(
+            int(role.get('in_progress_symbols') or 0)
+            for role in role_progress.values()
+            if isinstance(role, Mapping)
+        )
+        pending_items = sum(
+            int(role.get('pending_symbols') or 0)
+            for role in role_progress.values()
+            if isinstance(role, Mapping)
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        str(summary.get('run_status') or '').strip().lower() == 'partial'
+        and failed_items > 0
+        and retry_pending_items == failed_items
+        and in_progress_items == 0
+        and pending_items == 0
     )
 
 
@@ -2789,6 +2856,16 @@ class PykrxBackfillService:
             >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
             and _is_dart_provider_outage_rearm_candidate(pipeline_run)
         )
+        retryable_feedback_rearm_candidate = bool(
+            recovery_attempts
+            >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+            and recovery_attempts
+            < (
+                MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                + MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
+            )
+            and _is_retryable_feedback_rearm_candidate(pipeline_run)
+        )
         provider_outage_retry_after_seconds: int | None = None
         provider_outage_rearm_due = False
         provider_outage_completed_at = _parse_activity_datetime(
@@ -2822,6 +2899,7 @@ class PykrxBackfillService:
             and not cutoff_contract_repair
             and not cutoff_contract_repair_resume
             and not provider_outage_rearm_due
+            and not retryable_feedback_rearm_candidate
         ):
             result = build_daily_skip_result(
                 reason=(
@@ -2879,11 +2957,22 @@ class PykrxBackfillService:
                     'attempts': recovery_attempts,
                     'max_attempts': (
                         MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
-                        + (1 if cutoff_contract_repair_proven else 0)
+                        + (
+                            MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
+                            if retryable_feedback_rearm_candidate
+                            else (1 if cutoff_contract_repair_proven else 0)
+                        )
                     ),
                     'retry_after_seconds': retry_after_seconds,
                     'resume_from_stage': incomplete_stages[0],
                 }
+                if retryable_feedback_rearm_candidate:
+                    result['followup_recovery'].update(
+                        {
+                            'retry_scheduled': True,
+                            'retryable_feedback_rearm': True,
+                        }
+                    )
                 return result
 
         current_price_scope_preflight_required = bool(
@@ -3161,14 +3250,19 @@ class PykrxBackfillService:
                 else max(
                     MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
                     + (
-                        1
-                        if repair_checkpoint is not None
-                        or cutoff_contract_repair
-                        or cutoff_contract_repair_resume
-                        else 0
+                        MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
+                        if retryable_feedback_rearm_candidate
+                        else (
+                            1
+                            if repair_checkpoint is not None
+                            or cutoff_contract_repair
+                            or cutoff_contract_repair_resume
+                            else 0
+                        )
                     ),
                     recovery_attempts + 1
                     if provider_outage_rearm_due
+                    or retryable_feedback_rearm_candidate
                     else 0,
                 )
             ),
@@ -3190,6 +3284,10 @@ class PykrxBackfillService:
                     ),
                 }
             )
+        if retryable_feedback_rearm_candidate:
+            recovery_result['followup_recovery'][
+                'retryable_feedback_rearm'
+            ] = True
         if ordering_repair_stage is not None:
             recovery_result['followup_recovery'][
                 'ordering_repair'
