@@ -1949,6 +1949,9 @@ def _accepted_item_bindings_from_response_summary(
     for item in row_items:
         if not isinstance(item, dict):
             return None
+        item_status = _normalize_status(item.get('status'))
+        if item_status not in {None, EXEC_DISPATCH_STATUS_ACCEPTED}:
+            return None
         core_item_key = _normalize_optional_text(item.get('core_item_key'))
         execution_plan_id = _normalize_optional_text(item.get('execution_plan_id'))
         execution_plan_item_id = _normalize_optional_text(
@@ -1966,18 +1969,18 @@ def _accepted_item_bindings_from_response_summary(
     return bindings
 
 
-def _exec_dispatch_item_ack_status(link: dict[str, Any]) -> str | None:
-    explicit_ack = _normalize_status(
-        link.get('ack_status') or _extract_field(link, 'response_item', 'status')
+def _exec_dispatch_item_ack_is_consistent(link: dict[str, Any]) -> bool:
+    ack_status = _normalize_status(link.get('ack_status'))
+    if ack_status not in {None, EXEC_DISPATCH_STATUS_ACCEPTED}:
+        return False
+    if _normalize_status(link.get('remote_status_source')) != 'dispatch_ack':
+        return True
+    return bool(
+        _normalize_status(link.get('remote_status'))
+        == EXEC_DISPATCH_STATUS_ACCEPTED
+        and _normalize_status(_extract_field(link, 'response_item', 'status'))
+        in {None, EXEC_DISPATCH_STATUS_ACCEPTED}
     )
-    if explicit_ack:
-        return explicit_ack
-    if _normalize_status(link.get('remote_status_source')) not in {
-        None,
-        'dispatch_ack',
-    }:
-        return None
-    return _normalize_status(link.get('remote_status'))
 
 
 def _row_has_accepted_exec_dispatch(row: SignalDeciderExecutionPlanItem) -> bool:
@@ -2096,7 +2099,7 @@ def _row_has_accepted_exec_dispatch(row: SignalDeciderExecutionPlanItem) -> bool
         and [binding['core_item_key'] for binding in accepted_item_bindings]
         == submitted_keys
         and all(
-            _exec_dispatch_item_ack_status(link) == EXEC_DISPATCH_STATUS_ACCEPTED
+            _exec_dispatch_item_ack_is_consistent(link)
             and _normalize_optional_text(link.get('exec_plan_id'))
             and _normalize_optional_text(link.get('exec_plan_item_id'))
             for link in links_by_key.values()
