@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
+import tempfile
 from urllib.parse import unquote
 import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
@@ -291,14 +294,30 @@ class DartClient:
             if self._corp_codes and self._corp_codes_loaded_at and now - self._corp_codes_loaded_at < ttl:
                 return self._corp_codes
 
-            response = await self._request('/corpCode.xml', {})
-            payload = response.content
-            content_type = response.headers.get('content-type')
-
+            payload = b''
+            content_type: str | None = None
             try:
+                response = await self._request('/corpCode.xml', {})
+                payload = response.content
+                content_type = response.headers.get('content-type')
                 self._raise_for_binary_error_envelope(response, path='/corpCode.xml')
                 corp_codes = self._parse_corp_code_payload(payload, content_type=content_type)
-            except DartAPIError as exc:
+                if not corp_codes:
+                    raise DartAPIError('DART corp code archive contained no valid records')
+            except (DartAPIError, httpx.HTTPError) as exc:
+                persisted = self._load_persisted_corp_codes()
+                if persisted is not None:
+                    self._corp_codes = persisted
+                    self._corp_codes_loaded_at = now
+                    log_fetch_event(
+                        service='dart',
+                        operation='load_corp_codes',
+                        status='completed',
+                        source='persistent_fallback',
+                        corp_code_count=len(persisted),
+                        upstream_error_type=type(exc).__name__,
+                    )
+                    return persisted
                 log_fetch_event(
                     service='dart',
                     operation='load_corp_codes',
@@ -309,6 +328,7 @@ class DartClient:
                 )
                 raise
 
+            self._persist_corp_code_payload(payload)
             self._corp_codes = corp_codes
             self._corp_codes_loaded_at = now
             log_fetch_event(
@@ -320,6 +340,82 @@ class DartClient:
                 payload_bytes=len(payload),
             )
             return corp_codes
+
+    @staticmethod
+    def _corp_code_cache_path() -> Path | None:
+        configured = settings.dart_corp_code_cache_file.strip()
+        if not configured:
+            return None
+        return Path(configured).expanduser()
+
+    def _load_persisted_corp_codes(self) -> list[dict[str, str]] | None:
+        cache_path = self._corp_code_cache_path()
+        if cache_path is None or not cache_path.exists():
+            return None
+
+        try:
+            if cache_path.is_symlink() or not cache_path.is_file():
+                raise DartAPIError('DART corp code cache must be a regular file')
+            if cache_path.stat().st_size > 64 * 1024 * 1024:
+                raise DartAPIError('DART corp code cache exceeds the 64 MiB safety limit')
+
+            payload = cache_path.read_bytes()
+            corp_codes = self._parse_corp_code_payload(payload)
+            if not corp_codes:
+                raise DartAPIError('DART corp code cache contained no valid records')
+            return corp_codes
+        except (DartAPIError, OSError) as exc:
+            log_fetch_event(
+                service='dart',
+                operation='load_persisted_corp_codes',
+                status='failed',
+                cache_path=str(cache_path),
+                error_message=str(exc),
+            )
+            return None
+
+    def _persist_corp_code_payload(self, payload: bytes) -> None:
+        cache_path = self._corp_code_cache_path()
+        if cache_path is None:
+            return
+
+        temporary_path: str | None = None
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f'.{cache_path.name}.',
+                suffix='.tmp',
+                dir=cache_path.parent,
+            )
+            try:
+                os.fchmod(file_descriptor, 0o600)
+                with os.fdopen(file_descriptor, 'wb') as cache_file:
+                    cache_file.write(payload)
+                    cache_file.flush()
+                    os.fsync(cache_file.fileno())
+            except Exception:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+                raise
+            os.replace(temporary_path, cache_path)
+            temporary_path = None
+            cache_path.chmod(0o600)
+        except OSError as exc:
+            log_fetch_event(
+                service='dart',
+                operation='persist_corp_codes',
+                status='failed',
+                cache_path=str(cache_path),
+                error_message=str(exc),
+            )
+        finally:
+            if temporary_path is not None:
+                try:
+                    Path(temporary_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def _get_json(
         self,

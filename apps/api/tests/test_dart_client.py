@@ -1,6 +1,9 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from app.core.settings import settings
 from app.integrations.dart.client import DartAPIError, DartClient
 
 
@@ -47,6 +50,17 @@ class FakeAsyncClient:
 
 
 class DartClientTests(unittest.IsolatedAsyncioTestCase):
+    _CORP_CODE_XML = (
+        b'<?xml version="1.0" encoding="UTF-8"?>'
+        b'<result><list><corp_code>00126380</corp_code><corp_name>Samsung Electronics</corp_name>'
+        b'<stock_code>005930</stock_code><modify_date>20260408</modify_date></list></result>'
+    )
+
+    def setUp(self):
+        self._cache_setting_patch = patch.object(settings, 'dart_corp_code_cache_file', '')
+        self._cache_setting_patch.start()
+        self.addCleanup(self._cache_setting_patch.stop)
+
     async def test_fetch_single_company_financial_statements_returns_empty_list_for_no_data_status(self):
         client = TestableDartClient({'status': '013', 'message': 'No data'})
 
@@ -170,11 +184,7 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_lookup_corp_code_accepts_direct_xml_without_zip_wrapper(self):
         client = TestableDartClient(
             {'status': '000'},
-            content=(
-                b'<?xml version="1.0" encoding="UTF-8"?>'
-                b'<result><list><corp_code>00126380</corp_code><corp_name>Samsung Electronics</corp_name>'
-                b'<stock_code>005930</stock_code><modify_date>20260408</modify_date></list></result>'
-            ),
+            content=self._CORP_CODE_XML,
             headers={'content-type': 'application/xml'},
         )
 
@@ -182,6 +192,51 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(corp['corp_code'], '00126380')
         self.assertEqual(corp['corp_name'], 'Samsung Electronics')
+
+    async def test_successful_corp_code_fetch_persists_last_known_good_payload(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'dart' / 'corp-codes.xml'
+            client = TestableDartClient(
+                {'status': '000'},
+                content=self._CORP_CODE_XML,
+                headers={'content-type': 'application/xml'},
+            )
+
+            with patch.object(settings, 'dart_corp_code_cache_file', str(cache_file)):
+                corp = await client.lookup_corp_code(stock_code='005930')
+
+            self.assertEqual(corp['corp_code'], '00126380')
+            self.assertEqual(cache_file.read_bytes(), self._CORP_CODE_XML)
+            self.assertEqual(cache_file.stat().st_mode & 0o777, 0o600)
+
+    async def test_corp_code_fetch_uses_persisted_payload_when_upstream_is_unavailable(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            client = TestableDartClient(
+                {'status': '800', 'message': 'Maintenance'},
+                content=b'<result><status>800</status><message>Maintenance</message></result>',
+                headers={'content-type': 'application/xml'},
+            )
+
+            with patch.object(settings, 'dart_corp_code_cache_file', str(cache_file)):
+                corp = await client.lookup_corp_code(stock_code='005930')
+
+            self.assertEqual(corp['corp_code'], '00126380')
+
+    async def test_invalid_persisted_corp_code_payload_does_not_mask_upstream_error(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(b'not-a-valid-corp-code-payload')
+            client = TestableDartClient(
+                {'status': '800', 'message': 'Maintenance'},
+                content=b'<result><status>800</status><message>Maintenance</message></result>',
+                headers={'content-type': 'application/xml'},
+            )
+
+            with patch.object(settings, 'dart_corp_code_cache_file', str(cache_file)):
+                with self.assertRaisesRegex(DartAPIError, '800'):
+                    await client.lookup_corp_code(stock_code='005930')
 
     async def test_lookup_corp_code_invalid_payload_reports_diagnostics(self):
         client = TestableDartClient(
