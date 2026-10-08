@@ -24,6 +24,21 @@ EXECUTION_REVOCATION_MANUAL_REVIEW_REASON_CODES = frozenset(
         'broker_commit_or_exposure_possible',
         'persisted_v4_contract_not_proven',
         'revocation_item_binding_mismatch',
+        # Exec emits this only when a retired plan no longer has a uniformly
+        # revoked requested family. Core must preserve the fail-closed state.
+        'revocation_state_mismatch',
+    }
+)
+EXECUTION_REVOCATION_BLOCKED_REASON_CODES = frozenset(
+    {
+        # Transient advisory-lock contention: retry the exact pending request.
+        'revocation_exposure_scope_busy',
+    }
+)
+EXECUTION_REVOCATION_NOT_FOUND_REASON_CODES = frozenset(
+    {
+        # The requested external plan does not exist in the addressed Exec.
+        'execution_plan_not_found',
     }
 )
 EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION = 'exec_agent_decider_handoff_v1'
@@ -581,14 +596,20 @@ class ExecutionRevocationAckHeader(_ContractModel):
     contract_version: Literal[EXECUTION_HANDOFF_CONTRACT_VERSION]
     capability: Literal[EXECUTION_REVOCATION_CAPABILITY]
     plan_id: str
-    status: Literal['revoked', 'manual_review_required', 'not_found']
+    status: Literal['revoked', 'manual_review_required', 'not_found', 'blocked']
 
 
 class ExecutionRevocationItemAck(_ContractModel):
     model_config = ConfigDict(extra='forbid')
 
     core_item_key: str
-    status: Literal['revoked', 'manual_review_required', 'preserved_protective_exit', 'not_found']
+    status: Literal[
+        'revoked',
+        'manual_review_required',
+        'preserved_protective_exit',
+        'not_found',
+        'blocked',
+    ]
     execution_plan_id: str | None = None
     execution_plan_item_id: str
 
@@ -825,11 +846,20 @@ def validate_execution_revocation_ack(
         and expected_reason_code
         and expected_reason_code.strip() == expected_reason_code
     )
-    reason_matches_contract = (
-        parsed.reason_code in EXECUTION_REVOCATION_MANUAL_REVIEW_REASON_CODES
-        if header_status == 'manual_review_required'
-        else parsed.reason_code == expected_reason_code
-    )
+    if header_status == 'manual_review_required':
+        reason_matches_contract = (
+            parsed.reason_code in EXECUTION_REVOCATION_MANUAL_REVIEW_REASON_CODES
+        )
+    elif header_status == 'blocked':
+        reason_matches_contract = (
+            parsed.reason_code in EXECUTION_REVOCATION_BLOCKED_REASON_CODES
+        )
+    elif header_status == 'not_found':
+        reason_matches_contract = (
+            parsed.reason_code in EXECUTION_REVOCATION_NOT_FOUND_REASON_CODES
+        )
+    else:
+        reason_matches_contract = parsed.reason_code == expected_reason_code
     if (
         not expected_reason_is_valid
         or not reason_matches_contract
@@ -864,16 +894,22 @@ def validate_execution_revocation_ack(
     expected_execution_plan_id = (
         next(iter(submitted_plan_ids)) if submitted_plan_ids else None
     )
-    if expected_execution_plan_id is not None and (
-        parsed.execution_plan_id != expected_execution_plan_id
-        or any(
-            item.get('execution_plan_id') != expected_execution_plan_id
-            for item in ack_by_key.values()
-        )
-    ):
-        raise ValueError(
-            'execution revocation ACK plan identity does not match submitted plan'
-        )
+    if expected_execution_plan_id is not None:
+        acknowledged_plan_ids = {
+            item.get('execution_plan_id') for item in ack_by_key.values()
+        }
+        if header_status == 'not_found':
+            if parsed.execution_plan_id is not None or acknowledged_plan_ids != {None}:
+                raise ValueError(
+                    'execution revocation not-found ACK requires absent plan identity'
+                )
+        elif (
+            parsed.execution_plan_id != expected_execution_plan_id
+            or acknowledged_plan_ids != {expected_execution_plan_id}
+        ):
+            raise ValueError(
+                'execution revocation ACK plan identity does not match submitted plan'
+            )
     for key, submitted_item in submitted_by_key.items():
         submitted_item_id = str(
             submitted_item.get('exec_plan_item_id') or ''
@@ -905,6 +941,12 @@ def validate_execution_revocation_ack(
         status == 'manual_review_required' for status in statuses
     ):
         raise ValueError('manual-review ACK requires an explicit manual-review item')
+    if header_status == 'blocked' and any(status != 'blocked' for status in statuses):
+        raise ValueError('blocked ACK requires every item to remain blocked')
+    if header_status == 'not_found' and any(
+        status != 'not_found' for status in statuses
+    ):
+        raise ValueError('not-found ACK requires every item to be not_found')
     if parsed.execution_plan_id is not None and any(
         item['execution_plan_id'] != parsed.execution_plan_id
         for item in ack_by_key.values()

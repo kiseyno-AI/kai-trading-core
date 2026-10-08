@@ -5809,11 +5809,13 @@ class SignalDeciderExecIntegrationService:
             if not _normalize_optional_text(integration.get('base_url')):
                 results.append({'row_id': row.id, 'status': 'not_configured'})
                 continue
+            response_error_status_code: int | None = None
             try:
                 response_payload = await self.client.post_execution_plan_revocation(request_payload)
             except SignalDeciderExecClientError as exc:
-                if exc.status_code == 409 and isinstance(exc.payload, dict):
+                if exc.status_code in {404, 409} and isinstance(exc.payload, dict):
                     response_payload = exc.payload
+                    response_error_status_code = exc.status_code
                 else:
                     results.append(
                         {
@@ -5838,6 +5840,33 @@ class SignalDeciderExecIntegrationService:
                     expected_reason_code=request_payload['reason_code'],
                     submitted_items=item_links,
                 )
+                if response_error_status_code is None and ack_status != 'revoked':
+                    raise ValueError(
+                        'successful execution revocation response must be revoked'
+                    )
+                if response_error_status_code == 404 and ack_status != 'not_found':
+                    raise ValueError(
+                        'HTTP 404 execution revocation response must be not_found'
+                    )
+                if response_error_status_code == 409 and ack_status not in {
+                    'manual_review_required',
+                    'blocked',
+                }:
+                    raise ValueError(
+                        'HTTP 409 execution revocation response must be '
+                        'manual_review_required or blocked'
+                    )
+                if ack_status == 'blocked':
+                    results.append(
+                        {
+                            'row_id': row.id,
+                            'status': 'blocked',
+                            'reason_code': response_payload['reason_code'],
+                            'retryable': True,
+                            'trigger': trigger,
+                        }
+                    )
+                    continue
                 if ack_status == 'not_found':
                     ack_status = 'manual_review_required'
                 signal_decider_next_open_execution_service.apply_exec_revocation_ack(

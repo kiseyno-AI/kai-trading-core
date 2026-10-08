@@ -397,6 +397,7 @@ class ExecutionHandoffContractTests(unittest.TestCase):
         for reason_code in (
             'persisted_v4_contract_not_proven',
             'revocation_item_binding_mismatch',
+            'revocation_state_mismatch',
         ):
             with self.subTest(reason_code=reason_code):
                 payload = {
@@ -460,6 +461,108 @@ class ExecutionHandoffContractTests(unittest.TestCase):
                                 'current_live_market_evidence_unavailable'
                             ),
                         )
+
+    def test_transient_revocation_exposure_contention_is_a_retryable_blocked_ack(
+        self,
+    ) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': 'exec-plan-v4',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'blocked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'blocked',
+                    'execution_plan_id': 'exec-plan-v4',
+                    'execution_plan_item_id': 'exec-entry',
+                }
+            ],
+            'reason_code': 'revocation_exposure_scope_busy',
+            'revoked_item_count': 0,
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
+        }
+
+        status, _ = validate_execution_revocation_ack(
+            payload,
+            plan_id='plan-v4',
+            submitted_core_item_keys=['entry'],
+            submitted_items=[
+                {
+                    'core_item_key': 'entry',
+                    'side': 'buy',
+                    'intent': 'next_open_buy',
+                    'exec_plan_id': 'exec-plan-v4',
+                    'exec_plan_item_id': 'exec-entry',
+                }
+            ],
+            expected_reason_code='exec_contract_quarantined',
+        )
+
+        self.assertEqual(status, 'blocked')
+
+    def test_execution_plan_not_found_ack_allows_only_absent_remote_plan_identity(
+        self,
+    ) -> None:
+        payload = {
+            'plan_id': 'plan-v4',
+            'execution_plan_id': None,
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'plan-v4',
+                'status': 'not_found',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': 'entry',
+                    'status': 'not_found',
+                    'execution_plan_id': None,
+                    'execution_plan_item_id': 'exec-entry',
+                }
+            ],
+            'reason_code': 'execution_plan_not_found',
+            'revoked_item_count': 0,
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
+        }
+        submitted_items = [
+            {
+                'core_item_key': 'entry',
+                'side': 'buy',
+                'intent': 'next_open_buy',
+                'exec_plan_id': 'exec-plan-v4',
+                'exec_plan_item_id': 'exec-entry',
+            }
+        ]
+
+        status, _ = validate_execution_revocation_ack(
+            payload,
+            plan_id='plan-v4',
+            submitted_core_item_keys=['entry'],
+            submitted_items=submitted_items,
+            expected_reason_code='exec_contract_quarantined',
+        )
+        self.assertEqual(status, 'not_found')
+
+        invalid = copy.deepcopy(payload)
+        invalid['execution_plan_id'] = 'exec-plan-v4'
+        invalid['item_acks'][0]['execution_plan_id'] = 'exec-plan-v4'
+        with self.assertRaisesRegex(ValueError, 'absent plan identity'):
+            validate_execution_revocation_ack(
+                invalid,
+                plan_id='plan-v4',
+                submitted_core_item_keys=['entry'],
+                submitted_items=submitted_items,
+                expected_reason_code='exec_contract_quarantined',
+            )
 
     def test_manual_review_ack_rejects_unknown_outcome_reason(self) -> None:
         payload = {
