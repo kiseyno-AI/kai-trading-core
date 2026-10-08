@@ -6544,6 +6544,7 @@ class PykrxBackfillServiceTests(TestCase):
                     'status': 'partial',
                     'details': {
                         'result_summary': {
+                            'prerequisites': {'ready': True},
                             'progress': {
                                 'summary': {
                                     'run_status': 'partial',
@@ -6565,6 +6566,15 @@ class PykrxBackfillServiceTests(TestCase):
                 'signal_decider_evaluations': {'status': 'blocked'},
             },
         }
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
+        )
+        latest_pipeline_run['stages']['agent_feedback_summaries'][
+            'details'
+        ]['result_summary']['prerequisites']['ready'] = False
+        latest_pipeline_run['run_metadata'][
+            'inherited_feedback_prerequisite_admission'
+        ] = True
         self.assertTrue(
             _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
         )
@@ -6617,6 +6627,73 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['followup_recovery']['max_attempts'], 8)
         resume_followups.assert_not_called()
         run_collection.assert_not_called()
+
+        latest_pipeline_run['updated_at'] = (
+            now - timedelta(minutes=10)
+        ).isoformat()
+        latest_pipeline_run['completed_at'] = (
+            now - timedelta(minutes=10)
+        ).isoformat()
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch.object(
+                service,
+                '_resolve_point_in_time_followup_membership',
+                return_value=({'005930'}, ('KOSPI',)),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 97,
+                },
+            ) as rearmed_followups,
+        ):
+            rearmed = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+                markets=('KOSPI', 'KOSDAQ'),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(rearmed['triggered'])
+        self.assertTrue(
+            rearmed['followup_recovery']['retryable_feedback_rearm']
+        )
+        self.assertTrue(
+            rearmed_followups.call_args.kwargs[
+                'inherit_feedback_prerequisite_admission'
+            ]
+        )
 
         with (
             patch.object(
