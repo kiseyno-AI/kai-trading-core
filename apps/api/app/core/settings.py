@@ -213,6 +213,7 @@ class Settings(BaseSettings):
     dart_api_key: str = ''
     dart_base_url: str = 'https://opendart.fss.or.kr/api'
     dart_corp_code_cache_ttl_seconds: int = 86400
+    dart_corp_code_cache_file: str = '~/.cache/kai-trading/dart/corp-codes.xml'
     dart_sync_recent_days: int = 7
     dart_sync_page_count: int = 100
     dart_fundamentals_min_business_year: int = 2015

@@ -112,6 +112,7 @@ MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
 AUTO_PYKRX_DAILY_RETRY_MIN_INTERVAL_SECONDS = 5 * 60
 MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE = 5
 AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
+AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS = 60 * 60
 AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
 AUTO_EOD_PIPELINE_ENTRYPOINT = 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
 TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
@@ -1024,6 +1025,50 @@ def _parse_activity_datetime(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _is_dart_provider_outage_rearm_candidate(
+    pipeline_run: object,
+) -> bool:
+    """Recognize a DART maintenance failure that should not stay terminal."""
+
+    if not isinstance(pipeline_run, Mapping):
+        return False
+    stages = pipeline_run.get('stages')
+    if not isinstance(stages, Mapping):
+        return False
+    stage = stages.get('fundamentals_daily_refresh')
+    if not isinstance(stage, Mapping):
+        return False
+    if str(stage.get('status') or '').strip().lower() not in {
+        'failed',
+        'partial',
+    }:
+        return False
+    details = stage.get('details')
+    result_summary = (
+        details.get('result_summary')
+        if isinstance(details, Mapping)
+        else None
+    )
+    samples = (
+        result_summary.get('samples')
+        if isinstance(result_summary, Mapping)
+        else None
+    )
+    lookup_errors = (
+        samples.get('lookup_errors')
+        if isinstance(samples, Mapping)
+        else None
+    )
+    if not isinstance(lookup_errors, list):
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and str(item.get('error_type') or '') == 'DartAPIError'
+        and 'DART request failed [800]' in str(item.get('error') or '')
+        for item in lookup_errors
+    )
 
 
 def _feedback_suffix_has_stale_prerequisite_ordering(
@@ -2739,6 +2784,36 @@ class PykrxBackfillService:
             and repair_checkpoint is None
             and _is_terminal_followup_continuation_candidate(pipeline_run)
         )
+        provider_outage_rearm_candidate = bool(
+            recovery_attempts
+            >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+            and _is_dart_provider_outage_rearm_candidate(pipeline_run)
+        )
+        provider_outage_retry_after_seconds: int | None = None
+        provider_outage_rearm_due = False
+        provider_outage_completed_at = _parse_activity_datetime(
+            pipeline_run.get('completed_at')
+            or pipeline_run.get('updated_at')
+        )
+        if (
+            provider_outage_rearm_candidate
+            and provider_outage_completed_at is not None
+        ):
+            provider_outage_elapsed_seconds = max(
+                0.0,
+                (now - provider_outage_completed_at).total_seconds(),
+            )
+            provider_outage_retry_after_seconds = max(
+                0,
+                int(
+                    AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS
+                    - provider_outage_elapsed_seconds
+                ),
+            )
+            provider_outage_rearm_due = (
+                provider_outage_elapsed_seconds
+                >= AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS
+            )
         if (
             recovery_attempts
             >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
@@ -2746,9 +2821,14 @@ class PykrxBackfillService:
             and not terminal_continuation_in_place
             and not cutoff_contract_repair
             and not cutoff_contract_repair_resume
+            and not provider_outage_rearm_due
         ):
             result = build_daily_skip_result(
-                reason='followup_recovery_limit_reached',
+                reason=(
+                    'followup_recovery_provider_backoff'
+                    if provider_outage_rearm_candidate
+                    else 'followup_recovery_limit_reached'
+                ),
                 market_date=market_date,
                 latest_available_trade_date=latest_available_trade_date,
                 existing_run=latest_eod_run,
@@ -2761,6 +2841,17 @@ class PykrxBackfillService:
                 ),
                 'resume_from_stage': incomplete_stages[0],
             }
+            if provider_outage_rearm_candidate:
+                result['followup_recovery'].update(
+                    {
+                        'provider': 'dart',
+                        'provider_status': 'maintenance',
+                        'retry_scheduled': True,
+                        'retry_after_seconds': (
+                            provider_outage_retry_after_seconds
+                        ),
+                    }
+                )
             return result
 
         if pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER:
@@ -3067,13 +3158,18 @@ class PykrxBackfillService:
                     + (1 if repair_checkpoint is not None else 0),
                 )
                 if terminal_continuation_in_place
-                else MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
-                + (
-                    1
-                    if repair_checkpoint is not None
-                    or cutoff_contract_repair
-                    or cutoff_contract_repair_resume
-                    else 0
+                else max(
+                    MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                    + (
+                        1
+                        if repair_checkpoint is not None
+                        or cutoff_contract_repair
+                        or cutoff_contract_repair_resume
+                        else 0
+                    ),
+                    recovery_attempts + 1
+                    if provider_outage_rearm_due
+                    else 0,
                 )
             ),
             'resumed_from_pipeline_run_id': pipeline_run.get('id'),
@@ -3083,6 +3179,17 @@ class PykrxBackfillService:
             'symbols': recovery_symbols,
             'state_convergence': convergence,
         }
+        if provider_outage_rearm_due:
+            recovery_result['followup_recovery'].update(
+                {
+                    'provider_outage_rearm': True,
+                    'provider': 'dart',
+                    'provider_status': 'maintenance',
+                    'retry_interval_seconds': (
+                        AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS
+                    ),
+                }
+            )
         if ordering_repair_stage is not None:
             recovery_result['followup_recovery'][
                 'ordering_repair'

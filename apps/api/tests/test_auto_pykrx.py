@@ -16,12 +16,14 @@ import pandas as pd
 from app.core.settings import Settings
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import (
+    AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS,
     AUTO_FOLLOWUP_RECOVERY_TRIGGER,
     PYKRX_STAGE_SEQUENCE,
     PykrxBackfillService,
     PykrxSymbol,
     _call_pykrx,
     _feedback_suffix_has_stale_prerequisite_ordering,
+    _is_dart_provider_outage_rearm_candidate,
     _is_summary_cutoff_contract_repair_candidate,
     _is_terminal_followup_continuation_candidate,
     _select_summary_cutoff_proof,
@@ -6515,6 +6517,153 @@ class PykrxBackfillServiceTests(TestCase):
         load_repair_checkpoint.assert_not_called()
         resume_followups.assert_not_called()
         run_collection.assert_not_called()
+
+    def test_dart_provider_maintenance_waits_then_rearms_after_recovery_limit(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+
+        def provider_outage_run(*, completed_at: datetime) -> dict:
+            return {
+                'id': 96,
+                'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+                'status': 'blocked',
+                'updated_at': completed_at.isoformat(),
+                'completed_at': completed_at.isoformat(),
+                'run_metadata': {
+                    'resolved_stages': ['fundamentals_daily_refresh'],
+                    'reused_eod_collection_run_id': 7,
+                },
+                'stages': {
+                    'fundamentals_daily_refresh': {
+                        'status': 'partial',
+                        'details': {
+                            'result_summary': {
+                                'samples': {
+                                    'lookup_errors': [
+                                        {
+                                            'error_type': 'DartAPIError',
+                                            'error': (
+                                                'DART request failed [800]: '
+                                                'Maintenance'
+                                            ),
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+
+        latest_eod_run = {
+            'id': 7,
+            'status': 'completed',
+            'symbols_failed': 0,
+            'run_metadata': {'markets': ['KOSPI', 'KOSDAQ']},
+        }
+        recent_run = provider_outage_run(
+            completed_at=datetime.now(timezone.utc) - timedelta(minutes=10)
+        )
+        self.assertTrue(_is_dart_provider_outage_rearm_candidate(recent_run))
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=recent_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=5,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as resume_followups,
+        ):
+            waiting = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI', 'KOSDAQ'),
+            )
+
+        self.assertEqual(
+            waiting['reason'],
+            'followup_recovery_provider_backoff',
+        )
+        self.assertTrue(waiting['followup_recovery']['retry_scheduled'])
+        self.assertGreater(
+            waiting['followup_recovery']['retry_after_seconds'],
+            0,
+        )
+        resume_followups.assert_not_called()
+
+        expired_run = provider_outage_run(
+            completed_at=(
+                datetime.now(timezone.utc)
+                - timedelta(
+                    seconds=(
+                        AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS
+                        + 60
+                    )
+                )
+            )
+        )
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=expired_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=5,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 97,
+                },
+            ) as resume_followups,
+        ):
+            resumed = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI', 'KOSDAQ'),
+            )
+
+        self.assertTrue(resumed['triggered'])
+        self.assertEqual(resumed['followup_recovery']['attempt'], 6)
+        self.assertTrue(
+            resumed['followup_recovery']['provider_outage_rearm']
+        )
+        resume_followups.assert_called_once()
 
     def test_cutoff_contract_block_gets_one_repair_attempt_after_limit(
         self,
