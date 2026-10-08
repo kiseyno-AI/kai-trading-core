@@ -614,6 +614,8 @@ class DailyPipelineStageService:
         point_in_time_recovery: bool = False,
         existing_pipeline_run_id: int | None = None,
         inherit_feedback_prerequisite_admission: bool = False,
+        inherited_feedback_knowledge_cutoff_at: datetime | None = None,
+        inherited_feedback_source_run_id: str | None = None,
         provider_admission_fence_owned: bool = False,
         summary_cutoff_proof: Mapping[str, Any] | None = None,
         summary_cutoff_contract_repair: bool = False,
@@ -696,6 +698,38 @@ class DailyPipelineStageService:
             raise ValueError(
                 'feedback prerequisite admission inheritance requires the '
                 'exact point-in-time automatic feedback suffix retry'
+            )
+        if inherit_feedback_prerequisite_admission:
+            inherited_feedback_source_run_id = str(
+                inherited_feedback_source_run_id or ''
+            ).strip()
+            if not (
+                isinstance(inherited_feedback_knowledge_cutoff_at, datetime)
+                and inherited_feedback_knowledge_cutoff_at.tzinfo is not None
+                and inherited_feedback_knowledge_cutoff_at.utcoffset()
+                is not None
+            ):
+                raise ValueError(
+                    'feedback prerequisite admission inheritance requires '
+                    'an aware parent knowledge cutoff'
+                )
+            if not inherited_feedback_source_run_id:
+                raise ValueError(
+                    'feedback prerequisite admission inheritance requires '
+                    'an exact parent feedback run id'
+                )
+            feedback_knowledge_cutoff_at = (
+                inherited_feedback_knowledge_cutoff_at.astimezone(
+                    timezone.utc
+                )
+            )
+        elif (
+            inherited_feedback_knowledge_cutoff_at is not None
+            or inherited_feedback_source_run_id is not None
+        ):
+            raise ValueError(
+                'inherited feedback knowledge cutoff requires prerequisite '
+                'admission inheritance'
             )
         if (
             existing_pipeline_run_id is None
@@ -1163,6 +1197,17 @@ class DailyPipelineStageService:
                     'bypass_prerequisite_gate': bypass_prerequisite_gate,
                     'inherited_feedback_prerequisite_admission': (
                         inherit_feedback_prerequisite_admission
+                    ),
+                    'inherited_feedback_knowledge_cutoff_at': (
+                        feedback_knowledge_cutoff_at.isoformat()
+                        if inherit_feedback_prerequisite_admission
+                        and feedback_knowledge_cutoff_at is not None
+                        else None
+                    ),
+                    'inherited_feedback_source_run_id': (
+                        inherited_feedback_source_run_id
+                        if inherit_feedback_prerequisite_admission
+                        else None
                     ),
                     'reused_eod_collection_run_id': (
                         int(reused_eod_collection_run_id)
@@ -1700,6 +1745,11 @@ class DailyPipelineStageService:
                             ),
                             feedback_knowledge_cutoff_at=(
                                 feedback_knowledge_cutoff_at
+                            ),
+                            feedback_reuse_parent_run_id=(
+                                inherited_feedback_source_run_id
+                                if inherit_feedback_prerequisite_admission
+                                else None
                             ),
                             feedback_cutoff_resolution=(
                                 feedback_cutoff_resolution
@@ -2868,6 +2918,7 @@ class DailyPipelineStageService:
         feedback_outer_batch_size: int,
         reuse_existing_feedback: bool,
         feedback_knowledge_cutoff_at: datetime | None = None,
+        feedback_reuse_parent_run_id: str | None = None,
         feedback_cutoff_resolution: dict[str, Any] | None = None,
         point_in_time_recovery: bool = False,
         provider_admission_fence_owned: bool = False,
@@ -3226,6 +3277,9 @@ class DailyPipelineStageService:
                     max_cycles=feedback_max_cycles,
                     outer_batch_size=feedback_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
+                    reuse_parent_run_id=(
+                        feedback_reuse_parent_run_id
+                    ),
                     scope_authority=scope_authority,
                     progress_callback=progress_callback,
                 ),

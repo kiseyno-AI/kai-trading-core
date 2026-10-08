@@ -2493,7 +2493,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             },
         }
 
-        def build_snapshot():
+        def build_snapshot(*, reuse_parent_run_id=None):
             with (
                 patch.object(
                     service,
@@ -2521,6 +2521,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                         0,
                         tzinfo=timezone.utc,
                     ),
+                    reuse_parent_run_id=reuse_parent_run_id,
                     knowledge_cutoff_at=cutoff,
                     fs_div='CFS',
                 )
@@ -2549,6 +2550,23 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(
             failed_parent_role_state.boundary_pending_symbols,
             tuple(symbols),
+        )
+
+        exact_parent_snapshot = build_snapshot(
+            reuse_parent_run_id=lease_parent
+        )
+        exact_parent_role_state = exact_parent_snapshot.role_states[role]
+        self.assertEqual(
+            exact_parent_role_state.reused_symbols,
+            (success_symbol,),
+        )
+        self.assertEqual(
+            exact_parent_role_state.completed_symbols,
+            (success_symbol,),
+        )
+        self.assertEqual(
+            exact_parent_role_state.boundary_pending_symbols,
+            (failed_symbol,),
         )
 
         with session_scope() as session:

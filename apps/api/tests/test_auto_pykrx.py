@@ -25,6 +25,7 @@ from app.eod.pykrx_backfill import (
     _feedback_suffix_has_stale_prerequisite_ordering,
     _is_dart_provider_outage_rearm_candidate,
     _is_retryable_feedback_rearm_candidate,
+    _retryable_feedback_rearm_knowledge_cutoff,
     _is_summary_cutoff_contract_repair_candidate,
     _is_terminal_followup_continuation_candidate,
     _select_summary_cutoff_proof,
@@ -6544,11 +6545,13 @@ class PykrxBackfillServiceTests(TestCase):
                     'status': 'partial',
                     'details': {
                         'result_summary': {
+                            'run_id': 'feedback-cycle-test',
                             'prerequisites': {'ready': True},
                             'progress': {
                                 'summary': {
                                     'run_status': 'partial',
                                     'failed_items': 1,
+                                    'completed_cycles': 2,
                                     'role_progress': {
                                         'eod-summarizer': {
                                             'retry_pending_symbols': 1,
@@ -6569,12 +6572,43 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertTrue(
             _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
         )
+        with patch(
+            'app.eod.pykrx_backfill.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value={
+                'run_id': 'feedback-cycle-test',
+                'market_date': '2026-04-03',
+                'status': 'partial',
+                'request_payload': {
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                    'knowledge_cutoff_at': (
+                        '2026-04-03T08:00:00+00:00'
+                    ),
+                },
+            },
+        ) as get_feedback_run:
+            self.assertEqual(
+                _retryable_feedback_rearm_knowledge_cutoff(
+                    latest_pipeline_run,
+                    market_date='2026-04-03',
+                ),
+                datetime(2026, 4, 3, 8, 0, tzinfo=timezone.utc),
+            )
+        get_feedback_run.assert_called_once_with(
+            run_id='feedback-cycle-test'
+        )
         latest_pipeline_run['stages']['agent_feedback_summaries'][
             'details'
         ]['result_summary']['prerequisites']['ready'] = False
         latest_pipeline_run['run_metadata'][
             'inherited_feedback_prerequisite_admission'
         ] = True
+        latest_pipeline_run['run_metadata'][
+            'inherited_feedback_knowledge_cutoff_at'
+        ] = '2026-04-03T08:00:00+00:00'
+        latest_pipeline_run['run_metadata'][
+            'inherited_feedback_source_run_id'
+        ] = 'feedback-cycle-test'
         self.assertTrue(
             _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
         )
@@ -6693,6 +6727,22 @@ class PykrxBackfillServiceTests(TestCase):
             rearmed_followups.call_args.kwargs[
                 'inherit_feedback_prerequisite_admission'
             ]
+        )
+        self.assertEqual(
+            rearmed_followups.call_args.kwargs[
+                'inherited_feedback_knowledge_cutoff_at'
+            ],
+            datetime(2026, 4, 3, 8, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            rearmed_followups.call_args.kwargs[
+                'inherited_feedback_source_run_id'
+            ],
+            'feedback-cycle-test',
+        )
+        self.assertEqual(
+            rearmed_followups.call_args.kwargs['feedback_max_cycles'],
+            3,
         )
 
         with (

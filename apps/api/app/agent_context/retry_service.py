@@ -1589,6 +1589,7 @@ class FeedbackRetryCycleConfig:
     outer_batch_size: int = 20
     reuse_existing: bool = True
     force_recompute: bool = False
+    reuse_parent_run_id: str | None = None
     scope_authority: Mapping[str, Any] | None = None
     progress_callback: Callable[..., Any] | None = None
 
@@ -2227,6 +2228,7 @@ class AgentFeedbackRetryService:
         symbols: Sequence[str],
         current_parent_run_id: str,
         current_parent_started_at: datetime,
+        required_prior_parent_run_id: str | None = None,
     ) -> tuple[
         dict[tuple[str, str], tuple[str, str]],
         dict[str, str | None],
@@ -2452,6 +2454,11 @@ class AgentFeedbackRetryService:
                 continue
             if str(payload.get('mode') or '').strip() != DAILY_RETRY_CYCLE_MODE:
                 continue
+            if (
+                required_prior_parent_run_id is not None
+                and run_id != required_prior_parent_run_id
+            ):
+                continue
 
             failed_parent_scope_keys = failed_scope_keys_for_run(
                 row=row,
@@ -2597,6 +2604,7 @@ class AgentFeedbackRetryService:
         reuse_existing: bool = True,
         parent_run_id: str | None = None,
         parent_started_at: datetime | None = None,
+        reuse_parent_run_id: str | None = None,
         knowledge_cutoff_at: datetime | str | None = None,
         fs_div: str | None = None,
         reuse_static_inputs: FeedbackReuseStaticInputs | None = None,
@@ -2718,6 +2726,7 @@ class AgentFeedbackRetryService:
                 symbols=normalized_symbols,
                 current_parent_run_id=parent_run_id,
                 current_parent_started_at=normalized_parent_started_at,
+                required_prior_parent_run_id=reuse_parent_run_id,
             )
 
         def decision_is_reusable(symbol: str, role: str) -> bool:
@@ -2782,6 +2791,26 @@ class AgentFeedbackRetryService:
             if prior_parent is None:
                 return not failure_shadowed_by_latest_lineage
             prior_parent_run_id, prior_parent_status = prior_parent
+            feedback_run_id = str(
+                (reuse_evidence or {}).get('feedback_run_id') or ''
+            ).strip()
+            prior_child = latest_child_by_parent_key.get(
+                (prior_parent_run_id, symbol, role)
+            )
+            if reuse_parent_run_id is not None:
+                return (
+                    prior_parent_run_id == reuse_parent_run_id
+                    and parent_by_child_run_id.get(feedback_run_id)
+                    == reuse_parent_run_id
+                    and prior_child is not None
+                    and prior_child[0] == feedback_run_id
+                    and prior_child[1]
+                    in {
+                        'completed',
+                        'completed_with_failures',
+                        'partial',
+                    }
+                )
             if prior_parent_status not in {
                 'completed',
                 'completed_with_failures',
@@ -2789,12 +2818,6 @@ class AgentFeedbackRetryService:
                 _LEASE_LOSS_REUSABLE_PARENT_STATUS,
             }:
                 return False
-            feedback_run_id = str(
-                (reuse_evidence or {}).get('feedback_run_id') or ''
-            ).strip()
-            prior_child = latest_child_by_parent_key.get(
-                (prior_parent_run_id, symbol, role)
-            )
             return (
                 parent_by_child_run_id.get(feedback_run_id)
                 == prior_parent_run_id
@@ -3487,18 +3510,30 @@ class AgentFeedbackRetryService:
         )
 
         previous_run = None
+        reuse_parent_run_id = str(
+            getattr(config, 'reuse_parent_run_id', None) or ''
+        ).strip()
         if not bool(force or getattr(config, 'force_recompute', False)):
-            previous_run = agent_context_feedback_run_state_service.find_latest_run(
-                market_date=config.market_date,
-                requested_symbols=(
-                    list(requested_symbols)
-                    if requested_symbols is not None
-                    else None
-                ),
-                requested_roles=list(roles),
-                request_modes=[DAILY_RETRY_CYCLE_MODE],
-                feedback_scope_mode=feedback_scope_mode,
-            )
+            if reuse_parent_run_id:
+                previous_run = (
+                    agent_context_feedback_run_state_service.get_run(
+                        run_id=reuse_parent_run_id
+                    )
+                )
+            else:
+                previous_run = (
+                    agent_context_feedback_run_state_service.find_latest_run(
+                        market_date=config.market_date,
+                        requested_symbols=(
+                            list(requested_symbols)
+                            if requested_symbols is not None
+                            else None
+                        ),
+                        requested_roles=list(roles),
+                        request_modes=[DAILY_RETRY_CYCLE_MODE],
+                        feedback_scope_mode=feedback_scope_mode,
+                    )
+                )
             if not _previous_run_matches_knowledge_cutoff(
                 previous_run,
                 effective_knowledge_cutoff_at,
@@ -3510,6 +3545,32 @@ class AgentFeedbackRetryService:
                 normalized_scope_authority,
             ):
                 previous_run = None
+            if reuse_parent_run_id and isinstance(previous_run, dict):
+                previous_request = (
+                    previous_run.get('request_payload')
+                    if isinstance(
+                        previous_run.get('request_payload'),
+                        dict,
+                    )
+                    else {}
+                )
+                if not (
+                    previous_run.get('market_date') == config.market_date
+                    and str(
+                        previous_run.get('status') or ''
+                    ).strip().lower()
+                    == 'partial'
+                    and str(
+                        previous_request.get('mode') or ''
+                    ).strip()
+                    == DAILY_RETRY_CYCLE_MODE
+                ):
+                    previous_run = None
+            if reuse_parent_run_id and previous_run is None:
+                raise ValueError(
+                    'required feedback reuse parent does not match the '
+                    'requested cutoff, fs_div, or scope authority'
+                )
         request_run_id = (
             f"feedback-cycle-{config.market_date.isoformat()}-"
             f"{uuid4().hex[:10]}"
@@ -3935,6 +3996,9 @@ class AgentFeedbackRetryService:
             else []
         )
         previous_cycle_number, previous_completed_cycles = self._extract_prior_cycle_state(previous_run)
+        required_reuse_parent_run_id = str(
+            getattr(config, 'reuse_parent_run_id', None) or ''
+        ).strip() or None
         request_run_id = request_run_id or (
             f"feedback-cycle-{config.market_date.isoformat()}-"
             f"{uuid4().hex[:10]}"
@@ -3949,6 +4013,7 @@ class AgentFeedbackRetryService:
             reuse_existing=config.reuse_existing,
             parent_run_id=request_run_id,
             parent_started_at=parent_started_at,
+            reuse_parent_run_id=required_reuse_parent_run_id,
             knowledge_cutoff_at=knowledge_cutoff_at,
             fs_div=resolved_fs_div,
             reuse_static_inputs=reuse_static_inputs,
@@ -4146,6 +4211,9 @@ class AgentFeedbackRetryService:
                         reuse_existing=config.reuse_existing,
                         parent_run_id=request_run_id,
                         parent_started_at=parent_started_at,
+                        reuse_parent_run_id=(
+                            required_reuse_parent_run_id
+                        ),
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
                         reuse_static_inputs=reuse_static_inputs,
@@ -4266,6 +4334,9 @@ class AgentFeedbackRetryService:
                                     reuse_existing=config.reuse_existing,
                                     parent_run_id=request_run_id,
                                     parent_started_at=parent_started_at,
+                                    reuse_parent_run_id=(
+                                        required_reuse_parent_run_id
+                                    ),
                                     knowledge_cutoff_at=knowledge_cutoff_at,
                                     fs_div=resolved_fs_div,
                                     reuse_static_inputs=reuse_static_inputs,
@@ -4351,6 +4422,9 @@ class AgentFeedbackRetryService:
                         reuse_existing=config.reuse_existing,
                         parent_run_id=request_run_id,
                         parent_started_at=parent_started_at,
+                        reuse_parent_run_id=(
+                            required_reuse_parent_run_id
+                        ),
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
                         reuse_static_inputs=reuse_static_inputs,
@@ -4426,6 +4500,7 @@ class AgentFeedbackRetryService:
                     reuse_existing=config.reuse_existing,
                     parent_run_id=request_run_id,
                     parent_started_at=parent_started_at,
+                    reuse_parent_run_id=required_reuse_parent_run_id,
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=resolved_fs_div,
                     reuse_static_inputs=reuse_static_inputs,
@@ -4483,6 +4558,7 @@ class AgentFeedbackRetryService:
                 reuse_existing=config.reuse_existing,
                 parent_run_id=request_run_id,
                 parent_started_at=parent_started_at,
+                reuse_parent_run_id=required_reuse_parent_run_id,
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
                 reuse_static_inputs=reuse_static_inputs,
@@ -4580,6 +4656,7 @@ class AgentFeedbackRetryService:
                 reuse_existing=config.reuse_existing,
                 parent_run_id=request_run_id,
                 parent_started_at=parent_started_at,
+                reuse_parent_run_id=required_reuse_parent_run_id,
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
                 reuse_static_inputs=reuse_static_inputs,

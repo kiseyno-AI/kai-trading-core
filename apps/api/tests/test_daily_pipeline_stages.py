@@ -3260,6 +3260,17 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 trigger='auto_eod_followup_resume',
                 point_in_time_recovery=True,
                 inherit_feedback_prerequisite_admission=True,
+                inherited_feedback_knowledge_cutoff_at=datetime(
+                    2026,
+                    4,
+                    14,
+                    8,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                inherited_feedback_source_run_id=(
+                    'feedback-cycle-parent'
+                ),
                 reuse_existing_feedback=True,
                 reused_eod_collection_run_id=7,
             )
@@ -3274,6 +3285,14 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertFalse(call['force'])
         self.assertTrue(call['bypass_prerequisite_gate'])
         self.assertTrue(call['config'].reuse_existing)
+        self.assertEqual(
+            call['config'].reuse_parent_run_id,
+            'feedback-cycle-parent',
+        )
+        self.assertEqual(
+            call['config'].knowledge_cutoff_at,
+            datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc),
+        )
 
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()

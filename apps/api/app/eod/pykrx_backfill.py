@@ -14,6 +14,9 @@ from app.agent_context.derived_contexts import daily_price_context_service
 from app.agent_context.prerequisite_service import (
     FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
 )
+from app.agent_context.run_state_service import (
+    agent_context_feedback_run_state_service,
+)
 from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
@@ -1108,13 +1111,28 @@ def _is_retryable_feedback_rearm_candidate(
         if isinstance(pipeline_run.get('run_metadata'), Mapping)
         else {}
     )
-    if not (
-        isinstance(prerequisites, Mapping)
-        and prerequisites.get('ready') is True
-        or run_metadata.get(
+    inherited_admission = bool(
+        run_metadata.get(
             'inherited_feedback_prerequisite_admission'
         )
         is True
+        and _parse_activity_datetime(
+            run_metadata.get(
+                'inherited_feedback_knowledge_cutoff_at'
+            )
+        )
+        is not None
+        and str(
+            run_metadata.get('inherited_feedback_source_run_id')
+            or ''
+        ).strip()
+    )
+    if not (
+        (
+            isinstance(prerequisites, Mapping)
+            and prerequisites.get('ready') is True
+        )
+        or inherited_admission
     ):
         return False
     summary = (
@@ -1155,6 +1173,134 @@ def _is_retryable_feedback_rearm_candidate(
         and in_progress_items == 0
         and pending_items == 0
     )
+
+
+def _retryable_feedback_rearm_source_run_id(
+    pipeline_run: object,
+) -> str | None:
+    if not isinstance(pipeline_run, Mapping):
+        return None
+    run_metadata = (
+        pipeline_run.get('run_metadata')
+        if isinstance(pipeline_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    inherited_source_run_id = str(
+        run_metadata.get('inherited_feedback_source_run_id') or ''
+    ).strip()
+    if inherited_source_run_id:
+        return inherited_source_run_id
+    stages = pipeline_run.get('stages')
+    stage = (
+        stages.get('agent_feedback_summaries')
+        if isinstance(stages, Mapping)
+        else None
+    )
+    details = stage.get('details') if isinstance(stage, Mapping) else None
+    result_summary = (
+        details.get('result_summary')
+        if isinstance(details, Mapping)
+        else None
+    )
+    source_run_id = str(
+        result_summary.get('run_id')
+        if isinstance(result_summary, Mapping)
+        else ''
+    ).strip()
+    return source_run_id or None
+
+
+def _retryable_feedback_rearm_knowledge_cutoff(
+    pipeline_run: object,
+    *,
+    market_date: str,
+) -> datetime | None:
+    """Resolve the exact cutoff that made the parent feedback reusable."""
+
+    if not _is_retryable_feedback_rearm_candidate(pipeline_run):
+        return None
+    if not isinstance(pipeline_run, Mapping):
+        return None
+    run_metadata = (
+        pipeline_run.get('run_metadata')
+        if isinstance(pipeline_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    inherited_cutoff = _parse_activity_datetime(
+        run_metadata.get('inherited_feedback_knowledge_cutoff_at')
+    )
+    if inherited_cutoff is not None:
+        return inherited_cutoff
+
+    source_run_id = _retryable_feedback_rearm_source_run_id(
+        pipeline_run
+    )
+    if not source_run_id:
+        return None
+    source_run = agent_context_feedback_run_state_service.get_run(
+        run_id=source_run_id
+    )
+    if not isinstance(source_run, Mapping):
+        return None
+    if str(source_run.get('market_date') or '') != market_date:
+        return None
+    if str(source_run.get('status') or '').strip().lower() != 'partial':
+        return None
+    request_payload = source_run.get('request_payload')
+    if not isinstance(request_payload, Mapping):
+        return None
+    if (
+        str(request_payload.get('feedback_scope_mode') or '').strip()
+        != FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+    ):
+        return None
+    return _parse_activity_datetime(
+        request_payload.get('knowledge_cutoff_at')
+    )
+
+
+def _retryable_feedback_rearm_max_cycles(
+    pipeline_run: object,
+) -> int | None:
+    """Permit exactly one cycle beyond the persisted partial parent."""
+
+    if not _is_retryable_feedback_rearm_candidate(pipeline_run):
+        return None
+    if not isinstance(pipeline_run, Mapping):
+        return None
+    stages = pipeline_run.get('stages')
+    stage = (
+        stages.get('agent_feedback_summaries')
+        if isinstance(stages, Mapping)
+        else None
+    )
+    details = stage.get('details') if isinstance(stage, Mapping) else None
+    result_summary = (
+        details.get('result_summary')
+        if isinstance(details, Mapping)
+        else None
+    )
+    progress = (
+        result_summary.get('progress')
+        if isinstance(result_summary, Mapping)
+        else None
+    )
+    summary = (
+        progress.get('summary')
+        if isinstance(progress, Mapping)
+        else None
+    )
+    try:
+        completed_cycles = int(
+            summary.get('completed_cycles')
+            if isinstance(summary, Mapping)
+            else 0
+        )
+    except (TypeError, ValueError):
+        return None
+    if completed_cycles < 1:
+        return None
+    return completed_cycles + 1
 
 
 def _feedback_suffix_has_stale_prerequisite_ordering(
@@ -2885,6 +3031,30 @@ class PykrxBackfillService:
             )
             and _is_retryable_feedback_rearm_candidate(pipeline_run)
         )
+        retryable_feedback_knowledge_cutoff_at = (
+            _retryable_feedback_rearm_knowledge_cutoff(
+                pipeline_run,
+                market_date=market_date,
+            )
+            if retryable_feedback_rearm_candidate
+            else None
+        )
+        retryable_feedback_source_run_id = (
+            _retryable_feedback_rearm_source_run_id(pipeline_run)
+            if retryable_feedback_rearm_candidate
+            else None
+        )
+        retryable_feedback_max_cycles = (
+            _retryable_feedback_rearm_max_cycles(pipeline_run)
+            if retryable_feedback_rearm_candidate
+            else None
+        )
+        retryable_feedback_rearm_candidate = bool(
+            retryable_feedback_rearm_candidate
+            and retryable_feedback_knowledge_cutoff_at is not None
+            and retryable_feedback_source_run_id is not None
+            and retryable_feedback_max_cycles is not None
+        )
         provider_outage_retry_after_seconds: int | None = None
         provider_outage_rearm_due = False
         provider_outage_completed_at = _parse_activity_datetime(
@@ -3143,6 +3313,15 @@ class PykrxBackfillService:
             recovery_kwargs[
                 'inherit_feedback_prerequisite_admission'
             ] = True
+            recovery_kwargs[
+                'inherited_feedback_knowledge_cutoff_at'
+            ] = retryable_feedback_knowledge_cutoff_at
+            recovery_kwargs['inherited_feedback_source_run_id'] = (
+                retryable_feedback_source_run_id
+            )
+            recovery_kwargs['feedback_max_cycles'] = (
+                retryable_feedback_max_cycles
+            )
         if (
             summary_cutoff_proof is not None
             and 'signal_decider' in recovery_stages
