@@ -4174,6 +4174,7 @@ class AgentFeedbackRetryService:
                     dispatch_symbols = list(
                         role_symbol_scopes.get(role, scoped_feedback_symbols)
                         if effective_force_recompute
+                        and active_plan.mode != 'retry_followup'
                         else role_state_before.boundary_pending_symbols
                         if active_plan.mode == 'boundary_resume'
                         else self._retry_symbols_for_role(role_state_before)

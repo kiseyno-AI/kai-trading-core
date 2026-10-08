@@ -5356,7 +5356,8 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                                         roles=roles,
                                         max_cycles=3,
                                         outer_batch_size=20,
-                                        reuse_existing=True,
+                                        reuse_existing=False,
+                                        force_recompute=True,
                                     )
                                 )
 
