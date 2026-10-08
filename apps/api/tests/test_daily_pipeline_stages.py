@@ -3294,6 +3294,73 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc),
         )
 
+    def test_signal_decider_does_not_reuse_summary_parent_lineage(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+        )
+        cutoff = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+
+        with patch(
+            'app.eod.daily_pipeline_stages.'
+            'build_expired_decision_replay_result',
+            return_value=None,
+        ):
+            result = service._execute_stage(
+                stage_id='signal_decider',
+                market_date='2026-04-14',
+                symbols=['005930'],
+                markets=['KOSPI'],
+                force=False,
+                bypass_prerequisite_gate=True,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+                feedback_knowledge_cutoff_at=cutoff,
+                feedback_reuse_parent_run_id=(
+                    'feedback-cycle-summary-parent'
+                ),
+                feedback_cutoff_resolution={
+                    'ready': True,
+                    'knowledge_cutoff_at': cutoff,
+                    'source_run_id': 'feedback-cycle-summary-parent',
+                    'feedback_scope_mode': (
+                        'broad_feedback_universe'
+                    ),
+                    'requested_symbols': ['005930'],
+                    'completed_scope_proof': {
+                        'schema_version': (
+                            'completed_summarizer_intersection_v1'
+                        ),
+                        'completed_symbols': ['005930'],
+                        'admitted_symbols': ['005930'],
+                    },
+                },
+            )
+
+        self.assertTrue(result['completed'])
+        self.assertEqual(len(feedback_retry_service.calls), 1)
+        config = feedback_retry_service.calls[0]['config']
+        self.assertEqual(
+            config.feedback_scope_mode,
+            'decider_scope_fast_path',
+        )
+        self.assertIsNone(config.reuse_parent_run_id)
+
     def test_run_rejects_unknown_stage(self) -> None:
         service = DailyPipelineStageService()
 

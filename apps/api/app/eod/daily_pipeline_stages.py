@@ -3279,6 +3279,8 @@ class DailyPipelineStageService:
                     reuse_existing=reuse_existing_feedback,
                     reuse_parent_run_id=(
                         feedback_reuse_parent_run_id
+                        if stage_id == 'agent_feedback_summaries'
+                        else None
                     ),
                     scope_authority=scope_authority,
                     progress_callback=progress_callback,
