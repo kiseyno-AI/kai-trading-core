@@ -4998,7 +4998,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.submission_payload['revocation']['status'], 'pending')
             self.assertNotIn('revocation_history', row.submission_payload)
 
-    async def test_known_manual_review_reason_persists_terminal_revocation_ack(self) -> None:
+    async def test_revocation_state_mismatch_persists_terminal_manual_review_ack(
+        self,
+    ) -> None:
         await self.service.dispatch_next_open_plan(
             target_trade_date=self.target_trade_date,
             account_reference=self.account_reference,
@@ -5049,18 +5051,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'item_acks': [
                     {
                         **item,
-                        'status': (
-                            'manual_review_required'
-                            if item['core_item_key'].endswith(':next_open_buy')
-                            else 'preserved_protective_exit'
-                        ),
+                        'status': 'manual_review_required',
                     }
                     for item in accepted_response['item_acks']
                 ],
-                'reason_code': 'broker_commit_or_exposure_possible',
+                'reason_code': 'revocation_state_mismatch',
                 'revoked_item_count': 0,
-                'manual_review_item_count': 1,
-                'preserved_item_count': 2,
+                'manual_review_item_count': len(accepted_response['item_acks']),
+                'preserved_item_count': 0,
             }
             raise SignalDeciderExecClientError(
                 'Exec requires manual review',
@@ -5100,7 +5098,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 row.submission_payload['revocation_history'][-1]['response'][
                     'reason_code'
                 ],
-                'broker_commit_or_exposure_possible',
+                'revocation_state_mismatch',
             )
             manual_review_submission = copy.deepcopy(row.submission_payload)
             signal_decider_next_open_execution_service.stage_exec_contract_quarantine_retirement(
@@ -5150,24 +5148,39 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
-        original_revoke = self.client.post_execution_plan_revocation
-
         async def respond_not_found(payload: dict) -> dict:
-            accepted_response = await original_revoke(payload)
-            return {
-                **accepted_response,
+            self.client.revocation_calls.append(payload)
+            not_found_response = {
+                'plan_id': payload['plan_id'],
+                'execution_plan_id': None,
                 'contract_ack': {
-                    **accepted_response['contract_ack'],
+                    'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                    'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                    'capability': EXECUTION_REVOCATION_CAPABILITY,
+                    'plan_id': payload['plan_id'],
                     'status': 'not_found',
                 },
                 'item_acks': [
-                    {**item, 'status': 'not_found'}
-                    for item in accepted_response['item_acks']
+                    {
+                        'core_item_key': item['core_item_key'],
+                        'status': 'not_found',
+                        'execution_plan_id': None,
+                        'execution_plan_item_id': item['execution_plan_item_id'],
+                    }
+                    for item in payload['items']
                 ],
+                'reason_code': 'execution_plan_not_found',
                 'revoked_item_count': 0,
                 'manual_review_item_count': 0,
                 'preserved_item_count': 0,
             }
+            raise SignalDeciderExecClientError(
+                'Execution plan was not found',
+                code='not_found',
+                retryable=False,
+                status_code=404,
+                payload=not_found_response,
+            )
 
         with patch.object(
             self.client,
@@ -5205,6 +5218,244 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 row.submission_payload['revocation_history'][-1]['response']['contract_ack']['status'],
                 'not_found',
+            )
+            self.assertEqual(
+                row.submission_payload['revocation_history'][-1]['response'][
+                    'reason_code'
+                ],
+                'execution_plan_not_found',
+            )
+
+    async def test_revocation_transport_status_must_match_ack_outcome(self) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_revocation_transport_contract',
+        )
+        self.client.post_calls.clear()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            item_links = copy.deepcopy(
+                row.submission_payload['exec_dispatch']['item_links']
+            )
+            signal_decider_next_open_execution_service.stage_exec_contract_quarantine_retirement(
+                row=row,
+                item_links=item_links,
+                quarantine_observed_at='2026-04-30T00:01:00+00:00',
+                trigger='exec_contract_readback',
+                now=datetime(2026, 4, 30, 0, 1, 1, tzinfo=timezone.utc),
+            )
+
+        original_revoke = self.client.post_execution_plan_revocation
+
+        async def respond_success_with_manual_review(payload: dict) -> dict:
+            response = await original_revoke(payload)
+            return {
+                **response,
+                'contract_ack': {
+                    **response['contract_ack'],
+                    'status': 'manual_review_required',
+                },
+                'item_acks': [
+                    {**item, 'status': 'manual_review_required'}
+                    for item in response['item_acks']
+                ],
+                'reason_code': 'revocation_state_mismatch',
+                'revoked_item_count': 0,
+                'manual_review_item_count': len(response['item_acks']),
+            }
+
+        async def respond_error_with_revoked_ack(
+            payload: dict,
+            *,
+            status_code: int,
+        ) -> dict:
+            response = await original_revoke(payload)
+            raise SignalDeciderExecClientError(
+                'Exec transport status conflicts with ACK outcome',
+                code='conflict' if status_code == 409 else 'not_found',
+                retryable=False,
+                status_code=status_code,
+                payload=response,
+            )
+
+        async def respond_404_with_revoked_ack(payload: dict) -> dict:
+            return await respond_error_with_revoked_ack(payload, status_code=404)
+
+        async def respond_409_with_revoked_ack(payload: dict) -> dict:
+            return await respond_error_with_revoked_ack(payload, status_code=409)
+
+        response_cases = (
+            (
+                'successful manual-review ACK',
+                respond_success_with_manual_review,
+                'successful execution revocation response must be revoked',
+            ),
+            (
+                '404 revoked ACK',
+                respond_404_with_revoked_ack,
+                'HTTP 404 execution revocation response must be not_found',
+            ),
+            (
+                '409 revoked ACK',
+                respond_409_with_revoked_ack,
+                'HTTP 409 execution revocation response must be',
+            ),
+        )
+        for label, response_side_effect, expected_error in response_cases:
+            with self.subTest(case=label), patch.object(
+                self.client,
+                'post_execution_plan_revocation',
+                side_effect=response_side_effect,
+            ):
+                result = await self.service._flush_pending_exec_revocations(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                    integration=self.service.integration_status(),
+                    trigger='test_revocation_transport_contract',
+                )
+
+            self.assertEqual(result[0]['status'], 'contract_error')
+            self.assertIn(expected_error, result[0]['error']['message'])
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+                self.assertEqual(
+                    row.execution_status,
+                    EXECUTION_STATUS_REVOCATION_PENDING,
+                )
+                self.assertEqual(
+                    row.submission_payload['revocation']['status'],
+                    'pending',
+                )
+                self.assertNotIn('revocation_history', row.submission_payload)
+
+        self.assertEqual(len(self.client.revocation_calls), 3)
+        self.assertEqual(
+            self.client.revocation_calls,
+            [self.client.revocation_calls[0]] * 3,
+        )
+
+    async def test_transient_revocation_exposure_scope_busy_keeps_exact_retry_pending(
+        self,
+    ) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            refresh_plan=False,
+            force=True,
+            trigger='seed_quarantine_revocation_retry',
+        )
+        self.client.post_calls.clear()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            item_links = copy.deepcopy(
+                row.submission_payload['exec_dispatch']['item_links']
+            )
+            execution_plan_id = item_links[0]['exec_plan_id']
+            signal_decider_next_open_execution_service.stage_exec_contract_quarantine_retirement(
+                row=row,
+                item_links=item_links,
+                quarantine_observed_at='2026-04-30T00:01:00+00:00',
+                trigger='exec_contract_readback',
+                now=datetime(2026, 4, 30, 0, 1, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(
+                row.execution_status,
+                EXECUTION_STATUS_REVOCATION_PENDING,
+            )
+
+        async def respond_scope_busy(payload: dict) -> dict:
+            self.client.revocation_calls.append(payload)
+            blocked_response = {
+                'plan_id': payload['plan_id'],
+                'execution_plan_id': execution_plan_id,
+                'contract_ack': {
+                    'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                    'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                    'capability': EXECUTION_REVOCATION_CAPABILITY,
+                    'plan_id': payload['plan_id'],
+                    'status': 'blocked',
+                },
+                'item_acks': [
+                    {
+                        'core_item_key': item['core_item_key'],
+                        'status': 'blocked',
+                        'execution_plan_id': execution_plan_id,
+                        'execution_plan_item_id': item['execution_plan_item_id'],
+                    }
+                    for item in payload['items']
+                ],
+                'reason_code': 'revocation_exposure_scope_busy',
+                'revoked_item_count': 0,
+                'manual_review_item_count': 0,
+                'preserved_item_count': 0,
+            }
+            raise SignalDeciderExecClientError(
+                'Execution exposure scope is busy',
+                code='conflict',
+                retryable=True,
+                status_code=409,
+                payload=blocked_response,
+            )
+
+        with patch.object(
+            self.client,
+            'post_execution_plan_revocation',
+            side_effect=respond_scope_busy,
+        ):
+            blocked = await self.service._flush_pending_exec_revocations(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                integration=self.service.integration_status(),
+                trigger='test_revocation_exposure_scope_busy',
+            )
+
+        self.assertEqual(
+            blocked,
+            [
+                {
+                    'row_id': self.plan_item_id,
+                    'status': 'blocked',
+                    'reason_code': 'revocation_exposure_scope_busy',
+                    'retryable': True,
+                    'trigger': 'test_revocation_exposure_scope_busy',
+                }
+            ],
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(
+                row.execution_status,
+                EXECUTION_STATUS_REVOCATION_PENDING,
+            )
+            self.assertEqual(row.submission_payload['revocation']['status'], 'pending')
+            self.assertNotIn('revocation_history', row.submission_payload)
+
+        retried = await self.service._flush_pending_exec_revocations(
+            target_trade_date=self.target_trade_date,
+            account_reference=self.account_reference,
+            integration=self.service.integration_status(),
+            trigger='test_quarantine_revocation_retry',
+        )
+
+        self.assertEqual(retried[0]['status'], 'revoked')
+        self.assertEqual(len(self.client.revocation_calls), 2)
+        self.assertEqual(
+            self.client.revocation_calls[0],
+            self.client.revocation_calls[1],
+        )
+        self.assertEqual(
+            self.client.revocation_calls[1]['reason_code'],
+            'exec_contract_quarantined',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(
+                row.submission_payload['revocation_history'][-1]['request'],
+                self.client.revocation_calls[1],
             )
 
     async def test_dispatch_persistence_never_overwrites_newer_revocation_state(self) -> None:
