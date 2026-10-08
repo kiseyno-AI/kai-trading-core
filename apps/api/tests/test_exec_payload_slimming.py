@@ -714,6 +714,120 @@ def test_pending_revocation_and_recovery_evidence_precede_optional_diagnostics()
     assert result.payload['dispatch_reconciliation']['error']['retryable'] is True
 
 
+def test_acknowledged_revocation_proof_survives_repeated_oversized_slimming() -> None:
+    item_links = [
+        {
+            'core_item_key': f'candidate:{intent}',
+            'intent': intent,
+            'side': 'buy' if intent == 'next_open_buy' else 'sell',
+            'exec_plan_id': 'exec-plan-uuid',
+            'exec_plan_item_id': f'exec-item-{index}',
+        }
+        for index, intent in enumerate(
+            ('next_open_buy', 'target_sell', 'stop_sell'),
+            start=1,
+        )
+    ]
+    request = {
+        'schema_version': 'execution_plan_revocation_v1',
+        'contract_version': 'execution_handoff_contract_v4',
+        'required_capability': 'execution_plan_revocation_v1',
+        'plan_id': 'core-plan-id',
+        'requested_at': '2026-10-08T00:00:00+00:00',
+        'reason_code': 'exec_contract_quarantined',
+        'replacement_decision_snapshot_id': 'quarantine:core-plan-id',
+        'replacement_action': 'reject',
+        'items': [
+            {
+                'core_item_key': item['core_item_key'],
+                'execution_plan_item_id': item['exec_plan_item_id'],
+                'decision_snapshot_id': '1234',
+            }
+            for item in item_links
+        ],
+    }
+    response = {
+        'plan_id': 'core-plan-id',
+        'execution_plan_id': 'exec-plan-uuid',
+        'contract_ack': {
+            'schema_version': 'execution_plan_revocation_v1',
+            'contract_version': 'execution_handoff_contract_v4',
+            'capability': 'execution_plan_revocation_v1',
+            'plan_id': 'core-plan-id',
+            'status': 'revoked',
+        },
+        'item_acks': [
+            {
+                'core_item_key': item['core_item_key'],
+                'status': 'revoked',
+                'execution_plan_id': item['exec_plan_id'],
+                'execution_plan_item_id': item['exec_plan_item_id'],
+            }
+            for item in item_links
+        ],
+        'reason_code': 'exec_contract_quarantined',
+        'revoked_item_count': 3,
+        'manual_review_item_count': 0,
+        'preserved_item_count': 0,
+    }
+    payload = {
+        'mode': 'exec_dispatch',
+        'exec_dispatch': {
+            'plan_id': 'core-plan-id',
+            'dispatch_status': 'accepted',
+            'item_links': item_links,
+            'last_request_summary': {'diagnostic_blob': 'x' * 22_000},
+        },
+        'revocation': {
+            'schema_version': 'core_execution_revocation_state_v1',
+            'status': 'acknowledged',
+            'ack_status': 'revoked',
+            'reason_code': 'exec_contract_quarantined',
+            'plan_id': 'core-plan-id',
+            'requested_at': '2026-10-08T00:00:00+00:00',
+            'acknowledged_at': '2026-10-08T00:01:00+00:00',
+            'prior_decision_snapshot_id': '1234',
+            'replacement_decision_snapshot_id': 'quarantine:core-plan-id',
+            'replacement_action': 'reject',
+            'replacement_actionable': False,
+            'item_links': item_links,
+        },
+        'revocation_history': [
+            {
+                'acknowledged_at': '2026-10-08T00:01:00+00:00',
+                'request': request,
+                'response': response,
+            }
+        ],
+    }
+
+    for iteration in range(2):
+        result = slim_signal_decider_exec_submission_payload(payload)
+
+        assert result.payload is not None
+        if iteration == 0:
+            assert result.truncated is True
+        assert json_size_bytes(result.payload) <= SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES
+        assert result.payload['revocation']['status'] == 'acknowledged'
+        assert result.payload['revocation']['ack_status'] == 'revoked'
+        assert result.payload['revocation']['requested_at'] == request['requested_at']
+        assert result.payload['revocation']['acknowledged_at'] == (
+            '2026-10-08T00:01:00+00:00'
+        )
+        assert result.payload['revocation']['prior_decision_snapshot_id'] == '1234'
+        assert result.payload['revocation']['replacement_action'] == 'reject'
+        assert result.payload['revocation']['replacement_actionable'] is False
+        assert result.payload['revocation']['item_links'] == item_links
+        ack_record = result.payload['revocation_history'][-1]
+        assert ack_record['request'] == request
+        assert ack_record['response']['contract_ack'] == response['contract_ack']
+        assert ack_record['response']['item_acks'] == response['item_acks']
+        assert ack_record['response']['revoked_item_count'] == 3
+        assert ack_record['response']['manual_review_item_count'] == 0
+        assert ack_record['response']['preserved_item_count'] == 0
+        payload = result.payload
+
+
 def test_pending_activation_exact_replay_evidence_is_non_evictable() -> None:
     item_links = [
         {

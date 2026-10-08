@@ -875,6 +875,7 @@ def _compact_revocation_record(value: Any) -> dict[str, Any] | None:
         (
             'schema_version',
             'status',
+            'ack_status',
             'reason_code',
             'requested_at',
             'acknowledged_at',
@@ -904,10 +905,13 @@ def _compact_revocation_record(value: Any) -> dict[str, Any] | None:
             request,
             (
                 'schema_version',
+                'contract_version',
+                'required_capability',
                 'plan_id',
                 'reason_code',
                 'replacement_decision_snapshot_id',
                 'replacement_observation_id',
+                'replacement_action',
                 'requested_at',
             ),
         )
@@ -928,6 +932,10 @@ def _compact_revocation_record(value: Any) -> dict[str, Any] | None:
                 'accepted_count',
                 'rejected_count',
                 'revoked_count',
+                'revoked_item_count',
+                'manual_review_item_count',
+                'preserved_item_count',
+                'idempotent_replay',
             ),
         )
         if isinstance(response.get('item_acks'), list):
@@ -1191,14 +1199,34 @@ def slim_signal_decider_exec_submission_payload(
                     else raw_lifecycle_evidence
                 )
             )
-    active_revocation = None
+    critical_revocation = None
+    critical_revocation_history = None
     raw_revocation = raw_lifecycle_payload.get('revocation')
-    if (
-        isinstance(raw_revocation, dict)
-        and _normalize_text(raw_revocation.get('status'), lowercase=True)
-        == 'pending'
-    ):
-        active_revocation = _compact_revocation_record(raw_revocation)
+    if isinstance(raw_revocation, dict):
+        revocation_status = _normalize_text(
+            raw_revocation.get('status'), lowercase=True
+        )
+        revocation_ack_status = _normalize_text(
+            raw_revocation.get('ack_status'), lowercase=True
+        )
+        if revocation_status == 'pending' or (
+            revocation_status == 'acknowledged'
+            and revocation_ack_status == 'revoked'
+        ):
+            critical_revocation = _compact_revocation_record(raw_revocation)
+        if (
+            revocation_status == 'acknowledged'
+            and revocation_ack_status == 'revoked'
+        ):
+            raw_revocation_history = raw_lifecycle_payload.get(
+                'revocation_history'
+            )
+            if isinstance(raw_revocation_history, list) and raw_revocation_history:
+                latest_revocation_ack = _compact_revocation_record(
+                    raw_revocation_history[-1]
+                )
+                if latest_revocation_ack is not None:
+                    critical_revocation_history = [latest_revocation_ack]
     reconciliation = _compact_dispatch_reconciliation(
         raw_lifecycle_payload.get('dispatch_reconciliation')
     )
@@ -1207,14 +1235,16 @@ def slim_signal_decider_exec_submission_payload(
         'mode': payload.get('mode') or 'exec_dispatch',
         'exec_dispatch': critical_exec,
     }
-    if active_revocation is not None:
-        slimmed_payload['revocation'] = active_revocation
+    if critical_revocation is not None:
+        slimmed_payload['revocation'] = critical_revocation
+    if critical_revocation_history is not None:
+        slimmed_payload['revocation_history'] = critical_revocation_history
     if reconciliation is not None:
         slimmed_payload['dispatch_reconciliation'] = reconciliation
     latest = _shallow_slim(payload.get('latest'))
     if json_size_bytes(slimmed_payload) > max_bytes:
         raise ValueError(
-            'active exec dispatch, activation replay, or lifecycle recovery proof '
+            'active exec dispatch, activation replay, or lifecycle terminal proof '
             f'exceeds the submission payload budget ({max_bytes} bytes)'
         )
 
@@ -1247,7 +1277,7 @@ def slim_signal_decider_exec_submission_payload(
                 max_bytes=max_bytes,
             )
         revocation = _compact_revocation_record(raw_lifecycle_payload.get('revocation'))
-        if revocation and active_revocation is None:
+        if revocation and critical_revocation is None:
             _with_field_if_fits(
                 slimmed_payload,
                 'revocation',

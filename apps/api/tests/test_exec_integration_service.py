@@ -80,6 +80,7 @@ from app.orders.exec_payload_slimming import (
     SIGNAL_DECIDER_EXEC_SUBMISSION_MAX_BYTES,
     cleanup_signal_decider_exec_submission_payloads,
     json_size_bytes,
+    slim_signal_decider_exec_submission_payload,
 )
 from app.orders.next_open_execution import (
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
@@ -2309,6 +2310,372 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
                 'watch_sizing_pending': 1,
             },
         )
+
+    def _acknowledged_revocation_readback(
+        self,
+        *,
+        execution_status: str,
+    ) -> tuple[SimpleNamespace, list[dict], dict]:
+        bindings = (
+            ('candidate:next_open_buy', 'next_open_buy', 'entry-item'),
+            ('candidate:target_sell', 'target_sell', 'target-item'),
+            ('candidate:stop_sell', 'stop_sell', 'stop-item'),
+        )
+        revocation_links = [
+            {
+                'core_item_key': core_item_key,
+                'intent': intent,
+                'side': 'buy' if intent == 'next_open_buy' else 'sell',
+                'exec_plan_id': 'exec-plan-uuid',
+                'exec_plan_item_id': item_id,
+            }
+            for core_item_key, intent, item_id in bindings
+        ]
+        request_payload = {
+            'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+            'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+            'required_capability': EXECUTION_REVOCATION_CAPABILITY,
+            'plan_id': 'core-plan-id',
+            'requested_at': '2026-10-08T00:00:00+00:00',
+            'reason_code': 'exec_contract_quarantined',
+            'replacement_decision_snapshot_id': 'quarantine:core-plan-id',
+            'replacement_action': 'reject',
+            'items': [
+                {
+                    'core_item_key': link['core_item_key'],
+                    'execution_plan_item_id': link['exec_plan_item_id'],
+                    'decision_snapshot_id': '1234',
+                }
+                for link in revocation_links
+            ],
+        }
+        response_payload = {
+            'plan_id': 'core-plan-id',
+            'execution_plan_id': 'exec-plan-uuid',
+            'contract_ack': {
+                'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
+                'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+                'capability': EXECUTION_REVOCATION_CAPABILITY,
+                'plan_id': 'core-plan-id',
+                'status': 'revoked',
+            },
+            'item_acks': [
+                {
+                    'core_item_key': link['core_item_key'],
+                    'status': 'revoked',
+                    'execution_plan_id': link['exec_plan_id'],
+                    'execution_plan_item_id': link['exec_plan_item_id'],
+                }
+                for link in revocation_links
+            ],
+            'reason_code': 'exec_contract_quarantined',
+            'revoked_item_count': len(revocation_links),
+            'manual_review_item_count': 0,
+            'preserved_item_count': 0,
+        }
+        item_links = [
+            {
+                **link,
+                'remote_status': 'revoked',
+                'remote_status_source': 'exec_item_state',
+                'current_state': {
+                    'core_item_key': link['core_item_key'],
+                    'execution_plan_id': link['exec_plan_id'],
+                    'execution_plan_item_id': link['exec_plan_item_id'],
+                    'status': 'revoked',
+                    'terminal': True,
+                },
+            }
+            for link in revocation_links
+        ]
+        row = SimpleNamespace(
+            symbol='005930',
+            eligibility_status='blocked',
+            execution_status=execution_status,
+            submission_payload={
+                'revocation': {
+                    'schema_version': 'core_execution_revocation_state_v1',
+                    'status': 'acknowledged',
+                    'ack_status': 'revoked',
+                    'plan_id': 'core-plan-id',
+                    'reason_code': 'exec_contract_quarantined',
+                    'requested_at': '2026-10-08T00:00:00+00:00',
+                    'acknowledged_at': '2026-10-08T00:01:00+00:00',
+                    'prior_decision_snapshot_id': '1234',
+                    'replacement_decision_snapshot_id': 'quarantine:core-plan-id',
+                    'replacement_action': 'reject',
+                    'replacement_actionable': False,
+                    'item_links': copy.deepcopy(revocation_links),
+                },
+                'revocation_history': [
+                    {
+                        'acknowledged_at': '2026-10-08T00:01:00+00:00',
+                        'request': request_payload,
+                        'response': response_payload,
+                    }
+                ],
+            },
+            validation_payload={
+                'blocking_reasons': [
+                    {
+                        'code': 'exec_contract_quarantined',
+                        'message': 'The accepted Exec plan was quarantined.',
+                    }
+                ],
+            },
+            traceability_payload={
+                'handoff_active': False,
+                'exec_monitoring_active': False,
+                'exec_agent_approved': False,
+                'approval_state': 'rejected',
+            },
+        )
+        derived_state = self.service._derive_remote_state(
+            row=row,
+            item_links=item_links,
+            orders=[],
+            executions=[],
+            positions=[],
+            endpoint_statuses={
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'ok',
+                'positions': 'ok',
+            },
+        )
+        return row, item_links, derived_state
+
+    def test_acknowledged_revocation_remains_revoked_on_repeated_readback(
+        self,
+    ) -> None:
+        row, item_links, derived_state = self._acknowledged_revocation_readback(
+            execution_status='revoked',
+        )
+        row.submission_payload = {
+            **row.submission_payload,
+            'mode': 'exec_dispatch',
+            'exec_dispatch': {
+                'plan_id': 'core-plan-id',
+                'dispatch_status': 'accepted',
+                'item_links': copy.deepcopy(item_links),
+                'last_request_summary': {
+                    'diagnostic_blob': 'x' * 22_000,
+                },
+            },
+        }
+
+        for trigger in ('first_readback', 'second_readback'):
+            slimmed = slim_signal_decider_exec_submission_payload(
+                row.submission_payload
+            )
+            self.assertIsNotNone(slimmed.payload)
+            row.submission_payload = slimmed.payload
+            audit = self.service._sync_exec_terminal_state(
+                row=row,
+                item_links=item_links,
+                derived_state=derived_state,
+                now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                trigger=trigger,
+            )
+
+            self.assertIsNotNone(audit)
+            self.assertEqual(audit['core_state_after']['execution_status'], 'revoked')
+            self.assertTrue(audit['acknowledged_revocation_stable'])
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertEqual(row.execution_status, 'revoked')
+            self.assertEqual(
+                [
+                    reason['code']
+                    for reason in row.validation_payload['blocking_reasons']
+                ],
+                ['exec_contract_quarantined'],
+            )
+
+    def test_acknowledged_revocation_self_heals_legacy_submit_failed_state(
+        self,
+    ) -> None:
+        row, item_links, derived_state = self._acknowledged_revocation_readback(
+            execution_status=EXECUTION_STATUS_SUBMIT_FAILED,
+        )
+
+        audit = self.service._sync_exec_terminal_state(
+            row=row,
+            item_links=item_links,
+            derived_state=derived_state,
+            now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+            trigger='legacy_submit_failed_readback',
+        )
+
+        self.assertIsNotNone(audit)
+        self.assertEqual(
+            audit['core_state_before']['execution_status'],
+            EXECUTION_STATUS_SUBMIT_FAILED,
+        )
+        self.assertEqual(audit['core_state_after']['execution_status'], 'revoked')
+        self.assertTrue(audit['acknowledged_revocation_stable'])
+        self.assertEqual(row.execution_status, 'revoked')
+
+    def test_revocation_readback_requires_exact_complete_acknowledged_evidence(
+        self,
+    ) -> None:
+        mutations = {
+            'unacknowledged': lambda row, _links, _state: row.submission_payload[
+                'revocation'
+            ].update(status='pending'),
+            'non_revoked_ack': lambda row, _links, _state: row.submission_payload[
+                'revocation'
+            ].update(ack_status='manual_review_required'),
+            'unknown_state_schema': lambda row, _links, _state: (
+                row.submission_payload['revocation'].update(
+                    schema_version='unknown_revocation_state_v1'
+                )
+            ),
+            'replacement_action_mismatch': lambda row, _links, _state: (
+                row.submission_payload['revocation'].update(
+                    replacement_action='buy'
+                )
+            ),
+            'replacement_still_actionable': lambda row, _links, _state: (
+                row.submission_payload['revocation'].update(
+                    replacement_actionable=True
+                )
+            ),
+            'request_time_mismatch': lambda row, _links, _state: (
+                row.submission_payload['revocation_history'][0][
+                    'request'
+                ].update(requested_at='2026-10-08T00:00:01+00:00')
+            ),
+            'request_snapshot_mismatch': lambda row, _links, _state: (
+                row.submission_payload['revocation_history'][0]['request'][
+                    'items'
+                ][0].update(decision_snapshot_id='different-snapshot')
+            ),
+            'identity_mismatch': lambda row, _links, _state: row.submission_payload[
+                'revocation'
+            ]['item_links'][0].update(exec_plan_item_id='different-item'),
+            'malformed_expected_link': lambda row, _links, _state: (
+                row.submission_payload['revocation']['item_links'].append(None)
+            ),
+            'malformed_observed_link': lambda _row, links, _state: (
+                links.append(None)
+            ),
+            'ack_history_mismatch': lambda row, _links, _state: row.submission_payload[
+                'revocation_history'
+            ][0]['response']['item_acks'][0].update(
+                execution_plan_item_id='different-item'
+            ),
+            'unknown_reason': lambda row, _links, _state: (
+                row.submission_payload['revocation'].update(
+                    reason_code='unknown_reason'
+                ),
+                row.submission_payload['revocation_history'][0][
+                    'request'
+                ].update(reason_code='unknown_reason'),
+                row.submission_payload['revocation_history'][0][
+                    'response'
+                ].update(reason_code='unknown_reason'),
+            ),
+            'malformed_latest_ack': lambda row, _links, _state: (
+                row.submission_payload['revocation_history'].append(None)
+            ),
+            'remote_identity_mismatch': lambda _row, links, _state: links[0][
+                'current_state'
+            ].update(execution_plan_item_id='different-item'),
+            'partial_remote_state': lambda _row, links, state: (
+                links[-1]['current_state'].update(status='not_applicable'),
+                state['plan_item_status_counts'].update(
+                    {'revoked': 2, 'not_applicable': 1}
+                ),
+            ),
+            'exposure_unknown': lambda _row, _links, state: state.update(
+                scoped_position_exposure_quantity=None
+            ),
+        }
+
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                row, item_links, derived_state = (
+                    self._acknowledged_revocation_readback(
+                        execution_status=EXECUTION_STATUS_SUBMIT_FAILED,
+                    )
+                )
+                mutate(row, item_links, derived_state)
+
+                audit = self.service._sync_exec_terminal_state(
+                    row=row,
+                    item_links=item_links,
+                    derived_state=derived_state,
+                    now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                    trigger=f'incomplete_revocation:{name}',
+                )
+
+                self.assertIsNotNone(audit)
+                self.assertNotIn('acknowledged_revocation_stable', audit)
+                self.assertEqual(
+                    row.execution_status,
+                    EXECUTION_STATUS_SUBMIT_FAILED,
+                )
+
+    def test_revocation_readback_rejects_unknown_order_or_execution_evidence(
+        self,
+    ) -> None:
+        cases = {
+            'order_without_status': {
+                'orders': [
+                    {
+                        'execution_plan_item_id': 'entry-item',
+                        'symbol': '005930',
+                        'side': 'buy',
+                    }
+                ],
+                'executions': [],
+            },
+            'execution_without_quantity': {
+                'orders': [],
+                'executions': [
+                    {
+                        'execution_plan_item_id': 'entry-item',
+                        'symbol': '005930',
+                        'side': 'buy',
+                        'quantity': 'unknown',
+                    }
+                ],
+            },
+        }
+
+        for name, evidence in cases.items():
+            with self.subTest(name=name):
+                row, item_links, _ = self._acknowledged_revocation_readback(
+                    execution_status=EXECUTION_STATUS_SUBMIT_FAILED,
+                )
+                derived_state = self.service._derive_remote_state(
+                    row=row,
+                    item_links=item_links,
+                    orders=evidence['orders'],
+                    executions=evidence['executions'],
+                    positions=[],
+                    endpoint_statuses={
+                        'plans': 'ok',
+                        'orders': 'ok',
+                        'executions': 'ok',
+                        'positions': 'ok',
+                    },
+                )
+
+                audit = self.service._sync_exec_terminal_state(
+                    row=row,
+                    item_links=item_links,
+                    derived_state=derived_state,
+                    now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                    trigger=f'unknown_evidence:{name}',
+                )
+
+                self.assertIsNotNone(audit)
+                self.assertNotIn('acknowledged_revocation_stable', audit)
+                self.assertEqual(
+                    row.execution_status,
+                    EXECUTION_STATUS_SUBMIT_FAILED,
+                )
 
     def test_v4_completed_no_trade_family_uses_entry_reason_and_becomes_terminal(
         self,
