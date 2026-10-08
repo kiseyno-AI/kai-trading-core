@@ -552,6 +552,7 @@ class ExecutionRevocationPayload(_ContractModel):
         'execution_control_disabled',
         'current_live_market_risk_off',
         'current_live_market_evidence_unavailable',
+        'exec_contract_quarantined',
     ]
     replacement_decision_snapshot_id: str
     replacement_action: Literal[

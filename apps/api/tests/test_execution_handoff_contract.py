@@ -55,7 +55,7 @@ class ExecutionHandoffContractTests(unittest.TestCase):
 
         self.assertEqual(payload['reason_code'], 'current_live_market_risk_off')
 
-    def test_live_market_evidence_unavailable_is_a_valid_execution_revocation_reason(self) -> None:
+    def test_transient_fail_closed_states_are_valid_execution_revocation_reasons(self) -> None:
         payload = serialize_execution_revocation_payload(
             {
                 'schema_version': EXECUTION_REVOCATION_SCHEMA_VERSION,
@@ -79,6 +79,14 @@ class ExecutionHandoffContractTests(unittest.TestCase):
         self.assertEqual(
             payload['reason_code'],
             'current_live_market_evidence_unavailable',
+        )
+        payload['reason_code'] = 'exec_contract_quarantined'
+        payload['replacement_decision_snapshot_id'] = (
+            'observation:exec_contract_quarantined:1'
+        )
+        self.assertEqual(
+            serialize_execution_revocation_payload(payload)['reason_code'],
+            'exec_contract_quarantined',
         )
 
     def test_revoked_ack_allows_only_protective_exits_to_remain_active(self) -> None:

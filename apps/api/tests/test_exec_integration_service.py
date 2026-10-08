@@ -83,6 +83,8 @@ from app.orders.exec_payload_slimming import (
 )
 from app.orders.next_open_execution import (
     EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+    EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
+    EXECUTION_STATUS_REVOCATION_PENDING,
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
     NextOpenAccountTarget,
@@ -5100,6 +5102,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 'broker_commit_or_exposure_possible',
             )
+            manual_review_submission = copy.deepcopy(row.submission_payload)
+            signal_decider_next_open_execution_service.stage_exec_contract_quarantine_retirement(
+                row=row,
+                item_links=[row.submission_payload['exec_dispatch']['item_links'][0]],
+                quarantine_observed_at='2026-04-30T00:01:00+00:00',
+                trigger='repeated_exec_readback',
+                now=datetime(2026, 4, 30, 0, 1, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(row.execution_status, 'revocation_manual_review')
+            self.assertEqual(row.submission_payload, manual_review_submission)
 
     async def test_revocation_not_found_ack_enters_manual_review_and_blocks_replacement(self) -> None:
         await self.service.dispatch_next_open_plan(
@@ -10734,6 +10746,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'plan_id': plan_id,
                     'execution_plan_id': item_links[0]['exec_plan_id'],
                     'status': 'contract_quarantined',
+                    'updated_at': '2026-04-30T00:00:00+00:00',
                     'reason_code': 'execution_contract_identity_invalid',
                     'reason': 'The accepted handoff was quarantined before execution.',
                     'item_acks': [
@@ -10767,7 +10780,22 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
-            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMIT_FAILED)
+            self.assertEqual(
+                row.execution_status,
+                EXECUTION_STATUS_REVOCATION_PENDING,
+            )
+            self.assertEqual(row.eligibility_status, 'blocked')
+            self.assertIn('exec_dispatch', row.submission_payload)
+            self.assertEqual(
+                row.submission_payload['revocation']['reason_code'],
+                'exec_contract_quarantined',
+            )
+            self.assertEqual(
+                row.submission_payload['revocation'][
+                    'quarantine_observed_at'
+                ],
+                '2026-04-30T00:00:00+00:00',
+            )
             current_states = [
                 link.get('current_state')
                 for link in row.submission_payload['exec_dispatch']['item_links']
@@ -10784,6 +10812,109 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertTrue(_row_has_accepted_exec_dispatch(row))
+
+    async def test_contract_quarantine_retirement_requires_exact_timestamp_and_zero_exposure(
+        self,
+    ) -> None:
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='seed_quarantine_evidence',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            item_links = copy.deepcopy(
+                row.submission_payload['exec_dispatch']['item_links']
+            )
+            for link in item_links:
+                link['current_state'] = {
+                    'core_item_key': link['core_item_key'],
+                    'execution_plan_id': link['exec_plan_id'],
+                    'execution_plan_item_id': link['exec_plan_item_id'],
+                    'status': 'contract_quarantined',
+                    'terminal': True,
+                }
+            zero_exposure = {
+                'endpoint_statuses': {
+                    endpoint: 'ok'
+                    for endpoint in (
+                        'plans',
+                        'orders',
+                        'executions',
+                        'positions',
+                    )
+                },
+                'has_plan_attributed_fill_evidence': False,
+                'open_quantity': '0',
+                'scoped_position_exposure_quantity': '0',
+            }
+
+            evidence = lambda state: (
+                self.service._contract_quarantine_retirement_evidence(
+                    row=row,
+                    item_links=item_links,
+                    derived_state=state,
+                )
+            )
+            self.assertIsNone(evidence(zero_exposure))
+            item_links[0]['current_state']['observed_at'] = (
+                '2026-04-30T00:00:00+00:00'
+            )
+            self.assertIsNotNone(evidence(zero_exposure))
+            blocked_states = {
+                'missing_open_quantity': {
+                    **zero_exposure,
+                    'open_quantity': None,
+                },
+                'attributed_fill': {
+                    **zero_exposure,
+                    'has_plan_attributed_fill_evidence': True,
+                },
+                'open_exposure': {
+                    **zero_exposure,
+                    'open_quantity': '1',
+                },
+                'incomplete_readback': {
+                    **zero_exposure,
+                    'endpoint_statuses': {
+                        **zero_exposure['endpoint_statuses'],
+                        'executions': 'error',
+                    },
+                },
+            }
+            for case, derived_state in blocked_states.items():
+                with self.subTest(case=case):
+                    self.assertIsNone(evidence(derived_state))
+            scoped_position_exposure = self.service._derive_remote_state(
+                row=row,
+                item_links=item_links,
+                orders=[],
+                executions=[],
+                positions=[{'symbol': row.symbol, 'quantity': '5'}],
+                endpoint_statuses=zero_exposure['endpoint_statuses'],
+            )
+            self.assertIsNone(evidence(scoped_position_exposure))
+            item_links[0]['current_state']['observed_at'] = (
+                '2026-04-30T00:00:00'
+            )
+            self.assertIsNone(evidence(zero_exposure))
+            item_links[0]['current_state']['observed_at'] = (
+                '2026-04-30T00:00:00+00:00'
+            )
+            row.execution_status = EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK
+            signal_decider_next_open_execution_service.stage_exec_contract_quarantine_retirement(
+                row=row,
+                item_links=[item_links[0]],
+                quarantine_observed_at='2026-04-30T00:00:00+00:00',
+                trigger='strict_ambiguous_acceptance_readback',
+                now=datetime(2026, 4, 30, 0, 0, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(
+                row.execution_status,
+                EXECUTION_STATUS_REVOCATION_PENDING,
+            )
 
     async def test_exec_overview_completed_no_trade_persists_entry_terminal_reason(
         self,

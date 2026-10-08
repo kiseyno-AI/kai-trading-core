@@ -2866,6 +2866,85 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             ack_status='revoked',
         )
 
+    def _stage_contract_quarantine_fixture(
+        self,
+        *,
+        short_term: bool,
+    ) -> tuple[SignalDeciderNextOpenExecutionService, int, str, list[dict]]:
+        if short_term:
+            self._seed_short_term_snapshot(
+                symbol='005930',
+                tactical_action='watch_for_trigger',
+            )
+        else:
+            self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_scheduler',
+            )
+        row_id = self._mark_row_as_handed_off()
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            old_plan_id = row.submission_payload['exec_dispatch']['plan_id']
+            accepted_links = copy.deepcopy(
+                row.submission_payload['exec_dispatch']['item_links']
+            )
+            entry_intent = 'intraday_watch_buy' if short_term else 'next_open_buy'
+            if short_term:
+                accepted_links[0]['intent'] = entry_intent
+                accepted_links[0]['core_item_key'] = (
+                    f'core-plan-{row.id}:{entry_intent}'
+                )
+                row.submission_payload = {
+                    **row.submission_payload,
+                    'exec_dispatch': {
+                        **row.submission_payload['exec_dispatch'],
+                        'item_links': accepted_links,
+                    },
+                }
+            service.stage_exec_contract_quarantine_retirement(
+                row=row,
+                item_links=[
+                    link
+                    for link in accepted_links
+                    if link['intent'] == entry_intent
+                ],
+                quarantine_observed_at='2026-04-30T09:10:00+09:00',
+                trigger='exec_readback',
+                now=datetime(2026, 4, 30, 0, 10, 1, tzinfo=timezone.utc),
+            )
+        return service, row_id, old_plan_id, accepted_links
+
+    def _refresh_with_live_snapshot(
+        self,
+        *,
+        service: SignalDeciderNextOpenExecutionService,
+        snapshot_context: dict[str, object],
+        trigger: str,
+    ) -> dict:
+        with (
+            patch(
+                'app.orders.next_open_execution.load_current_market_snapshot_context',
+                return_value=snapshot_context,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            return service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger=trigger,
+            )['items'][0]
+
     def test_previous_trading_day_uses_kis_calendar_helper(self) -> None:
         set_krx_calendar_provider(
             KisKrxTradingCalendarProvider(
@@ -8853,6 +8932,275 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guarded_ids, [])
         self.assertEqual(pending_ids, [row_id])
         self.assertEqual(first_generation, second_generation)
+
+    def test_short_term_contract_quarantine_recovery_requires_newer_live_allow_and_new_watch_identity(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        (
+            preopen_service,
+            row_id,
+            old_plan_id,
+            accepted_links,
+        ) = self._stage_contract_quarantine_fixture(short_term=True)
+        pending = preopen_service.list_plan_items(
+            target_trade_date=self.target_trade_date,
+        )['items'][0]
+        original_revocation = copy.deepcopy(pending['submission']['revocation'])
+        self.assertEqual(
+            pending['execution_status'],
+            EXECUTION_STATUS_REVOCATION_PENDING,
+        )
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            preopen_service.stage_exec_contract_quarantine_retirement(
+                row=row,
+                item_links=[
+                    link
+                    for link in accepted_links
+                    if link['intent'] == 'intraday_watch_buy'
+                ],
+                quarantine_observed_at='2026-04-30T09:11:00+09:00',
+                trigger='repeated_exec_readback',
+                now=datetime(
+                    2026,
+                    4,
+                    30,
+                    0,
+                    11,
+                    1,
+                    tzinfo=timezone.utc,
+                ),
+            )
+        repeated_readback = preopen_service.list_plan_items(
+            target_trade_date=self.target_trade_date,
+        )['items'][0]
+        self.assertEqual(
+            repeated_readback['submission']['revocation'],
+            original_revocation,
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            for trigger in ('planner_retry_one', 'planner_retry_two'):
+                stable = preopen_service.refresh_plan_items(
+                    target_trade_date=self.target_trade_date,
+                    trigger=trigger,
+                )['items'][0]
+                self.assertEqual(
+                    stable['execution_status'],
+                    EXECUTION_STATUS_REVOCATION_PENDING,
+                )
+                self.assertEqual(
+                    stable['submission']['revocation'],
+                    original_revocation,
+                )
+
+        self._ack_pending_revocation(service=preopen_service, item=pending)
+        acknowledged = preopen_service.list_plan_items(
+            target_trade_date=self.target_trade_date,
+        )['items'][0]
+        acknowledged_revocation = copy.deepcopy(
+            acknowledged['submission']['revocation']
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            preopen_service.stage_exec_contract_quarantine_retirement(
+                row=row,
+                item_links=[accepted_links[0]],
+                quarantine_observed_at='2026-04-30T09:11:00+09:00',
+                trigger='post_ack_exec_readback',
+                now=datetime(
+                    2026,
+                    4,
+                    30,
+                    0,
+                    11,
+                    1,
+                    tzinfo=timezone.utc,
+                ),
+            )
+        acknowledged_readback = preopen_service.list_plan_items(
+            target_trade_date=self.target_trade_date,
+        )['items'][0]
+        self.assertEqual(
+            acknowledged_readback['submission']['revocation'],
+            acknowledged_revocation,
+        )
+        self.assertEqual(
+            acknowledged_readback['execution_status'],
+            EXECUTION_STATUS_REVOKED,
+        )
+        open_service = self._service(
+            state='OPEN',
+            server_time='2026-04-30T09:10:30+09:00',
+        )
+        stale_snapshot = self._live_market_snapshot_context(
+            observed_at=datetime(
+                2026,
+                4,
+                30,
+                9,
+                10,
+                tzinfo=timezone(timedelta(hours=9)),
+            ),
+            advancers=650,
+            unchanged=50,
+            decliners=250,
+        )
+        stale = self._refresh_with_live_snapshot(
+            service=open_service,
+            snapshot_context=stale_snapshot,
+            trigger='equal_timestamp_authority',
+        )
+        self.assertEqual(stale['execution_status'], EXECUTION_STATUS_REVOKED)
+        self.assertIn('exec_dispatch', stale['submission'])
+
+        fresh_snapshot = self._live_market_snapshot_context(
+            observed_at=datetime(
+                2026,
+                4,
+                30,
+                9,
+                10,
+                1,
+                tzinfo=timezone(timedelta(hours=9)),
+            ),
+            advancers=650,
+            unchanged=50,
+            decliners=250,
+        )
+        recovered = self._refresh_with_live_snapshot(
+            service=open_service,
+            snapshot_context=fresh_snapshot,
+            trigger='strictly_newer_authority',
+        )
+
+        self.assertEqual(
+            recovered['execution_status'],
+            EXECUTION_STATUS_AWAITING_TRIGGER,
+        )
+        self.assertEqual(
+            recovered['eligibility_status'],
+            ELIGIBILITY_MONITOR_CANDIDATE,
+        )
+        self.assertNotIn('exec_dispatch', recovered['submission'])
+        self.assertEqual(
+            recovered['submission']['revocation']['recovery']['status'],
+            'authority_revalidated',
+        )
+        self.assertEqual(
+            recovered['submission']['revision_history'][-1][
+                'dispatch_evidence'
+            ]['retirement_reason'],
+            'exec_contract_quarantine_recovered',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                row.decision_snapshot_id,
+            )
+            payload, _ = SignalDeciderExecIntegrationService()._build_exec_plan_payload(
+                rows=[row],
+                snapshots={int(snapshot.id): snapshot},
+                trigger='replacement_generation',
+            )
+        self.assertNotEqual(payload['plan_id'], old_plan_id)
+        self.assertEqual(payload['items'][0]['intent'], 'intraday_watch_buy')
+
+    def test_signal_contract_quarantine_recovery_revalidates_active_policy_authority(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        preopen_service, row_id, old_plan_id, _ = (
+            self._stage_contract_quarantine_fixture(short_term=False)
+        )
+        pending = preopen_service.list_plan_items(
+            target_trade_date=self.target_trade_date,
+        )['items'][0]
+        self._ack_pending_revocation(service=preopen_service, item=pending)
+
+        healthy_snapshot = self._live_market_snapshot_context(
+            observed_at=datetime(
+                2026,
+                4,
+                30,
+                9,
+                10,
+                1,
+                tzinfo=timezone(timedelta(hours=9)),
+            ),
+            advancers=650,
+            unchanged=50,
+            decliners=250,
+        )
+        open_service = self._service(
+            state='OPEN',
+            server_time='2026-04-30T09:10:30+09:00',
+        )
+        with session_scope() as session:
+            policy = (
+                session.query(SignalDeciderPolicyVersion)
+                .filter(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+                .one()
+            )
+            policy.status = 'retired'
+            policy.retired_at = datetime(
+                2026,
+                4,
+                30,
+                0,
+                10,
+                tzinfo=timezone.utc,
+            )
+        stale_policy = self._refresh_with_live_snapshot(
+            service=open_service,
+            snapshot_context=healthy_snapshot,
+            trigger='retired_policy_authority',
+        )
+        self.assertEqual(stale_policy['execution_status'], EXECUTION_STATUS_REVOKED)
+        self.assertIn('exec_dispatch', stale_policy['submission'])
+
+        with session_scope() as session:
+            policy = (
+                session.query(SignalDeciderPolicyVersion)
+                .filter(
+                    SignalDeciderPolicyVersion.policy_version
+                    == self.policy_version
+                )
+                .one()
+            )
+            policy.status = 'active'
+            policy.retired_at = None
+        recovered = self._refresh_with_live_snapshot(
+            service=open_service,
+            snapshot_context=healthy_snapshot,
+            trigger='strictly_newer_policy_revalidation',
+        )
+
+        self.assertEqual(recovered['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        self.assertEqual(recovered['execution_status'], EXECUTION_STATUS_PLANNED)
+        self.assertNotIn('exec_dispatch', recovered['submission'])
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                row.decision_snapshot_id,
+            )
+            payload, _ = SignalDeciderExecIntegrationService()._build_exec_plan_payload(
+                rows=[row],
+                snapshots={int(snapshot.id): snapshot},
+                trigger='replacement_generation',
+            )
+        self.assertNotEqual(payload['plan_id'], old_plan_id)
+        self.assertEqual(payload['items'][0]['intent'], 'next_open_buy')
 
     def test_transient_revocation_recovery_refuses_changed_row_authority(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
