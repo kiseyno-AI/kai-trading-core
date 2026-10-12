@@ -8729,8 +8729,6 @@ class SignalDeciderNextOpenExecutionService:
             and current_live_market_authority.get('schema_version')
             == CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION
             and current_live_market_authority.get('applies') is True
-            and current_live_market_authority.get('authoritative') is True
-            and current_live_market_authority.get('status') == 'available'
             and current_live_market_authority.get('action')
             in {'allow', 'reject', 'block_new_buy'}
             and current_live_market_authority.get('market_date')
