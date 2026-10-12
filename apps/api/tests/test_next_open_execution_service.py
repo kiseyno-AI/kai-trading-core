@@ -3430,16 +3430,47 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 }
             }
-        with patch(
-            'app.orders.next_open_execution._current_live_market_buy_authority',
-            return_value={'applies': True, 'action': 'reject'},
+        with (
+            patch(
+                'app.orders.next_open_execution._load_live_market_snapshot_context',
+                side_effect=[
+                    ({'generation': 'risk-off-tick-one'}, False),
+                    ({'generation': 'risk-off-tick-two'}, False),
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution._current_live_market_buy_authority',
+                side_effect=[
+                    {
+                        'applies': True,
+                        'action': 'reject',
+                        'observed_at': '2026-04-30T09:20:00+09:00',
+                        'market_breadth': {'up_count': 250, 'down_count': 650},
+                    },
+                    {
+                        'applies': True,
+                        'action': 'reject',
+                        'observed_at': '2026-04-30T09:21:00+09:00',
+                        'market_breadth': {'up_count': 245, 'down_count': 655},
+                    },
+                ],
+            ),
         ):
-            generation = service.inspect_dispatch_authority_generation(
+            first_generation = service.inspect_dispatch_authority_generation(
+                target_trade_date=self.target_trade_date,
+                expected_row_bindings=expected_row_bindings,
+            )
+            second_generation = service.inspect_dispatch_authority_generation(
                 target_trade_date=self.target_trade_date,
                 expected_row_bindings=expected_row_bindings,
             )
 
-        self.assertEqual(generation['status'], 'valid')
+        self.assertEqual(first_generation['status'], 'valid')
+        self.assertEqual(second_generation['status'], 'valid')
+        self.assertEqual(
+            first_generation['generation_fingerprint'],
+            second_generation['generation_fingerprint'],
+        )
 
     def test_closed_refresh_keeps_late_watch_tombstoned(self) -> None:
         self._seed_short_term_snapshot(
@@ -8956,6 +8987,194 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guarded_ids, [])
         self.assertEqual(pending_ids, [row_id])
         self.assertEqual(first_generation, second_generation)
+
+    def test_risk_off_refresh_recovers_acked_monitor_generation_drift(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            tactical_action='watch_for_trigger',
+        )
+        preopen_service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            preopen_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_monitor_generation',
+            )
+        row_id = self._mark_row_as_handed_off()
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            submission = copy.deepcopy(row.submission_payload)
+            exec_dispatch = copy.deepcopy(submission['exec_dispatch'])
+            item_links = copy.deepcopy(exec_dispatch['item_links'])
+            item_links[0]['core_item_key'] = (
+                f'core-plan-{row.id}:intraday_watch_buy'
+            )
+            item_links[0]['intent'] = 'intraday_watch_buy'
+            exec_dispatch['item_links'] = item_links
+            prior_fingerprint = _execution_plan_row_authority_fingerprint(row)
+            exec_dispatch['dispatch_revision_fingerprint'] = prior_fingerprint
+            submission['exec_dispatch'] = exec_dispatch
+            submission['revision_history'] = [
+                {
+                    'decision_snapshot_id': str(row.decision_snapshot_id),
+                    'decision_agent_name': row.decision_agent_name,
+                    'symbol': row.symbol,
+                    'dispatch_evidence': {
+                        'plan_id': exec_dispatch['plan_id'],
+                        'dispatch_revision_fingerprint': prior_fingerprint,
+                        'dispatch_status': 'accepted',
+                        'item_links': copy.deepcopy(item_links),
+                    },
+                }
+            ]
+            replacement_observation_id = (
+                'observation:dispatch_authority_generation:test-monitor-drift'
+            )
+            revocation = {
+                'schema_version': 'core_execution_revocation_state_v1',
+                'status': 'acknowledged',
+                'ack_status': 'revoked',
+                'reason_code': 'latest_snapshot_replaced',
+                'requested_at': '2026-04-30T00:05:00+00:00',
+                'acknowledged_at': '2026-04-30T00:05:01+00:00',
+                'prior_decision_snapshot_id': str(row.decision_snapshot_id),
+                'replacement_decision_snapshot_id': (
+                    replacement_observation_id
+                ),
+                'replacement_observation_id': replacement_observation_id,
+                'prior_dispatch_revision_fingerprint': prior_fingerprint,
+                'replacement_dispatch_revision_fingerprint': prior_fingerprint,
+                'prior_authority_generation_fingerprint': 'a' * 64,
+                'replacement_authority_generation_fingerprint': 'b' * 64,
+                'replacement_action': 'wait',
+                'replacement_actionable': False,
+                'plan_id': exec_dispatch['plan_id'],
+                'destination_binding': exec_dispatch.get(
+                    'destination_binding'
+                ),
+                'item_links': copy.deepcopy(item_links),
+            }
+            request_payload = {
+                'plan_id': exec_dispatch['plan_id'],
+                'replacement_decision_snapshot_id': (
+                    replacement_observation_id
+                ),
+                'items': [
+                    {
+                        'core_item_key': link['core_item_key'],
+                        'execution_plan_item_id': link['exec_plan_item_id'],
+                    }
+                    for link in item_links
+                ],
+            }
+            response_payload = {
+                'contract_ack': {'status': 'revoked'},
+                'item_acks': [
+                    {**item, 'status': 'revoked'}
+                    for item in request_payload['items']
+                ],
+            }
+            submission['revocation'] = revocation
+            submission['revocation_history'] = [
+                {
+                    'acknowledged_at': revocation['acknowledged_at'],
+                    'request': request_payload,
+                    'response': response_payload,
+                }
+            ]
+            row.submission_payload = submission
+            row.eligibility_status = ELIGIBILITY_BLOCKED
+            row.execution_status = EXECUTION_STATUS_REVOKED
+            row.validation_payload = {
+                **copy.deepcopy(row.validation_payload),
+                'blocking_reasons': [
+                    {
+                        'code': 'latest_snapshot_replaced',
+                        'message': 'Only the live risk-off observation changed.',
+                    }
+                ],
+            }
+
+        risk_off_snapshot = self._live_market_snapshot_context(
+            observed_at=datetime(
+                2026,
+                4,
+                30,
+                9,
+                10,
+                tzinfo=timezone(timedelta(hours=9)),
+            )
+        )
+        open_service = self._service(
+            state='OPEN',
+            server_time='2026-04-30T09:10:30+09:00',
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            row.planned_order_type = 'market'
+        with (
+            patch(
+                'app.orders.next_open_execution.load_current_market_snapshot_context',
+                return_value=risk_off_snapshot,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            tampered = open_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='reject_tampered_monitor_generation_drift',
+            )['items'][0]
+
+        self.assertEqual(tampered['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(tampered['execution_status'], EXECUTION_STATUS_REVOKED)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            row.planned_order_type = 'limit'
+        with (
+            patch(
+                'app.orders.next_open_execution.load_current_market_snapshot_context',
+                return_value=risk_off_snapshot,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            recovered = open_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='recover_monitor_generation_drift',
+            )['items'][0]
+
+        self.assertEqual(
+            recovered['eligibility_status'],
+            ELIGIBILITY_MONITOR_CANDIDATE,
+        )
+        self.assertEqual(
+            recovered['execution_status'],
+            EXECUTION_STATUS_AWAITING_TRIGGER,
+        )
+        self.assertNotIn('exec_dispatch', recovered['submission'])
+        self.assertEqual(
+            recovered['submission']['revocation']['recovery']['status'],
+            'authority_revalidated',
+        )
+        self.assertEqual(
+            recovered['submission']['revision_history'][-1][
+                'dispatch_evidence'
+            ]['retirement_reason'],
+            'monitor_only_generation_drift_recovered',
+        )
 
     def test_short_term_contract_quarantine_recovery_requires_newer_live_allow_and_new_watch_identity(
         self,
