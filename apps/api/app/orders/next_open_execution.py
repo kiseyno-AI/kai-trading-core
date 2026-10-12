@@ -8711,6 +8711,23 @@ class SignalDeciderNextOpenExecutionService:
                 ),
                 None,
             )
+        current_dispatch_status = str(
+            exec_dispatch.get('dispatch_status') or ''
+        ).strip().lower()
+        archived_dispatch_status = str(
+            (
+                archived_revision.get('dispatch_evidence')
+                if isinstance(archived_revision, dict)
+                and isinstance(archived_revision.get('dispatch_evidence'), dict)
+                else {}
+            ).get('dispatch_status')
+            or ''
+        ).strip().lower()
+        monitor_generation_write_ahead_recovered = bool(
+            monitor_generation_drift_recovered
+            and current_dispatch_status == 'pending_remote_ack'
+            and archived_dispatch_status == 'accepted'
+        )
 
         if (
             revocation.get('schema_version') != 'core_execution_revocation_state_v1'
@@ -8757,8 +8774,10 @@ class SignalDeciderNextOpenExecutionService:
                 )
             )
             or archived_revision is None
-            or str(exec_dispatch.get('dispatch_status') or '').strip().lower()
-            != 'accepted'
+            or (
+                current_dispatch_status != 'accepted'
+                and not monitor_generation_write_ahead_recovered
+            )
             or exec_dispatch.get('plan_id') != revocation.get('plan_id')
             or exec_dispatch.get('destination_binding')
             != revocation.get('destination_binding')

@@ -9022,6 +9022,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             exec_dispatch['item_links'] = item_links
             prior_fingerprint = _execution_plan_row_authority_fingerprint(row)
             exec_dispatch['dispatch_revision_fingerprint'] = prior_fingerprint
+            exec_dispatch['dispatch_status'] = 'pending_remote_ack'
             submission['exec_dispatch'] = exec_dispatch
             submission['revision_history'] = [
                 {
