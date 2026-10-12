@@ -232,13 +232,67 @@ def _stable_macro_context(value: Any) -> Any:
 
 
 def _durable_macro_context(value: Any) -> Any:
-    """Remove invocation metadata while preserving the macro data snapshot."""
+    """Remove time-derived freshness state while preserving macro facts.
+
+    A next-open decision can cross weekends or holidays while the underlying
+    slow-moving macro observations remain unchanged.  Recomputing the same
+    snapshot then changes ``available``/``fresh`` labels to ``stale`` purely
+    because wall-clock time advanced.  Those labels are execution-time context,
+    not a new decision input; the durable generation already binds the original
+    knowledge cutoff separately.  Keep observation values, periods, units, and
+    provenance, but exclude derived freshness labels and aggregate counters.
+    """
     result = _stable_macro_context(value)
     if not isinstance(result, dict):
         return result
+
+    result.pop('status', None)
+    result.pop('freshness_status', None)
     freshness = result.get('freshness')
     if isinstance(freshness, dict):
-        freshness.pop('knowledge_cutoff_applied', None)
+        for key in (
+            'age_hours',
+            'freshness_status',
+            'knowledge_cutoff_applied',
+            'knowledge_cutoff_at',
+            'status',
+        ):
+            freshness.pop(key, None)
+
+    macro_regime_summary = result.get('macro_regime_summary')
+    if isinstance(macro_regime_summary, dict):
+        macro_regime_summary.pop('freshness_label', None)
+
+    source_statuses = result.get('source_statuses')
+    if isinstance(source_statuses, dict):
+        for source_status in source_statuses.values():
+            if not isinstance(source_status, dict):
+                continue
+            for key in (
+                'available_count',
+                'missing_count',
+                'stale_count',
+                'status',
+            ):
+                source_status.pop(key, None)
+
+    series = result.get('series')
+    if isinstance(series, list):
+        for row in series:
+            if not isinstance(row, dict):
+                continue
+            row.pop('status', None)
+            row_freshness = row.get('freshness')
+            if not isinstance(row_freshness, dict):
+                continue
+            for key in (
+                'age_hours',
+                'freshness_status',
+                'knowledge_cutoff_applied',
+                'knowledge_cutoff_at',
+                'status',
+            ):
+                row_freshness.pop(key, None)
     return result
 
 
@@ -415,6 +469,121 @@ def _restore_post_decision_evaluation_metadata(
     return result
 
 
+def _restore_legacy_macro_freshness_metadata(
+    projected: dict[str, Any],
+    expected_source_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Rebuild the pre-stability fingerprint without replacing macro facts."""
+    result = deepcopy(projected)
+    if not isinstance(expected_source_context, dict):
+        return result
+    persisted_context = expected_source_context.get('symbol_day_context')
+    if not isinstance(persisted_context, dict):
+        persisted_context = expected_source_context
+
+    def restore_status_projection(
+        target: Any,
+        source: Any,
+        *,
+        series_row: bool = False,
+    ) -> None:
+        if not isinstance(target, dict) or not isinstance(source, dict):
+            return
+        for key in ('status', 'freshness_status'):
+            if key in source:
+                target[key] = deepcopy(source[key])
+
+        source_freshness = source.get('freshness')
+        target_freshness = target.get('freshness')
+        if isinstance(source_freshness, dict):
+            if not isinstance(target_freshness, dict):
+                target_freshness = {}
+                target['freshness'] = target_freshness
+            for key, value in source_freshness.items():
+                if key == 'age_hours' and series_row:
+                    continue
+                if key == 'knowledge_cutoff_applied' and not series_row:
+                    continue
+                target_freshness[key] = deepcopy(value)
+
+        source_summary = source.get('macro_regime_summary')
+        target_summary = target.get('macro_regime_summary')
+        if (
+            isinstance(source_summary, dict)
+            and isinstance(target_summary, dict)
+            and 'freshness_label' in source_summary
+        ):
+            target_summary['freshness_label'] = deepcopy(
+                source_summary['freshness_label']
+            )
+
+        source_statuses = source.get('source_statuses')
+        target_statuses = target.get('source_statuses')
+        if isinstance(source_statuses, dict) and isinstance(
+            target_statuses, dict
+        ):
+            for source_name, source_status in source_statuses.items():
+                target_status = target_statuses.get(source_name)
+                if not isinstance(source_status, dict) or not isinstance(
+                    target_status, dict
+                ):
+                    continue
+                for key in (
+                    'available_count',
+                    'missing_count',
+                    'stale_count',
+                    'status',
+                ):
+                    if key in source_status:
+                        target_status[key] = deepcopy(source_status[key])
+
+        source_series = source.get('series')
+        target_series = target.get('series')
+        if not isinstance(source_series, list) or not isinstance(
+            target_series, list
+        ):
+            return
+        source_by_identity = {
+            (
+                str(row.get('source') or ''),
+                str(row.get('series_id') or ''),
+            ): row
+            for row in source_series
+            if isinstance(row, dict)
+        }
+        for index, target_row in enumerate(target_series):
+            if not isinstance(target_row, dict):
+                continue
+            identity = (
+                str(target_row.get('source') or ''),
+                str(target_row.get('series_id') or ''),
+            )
+            source_row = source_by_identity.get(identity)
+            if source_row is None and index < len(source_series):
+                source_row = source_series[index]
+            restore_status_projection(
+                target_row,
+                source_row,
+                series_row=True,
+            )
+
+    expected_macro = expected_source_context.get('macro_context')
+    if not isinstance(expected_macro, dict):
+        expected_macro = persisted_context.get('macro_context')
+    restore_status_projection(result.get('macro_context'), expected_macro)
+
+    expected_provenance = persisted_context.get('context_provenance')
+    current_provenance = result.get('context_provenance')
+    if isinstance(expected_provenance, dict) and isinstance(
+        current_provenance, dict
+    ):
+        restore_status_projection(
+            current_provenance.get('macro_context'),
+            expected_provenance.get('macro_context'),
+        )
+    return result
+
+
 def _source_names(value: Any) -> tuple[Any, ...]:
     """Normalize provenance source fields without treating text as characters."""
     if value is None:
@@ -498,6 +667,8 @@ def _durable_decider_source_context(item: dict[str, Any]) -> dict[str, Any]:
             key: (
                 stable_external_news(value)
                 if key == 'recent_external_news'
+                else _durable_macro_context(value)
+                if key == 'macro_context'
                 else value
             )
             for key, value in context_provenance.items()
@@ -578,6 +749,17 @@ def durable_decider_source_context_fingerprint_matches(
         *legacy_metadata_variants,
         *evaluation_metadata_variants,
     ]
+    metadata_variants.extend(
+        _restore_legacy_macro_freshness_metadata(
+            metadata_variant,
+            (
+                expected_source_context
+                if isinstance(expected_source_context, dict)
+                else refreshed_source_context
+            ),
+        )
+        for metadata_variant in list(metadata_variants)
+    )
     legacy_projections = []
     for metadata_variant in metadata_variants:
         legacy_projections.append(metadata_variant)
