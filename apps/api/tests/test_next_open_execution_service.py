@@ -9125,8 +9125,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 2026,
                 4,
                 30,
-                9,
-                10,
+                8,
+                50,
                 tzinfo=timezone(timedelta(hours=9)),
             )
         )
