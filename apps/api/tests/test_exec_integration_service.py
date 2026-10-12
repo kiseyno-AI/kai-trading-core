@@ -9138,6 +9138,84 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'pending_remote_ack',
             )
 
+    async def test_risk_off_buy_authority_still_dispatches_monitor_only_watch(
+        self,
+    ) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        short_plan_item_id = self._seed_short_term_plan_item(
+            snapshot_id=short_snapshot_id,
+        )
+        with session_scope() as session:
+            signal_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            signal_row.eligibility_status = 'blocked'
+            signal_row.execution_status = 'blocked'
+            signal_row.validation_payload = {
+                **(signal_row.validation_payload or {}),
+                'blocking_reasons': [
+                    {
+                        'code': 'test_signal_buy_block',
+                        'message': 'Keep the ordinary BUY out of this watch-only group.',
+                    }
+                ],
+            }
+            watch_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            watch_row.eligibility_status = 'monitor_candidate'
+            watch_row.execution_status = 'awaiting_trigger'
+
+        blocked_sync = {
+            'applies': True,
+            'accounts': {
+                self.account_reference: {
+                    'dispatch_allowed': False,
+                    'fence_active': True,
+                    'errors': [],
+                }
+            },
+            'errors': [],
+        }
+        with (
+            patch.object(
+                self.service,
+                '_synchronize_open_buy_authority',
+                new=AsyncMock(return_value=blocked_sync),
+            ) as synchronize,
+            patch(
+                'app.orders.next_open_execution._current_live_market_buy_authority',
+                return_value={'applies': True, 'action': 'reject'},
+            ),
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                account_reference=self.account_reference,
+                refresh_plan=False,
+                dry_run=False,
+                force=False,
+                trigger='risk_off_monitor_only_watch',
+            )
+
+        synchronize.assert_awaited_once()
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(result['summary']['dispatched_group_count'], 1)
+        self.assertNotIn(
+            'core_exec_buy_authority_not_acknowledged',
+            {
+                group.get('reason')
+                for group in result['dispatch']['groups']
+            },
+        )
+        entry = next(
+            item
+            for item in self.client.post_calls[0]['items']
+            if item['side'] == 'buy'
+        )
+        self.assertEqual(entry['intent'], 'intraday_watch_buy')
+
     async def test_restart_never_retries_non_buy_write_ahead_as_buy(self) -> None:
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)

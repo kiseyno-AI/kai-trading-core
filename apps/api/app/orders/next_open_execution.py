@@ -2518,6 +2518,45 @@ def _row_validation_payload(row: SignalDeciderExecutionPlanItem) -> dict[str, An
     return payload if isinstance(payload, dict) else {}
 
 
+def _row_is_monitor_only_intraday_watch(
+    row: SignalDeciderExecutionPlanItem,
+) -> bool:
+    if (
+        _normalize_agent_name(getattr(row, 'decision_agent_name', None))
+        != SHORT_TERM_DECIDER_AGENT_NAME
+        or getattr(row, 'eligibility_status', None)
+        != ELIGIBILITY_MONITOR_CANDIDATE
+    ):
+        return False
+    validation_payload = getattr(row, 'validation_payload', None)
+    validation = (
+        validation_payload if isinstance(validation_payload, dict) else {}
+    )
+    traceability_payload = getattr(row, 'traceability_payload', None)
+    traceability = (
+        traceability_payload
+        if isinstance(traceability_payload, dict)
+        else {}
+    )
+    handoff = (
+        validation.get('handoff')
+        if isinstance(validation.get('handoff'), dict)
+        else {}
+    )
+    short_term = (
+        validation.get('short_term')
+        if isinstance(validation.get('short_term'), dict)
+        else {}
+    )
+    handoff_intent = _normalize_optional_text(
+        validation.get('handoff_intent')
+        or traceability.get('handoff_intent')
+        or handoff.get('handoff_intent')
+        or short_term.get('handoff_intent')
+    )
+    return handoff_intent == 'intraday_watch_buy'
+
+
 @dataclass(frozen=True)
 class NextOpenAccountTarget:
     label: str
@@ -3142,15 +3181,21 @@ class SignalDeciderNextOpenExecutionService:
                         snapshot_load_error=snapshot_load_error,
                     )
                     authority_action = live_authority.get('action')
-                    if reason_code is None and authority_action == 'reject':
+                    monitor_only_watch = _row_is_monitor_only_intraday_watch(
+                        row
+                    )
+                    if (
+                        reason_code is None
+                        and authority_action == 'reject'
+                        and not monitor_only_watch
+                    ):
                         reason_code = 'current_live_market_risk_off'
                         replacement_action = 'reject'
                         replacement_actionable = False
                     elif (
                         reason_code is None
                         and authority_action == 'block_new_buy'
-                        and row_validation.get('handoff_intent')
-                        != 'intraday_watch_buy'
+                        and not monitor_only_watch
                     ):
                         reason_code = 'current_live_market_evidence_unavailable'
                         replacement_action = 'reject'

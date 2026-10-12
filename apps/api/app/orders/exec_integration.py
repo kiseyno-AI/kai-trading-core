@@ -92,6 +92,7 @@ from app.orders.next_open_execution import (
     _current_route_live_market_buy_authority,
     _is_canonical_closed_market_cost_absence,
     _load_live_market_snapshot_context,
+    _row_is_monitor_only_intraday_watch,
     _async_previous_trading_day,
     async_normalize_next_open_target_trade_date,
     signal_decider_next_open_execution_service,
@@ -2369,6 +2370,7 @@ def _dispatch_group_requires_core_krx_buy_authority(
         route_family == 'kis_krx_krw'
         and any(
             str(row.planned_side or '').strip().lower() == 'buy'
+            and not _row_is_monitor_only_intraday_watch(row)
             for row in rows
         )
     )
