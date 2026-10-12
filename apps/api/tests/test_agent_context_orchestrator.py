@@ -325,6 +325,154 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
             build_durable_decider_input_generation(source_context=monday),
         )
 
+    def test_macro_freshness_ageing_does_not_revoke_durable_generation(self):
+        fresh = self._source_context()
+        fresh['macro_context'].update(
+            {
+                'status': 'available',
+                'freshness': {
+                    'status': 'fresh',
+                    'knowledge_cutoff_applied': False,
+                    'knowledge_cutoff_at': None,
+                },
+                'macro_regime_summary': {
+                    'regime': 'neutral',
+                    'freshness_label': 'macro_context_fresh',
+                },
+                'source_statuses': {
+                    'world_bank': {
+                        'status': 'available',
+                        'available_count': 1,
+                        'stale_count': 0,
+                        'missing_count': 0,
+                    }
+                },
+            }
+        )
+        fresh['macro_context']['series'][0].update(
+            {
+                'status': 'available',
+                'source_status': 'available',
+            }
+        )
+        fresh['macro_context']['series'][0]['freshness'].update(
+            {
+                'freshness_status': 'fresh',
+                'stale_after_hours': 72,
+            }
+        )
+        fresh['context_provenance']['macro_context'] = {
+            'freshness_status': 'fresh',
+            'provenance_status': 'provider_sourced',
+            'as_of_market_date': '2026-04-23',
+            'source_statuses': deepcopy(
+                fresh['macro_context']['source_statuses']
+            ),
+        }
+
+        aged = deepcopy(fresh)
+        aged['macro_context']['status'] = 'stale'
+        aged['macro_context']['freshness'].update(
+            {
+                'status': 'stale',
+                'knowledge_cutoff_applied': True,
+                'knowledge_cutoff_at': '2026-04-24T00:00:00+00:00',
+            }
+        )
+        aged['macro_context']['macro_regime_summary'][
+            'freshness_label'
+        ] = 'macro_context_stale'
+        aged['macro_context']['source_statuses']['world_bank'].update(
+            {
+                'status': 'stale',
+                'available_count': 0,
+                'stale_count': 1,
+            }
+        )
+        aged['macro_context']['series'][0]['status'] = 'stale'
+        aged['macro_context']['series'][0]['freshness'].update(
+            {
+                'status': 'stale',
+                'freshness_status': 'stale',
+                'age_hours': 97.0,
+            }
+        )
+        aged['context_provenance']['macro_context'][
+            'freshness_status'
+        ] = 'stale'
+        aged['context_provenance']['macro_context']['source_statuses'][
+            'world_bank'
+        ].update(
+            {
+                'status': 'stale',
+                'available_count': 0,
+                'stale_count': 1,
+            }
+        )
+
+        self.assertEqual(
+            build_durable_decider_input_generation(source_context=fresh),
+            build_durable_decider_input_generation(source_context=aged),
+        )
+
+        changed_value = deepcopy(aged)
+        changed_value['macro_context']['series'][0]['latest_value'] = 1401.0
+        self.assertNotEqual(
+            build_durable_decider_input_generation(source_context=fresh),
+            build_durable_decider_input_generation(
+                source_context=changed_value
+            ),
+        )
+
+        legacy_source = {
+            'symbol': fresh['symbol'],
+            'market_date': fresh['market_date'],
+            'macro_context': deepcopy(fresh['macro_context']),
+            'context_provenance': {
+                'macro_context': deepcopy(
+                    fresh['context_provenance']['macro_context']
+                )
+            },
+        }
+        legacy_source['macro_context'].pop('generated_at', None)
+        legacy_source['macro_context']['freshness'].pop(
+            'knowledge_cutoff_applied',
+            None,
+        )
+        legacy_source['macro_context']['series'][0]['freshness'].pop(
+            'age_hours',
+            None,
+        )
+        aged_legacy_source = deepcopy(legacy_source)
+        aged_legacy_source['macro_context'] = deepcopy(
+            aged['macro_context']
+        )
+        aged_legacy_source['context_provenance']['macro_context'] = deepcopy(
+            aged['context_provenance']['macro_context']
+        )
+        legacy_fingerprint = build_decider_source_context_generation(
+            legacy_source
+        )['fingerprint']
+        observed_fingerprint = build_durable_decider_input_generation(
+            source_context=aged_legacy_source
+        )['source_context_fingerprint']
+
+        self.assertTrue(
+            durable_decider_source_context_fingerprint_matches(
+                expected_fingerprint=legacy_fingerprint,
+                observed_fingerprint=observed_fingerprint,
+                refreshed_source_context=aged_legacy_source,
+                expected_source_context={
+                    'symbol_day_context': {
+                        'context_provenance': legacy_source[
+                            'context_provenance'
+                        ],
+                    },
+                    'macro_context': legacy_source['macro_context'],
+                },
+            )
+        )
+
     def test_eod_or_eligibility_changes_revoke_durable_generation(self):
         original = self._source_context()
         changed_eod = deepcopy(original)
