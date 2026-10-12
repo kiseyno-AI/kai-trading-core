@@ -3417,6 +3417,30 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             {warning['code'] for warning in item['validation']['warnings']},
         )
 
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                item['plan_item_id'],
+            )
+            expected_row_bindings = {
+                int(row.id): {
+                    'decision_snapshot_id': int(row.decision_snapshot_id),
+                    'row_revision_fingerprint': (
+                        _execution_plan_row_authority_fingerprint(row)
+                    ),
+                }
+            }
+        with patch(
+            'app.orders.next_open_execution._current_live_market_buy_authority',
+            return_value={'applies': True, 'action': 'reject'},
+        ):
+            generation = service.inspect_dispatch_authority_generation(
+                target_trade_date=self.target_trade_date,
+                expected_row_bindings=expected_row_bindings,
+            )
+
+        self.assertEqual(generation['status'], 'valid')
+
     def test_closed_refresh_keeps_late_watch_tombstoned(self) -> None:
         self._seed_short_term_snapshot(
             symbol='005930',
