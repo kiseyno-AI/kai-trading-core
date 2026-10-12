@@ -2599,6 +2599,48 @@ def _row_is_monitor_only_intraday_watch(
     )
 
 
+def _dispatch_write_ahead_links_match_accepted_links(
+    dispatch_links: Any,
+    accepted_links: Any,
+) -> bool:
+    if (
+        not isinstance(dispatch_links, list)
+        or not dispatch_links
+        or not isinstance(accepted_links, list)
+        or len(dispatch_links) != len(accepted_links)
+    ):
+        return False
+    dispatch_by_key = {
+        str(link.get('core_item_key')): link
+        for link in dispatch_links
+        if isinstance(link, dict) and link.get('core_item_key')
+    }
+    accepted_by_key = {
+        str(link.get('core_item_key')): link
+        for link in accepted_links
+        if isinstance(link, dict) and link.get('core_item_key')
+    }
+    if (
+        len(dispatch_by_key) != len(dispatch_links)
+        or len(accepted_by_key) != len(accepted_links)
+        or set(dispatch_by_key) != set(accepted_by_key)
+    ):
+        return False
+    for core_item_key, dispatch_link in dispatch_by_key.items():
+        accepted_link = accepted_by_key[core_item_key]
+        if (
+            not accepted_link.get('exec_plan_id')
+            or not accepted_link.get('exec_plan_item_id')
+            or accepted_link.get('remote_status') != 'accepted'
+            or any(
+                accepted_link.get(key) != value
+                for key, value in dispatch_link.items()
+            )
+        ):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class NextOpenAccountTarget:
     label: str
@@ -8728,6 +8770,16 @@ class SignalDeciderNextOpenExecutionService:
             and current_dispatch_status == 'pending_remote_ack'
             and archived_dispatch_status == 'accepted'
         )
+        dispatch_links_match_revocation = bool(
+            dispatch_links == expected_links
+            or (
+                monitor_generation_write_ahead_recovered
+                and _dispatch_write_ahead_links_match_accepted_links(
+                    dispatch_links,
+                    expected_links,
+                )
+            )
+        )
 
         if (
             revocation.get('schema_version') != 'core_execution_revocation_state_v1'
@@ -8783,7 +8835,7 @@ class SignalDeciderNextOpenExecutionService:
             != revocation.get('destination_binding')
             or not isinstance(expected_links, list)
             or not expected_links
-            or dispatch_links != expected_links
+            or not dispatch_links_match_revocation
             or acknowledged_request.get('plan_id') != revocation.get('plan_id')
             or str(
                 acknowledged_request.get('replacement_decision_snapshot_id') or ''

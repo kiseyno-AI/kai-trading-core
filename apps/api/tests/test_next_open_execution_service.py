@@ -9019,7 +9019,22 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 f'core-plan-{row.id}:intraday_watch_buy'
             )
             item_links[0]['intent'] = 'intraday_watch_buy'
-            exec_dispatch['item_links'] = item_links
+            item_links[0]['handoff_intent'] = 'intraday_watch_buy'
+            dispatch_write_ahead_links = [
+                {
+                    key: value
+                    for key, value in link.items()
+                    if key
+                    not in {
+                        'exec_plan_id',
+                        'exec_plan_item_id',
+                        'handoff_intent',
+                        'remote_status',
+                    }
+                }
+                for link in item_links
+            ]
+            exec_dispatch['item_links'] = dispatch_write_ahead_links
             prior_fingerprint = _execution_plan_row_authority_fingerprint(row)
             exec_dispatch['dispatch_revision_fingerprint'] = prior_fingerprint
             exec_dispatch['dispatch_status'] = 'pending_remote_ack'
