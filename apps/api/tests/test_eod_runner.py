@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from app.eod.runner import (
     BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
     EODBackgroundRunner,
+    NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS,
     NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
     OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY,
     is_preopen_exec_dispatch_due,
@@ -538,6 +539,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch('app.eod.runner.settings.background_runner_enabled', True),
                 patch('app.eod.runner.BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS', 0.01),
+                patch('app.eod.runner.NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS', 0.01),
                 patch('app.eod.runner.async_get_market_state', return_value=market_state),
                 patch('app.eod.runner.asyncio.to_thread', side_effect=stalled_second_offload),
                 patch('app.eod.runner.refresh_master_if_due'),
@@ -732,6 +734,32 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(runner._blocking_step_tasks['slow_refresh'], timeout=0.25)
 
         self.assertNotIn('slow_refresh', runner._blocking_step_tasks)
+
+    async def test_blocking_step_uses_next_open_refresh_timeout_override(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        observed_timeout: float | None = None
+
+        async def capture_wait_for(awaitable, *, timeout):
+            nonlocal observed_timeout
+            observed_timeout = timeout
+            return await awaitable
+
+        with patch(
+            'app.eod.runner.asyncio.wait_for',
+            side_effect=capture_wait_for,
+        ):
+            await runner._run_blocking_step(
+                NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
+                lambda: None,
+                timeout_seconds=NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS,
+            )
+
+        self.assertEqual(
+            observed_timeout,
+            NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS,
+        )
 
     async def test_async_step_timeout_recovers_when_shielded_refresh_succeeds(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)

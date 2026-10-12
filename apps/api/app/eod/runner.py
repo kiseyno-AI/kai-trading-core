@@ -20,6 +20,7 @@ from app.orders.reconciliation import trading_order_reconciliation_service
 logger = logging.getLogger(__name__)
 PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
 BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS = 45
+NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS = 120
 BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS = 600
 MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(9, 0)
 MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(14, 31)
@@ -249,7 +250,13 @@ class EODBackgroundRunner:
         func,
         *,
         fail_closed: bool = False,
+        timeout_seconds: float | None = None,
     ) -> None:
+        step_timeout_seconds = (
+            BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         running_task = self._blocking_step_tasks.get(name)
         if running_task is not None and not running_task.done():
             logger.info('Background runner blocking step already in flight: %s', name)
@@ -266,12 +273,15 @@ class EODBackgroundRunner:
         self._blocking_step_tasks[name] = task
         task.add_done_callback(lambda completed, step_name=name: self._finalize_blocking_step(step_name, completed))
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=step_timeout_seconds,
+            )
         except asyncio.TimeoutError:
             self._mark_step_timed_out(name)
             logger.warning(
                 'Background runner blocking step still running after %ss: %s; keeping single-flight lock and cooling down for %ss',
-                BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
+                step_timeout_seconds,
                 name,
                 BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS,
             )
@@ -486,6 +496,7 @@ class EODBackgroundRunner:
                                 _live_market_snapshot_loop=live_market_snapshot_loop,
                             ),
                             fail_closed=True,
+                            timeout_seconds=NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS,
                         ),
                     )
                     delegate_execution = (
@@ -530,6 +541,7 @@ class EODBackgroundRunner:
                                         _live_market_snapshot_loop=live_market_snapshot_loop,
                                     ),
                                     fail_closed=True,
+                                    timeout_seconds=NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS,
                                 ),
                             )
                             dispatch_completed = await self._run_async_step(
