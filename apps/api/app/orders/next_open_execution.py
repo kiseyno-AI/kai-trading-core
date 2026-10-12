@@ -862,9 +862,17 @@ def _load_signal_decider_policy_authority(
     }
 
 
-def _execution_plan_row_authority_fingerprint(
+def _execution_plan_row_authority_fingerprint_for_validation(
     row: SignalDeciderExecutionPlanItem,
+    validation_payload: dict[str, Any] | None,
+    *,
+    stabilize_monitor_live_authority: bool,
 ) -> str:
+    normalized_validation = copy.deepcopy(
+        validation_payload if isinstance(validation_payload, dict) else {}
+    )
+    if stabilize_monitor_live_authority and _row_has_intraday_watch_intent(row):
+        normalized_validation.pop('current_live_market_authority', None)
     material = _to_json_safe(
         {
             'id': row.id,
@@ -886,7 +894,7 @@ def _execution_plan_row_authority_fingerprint(
             'planned_quantity': row.planned_quantity,
             'estimated_notional_krw': row.estimated_notional_krw,
             'client_order_id': row.client_order_id,
-            'validation_payload': row.validation_payload,
+            'validation_payload': normalized_validation,
             'traceability_payload': row.traceability_payload,
         }
     )
@@ -897,6 +905,31 @@ def _execution_plan_row_authority_fingerprint(
         separators=(',', ':'),
     ).encode('utf-8')
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _execution_plan_row_authority_fingerprint(
+    row: SignalDeciderExecutionPlanItem,
+) -> str:
+    return _execution_plan_row_authority_fingerprint_for_validation(
+        row,
+        (
+            row.validation_payload
+            if isinstance(row.validation_payload, dict)
+            else {}
+        ),
+        stabilize_monitor_live_authority=True,
+    )
+
+
+def _legacy_execution_plan_row_authority_fingerprint(
+    row: SignalDeciderExecutionPlanItem,
+    validation_payload: dict[str, Any],
+) -> str:
+    return _execution_plan_row_authority_fingerprint_for_validation(
+        row,
+        validation_payload,
+        stabilize_monitor_live_authority=False,
+    )
 
 
 def _to_int(value: Any) -> int | None:
@@ -2518,14 +2551,13 @@ def _row_validation_payload(row: SignalDeciderExecutionPlanItem) -> dict[str, An
     return payload if isinstance(payload, dict) else {}
 
 
-def _row_is_monitor_only_intraday_watch(
+def _row_has_intraday_watch_intent(
     row: SignalDeciderExecutionPlanItem,
 ) -> bool:
     if (
         _normalize_agent_name(getattr(row, 'decision_agent_name', None))
         != SHORT_TERM_DECIDER_AGENT_NAME
-        or getattr(row, 'eligibility_status', None)
-        != ELIGIBILITY_MONITOR_CANDIDATE
+        or _normalize_optional_text(getattr(row, 'planned_side', None)) != 'buy'
     ):
         return False
     validation_payload = getattr(row, 'validation_payload', None)
@@ -2555,6 +2587,16 @@ def _row_is_monitor_only_intraday_watch(
         or short_term.get('handoff_intent')
     )
     return handoff_intent == 'intraday_watch_buy'
+
+
+def _row_is_monitor_only_intraday_watch(
+    row: SignalDeciderExecutionPlanItem,
+) -> bool:
+    return bool(
+        getattr(row, 'eligibility_status', None)
+        == ELIGIBILITY_MONITOR_CANDIDATE
+        and _row_has_intraday_watch_intent(row)
+    )
 
 
 @dataclass(frozen=True)
@@ -2972,6 +3014,7 @@ class SignalDeciderNextOpenExecutionService:
             )
             issues: list[dict[str, Any]] = []
             row_generation: list[dict[str, Any]] = []
+            generation_binds_live_market_snapshot = False
 
             for row_id in row_ids:
                 expected = normalized_bindings[row_id]
@@ -3172,6 +3215,7 @@ class SignalDeciderNextOpenExecutionService:
                     replacement_actionable = False
 
                 live_authority: dict[str, Any] | None = None
+                monitor_only_watch = _row_is_monitor_only_intraday_watch(row)
                 if latest is not None and row.planned_side == 'buy':
                     live_authority = _current_live_market_buy_authority(
                         snapshot=latest,
@@ -3181,8 +3225,9 @@ class SignalDeciderNextOpenExecutionService:
                         snapshot_load_error=snapshot_load_error,
                     )
                     authority_action = live_authority.get('action')
-                    monitor_only_watch = _row_is_monitor_only_intraday_watch(
-                        row
+                    generation_binds_live_market_snapshot = bool(
+                        generation_binds_live_market_snapshot
+                        or not monitor_only_watch
                     )
                     if (
                         reason_code is None
@@ -3246,7 +3291,14 @@ class SignalDeciderNextOpenExecutionService:
                             ),
                         },
                         'live_authority': (
-                            _stable_live_market_authority_generation_material(
+                            {
+                                'scope': 'monitor_only_intraday_watch',
+                                'buy_submission_authority': (
+                                    'delegated_to_exec_fence'
+                                ),
+                            }
+                            if monitor_only_watch
+                            else _stable_live_market_authority_generation_material(
                                 live_authority
                             )
                         ),
@@ -3267,6 +3319,8 @@ class SignalDeciderNextOpenExecutionService:
                         snapshot_context,
                         load_error=snapshot_load_error,
                     )
+                    if generation_binds_live_market_snapshot
+                    else 'monitor_only_delegated_to_exec_fence'
                 ),
                 'decision_input_generation_validation_fingerprint': (
                     generation_validation.get('generation_fingerprint')
@@ -8564,6 +8618,99 @@ class SignalDeciderNextOpenExecutionService:
             and _row_validation_payload(row).get('handoff_intent')
             == 'intraday_watch_buy'
         )
+        prior_dispatch_revision_fingerprint = _normalize_optional_text(
+            revocation.get('prior_dispatch_revision_fingerprint')
+        )
+        replacement_dispatch_revision_fingerprint = _normalize_optional_text(
+            revocation.get('replacement_dispatch_revision_fingerprint')
+        )
+        prior_authority_generation_fingerprint = _normalize_optional_text(
+            revocation.get('prior_authority_generation_fingerprint')
+        )
+        replacement_authority_generation_fingerprint = _normalize_optional_text(
+            revocation.get('replacement_authority_generation_fingerprint')
+        )
+        blocking_reasons = row_validation.get('blocking_reasons')
+        reconstructed_validation_candidates: list[dict[str, Any]] = []
+        if (
+            isinstance(blocking_reasons, list)
+            and len(blocking_reasons) == 1
+            and isinstance(blocking_reasons[0], dict)
+            and blocking_reasons[0].get('code') == 'latest_snapshot_replaced'
+        ):
+            with_empty_reasons = copy.deepcopy(row_validation)
+            with_empty_reasons['blocking_reasons'] = []
+            reconstructed_validation_candidates.append(with_empty_reasons)
+            without_reasons = copy.deepcopy(row_validation)
+            without_reasons.pop('blocking_reasons', None)
+            reconstructed_validation_candidates.append(without_reasons)
+        reconstructed_dispatch_fingerprints = {
+            fingerprint
+            for validation_candidate in reconstructed_validation_candidates
+            for fingerprint in {
+                _execution_plan_row_authority_fingerprint_for_validation(
+                    row,
+                    validation_candidate,
+                    stabilize_monitor_live_authority=True,
+                ),
+                _legacy_execution_plan_row_authority_fingerprint(
+                    row,
+                    validation_candidate,
+                ),
+            }
+        }
+        monitor_generation_drift_recovered = bool(
+            reason_code == 'latest_snapshot_replaced'
+            and _row_has_intraday_watch_intent(row)
+            and revocation.get('replacement_action') == 'wait'
+            and revocation.get('replacement_actionable') is False
+            and replacement_revision_id
+            and replacement_revision_id.startswith(
+                'observation:dispatch_authority_generation:'
+            )
+            and prior_dispatch_revision_fingerprint
+            and prior_dispatch_revision_fingerprint
+            == replacement_dispatch_revision_fingerprint
+            and exec_dispatch.get('dispatch_revision_fingerprint')
+            == prior_dispatch_revision_fingerprint
+            and prior_dispatch_revision_fingerprint
+            in reconstructed_dispatch_fingerprints
+            and prior_authority_generation_fingerprint
+            and replacement_authority_generation_fingerprint
+            and prior_authority_generation_fingerprint
+            != replacement_authority_generation_fingerprint
+            and _agent_context_authority_matches(
+                stored=stored_agent_context,
+                current=current_agent_context,
+            )
+            and policy_contract_matches
+            and current_live_market_authority.get('schema_version')
+            == CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION
+            and current_live_market_authority.get('applies') is True
+            and current_live_market_authority.get('authoritative') is True
+            and current_live_market_authority.get('status') == 'available'
+            and current_live_market_authority.get('action')
+            in {'allow', 'reject', 'block_new_buy'}
+            and current_live_market_authority.get('market_date')
+            == row.target_trade_date.isoformat()
+        )
+        if monitor_generation_drift_recovered and archived_revision is None:
+            archived_revision = next(
+                (
+                    item
+                    for item in reversed(revision_history)
+                    if str(item.get('decision_snapshot_id') or '')
+                    == str(row.decision_snapshot_id)
+                    and isinstance(item.get('dispatch_evidence'), dict)
+                    and item['dispatch_evidence'].get('plan_id')
+                    == revocation.get('plan_id')
+                    and item['dispatch_evidence'].get(
+                        'dispatch_revision_fingerprint'
+                    )
+                    == prior_dispatch_revision_fingerprint
+                ),
+                None,
+            )
 
         if (
             revocation.get('schema_version') != 'core_execution_revocation_state_v1'
@@ -8573,18 +8720,24 @@ class SignalDeciderNextOpenExecutionService:
                 market_evidence_recovered
                 or agent_context_recovered
                 or contract_quarantine_recovered
+                or monitor_generation_drift_recovered
             )
             or (
                 not monitor_only_watch_recovery
+                and not monitor_generation_drift_recovered
                 and revocation.get('replacement_action') != 'reject'
             )
             or (
                 not monitor_only_watch_recovery
+                and not monitor_generation_drift_recovered
                 and revocation.get('replacement_actionable') is not False
             )
             or not replacement_revision_id
-            or not replacement_revision_id.startswith(
-                f'observation:{reason_code}:'
+            or not (
+                replacement_revision_id.startswith(
+                    f'observation:{reason_code}:'
+                )
+                or monitor_generation_drift_recovered
             )
             or str(revocation.get('prior_decision_snapshot_id') or '')
             != str(row.decision_snapshot_id)
@@ -8594,10 +8747,15 @@ class SignalDeciderNextOpenExecutionService:
             or row.account_reference != target.account_reference
             or _row_validation_payload(row).get('preopen_policy_fingerprint')
             != expected_policy_fingerprint
-            or not revoked_row_authority_fingerprint
-            or _execution_plan_row_authority_fingerprint(row)
-            != revoked_row_authority_fingerprint
-            or not prior_row_authority_fingerprint
+            or (
+                not monitor_generation_drift_recovered
+                and (
+                    not revoked_row_authority_fingerprint
+                    or _execution_plan_row_authority_fingerprint(row)
+                    != revoked_row_authority_fingerprint
+                    or not prior_row_authority_fingerprint
+                )
+            )
             or archived_revision is None
             or str(exec_dispatch.get('dispatch_status') or '').strip().lower()
             != 'accepted'
@@ -8633,6 +8791,7 @@ class SignalDeciderNextOpenExecutionService:
                 'reason_code': reason_code,
                 'revoked_row_authority_fingerprint': (
                     revoked_row_authority_fingerprint
+                    or prior_dispatch_revision_fingerprint
                 ),
                 'live_market_authority': current_live_market_authority,
                 'agent_context_authority_fingerprint': (
@@ -8652,7 +8811,9 @@ class SignalDeciderNextOpenExecutionService:
                 {
                     'retired_at': now.isoformat(),
                     'retirement_reason': (
-                        'exec_contract_quarantine_recovered'
+                        'monitor_only_generation_drift_recovered'
+                        if monitor_generation_drift_recovered
+                        else 'exec_contract_quarantine_recovered'
                         if contract_quarantine_recovered
                         else 'transient_buy_authority_recovered'
                     ),
@@ -8664,7 +8825,10 @@ class SignalDeciderNextOpenExecutionService:
             'status': 'authority_revalidated',
             'recovered_at': now.isoformat(),
             'recovery_generation': recovery_generation,
-            'row_authority_fingerprint': revoked_row_authority_fingerprint,
+            'row_authority_fingerprint': (
+                revoked_row_authority_fingerprint
+                or prior_dispatch_revision_fingerprint
+            ),
             'live_market_observed_at': current_live_market_authority.get(
                 'observed_at'
             ),
