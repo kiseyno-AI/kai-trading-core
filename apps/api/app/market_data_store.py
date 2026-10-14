@@ -3879,15 +3879,24 @@ def load_agent_feedback_candidate_score_rows(
                 DailyActionSummary.signal_score,
                 DailyActionSummary.action_label,
                 DailyActionSummary.confidence_tier,
+                DailyActionSummary.risk_tier,
+                DailyActionSummary.captured_at,
                 DailySignalFeature.signal_count,
                 DailySignalFeature.volume_power_rank,
                 DailySignalFeature.overtime_volume_rank,
                 DailySignalFeature.overtime_fluctuation_rank,
+                DailySignalFeature.captured_at,
                 DailyMomentumFactorResult.momentum_percentile,
                 DailyMomentumFactorResult.passes_momentum_top_percentile,
                 DailyMomentumFactorResult.is_momentum_eligible,
+                DailyMomentumFactorResult.captured_at,
                 DailyCompositeFactorResult.composite_percentile,
                 DailyCompositeFactorResult.is_composite_eligible,
+                DailyCompositeFactorResult.low_risk_input,
+                DailyCompositeFactorResult.low_beta_input,
+                DailyCompositeFactorResult.valid_factor_count,
+                DailyCompositeFactorResult.available_base_weight,
+                DailyCompositeFactorResult.captured_at,
             )
             .select_from(Symbol)
             .outerjoin(
@@ -3928,30 +3937,73 @@ def load_agent_feedback_candidate_score_rows(
                 'signal_score': signal_score,
                 'action_label': action_label,
                 'confidence_tier': confidence_tier,
+                'risk_tier': risk_tier,
+                'action_captured_at': (
+                    action_captured_at.isoformat()
+                    if action_captured_at
+                    else None
+                ),
                 'signal_count': signal_count,
                 'volume_power_rank': volume_power_rank,
                 'overtime_volume_rank': overtime_volume_rank,
                 'overtime_fluctuation_rank': overtime_fluctuation_rank,
+                'signal_captured_at': (
+                    signal_captured_at.isoformat()
+                    if signal_captured_at
+                    else None
+                ),
                 'momentum_percentile': _round_float(momentum_percentile, 6),
                 'passes_momentum_top_percentile': passes_momentum_top_percentile,
                 'is_momentum_eligible': is_momentum_eligible,
+                'momentum_captured_at': (
+                    momentum_captured_at.isoformat()
+                    if momentum_captured_at
+                    else None
+                ),
                 'composite_percentile': _round_float(composite_percentile, 6),
                 'is_composite_eligible': is_composite_eligible,
+                'composite_low_risk_input': _round_float(
+                    composite_low_risk_input,
+                    6,
+                ),
+                'composite_low_beta_input': _round_float(
+                    composite_low_beta_input,
+                    6,
+                ),
+                'composite_valid_factor_count': composite_valid_factor_count,
+                'composite_available_base_weight': _round_float(
+                    composite_available_base_weight,
+                    6,
+                ),
+                'composite_captured_at': (
+                    composite_captured_at.isoformat()
+                    if composite_captured_at
+                    else None
+                ),
             }
             for (
                 symbol,
                 signal_score,
                 action_label,
                 confidence_tier,
+                risk_tier,
+                action_captured_at,
                 signal_count,
                 volume_power_rank,
                 overtime_volume_rank,
                 overtime_fluctuation_rank,
+                signal_captured_at,
                 momentum_percentile,
                 passes_momentum_top_percentile,
                 is_momentum_eligible,
+                momentum_captured_at,
                 composite_percentile,
                 is_composite_eligible,
+                composite_low_risk_input,
+                composite_low_beta_input,
+                composite_valid_factor_count,
+                composite_available_base_weight,
+                composite_captured_at,
             ) in rows
         ]
 

@@ -45,6 +45,30 @@ def build_daily_retry_context(
         if isinstance(run.get('run_metadata'), Mapping)
         else {}
     )
+    previous_retry = (
+        metadata.get('retry')
+        if isinstance(metadata.get('retry'), Mapping)
+        else {}
+    )
+    baseline_run_id = previous_retry.get('baseline_run_id') or run.get('id')
+    baseline_symbols_total = previous_retry.get('baseline_symbols_total')
+    if baseline_symbols_total is None:
+        baseline_symbols_total = run.get('symbols_total')
+    baseline_symbols_succeeded = previous_retry.get(
+        'baseline_symbols_succeeded'
+    )
+    if baseline_symbols_succeeded is None:
+        baseline_symbols_succeeded = run.get('symbols_succeeded')
+    if int(baseline_symbols_succeeded or 0) > 0:
+        context.update(
+            {
+                'baseline_run_id': baseline_run_id,
+                'baseline_symbols_total': int(baseline_symbols_total or 0),
+                'baseline_symbols_succeeded': int(
+                    baseline_symbols_succeeded or 0
+                ),
+            }
+        )
     price_retry_symbols = {
         str(symbol).strip()
         for key in ('failed_symbols', 'unattempted_symbols')

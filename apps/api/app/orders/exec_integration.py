@@ -11173,7 +11173,11 @@ class SignalDeciderExecIntegrationService:
         )
 
     @staticmethod
-    def _collect_exec_readback_plans(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def _collect_exec_readback_plans(payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            return _collect_items(payload)
+        if not isinstance(payload, dict):
+            return []
         looks_like_direct_plan = bool(
             _normalize_optional_text(
                 payload.get('execution_plan_id') or payload.get('exec_plan_id')
@@ -11212,7 +11216,7 @@ class SignalDeciderExecIntegrationService:
 
     @classmethod
     def _collect_exec_plan_readback_items(cls, *, plans_result: dict[str, Any]) -> list[dict[str, Any]]:
-        payload = plans_result.get('payload') if isinstance(plans_result.get('payload'), dict) else {}
+        payload = plans_result.get('payload')
         plan_items: list[dict[str, Any]] = []
         remote_plans = cls._collect_exec_readback_plans(payload)
 
@@ -11293,6 +11297,7 @@ class SignalDeciderExecIntegrationService:
                         **item,
                         'status': parent_status,
                         'terminal': parent_terminal,
+                        '_exec_readback_evidence_source': 'parent_projection',
                         **(
                             {'observed_at': parent_observed_at}
                             if parent_observed_at is not None
@@ -11310,10 +11315,24 @@ class SignalDeciderExecIntegrationService:
 
             for raw_state in raw_states:
                 state = dict(raw_state)
-                if parent_execution_plan_id and not _normalize_optional_text(
-                    state.get('execution_plan_id') or state.get('exec_plan_id')
-                ):
-                    state['execution_plan_id'] = parent_execution_plan_id
+                child_execution_plan_id = _normalize_optional_text(
+                    state.get('execution_plan_id')
+                )
+                child_legacy_exec_plan_id = _normalize_optional_text(
+                    state.get('exec_plan_id')
+                )
+                if parent_execution_plan_id:
+                    if any(
+                        child_plan_id
+                        and child_plan_id != parent_execution_plan_id
+                        for child_plan_id in (
+                            child_execution_plan_id,
+                            child_legacy_exec_plan_id,
+                        )
+                    ):
+                        state['_exec_readback_plan_identity_conflict'] = True
+                    if not child_execution_plan_id:
+                        state['execution_plan_id'] = parent_execution_plan_id
                 if parent_plan_id and not _normalize_optional_text(
                     state.get('external_plan_id') or state.get('plan_id')
                 ):
@@ -11370,10 +11389,24 @@ class SignalDeciderExecIntegrationService:
 
     @staticmethod
     def _exec_plan_ids(payload: dict[str, Any]) -> set[str]:
+        if payload.get('_exec_readback_plan_identity_conflict') is True:
+            return set()
+        canonical_execution_plan_id = _normalize_optional_text(
+            payload.get('execution_plan_id')
+        )
+        legacy_execution_plan_id = _normalize_optional_text(
+            payload.get('exec_plan_id')
+        )
+        if canonical_execution_plan_id:
+            if (
+                legacy_execution_plan_id
+                and legacy_execution_plan_id != canonical_execution_plan_id
+            ):
+                return set()
+            return {canonical_execution_plan_id}
         values = {
             _normalize_optional_text(payload.get(key))
             for key in (
-                'execution_plan_id',
                 'exec_plan_id',
                 'external_plan_id',
                 'plan_id',
@@ -11437,15 +11470,11 @@ class SignalDeciderExecIntegrationService:
             != dispatch_material_fingerprint
         ):
             return None
-        payload = (
-            plans_result.get('payload')
-            if isinstance(plans_result.get('payload'), dict)
-            else {}
-        )
+        payload = plans_result.get('payload')
         remote_plan = next(
             (
                 item
-                for item in _collect_items(payload)
+                for item in cls._collect_exec_readback_plans(payload)
                 if _normalize_optional_text(
                     item.get('plan_id') or item.get('external_plan_id')
                 )
@@ -11575,11 +11604,7 @@ class SignalDeciderExecIntegrationService:
         link: dict[str, Any],
         plans_result: dict[str, Any],
     ) -> dict[str, Any] | None:
-        payload = (
-            plans_result.get('payload')
-            if isinstance(plans_result.get('payload'), dict)
-            else {}
-        )
+        payload = plans_result.get('payload')
         link_plan_id = _normalize_optional_text(link.get('exec_plan_id'))
         if not link_plan_id:
             return None
@@ -11632,6 +11657,11 @@ class SignalDeciderExecIntegrationService:
                 link=link,
                 plan_items=plan_items,
             )
+            has_exact_current_item_evidence = bool(
+                matched_item is not None
+                and matched_item.get('_exec_readback_evidence_source')
+                != 'parent_projection'
+            )
             if identity_mismatch is not None:
                 identity_mismatches.append(identity_mismatch)
             if matched_item is None and identity_mismatch is None:
@@ -11648,10 +11678,20 @@ class SignalDeciderExecIntegrationService:
             if (
                 existing_status in EXEC_MONITORING_TERMINAL_STATUSES
                 and status not in EXEC_MONITORING_TERMINAL_STATUSES
+                and not (
+                    existing_status == 'exec_agent_rejected'
+                    and has_exact_current_item_evidence
+                )
             ):
                 merged_links.append(link)
                 continue
             if status:
+                # The exact current item-state tuple is Exec's live truth. A
+                # prior exec_agent_rejected readback can be reopened after
+                # re-sizing/revalidation; retaining that stale state would
+                # incorrectly rewrite Core to submit_failed. Other terminal
+                # states remain monotonic, and plan-wide terminal overrides
+                # remain enforced while collecting matched_item above.
                 link['remote_status'] = status
                 link['remote_status_source'] = 'exec_item_state'
             compact_item = compact_exec_response_item(matched_item)

@@ -195,6 +195,50 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             missing_audit['filter_payload']['provenance']['audit_evidence_status'],
             'unknown',
         )
+        self.assertEqual(
+            missing_audit['filter_payload']['evidence_status']['audit'],
+            'unavailable',
+        )
+
+    def test_missing_financial_inputs_are_unavailable_not_proven_issues(self):
+        service = DailyPiotroskiFilterService()
+        incomplete = _build_input(
+            symbol='005930',
+            pbr=0.4,
+            return_20d=8.0,
+            has_audit_issue=None,
+        )
+        incomplete.net_income = None
+        incomplete.total_equity = None
+        incomplete.operating_cash_flow = None
+        incomplete.prior_net_income = None
+        incomplete.total_assets = None
+        incomplete.prior_total_assets = None
+
+        with (
+            patch.object(
+                service,
+                '_load_inputs',
+                return_value=[
+                    incomplete,
+                    _build_input(symbol='000660', pbr=2.0, return_20d=-8.0),
+                ],
+            ),
+            patch(
+                'app.signals.piotroski_filter.upsert_daily_piotroski_filter_results'
+            ) as upsert,
+        ):
+            service.rebuild_for_market_date(market_date='2026-04-14')
+
+        payload = {
+            item['symbol']: item for item in upsert.call_args.args[0]
+        }['005930']
+        evidence = payload['filter_payload']['evidence_status']
+        self.assertEqual(evidence['profitability'], 'unavailable')
+        self.assertEqual(evidence['capital'], 'unavailable')
+        self.assertEqual(evidence['audit'], 'unavailable')
+        self.assertEqual(evidence['financial_signal_coverage'], 'unavailable')
+        self.assertFalse(payload['passed_filter'])
 
     def test_collect_and_persist_stores_passed_and_not_passed_symbols(self):
         service = DailyPiotroskiFilterService()

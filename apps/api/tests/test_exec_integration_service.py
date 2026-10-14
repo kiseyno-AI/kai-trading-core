@@ -50,6 +50,7 @@ from app.orders.exec_integration import (
     SignalDeciderExecPayloadContractError,
     _bind_core_confirmed_activation,
     _bounded_dispatch_object,
+    _build_exec_destination_binding,
     _build_market_regime_sizing_policy,
     _collect_items,
     _delegated_gate_contract_error,
@@ -420,6 +421,353 @@ def test_bounded_dispatch_projection_never_drops_late_essential_keys() -> None:
     assert len(json.dumps(projected, separators=(',', ':')).encode('utf-8')) <= 2 * 1024
 
 
+def test_top_level_exec_plan_list_preserves_current_item_statuses() -> None:
+    statuses = (
+        'watch_monitoring_active',
+        'watch_sizing_pending',
+        'watch_buy_triggered_blocked',
+    )
+    plans_result = {
+        'status': 'ok',
+        'payload': [
+            {
+                'execution_plan_id': 'exec-plan-1',
+                'external_plan_id': 'core-plan-1',
+                'status': 'accepted',
+                'item_states': [
+                    {
+                        'core_item_key': f'core-item-{index}',
+                        'execution_plan_item_id': f'exec-item-{index}',
+                        'status': status,
+                    }
+                    for index, status in enumerate(statuses, start=1)
+                ],
+            }
+        ],
+    }
+
+    items = SignalDeciderExecIntegrationService._collect_exec_plan_readback_items(
+        plans_result=plans_result
+    )
+
+    assert [item['status'] for item in items] == list(statuses)
+    assert {item['execution_plan_id'] for item in items} == {'exec-plan-1'}
+    assert {item['external_plan_id'] for item in items} == {'core-plan-1'}
+
+
+def test_exact_current_exec_state_replaces_stale_agent_rejection() -> None:
+    statuses = (
+        'watch_monitoring_active',
+        'watch_sizing_pending',
+        'watch_buy_triggered_blocked',
+    )
+    for status in statuses:
+        merged_links, identity_mismatches = (
+            SignalDeciderExecIntegrationService._merge_exec_plan_readback_links(
+                item_links=[
+                    {
+                        'core_item_key': 'core-item-1',
+                        'exec_plan_id': 'exec-plan-1',
+                        'exec_plan_item_id': 'exec-item-1',
+                        'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                        'remote_status': 'exec_agent_rejected',
+                        'remote_status_source': 'exec_item_state',
+                        'current_state': {
+                            'core_item_key': 'core-item-1',
+                            'execution_plan_id': 'exec-plan-1',
+                            'execution_plan_item_id': 'exec-item-1',
+                            'status': 'exec_agent_rejected',
+                        },
+                    }
+                ],
+                plans_result={
+                    'status': 'ok',
+                    'payload': [
+                        {
+                            'execution_plan_id': 'exec-plan-1',
+                            'external_plan_id': 'core-plan-1',
+                            'status': 'accepted',
+                            'item_states': [
+                                {
+                                    'core_item_key': 'core-item-1',
+                                    'execution_plan_item_id': 'exec-item-1',
+                                    'status': status,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+        )
+
+        assert identity_mismatches == [], status
+        assert merged_links[0]['remote_status'] == status
+        assert merged_links[0]['current_state']['status'] == status
+
+
+def test_partial_top_level_exec_state_cannot_replace_exact_bound_state() -> None:
+    original_link = {
+        'core_item_key': 'core-item-1',
+        'exec_plan_id': 'exec-plan-1',
+        'exec_plan_item_id': 'exec-item-1',
+        'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+        'remote_status': 'exec_agent_rejected',
+        'remote_status_source': 'exec_item_state',
+        'current_state': {
+            'core_item_key': 'core-item-1',
+            'execution_plan_id': 'exec-plan-1',
+            'execution_plan_item_id': 'exec-item-1',
+            'status': 'exec_agent_rejected',
+        },
+    }
+
+    merged_links, identity_mismatches = (
+        SignalDeciderExecIntegrationService._merge_exec_plan_readback_links(
+            item_links=[original_link],
+            plans_result={
+                'status': 'ok',
+                'payload': [
+                    {
+                        'execution_plan_id': 'exec-plan-1',
+                        'external_plan_id': 'core-plan-1',
+                        'status': 'accepted',
+                        'item_states': [
+                            {
+                                'core_item_key': 'core-item-1',
+                                'status': 'watch_monitoring_active',
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+    )
+
+    assert identity_mismatches[0]['reason_code'] == (
+        'exec_readback_identity_mismatch'
+    )
+    assert merged_links[0]['remote_status'] == 'exec_agent_rejected'
+    assert merged_links[0]['current_state']['status'] == (
+        'exec_agent_rejected'
+    )
+
+
+def test_canonical_exec_plan_id_mismatch_cannot_match_external_alias() -> None:
+    rejected_link = {
+        'core_item_key': 'core-item-1',
+        'exec_plan_id': 'exec-plan-a',
+        'exec_plan_item_id': 'exec-item-1',
+        'remote_status': 'exec_agent_rejected',
+        'remote_status_source': 'exec_item_state',
+        'current_state': {
+            'core_item_key': 'core-item-1',
+            'execution_plan_id': 'exec-plan-a',
+            'execution_plan_item_id': 'exec-item-1',
+            'status': 'exec_agent_rejected',
+            'terminal': True,
+        },
+    }
+
+    merged_links, identity_mismatches = (
+        SignalDeciderExecIntegrationService._merge_exec_plan_readback_links(
+            item_links=[rejected_link],
+            plans_result={
+                'status': 'ok',
+                'payload': [
+                    {
+                        'execution_plan_id': 'exec-plan-b',
+                        'external_plan_id': 'exec-plan-a',
+                        'status': 'running',
+                        'item_states': [
+                            {
+                                'core_item_key': 'core-item-1',
+                                'execution_plan_item_id': 'exec-item-1',
+                                'status': 'watch_monitoring_active',
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+    )
+
+    assert identity_mismatches[0]['reason_code'] == (
+        'exec_readback_identity_mismatch'
+    )
+    assert merged_links[0]['remote_status'] == 'exec_agent_rejected'
+    assert merged_links[0]['current_state']['status'] == (
+        'exec_agent_rejected'
+    )
+
+
+def test_parent_canonical_plan_id_rejects_conflicting_child_legacy_alias() -> None:
+    rejected_link = {
+        'core_item_key': 'core-item-1',
+        'exec_plan_id': 'exec-plan-a',
+        'exec_plan_item_id': 'exec-item-1',
+        'remote_status': 'exec_agent_rejected',
+        'remote_status_source': 'exec_item_state',
+        'current_state': {
+            'core_item_key': 'core-item-1',
+            'execution_plan_id': 'exec-plan-a',
+            'execution_plan_item_id': 'exec-item-1',
+            'status': 'exec_agent_rejected',
+            'terminal': True,
+        },
+    }
+
+    merged_links, identity_mismatches = (
+        SignalDeciderExecIntegrationService._merge_exec_plan_readback_links(
+            item_links=[rejected_link],
+            plans_result={
+                'status': 'ok',
+                'payload': [
+                    {
+                        'execution_plan_id': 'exec-plan-b',
+                        'external_plan_id': 'exec-plan-a',
+                        'status': 'running',
+                        'item_states': [
+                            {
+                                'core_item_key': 'core-item-1',
+                                'exec_plan_id': 'exec-plan-a',
+                                'execution_plan_item_id': 'exec-item-1',
+                                'status': 'watch_monitoring_active',
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+    )
+
+    assert identity_mismatches[0]['reason_code'] == (
+        'exec_readback_identity_mismatch'
+    )
+    assert merged_links[0]['remote_status'] == 'exec_agent_rejected'
+    assert merged_links[0]['current_state']['status'] == (
+        'exec_agent_rejected'
+    )
+
+
+def test_top_level_exec_plan_list_uses_parent_state_when_items_are_omitted() -> None:
+    merged_links, identity_mismatches = (
+        SignalDeciderExecIntegrationService._merge_exec_plan_readback_links(
+            item_links=[
+                {
+                    'core_item_key': 'core-item-1',
+                    'exec_plan_id': 'exec-plan-1',
+                    'exec_plan_item_id': 'exec-item-1',
+                    'remote_status': 'accepted',
+                    'remote_status_source': 'dispatch_ack',
+                }
+            ],
+            plans_result={
+                'status': 'ok',
+                'payload': [
+                    {
+                        'execution_plan_id': 'exec-plan-1',
+                        'status': 'running',
+                    }
+                ],
+            },
+        )
+    )
+
+    assert identity_mismatches == []
+    assert merged_links[0]['remote_status'] == 'running'
+    assert merged_links[0]['current_state'] == {
+        'core_item_key': 'core-item-1',
+        'execution_plan_id': 'exec-plan-1',
+        'execution_plan_item_id': 'exec-item-1',
+        'status': 'running',
+        'terminal': False,
+    }
+
+
+def test_parent_plan_state_cannot_reopen_exact_agent_rejection() -> None:
+    merged_links, identity_mismatches = (
+        SignalDeciderExecIntegrationService._merge_exec_plan_readback_links(
+            item_links=[
+                {
+                    'core_item_key': 'core-item-1',
+                    'exec_plan_id': 'exec-plan-1',
+                    'exec_plan_item_id': 'exec-item-1',
+                    'remote_status': 'exec_agent_rejected',
+                    'remote_status_source': 'exec_item_state',
+                    'current_state': {
+                        'core_item_key': 'core-item-1',
+                        'execution_plan_id': 'exec-plan-1',
+                        'execution_plan_item_id': 'exec-item-1',
+                        'status': 'exec_agent_rejected',
+                        'terminal': True,
+                    },
+                }
+            ],
+            plans_result={
+                'status': 'ok',
+                'payload': [
+                    {
+                        'execution_plan_id': 'exec-plan-1',
+                        'status': 'running',
+                    }
+                ],
+            },
+        )
+    )
+
+    assert identity_mismatches == []
+    assert merged_links[0]['remote_status'] == 'exec_agent_rejected'
+    assert merged_links[0]['current_state']['status'] == (
+        'exec_agent_rejected'
+    )
+
+
+def test_parent_state_projected_through_item_ack_cannot_reopen_rejection() -> None:
+    rejected_link = {
+        'core_item_key': 'core-item-1',
+        'exec_plan_id': 'exec-plan-1',
+        'exec_plan_item_id': 'exec-item-1',
+        'remote_status': 'exec_agent_rejected',
+        'remote_status_source': 'exec_item_state',
+        'current_state': {
+            'core_item_key': 'core-item-1',
+            'execution_plan_id': 'exec-plan-1',
+            'execution_plan_item_id': 'exec-item-1',
+            'status': 'exec_agent_rejected',
+            'terminal': True,
+        },
+    }
+
+    merged_links, identity_mismatches = (
+        SignalDeciderExecIntegrationService._merge_exec_plan_readback_links(
+            item_links=[rejected_link],
+            plans_result={
+                'status': 'ok',
+                'payload': [
+                    {
+                        'execution_plan_id': 'exec-plan-1',
+                        'status': 'running',
+                        'item_acks': [
+                            {
+                                'core_item_key': 'core-item-1',
+                                'execution_plan_id': 'exec-plan-1',
+                                'execution_plan_item_id': 'exec-item-1',
+                                'status': 'accepted',
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+    )
+
+    assert identity_mismatches == []
+    assert merged_links[0]['remote_status'] == 'exec_agent_rejected'
+    assert merged_links[0]['current_state']['status'] == (
+        'exec_agent_rejected'
+    )
+
+
 def test_bounded_dispatch_projection_fails_closed_when_essentials_exceed_budget() -> None:
     essential_keys = tuple(f'identity_{index}' for index in range(8))
     payload = {key: 'x' * 2_000 for key in essential_keys}
@@ -740,6 +1088,73 @@ def test_v4_dispatch_ack_requires_exact_one_to_one_items_and_durable_ids() -> No
                 submitted_core_item_keys=keys,
                 expected_dispatch_material_fingerprint=dispatch_material_fingerprint,
             )
+
+
+def test_ambiguous_dispatch_strict_readback_recovers_equivalent_top_level_list_ack() -> None:
+    plan_id = 'core-plan-1'
+    execution_plan_id = 'exec-plan-1'
+    core_item_key = 'core-plan-1:next_open_buy'
+    dispatch_material_fingerprint = 'a' * 64
+    destination_binding = _build_exec_destination_binding(
+        base_url='http://127.0.0.1:8010',
+        runtime_mode='paper',
+        dispatch_source='core',
+        account_reference='KIS:00000000-00',
+    )
+    exec_dispatch = {
+        'plan_id': plan_id,
+        'dispatch_material_fingerprint': dispatch_material_fingerprint,
+        'destination_binding': destination_binding,
+        'last_request_summary': {
+            'metadata': {
+                'dispatch_material_fingerprint': (
+                    dispatch_material_fingerprint
+                ),
+            },
+        },
+        'item_links': [{'core_item_key': core_item_key}],
+    }
+    remote_plan = {
+        'plan_id': plan_id,
+        'external_plan_id': plan_id,
+        'execution_plan_id': execution_plan_id,
+        'accepted_item_count': 1,
+        'rejected_item_count': 0,
+        'contract_ack': {
+            'schema_version': EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
+            'contract_version': EXECUTION_HANDOFF_CONTRACT_VERSION,
+            'capability': EXECUTION_HANDOFF_CAPABILITY,
+            'plan_id': plan_id,
+            'status': 'accepted',
+            'dispatch_material_fingerprint': dispatch_material_fingerprint,
+        },
+        'item_acks': [
+            {
+                'core_item_key': core_item_key,
+                'execution_plan_id': execution_plan_id,
+                'execution_plan_item_id': 'exec-item-1',
+                'status': 'accepted',
+            }
+        ],
+    }
+
+    wrapped = (
+        SignalDeciderExecIntegrationService
+        ._bind_ambiguous_dispatch_from_strict_readback_ack(
+            exec_dispatch=exec_dispatch,
+            plans_result={'payload': {'items': [remote_plan]}},
+        )
+    )
+    top_level = (
+        SignalDeciderExecIntegrationService
+        ._bind_ambiguous_dispatch_from_strict_readback_ack(
+            exec_dispatch=exec_dispatch,
+            plans_result={'payload': [remote_plan]},
+        )
+    )
+
+    assert wrapped is not None
+    assert top_level == wrapped
 
 
 def test_exec_payload_delegation_codes_are_allowlisted() -> None:
