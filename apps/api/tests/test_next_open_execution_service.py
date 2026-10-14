@@ -69,6 +69,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_REVOCATION_MANUAL_REVIEW,
     EXECUTION_STATUS_REVOKED,
     EXECUTION_STATUS_SUBMITTED,
+    EXECUTION_STATUS_WATCH_EXPIRED,
     ELIGIBILITY_BLOCKED,
     ELIGIBILITY_ELIGIBLE,
     ELIGIBILITY_MONITOR_CANDIDATE,
@@ -4694,6 +4695,49 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             row = session.get(SignalDeciderExecutionPlanItem, item['plan_item_id'])
             session.expunge(row)
         self.assertTrue(SignalDeciderExecIntegrationService._row_is_dispatchable(row))
+
+    def test_refresh_preserves_watch_expired_and_prevents_redispatch(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_short_term_snapshot(
+            symbol='005930',
+            tactical_action='watch_for_trigger',
+        )
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            initial = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+            initial_item = next(
+                item
+                for item in initial['items']
+                if item['decision_snapshot_id'] == snapshot_id
+            )
+            plan_item_id = initial_item['plan_item_id']
+            with session_scope() as session:
+                row = session.get(SignalDeciderExecutionPlanItem, plan_item_id)
+                row.execution_status = EXECUTION_STATUS_WATCH_EXPIRED
+
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_scheduler',
+            )
+
+        item = next(
+            item
+            for item in refreshed['items']
+            if item['plan_item_id'] == plan_item_id
+        )
+        self.assertEqual(item['execution_status'], EXECUTION_STATUS_WATCH_EXPIRED)
+        self.assertEqual(refreshed['summary']['watch_expired_count'], 1)
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, plan_item_id)
+            session.expunge(row)
+        self.assertFalse(SignalDeciderExecIntegrationService._row_is_dispatchable(row))
 
     def test_refresh_plan_items_audits_wait_conflict_block_report_only(self) -> None:
         signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='wait')

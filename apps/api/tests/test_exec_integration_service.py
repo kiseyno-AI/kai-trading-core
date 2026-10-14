@@ -2510,6 +2510,72 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
 
                 self.assertEqual(result['derived_status'], expected)
 
+    def test_watch_expiry_does_not_clear_quarantine_on_partial_readback(self) -> None:
+        row = SimpleNamespace(
+            decision_agent_name='short-term-decider',
+            planned_side='buy',
+            eligibility_status='blocked',
+            execution_status='submit_failed',
+            validation_payload={
+                'blocking_reasons': [
+                    {
+                        'code': 'exec_contract_quarantined',
+                        'message': 'Prior exact contract quarantine.',
+                    }
+                ],
+                'short_term': {
+                    'tactical_action': 'watch_for_trigger',
+                    'handoff_intent': 'intraday_watch_buy',
+                },
+            },
+            traceability_payload={
+                'raw_action': 'watch_for_trigger',
+                'handoff_intent': 'intraday_watch_buy',
+            },
+        )
+        item_links = [
+            {
+                'intent': 'intraday_watch_buy',
+                'current_state': {
+                    'status': 'watch_expired',
+                    'terminal': True,
+                },
+                'remote_status': 'watch_expired',
+                'remote_status_source': 'exec_item_state',
+            }
+        ]
+        derived_state = {
+            'derived_status': 'cancelled',
+            'has_plan_attributed_fill_evidence': False,
+            'matched_order_count': 0,
+            'matched_execution_count': 0,
+            'open_quantity': '0',
+            'scoped_position_exposure_quantity': '0',
+            'endpoint_statuses': {
+                'plans': 'ok',
+                'orders': 'ok',
+                'executions': 'error',
+                'positions': 'ok',
+            },
+        }
+
+        self.service._sync_exec_terminal_state(
+            row=row,
+            item_links=item_links,
+            derived_state=derived_state,
+            now=datetime(2026, 10, 14, tzinfo=timezone.utc),
+            trigger='test_partial_readback',
+        )
+
+        self.assertEqual(row.execution_status, 'submit_failed')
+        self.assertIn(
+            'exec_contract_quarantined',
+            {
+                reason['code']
+                for reason in row.validation_payload['blocking_reasons']
+            },
+        )
+
     def test_v4_item_states_are_current_truth_while_item_acks_remain_proof(self) -> None:
         link = {
             'core_item_key': 'core-item-1',
@@ -4926,6 +4992,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         exec_status: str = 'watch_monitoring_active',
         response_item_status: str | None = None,
         core_execution_status: str = 'planned',
+        blocking_reason_code: str = 'manual_recovery_gate_block',
     ) -> tuple[dict, dict, int]:
         short_snapshot_id = self._seed_short_term_snapshot()
         short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
@@ -4966,7 +5033,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 if link['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
             )
         original_blocking_reason = {
-            'code': 'manual_recovery_gate_block',
+            'code': blocking_reason_code,
             'message': 'Original core quality gate remained blocked before exec restore.',
         }
         original_warning = {
@@ -10849,6 +10916,43 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             audit = row.submission_payload['exec_dispatch']['core_state_sync']
             self.assertEqual(audit['core_state_before']['execution_status'], 'submit_failed')
             self.assertEqual(audit['core_state_after']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+
+    async def test_readback_reconciles_recovered_watch_expiry_without_stale_quarantine_reason(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_expired',
+            response_item_status='watch_expired',
+            core_execution_status='submit_failed',
+            blocking_reason_code='exec_contract_quarantined',
+        )
+
+        self.assertEqual(short_item['execution_status'], 'watch_expired')
+        self.assertEqual(short_item['remote_state']['derived_status'], 'cancelled')
+        self.assertEqual(short_item['exec_agent_reason_code'], 'watch_expired')
+        self.assertNotIn(
+            'exec_contract_quarantined',
+            {
+                reason['code']
+                for reason in short_item['validation']['blocking_reasons']
+            },
+        )
+        self.assertIn(
+            'watch_expired',
+            {
+                reason['code']
+                for reason in short_item['validation']['blocking_reasons']
+            },
+        )
+        self.assertEqual(overview['summary']['watch_expired_count'], 1)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            self.assertEqual(row.execution_status, 'watch_expired')
+            self.assertEqual(
+                row.submission_payload['exec_dispatch']['terminal_state_sync'][
+                    'terminal_status'
+                ],
+                'watch_expired',
+            )
 
     async def test_runtime_read_model_uses_exec_watch_status_without_broker_orders(self) -> None:
         _, _, short_plan_item_id = await self._readback_stale_short_term_watch(

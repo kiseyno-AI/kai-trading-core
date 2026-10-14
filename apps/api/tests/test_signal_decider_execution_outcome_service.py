@@ -1209,6 +1209,31 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
         self.assertIsNone(item['realized_pnl_krw'])
         self.assertEqual(item['diagnostics']['entry']['order_status'], 'rejected')
 
+    def test_list_outcomes_maps_unfilled_watch_expiry_to_entry_canceled(self) -> None:
+        snapshot_id = self._seed_snapshot(agent_name='short-term-decider')
+        entry_plan_item_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id='STDE-20260430-005930-WATCH',
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='watch_expired',
+            decision_agent_name='short-term-decider',
+        )
+
+        payload = signal_decider_execution_outcome_service.list_outcomes(
+            snapshot_id=snapshot_id,
+            refresh=True,
+        )
+
+        self.assertEqual(payload['summary']['count'], 1)
+        item = payload['items'][0]
+        self.assertEqual(item['entry_plan_item_id'], entry_plan_item_id)
+        self.assertEqual(item['lifecycle_status'], 'entry_canceled')
+        self.assertEqual(item['exit_reason'], 'entry_canceled')
+        self.assertEqual(item['entry_filled_quantity'], '0.00000000')
+
 
 if __name__ == '__main__':
     unittest.main()
