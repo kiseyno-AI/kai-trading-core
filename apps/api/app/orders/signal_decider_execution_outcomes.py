@@ -27,6 +27,7 @@ EXEC_INTENT_NEXT_OPEN_BUY = 'next_open_buy'
 EXEC_INTENT_INTRADAY_WATCH_BUY = 'intraday_watch_buy'
 EXEC_INTENT_TARGET_SELL = 'target_sell'
 EXEC_INTENT_STOP_SELL = 'stop_sell'
+EXECUTION_STATUS_WATCH_EXPIRED = 'watch_expired'
 LIFECYCLE_PLANNED = 'planned'
 LIFECYCLE_DRY_RUN = 'dry_run'
 LIFECYCLE_ENTRY_SUBMITTED = 'entry_submitted'
@@ -1864,6 +1865,8 @@ class SignalDeciderExecutionOutcomeService:
         if entry_row.execution_status == 'dry_run':
             return LIFECYCLE_DRY_RUN, EXIT_REASON_DRY_RUN
         if entry_filled_quantity <= Decimal('0'):
+            if entry_row.execution_status == EXECUTION_STATUS_WATCH_EXPIRED:
+                return LIFECYCLE_ENTRY_CANCELED, EXIT_REASON_ENTRY_CANCELED
             if entry_order_status == BrokerOrderStatus.REJECTED.value or entry_request_status == 'rejected':
                 return LIFECYCLE_ENTRY_REJECTED, EXIT_REASON_ENTRY_REJECTED
             if entry_order_status == BrokerOrderStatus.CANCELED.value:

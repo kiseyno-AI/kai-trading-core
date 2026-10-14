@@ -122,7 +122,10 @@ from app.market_data_store import (
     load_daily_pykrx_enrichment_rows,
 )
 from app.orders.account_scope import parse_kis_account_reference
-from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
+from app.orders.signal_decider_execution_outcomes import (
+    EXECUTION_STATUS_WATCH_EXPIRED,
+    signal_decider_execution_outcome_service,
+)
 from app.orders.signal_decider_performance_gates import evaluate_next_open_performance_gate
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
@@ -2459,6 +2462,7 @@ def _is_dispatch_terminal_status(value: Any) -> bool:
     return _normalize_optional_text(value) in {
         EXECUTION_STATUS_SUBMITTED,
         EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING,
+        EXECUTION_STATUS_WATCH_EXPIRED,
     }
 
 
@@ -9271,6 +9275,11 @@ class SignalDeciderNextOpenExecutionService:
                 1 for row in rows if row.execution_status == EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
             ),
             'submit_failed_count': sum(1 for row in rows if row.execution_status == EXECUTION_STATUS_SUBMIT_FAILED),
+            'watch_expired_count': sum(
+                1
+                for row in rows
+                if row.execution_status == EXECUTION_STATUS_WATCH_EXPIRED
+            ),
             'decision_agent_counts': dict(
                 sorted(
                     Counter(_normalize_agent_name(row.decision_agent_name) for row in rows).items()

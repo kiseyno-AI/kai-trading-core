@@ -82,6 +82,7 @@ from app.orders.next_open_execution import (
     EXECUTION_STATUS_REVOCATION_PENDING,
     EXECUTION_STATUS_SUBMIT_FAILED,
     EXECUTION_STATUS_SUBMITTED,
+    EXECUTION_STATUS_WATCH_EXPIRED,
     EXECUTION_WINDOW_NEXT_OPEN,
     NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION,
     SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW,
@@ -8744,6 +8745,11 @@ class SignalDeciderExecIntegrationService:
     def _row_is_dispatchable(row: SignalDeciderExecutionPlanItem) -> bool:
         if str(row.planned_side or '').strip().lower() != 'buy':
             return False
+        if (
+            _normalize_optional_text(getattr(row, 'execution_status', None))
+            == EXECUTION_STATUS_WATCH_EXPIRED
+        ):
+            return False
         decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
         if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
             if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
@@ -12055,6 +12061,25 @@ class SignalDeciderExecIntegrationService:
             if isinstance(terminal_state.get('decision'), dict)
             else {}
         )
+        watch_expired_reconciliation = bool(
+            acknowledged_revocation is None
+            and terminal_status == 'watch_expired'
+            and cls._is_short_term_watch_buy_row(row)
+            and all(
+                (derived_state.get('endpoint_statuses') or {}).get(endpoint)
+                == REMOTE_FETCH_STATUS_OK
+                for endpoint in ('plans', 'orders', 'executions', 'positions')
+            )
+            and derived_state.get('has_plan_attributed_fill_evidence') is False
+            and int(derived_state.get('matched_order_count') or 0) == 0
+            and int(derived_state.get('matched_execution_count') or 0) == 0
+            and _safe_decimal(derived_state.get('open_quantity'))
+            == Decimal('0')
+            and _safe_decimal(
+                derived_state.get('scoped_position_exposure_quantity')
+            )
+            == Decimal('0')
+        )
         if acknowledged_revocation is not None:
             terminal_status = 'revoked'
             reason_code = str(acknowledged_revocation['reason_code'])
@@ -12063,6 +12088,13 @@ class SignalDeciderExecIntegrationService:
                 'with no order, fill, or position exposure.'
             )
             target_execution_status = EXECUTION_STATUS_REVOKED
+        elif watch_expired_reconciliation:
+            reason_code = 'watch_expired'
+            reason = (
+                'Exec confirmed that the exact trigger-gated watch expired '
+                'without an order, fill, or scoped position.'
+            )
+            target_execution_status = EXECUTION_STATUS_WATCH_EXPIRED
         else:
             reason_code = (
                 _normalize_optional_text(decision.get('reason_code'))
@@ -12106,6 +12138,11 @@ class SignalDeciderExecIntegrationService:
             item
             for item in (validation.get('blocking_reasons') or [])
             if isinstance(item, dict)
+            and not (
+                watch_expired_reconciliation
+                and _normalize_optional_text(item.get('code'))
+                == 'exec_contract_quarantined'
+            )
         ]
         if acknowledged_revocation is None and not any(
             _normalize_optional_text(item.get('code')) == reason_code
@@ -13353,9 +13390,35 @@ class SignalDeciderExecIntegrationService:
             'item_links': exec_dispatch.get('item_links') or [],
         }
         agent_decision = self._extract_exec_agent_decision({**item, 'dispatch': dispatch_payload})
+        remote_status = _normalize_status(derived_state.get('derived_status'))
+        terminal_state_sync = (
+            exec_dispatch.get('terminal_state_sync')
+            if isinstance(exec_dispatch.get('terminal_state_sync'), dict)
+            else {}
+        )
+        terminal_sync_decision = (
+            terminal_state_sync.get('decision')
+            if isinstance(terminal_state_sync.get('decision'), dict)
+            else {}
+        )
+        exec_agent_reason_code = (
+            agent_decision['reason_code']
+            or (
+                terminal_sync_decision.get('reason_code')
+                or terminal_state_sync.get('terminal_status')
+                if remote_status in {
+                    UI_BOARD_STATUS_CANCELLED,
+                    UI_BOARD_STATUS_FAILED,
+                }
+                and _normalize_status(
+                    terminal_state_sync.get('derived_status')
+                )
+                == remote_status
+                else None
+            )
+        )
         exec_agent_approved = bool(agent_decision['approved'])
         exec_agent_rejected = bool(agent_decision['rejected'])
-        remote_status = _normalize_status(derived_state.get('derived_status'))
         terminal = remote_status in EXEC_MONITORING_TERMINAL_STATUSES or dispatch_status in {
             EXEC_DISPATCH_STATUS_FAILED,
             EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
@@ -13413,7 +13476,7 @@ class SignalDeciderExecIntegrationService:
             'exec_agent_approved': exec_agent_approved,
             'approval_state': approval_state,
             'exec_agent_action': agent_decision['action'],
-            'exec_agent_reason_code': agent_decision['reason_code'],
+            'exec_agent_reason_code': exec_agent_reason_code,
             'exec_agent_target_profile': agent_decision['target_profile'],
             'exec_agent_target_tag': agent_decision['target_tag'],
             'exec_watch_state_sync': sync_audit,
