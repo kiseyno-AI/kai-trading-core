@@ -12821,6 +12821,8 @@ class PykrxBackfillServiceTests(TestCase):
             {
                 'id': 7,
                 'status': 'completed_with_errors',
+                'symbols_total': 2681,
+                'symbols_succeeded': 2680,
                 'symbols_failed': 1,
                 'run_metadata': {
                     'failed_symbols': ['472220'],
@@ -12870,8 +12872,29 @@ class PykrxBackfillServiceTests(TestCase):
                 chain_fundamentals_followup=False,
             )
 
-        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertEqual(result['error_type'], 'PykrxRetryScopeUnresolved')
+        self.assertEqual(result['unresolved_symbols'], ['472220'])
+        self.assertFalse(result['provider_outage_suspected'])
+        self.assertEqual(result['retry_scope_status'], 'partial')
+        self.assertEqual(result['retry']['baseline_run_id'], 7)
+        self.assertEqual(result['retry']['baseline_symbols_total'], 2681)
+        self.assertEqual(result['retry']['baseline_symbols_succeeded'], 2680)
+        self.assertEqual(result['retry']['max_attempts'], 5)
+        self.assertEqual(
+            complete_run.call_args.kwargs['status'],
+            'completed_with_errors',
+        )
         completed_metadata = complete_run.call_args.kwargs['run_metadata']
+        self.assertEqual(
+            completed_metadata['stage_progress']['price_collection']['status'],
+            'partial',
+        )
+        self.assertEqual(completed_metadata['unresolved_symbols'], ['472220'])
+        self.assertEqual(
+            completed_metadata['retry']['baseline_symbols_succeeded'],
+            2680,
+        )
         self.assertEqual(
             completed_metadata['downstream_retry_symbols'],
             ['005930'],
@@ -12887,6 +12910,210 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             retry_context['inherited_universe_snapshot'],
             universe_snapshot,
+        )
+
+    def test_retry_early_abort_keeps_unattempted_tail_unresolved_and_reports_provider_outage(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        symbols = [
+            PykrxSymbol(
+                symbol=f'{index:06d}',
+                market='KOSPI',
+                name_ko=f'Retry Symbol {index}',
+            )
+            for index in range(25)
+        ]
+        retry_context = build_daily_retry_context(
+            {
+                'id': 7,
+                'status': 'completed_with_errors',
+                'symbols_total': 2681,
+                'symbols_succeeded': 2656,
+                'symbols_failed': 25,
+                'run_metadata': {
+                    'failed_symbols': [item.symbol for item in symbols],
+                },
+            },
+            attempt=2,
+            max_attempts=5,
+            symbol_count=len(symbols),
+        )
+
+        with (
+            patch.object(
+                service,
+                'fetch_recent_universe_snapshot',
+                return_value=_point_in_time_universe_snapshot(symbols),
+            ),
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                return_value=12,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                side_effect=TimeoutError('pykrx provider timed out'),
+            ) as price_fetch,
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.complete_eod_collection_run'
+            ) as complete_run,
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='auto_close_scheduler',
+                refresh_universe=False,
+                mode='daily_auto',
+                symbols_override=symbols,
+                retry_context=retry_context,
+                selected_stages=PYKRX_STAGE_SEQUENCE,
+                chain_fundamentals_followup=False,
+            )
+
+        attempted = [item.symbol for item in symbols[:20]]
+        unattempted = [item.symbol for item in symbols[20:]]
+        unresolved = [item.symbol for item in symbols]
+        self.assertEqual(price_fetch.call_count, 20)
+        self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertEqual(result['symbols_failed'], 20)
+        self.assertEqual(result['failed_symbols'], attempted)
+        self.assertEqual(result['unattempted_symbols'], unattempted)
+        self.assertEqual(result['unattempted_symbols_count'], 5)
+        self.assertEqual(result['unresolved_symbols'], unresolved)
+        self.assertEqual(result['unresolved_symbols_count'], 25)
+        self.assertTrue(result['provider_outage_suspected'])
+        self.assertEqual(result['retry_scope_status'], 'provider_outage')
+        self.assertEqual(
+            result['provider_outage_evidence'],
+            {
+                'early_abort_triggered': True,
+                'all_attempted_failures_provider_related': True,
+                'attempted_failure_count': 20,
+                'provider_failure_count': 20,
+                'unattempted_count': 5,
+                'failure_types': ['TimeoutError'],
+            },
+        )
+        self.assertIn('20 attempted failures', result['error_message'])
+        self.assertIn('5 unattempted', result['error_message'])
+        self.assertEqual(result['retry']['baseline_run_id'], 7)
+        self.assertEqual(result['retry']['attempt'], 2)
+
+        completed_metadata = complete_run.call_args.kwargs['run_metadata']
+        self.assertEqual(completed_metadata['failed_symbols'], attempted)
+        self.assertEqual(completed_metadata['unattempted_symbols'], unattempted)
+        self.assertEqual(completed_metadata['unresolved_symbols'], unresolved)
+        self.assertEqual(completed_metadata['unresolved_symbols_count'], 25)
+        self.assertTrue(completed_metadata['provider_outage_suspected'])
+        self.assertEqual(
+            completed_metadata['retry_scope_status'],
+            'provider_outage',
+        )
+        self.assertEqual(
+            completed_metadata['provider_outage_evidence'],
+            result['provider_outage_evidence'],
+        )
+        self.assertEqual(completed_metadata['retry']['baseline_run_id'], 7)
+
+    def test_retry_exact_abort_threshold_reports_provider_outage_without_unattempted_tail(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        symbols = [
+            PykrxSymbol(
+                symbol=f'{index:06d}',
+                market='KOSPI',
+                name_ko=f'Retry Symbol {index}',
+            )
+            for index in range(20)
+        ]
+        retry_context = build_daily_retry_context(
+            {
+                'id': 7,
+                'status': 'completed_with_errors',
+                'symbols_total': 2681,
+                'symbols_succeeded': 2661,
+                'symbols_failed': 20,
+                'run_metadata': {
+                    'failed_symbols': [item.symbol for item in symbols],
+                },
+            },
+            attempt=2,
+            max_attempts=5,
+            symbol_count=len(symbols),
+        )
+
+        with (
+            patch.object(
+                service,
+                'fetch_recent_universe_snapshot',
+                return_value=_point_in_time_universe_snapshot(symbols),
+            ),
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                return_value=13,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                side_effect=TimeoutError('pykrx provider timed out'),
+            ) as price_fetch,
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.complete_eod_collection_run'
+            ) as complete_run,
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='auto_close_scheduler',
+                refresh_universe=False,
+                mode='daily_auto',
+                symbols_override=symbols,
+                retry_context=retry_context,
+                selected_stages=PYKRX_STAGE_SEQUENCE,
+                chain_fundamentals_followup=False,
+            )
+
+        unresolved = [item.symbol for item in symbols]
+        self.assertEqual(price_fetch.call_count, 20)
+        self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertEqual(result['symbols_failed'], 20)
+        self.assertEqual(result['unattempted_symbols'], [])
+        self.assertEqual(result['unattempted_symbols_count'], 0)
+        self.assertEqual(result['unresolved_symbols'], unresolved)
+        self.assertEqual(result['unresolved_symbols_count'], 20)
+        self.assertTrue(result['provider_outage_suspected'])
+        self.assertEqual(result['retry_scope_status'], 'provider_outage')
+        self.assertEqual(
+            result['provider_outage_evidence'],
+            {
+                'early_abort_triggered': True,
+                'all_attempted_failures_provider_related': True,
+                'attempted_failure_count': 20,
+                'provider_failure_count': 20,
+                'unattempted_count': 0,
+                'failure_types': ['TimeoutError'],
+            },
+        )
+        completed_metadata = complete_run.call_args.kwargs['run_metadata']
+        self.assertEqual(completed_metadata['unresolved_symbols'], unresolved)
+        self.assertTrue(completed_metadata['provider_outage_suspected'])
+        self.assertEqual(
+            complete_run.call_args.kwargs['status'],
+            'completed_with_errors',
         )
 
     def test_successful_small_price_retry_preserves_inherited_enrichment_stage(

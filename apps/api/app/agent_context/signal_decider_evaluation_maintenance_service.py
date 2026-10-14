@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Sequence
 
+from app.agent_context.decider_evaluation_service import (
+    decider_post_decision_evaluation_service,
+)
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.agent_context.signal_decider_calendar_review_service import (
     signal_decider_calendar_review_service,
@@ -59,6 +62,7 @@ class SignalDeciderEvaluationMaintenanceService:
     loop_service: Any = signal_decider_loop_service
     calendar_review_service: Any = signal_decider_calendar_review_service
     prerequisite_service: Any = agent_feedback_prerequisite_service
+    post_decision_service: Any | None = None
 
     @staticmethod
     def _mature_gap_warning_message(not_computed_count: int) -> str | None:
@@ -152,22 +156,39 @@ class SignalDeciderEvaluationMaintenanceService:
             'fail_on_mature_gaps': fail_on_mature_gaps,
             'trigger': trigger,
         }
+        post_decision_maturity_refresh = None
+        if self.post_decision_service is not None:
+            post_decision_maturity_refresh = (
+                self.post_decision_service.refresh_mature_invalid_evaluations(
+                    as_of_market_date=normalized_market_date.isoformat(),
+                    lookback_days=resolved_lookback_days,
+                    symbols=normalized_symbols,
+                )
+            )
         if not force_recompute and not prerequisites['ready']:
             status = str(prerequisites.get('status') or 'waiting').strip().lower() or 'waiting'
+            summary = self._build_summary(
+                status=status,
+                evaluation_summary=None,
+                calendar_summary=None,
+                warning_message=None,
+            )
+            if isinstance(post_decision_maturity_refresh, dict):
+                summary['post_decision_maturity_refresh'] = dict(
+                    post_decision_maturity_refresh.get('summary') or {}
+                )
             return {
                 'triggered': False,
                 'status': status,
                 'reason': 'feedback_prerequisites_not_ready',
                 'market_date': normalized_market_date.isoformat(),
                 'request': request_payload,
-                'summary': self._build_summary(
-                    status=status,
-                    evaluation_summary=None,
-                    calendar_summary=None,
-                    warning_message=None,
-                ),
+                'summary': summary,
                 'prerequisites': prerequisites,
                 'warnings': [],
+                'post_decision_maturity_refresh': (
+                    post_decision_maturity_refresh
+                ),
             }
 
         evaluation_result = self.loop_service.compute_recent_evaluations(
@@ -222,21 +243,29 @@ class SignalDeciderEvaluationMaintenanceService:
         status = 'completed'
         if warning_message is not None:
             status = 'failed' if fail_on_mature_gaps else 'warning'
+        summary = self._build_summary(
+            status=status,
+            evaluation_summary=evaluation_summary,
+            calendar_summary=calendar_summary,
+            warning_message=warning_message,
+        )
+        if isinstance(post_decision_maturity_refresh, dict):
+            summary['post_decision_maturity_refresh'] = dict(
+                post_decision_maturity_refresh.get('summary') or {}
+            )
         return {
             'triggered': True,
             'status': status,
             'market_date': normalized_market_date.isoformat(),
             'request': request_payload,
-            'summary': self._build_summary(
-                status=status,
-                evaluation_summary=evaluation_summary,
-                calendar_summary=calendar_summary,
-                warning_message=warning_message,
-            ),
+            'summary': summary,
             'prerequisites': prerequisites,
             'warnings': [warning_message] if warning_message is not None else [],
             'evaluation_refresh': evaluation_result,
             'calendar_refresh': calendar_result,
+            'post_decision_maturity_refresh': (
+                post_decision_maturity_refresh
+            ),
         }
 
     def refresh_latest_stored_coverage(
@@ -373,4 +402,8 @@ class SignalDeciderEvaluationMaintenanceService:
         }
 
 
-signal_decider_evaluation_maintenance_service = SignalDeciderEvaluationMaintenanceService()
+signal_decider_evaluation_maintenance_service = (
+    SignalDeciderEvaluationMaintenanceService(
+        post_decision_service=decider_post_decision_evaluation_service,
+    )
+)

@@ -123,6 +123,40 @@ PREOPEN_PREVIOUS_SESSION_CURRENT_ONLY_STAGE_IDS: frozenset[str] = frozenset(
     }
 )
 
+_PYKRX_PROVIDER_FAILURE_MESSAGE_MARKERS: tuple[str, ...] = (
+    'client is unavailable',
+    'connection aborted',
+    'connection refused',
+    'connection reset',
+    'provider unavailable',
+    'read timed out',
+    'remote disconnected',
+    'service unavailable',
+    'temporarily unavailable',
+    'timed out',
+    'timeout',
+    'too many requests',
+)
+
+
+def _is_pykrx_provider_failure(exc: BaseException) -> bool:
+    """Identify transport/provider failures without treating bad symbol data as outage."""
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, ConnectionError)):
+            return True
+        error_type = type(current).__name__.lower()
+        message = str(current).lower()
+        if any(token in error_type for token in ('timeout', 'connection', 'transport')):
+            return True
+        if any(marker in message for marker in _PYKRX_PROVIDER_FAILURE_MESSAGE_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 
 def _parse_market_date(value: str | date) -> date:
     normalized = str(value).strip()
@@ -1816,6 +1850,9 @@ def run_market_data_pipeline(
     symbols_succeeded = 0
     symbols_failed = 0
     failed_symbols: list[str] = []
+    provider_failure_count = 0
+    price_failure_types: set[str] = set()
+    early_abort_triggered = False
     bars_upserted = 0
 
     def terminalize_tracking_failure(
@@ -2048,6 +2085,9 @@ def run_market_data_pipeline(
             except Exception as exc:
                 symbols_failed += 1
                 failed_symbols.append(item.symbol)
+                price_failure_types.add(type(exc).__name__)
+                if _is_pykrx_provider_failure(exc):
+                    provider_failure_count += 1
                 logger.warning('pykrx backfill failed for %s: %s', item.symbol, exc)
                 dependencies.log_fetch(
                     'fetch_symbol_ohlcv',
@@ -2091,6 +2131,10 @@ def run_market_data_pipeline(
                     )
                     unattempted_symbols = requested_symbol_codes[index + 1 :]
                     run_metadata['unattempted_symbols'] = unattempted_symbols
+                    run_metadata['unattempted_symbols_count'] = len(
+                        unattempted_symbols
+                    )
+                    early_abort_triggered = True
                     break
             unattempted_symbols = requested_symbol_codes[index + 1 :]
             run_metadata['unattempted_symbols'] = unattempted_symbols
@@ -2201,6 +2245,127 @@ def run_market_data_pipeline(
     turnover_coverage = _summarize_turnover_coverage(
         turnover_coverage_counters
     )
+    scoped_retry_with_existing_coverage = bool(
+        retry_context
+        and retry_context.get('retry_of_run_id') is not None
+        and int(retry_context.get('baseline_symbols_succeeded') or 0) > 0
+    )
+    if (
+        mode == 'daily_auto'
+        and symbols_succeeded == 0
+        and symbols_failed > 0
+        and scoped_retry_with_existing_coverage
+    ):
+        unresolved_symbols = list(
+            dict.fromkeys([*failed_symbols, *unattempted_symbols])
+        )
+        provider_outage_suspected = bool(
+            early_abort_triggered
+            and symbols_failed >= PYKRX_PROVIDER_OUTAGE_EARLY_ABORT_FAILURES
+            and provider_failure_count == symbols_failed
+        )
+        retry_scope_status = (
+            'provider_outage' if provider_outage_suspected else 'partial'
+        )
+        provider_outage_evidence = {
+            'early_abort_triggered': early_abort_triggered,
+            'all_attempted_failures_provider_related': bool(
+                symbols_failed > 0
+                and provider_failure_count == symbols_failed
+            ),
+            'attempted_failure_count': symbols_failed,
+            'provider_failure_count': provider_failure_count,
+            'unattempted_count': len(unattempted_symbols),
+            'failure_types': sorted(price_failure_types),
+        }
+        if provider_outage_suspected:
+            error_message = (
+                'PyKRX bounded retry stopped after '
+                f'{symbols_failed} attempted failures with provider-outage '
+                f'evidence and {len(unattempted_symbols)} unattempted symbols; '
+                'the prior broad-run coverage remains usable while all '
+                f'{len(unresolved_symbols)} symbols stay unresolved.'
+            )
+        else:
+            error_message = (
+                'PyKRX failed for every symbol in the bounded retry scope; '
+                'the prior broad-run coverage remains usable while these symbols '
+                'stay unresolved.'
+            )
+        run_metadata = service._run_metadata_with_failed_symbols(
+            run_metadata,
+            failed_symbols,
+        )
+        run_metadata['unattempted_symbols'] = list(unattempted_symbols)
+        run_metadata['unattempted_symbols_count'] = len(unattempted_symbols)
+        run_metadata['unresolved_symbols'] = list(unresolved_symbols)
+        run_metadata['unresolved_symbols_count'] = len(unresolved_symbols)
+        run_metadata['provider_outage_suspected'] = provider_outage_suspected
+        run_metadata['provider_outage_evidence'] = provider_outage_evidence
+        run_metadata['retry_scope_status'] = retry_scope_status
+        persist_stage_progress(
+            stage='price_collection',
+            status='partial',
+            current_step='price_collection_retry_scope_unresolved',
+            current_activity=error_message,
+            processed=symbols_failed,
+            total=len(symbols),
+            succeeded=0,
+            failed=symbols_failed,
+            current_symbol=None,
+            extra={
+                'bars_upserted': bars_upserted,
+                'provider_outage_suspected': provider_outage_suspected,
+                'provider_outage_evidence': provider_outage_evidence,
+                'downstream_stages_skipped': True,
+                'unattempted_symbols': list(unattempted_symbols),
+                'unattempted_symbols_count': len(unattempted_symbols),
+                'unresolved_symbols': list(unresolved_symbols),
+                'unresolved_symbols_count': len(unresolved_symbols),
+                'retry_scope_status': retry_scope_status,
+            },
+        )
+        complete_eod_run_or_fail_tracking(
+            status='completed_with_errors',
+            symbols_succeeded=0,
+            symbols_failed=symbols_failed,
+            error_message=error_message,
+            run_metadata=run_metadata,
+        )
+        daily_pipeline_tracker.finish_run(
+            status='partial',
+            error_message=error_message,
+        )
+        return {
+            'run_id': run_id,
+            'source': 'pykrx',
+            'status': 'completed_with_errors',
+            'selected_stages': list(resolved_selected_stages),
+            'markets': list(markets),
+            'start_date': normalized_start,
+            'requested_end_date': normalized_end,
+            'latest_available_trade_date': latest_trade_date,
+            'symbols_total': len(symbols),
+            'symbols_succeeded': 0,
+            'symbols_failed': symbols_failed,
+            'failed_symbols': failed_symbols[:50],
+            'unresolved_symbols': unresolved_symbols,
+            'unresolved_symbols_count': len(unresolved_symbols),
+            'unattempted_symbols': unattempted_symbols[:50],
+            'unattempted_symbols_count': len(unattempted_symbols),
+            'bars_upserted': bars_upserted,
+            'turnover_coverage': turnover_coverage,
+            'turnover_invalid_symbols': turnover_invalid_symbols[:50],
+            'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
+            'error_type': 'PykrxRetryScopeUnresolved',
+            'error_message': error_message,
+            'provider_outage_suspected': provider_outage_suspected,
+            'provider_outage_evidence': provider_outage_evidence,
+            'retry_scope_status': retry_scope_status,
+            'retry': dict(retry_context or {}),
+            'refresh_universe': effective_refresh_universe,
+            'universe_snapshot': universe_snapshot,
+        }
     if mode == 'daily_auto' and symbols_succeeded == 0 and symbols_failed > 0:
         error_message = (
             'PyKRX daily price collection failed for every requested symbol; '

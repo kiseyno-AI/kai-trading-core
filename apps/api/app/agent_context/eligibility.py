@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timezone
 from math import ceil
 from typing import Any, Sequence
 
@@ -39,8 +39,11 @@ AGENT_FEEDBACK_ELIGIBILITY_FILTERS: tuple[str, ...] = (
     'piotroski_filter',
 )
 AGENT_FEEDBACK_ELIGIBILITY_RULE = 'strategy_aware_prefilter_scoring_v1'
-AGENT_FEEDBACK_CANDIDATE_CAP_RULE = 'strategy_aware_prefilter_broad_top_percentile_cap_v2'
-AGENT_FEEDBACK_CANDIDATE_SCORE_VERSION = 'decider_role_gated_candidate_score_v2'
+AGENT_FEEDBACK_CANDIDATE_CAP_RULE = 'strategy_aware_prefilter_broad_top_percentile_cap_v3'
+AGENT_FEEDBACK_CANDIDATE_SCORE_VERSION = 'decider_role_gated_candidate_score_v3'
+AGENT_FEEDBACK_CANDIDATE_TIE_BREAK_VERSION = (
+    'score_then_evidence_completeness_freshness_risk_v2'
+)
 AGENT_FEEDBACK_ROLE_CAP_RULE = 'agent_feedback_role_scope_cap_v1'
 AGENT_FEEDBACK_FUNNEL_SCHEMA_VERSION = 'agent_feedback_funnel_v1'
 AGENT_FEEDBACK_VALUE_LONG_ONLY_ELIGIBILITY_RULE = 'market_risk_filter_passed_and_piotroski_passed_v1'
@@ -164,6 +167,36 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _evidence_timestamp_sort_value(value: Any) -> float:
+    if value is None:
+        return float('-inf')
+    try:
+        parsed = (
+            value
+            if isinstance(value, datetime)
+            else datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+        )
+    except (TypeError, ValueError):
+        return float('-inf')
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _normalized_risk_tier(value: Any) -> str:
+    normalized = str(value or '').strip().lower()
+    return normalized if normalized in {'low', 'medium', 'high'} else 'unknown'
+
+
+def _risk_tier_sort_priority(value: Any) -> int:
+    return {
+        'low': 0,
+        'medium': 1,
+        'high': 2,
+        'unknown': 3,
+    }[_normalized_risk_tier(value)]
 
 
 def _normalize_action(value: Any) -> str:
@@ -330,6 +363,25 @@ def _piotroski_filter_signals(row: dict | None) -> dict[str, Any]:
     thresholds = _as_dict(filter_payload.get('thresholds'))
     valuation = _as_dict(filter_payload.get('valuation'))
     provenance = _as_dict(filter_payload.get('provenance'))
+    evidence_status = _as_dict(filter_payload.get('evidence_status'))
+    required_signal_count = _as_int(
+        score_summary.get('required_financial_signal_count'),
+        default=0,
+    )
+    available_required_signals = _as_int(
+        score_summary.get('required_financial_signals_available'),
+        default=0,
+    )
+    factor_coverage_status = evidence_status.get('financial_signal_coverage')
+    if not factor_coverage_status and required_signal_count > 0:
+        factor_coverage_status = (
+            'complete'
+            if available_required_signals >= required_signal_count
+            else 'unavailable'
+        )
+    audit_evidence_status = provenance.get('audit_evidence_status')
+    profitability_evidence_status = evidence_status.get('profitability')
+    capital_evidence_status = evidence_status.get('capital')
     return {
         'available': True,
         'source': row.get('source'),
@@ -340,14 +392,35 @@ def _piotroski_filter_signals(row: dict | None) -> dict[str, Any]:
         'pbr_percentile_rank': row.get('pbr_percentile_rank'),
         'is_low_pbr': row.get('is_low_pbr'),
         'low_pbr_percentile_threshold': thresholds.get('low_pbr_percentile'),
-        'has_profitability_issue': row.get('has_profitability_issue'),
-        'has_capital_impairment': row.get('has_capital_impairment'),
-        'has_audit_issue': row.get('has_audit_issue'),
-        'audit_evidence_status': provenance.get('audit_evidence_status'),
+        'has_profitability_issue': (
+            None
+            if profitability_evidence_status == 'unavailable'
+            else row.get('has_profitability_issue')
+        ),
+        'profitability_evidence_status': profitability_evidence_status,
+        'has_capital_impairment': (
+            None
+            if capital_evidence_status == 'unavailable'
+            else row.get('has_capital_impairment')
+        ),
+        'capital_evidence_status': capital_evidence_status,
+        'has_audit_issue': (
+            None
+            if audit_evidence_status == 'unknown'
+            else row.get('has_audit_issue')
+        ),
+        'audit_evidence_status': audit_evidence_status,
         'piotroski_score': row.get('piotroski_score'),
         'passes_piotroski_score': row.get('passes_piotroski_score'),
         'piotroski_min_score': thresholds.get('piotroski_min_score'),
         'score_ratio': score_summary.get('score_ratio'),
+        'required_financial_signal_count': required_signal_count or None,
+        'required_financial_signals_available': (
+            available_required_signals
+            if required_signal_count > 0
+            else None
+        ),
+        'factor_coverage_status': factor_coverage_status or 'unknown',
         'momentum_percentile_rank': row.get('momentum_percentile_rank'),
         'is_bottom_momentum': row.get('is_bottom_momentum'),
         'valuation_available': valuation.get('available'),
@@ -439,18 +512,35 @@ def _piotroski_soft_penalties(row: dict | None) -> list[dict[str, Any]]:
     if bool(row.get('passed_filter')):
         return []
 
-    penalties = [
-        _penalty(
-            code='piotroski_filter_failed',
-            source='piotroski_filter',
-            message='Piotroski/value filter did not pass; short-term momentum dispatch keeps the symbol with this penalty.',
-            details=_piotroski_filter_signals(row),
-        )
-    ]
+    signals = _piotroski_filter_signals(row)
+    penalties: list[dict[str, Any]] = []
     filter_payload = _as_dict(row.get('filter_payload'))
     thresholds = _as_dict(filter_payload.get('thresholds'))
     provenance = _as_dict(filter_payload.get('provenance'))
     audit_evidence_status = provenance.get('audit_evidence_status')
+    factor_coverage_unavailable = (
+        signals.get('factor_coverage_status') == 'unavailable'
+    )
+    valuation_unavailable = signals.get('valuation_available') is False
+    if factor_coverage_unavailable:
+        penalties.append(
+            _penalty(
+                code='piotroski_factor_coverage_unavailable',
+                source='piotroski_filter',
+                message=(
+                    'Required Piotroski financial inputs are unavailable; '
+                    'this is data-quality uncertainty, not a failed factor.'
+                ),
+                details={
+                    'required_financial_signal_count': signals.get(
+                        'required_financial_signal_count'
+                    ),
+                    'required_financial_signals_available': signals.get(
+                        'required_financial_signals_available'
+                    ),
+                },
+            )
+        )
     if audit_evidence_status == 'unknown':
         penalties.append(
             _penalty(
@@ -459,7 +549,31 @@ def _piotroski_soft_penalties(row: dict | None) -> list[dict[str, Any]]:
                 message='Audit evidence is unavailable; this is treated as data-quality uncertainty, not a proven issue.',
             )
         )
-    if row.get('is_low_pbr') is False:
+    if valuation_unavailable:
+        penalties.append(
+            _penalty(
+                code='piotroski_valuation_unavailable',
+                source='piotroski_filter',
+                message=(
+                    'PBR valuation evidence is unavailable; this is '
+                    'data-quality uncertainty, not a failed value signal.'
+                ),
+            )
+        )
+    if not (
+        factor_coverage_unavailable
+        or audit_evidence_status == 'unknown'
+        or valuation_unavailable
+    ):
+        penalties.append(
+            _penalty(
+                code='piotroski_filter_failed',
+                source='piotroski_filter',
+                message='Piotroski/value filter did not pass; short-term momentum dispatch keeps the symbol with this penalty.',
+                details=signals,
+            )
+        )
+    if not valuation_unavailable and row.get('is_low_pbr') is False:
         penalties.append(
             _penalty(
                 code='not_low_pbr',
@@ -472,7 +586,10 @@ def _piotroski_soft_penalties(row: dict | None) -> list[dict[str, Any]]:
                 },
             )
         )
-    if row.get('passes_piotroski_score') is False:
+    if (
+        not factor_coverage_unavailable
+        and row.get('passes_piotroski_score') is False
+    ):
         penalties.append(
             _penalty(
                 code='low_piotroski_score',
@@ -492,7 +609,7 @@ def _piotroski_soft_penalties(row: dict | None) -> list[dict[str, Any]]:
     ):
         if field == 'has_audit_issue' and audit_evidence_status == 'unknown':
             continue
-        if row.get(field) is True:
+        if signals.get(field) is True:
             penalties.append(
                 _penalty(
                     code=field,
@@ -539,8 +656,39 @@ def _rank_bonus(rank: Any, *, max_rank: int = 30, weight: float = 2.0) -> float:
 
 def _soft_penalty_score(soft_penalties: Sequence[dict[str, Any]]) -> float:
     score = 0.0
+    uncertainty_penalized = False
+    uncertainty_codes = {
+        'missing_piotroski_filter',
+        'audit_evidence_unknown',
+        'piotroski_factor_coverage_unavailable',
+        'piotroski_valuation_unavailable',
+    }
+    penalty_codes = {
+        str(penalty.get('code') or '') for penalty in soft_penalties
+    }
+    proven_piotroski_codes = {
+        'not_low_pbr',
+        'low_piotroski_score',
+        'has_profitability_issue',
+        'has_capital_impairment',
+        'has_audit_issue',
+        'is_bottom_momentum',
+    }
+    has_specific_proven_piotroski_penalty = bool(
+        penalty_codes.intersection(proven_piotroski_codes)
+    )
     for penalty in soft_penalties:
         code = str(penalty.get('code') or '')
+        if code in uncertainty_codes:
+            if not uncertainty_penalized:
+                score -= 12.0
+                uncertainty_penalized = True
+            continue
+        if (
+            code == 'piotroski_filter_failed'
+            and has_specific_proven_piotroski_penalty
+        ):
+            continue
         if code.startswith('market_risk_watchlist'):
             score -= 10.0
         elif code in {'has_audit_issue', 'has_capital_impairment'}:
@@ -550,6 +698,35 @@ def _soft_penalty_score(soft_penalties: Sequence[dict[str, Any]]) -> float:
         else:
             score -= 6.0
     return score
+
+
+def _piotroski_evidence_known_count(record: dict[str, Any]) -> int:
+    signals = _as_dict(
+        _as_dict(record.get('filter_signals')).get('piotroski_filter')
+    )
+    if signals.get('available') is not True:
+        return 0
+
+    count = 0
+    if signals.get('valuation_available') is True:
+        count += 1
+    if signals.get('factor_coverage_status') == 'complete':
+        count += 1
+    for status_key, issue_key, unavailable_status in (
+        ('profitability_evidence_status', 'has_profitability_issue', 'unavailable'),
+        ('capital_evidence_status', 'has_capital_impairment', 'unavailable'),
+        ('audit_evidence_status', 'has_audit_issue', 'unknown'),
+    ):
+        status = signals.get(status_key)
+        if status in {'clean', 'issue'}:
+            count += 1
+        elif status != unavailable_status and isinstance(
+            signals.get(issue_key), bool
+        ):
+            # Legacy v1 rows predate nested evidence_status. Their existing
+            # top-level booleans remain the compatibility source of truth.
+            count += 1
+    return count
 
 
 def _candidate_score_payload(
@@ -594,10 +771,90 @@ def _candidate_score_payload(
         'signal-decider': round(signal_decider_score, 6),
     }
     total_score = max(role_scores.values())
+    evidence_source_presence = {
+        'action_summary': bool(
+            row.get('action_captured_at')
+            or row.get('signal_score') is not None
+            or row.get('action_label') is not None
+        ),
+        'direct_signal': bool(
+            row.get('signal_captured_at')
+            or any(
+                row.get(key) is not None
+                for key in (
+                    'signal_count',
+                    'volume_power_rank',
+                    'overtime_volume_rank',
+                    'overtime_fluctuation_rank',
+                )
+            )
+        ),
+        'momentum_factor': bool(
+            row.get('momentum_captured_at')
+            or row.get('momentum_percentile') is not None
+        ),
+        'composite_factor': bool(
+            row.get('composite_captured_at')
+            or row.get('composite_percentile') is not None
+        ),
+    }
+    captured_at_values = [
+        str(row[key])
+        for key in (
+            'action_captured_at',
+            'signal_captured_at',
+            'momentum_captured_at',
+            'composite_captured_at',
+        )
+        if row.get(key)
+    ]
+    risk_adjusted_components = [
+        _as_float(row.get(key))
+        for key in ('composite_low_risk_input', 'composite_low_beta_input')
+        if row.get(key) is not None
+    ]
+    risk_adjusted_component_score = (
+        sum(risk_adjusted_components) / len(risk_adjusted_components)
+        if risk_adjusted_components
+        else None
+    )
+    tie_breakers = {
+        'version': AGENT_FEEDBACK_CANDIDATE_TIE_BREAK_VERSION,
+        'evidence_source_count': sum(evidence_source_presence.values()),
+        'evidence_source_presence': evidence_source_presence,
+        'fresh_evidence_source_count': len(captured_at_values),
+        'piotroski_evidence_known_count': (
+            _piotroski_evidence_known_count(record)
+        ),
+        'oldest_evidence_captured_at': (
+            min(captured_at_values, key=_evidence_timestamp_sort_value)
+            if captured_at_values
+            else None
+        ),
+        'latest_evidence_captured_at': (
+            max(captured_at_values, key=_evidence_timestamp_sort_value)
+            if captured_at_values
+            else None
+        ),
+        'risk_adjusted_component_score': (
+            round(risk_adjusted_component_score, 6)
+            if risk_adjusted_component_score is not None
+            else None
+        ),
+        'composite_valid_factor_count': row.get(
+            'composite_valid_factor_count'
+        ),
+        'composite_available_base_weight': row.get(
+            'composite_available_base_weight'
+        ),
+        'risk_tier': _normalized_risk_tier(row.get('risk_tier')),
+        'risk_tier_priority': _risk_tier_sort_priority(row.get('risk_tier')),
+    }
     return {
         'scoring_version': AGENT_FEEDBACK_CANDIDATE_SCORE_VERSION,
         'score': round(total_score, 6),
         'role_scores': role_scores,
+        'tie_breakers': tie_breakers,
         'components': {
             'action_signal_score': signal_score,
             'direct_signal_score': round(direct_signal_score, 6),
@@ -620,6 +877,13 @@ def _candidate_score_payload(
             'passes_momentum_top_percentile': row.get('passes_momentum_top_percentile'),
             'composite_percentile': row.get('composite_percentile'),
             'is_composite_eligible': row.get('is_composite_eligible'),
+            'risk_tier': row.get('risk_tier'),
+            'composite_low_risk_input': row.get(
+                'composite_low_risk_input'
+            ),
+            'composite_low_beta_input': row.get(
+                'composite_low_beta_input'
+            ),
         },
     }
 
@@ -1159,11 +1423,40 @@ def _cap_metadata(
 
 
 def _rank_scored_candidates(dispatchable: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    def tie_break_key(record: dict[str, Any]) -> tuple[Any, ...]:
+        score_payload = _as_dict(record.get('candidate_score_payload'))
+        tie_breakers = _as_dict(score_payload.get('tie_breakers'))
+        components = _as_dict(score_payload.get('components'))
+        return (
+            -_as_int(tie_breakers.get('evidence_source_count')),
+            -_as_int(tie_breakers.get('fresh_evidence_source_count')),
+            -_as_int(tie_breakers.get('piotroski_evidence_known_count')),
+            -_as_int(tie_breakers.get('composite_valid_factor_count')),
+            -_as_float(
+                tie_breakers.get('composite_available_base_weight')
+            ),
+            -_evidence_timestamp_sort_value(
+                tie_breakers.get('oldest_evidence_captured_at')
+            ),
+            -_evidence_timestamp_sort_value(
+                tie_breakers.get('latest_evidence_captured_at')
+            ),
+            _risk_tier_sort_priority(tie_breakers.get('risk_tier')),
+            -_as_float(
+                tie_breakers.get('risk_adjusted_component_score'),
+                default=-1.0,
+            ),
+            -_as_float(components.get('eligible_composite_score')),
+            -_as_float(components.get('eligible_momentum_score')),
+            -_as_float(components.get('direct_signal_score')),
+            str(record.get('symbol') or ''),
+        )
+
     ranked = sorted(
         dispatchable,
         key=lambda record: (
             -_as_float(record.get('candidate_score')),
-            str(record.get('symbol') or ''),
+            *tie_break_key(record),
         ),
     )
     for index, record in enumerate(ranked, start=1):
@@ -1178,12 +1471,48 @@ def _rank_scored_candidates(dispatchable: Sequence[dict[str, Any]]) -> list[dict
                     _as_dict(_as_dict(record.get('candidate_score_payload')).get('role_scores')).get(role),
                     default=_as_float(record.get('candidate_score')),
                 ),
-                str(record.get('symbol') or ''),
+                *tie_break_key(record),
             ),
         )
         for index, record in enumerate(role_ranked, start=1):
             record['candidate_role_ranks'][role] = index
     return ranked
+
+
+def _selection_boundary(
+    *,
+    ranked: Sequence[dict[str, Any]],
+    selected_symbols: set[str],
+) -> dict[str, Any]:
+    def summary(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        score_payload = _as_dict(record.get('candidate_score_payload'))
+        return {
+            'symbol': record.get('symbol'),
+            'candidate_rank': record.get('candidate_rank'),
+            'candidate_score': record.get('candidate_score'),
+            'tie_breakers': _as_dict(score_payload.get('tie_breakers')),
+        }
+
+    selected = [
+        record
+        for record in ranked
+        if str(record.get('symbol')) in selected_symbols
+    ]
+    excluded = [
+        record
+        for record in ranked
+        if str(record.get('symbol')) not in selected_symbols
+    ]
+    return {
+        'selection_basis': AGENT_FEEDBACK_CANDIDATE_TIE_BREAK_VERSION,
+        'last_selected': summary(selected[-1] if selected else None),
+        'first_excluded': summary(excluded[0] if excluded else None),
+        'excluded_alternatives_preview': [
+            summary(record) for record in excluded[:5]
+        ],
+    }
 
 
 def _apply_candidate_cap(
@@ -1273,6 +1602,10 @@ def _apply_candidate_cap(
         cap_applied=cap_applied,
         forced_included_count=len(forced_symbols),
         forced_source_diagnostics=forced_source_diagnostics,
+    )
+    metadata['selection_boundary'] = _selection_boundary(
+        ranked=ranked,
+        selected_symbols=selected_symbols,
     )
     for index, record in enumerate(ranked, start=1):
         symbol = str(record.get('symbol'))

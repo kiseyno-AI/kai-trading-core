@@ -231,9 +231,16 @@ def _serialize_item(index: int, item: dict) -> dict:
 
 
 class FakeDeciderEvaluationRepository:
-    def __init__(self, source_rows: list[dict]):
+    def __init__(
+        self,
+        source_rows: list[dict],
+        *,
+        maturity_source_rows: list[dict] | None = None,
+    ):
         self.source_rows = list(source_rows)
+        self.maturity_source_rows = list(maturity_source_rows or [])
         self.list_feedback_args = None
+        self.list_maturity_args = None
         self.upserted_items = None
 
     def list_feedback_sources(self, **kwargs):
@@ -244,8 +251,230 @@ class FakeDeciderEvaluationRepository:
         self.upserted_items = list(items)
         return [_serialize_item(index, item) for index, item in enumerate(self.upserted_items, start=1)]
 
+    def list_maturity_refresh_sources(self, **kwargs):
+        self.list_maturity_args = kwargs
+        return list(self.maturity_source_rows)
+
 
 class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
+    def test_maturity_refresh_self_heals_missing_window_with_cost_and_lineage_preserved(self):
+        source = _feedback_source(
+            feedback_id=61,
+            decision_snapshot_id=161,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+        )
+        source['existing_evaluation_metadata'] = {
+            'evaluation_cost_assumptions': {
+                'schema_version': 'decider_evaluation_cost_assumptions_v1',
+                'fee_bps': 10.0,
+                'slippage_bps': 20.0,
+                'tax_bps': 18.0,
+                'costs_explicit': True,
+                'cost_inputs_provided': {
+                    'fee': True,
+                    'slippage': True,
+                    'tax': True,
+                },
+                'missing_cost_components': [],
+            },
+            'shadow_avoid_chase_rule': {'enabled': False},
+        }
+        repository = FakeDeciderEvaluationRepository(
+            [],
+            maturity_source_rows=[source],
+        )
+        bars = [
+            _bar('2026-04-24', 100, 104, 98, 103),
+            _bar('2026-04-27', 103, 106, 101, 105),
+            _bar('2026-04-28', 105, 109, 102, 108),
+            _bar('2026-04-29', 108, 108, 101, 102),
+            _bar('2026-04-30', 102, 103, 100, 101),
+        ]
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: bars,
+        )
+
+        result = service.refresh_mature_invalid_evaluations(
+            as_of_market_date='2026-04-30',
+            lookback_days=14,
+        )
+
+        self.assertEqual(result['summary']['candidate_count'], 1)
+        self.assertEqual(result['summary']['self_healed_count'], 1)
+        self.assertEqual(result['summary']['still_incomplete_count'], 0)
+        self.assertEqual(len(repository.upserted_items), 1)
+        refreshed = repository.upserted_items[0]
+        self.assertEqual(refreshed['feedback_id'], 61)
+        self.assertEqual(refreshed['decision_snapshot_id'], 161)
+        self.assertEqual(refreshed['outcome_label'], OUTCOME_TARGET_HIT)
+        self.assertEqual(
+            refreshed['metadata_payload']['evaluation_cost_assumptions'],
+            source['existing_evaluation_metadata']['evaluation_cost_assumptions'],
+        )
+        self.assertEqual(
+            refreshed['metadata_payload']['paper_ledger']['cost_assumptions_bps'],
+            {'fee': 10.0, 'slippage': 20.0, 'tax': 18.0},
+        )
+
+    def test_maturity_refresh_does_not_write_rows_that_are_still_incomplete(self):
+        source = _feedback_source(
+            feedback_id=62,
+            decision_snapshot_id=162,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+        )
+        source['existing_evaluation_metadata'] = {
+            'evaluation_cost_assumptions': {
+                'schema_version': 'decider_evaluation_cost_assumptions_v1',
+                'fee_bps': 10.0,
+                'slippage_bps': 20.0,
+                'tax_bps': 18.0,
+                'costs_explicit': True,
+                'cost_inputs_provided': {
+                    'fee': True,
+                    'slippage': True,
+                    'tax': True,
+                },
+                'missing_cost_components': [],
+            },
+        }
+        repository = FakeDeciderEvaluationRepository(
+            [],
+            maturity_source_rows=[source],
+        )
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: [
+                _bar('2026-04-24', 100, 104, 98, 103),
+                _bar('2026-04-27', 103, 106, 101, 105),
+                _bar('2026-04-28', 105, 109, 102, 108),
+            ],
+        )
+
+        result = service.refresh_mature_invalid_evaluations(
+            as_of_market_date='2026-04-28',
+            lookback_days=14,
+        )
+
+        self.assertEqual(result['summary']['candidate_count'], 1)
+        self.assertEqual(result['summary']['self_healed_count'], 0)
+        self.assertEqual(result['summary']['still_incomplete_count'], 1)
+        self.assertEqual(result['summary']['write_count'], 0)
+        self.assertEqual(repository.upserted_items, [])
+
+    def test_maturity_refresh_cannot_use_bars_after_as_of_market_date(self):
+        source = _feedback_source(
+            feedback_id=63,
+            decision_snapshot_id=163,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+        )
+        source['existing_evaluation_metadata'] = {}
+        repository = FakeDeciderEvaluationRepository(
+            [],
+            maturity_source_rows=[source],
+        )
+        loader_calls = []
+
+        def load_bars(_symbol, **kwargs):
+            loader_calls.append(kwargs)
+            return [
+                _bar('2026-04-24', 100, 104, 98, 103),
+                _bar('2026-04-27', 103, 106, 101, 105),
+                _bar('2026-04-28', 105, 109, 102, 108),
+                _bar('2026-04-29', 108, 108, 101, 102),
+                _bar('2026-04-30', 102, 103, 100, 101),
+            ]
+
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=load_bars,
+        )
+
+        result = service.refresh_mature_invalid_evaluations(
+            as_of_market_date='2026-04-29',
+            lookback_days=14,
+        )
+
+        self.assertEqual(result['summary']['self_healed_count'], 0)
+        self.assertEqual(result['summary']['still_incomplete_count'], 1)
+        self.assertEqual(result['summary']['write_count'], 0)
+        self.assertEqual(repository.upserted_items, [])
+        self.assertEqual(
+            repository.list_maturity_args['market_date_to'],
+            date(2026, 4, 24),
+        )
+        self.assertEqual(loader_calls[0]['end_date'], date(2026, 4, 29))
+
+    def test_maturity_refresh_cannot_substitute_later_bar_for_missing_session(self):
+        source = _feedback_source(
+            feedback_id=64,
+            decision_snapshot_id=164,
+            agent_name='short-term-decider',
+            action='watch_for_trigger',
+            market_date='2026-06-08',
+        )
+        source['existing_evaluation_metadata'] = {}
+        repository = FakeDeciderEvaluationRepository(
+            [],
+            maturity_source_rows=[source],
+        )
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: [
+                _bar('2026-06-09', 100, 104, 98, 103),
+                _bar('2026-06-10', 103, 106, 101, 105),
+                # 2026-06-11 is missing; a later sixth session must not fill it.
+                _bar('2026-06-12', 105, 109, 102, 108),
+                _bar('2026-06-15', 108, 108, 101, 102),
+                _bar('2026-06-16', 102, 103, 100, 101),
+            ],
+        )
+
+        result = service.refresh_mature_invalid_evaluations(
+            as_of_market_date='2026-06-16',
+            lookback_days=14,
+        )
+
+        self.assertEqual(result['summary']['self_healed_count'], 0)
+        self.assertEqual(result['summary']['still_incomplete_count'], 1)
+        self.assertEqual(result['summary']['write_count'], 0)
+        self.assertEqual(repository.upserted_items, [])
+
+    def test_compute_cannot_substitute_later_bar_for_missing_session(self):
+        source = _feedback_source(
+            feedback_id=65,
+            decision_snapshot_id=165,
+            market_date='2026-06-08',
+        )
+        repository = FakeDeciderEvaluationRepository([source])
+        service = DeciderPostDecisionEvaluationService(
+            repository=repository,
+            daily_bar_loader=lambda _symbol, **_kwargs: [
+                _bar('2026-06-09', 100, 104, 98, 103),
+                _bar('2026-06-10', 103, 106, 101, 105),
+                # 2026-06-11 is missing; a later sixth session must not fill it.
+                _bar('2026-06-12', 105, 109, 102, 108),
+                _bar('2026-06-15', 108, 108, 101, 102),
+                _bar('2026-06-16', 102, 103, 100, 101),
+            ],
+        )
+
+        result = service.compute_evaluations(
+            market_date_from='2026-06-08',
+            market_date_to='2026-06-08',
+        )
+
+        self.assertEqual(result['summary']['outcome_label_counts'], {
+            OUTCOME_INVALID_MISSING_DATA: 1,
+        })
+        self.assertEqual(
+            repository.upserted_items[0]['outcome_label'],
+            OUTCOME_INVALID_MISSING_DATA,
+        )
+
     def test_compute_evaluations_quarantines_feedback_with_late_decision_snapshot(self):
         source = _feedback_source(market_date='2026-04-23')
         source['feedback_received_at'] = datetime(
@@ -315,7 +544,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         bars_by_symbol = {
             '005930': [
                 _bar('2026-04-24', 100, 104, 98, 103),
-                _bar('2026-04-25', 103, 106, 101, 105),
+                _bar('2026-04-27', 103, 106, 101, 105),
                 _bar('2026-04-28', 105, 109, 102, 108),
                 _bar('2026-04-29', 108, 108, 101, 102),
                 _bar('2026-04-30', 102, 103, 100, 101),
@@ -334,7 +563,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['outcome_label_counts'][OUTCOME_TARGET_HIT], 1)
         item = result['items'][0]
         self.assertEqual(item['outcome_label'], OUTCOME_TARGET_HIT)
-        self.assertEqual(item['first_target_hit_trade_date'], '2026-04-25')
+        self.assertEqual(item['first_target_hit_trade_date'], '2026-04-27')
         self.assertIsNone(item['first_stop_hit_trade_date'])
         self.assertAlmostEqual(item['mfe_pct'], 0.09, places=6)
         self.assertAlmostEqual(item['mae_pct'], -0.02, places=6)
@@ -344,7 +573,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         bars_by_symbol = {
             '005930': [
                 _bar('2026-04-24', 100, 101, 99, 100),
-                _bar('2026-04-25', 100, 103, 94, 96),
+                _bar('2026-04-27', 100, 103, 94, 96),
                 _bar('2026-04-28', 96, 98, 93, 95),
                 _bar('2026-04-29', 95, 100, 94, 99),
                 _bar('2026-04-30', 99, 101, 98, 100),
@@ -362,7 +591,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
 
         item = result['items'][0]
         self.assertEqual(item['outcome_label'], OUTCOME_STOP_HIT)
-        self.assertEqual(item['first_stop_hit_trade_date'], '2026-04-25')
+        self.assertEqual(item['first_stop_hit_trade_date'], '2026-04-27')
         self.assertIsNone(item['first_target_hit_trade_date'])
 
     def test_compute_evaluations_marks_same_day_target_stop_collision_ambiguous(self):
@@ -370,7 +599,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         bars_by_symbol = {
             '005930': [
                 _bar('2026-04-24', 100, 106, 94, 101),
-                _bar('2026-04-25', 101, 102, 99, 100),
+                _bar('2026-04-27', 101, 102, 99, 100),
                 _bar('2026-04-28', 100, 101, 99, 100),
                 _bar('2026-04-29', 100, 101, 99, 100),
                 _bar('2026-04-30', 100, 101, 99, 100),
@@ -396,7 +625,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         bars_by_symbol = {
             '005930': [
                 _bar('2026-04-24', 100, 103, 97, 101),
-                _bar('2026-04-25', 101, 104, 98, 102),
+                _bar('2026-04-27', 101, 104, 98, 102),
                 _bar('2026-04-28', 102, 104, 98, 103),
                 _bar('2026-04-29', 103, 104, 98, 100),
                 _bar('2026-04-30', 100, 104, 97, 99),
@@ -419,7 +648,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         bars_by_symbol = {
             '005930': [
                 _bar('2026-04-24', 100, 103, 99, 102),
-                _bar('2026-04-25', 102, 104, 100, 103),
+                _bar('2026-04-27', 102, 104, 100, 103),
                 _bar('2026-04-28', 103, 104, 101, 102),
             ]
         }
@@ -467,7 +696,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         bars_by_symbol = {
             '005930': [
                 _bar('2026-04-24', 100, 103, 99, 102),
-                _bar('2026-04-25', 102, 104, 100, 103),
+                _bar('2026-04-27', 102, 104, 100, 103),
                 _bar('2026-04-28', 103, 105, 101, 104),
                 _bar('2026-04-29', 104, 106, 102, 105),
                 _bar('2026-04-30', 105, 107, 103, 106),
@@ -506,7 +735,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar('2026-04-24', 100, 106, 94, 102),
-            _bar('2026-04-25', 102, 104, 98, 103),
+            _bar('2026-04-27', 102, 104, 98, 103),
             _bar('2026-04-28', 103, 104, 100, 102),
             _bar('2026-04-29', 102, 103, 99, 101),
             _bar('2026-04-30', 101, 102, 100, 101),
@@ -554,7 +783,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar('2026-04-24', 100, 104, 98, 103),
-            _bar('2026-04-25', 103, 106, 101, 105),
+            _bar('2026-04-27', 103, 106, 101, 105),
             _bar('2026-04-28', 105, 106, 102, 104),
             _bar('2026-04-29', 104, 105, 102, 103),
             _bar('2026-04-30', 103, 104, 101, 102),
@@ -590,7 +819,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar(f'2026-04-{day:02d}', 104, 110, 100, 106)
-            for day in (24, 25, 28, 29, 30)
+            for day in (24, 27, 28, 29, 30)
         ]
         service = DeciderPostDecisionEvaluationService(
             repository=repository,
@@ -618,7 +847,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar('2026-04-24', 100, 100, 98, 99),
-            _bar('2026-04-25', 99, 100, 97, 98),
+            _bar('2026-04-27', 99, 100, 97, 98),
             _bar('2026-04-28', 98, 100, 96, 97),
         ]
         service = DeciderPostDecisionEvaluationService(
@@ -655,7 +884,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar('2026-04-24', 100, 102, 98, 101),
-            _bar('2026-04-25', 101, 103, 99, 102),
+            _bar('2026-04-27', 101, 103, 99, 102),
             _bar('2026-04-28', 102, 104, 100, 103),
         ]
         service = DeciderPostDecisionEvaluationService(
@@ -685,7 +914,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar('2026-04-24', 100, 100, 98, 99),
-            _bar('2026-04-25', 99, 100, 97, 98),
+            _bar('2026-04-27', 99, 100, 97, 98),
             _bar('2026-04-28', 98, 100, 96, None),
             _bar('2026-04-29', 97, 100, 95, 96),
             _bar('2026-04-30', 96, 100, 94, 95),
@@ -747,7 +976,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([older, newer])
         bars = [
             _bar('2026-04-24', 100, 104, 98, 103),
-            _bar('2026-04-25', 103, 106, 101, 105),
+            _bar('2026-04-27', 103, 106, 101, 105),
             _bar('2026-04-28', 105, 109, 102, 108),
             _bar('2026-04-29', 108, 108, 101, 102),
             _bar('2026-04-30', 102, 103, 100, 101),
@@ -806,7 +1035,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar('2026-04-24', 100, 104, 98, 103),
-            _bar('2026-04-25', 103, 112, 101, 111),
+            _bar('2026-04-27', 103, 112, 101, 111),
             _bar('2026-04-28', 111, 113, 108, 112),
             _bar('2026-04-29', 112, 114, 109, 113),
             _bar('2026-04-30', 113, 114, 111, 112),
@@ -888,7 +1117,7 @@ class DeciderPostDecisionEvaluationServiceTests(unittest.TestCase):
         repository = FakeDeciderEvaluationRepository([source])
         bars = [
             _bar('2026-04-24', 100, 104, 98, 103),
-            _bar('2026-04-25', 103, 106, 101, 105),
+            _bar('2026-04-27', 103, 106, 101, 105),
             _bar('2026-04-28', 105, 109, 102, 108),
             _bar('2026-04-29', 108, 108, 101, 102),
             _bar('2026-04-30', 102, 103, 100, 101),

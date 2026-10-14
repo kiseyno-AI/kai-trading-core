@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Sequence
 
@@ -19,6 +19,7 @@ from app.db_models import (
     DeciderPostDecisionEvaluation,
     SignalDeciderDecisionSnapshot,
 )
+from app.market.session import next_krx_trading_date
 from app.market_data_store import load_daily_bars_for_symbol_range
 
 DEFAULT_DECIDER_EVALUATION_WINDOW_DAYS = 5
@@ -37,6 +38,9 @@ SHORT_TERM_WATCH_ACTION = 'watch_for_trigger'
 SHORT_TERM_AVOID_CHASE_ACTION = 'avoid_chase'
 PAPER_LEDGER_SCHEMA_VERSION = 'short_term_paper_outcome_v1'
 SHADOW_AVOID_CHASE_SCHEMA_VERSION = 'short_term_avoid_chase_shadow_v1'
+EVALUATION_COST_ASSUMPTIONS_SCHEMA_VERSION = (
+    'decider_evaluation_cost_assumptions_v1'
+)
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -542,6 +546,83 @@ class DeciderPostDecisionEvaluationRepository:
             if record_id in rows_by_id
         ]
 
+    def list_maturity_refresh_sources(
+        self,
+        *,
+        market_date_from: date,
+        market_date_to: date,
+        window_days: int,
+        agent_names: Sequence[str],
+        symbols: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        with session_scope() as session:
+            stmt = (
+                select(
+                    AgentContextFeedback.id.label('feedback_id'),
+                    AgentContextFeedback.market_date.label('market_date'),
+                    AgentContextFeedback.symbol.label('symbol'),
+                    AgentContextFeedback.agent_name.label('agent_name'),
+                    AgentContextFeedback.agent_version.label('agent_version'),
+                    AgentContextFeedback.run_id.label('run_id'),
+                    AgentContextFeedback.received_at.label('received_at'),
+                    AgentContextFeedback.normalized_feedback_payload.label(
+                        'normalized_feedback_payload'
+                    ),
+                    AgentContextFeedback.feedback_payload.label(
+                        'feedback_payload'
+                    ),
+                    DeciderPostDecisionEvaluation.decision_snapshot_id.label(
+                        'decision_snapshot_id'
+                    ),
+                    SignalDeciderDecisionSnapshot.feedback_received_at.label(
+                        'feedback_received_at'
+                    ),
+                    SignalDeciderDecisionSnapshot.created_at.label('created_at'),
+                    SignalDeciderDecisionSnapshot.request_payload.label(
+                        'decision_request_payload'
+                    ),
+                    DeciderPostDecisionEvaluation.metadata_payload.label(
+                        'existing_evaluation_metadata'
+                    ),
+                    DeciderPostDecisionEvaluation.computed_at.label(
+                        'existing_computed_at'
+                    ),
+                )
+                .join(
+                    AgentContextFeedback,
+                    AgentContextFeedback.id
+                    == DeciderPostDecisionEvaluation.feedback_id,
+                )
+                .outerjoin(
+                    SignalDeciderDecisionSnapshot,
+                    SignalDeciderDecisionSnapshot.id
+                    == DeciderPostDecisionEvaluation.decision_snapshot_id,
+                )
+                .where(
+                    DeciderPostDecisionEvaluation.outcome_label
+                    == OUTCOME_INVALID_MISSING_DATA,
+                    DeciderPostDecisionEvaluation.window_days
+                    == int(window_days),
+                    DeciderPostDecisionEvaluation.market_date
+                    >= market_date_from,
+                    DeciderPostDecisionEvaluation.market_date
+                    <= market_date_to,
+                    DeciderPostDecisionEvaluation.agent_name.in_(
+                        list(agent_names)
+                    ),
+                )
+                .order_by(
+                    DeciderPostDecisionEvaluation.market_date.asc(),
+                    DeciderPostDecisionEvaluation.id.asc(),
+                )
+            )
+            if symbols:
+                stmt = stmt.where(
+                    DeciderPostDecisionEvaluation.symbol.in_(list(symbols))
+                )
+            rows = session.execute(stmt).mappings().all()
+        return [dict(row) for row in rows]
+
     def list_evaluations(
         self,
         *,
@@ -614,6 +695,174 @@ class DeciderPostDecisionEvaluationService:
     ) -> None:
         self.repository = repository or DeciderPostDecisionEvaluationRepository()
         self.daily_bar_loader = daily_bar_loader
+
+    @staticmethod
+    def _serialize_cost_assumptions(
+        cost_assumptions: dict[str, Any],
+    ) -> dict[str, Any]:
+        cost_inputs_provided = cost_assumptions.get('cost_inputs_provided')
+        if not isinstance(cost_inputs_provided, dict):
+            cost_inputs_provided = {
+                'fee': False,
+                'slippage': False,
+                'tax': False,
+            }
+        missing_cost_components = cost_assumptions.get(
+            'missing_cost_components'
+        )
+        if not isinstance(missing_cost_components, list):
+            missing_cost_components = [
+                component
+                for component, provided in cost_inputs_provided.items()
+                if not provided
+            ]
+        return {
+            'schema_version': EVALUATION_COST_ASSUMPTIONS_SCHEMA_VERSION,
+            'fee_bps': float(cost_assumptions['fee_bps']),
+            'slippage_bps': float(cost_assumptions['slippage_bps']),
+            'tax_bps': float(cost_assumptions['tax_bps']),
+            'costs_explicit': bool(cost_assumptions.get('costs_explicit')),
+            'cost_inputs_provided': {
+                'fee': bool(cost_inputs_provided.get('fee')),
+                'slippage': bool(cost_inputs_provided.get('slippage')),
+                'tax': bool(cost_inputs_provided.get('tax')),
+            },
+            'missing_cost_components': list(missing_cost_components),
+        }
+
+    @classmethod
+    def _cost_assumptions_from_evaluation_metadata(
+        cls,
+        metadata: Any,
+    ) -> dict[str, Any]:
+        metadata_payload = metadata if isinstance(metadata, dict) else {}
+        stored = metadata_payload.get('evaluation_cost_assumptions')
+        stored = stored if isinstance(stored, dict) else {}
+        cost_inputs_provided = stored.get('cost_inputs_provided')
+        cost_inputs_provided = (
+            cost_inputs_provided
+            if isinstance(cost_inputs_provided, dict)
+            else {'fee': False, 'slippage': False, 'tax': False}
+        )
+        missing_cost_components = stored.get('missing_cost_components')
+        missing_cost_components = (
+            list(missing_cost_components)
+            if isinstance(missing_cost_components, list)
+            else [
+                component
+                for component, provided in cost_inputs_provided.items()
+                if not provided
+            ]
+        )
+        return {
+            'fee_bps': _normalize_non_negative_bps(
+                stored.get('fee_bps', 0),
+                field='fee_bps',
+            ),
+            'slippage_bps': _normalize_non_negative_bps(
+                stored.get('slippage_bps', 0),
+                field='slippage_bps',
+            ),
+            'tax_bps': _normalize_non_negative_bps(
+                stored.get('tax_bps', 0),
+                field='tax_bps',
+            ),
+            'costs_explicit': bool(stored.get('costs_explicit')),
+            'cost_inputs_provided': {
+                'fee': bool(cost_inputs_provided.get('fee')),
+                'slippage': bool(cost_inputs_provided.get('slippage')),
+                'tax': bool(cost_inputs_provided.get('tax')),
+            },
+            'missing_cost_components': missing_cost_components,
+        }
+
+    def refresh_mature_invalid_evaluations(
+        self,
+        *,
+        as_of_market_date: str | date,
+        lookback_days: int = 30,
+        agent_names: Sequence[str] | None = None,
+        symbols: Sequence[str] | None = None,
+        window_days: int = DEFAULT_DECIDER_EVALUATION_WINDOW_DAYS,
+    ) -> dict[str, Any]:
+        normalized_as_of = _normalize_market_date(as_of_market_date)
+        resolved_lookback_days = max(1, int(lookback_days))
+        resolved_window_days = self._normalize_window_days(window_days)
+        normalized_agent_names = _normalize_agent_names(agent_names)
+        normalized_symbols = _normalize_symbols(symbols)
+        market_date_from = normalized_as_of - timedelta(
+            days=resolved_lookback_days
+        )
+        maturity_market_date_to = normalized_as_of - timedelta(
+            days=resolved_window_days
+        )
+        source_rows = self.repository.list_maturity_refresh_sources(
+            market_date_from=market_date_from,
+            market_date_to=maturity_market_date_to,
+            window_days=resolved_window_days,
+            agent_names=normalized_agent_names,
+            symbols=normalized_symbols or None,
+        )
+        evaluation_items: list[dict[str, Any]] = []
+        still_incomplete_count = 0
+        invalid_authority_count = 0
+        for source_row in source_rows:
+            if (
+                source_row.get('decision_snapshot_id') is not None
+                and not is_decision_snapshot_valid_for_source_date(source_row)
+            ):
+                invalid_authority_count += 1
+                continue
+            existing_metadata = source_row.get(
+                'existing_evaluation_metadata'
+            )
+            existing_metadata = (
+                existing_metadata
+                if isinstance(existing_metadata, dict)
+                else {}
+            )
+            cost_assumptions = (
+                self._cost_assumptions_from_evaluation_metadata(
+                    existing_metadata
+                )
+            )
+            shadow_rule = existing_metadata.get('shadow_avoid_chase_rule')
+            shadow_rule = shadow_rule if isinstance(shadow_rule, dict) else {}
+            item = self._build_evaluation_item(
+                source_row=source_row,
+                window_days=resolved_window_days,
+                cost_assumptions=cost_assumptions,
+                enable_shadow_avoid_chase_rule=bool(
+                    shadow_rule.get('enabled')
+                ),
+                price_data_as_of_market_date=normalized_as_of,
+            )
+            if item['outcome_label'] == OUTCOME_INVALID_MISSING_DATA:
+                still_incomplete_count += 1
+                continue
+            evaluation_items.append(item)
+        persisted = self.repository.bulk_upsert_evaluations(
+            items=evaluation_items
+        )
+        return {
+            'request': {
+                'as_of_market_date': normalized_as_of.isoformat(),
+                'market_date_from': market_date_from.isoformat(),
+                'market_date_to': maturity_market_date_to.isoformat(),
+                'lookback_days': resolved_lookback_days,
+                'agent_names': normalized_agent_names,
+                'symbols': normalized_symbols,
+                'window_days': resolved_window_days,
+            },
+            'summary': {
+                'candidate_count': len(source_rows),
+                'self_healed_count': len(persisted),
+                'still_incomplete_count': still_incomplete_count,
+                'invalid_authority_count': invalid_authority_count,
+                'write_count': len(persisted),
+            },
+            'items': persisted,
+        }
 
     def compute_evaluations(
         self,
@@ -841,18 +1090,47 @@ class DeciderPostDecisionEvaluationService:
         symbol: str,
         market_date: date,
         window_days: int,
+        price_data_as_of_market_date: date | None = None,
     ) -> list[dict[str, Any]]:
-        bars = self.daily_bar_loader(
-            symbol,
-            start_date=market_date,
-            limit=window_days + 2,
-            prefer_recent_limit=False,
+        loader_kwargs: dict[str, Any] = {
+            'start_date': market_date,
+            'limit': window_days + 2,
+            'prefer_recent_limit': False,
+        }
+        if price_data_as_of_market_date is not None:
+            loader_kwargs['end_date'] = price_data_as_of_market_date
+        bars = self.daily_bar_loader(symbol, **loader_kwargs)
+        as_of_text = (
+            price_data_as_of_market_date.isoformat()
+            if price_data_as_of_market_date is not None
+            else None
         )
-        return [
+        expected_trade_dates: list[str] = []
+        current_date = market_date
+        while len(expected_trade_dates) < window_days:
+            next_trade_date = next_krx_trading_date(current_date)
+            if next_trade_date is None:
+                break
+            expected_trade_dates.append(next_trade_date.isoformat())
+            current_date = next_trade_date
+        eligible_bars = [
             bar
             for bar in bars
             if str(bar.get('trade_date') or '') > market_date.isoformat()
-        ][:window_days]
+            and (
+                as_of_text is None
+                or str(bar.get('trade_date') or '') <= as_of_text
+            )
+        ]
+        bars_by_trade_date = {
+            str(bar.get('trade_date') or ''): bar
+            for bar in eligible_bars
+        }
+        return [
+            bars_by_trade_date[trade_date]
+            for trade_date in expected_trade_dates
+            if trade_date in bars_by_trade_date
+        ]
 
     def _build_evaluation_item(
         self,
@@ -861,8 +1139,21 @@ class DeciderPostDecisionEvaluationService:
         window_days: int,
         cost_assumptions: dict[str, Any] | None = None,
         enable_shadow_avoid_chase_rule: bool = False,
+        price_data_as_of_market_date: date | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
+        resolved_cost_assumptions = cost_assumptions or {
+            'fee_bps': Decimal('0'),
+            'slippage_bps': Decimal('0'),
+            'tax_bps': Decimal('0'),
+            'costs_explicit': False,
+            'cost_inputs_provided': {
+                'fee': False,
+                'slippage': False,
+                'tax': False,
+            },
+            'missing_cost_components': ['fee', 'slippage', 'tax'],
+        }
         payload = _resolve_feedback_payload(source_row)
         action = (
             _normalize_optional_text(
@@ -901,6 +1192,7 @@ class DeciderPostDecisionEvaluationService:
             symbol=str(source_row['symbol']),
             market_date=source_row['market_date'],
             window_days=window_days,
+            price_data_as_of_market_date=price_data_as_of_market_date,
         )
         usable_bars = [bar for bar in future_bars if _bar_has_complete_ohlc(bar)]
         price_window_complete = (
@@ -1083,11 +1375,7 @@ class DeciderPostDecisionEvaluationService:
                 chase_limit_price=chase_limit_price,
                 target_price=target_price,
                 stop_loss_price=stop_loss_price,
-                cost_assumptions=cost_assumptions or {
-                    'fee_bps': Decimal('0'),
-                    'slippage_bps': Decimal('0'),
-                    'tax_bps': Decimal('0'),
-                },
+                cost_assumptions=resolved_cost_assumptions,
             )
         metadata_payload = {
             'schema_version': DECIDER_EVALUATION_ENGINE_VERSION,
@@ -1109,6 +1397,9 @@ class DeciderPostDecisionEvaluationService:
             'chase_limit_price': chase_limit_price,
             'latest_decision_snapshot_id': source_row.get('decision_snapshot_id'),
             'observed_price_path': _build_observed_price_path(future_bars),
+            'evaluation_cost_assumptions': self._serialize_cost_assumptions(
+                resolved_cost_assumptions
+            ),
             'paper_ledger': paper_ledger,
             'shadow_avoid_chase_rule': shadow_avoid_chase,
             'calibration_features': calibration_features,

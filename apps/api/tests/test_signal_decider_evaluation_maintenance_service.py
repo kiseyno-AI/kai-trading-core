@@ -61,7 +61,59 @@ class _FakePrerequisiteService:
         return dict(self.payload)
 
 
+class _FakePostDecisionEvaluationService:
+    def __init__(self) -> None:
+        self.refresh_args = None
+
+    def refresh_mature_invalid_evaluations(self, **kwargs):
+        self.refresh_args = kwargs
+        return {
+            'summary': {
+                'candidate_count': 3,
+                'self_healed_count': 2,
+                'still_incomplete_count': 1,
+                'write_count': 2,
+            }
+        }
+
+
 class SignalDeciderEvaluationMaintenanceServiceTests(unittest.TestCase):
+    def test_refresh_recent_coverage_runs_post_decision_maturity_self_heal(self) -> None:
+        post_decision_service = _FakePostDecisionEvaluationService()
+        service = SignalDeciderEvaluationMaintenanceService(
+            loop_service=_FakeLoopService(),
+            calendar_review_service=_FakeCalendarService(),
+            prerequisite_service=_FakePrerequisiteService(),
+            post_decision_service=post_decision_service,
+        )
+
+        result = service.refresh_recent_coverage(
+            as_of_market_date='2026-05-08',
+            lookback_days=21,
+            symbols=['005930'],
+            refresh_calendar=False,
+            trigger='eod_pykrx_followup',
+        )
+
+        self.assertEqual(
+            post_decision_service.refresh_args,
+            {
+                'as_of_market_date': '2026-05-08',
+                'lookback_days': 21,
+                'symbols': ['005930'],
+            },
+        )
+        self.assertEqual(
+            result['post_decision_maturity_refresh']['summary'][
+                'self_healed_count'
+            ],
+            2,
+        )
+        self.assertEqual(
+            result['summary']['post_decision_maturity_refresh']['write_count'],
+            2,
+        )
+
     def test_refresh_recent_coverage_skips_when_prerequisites_are_not_ready(self) -> None:
         loop_service = _FakeLoopService()
         calendar_service = _FakeCalendarService()
@@ -81,6 +133,40 @@ class SignalDeciderEvaluationMaintenanceServiceTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'feedback_prerequisites_not_ready')
         self.assertIsNone(loop_service.recent_args)
         self.assertIsNone(calendar_service.recent_args)
+
+    def test_prerequisite_wait_still_repairs_mature_post_decision_rows(self) -> None:
+        loop_service = _FakeLoopService()
+        calendar_service = _FakeCalendarService()
+        post_decision_service = _FakePostDecisionEvaluationService()
+        service = SignalDeciderEvaluationMaintenanceService(
+            loop_service=loop_service,
+            calendar_review_service=calendar_service,
+            prerequisite_service=_FakePrerequisiteService(
+                ready=False,
+                status='waiting',
+            ),
+            post_decision_service=post_decision_service,
+        )
+
+        result = service.refresh_recent_coverage(
+            as_of_market_date='2026-05-08',
+            lookback_days=21,
+        )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['status'], 'waiting')
+        self.assertIsNone(loop_service.recent_args)
+        self.assertIsNone(calendar_service.recent_args)
+        self.assertEqual(
+            post_decision_service.refresh_args['as_of_market_date'],
+            '2026-05-08',
+        )
+        self.assertEqual(
+            result['summary']['post_decision_maturity_refresh'][
+                'self_healed_count'
+            ],
+            2,
+        )
 
     def test_refresh_recent_coverage_passes_calendar_refresh_summary_without_recompute(self) -> None:
         evaluation_summary = {

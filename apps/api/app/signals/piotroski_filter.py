@@ -290,6 +290,22 @@ class DailyPiotroskiFilterService:
                 else ('issue' if item.has_audit_issue else 'clean')
             )
             has_audit_issue = item.has_audit_issue is not False
+            profitability_evidence_status = (
+                'unavailable'
+                if item.net_income is None
+                else ('issue' if item.net_income <= 0 else 'clean')
+            )
+            capital_evidence_status = (
+                'unavailable'
+                if item.total_equity is None
+                else ('issue' if item.total_equity <= 0 else 'clean')
+            )
+            financial_signal_coverage_status = (
+                'complete'
+                if required_financial_signals_available
+                == len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
+                else 'unavailable'
+            )
             score_ratio = score / PIOTROSKI_SIGNAL_COUNT
             signal_coverage_ratio = available_signal_count / PIOTROSKI_SIGNAL_COUNT
             passes_piotroski_score = (
@@ -326,6 +342,18 @@ class DailyPiotroskiFilterService:
                 'filter_payload': {
                     'filter_name': 'piotroski_filter_d',
                     'name_ko': item.name_ko,
+                    'evidence_status': {
+                        'profitability': profitability_evidence_status,
+                        'capital': capital_evidence_status,
+                        'audit': (
+                            'unavailable'
+                            if audit_evidence_status == 'unknown'
+                            else audit_evidence_status
+                        ),
+                        'financial_signal_coverage': (
+                            financial_signal_coverage_status
+                        ),
+                    },
                     'signals': {key: {'value': result.value, 'available': result.available} for key, result in signals.items()},
                     'score_summary': {
                         'score': score,
