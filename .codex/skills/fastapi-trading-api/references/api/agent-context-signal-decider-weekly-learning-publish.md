@@ -17,9 +17,11 @@ activates a policy candidate.
 
 `evidence_manifest.idempotency_key` is an opaque stable key. Core scopes it to
 the week, horizon, evaluation version, minimum sample, lookback, maturity, and
-validity settings. Retry-only fields such as run IDs and completion timestamps
-do not create a second artifact. The complete first accepted manifest remains
-in the artifact for audit.
+validity settings, plus the canonical source evidence SHA-256 when supplied.
+Retry-only fields such as run IDs and completion timestamps do not create a
+second artifact, while corrected source evidence with a different SHA creates
+a new immutable artifact. The complete first accepted manifest remains in the
+artifact for audit.
 
 ## Example request
 
@@ -34,10 +36,12 @@ Content-Type: application/json
   "evaluation_version": "signal_decider_eval_v1",
   "min_sample_size": 30,
   "evidence_manifest": {
-    "source": "weekly-trading-analysis",
+    "source": {
+      "name": "weekly-trading-analysis",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
     "idempotency_key": "weekly:2026-10-05:2026-10-09:h5:v1:n30",
-    "run_id": "weekly-run-2026-10-10",
-    "exec_report_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    "run_id": "weekly-run-2026-10-10"
   }
 }
 ```

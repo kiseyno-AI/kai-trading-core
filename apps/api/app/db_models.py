@@ -2464,6 +2464,7 @@ class SignalDeciderWeeklyLearningArtifact(Base):
         Index(
             'ix_signal_decider_weekly_learning_latest_published',
             'publication_status',
+            desc('week_end'),
             desc('published_at'),
             desc('id'),
         ),

@@ -65,7 +65,7 @@ class SchemaMetadataContractTests(unittest.TestCase):
             ),
             'CREATE INDEX ix_signal_decider_weekly_learning_latest_published '
             'ON signal_decider_weekly_learning_artifacts '
-            '(publication_status, published_at DESC, id DESC)',
+            '(publication_status, week_end DESC, published_at DESC, id DESC)',
         )
 
     def test_signal_decider_policy_version_columns_share_registry_capacity(self) -> None:

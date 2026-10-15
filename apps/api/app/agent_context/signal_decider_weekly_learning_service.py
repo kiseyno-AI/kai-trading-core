@@ -94,10 +94,16 @@ def _mapping_value(row: Mapping[str, Any] | Any, key: str) -> Any:
 
 
 def _normalize_datetime(value: Any) -> datetime | None:
-    if value is None or isinstance(value, datetime):
+    if value is None:
         return value
-    parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    parsed = (
+        value
+        if isinstance(value, datetime)
+        else datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _artifact_record(row: Mapping[str, Any] | Any) -> dict[str, Any]:
@@ -249,6 +255,21 @@ def _normalize_idempotency_key(value: Any) -> str | None:
     if re.fullmatch(r'[A-Za-z0-9._:/-]+', normalized) is None:
         raise ValueError(
             'evidence_manifest.idempotency_key contains unsupported characters'
+        )
+    return normalized
+
+
+def _evidence_content_sha256(manifest: Mapping[str, Any]) -> str | None:
+    source = manifest.get('source')
+    value = source.get('sha256') if isinstance(source, Mapping) else None
+    if value is None:
+        value = manifest.get('exec_report_sha256')
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if re.fullmatch(r'[0-9a-f]{64}', normalized) is None:
+        raise ValueError(
+            'evidence manifest source sha256 must be 64 lowercase hex characters'
         )
     return normalized
 
@@ -413,6 +434,7 @@ class SignalDeciderWeeklyLearningRepository:
                     == 'published'
                 )
                 .order_by(
+                    SignalDeciderWeeklyLearningArtifact.week_end.desc(),
                     SignalDeciderWeeklyLearningArtifact.published_at.desc(),
                     SignalDeciderWeeklyLearningArtifact.id.desc(),
                 )
@@ -488,10 +510,12 @@ class SignalDeciderWeeklyLearningService:
         idempotency_key = _normalize_idempotency_key(
             resolved_manifest.get('idempotency_key')
         )
+        evidence_content_sha256 = _evidence_content_sha256(resolved_manifest)
         maturity_buffer_days = max(14, resolved_horizon * 3)
         stable_publication_scope = {
             'schema_version': WEEKLY_LEARNING_ARTIFACT_SCHEMA_VERSION,
             'idempotency_key': idempotency_key,
+            'evidence_content_sha256': evidence_content_sha256,
             'week_start': resolved_week_start.isoformat(),
             'week_end': resolved_week_end.isoformat(),
             'lookback_days': self.lookback_days,
@@ -668,6 +692,14 @@ class SignalDeciderWeeklyLearningService:
         rows = self.repository.list_published_candidates(limit=100)
         if not rows:
             return {'available': False, 'artifact': None}
+        rows.sort(
+            key=lambda row: (
+                row['week_end'],
+                row['published_at'],
+                row['id'],
+            ),
+            reverse=True,
+        )
         first_rejection: dict[str, Any] | None = None
         for row in rows:
             artifact = _serialize_artifact(row)

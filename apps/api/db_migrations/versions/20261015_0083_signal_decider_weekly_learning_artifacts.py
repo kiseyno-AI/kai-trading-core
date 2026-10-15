@@ -58,7 +58,12 @@ def upgrade() -> None:
     op.create_index(
         'ix_signal_decider_weekly_learning_latest_published',
         'signal_decider_weekly_learning_artifacts',
-        ['publication_status', sa.text('published_at DESC'), sa.text('id DESC')],
+        [
+            'publication_status',
+            sa.text('week_end DESC'),
+            sa.text('published_at DESC'),
+            sa.text('id DESC'),
+        ],
         unique=False,
     )
     op.create_index(

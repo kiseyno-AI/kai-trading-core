@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import unittest
 
 from sqlalchemy.exc import IntegrityError
@@ -254,7 +254,10 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
         )
         common_manifest = {
-            'source': 'weekly-trading-analysis',
+            'source': {
+                'name': 'weekly-trading-analysis',
+                'sha256': 'a' * 64,
+            },
             'idempotency_key': 'weekly-learning:2026-10-05:2026-10-11:h5:v1:n30',
         }
 
@@ -293,6 +296,42 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
         self.assertEqual(
             first['artifact']['evidence_manifest']['run_id'],
             'ops-run-first',
+        )
+
+    def test_corrected_evidence_sha_creates_a_new_immutable_artifact(self) -> None:
+        repository = FakeWeeklyLearningRepository()
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+            now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
+        )
+        common_manifest = {
+            'idempotency_key': 'weekly-learning:2026-10-05:2026-10-11:h5:v1:n30',
+        }
+
+        original = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest={
+                **common_manifest,
+                'source': {'sha256': 'a' * 64},
+            },
+        )
+        corrected = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest={
+                **common_manifest,
+                'source': {'sha256': 'b' * 64},
+            },
+        )
+
+        self.assertFalse(original['idempotent_replay'])
+        self.assertFalse(corrected['idempotent_replay'])
+        self.assertEqual(len(repository.rows_by_fingerprint), 2)
+        self.assertNotEqual(
+            original['artifact']['source_fingerprint'],
+            corrected['artifact']['source_fingerprint'],
         )
 
     def test_ineligible_run_is_audited_but_never_returned_as_latest_published(self) -> None:
@@ -337,6 +376,33 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
 
         self.assertFalse(latest['available'])
         self.assertEqual(latest['reason'], 'artifact_content_hash_mismatch')
+
+    def test_database_timezone_rendering_does_not_change_artifact_hash(self) -> None:
+        repository = FakeWeeklyLearningRepository()
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+            now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
+        )
+        service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            min_sample_size=30,
+        )
+        stored = next(iter(repository.rows_by_fingerprint.values()))
+        database_timezone = timezone(timedelta(hours=9))
+        stored['generated_at'] = stored['generated_at'].astimezone(
+            database_timezone
+        )
+        stored['published_at'] = stored['published_at'].astimezone(
+            database_timezone
+        )
+
+        latest = service.get_latest_published(as_of_date='2026-10-13')
+
+        self.assertTrue(latest['available'])
+        self.assertEqual(latest['artifact']['generated_at'], '2026-10-12T01:30:00+00:00')
+        self.assertEqual(latest['artifact']['published_at'], '2026-10-12T01:30:00+00:00')
 
     def test_latest_read_rejects_artifact_after_valid_through_date(self) -> None:
         repository = FakeWeeklyLearningRepository()
@@ -386,6 +452,40 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
         self.assertEqual(backfill['status'], 'published')
         self.assertEqual(backfill['artifact']['valid_through'], '2026-09-19')
         self.assertTrue(latest['available'])
+        self.assertEqual(
+            latest['artifact']['artifact_version'],
+            current['artifact']['artifact_version'],
+        )
+
+    def test_recent_backfill_does_not_shadow_newer_week_artifact(self) -> None:
+        repository = FakeWeeklyLearningRepository()
+        clock = {'now': datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc)}
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+            now=lambda: clock['now'],
+        )
+        current = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            min_sample_size=30,
+        )
+        clock['now'] = datetime(2026, 10, 15, 1, 30, tzinfo=timezone.utc)
+        backfill = service.publish(
+            week_start='2026-09-28',
+            week_end='2026-10-04',
+            min_sample_size=30,
+        )
+
+        latest = service.get_latest_published(as_of_date='2026-10-16')
+
+        self.assertEqual(backfill['status'], 'published')
+        self.assertGreater(
+            backfill['artifact']['published_at'],
+            current['artifact']['published_at'],
+        )
+        self.assertTrue(latest['available'])
+        self.assertEqual(latest['artifact']['week_end'], '2026-10-11')
         self.assertEqual(
             latest['artifact']['artifact_version'],
             current['artifact']['artifact_version'],
