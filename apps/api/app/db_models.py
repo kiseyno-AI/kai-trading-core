@@ -2446,6 +2446,58 @@ class SignalDeciderActualExecutionOutcome(Base, TimestampMixin):
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class SignalDeciderWeeklyLearningArtifact(Base):
+    __tablename__ = 'signal_decider_weekly_learning_artifacts'
+    __table_args__ = (
+        UniqueConstraint(
+            'artifact_version',
+            name='uq_signal_decider_weekly_learning_artifact_version',
+        ),
+        UniqueConstraint(
+            'source_fingerprint',
+            name='uq_signal_decider_weekly_learning_source_fingerprint',
+        ),
+        CheckConstraint(
+            "publication_status IN ('published', 'ineligible')",
+            name='ck_signal_decider_weekly_learning_publication_status',
+        ),
+        Index(
+            'ix_signal_decider_weekly_learning_latest_published',
+            'publication_status',
+            desc('published_at'),
+            desc('id'),
+        ),
+        Index(
+            'ix_signal_decider_weekly_learning_week',
+            'week_end',
+            'week_start',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    artifact_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    week_start: Mapped[date] = mapped_column(Date, nullable=False)
+    week_end: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_through: Mapped[date] = mapped_column(Date, nullable=False)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    min_sample_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    publication_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    eligibility_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    learning_context_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    evidence_manifest_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    source_report_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AgentContextFeedbackFailure(Base, TimestampMixin):
     __tablename__ = 'agent_context_feedback_failures'
     __table_args__ = (

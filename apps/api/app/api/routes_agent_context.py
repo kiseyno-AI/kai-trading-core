@@ -40,6 +40,9 @@ from app.agent_context.session_cleanup_service import agent_feedback_session_cle
 from app.agent_context.signal_decider_calibration_service import signal_decider_calibration_service
 from app.agent_context.signal_decider_calendar_review_service import signal_decider_calendar_review_service
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
+from app.agent_context.signal_decider_weekly_learning_service import (
+    signal_decider_weekly_learning_service,
+)
 from app.agent_context.retry_service import (
     EXPECTED_ROLES,
     FeedbackRetryCycleConfig,
@@ -260,6 +263,29 @@ class SignalDeciderPolicyCandidateRequest(BaseModel):
     def validate_window(self) -> 'SignalDeciderPolicyCandidateRequest':
         if self.market_date_from > self.market_date_to:
             raise ValueError('market_date_from must be on or before market_date_to')
+        return self
+
+
+class SignalDeciderWeeklyLearningPublishRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    week_start: date
+    week_end: date
+    horizon_days: int = Field(default=5)
+    evaluation_version: str = Field(
+        default='signal_decider_eval_v1',
+        min_length=1,
+        max_length=64,
+    )
+    min_sample_size: int = Field(default=30, ge=3, le=1000)
+    evidence_manifest: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode='after')
+    def validate_window(self) -> 'SignalDeciderWeeklyLearningPublishRequest':
+        if self.week_start > self.week_end:
+            raise ValueError('week_start must be on or before week_end')
+        if (self.week_end - self.week_start).days > 13:
+            raise ValueError('publication evidence window may not exceed 14 days')
         return self
 
 
@@ -1866,6 +1892,47 @@ async def get_signal_decider_calibration_report(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Signal-decider calibration report failed: {exc}') from exc
+
+
+@router.post('/signal-decider/weekly-learning/publish')
+async def publish_signal_decider_weekly_learning(
+    payload: SignalDeciderWeeklyLearningPublishRequest,
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_weekly_learning_service.publish,
+            week_start=payload.week_start,
+            week_end=payload.week_end,
+            horizon_days=payload.horizon_days,
+            evaluation_version=payload.evaluation_version,
+            min_sample_size=payload.min_sample_size,
+            evidence_manifest=payload.evidence_manifest,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f'Signal-decider weekly learning publish failed: {exc}',
+        ) from exc
+
+
+@router.get('/signal-decider/weekly-learning/latest')
+async def get_latest_signal_decider_weekly_learning(
+    as_of_date: date | None = Query(default=None),
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            signal_decider_weekly_learning_service.get_latest_published,
+            as_of_date=as_of_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f'Signal-decider weekly learning read failed: {exc}',
+        ) from exc
 
 
 @router.post('/signal-decider/policy-candidates/generate')

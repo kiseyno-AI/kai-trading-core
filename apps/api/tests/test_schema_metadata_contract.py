@@ -29,6 +29,45 @@ def _postgres_index_ddl(table_name: str, index_name: str) -> str:
 
 
 class SchemaMetadataContractTests(unittest.TestCase):
+    def test_weekly_learning_artifact_metadata_is_versioned_and_queryable(self) -> None:
+        table_name = 'signal_decider_weekly_learning_artifacts'
+        table = Base.metadata.tables[table_name]
+
+        self.assertTrue(
+            {
+                'artifact_version',
+                'week_start',
+                'week_end',
+                'valid_through',
+                'source_fingerprint',
+                'content_sha256',
+                'publication_status',
+                'eligibility_payload',
+                'learning_context_payload',
+                'evidence_manifest_payload',
+                'source_report_payload',
+                'published_at',
+            }.issubset(set(table.columns.keys()))
+        )
+        constraints = _unique_constraints(table_name)
+        self.assertEqual(
+            constraints['uq_signal_decider_weekly_learning_artifact_version'],
+            ('artifact_version',),
+        )
+        self.assertEqual(
+            constraints['uq_signal_decider_weekly_learning_source_fingerprint'],
+            ('source_fingerprint',),
+        )
+        self.assertEqual(
+            _postgres_index_ddl(
+                table_name,
+                'ix_signal_decider_weekly_learning_latest_published',
+            ),
+            'CREATE INDEX ix_signal_decider_weekly_learning_latest_published '
+            'ON signal_decider_weekly_learning_artifacts '
+            '(publication_status, published_at DESC, id DESC)',
+        )
+
     def test_signal_decider_policy_version_columns_share_registry_capacity(self) -> None:
         expected_columns = {
             ('signal_decider_decision_snapshots', 'policy_version'),

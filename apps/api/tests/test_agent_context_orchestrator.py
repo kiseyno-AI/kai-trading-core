@@ -2164,7 +2164,18 @@ class RepairJsonTailTests(unittest.TestCase):
             },
         }
 
-        with patch.object(orchestrator_module.signal_decider_calibration_service, 'build_report', return_value=report):
+        with (
+            patch.object(
+                orchestrator_module.signal_decider_weekly_learning_service,
+                'get_latest_performance_criteria',
+                return_value=None,
+            ),
+            patch.object(
+                orchestrator_module.signal_decider_calibration_service,
+                'build_report',
+                return_value=report,
+            ),
+        ):
             criteria = service._build_signal_decider_performance_criteria(
                 policy_context={'current_version': 'signal_decider_policy_v1'},
                 market_date=date(2026, 7, 14),
@@ -2187,6 +2198,86 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertFalse(criteria['usage_policy']['allow_buy_authorization'])
         self.assertTrue(criteria['usage_policy']['reward_risk_and_outcome_path_override_name_only_reasoning'])
         self.assertFalse(criteria['usage_policy']['auto_apply_policy_changes'])
+
+    def test_every_decider_payload_receives_latest_published_weekly_learning_context(self):
+        service = AgentFeedbackOrchestrator()
+        published = {
+            'schema_version': 'signal_decider_performance_criteria_v1',
+            'status': 'ready',
+            'source': 'published_weekly_learning_artifact',
+            'artifact': {
+                'artifact_version': 'signal_decider_weekly_learning_2026-10-09_abc123',
+                'source_fingerprint': 'f' * 64,
+                'content_sha256': 'c' * 64,
+                'week_start': '2026-10-05',
+                'week_end': '2026-10-09',
+                'valid_through': '2026-10-23',
+            },
+            'usage_policy': {
+                'model_guidance_eligible': True,
+                'deterministic_gate_eligible': False,
+                'allow_buy_authorization': False,
+                'allow_sell_authorization': False,
+                'manual_review_only': True,
+            },
+        }
+
+        with (
+            patch.object(
+                orchestrator_module.signal_decider_weekly_learning_service,
+                'get_latest_performance_criteria',
+                return_value=published,
+            ) as latest,
+            patch.object(
+                orchestrator_module.signal_decider_calibration_service,
+                'build_report',
+            ) as live_calibration,
+            patch.object(
+                orchestrator_module.signal_decider_loop_service,
+                'get_active_policy_context',
+                return_value={'current_version': 'signal_decider_policy_v1'},
+            ),
+        ):
+            for role in ('signal-decider', 'short-term-decider'):
+                policy = service._build_decider_policy_context(
+                    role=role,
+                    market_date=date(2026, 10, 13),
+                )
+                payload = service._build_signal_decider_payload(
+                    item={'symbol': '005930', 'market_date': '2026-10-13'},
+                    market_date=date(2026, 10, 13),
+                    request_run_id=f'weekly-learning-{role}',
+                    market_context={},
+                    upstream_summaries={},
+                    upstream_traceability={},
+                    signal_decider_policy=policy,
+                    agent_name=role,
+                )
+
+                artifact = payload['signal_decider_policy'][
+                    'performance_criteria'
+                ]['artifact']
+                self.assertEqual(artifact['source_fingerprint'], 'f' * 64)
+                self.assertEqual(artifact['week_start'], '2026-10-05')
+                self.assertEqual(artifact['week_end'], '2026-10-09')
+
+        self.assertEqual(latest.call_count, 2)
+        live_calibration.assert_not_called()
+
+    def test_no_weekly_artifact_preserves_short_term_empty_policy_context(self):
+        service = AgentFeedbackOrchestrator()
+
+        with patch.object(
+            orchestrator_module.signal_decider_weekly_learning_service,
+            'get_latest_performance_criteria',
+            return_value=None,
+        ):
+            policy = service._build_decider_policy_context(
+                role='short-term-decider',
+                market_date=date(2026, 10, 13),
+            )
+
+        self.assertEqual(policy, {})
 
     def test_signal_decider_rule_candidate_compaction_normalizes_type_and_activation_safely(self):
         compacted = AgentFeedbackOrchestrator._compact_signal_decider_rule_candidates(
@@ -2322,6 +2413,10 @@ class RepairJsonTailTests(unittest.TestCase):
             orchestrator_module.signal_decider_calibration_service,
             'build_report',
             return_value=report,
+        ), patch.object(
+            orchestrator_module.signal_decider_weekly_learning_service,
+            'get_latest_performance_criteria',
+            return_value=None,
         ):
             criteria = AgentFeedbackOrchestrator()._build_signal_decider_performance_criteria(
                 policy_context={'current_version': 'signal_decider_policy_v1'},
@@ -2383,7 +2478,18 @@ class RepairJsonTailTests(unittest.TestCase):
             'calibration_hints': {},
         }
 
-        with patch.object(orchestrator_module.signal_decider_calibration_service, 'build_report', return_value=report):
+        with (
+            patch.object(
+                orchestrator_module.signal_decider_weekly_learning_service,
+                'get_latest_performance_criteria',
+                return_value=None,
+            ),
+            patch.object(
+                orchestrator_module.signal_decider_calibration_service,
+                'build_report',
+                return_value=report,
+            ),
+        ):
             criteria = service._build_signal_decider_performance_criteria(
                 policy_context={'current_version': 'signal_decider_policy_v1'},
                 market_date=date(2026, 7, 14),
@@ -2408,7 +2514,18 @@ class RepairJsonTailTests(unittest.TestCase):
             'calibration_hints': {},
         }
 
-        with patch.object(orchestrator_module.signal_decider_calibration_service, 'build_report', return_value=report):
+        with (
+            patch.object(
+                orchestrator_module.signal_decider_weekly_learning_service,
+                'get_latest_performance_criteria',
+                return_value=None,
+            ),
+            patch.object(
+                orchestrator_module.signal_decider_calibration_service,
+                'build_report',
+                return_value=report,
+            ),
+        ):
             criteria = service._build_signal_decider_performance_criteria(
                 policy_context={'current_version': 'signal_decider_policy_v1'},
                 market_date=date(2026, 7, 14),

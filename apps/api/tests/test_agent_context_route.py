@@ -1231,6 +1231,40 @@ class FakeSignalDeciderCalibrationService:
         }
 
 
+class FakeSignalDeciderWeeklyLearningService:
+    def __init__(self):
+        self.publish_args = None
+        self.latest_args = None
+
+    def publish(self, **kwargs):
+        self.publish_args = kwargs
+        return {
+            'status': 'published',
+            'idempotent_replay': False,
+            'artifact': {
+                'artifact_version': 'signal_decider_weekly_learning_2026-10-09_abc123',
+                'source_fingerprint': 'f' * 64,
+                'week_start': kwargs['week_start'].isoformat(),
+                'week_end': kwargs['week_end'].isoformat(),
+                'valid_through': '2026-10-23',
+            },
+        }
+
+    def get_latest_published(self, **kwargs):
+        self.latest_args = kwargs
+        return {
+            'available': True,
+            'stale': False,
+            'artifact': {
+                'artifact_version': 'signal_decider_weekly_learning_2026-10-09_abc123',
+                'source_fingerprint': 'f' * 64,
+                'week_start': '2026-10-05',
+                'week_end': '2026-10-09',
+                'valid_through': '2026-10-23',
+            },
+        }
+
+
 class AgentContextRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = FastAPI()
@@ -2382,6 +2416,60 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(payload['condition_clusters']['positive'][0]['cluster_key'], 'decision.confidence_bucket=high')
         self.assertEqual(payload['calibration_hints']['scoring_guidance'][0]['manual_review_only'], True)
         self.assertEqual(payload['rule_candidates']['items'][0]['activation_status'], 'needs_replay')
+
+    def test_signal_decider_weekly_learning_publish_route_calls_service(self):
+        fake_service = FakeSignalDeciderWeeklyLearningService()
+        original_service = routes_agent_context.signal_decider_weekly_learning_service
+        routes_agent_context.signal_decider_weekly_learning_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.post(
+                '/agent-context/signal-decider/weekly-learning/publish',
+                json={
+                    'week_start': '2026-10-05',
+                    'week_end': '2026-10-09',
+                    'horizon_days': 5,
+                    'evaluation_version': 'signal_decider_eval_v1',
+                    'min_sample_size': 30,
+                    'evidence_manifest': {
+                        'source': 'weekly-trading-analysis',
+                        'idempotency_key': 'weekly:2026-10-05:2026-10-09:h5',
+                        'run_id': 'ops-run-1',
+                    },
+                },
+            )
+        finally:
+            routes_agent_context.signal_decider_weekly_learning_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.publish_args['week_start'], date(2026, 10, 5))
+        self.assertEqual(fake_service.publish_args['week_end'], date(2026, 10, 9))
+        self.assertEqual(fake_service.publish_args['horizon_days'], 5)
+        self.assertEqual(fake_service.publish_args['min_sample_size'], 30)
+        self.assertEqual(
+            fake_service.publish_args['evidence_manifest']['run_id'],
+            'ops-run-1',
+        )
+        self.assertEqual(response.json()['status'], 'published')
+
+    def test_signal_decider_weekly_learning_latest_route_calls_service(self):
+        fake_service = FakeSignalDeciderWeeklyLearningService()
+        original_service = routes_agent_context.signal_decider_weekly_learning_service
+        routes_agent_context.signal_decider_weekly_learning_service = fake_service
+        try:
+            client = TestClient(self.app)
+            response = client.get(
+                '/agent-context/signal-decider/weekly-learning/latest',
+                params={'as_of_date': '2026-10-13'},
+            )
+        finally:
+            routes_agent_context.signal_decider_weekly_learning_service = original_service
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_service.latest_args['as_of_date'], date(2026, 10, 13))
+        payload = response.json()
+        self.assertTrue(payload['available'])
+        self.assertEqual(payload['artifact']['source_fingerprint'], 'f' * 64)
 
     def test_signal_decider_policy_candidate_generation_route_calls_service(self):
         fake_service = FakeSignalDeciderLoopService()

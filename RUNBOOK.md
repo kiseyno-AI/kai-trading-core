@@ -56,6 +56,8 @@ What it does:
 - `GET /scanner/trending-stocks?period=5d&direction=both&limit=20`
 - `GET /eod/status`
 - `GET /agent-context/feedback/decider-coverage?market_date=2026-05-08`
+- `POST /agent-context/signal-decider/weekly-learning/publish`
+- `GET /agent-context/signal-decider/weekly-learning/latest?as_of_date=2026-10-13`
 - `GET /eod/pipeline/status`
 - `GET /eod/pipeline/stages`
 - `POST /eod/master/refresh-if-due`

@@ -109,12 +109,20 @@ from app.agent_context.reuse_service import (
 )
 from app.agent_context.session_cleanup_service import SessionCleanupTarget, agent_feedback_session_cleanup_service
 from app.agent_context.signal_decider_calibration_service import signal_decider_calibration_service
-from app.agent_context.signal_decider_market_context import signal_decider_market_context_builder
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
     DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON,
     signal_decider_loop_service,
+)
+from app.agent_context.signal_decider_market_context import signal_decider_market_context_builder
+from app.agent_context.signal_decider_performance_criteria import (
+    compact_guidance,
+    compact_performance_buckets,
+    compact_rule_candidates,
+)
+from app.agent_context.signal_decider_weekly_learning_service import (
+    signal_decider_weekly_learning_service,
 )
 from app.core.settings import settings
 from app.db import session_scope, session_timeout_budget
@@ -2788,15 +2796,10 @@ class AgentFeedbackOrchestrator:
                     refreshed_item.pop('agent_feedback_eligibility', None)
             refreshed_policy_context: dict[str, Any] = {}
             try:
-                if decision_role == SIGNAL_DECIDER_AGENT_NAME:
-                    refreshed_policy_context = (
-                        self._attach_signal_decider_performance_criteria(
-                            policy_context=(
-                                signal_decider_loop_service
-                                .get_active_policy_context()
-                            ),
-                            market_date=market_date,
-                        )
+                if decision_role in DECISION_SUPPORT_AGENT_NAMES:
+                    refreshed_policy_context = self._build_decider_policy_context(
+                        role=decision_role,
+                        market_date=market_date,
                     )
             except Exception as exc:  # noqa: BLE001
                 reasons.append(
@@ -3767,16 +3770,10 @@ class AgentFeedbackOrchestrator:
                 started_at=datetime.now(timezone.utc),
             )
             buffered_lookup = _feedback_row_lookup(snapshot.buffered_feedback_rows)
-            active_signal_decider_policy = (
-                signal_decider_loop_service.get_active_policy_context()
-                if role == SIGNAL_DECIDER_AGENT_NAME
-                else {}
+            active_signal_decider_policy = self._build_decider_policy_context(
+                role=role,
+                market_date=market_date,
             )
-            if role == SIGNAL_DECIDER_AGENT_NAME:
-                active_signal_decider_policy = self._attach_signal_decider_performance_criteria(
-                    policy_context=active_signal_decider_policy,
-                    market_date=market_date,
-                )
 
         dispatch_items: list[dict[str, Any]] = []
         for item in symbol_context_items:
@@ -3979,12 +3976,58 @@ class AgentFeedbackOrchestrator:
             'performance_criteria': criteria,
         }
 
+    def _build_decider_policy_context(
+        self,
+        *,
+        role: str,
+        market_date: date,
+    ) -> dict[str, Any]:
+        if role == SIGNAL_DECIDER_AGENT_NAME:
+            return self._attach_signal_decider_performance_criteria(
+                policy_context=(
+                    signal_decider_loop_service.get_active_policy_context()
+                ),
+                market_date=market_date,
+            )
+        if role == SHORT_TERM_DECIDER_AGENT_NAME:
+            criteria = self._load_published_weekly_performance_criteria(
+                market_date=market_date,
+            )
+            return (
+                {'performance_criteria': criteria}
+                if isinstance(criteria, dict)
+                else {}
+            )
+        return {}
+
+    @staticmethod
+    def _load_published_weekly_performance_criteria(
+        *,
+        market_date: date,
+    ) -> dict[str, Any] | None:
+        try:
+            return (
+                signal_decider_weekly_learning_service
+                .get_latest_performance_criteria(as_of_date=market_date)
+            )
+        except Exception as exc:  # Published learning must degrade to live fallback.
+            logger.warning(
+                'signal_decider_weekly_learning_unavailable: %s',
+                exc,
+            )
+            return None
+
     def _build_signal_decider_performance_criteria(
         self,
         *,
         policy_context: dict[str, Any],
         market_date: date,
     ) -> dict[str, Any] | None:
+        published = self._load_published_weekly_performance_criteria(
+            market_date=market_date,
+        )
+        if published is not None:
+            return published
         policy_version = str(policy_context.get('current_version') or '').strip() or None
         market_date_to = market_date - timedelta(days=1)
         market_date_from = market_date_to - timedelta(days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS)
@@ -4062,107 +4105,15 @@ class AgentFeedbackOrchestrator:
 
     @staticmethod
     def _compact_signal_decider_performance_buckets(group_summaries: dict[str, Any]) -> list[dict[str, Any]]:
-        compacted: list[dict[str, Any]] = []
-        preferred_sections = (
-            'decision_actions',
-            'outcome_path_buckets',
-            'reward_risk_buckets',
-            'confidence_buckets',
-            'factor_signal_score_buckets',
-            'factor_momentum_buckets',
-            'factor_quality_buckets',
-        )
-        for section in preferred_sections:
-            section_payload = group_summaries.get(section)
-            buckets = section_payload.get('items') if isinstance(section_payload, dict) else None
-            if not isinstance(buckets, list):
-                continue
-            for bucket in buckets[:4]:
-                if not isinstance(bucket, dict):
-                    continue
-                compacted.append(
-                    {
-                        'bucket_type': bucket.get('bucket_type') or section,
-                        'bucket_key': bucket.get('bucket_key'),
-                        'bucket_value': bucket.get('bucket_value'),
-                        'sample_count': bucket.get('sample_count'),
-                        'positive_rate': bucket.get('positive_rate'),
-                        'negative_rate': bucket.get('negative_rate'),
-                        'bad_buy_rate': bucket.get('bad_buy_rate'),
-                        'missed_opportunity_rate': bucket.get('missed_opportunity_rate'),
-                        'avg_close_return_pct': bucket.get('avg_close_return_pct'),
-                        'avg_max_upside_return_pct': bucket.get('avg_max_upside_return_pct'),
-                        'avg_max_drawdown_return_pct': bucket.get('avg_max_drawdown_return_pct'),
-                    }
-                )
-        return compacted[:18]
+        return compact_performance_buckets(group_summaries)
 
     @staticmethod
     def _compact_signal_decider_rule_candidates(rule_candidates: dict[str, Any]) -> list[dict[str, Any]]:
-        items = rule_candidates.get('items') if isinstance(rule_candidates, dict) else None
-        if not isinstance(items, list):
-            return []
-        candidate_type_aliases = {
-            'veto': 'buy_veto',
-            'downsize': 'tighten_buy_gate',
-        }
-        compacted: list[dict[str, Any]] = []
-        for item in items[:8]:
-            if not isinstance(item, dict):
-                continue
-            candidate_type = candidate_type_aliases.get(
-                str(item.get('candidate_type') or '').strip(),
-                str(item.get('candidate_type') or '').strip(),
-            )
-            predicate = item.get('predicate') if isinstance(item.get('predicate'), dict) else {}
-            predicate_branch = (
-                'all' if 'all' in predicate and 'any' not in predicate
-                else 'any' if 'any' in predicate and 'all' not in predicate
-                else None
-            )
-            predicate_items = predicate.get(predicate_branch) if predicate_branch else None
-            canonical_predicate = bool(
-                predicate.get('schema_version') == 'signal_decider_rule_predicate_v1'
-                and predicate_branch
-                and set(predicate) == {'schema_version', predicate_branch}
-                and isinstance(predicate_items, list)
-                and predicate_items
-                and all(isinstance(predicate_item, dict) for predicate_item in predicate_items)
-            )
-            activation_status = str(item.get('activation_status') or 'needs_replay').strip()
-            manual_review_only = item.get('manual_review_only') is not False
-            deterministic_gate_eligible = bool(
-                candidate_type in {'buy_veto', 'tighten_buy_gate'}
-                and canonical_predicate
-                and activation_status == 'active'
-                and item.get('active_policy') is True
-                and item.get('deterministic_gate_eligible') is True
-                and not manual_review_only
-            )
-            compacted.append(
-                {
-                    'candidate_id': item.get('candidate_id'),
-                    'candidate_type': candidate_type,
-                    'predicate': predicate,
-                    'reason': item.get('reason'),
-                    'support_sample_count': item.get('support_sample_count'),
-                    'evaluated_sample_count': item.get('evaluated_sample_count'),
-                    'negative_rate': item.get('negative_rate'),
-                    'activation_status': activation_status,
-                    'manual_review_only': manual_review_only,
-                    'active_policy': deterministic_gate_eligible,
-                    'deterministic_gate_eligible': deterministic_gate_eligible,
-                }
-            )
-        return compacted
+        return compact_rule_candidates(rule_candidates)
 
     @staticmethod
     def _compact_signal_decider_guidance(guidance: dict[str, Any]) -> dict[str, Any]:
-        return {
-            key: list(value)[:3]
-            for key, value in guidance.items()
-            if key in {'prompt_guidance', 'scoring_guidance', 'operator_review'} and isinstance(value, list)
-        }
+        return compact_guidance(guidance)
 
     def _wait_for_subagent_feedback(
         self,

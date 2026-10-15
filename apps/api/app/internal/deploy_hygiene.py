@@ -58,6 +58,9 @@ RUNTIME_SCHEMA_TABLE_DESCRIPTIONS: dict[str, str] = {
     'signal_decider_policy_candidates': 'Signal-decider policy candidate store.',
     'signal_decider_execution_plan_items': 'Signal-decider next-open/intraday execution plan items.',
     'signal_decider_actual_execution_outcomes': 'Actual execution outcome store linked to execution plan items.',
+    'signal_decider_weekly_learning_artifacts': (
+        'Versioned weekly learning artifacts consumed by decider context assembly.'
+    ),
     'order_requests': 'Normalized trading order request store; duplicate protection uses ON CONFLICT.',
     'broker_orders': 'Current broker order snapshots; execution submit/reconcile writes select and update this parent store first.',
     'broker_order_events': 'Broker order event ledger; event dedupe uses ON CONFLICT.',
@@ -330,6 +333,20 @@ RUNTIME_SCHEMA_UNIQUE_CHECKS: tuple[dict[str, Any], ...] = (
         'columns': ('entry_plan_item_id',),
         'required_name': 'uq_sdao_entry_plan',
         'description': 'Actual execution outcomes depend on one outcome per entry plan item.',
+    },
+    {
+        'name': 'signal_decider_weekly_learning_artifact_version_unique',
+        'table': 'signal_decider_weekly_learning_artifacts',
+        'columns': ('artifact_version',),
+        'required_name': 'uq_signal_decider_weekly_learning_artifact_version',
+        'description': 'Weekly learning artifact versions are immutable identities.',
+    },
+    {
+        'name': 'signal_decider_weekly_learning_source_fingerprint_unique',
+        'table': 'signal_decider_weekly_learning_artifacts',
+        'columns': ('source_fingerprint',),
+        'required_name': 'uq_signal_decider_weekly_learning_source_fingerprint',
+        'description': 'Weekly learning publication retries depend on source-fingerprint idempotency.',
     },
     {
         'name': 'order_requests_broker_account_client_order_id_unique',

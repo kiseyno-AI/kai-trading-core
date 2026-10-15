@@ -198,6 +198,28 @@ class DeployHygieneTests(unittest.TestCase):
         self.assertFalse(missing_table_check['ready'])
         self.assertEqual(missing_table_check['kind'], 'table')
 
+    def test_collect_schema_drift_preflight_blocks_missing_weekly_learning_store(self) -> None:
+        connection = object()
+        inspector = _ready_schema_inspector(
+            missing_tables={'signal_decider_weekly_learning_artifacts'}
+        )
+        connect_context = Mock()
+        connect_context.__enter__ = Mock(return_value=connection)
+        connect_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch('app.internal.deploy_hygiene.engine.connect', return_value=connect_context),
+            patch('app.internal.deploy_hygiene.sqlalchemy_inspect', return_value=inspector),
+        ):
+            report, exit_code = deploy_hygiene.collect_schema_drift_preflight()
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['ready'])
+        self.assertIn(
+            'Missing required table signal_decider_weekly_learning_artifacts.',
+            report['blocking_reasons'],
+        )
+
     def test_collect_schema_drift_preflight_blocks_missing_unique_and_foreign_key(self) -> None:
         connection = object()
         inspector = _ready_schema_inspector(

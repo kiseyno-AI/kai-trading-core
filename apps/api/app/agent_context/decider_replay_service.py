@@ -660,6 +660,14 @@ def _actual_outcome_exclusion_reason(
     return None
 
 
+def actual_execution_outcome_exclusion_reason(
+    outcome: SignalDeciderActualExecutionOutcome,
+) -> str | None:
+    """Return the canonical economic-replay exclusion for an actual outcome."""
+
+    return _actual_outcome_exclusion_reason(outcome)
+
+
 def _actual_outcome_to_trade(
     *,
     snapshot: SignalDeciderDecisionSnapshot,

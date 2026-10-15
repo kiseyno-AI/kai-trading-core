@@ -35,7 +35,7 @@
 32. Daily unified value factor compute/read routes
 33. Daily quality factor compute/read routes
 34. Daily composite factor compute/read routes
-35. Signal-decider evaluation, diagnostics, and policy-candidate routes
+35. Signal-decider evaluation, diagnostics, weekly-learning, and policy-candidate routes
 36. Internal trading order control, inquiry, and reconciliation routes
 37. Signal-decider next-open execution planning and market-open submit routes
 38. Signal-decider intraday auto-sell diagnostics and runtime submit routes
@@ -195,6 +195,8 @@
 - `POST /agent-context/signal-decider/evaluations/compute`
 - `GET /agent-context/signal-decider/evaluations?market_date=YYYY-MM-DD&symbol=005930&horizons=1&horizons=5`
 - `GET /agent-context/signal-decider/calibration?market_date_from=YYYY-MM-DD&market_date_to=YYYY-MM-DD&symbols=005930&policy_version=signal_decider_policy_v1&horizon_days=5&evaluation_version=signal_decider_eval_v1&min_sample_size=3&cluster_limit=10`
+- `POST /agent-context/signal-decider/weekly-learning/publish`
+- `GET /agent-context/signal-decider/weekly-learning/latest?as_of_date=YYYY-MM-DD`
 - `GET /agent-context/signal-decider/decision-policies?status=active&limit=20`
 - `GET /agent-context/signal-decider/decision-policies/signal_decider_policy_v1`
 - `POST /agent-context/signal-decider/decision-policies/signal_decider_policy_v2/activate`
@@ -211,6 +213,8 @@
 
 ## Agent context notes
 - `GET /agent-context/signal-decider/calibration` now includes a backward-compatible `rule_candidates` section. Candidates are deterministic, structured, replay-only proposals from negative calibration clusters; they default to `activation_status="needs_replay"` and are not active policy.
+- `POST /agent-context/signal-decider/weekly-learning/publish` persists an immutable, content-hashed weekly artifact from verified calibration evidence plus economically eligible actual execution outcomes. The requested week is an audit/evidence window; training uses a 90-day rolling cohort ending before `max(14, 3 * horizon_days)` calendar days so pending h5 decisions do not poison coverage. Stable manifest idempotency keys ignore retry-only run metadata, while the complete accepted manifest remains auditable.
+- `GET /agent-context/signal-decider/weekly-learning/latest` returns only the newest published, eligible, hash-valid artifact applicable to the requested date. Artifacts expire 14 days after the evidence week; a newly published stale backfill cannot shadow a still-valid current artifact. Explicit historical reads require the artifact to be effective strictly after both its evidence week and publication date, preventing future learning from leaking into old decision revalidation. Fresh artifacts replace the live rolling performance criteria under the existing `signal_decider_policy.performance_criteria` contract for both deciders. Signal-decider falls back to the existing rolling calibration when no artifact is available, short-term-decider preserves its previous empty policy context, and neither path submits orders or activates policy changes.
 - Calibration responses now expose descriptive `group_summaries.outcome_path_buckets` and `group_summaries.reward_risk_buckets` sections with the same bucket-stat shape as other summaries. These outcome-derived buckets are reporting-only and are intentionally excluded from `condition_clusters` and `rule_candidates[*].predicate.conditions` because they are only known after replay maturity.
 - `GET /agent-context/symbol-day` now includes a compact `factor_summary` block plus a compact `liquidity_context` block for prompt-safe decider use.
 - `liquidity_context.turnover.status` distinguishes `available`, `derived`, `stale`, `missing_price_or_volume`, and `storage_unavailable` so deciders can tell current-day turnover, safe close×volume fallback, stale prior-day context, and true storage failures apart.
