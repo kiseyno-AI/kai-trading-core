@@ -2432,7 +2432,40 @@ class AgentContextRouteTests(unittest.TestCase):
                     'evaluation_version': 'signal_decider_eval_v1',
                     'min_sample_size': 30,
                     'evidence_manifest': {
-                        'source': 'weekly-trading-analysis',
+                        'schema_version': 'weekly-learning-evidence-manifest/v1',
+                        'evidence_schema_version': 'weekly-trade-review-v2',
+                        'week_start': '2026-10-05',
+                        'week_end': '2026-10-09',
+                        'source': {
+                            'sha256': 'a' * 64,
+                            'runtime_mode': 'live',
+                            'exec_git_commit': 'b' * 40,
+                        },
+                        'validation': {'status': 'valid'},
+                        'learning_quality': {
+                            'schema_version': 'weekly-learning-quality/v1',
+                            'mode': 'calibration_only',
+                            'publication_eligible': True,
+                            'ineligible_reasons': [],
+                            'performance': {
+                                'status': 'no_data',
+                                'consumer_eligible': False,
+                                'closed_trade_count': 0,
+                                'cost_basis_coverage': 'complete',
+                                'transaction_cost_coverage': 'complete',
+                                'settlement_currency_coverage': 'incomplete',
+                                'fill_decision_lineage_coverage': 'empty',
+                                'closed_trade_decision_lineage_missing_count': 0,
+                            },
+                            'failure_and_rejection': {
+                                'status': 'no_data',
+                                'consumer_eligible': False,
+                                'execution_failure_count': 0,
+                                'terminal_order_outcome_count': 0,
+                                'lineage_linked_execution_failure_count': 0,
+                                'lineage_missing_execution_failure_count': 0,
+                            },
+                        },
                         'idempotency_key': 'weekly:2026-10-05:2026-10-09:h5',
                         'run_id': 'ops-run-1',
                     },
@@ -2451,6 +2484,37 @@ class AgentContextRouteTests(unittest.TestCase):
             'ops-run-1',
         )
         self.assertEqual(response.json()['status'], 'published')
+
+    def test_signal_decider_weekly_learning_publish_rejects_missing_quality(self):
+        client = TestClient(self.app)
+        response = client.post(
+            '/agent-context/signal-decider/weekly-learning/publish',
+            json={
+                'week_start': '2026-10-05',
+                'week_end': '2026-10-09',
+                'horizon_days': 5,
+                'evaluation_version': 'signal_decider_eval_v1',
+                'min_sample_size': 30,
+                'evidence_manifest': {
+                    'schema_version': 'weekly-learning-evidence-manifest/v1',
+                    'evidence_schema_version': 'weekly-trade-review-v2',
+                    'week_start': '2026-10-05',
+                    'week_end': '2026-10-09',
+                    'source': {
+                        'sha256': 'a' * 64,
+                        'runtime_mode': 'live',
+                        'exec_git_commit': 'b' * 40,
+                    },
+                    'validation': {'status': 'valid'},
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            'evidence_manifest.learning_quality is required',
+            response.json()['detail'],
+        )
 
     def test_signal_decider_weekly_learning_latest_route_calls_service(self):
         fake_service = FakeSignalDeciderWeeklyLearningService()

@@ -48,10 +48,40 @@ WEEKLY_LEARNING_ARTIFACT_SCHEMA_VERSION = (
 WEEKLY_LEARNING_CONTEXT_SCHEMA_VERSION = (
     'signal_decider_weekly_learning_context_v1'
 )
+WEEKLY_LEARNING_EVIDENCE_MANIFEST_SCHEMA_VERSION = (
+    'weekly-learning-evidence-manifest/v1'
+)
+WEEKLY_TRADE_REVIEW_SCHEMA_VERSION = 'weekly-trade-review-v2'
+WEEKLY_LEARNING_QUALITY_SCHEMA_VERSION = 'weekly-learning-quality/v1'
 DEFAULT_WEEKLY_LEARNING_LOOKBACK_DAYS = 90
 DEFAULT_WEEKLY_LEARNING_VALIDITY_DAYS = 14
 MAX_EVIDENCE_MANIFEST_BYTES = 65_536
 MAX_IDEMPOTENCY_KEY_LENGTH = 160
+_LEARNING_QUALITY_MODES = frozenset(
+    {
+        'calibration_only',
+        'performance_feedback',
+        'failure_feedback',
+        'performance_and_failure_feedback',
+        'ineligible_evidence',
+    }
+)
+_PERFORMANCE_FEEDBACK_STATUSES = frozenset({'ready', 'blocked', 'no_data'})
+_FAILURE_FEEDBACK_STATUSES = frozenset(
+    {'complete', 'blocked', 'truncated', 'no_data'}
+)
+_COST_BASIS_COVERAGE_STATUSES = frozenset(
+    {'complete', 'incomplete', 'truncated'}
+)
+_TRANSACTION_COST_COVERAGE_STATUSES = frozenset(
+    {'complete', 'partial', 'unknown'}
+)
+_SETTLEMENT_CURRENCY_COVERAGE_STATUSES = frozenset(
+    {'complete', 'incomplete'}
+)
+_FILL_DECISION_LINEAGE_COVERAGE_STATUSES = frozenset(
+    {'complete', 'incomplete', 'truncated', 'empty'}
+)
 _SENSITIVE_MANIFEST_KEY_PARTS = (
     'authorization',
     'cookie',
@@ -272,6 +302,388 @@ def _evidence_content_sha256(manifest: Mapping[str, Any]) -> str | None:
             'evidence manifest source sha256 must be 64 lowercase hex characters'
         )
     return normalized
+
+
+def _required_mapping(value: Any, *, field_name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f'{field_name} is required and must be an object')
+    return value
+
+
+def _required_boolean(value: Any, *, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f'{field_name} must be boolean')
+    return value
+
+
+def _non_negative_integer(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f'{field_name} must be a non-negative integer')
+    return value
+
+
+def _normalize_learning_quality(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    quality = _required_mapping(
+        manifest.get('learning_quality'),
+        field_name='evidence_manifest.learning_quality',
+    )
+    if quality.get('schema_version') != WEEKLY_LEARNING_QUALITY_SCHEMA_VERSION:
+        raise ValueError(
+            'evidence_manifest.learning_quality.schema_version must be '
+            f'{WEEKLY_LEARNING_QUALITY_SCHEMA_VERSION}'
+        )
+
+    mode = str(quality.get('mode') or '').strip()
+    if mode not in _LEARNING_QUALITY_MODES:
+        raise ValueError('evidence_manifest.learning_quality.mode is unsupported')
+    publication_eligible = _required_boolean(
+        quality.get('publication_eligible'),
+        field_name='evidence_manifest.learning_quality.publication_eligible',
+    )
+
+    performance = _required_mapping(
+        quality.get('performance'),
+        field_name='evidence_manifest.learning_quality.performance',
+    )
+    performance_status = str(performance.get('status') or '').strip()
+    if performance_status not in _PERFORMANCE_FEEDBACK_STATUSES:
+        raise ValueError(
+            'evidence_manifest.learning_quality.performance.status is unsupported'
+        )
+    performance_consumer_eligible = _required_boolean(
+        performance.get('consumer_eligible'),
+        field_name=(
+            'evidence_manifest.learning_quality.performance.consumer_eligible'
+        ),
+    )
+    closed_trade_count = _non_negative_integer(
+        performance.get('closed_trade_count'),
+        field_name=(
+            'evidence_manifest.learning_quality.performance.closed_trade_count'
+        ),
+    )
+    cost_basis_coverage = str(
+        performance.get('cost_basis_coverage') or ''
+    ).strip()
+    if cost_basis_coverage not in _COST_BASIS_COVERAGE_STATUSES:
+        raise ValueError(
+            'evidence_manifest.learning_quality.performance.'
+            'cost_basis_coverage is unsupported'
+        )
+    transaction_cost_coverage = str(
+        performance.get('transaction_cost_coverage') or ''
+    ).strip()
+    if transaction_cost_coverage not in _TRANSACTION_COST_COVERAGE_STATUSES:
+        raise ValueError(
+            'evidence_manifest.learning_quality.performance.'
+            'transaction_cost_coverage is unsupported'
+        )
+    settlement_currency_coverage = str(
+        performance.get('settlement_currency_coverage') or ''
+    ).strip()
+    if (
+        settlement_currency_coverage
+        not in _SETTLEMENT_CURRENCY_COVERAGE_STATUSES
+    ):
+        raise ValueError(
+            'evidence_manifest.learning_quality.performance.'
+            'settlement_currency_coverage is unsupported'
+        )
+    fill_decision_lineage_coverage = str(
+        performance.get('fill_decision_lineage_coverage') or ''
+    ).strip()
+    if (
+        fill_decision_lineage_coverage
+        not in _FILL_DECISION_LINEAGE_COVERAGE_STATUSES
+    ):
+        raise ValueError(
+            'evidence_manifest.learning_quality.performance.'
+            'fill_decision_lineage_coverage is unsupported'
+        )
+    closed_trade_decision_lineage_missing_count = _non_negative_integer(
+        performance.get('closed_trade_decision_lineage_missing_count'),
+        field_name=(
+            'evidence_manifest.learning_quality.performance.'
+            'closed_trade_decision_lineage_missing_count'
+        ),
+    )
+
+    failure = _required_mapping(
+        quality.get('failure_and_rejection'),
+        field_name=(
+            'evidence_manifest.learning_quality.failure_and_rejection'
+        ),
+    )
+    failure_status = str(failure.get('status') or '').strip()
+    if failure_status not in _FAILURE_FEEDBACK_STATUSES:
+        raise ValueError(
+            'evidence_manifest.learning_quality.failure_and_rejection.status '
+            'is unsupported'
+        )
+    failure_consumer_eligible = _required_boolean(
+        failure.get('consumer_eligible'),
+        field_name=(
+            'evidence_manifest.learning_quality.failure_and_rejection.'
+            'consumer_eligible'
+        ),
+    )
+    execution_failure_count = _non_negative_integer(
+        failure.get('execution_failure_count'),
+        field_name=(
+            'evidence_manifest.learning_quality.failure_and_rejection.'
+            'execution_failure_count'
+        ),
+    )
+    terminal_order_outcome_count = _non_negative_integer(
+        failure.get('terminal_order_outcome_count'),
+        field_name=(
+            'evidence_manifest.learning_quality.failure_and_rejection.'
+            'terminal_order_outcome_count'
+        ),
+    )
+    lineage_linked_execution_failure_count = _non_negative_integer(
+        failure.get('lineage_linked_execution_failure_count'),
+        field_name=(
+            'evidence_manifest.learning_quality.failure_and_rejection.'
+            'lineage_linked_execution_failure_count'
+        ),
+    )
+    lineage_missing_execution_failure_count = _non_negative_integer(
+        failure.get('lineage_missing_execution_failure_count'),
+        field_name=(
+            'evidence_manifest.learning_quality.failure_and_rejection.'
+            'lineage_missing_execution_failure_count'
+        ),
+    )
+    if (
+        lineage_linked_execution_failure_count
+        + lineage_missing_execution_failure_count
+        != execution_failure_count
+    ):
+        raise ValueError(
+            'evidence_manifest learning_quality failure lineage counts must '
+            'sum to execution_failure_count'
+        )
+
+    performance_has_data = closed_trade_count > 0
+    failure_has_data = (
+        execution_failure_count > 0 or terminal_order_outcome_count > 0
+    )
+    performance_coverage_complete = bool(
+        cost_basis_coverage == 'complete'
+        and transaction_cost_coverage == 'complete'
+        and settlement_currency_coverage == 'complete'
+        and fill_decision_lineage_coverage == 'complete'
+        and closed_trade_decision_lineage_missing_count == 0
+    )
+    if performance_has_data:
+        expected_performance_status = (
+            'ready' if performance_coverage_complete else 'blocked'
+        )
+        if (
+            performance_status != expected_performance_status
+            or performance_consumer_eligible != performance_coverage_complete
+        ):
+            raise ValueError(
+                'evidence_manifest learning_quality performance status and '
+                'consumer_eligible disagree with coverage'
+            )
+    else:
+        if not (
+            performance_status == 'no_data'
+            and performance_consumer_eligible is False
+        ):
+            raise ValueError(
+                'evidence_manifest learning_quality performance without closed '
+                'trades must be no_data and consumer-ineligible'
+            )
+        if closed_trade_decision_lineage_missing_count != 0:
+            raise ValueError(
+                'evidence_manifest learning_quality performance without closed '
+                'trades may not report missing closed-trade lineage'
+            )
+
+    if failure_has_data:
+        failure_lineage_complete = bool(
+            execution_failure_count > 0
+            and lineage_linked_execution_failure_count
+            == execution_failure_count
+            and lineage_missing_execution_failure_count == 0
+        )
+        if failure_status == 'truncated':
+            expected_failure_eligible = False
+            expected_failure_status = 'truncated'
+        else:
+            expected_failure_eligible = failure_lineage_complete
+            expected_failure_status = (
+                'complete' if failure_lineage_complete else 'blocked'
+            )
+        if (
+            failure_status != expected_failure_status
+            or failure_consumer_eligible != expected_failure_eligible
+        ):
+            raise ValueError(
+                'evidence_manifest learning_quality failure status and '
+                'consumer_eligible disagree with lineage'
+            )
+    else:
+        if not (
+            failure_status == 'no_data'
+            and failure_consumer_eligible is False
+        ):
+            raise ValueError(
+                'evidence_manifest learning_quality failure_and_rejection '
+                'without data must be no_data and consumer-ineligible'
+            )
+
+    expected_reasons: list[str] = []
+    if performance_has_data and not performance_consumer_eligible:
+        expected_reasons.append('performance_feedback_ineligible')
+    if failure_has_data and not failure_consumer_eligible:
+        expected_reasons.append('failure_and_rejection_feedback_ineligible')
+    if expected_reasons:
+        expected_mode = 'ineligible_evidence'
+    elif performance_has_data and failure_has_data:
+        expected_mode = 'performance_and_failure_feedback'
+    elif performance_has_data:
+        expected_mode = 'performance_feedback'
+    elif failure_has_data:
+        expected_mode = 'failure_feedback'
+    else:
+        expected_mode = 'calibration_only'
+
+    if mode != expected_mode:
+        raise ValueError(
+            'evidence_manifest.learning_quality.mode must be '
+            f'{expected_mode} for the supplied channel evidence'
+        )
+    if publication_eligible != (not expected_reasons):
+        raise ValueError(
+            'evidence_manifest.learning_quality.publication_eligible '
+            'disagrees with channel eligibility'
+        )
+    raw_reasons = quality.get('ineligible_reasons')
+    if not isinstance(raw_reasons, list) or any(
+        not isinstance(reason, str) for reason in raw_reasons
+    ):
+        raise ValueError(
+            'evidence_manifest.learning_quality.ineligible_reasons must be '
+            'a string array'
+        )
+    if raw_reasons != expected_reasons:
+        raise ValueError(
+            'evidence_manifest.learning_quality.ineligible_reasons disagree '
+            'with channel eligibility'
+        )
+
+    return {
+        'schema_version': WEEKLY_LEARNING_QUALITY_SCHEMA_VERSION,
+        'mode': mode,
+        'publication_eligible': publication_eligible,
+        'ineligible_reasons': expected_reasons,
+        'performance': {
+            'status': performance_status,
+            'consumer_eligible': performance_consumer_eligible,
+            'closed_trade_count': closed_trade_count,
+            'cost_basis_coverage': cost_basis_coverage,
+            'transaction_cost_coverage': transaction_cost_coverage,
+            'settlement_currency_coverage': settlement_currency_coverage,
+            'fill_decision_lineage_coverage': (
+                fill_decision_lineage_coverage
+            ),
+            'closed_trade_decision_lineage_missing_count': (
+                closed_trade_decision_lineage_missing_count
+            ),
+        },
+        'failure_and_rejection': {
+            'status': failure_status,
+            'consumer_eligible': failure_consumer_eligible,
+            'execution_failure_count': execution_failure_count,
+            'terminal_order_outcome_count': terminal_order_outcome_count,
+            'lineage_linked_execution_failure_count': (
+                lineage_linked_execution_failure_count
+            ),
+            'lineage_missing_execution_failure_count': (
+                lineage_missing_execution_failure_count
+            ),
+        },
+    }
+
+
+def _validate_evidence_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    week_start: date,
+    week_end: date,
+) -> dict[str, Any]:
+    if (
+        manifest.get('schema_version')
+        != WEEKLY_LEARNING_EVIDENCE_MANIFEST_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            'evidence_manifest.schema_version must be '
+            f'{WEEKLY_LEARNING_EVIDENCE_MANIFEST_SCHEMA_VERSION}'
+        )
+    if manifest.get('evidence_schema_version') != WEEKLY_TRADE_REVIEW_SCHEMA_VERSION:
+        raise ValueError(
+            'evidence_manifest.evidence_schema_version must be '
+            f'{WEEKLY_TRADE_REVIEW_SCHEMA_VERSION}'
+        )
+    manifest_week_start = _normalize_date(
+        manifest.get('week_start'),
+        field_name='evidence_manifest.week_start',
+    )
+    manifest_week_end = _normalize_date(
+        manifest.get('week_end'),
+        field_name='evidence_manifest.week_end',
+    )
+    if manifest_week_start != week_start or manifest_week_end != week_end:
+        raise ValueError(
+            'evidence_manifest week_start/week_end must match the publication request'
+        )
+
+    source = _required_mapping(
+        manifest.get('source'),
+        field_name='evidence_manifest.source',
+    )
+    source_sha256 = source.get('sha256')
+    if not isinstance(source_sha256, str) or re.fullmatch(
+        r'[0-9a-f]{64}', source_sha256
+    ) is None:
+        raise ValueError(
+            'evidence_manifest.source.sha256 must be 64 lowercase hex characters'
+        )
+    if source.get('runtime_mode') not in {'live', 'paper'}:
+        raise ValueError(
+            'evidence_manifest.source.runtime_mode must be live or paper'
+        )
+    exec_git_commit = str(source.get('exec_git_commit') or '').strip()
+    if re.fullmatch(r'[0-9a-f]{40}', exec_git_commit) is None:
+        raise ValueError(
+            'evidence_manifest.source.exec_git_commit must be 40 lowercase hex '
+            'characters'
+        )
+    validation = _required_mapping(
+        manifest.get('validation'),
+        field_name='evidence_manifest.validation',
+    )
+    if validation.get('status') != 'valid':
+        raise ValueError('evidence_manifest.validation.status must be valid')
+    return _normalize_learning_quality(manifest)
+
+
+def _assert_idempotent_learning_quality(
+    existing: Mapping[str, Any] | Any,
+    *,
+    learning_quality: Mapping[str, Any],
+) -> None:
+    stored_manifest = _mapping_value(existing, 'evidence_manifest_payload') or {}
+    try:
+        stored_quality = _normalize_learning_quality(stored_manifest)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('idempotency conflict for learning_quality') from exc
+    if _canonical_json(stored_quality) != _canonical_json(learning_quality):
+        raise ValueError('idempotency conflict for learning_quality')
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -506,6 +918,11 @@ class SignalDeciderWeeklyLearningService:
             raise ValueError(
                 f'evidence_manifest may not exceed {MAX_EVIDENCE_MANIFEST_BYTES} bytes'
             )
+        learning_quality = _validate_evidence_manifest(
+            resolved_manifest,
+            week_start=resolved_week_start,
+            week_end=resolved_week_end,
+        )
 
         idempotency_key = _normalize_idempotency_key(
             resolved_manifest.get('idempotency_key')
@@ -535,6 +952,10 @@ class SignalDeciderWeeklyLearningService:
                 source_fingerprint
             )
             if existing is not None:
+                _assert_idempotent_learning_quality(
+                    existing,
+                    learning_quality=learning_quality,
+                )
                 return {
                     'status': _mapping_value(existing, 'publication_status'),
                     'idempotent_replay': True,
@@ -573,6 +994,7 @@ class SignalDeciderWeeklyLearningService:
             training_date_to=training_date_to,
             lookback_days=self.lookback_days,
             maturity_buffer_days=maturity_buffer_days,
+            learning_quality=learning_quality,
         )
         request_material = {
             'schema_version': WEEKLY_LEARNING_ARTIFACT_SCHEMA_VERSION,
@@ -593,6 +1015,10 @@ class SignalDeciderWeeklyLearningService:
         source_fingerprint = source_fingerprint or _sha256(request_material)
         existing = self.repository.get_by_source_fingerprint(source_fingerprint)
         if existing is not None:
+            _assert_idempotent_learning_quality(
+                existing,
+                learning_quality=learning_quality,
+            )
             return {
                 'status': _mapping_value(existing, 'publication_status'),
                 'idempotent_replay': True,
@@ -615,8 +1041,21 @@ class SignalDeciderWeeklyLearningService:
             resolved_week_end + timedelta(days=1),
             now.date() + timedelta(days=1),
         )
+        actual_execution_for_context, realized_execution_learning_included = (
+            self._actual_execution_for_context(
+                actual_execution=actual_execution,
+                learning_quality=learning_quality,
+                publication_status=publication_status,
+            )
+        )
         learning_context = {
             'schema_version': WEEKLY_LEARNING_CONTEXT_SCHEMA_VERSION,
+            'publication_mode': learning_quality['mode'],
+            'advisory_only': True,
+            'realized_execution_learning_included': (
+                realized_execution_learning_included
+            ),
+            'exec_learning_quality': deepcopy(learning_quality),
             'training_window': {
                 'training_date_from': training_date_from.isoformat(),
                 'training_date_to': training_date_to.isoformat(),
@@ -633,7 +1072,12 @@ class SignalDeciderWeeklyLearningService:
                 week_start=resolved_week_start.isoformat(),
                 week_end=resolved_week_end.isoformat(),
                 valid_through=valid_through.isoformat(),
-                actual_execution=actual_execution,
+                actual_execution=actual_execution_for_context,
+                publication_mode=learning_quality['mode'],
+                exec_learning_quality=learning_quality,
+                realized_execution_learning_included=(
+                    realized_execution_learning_included
+                ),
             ),
         }
         item = {
@@ -668,6 +1112,10 @@ class SignalDeciderWeeklyLearningService:
             )
             if existing is None:
                 raise
+            _assert_idempotent_learning_quality(
+                existing,
+                learning_quality=learning_quality,
+            )
             return {
                 'status': _mapping_value(existing, 'publication_status'),
                 'idempotent_replay': True,
@@ -678,6 +1126,43 @@ class SignalDeciderWeeklyLearningService:
             'idempotent_replay': False,
             'artifact': _serialize_artifact(stored),
         }
+
+    @staticmethod
+    def _actual_execution_for_context(
+        *,
+        actual_execution: dict[str, Any],
+        learning_quality: dict[str, Any],
+        publication_status: str,
+    ) -> tuple[dict[str, Any], bool]:
+        performance = learning_quality['performance']
+        include_realized_execution = bool(
+            publication_status == 'published'
+            and performance['consumer_eligible'] is True
+            and performance['closed_trade_count'] > 0
+            and actual_execution.get('status') == 'eligible'
+            and int(actual_execution.get('eligible_count') or 0) > 0
+        )
+        if include_realized_execution:
+            return deepcopy(actual_execution), True
+        if learning_quality['mode'] == 'calibration_only':
+            reason = 'calibration_only_evidence_mode'
+        elif performance['closed_trade_count'] == 0:
+            reason = 'exec_performance_feedback_no_data'
+        elif performance['consumer_eligible'] is not True:
+            reason = 'exec_performance_feedback_not_consumer_eligible'
+        elif publication_status != 'published':
+            reason = 'artifact_not_published'
+        else:
+            reason = 'core_actual_execution_evidence_unavailable'
+        return (
+            {
+                'status': 'not_included',
+                'reason': reason,
+                'eligible_count': 0,
+                'metric_basis': 'not_applicable',
+            },
+            False,
+        )
 
     def get_latest_published(
         self,
@@ -711,10 +1196,28 @@ class SignalDeciderWeeklyLearningService:
                 }
                 continue
             eligibility = artifact.get('eligibility')
+            try:
+                learning_quality = _validate_evidence_manifest(
+                    artifact.get('evidence_manifest') or {},
+                    week_start=date.fromisoformat(artifact['week_start']),
+                    week_end=date.fromisoformat(artifact['week_end']),
+                )
+            except (TypeError, ValueError):
+                first_rejection = first_rejection or {
+                    'available': False,
+                    'artifact': None,
+                    'reason': 'artifact_evidence_contract_invalid',
+                }
+                continue
             if (
                 artifact.get('publication_status') != 'published'
                 or not isinstance(eligibility, dict)
                 or eligibility.get('eligible') is not True
+                or eligibility.get('publication_mode')
+                != learning_quality['mode']
+                or eligibility.get('exec_learning_quality')
+                != learning_quality
+                or learning_quality['publication_eligible'] is not True
             ):
                 first_rejection = first_rejection or {
                     'available': False,
@@ -784,6 +1287,7 @@ class SignalDeciderWeeklyLearningService:
         training_date_to: date,
         lookback_days: int,
         maturity_buffer_days: int,
+        learning_quality: dict[str, Any],
     ) -> dict[str, Any]:
         summary = report.get('summary') if isinstance(report.get('summary'), dict) else {}
         request = report.get('request') if isinstance(report.get('request'), dict) else {}
@@ -810,9 +1314,13 @@ class SignalDeciderWeeklyLearningService:
             and review_boundary.get('auto_apply_policy_changes') is False
         ):
             reasons.append('unsafe_review_boundary')
+        if learning_quality['publication_eligible'] is not True:
+            reasons.extend(learning_quality['ineligible_reasons'])
         return {
             'eligible': not reasons,
             'reasons': reasons,
+            'publication_mode': learning_quality['mode'],
+            'exec_learning_quality': deepcopy(learning_quality),
             'verified_evaluation_sample_count': sample_count,
             'min_sample_size': min_sample_size,
             'coverage_gap_count': int(summary.get('coverage_gap_count') or 0),

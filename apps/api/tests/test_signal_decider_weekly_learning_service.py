@@ -91,6 +91,88 @@ def _ready_calibration_report() -> dict:
     }
 
 
+def _learning_quality(
+    *,
+    mode: str = 'performance_feedback',
+    publication_eligible: bool = True,
+    ineligible_reasons: list[str] | None = None,
+    performance_status: str = 'ready',
+    performance_consumer_eligible: bool = True,
+    closed_trade_count: int = 1,
+    cost_basis_coverage: str = 'complete',
+    transaction_cost_coverage: str = 'complete',
+    settlement_currency_coverage: str = 'complete',
+    fill_decision_lineage_coverage: str = 'complete',
+    closed_trade_decision_lineage_missing_count: int = 0,
+    failure_status: str = 'no_data',
+    failure_consumer_eligible: bool = False,
+    execution_failure_count: int = 0,
+    terminal_order_outcome_count: int = 0,
+    lineage_linked_execution_failure_count: int = 0,
+    lineage_missing_execution_failure_count: int = 0,
+) -> dict:
+    return {
+        'schema_version': 'weekly-learning-quality/v1',
+        'mode': mode,
+        'publication_eligible': publication_eligible,
+        'ineligible_reasons': list(ineligible_reasons or []),
+        'performance': {
+            'status': performance_status,
+            'consumer_eligible': performance_consumer_eligible,
+            'closed_trade_count': closed_trade_count,
+            'cost_basis_coverage': cost_basis_coverage,
+            'transaction_cost_coverage': transaction_cost_coverage,
+            'settlement_currency_coverage': settlement_currency_coverage,
+            'fill_decision_lineage_coverage': (
+                fill_decision_lineage_coverage
+            ),
+            'closed_trade_decision_lineage_missing_count': (
+                closed_trade_decision_lineage_missing_count
+            ),
+        },
+        'failure_and_rejection': {
+            'status': failure_status,
+            'consumer_eligible': failure_consumer_eligible,
+            'execution_failure_count': execution_failure_count,
+            'terminal_order_outcome_count': terminal_order_outcome_count,
+            'lineage_linked_execution_failure_count': (
+                lineage_linked_execution_failure_count
+            ),
+            'lineage_missing_execution_failure_count': (
+                lineage_missing_execution_failure_count
+            ),
+        },
+    }
+
+
+def _evidence_manifest(
+    *,
+    week_start: str = '2026-10-05',
+    week_end: str = '2026-10-11',
+    source_sha256: str = 'a' * 64,
+    idempotency_key: str | None = None,
+    learning_quality: dict | None = None,
+) -> dict:
+    manifest = {
+        'schema_version': 'weekly-learning-evidence-manifest/v1',
+        'evidence_schema_version': 'weekly-trade-review-v2',
+        'week_start': week_start,
+        'week_end': week_end,
+        'source': {
+            'sha256': source_sha256,
+            'runtime_mode': 'live',
+            'exec_git_commit': 'b' * 40,
+        },
+        'validation': {'status': 'valid'},
+        'learning_quality': deepcopy(
+            learning_quality if learning_quality is not None else _learning_quality()
+        ),
+    }
+    if idempotency_key is not None:
+        manifest['idempotency_key'] = idempotency_key
+    return manifest
+
+
 class FakeCalibrationService:
     def __init__(self, report: dict | None = None) -> None:
         self.report = deepcopy(report or _ready_calibration_report())
@@ -186,6 +268,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_end=date(2026, 10, 9),
             horizon_days=5,
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(week_end='2026-10-09'),
         )
 
         self.assertEqual(len(calibration_service.calls), 1)
@@ -216,7 +299,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             horizon_days=5,
             evaluation_version='signal_decider_eval_v1',
             min_sample_size=30,
-            evidence_manifest={'source': 'weekly-trading-analysis', 'exec_report_sha256': 'a' * 64},
+            evidence_manifest=_evidence_manifest(),
         )
         second = service.publish(
             week_start=date(2026, 10, 5),
@@ -224,7 +307,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             horizon_days=5,
             evaluation_version='signal_decider_eval_v1',
             min_sample_size=30,
-            evidence_manifest={'source': 'weekly-trading-analysis', 'exec_report_sha256': 'a' * 64},
+            evidence_manifest=_evidence_manifest(),
         )
 
         self.assertEqual(first['status'], 'published')
@@ -246,6 +329,432 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             first['artifact']['source_fingerprint'],
         )
 
+    def test_exec_ineligible_performance_evidence_cannot_publish(self) -> None:
+        repository = FakeWeeklyLearningRepository()
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+            now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
+        )
+        learning_quality = _learning_quality(
+            mode='ineligible_evidence',
+            publication_eligible=False,
+            ineligible_reasons=['performance_feedback_ineligible'],
+            performance_status='blocked',
+            performance_consumer_eligible=False,
+            closed_trade_count=1,
+            transaction_cost_coverage='unknown',
+        )
+        manifest = _evidence_manifest(
+            idempotency_key='weekly-learning-v2:2026-10-05:2026-10-11',
+            learning_quality=learning_quality,
+        )
+
+        first = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest={**manifest, 'run_id': 'first'},
+        )
+        retry = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest={**manifest, 'run_id': 'retry'},
+        )
+
+        self.assertEqual(first['status'], 'ineligible')
+        self.assertFalse(first['artifact']['eligibility']['eligible'])
+        self.assertIn(
+            'performance_feedback_ineligible',
+            first['artifact']['eligibility']['reasons'],
+        )
+        self.assertIsNone(first['artifact']['published_at'])
+        self.assertTrue(retry['idempotent_replay'])
+        self.assertEqual(retry['status'], 'ineligible')
+        self.assertEqual(len(repository.rows_by_fingerprint), 1)
+        self.assertEqual(
+            service.get_latest_published(),
+            {'available': False, 'artifact': None},
+        )
+
+    def test_exec_ineligible_failure_evidence_cannot_publish(self) -> None:
+        repository = FakeWeeklyLearningRepository()
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+            now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
+        )
+        learning_quality = _learning_quality(
+            mode='ineligible_evidence',
+            publication_eligible=False,
+            ineligible_reasons=[
+                'failure_and_rejection_feedback_ineligible'
+            ],
+            performance_status='no_data',
+            performance_consumer_eligible=False,
+            closed_trade_count=0,
+            failure_status='truncated',
+            failure_consumer_eligible=False,
+            execution_failure_count=2,
+            terminal_order_outcome_count=1,
+            lineage_linked_execution_failure_count=1,
+            lineage_missing_execution_failure_count=1,
+        )
+
+        result = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest=_evidence_manifest(
+                learning_quality=learning_quality,
+            ),
+        )
+
+        self.assertEqual(result['status'], 'ineligible')
+        self.assertFalse(result['artifact']['eligibility']['eligible'])
+        self.assertIn(
+            'failure_and_rejection_feedback_ineligible',
+            result['artifact']['eligibility']['reasons'],
+        )
+        self.assertIsNone(result['artifact']['published_at'])
+        self.assertEqual(
+            result['artifact']['learning_context']['performance_criteria'][
+                'actual_execution'
+            ]['reason'],
+            'exec_performance_feedback_no_data',
+        )
+        self.assertEqual(
+            service.get_latest_published(),
+            {'available': False, 'artifact': None},
+        )
+
+    def test_explicit_zero_data_calibration_only_publish_is_labeled(self) -> None:
+        repository = FakeWeeklyLearningRepository()
+        repository.actual_summary = {
+            'status': 'unavailable',
+            'source_count': 0,
+            'model_verified_count': 0,
+            'eligible_count': 0,
+            'excluded_count': 0,
+            'win_count': 0,
+            'loss_count': 0,
+            'win_rate': None,
+            'total_realized_pnl_krw': '0.00',
+            'average_realized_return_pct': None,
+            'metric_basis': 'gross_before_transaction_costs',
+            'model_identity_cohort': None,
+            'exclusion_reason_counts': {},
+        }
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+            now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
+        )
+        calibration_only = _learning_quality(
+            mode='calibration_only',
+            performance_status='no_data',
+            performance_consumer_eligible=False,
+            closed_trade_count=0,
+        )
+
+        result = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest=_evidence_manifest(
+                learning_quality=calibration_only,
+            ),
+        )
+
+        self.assertEqual(result['status'], 'published')
+        self.assertEqual(
+            result['artifact']['eligibility']['publication_mode'],
+            'calibration_only',
+        )
+        learning_context = result['artifact']['learning_context']
+        self.assertEqual(learning_context['publication_mode'], 'calibration_only')
+        self.assertFalse(learning_context['realized_execution_learning_included'])
+        criteria = learning_context['performance_criteria']
+        self.assertEqual(criteria['actual_execution']['status'], 'not_included')
+        self.assertEqual(
+            criteria['actual_execution']['reason'],
+            'calibration_only_evidence_mode',
+        )
+        self.assertFalse(
+            criteria['usage_policy']['realized_execution_learning_included']
+        )
+
+    def test_missing_learning_quality_contract_is_rejected(self) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        manifest = _evidence_manifest()
+        del manifest['learning_quality']
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'evidence_manifest.learning_quality is required',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=manifest,
+            )
+
+    def test_malformed_evidence_provenance_is_rejected(self) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        cases = (
+            (
+                'manifest schema',
+                lambda manifest: manifest.update({'schema_version': 'legacy'}),
+                'evidence_manifest.schema_version',
+            ),
+            (
+                'evidence schema',
+                lambda manifest: manifest.update(
+                    {'evidence_schema_version': 'weekly-trade-review-v1'}
+                ),
+                'evidence_manifest.evidence_schema_version',
+            ),
+            (
+                'window',
+                lambda manifest: manifest.update({'week_end': '2026-10-10'}),
+                'week_start/week_end must match',
+            ),
+            (
+                'sha256',
+                lambda manifest: manifest['source'].update(
+                    {'sha256': 'A' * 64}
+                ),
+                'source.sha256 must be 64 lowercase hex',
+            ),
+            (
+                'runtime mode',
+                lambda manifest: manifest['source'].update(
+                    {'runtime_mode': 'backtest'}
+                ),
+                'source.runtime_mode must be live or paper',
+            ),
+            (
+                'commit',
+                lambda manifest: manifest['source'].update(
+                    {'exec_git_commit': 'not-a-commit'}
+                ),
+                'source.exec_git_commit must be 40 lowercase hex',
+            ),
+            (
+                'validation',
+                lambda manifest: manifest['validation'].update(
+                    {'status': 'invalid'}
+                ),
+                'validation.status must be valid',
+            ),
+        )
+
+        for label, mutate, pattern in cases:
+            with self.subTest(label=label):
+                manifest = _evidence_manifest()
+                mutate(manifest)
+                with self.assertRaisesRegex(ValueError, pattern):
+                    service.publish(
+                        week_start='2026-10-05',
+                        week_end='2026-10-11',
+                        evidence_manifest=manifest,
+                    )
+
+    def test_malformed_learning_quality_count_is_rejected(self) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        malformed = _learning_quality()
+        malformed['performance']['closed_trade_count'] = True
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'closed_trade_count must be a non-negative integer',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=_evidence_manifest(
+                    learning_quality=malformed,
+                ),
+            )
+
+    def test_performance_eligibility_requires_complete_quality_coverage(
+        self,
+    ) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        contradictory = _learning_quality(
+            cost_basis_coverage='incomplete',
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'performance status and consumer_eligible disagree with coverage',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=_evidence_manifest(
+                    learning_quality=contradictory,
+                ),
+            )
+
+    def test_failure_eligibility_requires_complete_lineage_counts(self) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        contradictory = _learning_quality(
+            mode='failure_feedback',
+            performance_status='no_data',
+            performance_consumer_eligible=False,
+            closed_trade_count=0,
+            failure_status='complete',
+            failure_consumer_eligible=True,
+            execution_failure_count=2,
+            lineage_linked_execution_failure_count=1,
+            lineage_missing_execution_failure_count=1,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'failure status and consumer_eligible disagree with lineage',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=_evidence_manifest(
+                    learning_quality=contradictory,
+                ),
+            )
+
+    def test_failure_lineage_counts_must_partition_normalized_failures(
+        self,
+    ) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        contradictory = _learning_quality(
+            mode='ineligible_evidence',
+            publication_eligible=False,
+            ineligible_reasons=[
+                'failure_and_rejection_feedback_ineligible'
+            ],
+            performance_status='no_data',
+            performance_consumer_eligible=False,
+            closed_trade_count=0,
+            failure_status='blocked',
+            failure_consumer_eligible=False,
+            execution_failure_count=2,
+            lineage_linked_execution_failure_count=1,
+            lineage_missing_execution_failure_count=0,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'failure lineage counts must sum to execution_failure_count',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=_evidence_manifest(
+                    learning_quality=contradictory,
+                ),
+            )
+
+    def test_contradictory_calibration_only_mode_is_rejected(self) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        contradictory = _learning_quality(mode='calibration_only')
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'learning_quality.mode must be performance_feedback',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=_evidence_manifest(
+                    learning_quality=contradictory,
+                ),
+            )
+
+    def test_terminal_outcomes_without_normalized_failures_cannot_be_eligible(
+        self,
+    ) -> None:
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=FakeWeeklyLearningRepository(),
+        )
+        contradictory = _learning_quality(
+            mode='failure_feedback',
+            performance_status='no_data',
+            performance_consumer_eligible=False,
+            closed_trade_count=0,
+            failure_status='complete',
+            failure_consumer_eligible=True,
+            execution_failure_count=0,
+            terminal_order_outcome_count=1,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'failure status and consumer_eligible disagree with lineage',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=_evidence_manifest(
+                    learning_quality=contradictory,
+                ),
+            )
+
+    def test_same_evidence_identity_rejects_learning_quality_conflict(self) -> None:
+        repository = FakeWeeklyLearningRepository()
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+        )
+        key = 'weekly-learning-v2:2026-10-05:2026-10-11'
+        service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest=_evidence_manifest(idempotency_key=key),
+        )
+        failure_only = _learning_quality(
+            mode='failure_feedback',
+            performance_status='no_data',
+            performance_consumer_eligible=False,
+            closed_trade_count=0,
+            failure_status='complete',
+            failure_consumer_eligible=True,
+            execution_failure_count=1,
+            lineage_linked_execution_failure_count=1,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'idempotency conflict for learning_quality',
+        ):
+            service.publish(
+                week_start='2026-10-05',
+                week_end='2026-10-11',
+                evidence_manifest=_evidence_manifest(
+                    idempotency_key=key,
+                    learning_quality=failure_only,
+                ),
+            )
+
     def test_publish_idempotency_key_ignores_retry_run_metadata(self) -> None:
         repository = FakeWeeklyLearningRepository()
         service = SignalDeciderWeeklyLearningService(
@@ -253,13 +762,11 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             repository=repository,
             now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
         )
-        common_manifest = {
-            'source': {
-                'name': 'weekly-trading-analysis',
-                'sha256': 'a' * 64,
-            },
-            'idempotency_key': 'weekly-learning:2026-10-05:2026-10-11:h5:v1:n30',
-        }
+        common_manifest = _evidence_manifest(
+            idempotency_key=(
+                'weekly-learning:2026-10-05:2026-10-11:h5:v1:n30'
+            )
+        )
 
         first = service.publish(
             week_start='2026-10-05',
@@ -305,16 +812,21 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             repository=repository,
             now=lambda: datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc),
         )
-        common_manifest = {
-            'idempotency_key': 'weekly-learning:2026-10-05:2026-10-11:h5:v1:n30',
-        }
+        common_manifest = _evidence_manifest(
+            idempotency_key=(
+                'weekly-learning:2026-10-05:2026-10-11:h5:v1:n30'
+            )
+        )
 
         original = service.publish(
             week_start='2026-10-05',
             week_end='2026-10-11',
             evidence_manifest={
                 **common_manifest,
-                'source': {'sha256': 'a' * 64},
+                'source': {
+                    **common_manifest['source'],
+                    'sha256': 'a' * 64,
+                },
             },
         )
         corrected = service.publish(
@@ -322,7 +834,10 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_end='2026-10-11',
             evidence_manifest={
                 **common_manifest,
-                'source': {'sha256': 'b' * 64},
+                'source': {
+                    **common_manifest['source'],
+                    'sha256': 'b' * 64,
+                },
             },
         )
 
@@ -350,6 +865,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
 
         self.assertEqual(result['status'], 'ineligible')
@@ -368,6 +884,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
         stored = next(iter(repository.rows_by_fingerprint.values()))
         stored['learning_context_payload']['performance_criteria']['sample_count'] = 999
@@ -388,6 +905,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
         stored = next(iter(repository.rows_by_fingerprint.values()))
         database_timezone = timezone(timedelta(hours=9))
@@ -416,6 +934,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
         self.assertEqual(published['artifact']['valid_through'], '2026-10-25')
 
@@ -439,12 +958,17 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
         clock['now'] = datetime(2026, 10, 20, 1, 30, tzinfo=timezone.utc)
         backfill = service.publish(
             week_start='2026-09-01',
             week_end='2026-09-05',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(
+                week_start='2026-09-01',
+                week_end='2026-09-05',
+            ),
         )
 
         latest = service.get_latest_published(as_of_date='2026-10-20')
@@ -469,12 +993,17 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
         clock['now'] = datetime(2026, 10, 15, 1, 30, tzinfo=timezone.utc)
         backfill = service.publish(
             week_start='2026-09-28',
             week_end='2026-10-04',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(
+                week_start='2026-09-28',
+                week_end='2026-10-04',
+            ),
         )
 
         latest = service.get_latest_published(as_of_date='2026-10-16')
@@ -502,6 +1031,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
 
         before_publication = service.get_latest_published(
@@ -536,6 +1066,7 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
+            evidence_manifest=_evidence_manifest(),
         )
 
         publication_day = service.get_latest_published()
@@ -562,9 +1093,9 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
             week_start='2026-10-05',
             week_end='2026-10-11',
             min_sample_size=30,
-            evidence_manifest={
-                'idempotency_key': 'weekly:2026-10-05:2026-10-11:h5'
-            },
+            evidence_manifest=_evidence_manifest(
+                idempotency_key='weekly:2026-10-05:2026-10-11:h5'
+            ),
         )
 
         self.assertTrue(result['idempotent_replay'])

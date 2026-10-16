@@ -7,14 +7,15 @@ artifact. `as_of_date` is optional and lets operators audit freshness for a
 specific market date.
 
 Core returns `available=false` for a missing, ineligible, content-hash-mismatched,
-or expired artifact. Expiry is the evidence `week_end + 14 days`; stale
-artifacts remain visible in the response for audit but are not injected into a
-decider payload. Candidate selection skips a newly published but already stale
-backfill in favor of the newest still-valid artifact. An artifact is eligible
-only from the day after both its evidence week and publication date, whether
-Core resolves the current date or the caller supplies `as_of_date`. This keeps
-future or same-day weekly learning out of live and historical decision
-contexts.
+evidence-contract-invalid, or expired artifact. Published candidates must retain
+the validated `weekly-learning-quality/v1` contract that authorized their
+publication. Expiry is the evidence `week_end + 14 days`; stale artifacts
+remain visible in the response for audit but are not injected into a decider
+payload. Candidate selection skips a newly published but already stale backfill
+in favor of the newest still-valid artifact. An artifact is eligible only from
+the day after both its evidence week and publication date, whether Core resolves
+the current date or the caller supplies `as_of_date`. This keeps future or
+same-day weekly learning out of live and historical decision contexts.
 
 ## Example request
 

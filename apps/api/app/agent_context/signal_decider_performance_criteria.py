@@ -130,6 +130,9 @@ def build_published_performance_criteria(
     week_end: str,
     valid_through: str,
     actual_execution: dict[str, Any],
+    publication_mode: str,
+    exec_learning_quality: dict[str, Any],
+    realized_execution_learning_included: bool,
 ) -> dict[str, Any]:
     summary = report.get('summary') if isinstance(report.get('summary'), dict) else {}
     request = report.get('request') if isinstance(report.get('request'), dict) else {}
@@ -137,6 +140,8 @@ def build_published_performance_criteria(
         'schema_version': PERFORMANCE_CRITERIA_SCHEMA_VERSION,
         'status': 'ready',
         'source': 'published_weekly_learning_artifact',
+        'publication_mode': publication_mode,
+        'exec_learning_quality': exec_learning_quality,
         'artifact': {
             'artifact_version': artifact_version,
             'source_fingerprint': source_fingerprint,
@@ -186,5 +191,8 @@ def build_published_performance_criteria(
             'manual_review_only': True,
             'manual_policy_activation_required': True,
             'actual_execution_is_advisory_corroboration_only': True,
+            'realized_execution_learning_included': (
+                realized_execution_learning_included
+            ),
         },
     }
