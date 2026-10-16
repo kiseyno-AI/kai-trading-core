@@ -30,7 +30,11 @@ validity settings, plus the canonical source evidence SHA-256 when supplied.
 Retry-only fields such as run IDs and completion timestamps do not create a
 second artifact, while corrected source evidence with a different SHA creates
 a new immutable artifact. The complete first accepted manifest remains in the
-artifact for audit.
+artifact for audit. Corrections are ordered by acceptance time within the exact
+evidence week and source identity. A valid ineligible correction revokes the
+older artifact from latest/context reads without deleting or rewriting either
+audit row; a later eligible correction restores guidance only from its normal
+effective date.
 
 ## Example request
 

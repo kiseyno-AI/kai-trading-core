@@ -235,14 +235,14 @@ class FakeWeeklyLearningRepository:
         self.rows_by_fingerprint[stored['source_fingerprint']] = stored
         return deepcopy(stored)
 
-    def list_published_candidates(self, *, limit: int = 100) -> list[dict]:
-        rows = [
-            row
-            for row in self.rows_by_fingerprint.values()
-            if row['publication_status'] == 'published'
-        ]
+    def list_candidates(self, *, limit: int = 100) -> list[dict]:
+        rows = list(self.rows_by_fingerprint.values())
         rows.sort(
-            key=lambda row: (row['published_at'], row['id']),
+            key=lambda row: (
+                row['week_end'],
+                row['generated_at'],
+                row['id'],
+            ),
             reverse=True,
         )
         return deepcopy(rows[:limit])
@@ -847,6 +847,114 @@ class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
         self.assertNotEqual(
             original['artifact']['source_fingerprint'],
             corrected['artifact']['source_fingerprint'],
+        )
+
+    def test_ineligible_correction_supersedes_same_source_guidance_until_repaired(
+        self,
+    ) -> None:
+        repository = FakeWeeklyLearningRepository()
+        clock = {'now': datetime(2026, 10, 12, 1, 30, tzinfo=timezone.utc)}
+        service = SignalDeciderWeeklyLearningService(
+            calibration_service=FakeCalibrationService(),
+            repository=repository,
+            now=lambda: clock['now'],
+        )
+        idempotency_key = (
+            'weekly-learning:2026-10-05:2026-10-11:h5:v1:n30'
+        )
+
+        published = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest=_evidence_manifest(
+                source_sha256='a' * 64,
+                idempotency_key=idempotency_key,
+            ),
+        )
+        self.assertTrue(
+            service.get_latest_published(as_of_date='2026-10-13')['available']
+        )
+
+        clock['now'] = datetime(2026, 10, 13, 2, 0, tzinfo=timezone.utc)
+        ineligible_quality = _learning_quality(
+            mode='ineligible_evidence',
+            publication_eligible=False,
+            ineligible_reasons=['performance_feedback_ineligible'],
+            performance_status='blocked',
+            performance_consumer_eligible=False,
+            transaction_cost_coverage='unknown',
+        )
+        correction = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest=_evidence_manifest(
+                source_sha256='b' * 64,
+                idempotency_key=idempotency_key,
+                learning_quality=ineligible_quality,
+            ),
+        )
+
+        latest_after_revocation = service.get_latest_published(
+            as_of_date='2026-10-13'
+        )
+        self.assertEqual(published['status'], 'published')
+        self.assertEqual(correction['status'], 'ineligible')
+        self.assertFalse(latest_after_revocation['available'])
+        self.assertEqual(
+            latest_after_revocation['reason'],
+            'artifact_superseded_by_ineligible_correction',
+        )
+        self.assertEqual(
+            latest_after_revocation['artifact']['artifact_version'],
+            correction['artifact']['artifact_version'],
+        )
+        self.assertIsNone(
+            service.get_latest_performance_criteria(
+                as_of_date='2026-10-13'
+            )
+        )
+
+        clock['now'] = datetime(2026, 10, 14, 2, 0, tzinfo=timezone.utc)
+        repaired = service.publish(
+            week_start='2026-10-05',
+            week_end='2026-10-11',
+            evidence_manifest=_evidence_manifest(
+                source_sha256='c' * 64,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+        self.assertEqual(repaired['status'], 'published')
+        self.assertEqual(len(repository.rows_by_fingerprint), 3)
+        self.assertEqual(
+            repository.rows_by_fingerprint[
+                published['artifact']['source_fingerprint']
+            ]['publication_status'],
+            'published',
+        )
+        historical_revocation = service.get_latest_published(
+            as_of_date='2026-10-13'
+        )
+        self.assertFalse(historical_revocation['available'])
+        self.assertEqual(
+            historical_revocation['reason'],
+            'artifact_superseded_by_ineligible_correction',
+        )
+        self.assertFalse(
+            service.get_latest_published(as_of_date='2026-10-14')['available']
+        )
+        latest_after_repair = service.get_latest_published(
+            as_of_date='2026-10-15'
+        )
+        self.assertTrue(latest_after_repair['available'])
+        self.assertEqual(
+            latest_after_repair['artifact']['artifact_version'],
+            repaired['artifact']['artifact_version'],
+        )
+        self.assertIsNotNone(
+            service.get_latest_performance_criteria(
+                as_of_date='2026-10-15'
+            )
         )
 
     def test_ineligible_run_is_audited_but_never_returned_as_latest_published(self) -> None:

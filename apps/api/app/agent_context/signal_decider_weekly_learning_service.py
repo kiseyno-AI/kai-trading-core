@@ -686,6 +686,31 @@ def _assert_idempotent_learning_quality(
         raise ValueError('idempotency conflict for learning_quality')
 
 
+def _artifact_correction_scope(
+    artifact: Mapping[str, Any],
+) -> tuple[str, str, str, str]:
+    manifest = artifact['evidence_manifest']
+    source = manifest['source']
+    idempotency_key = _normalize_idempotency_key(
+        manifest.get('idempotency_key')
+    )
+    if idempotency_key is not None:
+        source_identity = f'idempotency:{idempotency_key}'
+    else:
+        source_identity = (
+            f"commit:{source['exec_git_commit']}:"
+            f"horizon:{artifact['horizon_days']}:"
+            f"evaluation:{artifact['evaluation_version']}:"
+            f"sample:{artifact['min_sample_size']}"
+        )
+    return (
+        str(artifact['week_start']),
+        str(artifact['week_end']),
+        str(source['runtime_mode']),
+        source_identity,
+    )
+
+
 def _decimal(value: Any) -> Decimal | None:
     if value is None or isinstance(value, bool):
         return None
@@ -832,7 +857,7 @@ class SignalDeciderWeeklyLearningRepository:
             session.flush()
             return _artifact_record(row)
 
-    def list_published_candidates(
+    def list_candidates(
         self,
         *,
         limit: int = 100,
@@ -841,13 +866,9 @@ class SignalDeciderWeeklyLearningRepository:
             rows = list(
                 session.execute(
                 select(SignalDeciderWeeklyLearningArtifact)
-                .where(
-                    SignalDeciderWeeklyLearningArtifact.publication_status
-                    == 'published'
-                )
                 .order_by(
                     SignalDeciderWeeklyLearningArtifact.week_end.desc(),
-                    SignalDeciderWeeklyLearningArtifact.published_at.desc(),
+                    SignalDeciderWeeklyLearningArtifact.generated_at.desc(),
                     SignalDeciderWeeklyLearningArtifact.id.desc(),
                 )
                 .limit(max(1, min(int(limit), 500)))
@@ -1174,18 +1195,24 @@ class SignalDeciderWeeklyLearningService:
             if as_of_date is not None
             else self._now().date()
         )
-        rows = self.repository.list_published_candidates(limit=100)
+        rows = self.repository.list_candidates(limit=500)
         if not rows:
             return {'available': False, 'artifact': None}
         rows.sort(
             key=lambda row: (
                 row['week_end'],
-                row['published_at'],
+                row['generated_at'],
                 row['id'],
             ),
             reverse=True,
         )
         first_rejection: dict[str, Any] | None = None
+        future_rejection: dict[str, Any] | None = None
+        correction_heads: list[dict[str, Any]] = []
+        correction_head_by_scope: dict[
+            tuple[str, str, str, str],
+            dict[str, Any],
+        ] = {}
         for row in rows:
             artifact = _serialize_artifact(row)
             if _artifact_hash(row) != artifact['content_sha256']:
@@ -1209,9 +1236,83 @@ class SignalDeciderWeeklyLearningService:
                     'reason': 'artifact_evidence_contract_invalid',
                 }
                 continue
+            publication_status = artifact.get('publication_status')
+            common_contract_valid = bool(
+                isinstance(eligibility, dict)
+                and eligibility.get('publication_mode')
+                == learning_quality['mode']
+                and eligibility.get('exec_learning_quality')
+                == learning_quality
+            )
+            published_contract_valid = bool(
+                publication_status == 'published'
+                and common_contract_valid
+                and eligibility.get('eligible') is True
+                and learning_quality['publication_eligible'] is True
+                and artifact.get('published_at') is not None
+            )
+            ineligible_contract_valid = bool(
+                publication_status == 'ineligible'
+                and common_contract_valid
+                and eligibility.get('eligible') is False
+                and isinstance(eligibility.get('reasons'), list)
+                and bool(eligibility['reasons'])
+                and artifact.get('published_at') is None
+            )
+            if not (published_contract_valid or ineligible_contract_valid):
+                first_rejection = first_rejection or {
+                    'available': False,
+                    'artifact': None,
+                    'reason': 'artifact_not_eligible',
+                }
+                continue
+
+            generated_at = _normalize_datetime(artifact.get('generated_at'))
+            if generated_at is not None and generated_at.date() > resolved_as_of:
+                effective_from = date.fromisoformat(artifact['effective_from'])
+                future_rejection = future_rejection or {
+                    'available': False,
+                    'artifact': artifact,
+                    'reason': 'artifact_not_yet_effective',
+                    'stale': False,
+                    'as_of_date': resolved_as_of.isoformat(),
+                    'effective_from': effective_from.isoformat(),
+                }
+                continue
+
+            correction_scope = _artifact_correction_scope(artifact)
+            correction_head = correction_head_by_scope.get(correction_scope)
+            if correction_head is not None:
+                if artifact['publication_status'] == 'published':
+                    correction_head['has_older_published'] = True
+                continue
+            correction_head = {
+                'artifact': artifact,
+                'learning_quality': learning_quality,
+                'has_older_published': False,
+            }
+            correction_head_by_scope[correction_scope] = correction_head
+            correction_heads.append(correction_head)
+
+        for correction_head in correction_heads:
+            artifact = correction_head['artifact']
+            learning_quality = correction_head['learning_quality']
+            eligibility = artifact['eligibility']
+            if artifact['publication_status'] == 'ineligible':
+                if correction_head['has_older_published'] is not True:
+                    continue
+                first_rejection = first_rejection or {
+                    'available': False,
+                    'artifact': artifact,
+                    'reason': (
+                        'artifact_superseded_by_ineligible_correction'
+                    ),
+                    'stale': False,
+                    'as_of_date': resolved_as_of.isoformat(),
+                }
+                continue
             if (
-                artifact.get('publication_status') != 'published'
-                or not isinstance(eligibility, dict)
+                not isinstance(eligibility, dict)
                 or eligibility.get('eligible') is not True
                 or eligibility.get('publication_mode')
                 != learning_quality['mode']
@@ -1255,7 +1356,11 @@ class SignalDeciderWeeklyLearningService:
                 'effective_from': effective_from.isoformat(),
                 'valid_through': valid_through.isoformat(),
             }
-        return first_rejection or {'available': False, 'artifact': None}
+        return (
+            first_rejection
+            or future_rejection
+            or {'available': False, 'artifact': None}
+        )
 
     def get_latest_performance_criteria(
         self,
