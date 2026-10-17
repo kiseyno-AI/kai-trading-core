@@ -164,7 +164,7 @@ class Settings(BaseSettings):
     us_equity_auto_pipeline_stale_after_minutes: int = Field(default=180, ge=30, le=1440)
     signal_decider_exec_dashboard_cache_ttl_seconds: int = 5
     signal_decider_exec_dashboard_refresh_debounce_seconds: float = 15.0
-    signal_decider_exec_dashboard_refresh_timeout_seconds: float = 2.0
+    signal_decider_exec_dashboard_refresh_timeout_seconds: float = 30.0
     signal_decider_intraday_auto_sell_enabled: bool = False
     signal_decider_intraday_auto_sell_dry_run: bool = True
     signal_decider_intraday_auto_sell_cooldown_seconds: int = 120

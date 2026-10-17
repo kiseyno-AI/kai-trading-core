@@ -1501,6 +1501,111 @@ class ExecIntegrationDashboardCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first['items'], [{'symbol': '005930'}])
         self.assertEqual(second['freshness']['served_from_cache'], True)
 
+    async def test_default_dashboard_refresh_timeout_allows_slow_readback(self) -> None:
+        client = FakeExecClient()
+        timeout_setting = 'signal_decider_exec_dashboard_refresh_timeout_seconds'
+        default_timeout = type(settings).model_fields[timeout_setting].default
+        self.assertEqual(default_timeout, 30.0)
+        with patch.object(settings, timeout_setting, default_timeout):
+            service = SignalDeciderExecIntegrationService(client=client)
+        market_date = date(2026, 10, 19)
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        refresh_cancelled = False
+
+        async def slow_refresh_overview(**_kwargs):
+            nonlocal refresh_cancelled
+            refresh_started.set()
+            try:
+                await release_refresh.wait()
+            except asyncio.CancelledError:
+                refresh_cancelled = True
+                raise
+            return {
+                'integration': {
+                    'enabled': True,
+                    'config_status': 'ready',
+                    'issues': [],
+                },
+                'runtime': {'ready': True},
+                'items': [],
+            }
+
+        with (
+            patch.object(
+                service,
+                'integration_status',
+                return_value={
+                    'enabled': True,
+                    'config_status': 'ready',
+                    'issues': [],
+                },
+            ),
+            patch.object(
+                service,
+                'list_signal_decider_exec_overview',
+                new=AsyncMock(side_effect=slow_refresh_overview),
+            ),
+            patch.object(
+                service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                service,
+                '_store_dashboard_caches_from_overview',
+                new=AsyncMock(),
+            ) as store_caches,
+        ):
+            try:
+                scheduled = service._ensure_dashboard_background_refresh(
+                    target_trade_date=market_date,
+                    account_reference=None,
+                    symbol=None,
+                    refresh=True,
+                    trigger='test',
+                )
+
+                self.assertEqual(scheduled['status'], 'scheduled')
+                self.assertEqual(scheduled['timeout_seconds'], 30.0)
+                await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+
+                tasks = list(service._dashboard_refresh_tasks.values())
+                self.assertEqual(len(tasks), 1)
+                task = tasks[0]
+                await asyncio.sleep(2.1)
+
+                self.assertFalse(refresh_cancelled)
+                self.assertFalse(task.done())
+
+                release_refresh.set()
+                await asyncio.wait_for(task, timeout=1.0)
+                key = service._dashboard_refresh_key(
+                    target_trade_date=market_date,
+                    account_reference=None,
+                    symbol=None,
+                )
+                refresh_state = service._dashboard_refresh_payload(
+                    key,
+                    requested=True,
+                )
+
+                self.assertEqual(refresh_state['status'], 'succeeded')
+                self.assertEqual(refresh_state['timeout_seconds'], 30.0)
+                self.assertIsNone(refresh_state['last_error'])
+                store_caches.assert_awaited_once()
+                self.assertEqual(client.post_calls, [])
+            finally:
+                release_refresh.set()
+                tasks = list(service._dashboard_refresh_tasks.values())
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_realtime_source_cold_start_returns_holdings_without_dashboard_build(
         self,
     ) -> None:
