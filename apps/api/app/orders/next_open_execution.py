@@ -45,6 +45,10 @@ from app.agent_context.signal_decider_snapshot_validity import (
     decision_snapshot_target_open_at_utc,
     is_decision_snapshot_pre_target_open,
 )
+from app.agent_context.weekly_policy_rebind_service import (
+    WEEKLY_POLICY_REBIND_SCHEMA_VERSION,
+    weekly_policy_rebind_preparation_service,
+)
 from app.orders.signal_decider_alignment_gate import (
     ALIGNMENT_GATE_ACTION_BLOCK,
     ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE,
@@ -313,6 +317,7 @@ def _load_projected_decider_feedback_runs(
         'fs_div',
         'knowledge_cutoff_at',
         'admission_knowledge_cutoff_at',
+        'idempotency_key',
         'scope_authority',
     )
     summary_fields = (
@@ -610,6 +615,30 @@ def _snapshot_generation_authority_fingerprint(
             'validations': validations,
         }
     )
+
+
+def _generation_requires_policy_rebind(
+    generation_validation: dict[str, Any],
+) -> bool:
+    for item in generation_validation.get('validations') or []:
+        if not isinstance(item, dict) or item.get('status') != 'invalid':
+            continue
+        details = item.get('details')
+        if not isinstance(details, dict):
+            continue
+        reasons = details.get('reasons')
+        reason_codes = {
+            str(reason.get('code') or '').strip()
+            for reason in reasons or []
+            if isinstance(reason, dict)
+        }
+        if (
+            details.get('reason') == 'decider_inputs_changed_during_dispatch'
+            and isinstance(reasons, list)
+            and 'policy_context_changed' in reason_codes
+        ):
+            return True
+    return False
 
 
 def _snapshot_generation_authority_changes(
@@ -2897,11 +2926,16 @@ class SignalDeciderNextOpenExecutionService:
         order_service: TradingOrderService | None = None,
         market_state_getter: Callable[[], Any] | None = None,
         live_market_snapshot_refresher: Callable[..., Any] | None = None,
+        weekly_policy_rebind_coordinator: Callable[..., dict[str, Any]]
+        | None = None,
     ) -> None:
         self.order_service = order_service or trading_order_service
         self.market_state_getter = market_state_getter or get_market_state
         self._uses_default_market_state_getter = market_state_getter is None
         self.live_market_snapshot_refresher = live_market_snapshot_refresher
+        self.weekly_policy_rebind_coordinator = (
+            weekly_policy_rebind_coordinator
+        )
 
     def runtime_status(self) -> dict[str, Any]:
         targets, errors = self._parse_account_targets()
@@ -3005,6 +3039,7 @@ class SignalDeciderNextOpenExecutionService:
                     market_date=source_market_date,
                     snapshots=raw_latest_snapshots,
                     full_source_revalidation_actionable_only=True,
+                    policy_context_as_of_date=resolved_target_date,
                 )
             )
             valid_snapshot_ids = {
@@ -3628,6 +3663,9 @@ class SignalDeciderNextOpenExecutionService:
         blocked_source_scope_keys = set(
             scope_state.get('blocked_source_scope_keys') or ()
         )
+        weekly_policy_rebind_blocked_scope_keys = set(
+            scope_state.get('weekly_policy_rebind_blocked_scope_keys') or ()
+        )
 
         def assess_scope(
             scope_keys: set[tuple[str, str]],
@@ -3663,6 +3701,9 @@ class SignalDeciderNextOpenExecutionService:
                 'blocked_source_scope_keys': (
                     scope_keys & blocked_source_scope_keys
                 ),
+                'weekly_policy_rebind_blocked_scope_keys': (
+                    scope_keys & weekly_policy_rebind_blocked_scope_keys
+                ),
                 'invalid_scope_keys': invalid_keys,
                 'failed_rows': failed_rows,
                 'failure_group_map': build_failure_groups(failed_rows),
@@ -3697,6 +3738,8 @@ class SignalDeciderNextOpenExecutionService:
                 return 'unknown', 'source_decision_cohort_scope_missing'
             if assessment['invalid_scope_keys']:
                 return 'incomplete', 'candidate_symbols_outside_source_cohort'
+            if assessment['weekly_policy_rebind_blocked_scope_keys']:
+                return 'incomplete', 'weekly_policy_rebind_cohort_incomplete'
             blocked_keys = assessment['blocked_source_scope_keys']
             if blocked_keys:
                 blocked_statuses = {
@@ -3999,6 +4042,52 @@ class SignalDeciderNextOpenExecutionService:
         generation_validation = snapshot_generation_state[
             'generation_validation'
         ]
+        weekly_policy_rebind: dict[str, Any] | None = None
+        if (
+            trigger == 'preopen_scheduler'
+            and self.weekly_policy_rebind_coordinator is not None
+            and _generation_requires_policy_rebind(generation_validation)
+        ):
+            try:
+                weekly_policy_rebind = (
+                    self.weekly_policy_rebind_coordinator(
+                        target_trade_date=resolved_target_date
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    'Weekly policy rebind backstop failed before next-open '
+                    'refresh: target_trade_date=%s error=%s',
+                    resolved_target_date,
+                    exc,
+                )
+                weekly_policy_rebind = {
+                    'status': 'blocked',
+                    'reason': 'weekly_policy_rebind_backstop_failed',
+                    'error_type': type(exc).__name__,
+                }
+            if str(
+                (weekly_policy_rebind or {}).get('status') or ''
+            ).lower() in {'completed', 'noop'}:
+                snapshot_generation_state = (
+                    self._load_latest_snapshot_generation_state(
+                        source_market_date=source_market_date,
+                        target_trade_date=resolved_target_date,
+                        allow_post_open_intraday_watch=(
+                            allow_post_open_intraday_watch
+                        ),
+                    )
+                )
+                snapshots = snapshot_generation_state['snapshots']
+                expired_snapshot_by_key = (
+                    snapshot_generation_state.get(
+                        'expired_snapshot_by_key'
+                    )
+                    or {}
+                )
+                generation_validation = snapshot_generation_state[
+                    'generation_validation'
+                ]
         account_targets, account_target_errors = self._parse_account_targets()
         account_targets_setting_configured = bool(
             settings.signal_decider_next_open_account_targets.strip()
@@ -4322,6 +4411,7 @@ class SignalDeciderNextOpenExecutionService:
                     market_date=source_market_date,
                     snapshots=current_raw_snapshots,
                     full_source_revalidation_actionable_only=True,
+                    policy_context_as_of_date=resolved_target_date,
                 )
             )
             if (
@@ -4950,6 +5040,7 @@ class SignalDeciderNextOpenExecutionService:
                 reason='pykrx_enrichment_preflight_blocked' if enrichment_preflight_blocked else None,
             ),
             'enrichment_preflight': enrichment_preflight,
+            'weekly_policy_rebind': weekly_policy_rebind,
             'items': response_items,
         }
 
@@ -5866,9 +5957,49 @@ class SignalDeciderNextOpenExecutionService:
         def normalized_run_status(run: dict[str, Any]) -> str:
             return str(run.get('status') or '').strip().lower()
 
+        def weekly_policy_binding(
+            run: dict[str, Any],
+        ) -> dict[str, Any] | None:
+            authority = request_payload(run).get('scope_authority')
+            if not isinstance(authority, dict):
+                return None
+            binding = authority.get('policy_binding')
+            if not isinstance(binding, dict) or str(
+                binding.get('schema_version') or ''
+            ).strip() != WEEKLY_POLICY_REBIND_SCHEMA_VERSION:
+                return None
+            return binding
+
+        def weekly_policy_parent_is_complete(
+            run: dict[str, Any],
+        ) -> bool:
+            if weekly_policy_binding(run) is None:
+                return True
+            scopes = self._decider_role_symbol_scopes(run)
+            exact_scope_total = sum(
+                len(scopes.get(agent_name, []))
+                for agent_name in required_agents
+            )
+            try:
+                symbols_total = int(run.get('symbols_total') or 0)
+                completed_count = int(run.get('completed_count') or 0)
+                failed_count = int(run.get('failed_count') or 0)
+            except (TypeError, ValueError):
+                return False
+            return bool(
+                normalized_run_status(run) == 'completed'
+                and run.get('completed_at') is not None
+                and set(scopes) == set(required_agents)
+                and exact_scope_total > 0
+                and symbols_total == exact_scope_total
+                and completed_count == exact_scope_total
+                and failed_count == 0
+            )
+
         def is_usable_run(run: dict[str, Any]) -> bool:
             return bool(
                 normalized_run_status(run) != 'abandoned'
+                and weekly_policy_parent_is_complete(run)
                 and not agent_context_feedback_run_state_service._is_stale_running_row(
                     run
                 )
@@ -6035,7 +6166,91 @@ class SignalDeciderNextOpenExecutionService:
                 )
             ):
                 return 'invalid'
+            policy_binding = authority.get('policy_binding')
+            if policy_binding is not None:
+                decider_role_symbol_scopes = authority.get(
+                    'decider_role_symbol_scopes'
+                )
+                raw_idempotency_key = str(
+                    policy_binding.get('idempotency_key') or ''
+                ).strip() if isinstance(policy_binding, dict) else ''
+                if not (
+                    isinstance(policy_binding, dict)
+                    and str(
+                        policy_binding.get('schema_version') or ''
+                    ).strip()
+                    == WEEKLY_POLICY_REBIND_SCHEMA_VERSION
+                    and str(
+                        policy_binding.get('source_market_date') or ''
+                    ).strip()
+                    == source_market_date.isoformat()
+                    and (
+                        target_trade_date is None
+                        or str(
+                            policy_binding.get('target_trade_date') or ''
+                        ).strip()
+                        == target_trade_date.isoformat()
+                    )
+                    and str(
+                        policy_binding.get('policy_context_as_of_date') or ''
+                    ).strip()
+                    == str(
+                        policy_binding.get('target_trade_date') or ''
+                    ).strip()
+                    and str(
+                        policy_binding.get('artifact_version') or ''
+                    ).strip()
+                    and len(
+                        str(policy_binding.get('content_sha256') or '')
+                    )
+                    == 64
+                    and raw_idempotency_key
+                    and raw_idempotency_key
+                    == str(payload.get('idempotency_key') or '').strip()
+                    and isinstance(decider_role_symbol_scopes, dict)
+                    and decider_role_symbol_scopes
+                    == {
+                        role: list(symbols)
+                        for role, symbols in role_scopes.items()
+                    }
+                ):
+                    return 'invalid'
             return 'valid'
+
+        def weekly_policy_bound_scope_keys(
+            run: dict[str, Any],
+        ) -> set[tuple[str, str]]:
+            """Return the immutable cohort declared by a weekly rebind.
+
+            A later ordinary targeted retry may replace the selected parent for
+            one key, but it cannot shrink the all-or-nothing cohort established
+            by the weekly policy authority. ``scope_authority_state`` already
+            proves this payload is canonical and exactly matches the persisted
+            run role scopes before these keys are trusted.
+            """
+
+            if (
+                weekly_policy_binding(run) is None
+                or scope_authority_state(run) != 'valid'
+            ):
+                return set()
+            authority = request_payload(run).get('scope_authority')
+            if not isinstance(authority, dict):
+                return set()
+            raw_scopes = authority.get('decider_role_symbol_scopes')
+            if not isinstance(raw_scopes, dict):
+                return set()
+            return {
+                (
+                    str(symbol).strip().upper(),
+                    _normalize_agent_name(raw_role),
+                )
+                for raw_role, raw_symbols in raw_scopes.items()
+                if _normalize_agent_name(raw_role) in required_agents
+                and isinstance(raw_symbols, list)
+                for symbol in raw_symbols
+                if str(symbol or '').strip()
+            }
 
         # An ordinary requested-symbol retry is a patch over the most recent
         # authoritative cohort. A request bounded by a versioned, exact
@@ -6628,17 +6843,31 @@ class SignalDeciderNextOpenExecutionService:
             for parent in active_source_parents
             if str(parent.get('run_id') or '').strip()
         }
+        weekly_policy_bound_scope_keys_by_parent = {
+            parent_run_id: weekly_policy_bound_scope_keys(parent)
+            for parent_run_id, parent in source_parent_by_id.items()
+            if weekly_policy_binding(parent) is not None
+        }
         terminal_parent_statuses = {
             'completed',
             'completed_with_failures',
             'partial',
             'failed',
         }
+        weekly_policy_rebind_blocked_scope_keys = {
+            key
+            for parent_run_id, parent in source_parent_by_id.items()
+            if not weekly_policy_parent_is_complete(parent)
+            for key in weekly_policy_bound_scope_keys_by_parent.get(
+                parent_run_id,
+                set(),
+            )
+        }
         blocked_source_scope_keys = {
             key
             for key, parent in source_parent_by_key.items()
             if normalized_run_status(parent) not in terminal_parent_statuses
-        }
+        } | weekly_policy_rebind_blocked_scope_keys
         evidenced_scope_keys: set[tuple[str, str]] = {
             key
             for key, snapshot in selected_by_key.items()
@@ -6881,6 +7110,39 @@ class SignalDeciderNextOpenExecutionService:
                 evidenced_scope_keys.discard(key)
                 reused_scope_keys.discard(key)
 
+        # A weekly policy publication replaces the full bound cohort. Apply
+        # this all-or-nothing check only after every terminal failure and
+        # target-session timing rule has invalidated individual snapshots; a
+        # later ordinary patch, failure, or expired snapshot must never expose
+        # a successful subset of the weekly authority.
+        for parent_run_id, parent in source_parent_by_id.items():
+            if weekly_policy_binding(parent) is None:
+                continue
+            parent_scope_keys = weekly_policy_bound_scope_keys_by_parent.get(
+                parent_run_id,
+                set(),
+            )
+            complete_evidence = bool(
+                weekly_policy_parent_is_complete(parent)
+                and parent_scope_keys
+                and all(
+                    selected_by_key.get(key) is not None
+                    and key in evidenced_scope_keys
+                    for key in parent_scope_keys
+                )
+            )
+            if complete_evidence:
+                continue
+            weekly_policy_rebind_blocked_scope_keys.update(
+                parent_scope_keys
+            )
+            blocked_source_scope_keys.update(parent_scope_keys)
+            for key in parent_scope_keys:
+                selected_by_key[key] = None
+                authoritative_run_id_by_key[key] = parent_run_id
+                evidenced_scope_keys.discard(key)
+                reused_scope_keys.discard(key)
+
         selected_projections_by_id = {
             int(snapshot.id): snapshot
             for snapshot in selected_by_key.values()
@@ -6938,6 +7200,9 @@ class SignalDeciderNextOpenExecutionService:
             'source_parent_run_id_by_key': source_parent_run_id_by_key,
             'source_role_symbol_scopes': source_role_scopes,
             'blocked_source_scope_keys': blocked_source_scope_keys,
+            'weekly_policy_rebind_blocked_scope_keys': (
+                weekly_policy_rebind_blocked_scope_keys
+            ),
             'strict_source_lineage': strict_source_lineage,
         }
 
@@ -6983,6 +7248,7 @@ class SignalDeciderNextOpenExecutionService:
                 market_date=source_market_date,
                 snapshots=raw_snapshots,
                 full_source_revalidation_actionable_only=True,
+                policy_context_as_of_date=target_trade_date,
             )
         )
         valid_snapshot_ids = set(
@@ -9636,5 +9902,8 @@ class SignalDeciderNextOpenExecutionService:
 signal_decider_next_open_execution_service = SignalDeciderNextOpenExecutionService(
     live_market_snapshot_refresher=(
         market_snapshot_service.refresh_market_snapshot_if_due
+    ),
+    weekly_policy_rebind_coordinator=(
+        weekly_policy_rebind_preparation_service.coordinate_for_target
     ),
 )

@@ -58,6 +58,7 @@ What it does:
 - `GET /agent-context/feedback/decider-coverage?market_date=2026-05-08`
 - `POST /agent-context/signal-decider/weekly-learning/publish`
 - `GET /agent-context/signal-decider/weekly-learning/latest?as_of_date=2026-10-13`
+- `POST /agent-context/feedback/rebind/prepare`
 - `GET /eod/pipeline/status`
 - `GET /eod/pipeline/stages`
 - `POST /eod/master/refresh-if-due`
@@ -333,6 +334,14 @@ Useful limited-scope runs:
 - API-triggered KIS market-risk filter compute: `curl -X POST "http://127.0.0.1:8000/eod/market-risk-filters/compute?market_date=2026-04-14"`
 - Recent derived-context backfill: `python3.11 -m app.internal.ops agent-derived-contexts-backfill-recent`
 - API-triggered KIS ranking signal-feature collection: `curl -X POST "http://127.0.0.1:8000/eod/signal-features/collect?market_date=2026-04-14"`
+
+Weekly-policy rebind safety check (Saturday only):
+
+- Call `POST /agent-context/feedback/rebind/prepare` with `{"as_of_date":"YYYY-MM-DD","market":"KRX"}` after the Friday session is complete. Add the normal bearer header when `UPSTREAM_BEARER_TOKEN` is configured.
+- Continue only for `status="ready"`, and submit the returned `retry_request` byte-for-field to `POST /agent-context/feedback/retry-cycles`. Do not reconstruct the summary cutoff, symbols, role scopes, artifact identity, authority proof, or idempotency key.
+- `status="noop"` means the exact fully completed two-decider rebind already exists. `status="blocked"` is a safe stop; inspect `reason` and `guards` and do not override it with `force`.
+- The prepare and retry paths never call Exec or an order endpoint. Weekly-bound retries are rejected during every current KRX `OPEN` state and are checked again inside the feedback/snapshot write transaction. A partial/failed run leaves the prior next-open plan blocked rather than exposing a partial replacement cohort.
+- PREOPEN next-open refresh uses the same coordinator as an idempotent backstop for both Monday and midweek target sessions. If the bound artifact is missing or changes, the source/target dates are not adjacent KRX sessions, or the session opens during work, Core persists no new feedback/snapshot transaction and keeps the plan fail-closed.
 
 Internal ops commands from `apps/api`:
 

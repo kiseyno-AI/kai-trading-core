@@ -735,6 +735,7 @@ def run_agent_feedback_retry_cycles(
     market_date: str,
     symbols: str | None = None,
     roles: str | None = None,
+    policy_context_as_of_date: str | None = None,
     feedback_scope_mode: str = FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
     max_cycles: int = 3,
     outer_batch_size: int = 20,
@@ -750,6 +751,13 @@ def run_agent_feedback_retry_cycles(
             market_date=__import__('datetime').date.fromisoformat(market_date),
             roles=parsed_roles,
             symbols=parsed_symbols,
+            policy_context_as_of_date=(
+                __import__('datetime').date.fromisoformat(
+                    policy_context_as_of_date
+                )
+                if policy_context_as_of_date
+                else None
+            ),
             feedback_scope_mode=feedback_scope_mode,
             max_cycles=max_cycles,
             outer_batch_size=outer_batch_size,
@@ -1169,6 +1177,7 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback_retry_parser.add_argument('--market-date', required=True)
     feedback_retry_parser.add_argument('--symbols')
     feedback_retry_parser.add_argument('--roles')
+    feedback_retry_parser.add_argument('--policy-context-as-of-date')
     feedback_retry_parser.add_argument(
         '--feedback-scope-mode',
         choices=FEEDBACK_SCOPE_MODES,
@@ -1595,6 +1604,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             market_date=args.market_date,
             symbols=args.symbols,
             roles=args.roles,
+            policy_context_as_of_date=args.policy_context_as_of_date,
             feedback_scope_mode=args.feedback_scope_mode,
             max_cycles=args.max_cycles,
             outer_batch_size=args.outer_batch_size,

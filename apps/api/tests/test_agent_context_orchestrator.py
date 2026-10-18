@@ -1341,6 +1341,95 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
             '2026-04-23T06:30:00+00:00',
         )
 
+    def test_persisted_snapshot_revalidation_uses_next_open_policy_date(self):
+        snapshot = SimpleNamespace(
+            id=116,
+            request_payload={
+                'durable_decision_input_generation': {
+                    'schema_version': 'durable_decider_input_generation_v1',
+                    'durable_reuse_eligible': True,
+                    'non_durable_reasons': [],
+                },
+                'decision_input_generation_fence': {'enforcement': 'required'},
+                'source_revalidation_request': {
+                    'source_context_scope_symbols': ['005930'],
+                    'eligibility_scope_symbols': ['005930'],
+                    'fs_div': 'CFS',
+                    'disclosures_limit': 5,
+                    'knowledge_cutoff_at': '2026-10-16T06:30:00+00:00',
+                    'policy_context_as_of_date': '2026-10-16',
+                },
+            },
+            response_payload={'tactical_action': 'watch_for_trigger'},
+            decision_run_id='friday-short-term-run',
+            agent_name='short-term-decider',
+            symbol='005930',
+            decision_action='buy',
+            next_day_open_action='buy',
+        )
+        service = AgentFeedbackOrchestrator()
+
+        with patch.object(
+            service,
+            '_revalidate_decider_dispatch_inputs',
+            return_value={},
+        ) as revalidate:
+            result = service.revalidate_persisted_decider_snapshots(
+                market_date='2026-10-16',
+                snapshots=[snapshot],
+                policy_context_as_of_date='2026-10-19',
+            )
+
+        self.assertEqual(result['valid_snapshot_ids'], [116])
+        self.assertEqual(
+            revalidate.call_args.kwargs['policy_context_as_of_date'],
+            date(2026, 10, 19),
+        )
+
+    def test_persisted_snapshot_revalidation_defaults_to_stored_policy_date(self):
+        snapshot = SimpleNamespace(
+            id=117,
+            request_payload={
+                'durable_decision_input_generation': {
+                    'schema_version': 'durable_decider_input_generation_v1',
+                    'durable_reuse_eligible': True,
+                    'non_durable_reasons': [],
+                },
+                'decision_input_generation_fence': {'enforcement': 'required'},
+                'source_revalidation_request': {
+                    'source_context_scope_symbols': ['005930'],
+                    'eligibility_scope_symbols': ['005930'],
+                    'fs_div': 'CFS',
+                    'disclosures_limit': 5,
+                    'knowledge_cutoff_at': '2026-10-16T06:30:00+00:00',
+                    'policy_context_as_of_date': '2026-10-19',
+                },
+            },
+            response_payload={'tactical_action': 'watch_for_trigger'},
+            decision_run_id='monday-policy-short-term-run',
+            agent_name='short-term-decider',
+            symbol='005930',
+            decision_action='buy',
+            next_day_open_action='buy',
+        )
+        service = AgentFeedbackOrchestrator()
+
+        with patch.object(
+            service,
+            '_revalidate_decider_dispatch_inputs',
+            return_value={},
+        ) as revalidate:
+            result = service.revalidate_persisted_decider_snapshots(
+                market_date='2026-10-16',
+                snapshots=[snapshot],
+            )
+
+        self.assertEqual(result['valid_snapshot_ids'], [117])
+        self.assertEqual(
+            revalidate.call_args.kwargs['policy_context_as_of_date'],
+            date(2026, 10, 19),
+        )
+
     def test_actionable_only_revalidation_still_validates_every_snapshot_payload_and_metadata(
         self,
     ):
@@ -2278,6 +2367,105 @@ class RepairJsonTailTests(unittest.TestCase):
             )
 
         self.assertEqual(policy, {})
+
+    def test_bound_weekly_policy_requires_exact_published_artifact_identity(self):
+        service = AgentFeedbackOrchestrator()
+        expected_binding = {
+            'artifact_version': 'weekly-2026-10-16-a',
+            'content_sha256': 'a' * 64,
+            'policy_context_as_of_date': '2026-10-19',
+        }
+        exact = {
+            'schema_version': 'signal_decider_performance_criteria_v1',
+            'status': 'ready',
+            'artifact': {
+                'artifact_version': expected_binding['artifact_version'],
+                'content_sha256': expected_binding['content_sha256'],
+            },
+        }
+
+        with patch.object(
+            orchestrator_module.signal_decider_weekly_learning_service,
+            'get_latest_performance_criteria',
+            return_value=exact,
+        ):
+            policy = service._build_decider_policy_context(
+                role='short-term-decider',
+                market_date=date(2026, 10, 16),
+                policy_context_as_of_date=date(2026, 10, 19),
+                expected_weekly_policy_binding=expected_binding,
+            )
+
+        self.assertEqual(
+            policy['performance_criteria']['artifact'],
+            exact['artifact'],
+        )
+
+        for latest in (
+            None,
+            {
+                **exact,
+                'artifact': {
+                    **exact['artifact'],
+                    'content_sha256': 'b' * 64,
+                },
+            },
+        ):
+            with (
+                self.subTest(latest=latest),
+                patch.object(
+                    orchestrator_module.signal_decider_weekly_learning_service,
+                    'get_latest_performance_criteria',
+                    return_value=latest,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    'bound weekly performance criteria',
+                ),
+            ):
+                service._build_decider_policy_context(
+                    role='short-term-decider',
+                    market_date=date(2026, 10, 16),
+                    policy_context_as_of_date=date(2026, 10, 19),
+                    expected_weekly_policy_binding=expected_binding,
+                )
+
+    def test_bound_weekly_policy_does_not_fall_back_when_artifact_load_fails(self):
+        service = AgentFeedbackOrchestrator()
+        expected_binding = {
+            'artifact_version': 'weekly-2026-10-16-a',
+            'content_sha256': 'a' * 64,
+            'policy_context_as_of_date': '2026-10-19',
+        }
+
+        with (
+            patch.object(
+                orchestrator_module.signal_decider_weekly_learning_service,
+                'get_latest_performance_criteria',
+                side_effect=RuntimeError('repository unavailable'),
+            ),
+            patch.object(
+                orchestrator_module.signal_decider_calibration_service,
+                'build_report',
+            ) as calibration,
+            patch.object(
+                orchestrator_module.signal_decider_loop_service,
+                'get_active_policy_context',
+                return_value={'current_version': 'signal_decider_policy_v1'},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                'bound weekly performance criteria unavailable',
+            ),
+        ):
+            service._build_decider_policy_context(
+                role='signal-decider',
+                market_date=date(2026, 10, 16),
+                policy_context_as_of_date=date(2026, 10, 19),
+                expected_weekly_policy_binding=expected_binding,
+            )
+
+        calibration.assert_not_called()
 
     def test_signal_decider_rule_candidate_compaction_normalizes_type_and_activation_safely(self):
         compacted = AgentFeedbackOrchestrator._compact_signal_decider_rule_candidates(

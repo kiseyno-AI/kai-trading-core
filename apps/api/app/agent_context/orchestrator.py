@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -2525,6 +2525,7 @@ class AgentFeedbackOrchestrator:
         self,
         *,
         market_date: date,
+        policy_context_as_of_date: date | None = None,
         request_run_id: str,
         source_items: Sequence[dict[str, Any]],
         source_context_scope_symbols: Sequence[str],
@@ -2800,6 +2801,7 @@ class AgentFeedbackOrchestrator:
                     refreshed_policy_context = self._build_decider_policy_context(
                         role=decision_role,
                         market_date=market_date,
+                        policy_context_as_of_date=policy_context_as_of_date,
                     )
             except Exception as exc:  # noqa: BLE001
                 reasons.append(
@@ -3406,6 +3408,7 @@ class AgentFeedbackOrchestrator:
         market_date: str | date,
         snapshots: Sequence[Any],
         full_source_revalidation_actionable_only: bool = False,
+        policy_context_as_of_date: str | date | None = None,
     ) -> dict[str, Any]:
         """Revalidate immutable decision inputs before next-open execution use.
 
@@ -3428,6 +3431,15 @@ class AgentFeedbackOrchestrator:
             market_date
             if isinstance(market_date, date)
             else date.fromisoformat(market_date)
+        )
+        normalized_policy_context_as_of_date = (
+            policy_context_as_of_date.date()
+            if isinstance(policy_context_as_of_date, datetime)
+            else policy_context_as_of_date
+            if isinstance(policy_context_as_of_date, date)
+            else date.fromisoformat(policy_context_as_of_date)
+            if policy_context_as_of_date is not None
+            else None
         )
         validation_by_snapshot_id: dict[int, dict[str, Any]] = {}
         grouped: dict[str, dict[str, Any]] = {}
@@ -3582,6 +3594,33 @@ class AgentFeedbackOrchestrator:
             normalized_knowledge_cutoff = (
                 parsed_knowledge_cutoff.astimezone(timezone.utc).isoformat()
             )
+            raw_stored_policy_context_as_of_date = (
+                revalidation_request.get('policy_context_as_of_date')
+            )
+            try:
+                stored_policy_context_as_of_date = (
+                    date.fromisoformat(
+                        str(raw_stored_policy_context_as_of_date)
+                    )
+                    if raw_stored_policy_context_as_of_date is not None
+                    else normalized_market_date
+                )
+            except (TypeError, ValueError):
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'durable_policy_context_date_invalid',
+                }
+                continue
+            effective_policy_context_as_of_date = (
+                normalized_policy_context_as_of_date
+                or stored_policy_context_as_of_date
+            )
+            if effective_policy_context_as_of_date < normalized_market_date:
+                validation_by_snapshot_id[snapshot_id] = {
+                    'status': 'invalid',
+                    'reason': 'durable_policy_context_date_invalid',
+                }
+                continue
             if (
                 full_source_revalidation_actionable_only
                 and not actionable_snapshot
@@ -3600,6 +3639,9 @@ class AgentFeedbackOrchestrator:
                 ],
                 'eligibility_scope_symbols': raw_eligibility_scope,
                 'source_knowledge_cutoff_at': normalized_knowledge_cutoff,
+                'policy_context_as_of_date': (
+                    effective_policy_context_as_of_date.isoformat()
+                ),
                 'authoritative_summary_run_id': str(
                     revalidation_request.get('upstream_summary_run_id')
                     or ''
@@ -3634,6 +3676,9 @@ class AgentFeedbackOrchestrator:
                 ):
                     failures = self._revalidate_decider_dispatch_inputs(
                         market_date=normalized_market_date,
+                        policy_context_as_of_date=date.fromisoformat(
+                            material['policy_context_as_of_date']
+                        ),
                         request_run_id=material['decision_run_id'],
                         source_items=group['source_items'],
                         source_context_scope_symbols=material[
@@ -3741,6 +3786,8 @@ class AgentFeedbackOrchestrator:
         *,
         role: str,
         market_date: date,
+        policy_context_as_of_date: date,
+        expected_weekly_policy_binding: Mapping[str, Any] | None = None,
         request_run_id: str,
         symbol_context_items: Sequence[dict[str, Any]],
         source_context_scope_symbols: Sequence[str],
@@ -3773,6 +3820,10 @@ class AgentFeedbackOrchestrator:
             active_signal_decider_policy = self._build_decider_policy_context(
                 role=role,
                 market_date=market_date,
+                policy_context_as_of_date=policy_context_as_of_date,
+                expected_weekly_policy_binding=(
+                    expected_weekly_policy_binding
+                ),
             )
 
         dispatch_items: list[dict[str, Any]] = []
@@ -3948,6 +3999,9 @@ class AgentFeedbackOrchestrator:
                 'fs_div': fs_div,
                 'disclosures_limit': int(disclosures_limit),
                 'knowledge_cutoff_at': source_knowledge_cutoff_at,
+                'policy_context_as_of_date': (
+                    policy_context_as_of_date.isoformat()
+                ),
                 'upstream_summary_run_id': upstream_summary_run_id,
             }
             payload['decision_input_generation_fence'] = {
@@ -3964,10 +4018,14 @@ class AgentFeedbackOrchestrator:
         *,
         policy_context: dict[str, Any],
         market_date: date,
+        policy_context_as_of_date: date | None = None,
+        expected_weekly_policy_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         criteria = self._build_signal_decider_performance_criteria(
             policy_context=policy_context,
             market_date=market_date,
+            policy_context_as_of_date=policy_context_as_of_date,
+            expected_weekly_policy_binding=expected_weekly_policy_binding,
         )
         if not criteria:
             return policy_context
@@ -3981,17 +4039,31 @@ class AgentFeedbackOrchestrator:
         *,
         role: str,
         market_date: date,
+        policy_context_as_of_date: date | None = None,
+        expected_weekly_policy_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        resolved_policy_context_as_of_date = (
+            policy_context_as_of_date or market_date
+        )
         if role == SIGNAL_DECIDER_AGENT_NAME:
             return self._attach_signal_decider_performance_criteria(
                 policy_context=(
                     signal_decider_loop_service.get_active_policy_context()
                 ),
                 market_date=market_date,
+                policy_context_as_of_date=(
+                    resolved_policy_context_as_of_date
+                ),
+                expected_weekly_policy_binding=(
+                    expected_weekly_policy_binding
+                ),
             )
         if role == SHORT_TERM_DECIDER_AGENT_NAME:
             criteria = self._load_published_weekly_performance_criteria(
-                market_date=market_date,
+                market_date=resolved_policy_context_as_of_date,
+                expected_weekly_policy_binding=(
+                    expected_weekly_policy_binding
+                ),
             )
             return (
                 {'performance_criteria': criteria}
@@ -4004,27 +4076,66 @@ class AgentFeedbackOrchestrator:
     def _load_published_weekly_performance_criteria(
         *,
         market_date: date,
+        expected_weekly_policy_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         try:
-            return (
+            criteria = (
                 signal_decider_weekly_learning_service
                 .get_latest_performance_criteria(as_of_date=market_date)
             )
-        except Exception as exc:  # Published learning must degrade to live fallback.
+        except Exception as exc:
+            if expected_weekly_policy_binding is not None:
+                raise RuntimeError(
+                    'bound weekly performance criteria unavailable'
+                ) from exc
             logger.warning(
                 'signal_decider_weekly_learning_unavailable: %s',
                 exc,
             )
             return None
+        if expected_weekly_policy_binding is None:
+            return criteria
+        if not isinstance(criteria, Mapping):
+            raise RuntimeError(
+                'bound weekly performance criteria unavailable'
+            )
+        artifact = criteria.get('artifact')
+        if not isinstance(artifact, Mapping):
+            raise RuntimeError(
+                'bound weekly performance criteria artifact missing'
+            )
+        expected_artifact_version = str(
+            expected_weekly_policy_binding.get('artifact_version') or ''
+        ).strip()
+        expected_content_sha256 = str(
+            expected_weekly_policy_binding.get('content_sha256') or ''
+        ).strip()
+        if not expected_artifact_version or not expected_content_sha256:
+            raise ValueError(
+                'expected weekly policy binding identity is incomplete'
+            )
+        if (
+            str(artifact.get('artifact_version') or '').strip()
+            != expected_artifact_version
+            or str(artifact.get('content_sha256') or '').strip()
+            != expected_content_sha256
+        ):
+            raise RuntimeError(
+                'bound weekly performance criteria identity changed'
+            )
+        return dict(criteria)
 
     def _build_signal_decider_performance_criteria(
         self,
         *,
         policy_context: dict[str, Any],
         market_date: date,
+        policy_context_as_of_date: date | None = None,
+        expected_weekly_policy_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         published = self._load_published_weekly_performance_criteria(
-            market_date=market_date,
+            market_date=policy_context_as_of_date or market_date,
+            expected_weekly_policy_binding=expected_weekly_policy_binding,
         )
         if published is not None:
             return published
@@ -4626,11 +4737,13 @@ class AgentFeedbackOrchestrator:
         lifecycle_stage: str,
         current_role: str | None,
         status: str = 'running',
+        persistence_guard: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         flush_result = self._flush_pending_run_buffers(
             market_date=market_date,
             request_run_id=request_run_id,
             reason=reason,
+            persistence_guard=persistence_guard,
         )
         if flush_result['feedback_rows_seen'] or flush_result['failure_rows_seen']:
             self._checkpoint_run_state(
@@ -4650,6 +4763,7 @@ class AgentFeedbackOrchestrator:
         market_date: date,
         request_run_id: str,
         reason: str,
+        persistence_guard: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         state = runtime_feedback_state_store.get_run(market_date, run_id=request_run_id)
         if state is None:
@@ -4669,6 +4783,16 @@ class AgentFeedbackOrchestrator:
         }
         if not pending_feedback_rows and not pending_failures:
             return flush_result
+
+        if persistence_guard is not None:
+            persistence_guard(
+                stage='before_feedback_persistence',
+                market_date=market_date,
+                request_run_id=request_run_id,
+                reason=reason,
+                feedback_rows=len(pending_feedback_rows),
+                failure_rows=len(pending_failures),
+            )
 
         if pending_feedback_rows:
             for row in pending_feedback_rows:
@@ -4705,7 +4829,19 @@ class AgentFeedbackOrchestrator:
                 for row in pending_feedback_rows
             ]
             try:
-                feedback_result = agent_context_feedback_service.bulk_submit_feedback(items=flush_payload)
+                if persistence_guard is None:
+                    feedback_result = (
+                        agent_context_feedback_service.bulk_submit_feedback(
+                            items=flush_payload,
+                        )
+                    )
+                else:
+                    feedback_result = (
+                        agent_context_feedback_service.bulk_submit_feedback(
+                            items=flush_payload,
+                            before_commit_guard=persistence_guard,
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001
                 flush_result['feedback_error'] = f'{type(exc).__name__}: {exc}'
                 flush_result['status'] = 'failed'
@@ -5016,6 +5152,7 @@ class AgentFeedbackOrchestrator:
         fs_div: str | None = None,
         disclosures_limit: int = 5,
         knowledge_cutoff_at: datetime | str | None = None,
+        policy_context_as_of_date: str | date | None = None,
         reuse_existing: bool = True,
         request_run_id: str | None = None,
         parent_run_id: str | None = None,
@@ -5025,8 +5162,55 @@ class AgentFeedbackOrchestrator:
         role_symbol_scopes: dict[str, Sequence[str]] | None = None,
         funnel_diagnostics: dict[str, Any] | None = None,
         upstream_summary_run_id: str | None = None,
+        persistence_guard: Callable[..., Any] | None = None,
+        expected_weekly_policy_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
+        resolved_policy_context_as_of_date = (
+            policy_context_as_of_date.date()
+            if isinstance(policy_context_as_of_date, datetime)
+            else policy_context_as_of_date
+            if isinstance(policy_context_as_of_date, date)
+            else date.fromisoformat(policy_context_as_of_date)
+            if policy_context_as_of_date is not None
+            else normalized_market_date
+        )
+        if resolved_policy_context_as_of_date < normalized_market_date:
+            raise ValueError(
+                'policy_context_as_of_date must be on or after market_date'
+            )
+        normalized_expected_weekly_policy_binding = None
+        if expected_weekly_policy_binding is not None:
+            if not isinstance(expected_weekly_policy_binding, Mapping):
+                raise ValueError(
+                    'expected_weekly_policy_binding must be an object'
+                )
+            artifact_version = str(
+                expected_weekly_policy_binding.get('artifact_version') or ''
+            ).strip()
+            content_sha256 = str(
+                expected_weekly_policy_binding.get('content_sha256') or ''
+            ).strip()
+            binding_policy_date = str(
+                expected_weekly_policy_binding.get(
+                    'policy_context_as_of_date'
+                )
+                or ''
+            ).strip()
+            if (
+                not artifact_version
+                or not content_sha256
+                or binding_policy_date
+                != resolved_policy_context_as_of_date.isoformat()
+            ):
+                raise ValueError(
+                    'expected weekly policy binding does not match dispatch'
+                )
+            normalized_expected_weekly_policy_binding = {
+                'artifact_version': artifact_version,
+                'content_sha256': content_sha256,
+                'policy_context_as_of_date': binding_policy_date,
+            }
         effective_knowledge_cutoff_at, _knowledge_cutoff_source = (
             resolve_external_news_knowledge_cutoff_for_symbols(
                 market_date=normalized_market_date,
@@ -5058,6 +5242,9 @@ class AgentFeedbackOrchestrator:
                     'fs_div': fs_div,
                     'disclosures_limit': disclosures_limit,
                     'knowledge_cutoff_at': requested_knowledge_cutoff_at,
+                    'policy_context_as_of_date': (
+                        resolved_policy_context_as_of_date.isoformat()
+                    ),
                     'reuse_existing': reuse_existing,
                     'force_recompute': force_recompute,
                     'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
@@ -5117,6 +5304,9 @@ class AgentFeedbackOrchestrator:
                         'fs_div': fs_div,
                         'disclosures_limit': disclosures_limit,
                         'knowledge_cutoff_at': requested_knowledge_cutoff_at,
+                        'policy_context_as_of_date': (
+                            resolved_policy_context_as_of_date.isoformat()
+                        ),
                         'reuse_existing': reuse_existing,
                         'force_recompute': force_recompute,
                         'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
@@ -5196,6 +5386,9 @@ class AgentFeedbackOrchestrator:
             'fs_div': fs_div,
             'disclosures_limit': disclosures_limit,
             'knowledge_cutoff_at': requested_knowledge_cutoff_at,
+            'policy_context_as_of_date': (
+                resolved_policy_context_as_of_date.isoformat()
+            ),
             'symbol_chunk_size': batch_size,
             'parallel_subtasks': role_parallelism,
             'role_parallel_subtasks': role_parallelism,
@@ -5219,6 +5412,9 @@ class AgentFeedbackOrchestrator:
             'feedback_scope_mode': feedback_scope_mode,
             'upstream_summary_run_id': (
                 normalized_upstream_summary_run_id
+            ),
+            'expected_weekly_policy_binding': (
+                normalized_expected_weekly_policy_binding
             ),
         }
         state = RuntimeFeedbackRunState(
@@ -5755,6 +5951,7 @@ class AgentFeedbackOrchestrator:
                 lifecycle_stage='run_level_preflight_failed',
                 current_role=OPENCLAW_GATEWAY_AGENT_NAME,
                 status='failed',
+                persistence_guard=persistence_guard,
             )
             response_payload = {
                 'request': request_payload,
@@ -6131,6 +6328,12 @@ class AgentFeedbackOrchestrator:
                     dispatch_items = self._prepare_role_dispatch_items(
                         role=role,
                         market_date=normalized_market_date,
+                        policy_context_as_of_date=(
+                            resolved_policy_context_as_of_date
+                        ),
+                        expected_weekly_policy_binding=(
+                            normalized_expected_weekly_policy_binding
+                        ),
                         request_run_id=request_run_id,
                         symbol_context_items=[
                             item
@@ -6431,6 +6634,9 @@ class AgentFeedbackOrchestrator:
                                             input_generation_failures = (
                                                 self._revalidate_decider_dispatch_inputs(
                                                     market_date=normalized_market_date,
+                                                    policy_context_as_of_date=(
+                                                        resolved_policy_context_as_of_date
+                                                    ),
                                                     request_run_id=request_run_id,
                                                     source_items=dispatch_items,
                                                     source_context_scope_symbols=(
@@ -6893,6 +7099,7 @@ class AgentFeedbackOrchestrator:
                                             lifecycle_stage='batch_persisted',
                                             current_role=role,
                                             status='running',
+                                            persistence_guard=persistence_guard,
                                         )
                                     should_submit_next = True
                                 finally:
@@ -6908,6 +7115,7 @@ class AgentFeedbackOrchestrator:
                         market_date=normalized_market_date,
                         request_run_id=request_run_id,
                         reason=f'role_completed:{role}',
+                        persistence_guard=persistence_guard,
                     )
                     try:
                         role_cleanup_result = self._cleanup_persisted_run_sessions(
@@ -6963,6 +7171,9 @@ class AgentFeedbackOrchestrator:
                         final_generation_failures = (
                             self._revalidate_decider_dispatch_inputs(
                                 market_date=normalized_market_date,
+                                policy_context_as_of_date=(
+                                    resolved_policy_context_as_of_date
+                                ),
                                 request_run_id=request_run_id,
                                 source_items=list(
                                     accepted_decider_source_items.values()
@@ -7092,6 +7303,7 @@ class AgentFeedbackOrchestrator:
                                 lifecycle_stage='final_input_generation_checked',
                                 current_role=state.current_role,
                                 status='running',
+                                persistence_guard=persistence_guard,
                             )
                     final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or state
                     progress_counts = final_snapshot.to_progress_summary()
@@ -7122,6 +7334,7 @@ class AgentFeedbackOrchestrator:
                     market_date=normalized_market_date,
                     request_run_id=request_run_id,
                     reason='finalize',
+                    persistence_guard=persistence_guard,
                 )
                 final_snapshot = runtime_feedback_state_store.get_run(normalized_market_date, run_id=request_run_id) or final_snapshot
                 if final_snapshot is not None and (final_snapshot.pending_feedback_rows or final_snapshot.pending_failures):
@@ -7129,6 +7342,7 @@ class AgentFeedbackOrchestrator:
                         market_date=normalized_market_date,
                         request_run_id=request_run_id,
                         reason='finalize_drain_pending',
+                        persistence_guard=persistence_guard,
                     )
                     final_flush_result = {
                         'status': 'drained',
@@ -7149,6 +7363,7 @@ class AgentFeedbackOrchestrator:
                             market_date=normalized_market_date,
                             request_run_id=request_run_id,
                             reason='finalize_missing_terminal_feedback',
+                            persistence_guard=persistence_guard,
                         )
                         final_flush_result = {
                             'status': 'terminal_reconciled',

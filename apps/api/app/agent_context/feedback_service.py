@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -282,6 +282,7 @@ class AgentContextFeedbackRepository:
         *,
         items: Sequence[dict[str, Any]],
         chunk_size: int = BULK_UPSERT_CHUNK_SIZE,
+        before_commit_guard: Callable[..., Any] | None = None,
     ) -> list[dict[str, Any]]:
         deduped_items = _dedupe_feedback_items_for_upsert(items)
         if not deduped_items:
@@ -409,6 +410,11 @@ class AgentContextFeedbackRepository:
                         session=session,
                         items=snapshot_items,
                     )
+            if before_commit_guard is not None:
+                before_commit_guard(
+                    stage='before_feedback_transaction_commit',
+                    feedback_rows=len(deduped_items),
+                )
         return accepted
 
     def list_feedback(
@@ -676,9 +682,18 @@ class AgentContextFeedbackService:
         self,
         *,
         items: Sequence[dict[str, Any]],
+        before_commit_guard: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         normalized_items = [self._normalize_feedback_item(**item) for item in items]
-        accepted = self.repository.bulk_upsert_feedback(items=normalized_items)
+        if before_commit_guard is None:
+            accepted = self.repository.bulk_upsert_feedback(
+                items=normalized_items,
+            )
+        else:
+            accepted = self.repository.bulk_upsert_feedback(
+                items=normalized_items,
+                before_commit_guard=before_commit_guard,
+            )
         return {'accepted': True, 'count': len(accepted), 'items': accepted}
 
 

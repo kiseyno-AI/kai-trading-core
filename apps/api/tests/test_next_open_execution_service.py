@@ -80,6 +80,7 @@ from app.orders.next_open_execution import (
     _actionable_signal_policy_versions,
     _delegate_short_term_watch_entry_quality_blocks_to_warnings,
     _execution_plan_row_authority_fingerprint,
+    _generation_requires_policy_rebind,
     _is_canonical_closed_market_cost_absence,
     _lock_dispatch_authority_source_tables,
     _next_open_performance_cost_evidence,
@@ -443,6 +444,39 @@ def test_generation_authority_ignores_diagnostics_but_not_validity() -> None:
             },
         }
     }
+
+
+def test_generation_policy_rebind_detects_structured_reason_code() -> None:
+    assert _generation_requires_policy_rebind(
+        {
+            'validations': [
+                {
+                    'status': 'invalid',
+                    'details': {
+                        'reason': 'decider_inputs_changed_during_dispatch',
+                        'reasons': [
+                            {'code': 'policy_context_changed'},
+                        ],
+                    },
+                }
+            ]
+        }
+    )
+    assert not _generation_requires_policy_rebind(
+        {
+            'validations': [
+                {
+                    'status': 'invalid',
+                    'details': {
+                        'reason': 'decider_inputs_changed_during_dispatch',
+                        'reasons': [
+                            {'code': 'source_context_changed'},
+                        ],
+                    },
+                }
+            ]
+        }
+    )
 
 
 def test_dispatch_authority_source_lock_contention_is_a_retryable_revision_conflict(
@@ -1621,6 +1655,12 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.target_trade_date = date(2026, 4, 30)
         self.feedback_run_ids: list[str] = []
         self.feedback_failure_symbols: list[str] = []
+        with session_scope() as session:
+            self._preexisting_policy_versions = set(
+                session.execute(
+                    select(SignalDeciderPolicyVersion.policy_version)
+                ).scalars()
+            )
         self.original_settings = {
             'signal_decider_next_open_account_targets': settings.signal_decider_next_open_account_targets,
             'signal_decider_next_open_enabled': settings.signal_decider_next_open_enabled,
@@ -1750,6 +1790,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             market_date,
             snapshots,
             full_source_revalidation_actionable_only=False,
+            policy_context_as_of_date=None,
         ):
             snapshot_ids = sorted(int(snapshot.id) for snapshot in snapshots)
             identity_by_id = {
@@ -1843,6 +1884,13 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             session.execute(
                 delete(SignalDeciderPolicyVersion).where(
                     SignalDeciderPolicyVersion.policy_version == self.policy_version
+                )
+            )
+            session.execute(
+                delete(SignalDeciderPolicyVersion).where(
+                    SignalDeciderPolicyVersion.policy_version.not_in(
+                        self._preexisting_policy_versions
+                    )
                 )
             )
 
@@ -2597,6 +2645,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         role_symbol_scopes: dict[str, list[str]] | None = None,
         started_at: datetime,
         status: str = 'completed',
+        symbols_total: int | None = None,
         completed_count: int | None = None,
         failed_count: int = 0,
         mode: str = 'role_sequential_runtime_buffered',
@@ -2636,6 +2685,11 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 scope_authority['knowledge_cutoff_at']
             )
             request_payload['fs_div'] = scope_authority['fs_div']
+            policy_binding = scope_authority.get('policy_binding')
+            if isinstance(policy_binding, dict):
+                request_payload['idempotency_key'] = policy_binding.get(
+                    'idempotency_key'
+                )
         if parent_run_id is not None:
             request_payload['parent_run_id'] = parent_run_id
         if child_run_lineage:
@@ -2650,8 +2704,16 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     run_id=run_id,
                     market_date=self.market_date,
                     status=status,
-                    symbols_total=len(symbols),
-                    completed_count=(len(symbols) if completed_count is None else completed_count),
+                    symbols_total=(
+                        len(symbols)
+                        if symbols_total is None
+                        else symbols_total
+                    ),
+                    completed_count=(
+                        len(symbols)
+                        if completed_count is None
+                        else completed_count
+                    ),
                     failed_count=failed_count,
                     request_payload=request_payload,
                     summary_payload={
@@ -2664,6 +2726,95 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     completed_at=started_at,
                 )
             )
+
+    def _seed_completed_weekly_policy_cohort(
+        self,
+        *,
+        symbols: list[str],
+        snapshot_received_at_by_key: (
+            dict[tuple[str, str], datetime] | None
+        ) = None,
+    ) -> tuple[str, str, str]:
+        normalized_symbols = sorted(symbols)
+        roles = ['short-term-decider', 'signal-decider']
+        role_symbol_scopes = {
+            role: list(normalized_symbols) for role in roles
+        }
+        weekly_parent = f'weekly-rebind-parent-{uuid4().hex[:8]}'
+        short_child = f'weekly-rebind-short-{uuid4().hex[:8]}'
+        signal_child = f'weekly-rebind-signal-{uuid4().hex[:8]}'
+        scope_authority = {
+            'schema_version': 'agent_feedback_scope_authority_v1',
+            'kind': 'completed_summary_intersection_authoritative_cohort',
+            'source_summary_run_id': 'summary-source-run',
+            'source_feedback_scope_mode': 'broad_feedback_universe',
+            'decision_feedback_scope_mode': 'decider_scope_fast_path',
+            'knowledge_cutoff_at': '2026-04-29T08:30:00+00:00',
+            'fs_div': 'CFS',
+            'completed_symbols': list(normalized_symbols),
+            'admitted_symbol_count': len(normalized_symbols),
+            'admitted_symbols_sha256': hashlib.sha256(
+                '\n'.join(normalized_symbols).encode('utf-8')
+            ).hexdigest(),
+            'decider_role_symbol_scopes': role_symbol_scopes,
+            'policy_binding': {
+                'schema_version': 'weekly_policy_rebind_v1',
+                'artifact_version': f'weekly-policy-{uuid4().hex[:8]}',
+                'content_sha256': 'a' * 64,
+                'source_market_date': self.market_date.isoformat(),
+                'target_trade_date': self.target_trade_date.isoformat(),
+                'policy_context_as_of_date': (
+                    self.target_trade_date.isoformat()
+                ),
+                'idempotency_key': f'weekly-policy-rebind:{uuid4().hex}',
+            },
+        }
+        exact_scope_total = len(normalized_symbols) * len(roles)
+        self._seed_feedback_run(
+            run_id=weekly_parent,
+            symbols=normalized_symbols,
+            roles=roles,
+            role_symbol_scopes=role_symbol_scopes,
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            symbols_total=exact_scope_total,
+            completed_count=exact_scope_total,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+            scope_authority=scope_authority,
+            force_recompute=True,
+        )
+        self._seed_feedback_run(
+            run_id=short_child,
+            symbols=normalized_symbols,
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=weekly_parent,
+        )
+        self._seed_feedback_run(
+            run_id=signal_child,
+            symbols=normalized_symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            parent_run_id=weekly_parent,
+        )
+        received_at_by_key = snapshot_received_at_by_key or {}
+        for symbol in normalized_symbols:
+            self._seed_short_term_snapshot(
+                symbol=symbol,
+                decision_run_id=short_child,
+                feedback_received_at=received_at_by_key.get(
+                    (symbol, 'short-term-decider')
+                ),
+            )
+            self._seed_snapshot(
+                symbol=symbol,
+                decision_run_id=signal_child,
+                feedback_received_at=received_at_by_key.get(
+                    (symbol, 'signal-decider')
+                ),
+            )
+        return weekly_parent, short_child, signal_child
 
     def _seed_short_term_snapshot(
         self,
@@ -2785,6 +2936,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         state='OPEN',
         server_time='2026-04-30T09:01:00+09:00',
         live_market_snapshot_refresher=None,
+        weekly_policy_rebind_coordinator=None,
     ):
         return SignalDeciderNextOpenExecutionService(
             order_service=order_service,
@@ -2798,6 +2950,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 session_close_at='2026-04-30T15:30:00+09:00',
             ),
             live_market_snapshot_refresher=live_market_snapshot_refresher,
+            weekly_policy_rebind_coordinator=(
+                weekly_policy_rebind_coordinator
+            ),
         )
 
     def _mark_row_as_handed_off(self, *, symbol: str = '005930') -> int:
@@ -6092,6 +6247,306 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             {},
         )
         self.assertEqual(broad_scope_state['source_parent_runs'], [])
+
+    def test_partial_weekly_policy_rebind_blocks_its_entire_bound_cohort(
+        self,
+    ) -> None:
+        symbol = '005930'
+        parent_run = f'weekly-rebind-parent-{uuid4().hex[:8]}'
+        short_child_run = f'weekly-rebind-short-{uuid4().hex[:8]}'
+        roles = ['short-term-decider', 'signal-decider']
+        role_symbol_scopes = {role: [symbol] for role in roles}
+        scope_authority = {
+            'schema_version': 'agent_feedback_scope_authority_v1',
+            'kind': 'completed_summary_intersection_authoritative_cohort',
+            'source_summary_run_id': 'summary-source-run',
+            'source_feedback_scope_mode': 'broad_feedback_universe',
+            'decision_feedback_scope_mode': 'decider_scope_fast_path',
+            'knowledge_cutoff_at': '2026-04-29T08:30:00+00:00',
+            'fs_div': 'CFS',
+            'completed_symbols': [symbol],
+            'admitted_symbol_count': 1,
+            'admitted_symbols_sha256': hashlib.sha256(
+                symbol.encode('utf-8')
+            ).hexdigest(),
+            'decider_role_symbol_scopes': role_symbol_scopes,
+            'policy_binding': {
+                'schema_version': 'weekly_policy_rebind_v1',
+                'artifact_version': 'weekly-policy-test',
+                'content_sha256': 'a' * 64,
+                'source_market_date': self.market_date.isoformat(),
+                'target_trade_date': self.target_trade_date.isoformat(),
+                'policy_context_as_of_date': (
+                    self.target_trade_date.isoformat()
+                ),
+                'idempotency_key': f'weekly-policy-rebind:{"b" * 64}',
+            },
+        }
+        self._seed_feedback_run(
+            run_id=parent_run,
+            symbols=[symbol],
+            roles=roles,
+            role_symbol_scopes=role_symbol_scopes,
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            status='partial',
+            symbols_total=2,
+            completed_count=1,
+            failed_count=1,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+            scope_authority=scope_authority,
+            force_recompute=True,
+        )
+        self._seed_feedback_run(
+            run_id=short_child_run,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=parent_run,
+        )
+        self._seed_short_term_snapshot(
+            symbol=symbol,
+            decision_run_id=short_child_run,
+        )
+
+        service = self._service()
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+        )
+        expected_keys = {
+            (symbol, 'short-term-decider'),
+            (symbol, 'signal-decider'),
+        }
+
+        self.assertEqual(
+            scope_state['weekly_policy_rebind_blocked_scope_keys'],
+            expected_keys,
+        )
+        self.assertTrue(
+            all(
+                scope_state['selected_by_key'].get(key) is None
+                for key in expected_keys
+            )
+        )
+        result = self.agent_context_from_state_patcher.temp_original(
+            service,
+            source_market_date=self.market_date,
+            candidate_symbols=[symbol],
+            source_run=scope_state['source_run'],
+            scope_state=scope_state,
+        )
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(
+            result['reason'],
+            'weekly_policy_rebind_cohort_incomplete',
+        )
+        self.assertEqual(result['completed_scope_count'], 0)
+
+    def test_targeted_patch_cannot_escape_partial_weekly_bound_cohort(
+        self,
+    ) -> None:
+        symbols = ['000660', '005930']
+        roles = ['short-term-decider', 'signal-decider']
+        role_symbol_scopes = {role: list(symbols) for role in roles}
+        weekly_parent = f'weekly-rebind-parent-{uuid4().hex[:8]}'
+        weekly_short_child = f'weekly-rebind-short-{uuid4().hex[:8]}'
+        weekly_signal_child = f'weekly-rebind-signal-{uuid4().hex[:8]}'
+        targeted_parent = f'targeted-signal-patch-{uuid4().hex[:8]}'
+        scope_authority = {
+            'schema_version': 'agent_feedback_scope_authority_v1',
+            'kind': 'completed_summary_intersection_authoritative_cohort',
+            'source_summary_run_id': 'summary-source-run',
+            'source_feedback_scope_mode': 'broad_feedback_universe',
+            'decision_feedback_scope_mode': 'decider_scope_fast_path',
+            'knowledge_cutoff_at': '2026-04-29T08:30:00+00:00',
+            'fs_div': 'CFS',
+            'completed_symbols': list(symbols),
+            'admitted_symbol_count': len(symbols),
+            'admitted_symbols_sha256': hashlib.sha256(
+                '\n'.join(sorted(symbols)).encode('utf-8')
+            ).hexdigest(),
+            'decider_role_symbol_scopes': role_symbol_scopes,
+            'policy_binding': {
+                'schema_version': 'weekly_policy_rebind_v1',
+                'artifact_version': 'weekly-policy-test',
+                'content_sha256': 'a' * 64,
+                'source_market_date': self.market_date.isoformat(),
+                'target_trade_date': self.target_trade_date.isoformat(),
+                'policy_context_as_of_date': (
+                    self.target_trade_date.isoformat()
+                ),
+                'idempotency_key': f'weekly-policy-rebind:{"b" * 64}',
+            },
+        }
+        self._seed_feedback_run(
+            run_id=weekly_parent,
+            symbols=symbols,
+            roles=roles,
+            role_symbol_scopes=role_symbol_scopes,
+            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            status='partial',
+            symbols_total=4,
+            completed_count=3,
+            failed_count=1,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+            scope_authority=scope_authority,
+            force_recompute=True,
+        )
+        self._seed_feedback_run(
+            run_id=weekly_short_child,
+            symbols=symbols,
+            roles=['short-term-decider'],
+            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            parent_run_id=weekly_parent,
+        )
+        self._seed_feedback_run(
+            run_id=weekly_signal_child,
+            symbols=['000660'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            parent_run_id=weekly_parent,
+        )
+        for symbol in symbols:
+            self._seed_short_term_snapshot(
+                symbol=symbol,
+                decision_run_id=weekly_short_child,
+            )
+        self._seed_snapshot(
+            symbol='000660',
+            decision_run_id=weekly_signal_child,
+        )
+
+        # A newer ordinary targeted retry successfully fills the one failed
+        # weekly key. It must not turn any part of the failed bound cohort into
+        # actionable authority.
+        self._seed_feedback_run(
+            run_id=targeted_parent,
+            symbols=['005930'],
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 5, 30, tzinfo=timezone.utc),
+            mode='daily_retry_cycle_role_sequenced',
+            scope='requested_symbols_scored_by_strategy_aware_prefilter',
+            force_recompute=True,
+        )
+        self._seed_snapshot(
+            symbol='005930',
+            decision_run_id=targeted_parent,
+        )
+
+        scope_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+        )
+        expected_keys = {
+            (symbol, role)
+            for symbol in symbols
+            for role in roles
+        }
+
+        self.assertEqual(
+            scope_state['source_parent_run_id_by_key'][
+                ('005930', 'signal-decider')
+            ],
+            targeted_parent,
+        )
+        self.assertEqual(
+            scope_state['weekly_policy_rebind_blocked_scope_keys'],
+            expected_keys,
+        )
+        self.assertTrue(
+            all(
+                scope_state['selected_by_key'].get(key) is None
+                for key in expected_keys
+            )
+        )
+
+    def test_later_child_failure_blocks_completed_weekly_bound_cohort(
+        self,
+    ) -> None:
+        symbols = ['000660', '005930']
+        _, _, signal_child = self._seed_completed_weekly_policy_cohort(
+            symbols=symbols,
+        )
+        failed_key = ('005930', 'signal-decider')
+        self.feedback_failure_symbols.append(failed_key[0])
+        with session_scope() as session:
+            session.add(
+                AgentContextFeedbackFailure(
+                    market_date=self.market_date,
+                    symbol=failed_key[0],
+                    agent_name=failed_key[1],
+                    run_id=signal_child,
+                    failure_kind='upstream_changed_during_dispatch',
+                    retryable=True,
+                    summary_payload={},
+                    context_payload={},
+                    received_at=datetime(
+                        2026, 4, 29, 6, 1, tzinfo=timezone.utc
+                    ),
+                )
+            )
+
+        scope_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+        )
+        expected_keys = {
+            (symbol, role)
+            for symbol in symbols
+            for role in ['short-term-decider', 'signal-decider']
+        }
+
+        self.assertIn(failed_key, scope_state['failures_by_key'])
+        self.assertEqual(
+            scope_state['weekly_policy_rebind_blocked_scope_keys'],
+            expected_keys,
+        )
+        self.assertTrue(
+            all(
+                scope_state['selected_by_key'].get(key) is None
+                for key in expected_keys
+            )
+        )
+
+    def test_expired_snapshot_blocks_completed_weekly_bound_cohort(
+        self,
+    ) -> None:
+        symbols = ['000660', '005930']
+        expired_key = ('005930', 'signal-decider')
+        self._seed_completed_weekly_policy_cohort(
+            symbols=symbols,
+            snapshot_received_at_by_key={
+                expired_key: datetime(
+                    2026, 4, 30, 0, 1, tzinfo=timezone.utc
+                ),
+            },
+        )
+
+        scope_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+        )
+        expected_keys = {
+            (symbol, role)
+            for symbol in symbols
+            for role in ['short-term-decider', 'signal-decider']
+        }
+
+        self.assertIn(expired_key, scope_state['expired_snapshot_by_key'])
+        self.assertEqual(
+            scope_state['weekly_policy_rebind_blocked_scope_keys'],
+            expected_keys,
+        )
+        self.assertTrue(
+            all(
+                scope_state['selected_by_key'].get(key) is None
+                for key in expected_keys
+            )
+        )
 
     def test_abandoned_targeted_parent_blocks_only_its_overlay_symbols(self) -> None:
         base_parent = f'base-parent-{uuid4().hex[:8]}'
@@ -10270,6 +10725,146 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             [reason['code'] for reason in item['validation']['blocking_reasons']],
             ['decision_input_generation_changed'],
         )
+
+    def test_next_open_refresh_revalidates_policy_for_target_trade_date(self) -> None:
+        self._seed_short_term_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='target_policy_generation',
+            )
+
+        self.assertTrue(self.snapshot_generation_mock.call_args_list)
+        self.assertTrue(
+            all(
+                call.kwargs['policy_context_as_of_date']
+                == self.target_trade_date
+                for call in self.snapshot_generation_mock.call_args_list
+            )
+        )
+
+    def test_preopen_policy_rebind_regenerates_and_rebinds_latest_snapshot(
+        self,
+    ) -> None:
+        stale_snapshot_id = self._seed_short_term_snapshot(
+            symbol='005930',
+            decision_run_id='short-run-stale-policy',
+        )
+        rebound_snapshot_id: int | None = None
+
+        def coordinate_policy_rebind(*, target_trade_date):
+            nonlocal rebound_snapshot_id
+            self.assertEqual(target_trade_date, self.target_trade_date)
+            rebound_snapshot_id = self._seed_short_term_snapshot(
+                symbol='005930',
+                decision_run_id='short-run-rebound-policy',
+                feedback_received_at=datetime(
+                    2026,
+                    4,
+                    29,
+                    6,
+                    5,
+                    tzinfo=timezone.utc,
+                ),
+            )
+            return {'status': 'completed', 'reason': 'test_rebound'}
+
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+            weekly_policy_rebind_coordinator=coordinate_policy_rebind,
+        )
+        validation_calls = 0
+
+        def policy_generation_validation(*, market_date, snapshots, **_kwargs):
+            nonlocal validation_calls
+            validation_calls += 1
+            snapshot_ids = [int(snapshot.id) for snapshot in snapshots]
+            if validation_calls == 1:
+                self.assertEqual(snapshot_ids, [stale_snapshot_id])
+                return {
+                    'schema_version': (
+                        'persisted_decider_generation_validation_v1'
+                    ),
+                    'market_date': market_date.isoformat(),
+                    'valid_snapshot_ids': [],
+                    'invalid_snapshot_ids': snapshot_ids,
+                    'validations': [
+                        {
+                            'snapshot_id': stale_snapshot_id,
+                            'symbol': '005930',
+                            'agent_name': 'short-term-decider',
+                            'status': 'invalid',
+                            'reason': 'durable_decider_inputs_changed',
+                            'details': {
+                                'reason': (
+                                    'decider_inputs_changed_during_dispatch'
+                                ),
+                                'reasons': [
+                                    {'code': 'policy_context_changed'}
+                                ],
+                            },
+                        }
+                    ],
+                    'generation_fingerprint': 'test-policy-stale',
+                }
+            return {
+                'schema_version': (
+                    'persisted_decider_generation_validation_v1'
+                ),
+                'market_date': market_date.isoformat(),
+                'valid_snapshot_ids': snapshot_ids,
+                'invalid_snapshot_ids': [],
+                'validations': [
+                    {
+                        'snapshot_id': snapshot_id,
+                        'symbol': '005930',
+                        'agent_name': 'short-term-decider',
+                        'status': 'valid',
+                        'reason': 'durable_decider_inputs_unchanged',
+                    }
+                    for snapshot_id in snapshot_ids
+                ],
+                'generation_fingerprint': 'test-policy-rebound',
+            }
+
+        self.snapshot_generation_mock.side_effect = (
+            policy_generation_validation
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_scheduler',
+            )
+
+        self.assertIsNotNone(rebound_snapshot_id)
+        self.assertEqual(
+            refreshed['weekly_policy_rebind']['status'],
+            'completed',
+        )
+        item = next(
+            item
+            for item in refreshed['items']
+            if item['symbol'] == '005930'
+            and item['account_reference'] == self.account_reference
+        )
+        self.assertEqual(item['decision_snapshot_id'], rebound_snapshot_id)
+        self.assertNotEqual(item['decision_snapshot_id'], stale_snapshot_id)
 
     def test_feedback_active_watch_excludes_same_generation_and_blocked_rows(self) -> None:
         self._seed_snapshot(symbol='005930')

@@ -9,6 +9,145 @@ from sqlalchemy.dialects.postgresql import insert
 from app.db import session_scope
 from app.db_models import AgentContextFeedbackRun
 from app.core.settings import settings
+from app.agent_context.eligibility import AGENT_FEEDBACK_SCOPE_REQUESTED
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
+from app.agent_context.run_modes import (
+    DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
+
+
+def resolve_effective_decider_scope_authority_from_runs(
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compose the effective decider scope from base authority plus patches."""
+
+    required_roles = set(DECISION_SUPPORT_AGENT_NAMES)
+
+    def request_payload(run: dict[str, Any]) -> dict[str, Any]:
+        payload = run.get('request_payload')
+        return payload if isinstance(payload, dict) else {}
+
+    def feedback_scope_modes(run: dict[str, Any]) -> set[str]:
+        containers: list[dict[str, Any]] = []
+        payload = request_payload(run)
+        if payload:
+            containers.append(payload)
+        summary = run.get('summary_payload')
+        if isinstance(summary, dict):
+            containers.append(summary)
+            progress = summary.get('progress_summary')
+            if isinstance(progress, dict):
+                containers.append(progress)
+        return {
+            str(container.get('feedback_scope_mode') or '').strip()
+            for container in containers
+            if str(container.get('feedback_scope_mode') or '').strip()
+        }
+
+    def role_symbol_scopes(
+        run: dict[str, Any],
+    ) -> dict[str, list[str]] | None:
+        raw_scopes = request_payload(run).get('role_symbol_scopes')
+        if not isinstance(raw_scopes, dict):
+            return None
+        normalized: dict[str, list[str]] = {}
+        for raw_role, raw_symbols in raw_scopes.items():
+            role = str(raw_role or '').strip().lower()
+            if role not in required_roles:
+                continue
+            if not isinstance(raw_symbols, list):
+                return None
+            symbols = sorted(
+                {
+                    str(symbol or '').strip().upper()
+                    for symbol in raw_symbols
+                    if str(symbol or '').strip()
+                }
+            )
+            if not symbols or len(symbols) != len(raw_symbols):
+                return None
+            normalized[role] = symbols
+        return normalized or None
+
+    parents: list[dict[str, Any]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        payload = request_payload(run)
+        if str(payload.get('mode') or '').strip() != DAILY_RETRY_CYCLE_MODE:
+            continue
+        if FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH not in (
+            feedback_scope_modes(run)
+        ):
+            continue
+        raw_roles = payload.get('roles')
+        if not isinstance(raw_roles, list):
+            continue
+        roles = {
+            str(role or '').strip().lower()
+            for role in raw_roles
+            if str(role or '').strip()
+        }
+        if roles.intersection(required_roles):
+            parents.append(run)
+
+    base_parent: dict[str, Any] | None = None
+    newer_patches: list[dict[str, Any]] = []
+    for index, run in enumerate(parents):
+        payload = request_payload(run)
+        if isinstance(payload.get('scope_authority'), dict):
+            base_parent = run
+            newer_patches = parents[:index]
+            break
+        if str(payload.get('scope') or '').strip() != (
+            AGENT_FEEDBACK_SCOPE_REQUESTED
+        ):
+            return {
+                'ready': False,
+                'reason': 'decider_scope_authority_missing',
+            }
+    if base_parent is None:
+        return {
+            'ready': False,
+            'reason': 'decider_scope_authority_missing',
+        }
+
+    base_scopes = role_symbol_scopes(base_parent)
+    if base_scopes is None or set(base_scopes) != required_roles:
+        return {
+            'ready': False,
+            'reason': 'decider_role_symbol_scopes_invalid',
+        }
+    effective_scopes = {
+        role: set(symbols) for role, symbols in base_scopes.items()
+    }
+    for patch in reversed(newer_patches):
+        payload = request_payload(patch)
+        if str(payload.get('scope') or '').strip() != (
+            AGENT_FEEDBACK_SCOPE_REQUESTED
+        ):
+            return {
+                'ready': False,
+                'reason': 'decider_scope_authority_missing',
+            }
+        patch_scopes = role_symbol_scopes(patch)
+        if patch_scopes is None:
+            return {
+                'ready': False,
+                'reason': 'decider_role_symbol_scopes_invalid',
+            }
+        for role, symbols in patch_scopes.items():
+            effective_scopes.setdefault(role, set()).update(symbols)
+    return {
+        'ready': True,
+        'reason': 'effective_decider_scope_authority',
+        'base_parent': base_parent,
+        'role_symbol_scopes': {
+            role: sorted(effective_scopes.get(role, set()))
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        },
+    }
 
 
 class AgentContextFeedbackRunStateService:
@@ -430,26 +569,13 @@ class AgentContextFeedbackRunStateService:
         request_modes: list[str] | tuple[str, ...] | None = None,
         feedback_scope_mode: str | None = None,
     ) -> dict[str, Any] | None:
-        self._mark_stale_running_rows_abandoned(market_date=market_date)
-        with session_scope() as session:
-            serialized_rows = [
-                self._serialize_run(row)
-                for row in session.execute(
-                select(AgentContextFeedbackRun)
-                .where(AgentContextFeedbackRun.market_date == market_date)
-                .order_by(AgentContextFeedbackRun.started_at.desc(), AgentContextFeedbackRun.id.desc())
-                ).scalars().all()
-            ]
+        serialized_rows = self.list_runs(market_date=market_date)
 
         normalized_symbols = self._normalize_scope(requested_symbols)
         normalized_roles = self._normalize_scope(requested_roles)
         normalized_modes = set(self._normalize_scope(list(request_modes) if request_modes is not None else None))
         normalized_feedback_scope_mode = str(feedback_scope_mode or '').strip()
         for row in serialized_rows:
-            if str(row.get('status') or '').strip().lower() == 'abandoned':
-                continue
-            if self._is_stale_running_row(row):
-                continue
             request_payload = row.get('request_payload') if isinstance(row.get('request_payload'), dict) else {}
             run_symbol_scopes = self._collect_run_symbol_scopes(row)
             run_roles = request_payload.get('roles')
@@ -467,6 +593,30 @@ class AgentContextFeedbackRunStateService:
                     continue
             return row
         return None
+
+    def list_runs(
+        self,
+        *,
+        market_date: date,
+    ) -> list[dict[str, Any]]:
+        """Return current durable runs newest-first for authority composition."""
+
+        self._mark_stale_running_rows_abandoned(market_date=market_date)
+        with session_scope() as session:
+            serialized_rows = [
+                self._serialize_run(row)
+                for row in session.execute(
+                select(AgentContextFeedbackRun)
+                .where(AgentContextFeedbackRun.market_date == market_date)
+                .order_by(AgentContextFeedbackRun.started_at.desc(), AgentContextFeedbackRun.id.desc())
+                ).scalars().all()
+            ]
+        return [
+            row
+            for row in serialized_rows
+            if str(row.get('status') or '').strip().lower() != 'abandoned'
+            and not self._is_stale_running_row(row)
+        ]
 
 
 agent_context_feedback_run_state_service = AgentContextFeedbackRunStateService()

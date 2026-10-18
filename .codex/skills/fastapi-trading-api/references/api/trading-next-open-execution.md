@@ -7,6 +7,18 @@ Inspect or dispatch the persisted next-open plan derived from the latest previou
 
 The daily EOD pipeline refreshes this persisted plan immediately after the decision-support decider stage completes. PREOPEN refresh remains as an idempotent safety net, but operators no longer need to wait until the next morning for buy snapshots to become inspectable execution-plan rows.
 
+When PREOPEN validation finds that a candidate was generated against an older
+weekly-learning policy, Core invokes the no-order weekly-policy rebind
+coordinator before refreshing the plan. The coordinator preserves the exact
+completed source-summary proof and the prior decider role scopes, selects the
+artifact effective for the target trade date, and regenerates only
+`short-term-decider` and `signal-decider`. It works for Friday-to-Monday and
+midweek Wednesday-to-Thursday transitions. If the source and target are not
+adjacent KRX trading sessions, the artifact identity changes, the authoritative
+scope cannot be proved, the current KRX session is open, or the bound run is
+partial, the refresh remains fail-closed and no order or Exec endpoint is
+called.
+
 For dispatch-mode buy candidates, core sends sizing context as a candidate contract (`quantity_policy.type='exec_agent_sized'`) so exec can make the final share decision using account/feedback/context rails, budgets, reference/entry context, confidence, and target/stop metadata. An enforced short-term `downsize_probe` remains exec-agent-sized at the v4 boundary: core sends the deterministic probe only as `max_quantity`, a hard ceiling that Exec may reduce further or reject after its final full-cost and account-aware checks. Core-local disabled mode may retain a compatibility planned quantity for display, but it never turns that value into current buy authority.
 
 Short-term validation now preserves the decider request's `pre_decider_enrichment_context` in both `validation.pre_decider_enrichment_context` and `validation.short_term.pre_decider_enrichment_context`. Operators can inspect the quote/orderbook snapshot status, raw-vs-estimated trading value provenance, investor/short-selling flow, and sector-peer context that were available before dispatch validation.

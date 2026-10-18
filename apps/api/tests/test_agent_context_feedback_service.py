@@ -1,11 +1,23 @@
 from datetime import date
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
+
+from sqlalchemy import func, select
 
 from app.agent_context.feedback_service import (
+    AgentContextFeedbackRepository,
     AgentContextFeedbackService,
     _dedupe_feedback_items_for_upsert,
     _feedback_write_session_scope,
+)
+from app.agent_context.signal_decider_loop_service import (
+    signal_decider_loop_service,
+)
+from app.db import session_scope
+from app.db_models import (
+    AgentContextFeedback,
+    SignalDeciderDecisionSnapshot,
 )
 
 
@@ -387,6 +399,103 @@ class AgentContextFeedbackServiceTests(unittest.TestCase):
         self.assertTrue(result['accepted'])
         self.assertEqual(result['count'], 2)
         self.assertEqual([item['symbol'] for item in result['items']], ['005930', '000660'])
+
+    def test_bulk_submit_feedback_rolls_back_feedback_and_snapshot_when_commit_guard_fails(
+        self,
+    ):
+        market_date = date(2099, 1, 7)
+        symbol = uuid4().hex[:12].upper()
+        service = AgentContextFeedbackService(
+            repository=AgentContextFeedbackRepository(),
+            decision_loop_service=FakeSignalDeciderLoopService(),
+        )
+        observed_stages = []
+
+        def prepare_snapshot(**kwargs):
+            return {
+                'feedback_id': kwargs['feedback_id'],
+                'market_date': kwargs['market_date'],
+                'symbol': kwargs['symbol'],
+                'agent_name': kwargs['agent_name'],
+                'agent_version': kwargs['agent_version'],
+                'decision_run_id': kwargs['run_id'],
+                'feedback_received_at': kwargs['received_at'],
+                'policy_version': 'test-policy-v1',
+                'decision_action': 'wait',
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'entry_price_basis': 'next_open',
+                'target_price': None,
+                'expected_return_pct': None,
+                'stop_loss_price': None,
+                'suggested_holding_period': None,
+                'confidence_score_10': None,
+                'conviction_score_10': None,
+                'thesis_summary': 'Commit guard rollback test.',
+                'supporting_evidence_payload': [],
+                'decision_risks_payload': [],
+                'invalidation_conditions_payload': [],
+                'data_quality_warnings_payload': [],
+                'specialist_disagreement_payload': [],
+                'traceability_payload': {},
+                'input_feature_snapshot_payload': {},
+                'request_payload': {},
+                'response_payload': {},
+                'response_summary_payload': {},
+            }
+
+        def reject_commit(**kwargs):
+            observed_stages.append(kwargs['stage'])
+            raise RuntimeError('target session opened before commit')
+
+        with (
+            patch.object(
+                signal_decider_loop_service,
+                'prepare_snapshot_persistence_item',
+                side_effect=prepare_snapshot,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                'target session opened before commit',
+            ),
+        ):
+            service.bulk_submit_feedback(
+                items=[
+                    {
+                        'market_date': market_date,
+                        'symbol': symbol,
+                        'agent_name': 'signal-decider',
+                        'run_id': f'weekly-rebind-{uuid4().hex}',
+                        'feedback': {
+                            'preferred_action': 'wait',
+                            'next_day_open_action': 'wait',
+                        },
+                    }
+                ],
+                before_commit_guard=reject_commit,
+            )
+
+        with session_scope() as session:
+            feedback_count = session.execute(
+                select(func.count())
+                .select_from(AgentContextFeedback)
+                .where(
+                    AgentContextFeedback.market_date == market_date,
+                    AgentContextFeedback.symbol == symbol,
+                )
+            ).scalar_one()
+            snapshot_count = session.execute(
+                select(func.count())
+                .select_from(SignalDeciderDecisionSnapshot)
+                .where(
+                    SignalDeciderDecisionSnapshot.market_date == market_date,
+                    SignalDeciderDecisionSnapshot.symbol == symbol,
+                )
+            ).scalar_one()
+
+        self.assertEqual(observed_stages, ['before_feedback_transaction_commit'])
+        self.assertEqual(feedback_count, 0)
+        self.assertEqual(snapshot_count, 0)
 
     def test_list_feedback_normalizes_filters(self):
         repository = FakeFeedbackRepository()

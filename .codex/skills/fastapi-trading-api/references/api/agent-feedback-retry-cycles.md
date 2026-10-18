@@ -38,6 +38,18 @@ case-insensitively, and defaults to the configured
 selected statement slice is preserved across prerequisite checks, reuse,
 prior-cycle resume, active-run admission, and role dispatch.
 
+A request whose `scope_authority.policy_binding.schema_version` is
+`weekly_policy_rebind_v1` is a stricter, server-bound subtype. Core re-derives
+the source summary run, completed-symbol proof, knowledge cutoff, previous
+decider role scopes, adjacent KRX target session, and target-date-effective
+weekly artifact from persisted state. It rejects caller-edited or widened
+authority even when the caller recomputes the idempotency hash. These requests
+must use `force=false`, `force_recompute=true`, `reuse_existing=true`,
+`max_cycles=3`, and `outer_batch_size=20`, and may run only while the current
+KRX session is not open. The same guard is checked again inside the
+feedback/snapshot transaction before commit. A partial or failed bound parent
+never supplies a replacement subset to the next-open selector.
+
 ## Example request
 ```http
 POST /agent-context/feedback/retry-cycles

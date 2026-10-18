@@ -5,7 +5,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import json
 import logging
+import re
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -48,6 +50,9 @@ from app.agent_context.roles import (
     DEFAULT_AGENT_NAMES,
     SUMMARIZER_AGENT_NAMES,
 )
+from app.agent_context.signal_decider_weekly_learning_service import (
+    signal_decider_weekly_learning_service,
+)
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
@@ -55,7 +60,10 @@ from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
     normalize_feedback_scope_mode,
 )
-from app.agent_context.run_state_service import agent_context_feedback_run_state_service
+from app.agent_context.run_state_service import (
+    agent_context_feedback_run_state_service,
+    resolve_effective_decider_scope_authority_from_runs,
+)
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.core.settings import settings
 from app.db import session_scope
@@ -67,11 +75,17 @@ from app.db_models import (
 from app.eod.summary_cutoff_contract import (
     COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION,
 )
+from app.market.session import (
+    latest_krx_trading_date,
+    next_krx_trading_date,
+)
+from app.market.clock import get_market_state
 
 EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
 CHILD_RUN_LINEAGE_SCHEMA_VERSION = 'agent_feedback_child_run_lineage_v1'
 REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION = 'agent_feedback_reuse_evidence_v1'
 _LEASE_LOSS_REUSABLE_PARENT_STATUS = 'abandoned_lease_loss_reusable'
+WEEKLY_POLICY_REBIND_SCHEMA_VERSION = 'weekly_policy_rebind_v1'
 logger = logging.getLogger(__name__)
 
 
@@ -233,6 +247,116 @@ def _normalize_feedback_fs_div(value: str | None) -> str:
     return normalized
 
 
+def _normalize_policy_context_as_of_date(
+    value: date | datetime | str | None,
+    *,
+    market_date: date,
+) -> date:
+    if value is None:
+        resolved = market_date
+    elif isinstance(value, datetime):
+        resolved = value.date()
+    elif isinstance(value, date):
+        resolved = value
+    else:
+        resolved = date.fromisoformat(str(value).strip())
+    if resolved < market_date:
+        raise ValueError(
+            'policy_context_as_of_date must be on or after market_date'
+        )
+    return resolved
+
+
+def build_weekly_policy_rebind_idempotency_key(
+    *,
+    artifact_version: str,
+    content_sha256: str,
+    source_summary_run_id: str,
+    source_market_date: date,
+    target_trade_date: date,
+    policy_context_as_of_date: date,
+    knowledge_cutoff_at: datetime | str,
+    symbols: Sequence[str],
+    roles: Sequence[str],
+    role_symbol_scopes: Mapping[str, Sequence[str]],
+    fs_div: str,
+) -> str:
+    """Bind one weekly-policy rebind to its immutable source authority."""
+
+    material = {
+        'schema_version': WEEKLY_POLICY_REBIND_SCHEMA_VERSION,
+        'artifact_version': str(artifact_version or '').strip(),
+        'content_sha256': str(content_sha256 or '').strip().lower(),
+        'source_summary_run_id': str(source_summary_run_id or '').strip(),
+        'source_market_date': source_market_date.isoformat(),
+        'target_trade_date': target_trade_date.isoformat(),
+        'policy_context_as_of_date': (
+            policy_context_as_of_date.isoformat()
+        ),
+        'knowledge_cutoff_at': _normalize_admission_knowledge_cutoff(
+            knowledge_cutoff_at
+        ),
+        'symbols': sorted(_normalize_optional_symbol_scope(symbols)),
+        'roles': sorted(
+            {
+                str(role or '').strip().lower()
+                for role in roles
+                if str(role or '').strip()
+            }
+        ),
+        'role_symbol_scopes': {
+            str(role or '').strip().lower(): sorted(
+                _normalize_optional_symbol_scope(role_symbols)
+            )
+            for role, role_symbols in sorted(role_symbol_scopes.items())
+        },
+        'fs_div': _normalize_feedback_fs_div(fs_div),
+    }
+    if not all(
+        material[key]
+        for key in (
+            'artifact_version',
+            'content_sha256',
+            'source_summary_run_id',
+            'knowledge_cutoff_at',
+            'symbols',
+            'roles',
+            'role_symbol_scopes',
+        )
+    ):
+        raise ValueError('weekly policy rebind identity is incomplete')
+    digest = hashlib.sha256(
+        json.dumps(
+            material,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+    return f'weekly-policy-rebind:{digest}'
+
+
+def _previous_run_matches_policy_context_as_of_date(
+    previous_run: dict[str, Any] | None,
+    *,
+    market_date: date,
+    policy_context_as_of_date: date,
+) -> bool:
+    if not isinstance(previous_run, dict):
+        return False
+    request_payload = previous_run.get('request_payload')
+    if not isinstance(request_payload, dict):
+        return False
+    try:
+        prior = _normalize_policy_context_as_of_date(
+            request_payload.get('policy_context_as_of_date'),
+            market_date=market_date,
+        )
+    except (TypeError, ValueError):
+        return False
+    return prior == policy_context_as_of_date
+
+
 def _previous_run_matches_fs_div(
     previous_run: dict[str, Any] | None,
     effective_fs_div: str,
@@ -251,11 +375,58 @@ def _previous_run_matches_fs_div(
         return False
 
 
-def _normalize_feedback_scope_authority(
-    value: Mapping[str, Any] | None,
+def _normalize_role_symbol_scopes(
+    value: Mapping[str, Sequence[str]] | None,
     *,
     roles: Sequence[str],
     requested_symbols: Sequence[str] | None,
+) -> dict[str, list[str]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError('role_symbol_scopes must be a mapping')
+    normalized_roles = [
+        str(role or '').strip().lower()
+        for role in roles
+        if str(role or '').strip()
+    ]
+    if set(value) != set(normalized_roles):
+        raise ValueError('role_symbol_scopes must match requested roles')
+    requested_set = (
+        set(_normalize_optional_symbol_scope(requested_symbols))
+        if requested_symbols is not None
+        else None
+    )
+    normalized: dict[str, list[str]] = {}
+    for role in normalized_roles:
+        raw_symbols = value.get(role)
+        if isinstance(raw_symbols, (str, bytes)) or not isinstance(
+            raw_symbols, Sequence
+        ):
+            raise ValueError('role_symbol_scopes entries must be symbol lists')
+        role_symbols = _normalize_optional_symbol_scope(raw_symbols)
+        if not role_symbols or len(role_symbols) != len(raw_symbols):
+            raise ValueError(
+                'role_symbol_scopes entries must be non-empty and unique'
+            )
+        if requested_set is not None and not set(role_symbols).issubset(
+            requested_set
+        ):
+            raise ValueError(
+                'role_symbol_scopes must stay within requested symbols'
+            )
+        normalized[role] = role_symbols
+    return normalized
+
+
+def _normalize_feedback_scope_authority(
+    value: Mapping[str, Any] | None,
+    *,
+    market_date: date,
+    policy_context_as_of_date: date,
+    roles: Sequence[str],
+    requested_symbols: Sequence[str] | None,
+    role_symbol_scopes: Mapping[str, Sequence[str]] | None,
     feedback_scope_mode: str,
     knowledge_cutoff_at: datetime | str,
     fs_div: str,
@@ -287,6 +458,11 @@ def _normalize_feedback_scope_authority(
         )
     normalized_requested = sorted(
         _normalize_optional_symbol_scope(requested_symbols)
+    )
+    normalized_role_symbol_scopes = _normalize_role_symbol_scopes(
+        role_symbol_scopes,
+        roles=roles,
+        requested_symbols=normalized_requested,
     )
     if not normalized_requested or len(normalized_requested) != len(
         requested_symbols
@@ -378,7 +554,7 @@ def _normalize_feedback_scope_authority(
         raise ValueError(
             'summary-intersection scope authority proof is outside admission'
         )
-    return {
+    normalized_authority = {
         'schema_version': FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
         'kind': FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
         'source_summary_run_id': source_summary_run_id,
@@ -386,12 +562,150 @@ def _normalize_feedback_scope_authority(
         'decision_feedback_scope_mode': normalized_scope_mode,
         'knowledge_cutoff_at': normalized_cutoff,
         'fs_div': normalized_fs_div,
+        'completed_scope_proof': {
+            'schema_version': (
+                COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+            ),
+            'completed_symbols': list(normalized_completed),
+            'admitted_symbols': list(normalized_admitted),
+        },
         'completed_symbols': normalized_completed,
         'admitted_symbol_count': len(normalized_admitted),
         'admitted_symbols_sha256': hashlib.sha256(
             '\n'.join(normalized_admitted).encode('utf-8')
         ).hexdigest(),
     }
+    raw_policy_binding = value.get('policy_binding')
+    if raw_policy_binding is None:
+        return normalized_authority
+    if not isinstance(raw_policy_binding, Mapping) or str(
+        raw_policy_binding.get('schema_version') or ''
+    ).strip() != WEEKLY_POLICY_REBIND_SCHEMA_VERSION:
+        raise ValueError('weekly policy rebind binding is invalid')
+    try:
+        source_market_date = date.fromisoformat(
+            str(raw_policy_binding.get('source_market_date') or '')
+        )
+        target_trade_date = date.fromisoformat(
+            str(raw_policy_binding.get('target_trade_date') or '')
+        )
+        binding_policy_date = date.fromisoformat(
+            str(
+                raw_policy_binding.get('policy_context_as_of_date') or ''
+            )
+        )
+    except ValueError as exc:
+        raise ValueError('weekly policy rebind dates are invalid') from exc
+    if not (
+        source_market_date == market_date
+        and target_trade_date == policy_context_as_of_date
+        and binding_policy_date == policy_context_as_of_date
+    ):
+        raise ValueError('weekly policy rebind dates do not match request')
+    if next_krx_trading_date(source_market_date) != target_trade_date:
+        raise ValueError(
+            'weekly policy rebind target must be the next KRX trading day'
+        )
+    artifact_version = str(
+        raw_policy_binding.get('artifact_version') or ''
+    ).strip()
+    content_sha256 = str(
+        raw_policy_binding.get('content_sha256') or ''
+    ).strip().lower()
+    if not artifact_version or not re.fullmatch(r'[0-9a-f]{64}', content_sha256):
+        raise ValueError('weekly policy rebind artifact identity is invalid')
+    binding_idempotency_key = str(
+        raw_policy_binding.get('idempotency_key') or ''
+    ).strip()
+    expected_idempotency_key = build_weekly_policy_rebind_idempotency_key(
+        artifact_version=artifact_version,
+        content_sha256=content_sha256,
+        source_summary_run_id=source_summary_run_id,
+        source_market_date=source_market_date,
+        target_trade_date=target_trade_date,
+        policy_context_as_of_date=binding_policy_date,
+        knowledge_cutoff_at=normalized_cutoff,
+        symbols=normalized_requested,
+        roles=roles,
+        role_symbol_scopes=normalized_role_symbol_scopes or {},
+        fs_div=normalized_fs_div,
+    )
+    if binding_idempotency_key != expected_idempotency_key:
+        raise ValueError('weekly policy rebind idempotency binding mismatched')
+    latest_policy = signal_decider_weekly_learning_service.get_latest_published(
+        as_of_date=policy_context_as_of_date
+    )
+    latest_artifact = (
+        latest_policy.get('artifact')
+        if isinstance(latest_policy, Mapping)
+        and latest_policy.get('available') is True
+        and isinstance(latest_policy.get('artifact'), Mapping)
+        else None
+    )
+    try:
+        artifact_week_start = date.fromisoformat(
+            str((latest_artifact or {}).get('week_start'))
+        )
+        artifact_week_end = date.fromisoformat(
+            str((latest_artifact or {}).get('week_end'))
+        )
+    except (TypeError, ValueError):
+        artifact_week_start = None
+        artifact_week_end = None
+    artifact_source_compatible = bool(
+        artifact_week_start is not None
+        and artifact_week_end is not None
+        and (
+            artifact_week_end <= source_market_date
+            or (
+                artifact_week_start
+                <= source_market_date
+                <= artifact_week_end
+                and latest_krx_trading_date(artifact_week_end)
+                == source_market_date
+            )
+        )
+    )
+    if not (
+        isinstance(latest_artifact, Mapping)
+        and latest_artifact.get('artifact_version') == artifact_version
+        and str(latest_artifact.get('content_sha256') or '').lower()
+        == content_sha256
+        and artifact_source_compatible
+    ):
+        raise ValueError(
+            'weekly policy rebind artifact is not authoritative for target date'
+        )
+    normalized_authority['policy_binding'] = {
+        'schema_version': WEEKLY_POLICY_REBIND_SCHEMA_VERSION,
+        'artifact_version': artifact_version,
+        'content_sha256': content_sha256,
+        'source_market_date': source_market_date.isoformat(),
+        'target_trade_date': target_trade_date.isoformat(),
+        'policy_context_as_of_date': binding_policy_date.isoformat(),
+        'idempotency_key': binding_idempotency_key,
+    }
+    persisted_role_symbol_scopes = value.get('decider_role_symbol_scopes')
+    if normalized_role_symbol_scopes is None or (
+        persisted_role_symbol_scopes != normalized_role_symbol_scopes
+    ):
+        raise ValueError(
+            'weekly policy rebind role_symbol_scopes binding mismatched'
+        )
+    normalized_authority['decider_role_symbol_scopes'] = {
+        role: list(symbols)
+        for role, symbols in normalized_role_symbol_scopes.items()
+    }
+    _validate_weekly_policy_rebind_authority_against_persisted_state(
+        market_date=market_date,
+        roles=roles,
+        requested_symbols=normalized_requested,
+        role_symbol_scopes=normalized_role_symbol_scopes,
+        knowledge_cutoff_at=normalized_cutoff,
+        fs_div=normalized_fs_div,
+        normalized_authority=normalized_authority,
+    )
+    return normalized_authority
 
 
 def _previous_run_matches_scope_authority(
@@ -866,6 +1180,118 @@ def resolve_latest_completed_summary_knowledge_cutoff(
     }
 
 
+def _validate_weekly_policy_rebind_authority_against_persisted_state(
+    *,
+    market_date: date,
+    roles: Sequence[str],
+    requested_symbols: Sequence[str],
+    role_symbol_scopes: Mapping[str, Sequence[str]],
+    knowledge_cutoff_at: datetime | str,
+    fs_div: str,
+    normalized_authority: Mapping[str, Any],
+) -> None:
+    persisted_scope = resolve_effective_decider_scope_authority_from_runs(
+        agent_context_feedback_run_state_service.list_runs(
+            market_date=market_date,
+        )
+    )
+    persisted_parent = persisted_scope.get('base_parent')
+    parent_request = (
+        persisted_parent.get('request_payload')
+        if isinstance(persisted_parent, Mapping)
+        and isinstance(persisted_parent.get('request_payload'), Mapping)
+        else None
+    )
+    parent_authority = (
+        parent_request.get('scope_authority')
+        if isinstance(parent_request, Mapping)
+        and isinstance(parent_request.get('scope_authority'), Mapping)
+        else None
+    )
+    if (
+        persisted_scope.get('ready') is not True
+        or parent_request is None
+        or parent_authority is None
+    ):
+        raise ValueError(
+            'weekly policy rebind authoritative decider parent is unavailable'
+        )
+    source_summary_run_id = str(
+        normalized_authority.get('source_summary_run_id') or ''
+    ).strip()
+    source_feedback_scope_mode = str(
+        normalized_authority.get('source_feedback_scope_mode') or ''
+    ).strip()
+    if not (
+        source_summary_run_id
+        and source_summary_run_id
+        == str(parent_authority.get('source_summary_run_id') or '').strip()
+        and source_feedback_scope_mode
+        == str(
+            parent_authority.get('source_feedback_scope_mode') or ''
+        ).strip()
+        and _normalize_admission_knowledge_cutoff(
+            parent_authority.get('knowledge_cutoff_at')
+        )
+        == _normalize_admission_knowledge_cutoff(knowledge_cutoff_at)
+        and _normalize_feedback_fs_div(parent_authority.get('fs_div'))
+        == _normalize_feedback_fs_div(fs_div)
+    ):
+        raise ValueError(
+            'weekly policy rebind source authority does not match persisted '
+            'decider lineage'
+        )
+    persisted_role_symbol_scopes = _normalize_role_symbol_scopes(
+        persisted_scope.get('role_symbol_scopes'),
+        roles=roles,
+        requested_symbols=requested_symbols,
+    )
+    normalized_role_symbol_scopes = _normalize_role_symbol_scopes(
+        role_symbol_scopes,
+        roles=roles,
+        requested_symbols=requested_symbols,
+    )
+    if persisted_role_symbol_scopes != normalized_role_symbol_scopes:
+        raise ValueError(
+            'weekly policy rebind role scopes do not match persisted decider '
+            'lineage'
+        )
+    exact_summary = resolve_latest_completed_summary_knowledge_cutoff(
+        market_date=market_date,
+        feedback_scope_mode=source_feedback_scope_mode,
+        fs_div=fs_div,
+        source_run_id=source_summary_run_id,
+    )
+    if exact_summary.get('ready') is not True:
+        raise ValueError(
+            'weekly policy rebind source summary is not authoritative: '
+            f"{exact_summary.get('reason') or 'unknown'}"
+        )
+    exact_symbols = sorted(
+        _normalize_optional_symbol_scope(
+            exact_summary.get('requested_symbols') or []
+        )
+    )
+    exact_cutoff = _normalize_admission_knowledge_cutoff(
+        exact_summary.get('knowledge_cutoff_at')
+    )
+    exact_proof = exact_summary.get('completed_scope_proof')
+    expected_proof = normalized_authority.get('completed_scope_proof')
+    if not (
+        exact_symbols == sorted(_normalize_optional_symbol_scope(
+            requested_symbols
+        ))
+        and exact_cutoff
+        == _normalize_admission_knowledge_cutoff(knowledge_cutoff_at)
+        and isinstance(exact_proof, Mapping)
+        and dict(exact_proof) == dict(expected_proof or {})
+    ):
+        raise ValueError(
+            'weekly policy rebind summary proof does not match persisted '
+            'authority'
+        )
+
+
 def _normalized_admission_scope(
     *,
     roles: Sequence[str],
@@ -979,6 +1405,142 @@ def _serialize_feedback_retry_run(row: AgentContextFeedbackRun) -> dict[str, Any
     }
 
 
+def find_feedback_retry_run_by_idempotency_key(
+    *,
+    market_date: date,
+    idempotency_key: str,
+) -> dict[str, Any] | None:
+    normalized_key = str(idempotency_key or '').strip()
+    if not normalized_key:
+        raise ValueError('idempotency_key must be non-empty')
+    with session_scope() as session:
+        rows = session.execute(
+            select(AgentContextFeedbackRun)
+            .where(AgentContextFeedbackRun.market_date == market_date)
+            .order_by(
+                AgentContextFeedbackRun.started_at.desc(),
+                AgentContextFeedbackRun.id.desc(),
+            )
+        ).scalars().all()
+        for row in rows:
+            payload = (
+                row.request_payload
+                if isinstance(row.request_payload, dict)
+                else {}
+            )
+            if str(payload.get('idempotency_key') or '').strip() == normalized_key:
+                return _serialize_feedback_retry_run(row)
+    return None
+
+
+def feedback_retry_run_is_complete_for_weekly_policy_rebind(
+    run: Mapping[str, Any] | None,
+    *,
+    idempotency_key: str,
+    role_symbol_scopes: Mapping[str, Sequence[str]],
+) -> bool:
+    if not isinstance(run, Mapping):
+        return False
+    payload = run.get('request_payload')
+    if not isinstance(payload, Mapping):
+        return False
+    authority = payload.get('scope_authority')
+    policy_binding = (
+        authority.get('policy_binding')
+        if isinstance(authority, Mapping)
+        else None
+    )
+    if not (
+        isinstance(policy_binding, Mapping)
+        and str(policy_binding.get('schema_version') or '').strip()
+        == WEEKLY_POLICY_REBIND_SCHEMA_VERSION
+        and str(payload.get('idempotency_key') or '').strip()
+        == str(idempotency_key or '').strip()
+        and str(policy_binding.get('idempotency_key') or '').strip()
+        == str(idempotency_key or '').strip()
+    ):
+        return False
+    try:
+        normalized_roles = tuple(
+            str(role or '').strip().lower()
+            for role in payload.get('roles') or []
+            if str(role or '').strip()
+        )
+        expected_scopes = _normalize_role_symbol_scopes(
+            role_symbol_scopes,
+            roles=normalized_roles,
+            requested_symbols=payload.get('requested_symbols'),
+        )
+        persisted_scopes = _normalize_role_symbol_scopes(
+            payload.get('role_symbol_scopes'),
+            roles=normalized_roles,
+            requested_symbols=payload.get('requested_symbols'),
+        )
+        symbols_total = int(run.get('symbols_total') or 0)
+        completed_count = int(run.get('completed_count') or 0)
+        failed_count = int(run.get('failed_count') or 0)
+    except (TypeError, ValueError):
+        return False
+    exact_scope_total = sum(
+        len(symbols) for symbols in (expected_scopes or {}).values()
+    )
+    return bool(
+        set(normalized_roles) == set(DECISION_SUPPORT_AGENT_NAMES)
+        and expected_scopes is not None
+        and persisted_scopes == expected_scopes
+        and exact_scope_total > 0
+        and str(run.get('status') or '').strip().lower() == 'completed'
+        and run.get('completed_at') is not None
+        and failed_count == 0
+        and symbols_total == exact_scope_total
+        and completed_count == exact_scope_total
+    )
+
+
+def _assert_weekly_policy_target_session_not_open(
+    *,
+    policy_binding: Mapping[str, Any],
+    stage: str,
+    market_state_provider: Callable[[], Any] | None = None,
+    **_: Any,
+) -> None:
+    try:
+        target_trade_date = date.fromisoformat(
+            str(policy_binding.get('target_trade_date') or '')
+        )
+    except ValueError as exc:
+        raise ValueError(
+            'weekly policy rebind target_trade_date is invalid'
+        ) from exc
+    market_state = (market_state_provider or get_market_state)()
+    try:
+        current_calendar_date = date.fromisoformat(
+            str(getattr(market_state, 'current_calendar_date', '') or '')
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            'weekly policy rebind current KRX date is unavailable'
+        ) from exc
+    state = str(getattr(market_state, 'state', '') or '').strip().upper()
+    is_open = bool(getattr(market_state, 'is_open', False))
+    target_is_safe = bool(
+        not is_open
+        and state != 'OPEN'
+        and (
+            current_calendar_date < target_trade_date
+            or (
+                current_calendar_date == target_trade_date
+                and state == 'PREOPEN'
+            )
+        )
+    )
+    if not target_is_safe:
+        raise RuntimeError(
+            'weekly policy rebind target session is not safely before open: '
+            f'stage={stage}'
+        )
+
+
 def _claim_feedback_retry_run(
     *,
     market_date: date,
@@ -988,6 +1550,9 @@ def _claim_feedback_retry_run(
     run_id: str,
     started_at: datetime,
     admission_knowledge_cutoff_at: datetime | str | None = None,
+    policy_context_as_of_date: date | str | None = None,
+    idempotency_key: str | None = None,
+    role_symbol_scopes: Mapping[str, Sequence[str]] | None = None,
     fs_div: str | None = None,
     scope_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1015,6 +1580,18 @@ def _claim_feedback_retry_run(
             admission_knowledge_cutoff_at
         )
     )
+    normalized_policy_context_as_of_date = (
+        _normalize_policy_context_as_of_date(
+            policy_context_as_of_date,
+            market_date=market_date,
+        )
+    )
+    normalized_idempotency_key = str(idempotency_key or '').strip() or None
+    normalized_role_symbol_scopes = _normalize_role_symbol_scopes(
+        role_symbol_scopes,
+        roles=normalized_roles,
+        requested_symbols=normalized_symbols,
+    )
     normalized_fs_div = _normalize_feedback_fs_div(fs_div)
     requested_scope = _normalized_admission_scope(
         roles=normalized_roles,
@@ -1027,6 +1604,61 @@ def _claim_feedback_retry_run(
         roles=normalized_roles,
         symbols=normalized_symbols,
     )
+
+    def exact_admission_binding(payload: Mapping[str, Any]) -> bool:
+        active_scope = _admission_scope_from_payload(payload)
+        try:
+            active_feedback_scope_mode = normalize_feedback_scope_mode(
+                payload.get('feedback_scope_mode')
+            )
+            raw_active_cutoff = (
+                payload.get('admission_knowledge_cutoff_at')
+                if 'admission_knowledge_cutoff_at' in payload
+                else payload.get('requested_knowledge_cutoff_at')
+                if 'requested_knowledge_cutoff_at' in payload
+                else payload.get('knowledge_cutoff_at')
+            )
+            active_knowledge_cutoff_at = (
+                _normalize_admission_knowledge_cutoff(raw_active_cutoff)
+            )
+            active_policy_context_as_of_date = (
+                _normalize_policy_context_as_of_date(
+                    payload.get('policy_context_as_of_date'),
+                    market_date=market_date,
+                )
+            )
+            raw_active_fs_div = payload.get('fs_div')
+            active_fs_div = (
+                _normalize_feedback_fs_div(raw_active_fs_div)
+                if raw_active_fs_div is not None
+                else '__missing_active_fs_div__'
+            )
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            requested_scope == active_scope
+            and normalized_feedback_scope_mode
+            == active_feedback_scope_mode
+            and normalized_admission_knowledge_cutoff_at
+            == active_knowledge_cutoff_at
+            and normalized_policy_context_as_of_date
+            == active_policy_context_as_of_date
+            and (
+                str(payload.get('idempotency_key') or '').strip()
+                or None
+            )
+            == normalized_idempotency_key
+            and payload.get('role_symbol_scopes')
+            == normalized_role_symbol_scopes
+            and normalized_fs_div == active_fs_div
+            and payload.get('scope_authority')
+            == (
+                dict(scope_authority)
+                if scope_authority is not None
+                else None
+            )
+        )
+
     with session_scope() as session:
         bind = session.get_bind()
         if bind is not None and bind.dialect.name == 'postgresql':
@@ -1035,17 +1667,44 @@ def _claim_feedback_retry_run(
                 {'lock_key': lock_key},
             )
 
-        running_rows = session.execute(
+        existing_rows = session.execute(
             select(AgentContextFeedbackRun)
             .where(
                 AgentContextFeedbackRun.market_date == market_date,
-                AgentContextFeedbackRun.status == 'running',
             )
             .order_by(
-                AgentContextFeedbackRun.started_at.asc(),
-                AgentContextFeedbackRun.id.asc(),
+                AgentContextFeedbackRun.started_at.desc(),
+                AgentContextFeedbackRun.id.desc(),
             )
         ).scalars().all()
+        if normalized_idempotency_key is not None:
+            for row in existing_rows:
+                payload = (
+                    dict(row.request_payload)
+                    if isinstance(row.request_payload, dict)
+                    else {}
+                )
+                if str(payload.get('idempotency_key') or '').strip() != (
+                    normalized_idempotency_key
+                ):
+                    continue
+                snapshot = _serialize_feedback_retry_run(row)
+                if _feedback_retry_run_is_stale(snapshot):
+                    break
+                return {
+                    'acquired': False,
+                    'run_id': None,
+                    'owner_token': None,
+                    'conflict_run': snapshot,
+                    'exact_scope': exact_admission_binding(payload),
+                    'idempotency_match': True,
+                }
+
+        running_rows = [
+            row
+            for row in reversed(existing_rows)
+            if str(row.status or '').strip().lower() == 'running'
+        ]
         for row in running_rows:
             payload = (
                 dict(row.request_payload)
@@ -1093,52 +1752,18 @@ def _claim_feedback_retry_run(
             active_scope = _admission_scope_from_payload(payload)
             if not _admission_scopes_overlap(requested_scope, active_scope):
                 continue
-            try:
-                active_feedback_scope_mode = normalize_feedback_scope_mode(
-                    payload.get('feedback_scope_mode')
-                )
-            except ValueError:
-                active_feedback_scope_mode = '__invalid_active_scope_mode__'
-            raw_active_cutoff = (
-                payload.get('admission_knowledge_cutoff_at')
-                if 'admission_knowledge_cutoff_at' in payload
-                else payload.get('requested_knowledge_cutoff_at')
-                if 'requested_knowledge_cutoff_at' in payload
-                else payload.get('knowledge_cutoff_at')
-            )
-            try:
-                active_knowledge_cutoff_at = (
-                    _normalize_admission_knowledge_cutoff(raw_active_cutoff)
-                )
-            except (TypeError, ValueError):
-                active_knowledge_cutoff_at = '__invalid_active_cutoff__'
-            raw_active_fs_div = payload.get('fs_div')
-            try:
-                active_fs_div = (
-                    _normalize_feedback_fs_div(raw_active_fs_div)
-                    if raw_active_fs_div is not None
-                    else '__missing_active_fs_div__'
-                )
-            except ValueError:
-                active_fs_div = '__invalid_active_fs_div__'
             return {
                 'acquired': False,
                 'run_id': None,
                 'owner_token': None,
                 'conflict_run': snapshot,
-                'exact_scope': bool(
-                    requested_scope == active_scope
-                    and normalized_feedback_scope_mode
-                    == active_feedback_scope_mode
-                    and normalized_admission_knowledge_cutoff_at
-                    == active_knowledge_cutoff_at
-                    and normalized_fs_div == active_fs_div
-                    and payload.get('scope_authority')
-                    == (
-                        dict(scope_authority)
-                        if scope_authority is not None
-                        else None
-                    )
+                'exact_scope': exact_admission_binding(payload),
+                'idempotency_match': bool(
+                    normalized_idempotency_key is not None
+                    and str(
+                        payload.get('idempotency_key') or ''
+                    ).strip()
+                    == normalized_idempotency_key
                 ),
             }
 
@@ -1172,6 +1797,11 @@ def _claim_feedback_retry_run(
                     'admission_knowledge_cutoff_at': (
                         normalized_admission_knowledge_cutoff_at
                     ),
+                    'policy_context_as_of_date': (
+                        normalized_policy_context_as_of_date.isoformat()
+                    ),
+                    'idempotency_key': normalized_idempotency_key,
+                    'role_symbol_scopes': normalized_role_symbol_scopes,
                     'admission_scope_by_role': admission_scope_payload,
                     **(
                         {'scope_authority': dict(scope_authority)}
@@ -1200,6 +1830,7 @@ def _claim_feedback_retry_run(
         'owner_token': owner_token,
         'conflict_run': None,
         'exact_scope': True,
+        'idempotency_match': False,
     }
 
 
@@ -1583,6 +2214,8 @@ class FeedbackRetryCycleConfig:
     roles: tuple[str, ...]
     symbols: tuple[str, ...] | None = None
     knowledge_cutoff_at: datetime | str | None = None
+    policy_context_as_of_date: date | str | None = None
+    idempotency_key: str | None = None
     fs_div: str | None = None
     feedback_scope_mode: str = FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
     max_cycles: int = 3
@@ -1591,6 +2224,7 @@ class FeedbackRetryCycleConfig:
     force_recompute: bool = False
     reuse_parent_run_id: str | None = None
     scope_authority: Mapping[str, Any] | None = None
+    role_symbol_scopes: Mapping[str, Sequence[str]] | None = None
     progress_callback: Callable[..., Any] | None = None
 
 
@@ -3441,6 +4075,19 @@ class AgentFeedbackRetryService:
         bypass_prerequisite_gate: bool = False,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
+        resolved_idempotency_key = str(
+            getattr(config, 'idempotency_key', None) or ''
+        ).strip() or None
+        if resolved_idempotency_key is not None and len(
+            resolved_idempotency_key
+        ) > 128:
+            raise ValueError('idempotency_key must be at most 128 characters')
+        resolved_policy_context_as_of_date = (
+            _normalize_policy_context_as_of_date(
+                getattr(config, 'policy_context_as_of_date', None),
+                market_date=config.market_date,
+            )
+        )
         resolved_fs_div = _normalize_feedback_fs_div(
             getattr(config, 'fs_div', None)
         )
@@ -3449,6 +4096,11 @@ class AgentFeedbackRetryService:
             tuple(_normalize_requested_symbols(raw_requested_symbols))
             if raw_requested_symbols is not None
             else None
+        )
+        resolved_role_symbol_scopes = _normalize_role_symbol_scopes(
+            getattr(config, 'role_symbol_scopes', None),
+            roles=roles,
+            requested_symbols=requested_symbols,
         )
         feedback_scope_mode = normalize_feedback_scope_mode(
             getattr(config, 'feedback_scope_mode', None)
@@ -3465,6 +4117,75 @@ class AgentFeedbackRetryService:
                 symbols=requested_symbols,
                 knowledge_cutoff_at=raw_knowledge_cutoff_at,
             )
+        normalized_scope_authority: dict[str, Any] | None = None
+        policy_binding: Mapping[str, Any] | None = None
+        if getattr(config, 'scope_authority', None) is not None:
+            if effective_knowledge_cutoff_at is None:
+                raise ValueError(
+                    'scope_authority requires an explicit symbol cutoff'
+                )
+            normalized_scope_authority = _normalize_feedback_scope_authority(
+                getattr(config, 'scope_authority', None),
+                market_date=config.market_date,
+                policy_context_as_of_date=(
+                    resolved_policy_context_as_of_date
+                ),
+                roles=roles,
+                requested_symbols=requested_symbols,
+                role_symbol_scopes=resolved_role_symbol_scopes,
+                feedback_scope_mode=feedback_scope_mode,
+                knowledge_cutoff_at=effective_knowledge_cutoff_at,
+                fs_div=resolved_fs_div,
+            )
+            policy_binding = (
+                normalized_scope_authority.get('policy_binding')
+                if isinstance(normalized_scope_authority, Mapping)
+                and isinstance(
+                    normalized_scope_authority.get('policy_binding'),
+                    Mapping,
+                )
+                else None
+            )
+        weekly_policy_session_guard: Callable[..., Any] | None = None
+        if policy_binding is not None:
+            bound_key = str(
+                policy_binding.get('idempotency_key') or ''
+            ).strip()
+            if resolved_idempotency_key != bound_key:
+                raise ValueError(
+                    'idempotency_key must match weekly policy rebind binding'
+                )
+            if force or bypass_prerequisite_gate:
+                raise ValueError(
+                    'weekly policy rebind cannot bypass prerequisite gates'
+                )
+            if getattr(config, 'force_recompute', False) is not True:
+                raise ValueError(
+                    'weekly policy rebind requires force_recompute=true'
+                )
+            if getattr(config, 'reuse_existing', True) is not True:
+                raise ValueError(
+                    'weekly policy rebind requires reuse_existing=true'
+                )
+            if int(getattr(config, 'max_cycles', 0) or 0) != 3:
+                raise ValueError(
+                    'weekly policy rebind requires max_cycles=3'
+                )
+            if int(getattr(config, 'outer_batch_size', 0) or 0) != 20:
+                raise ValueError(
+                    'weekly policy rebind requires outer_batch_size=20'
+                )
+            def weekly_policy_session_guard(**kwargs: Any) -> None:
+                _assert_weekly_policy_target_session_not_open(
+                    policy_binding=policy_binding,
+                    **kwargs,
+                )
+
+            weekly_policy_session_guard(stage='admission')
+        elif resolved_idempotency_key is not None:
+            raise ValueError(
+                'idempotency_key requires a weekly policy rebind binding'
+            )
         should_bypass_prerequisite_gate = bool(
             force or bypass_prerequisite_gate
         )
@@ -3480,6 +4201,9 @@ class AgentFeedbackRetryService:
                 force=force,
                 bypass_prerequisite_gate=bypass_prerequisite_gate,
                 prerequisites=prerequisites,
+                weekly_policy_session_guard=(
+                    weekly_policy_session_guard
+                ),
             )
 
         eligible_symbols = self._load_eligible_symbols(
@@ -3500,14 +4224,94 @@ class AgentFeedbackRetryService:
             if raw_knowledge_cutoff_at is not None
             else None
         )
-        normalized_scope_authority = _normalize_feedback_scope_authority(
-            getattr(config, 'scope_authority', None),
-            roles=roles,
-            requested_symbols=requested_symbols,
-            feedback_scope_mode=feedback_scope_mode,
-            knowledge_cutoff_at=effective_knowledge_cutoff_at,
-            fs_div=resolved_fs_div,
-        )
+
+        def idempotent_binding_is_exact(
+            run: Mapping[str, Any],
+        ) -> bool:
+            prior_request = (
+                run.get('request_payload')
+                if isinstance(run.get('request_payload'), Mapping)
+                else {}
+            )
+            return bool(
+                prior_request.get('scope_authority')
+                == dict(normalized_scope_authority or {})
+                and prior_request.get('policy_context_as_of_date')
+                == resolved_policy_context_as_of_date.isoformat()
+                and _normalize_optional_symbol_scope(
+                    prior_request.get('requested_symbols') or []
+                )
+                == _normalize_optional_symbol_scope(
+                    requested_symbols or ()
+                )
+                and sorted(prior_request.get('roles') or [])
+                == sorted(roles)
+                and prior_request.get('role_symbol_scopes')
+                == resolved_role_symbol_scopes
+                and str(prior_request.get('fs_div') or '').upper()
+                == resolved_fs_div
+                and _normalize_admission_knowledge_cutoff(
+                    prior_request.get('admission_knowledge_cutoff_at')
+                    or prior_request.get('knowledge_cutoff_at')
+                )
+                == _normalize_admission_knowledge_cutoff(
+                    effective_knowledge_cutoff_at
+                )
+            )
+
+        def idempotent_replay_response(
+            run: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            return {
+                'market_date': config.market_date.isoformat(),
+                'policy_context_as_of_date': (
+                    resolved_policy_context_as_of_date.isoformat()
+                ),
+                'roles': list(roles),
+                'max_cycles': int(
+                    getattr(config, 'max_cycles', 3) or 3
+                ),
+                'outer_batch_size': int(
+                    getattr(config, 'outer_batch_size', 20) or 20
+                ),
+                'reuse_existing': bool(
+                    getattr(config, 'reuse_existing', True)
+                ),
+                'force_recompute': bool(
+                    force or getattr(config, 'force_recompute', False)
+                ),
+                'feedback_scope_mode': feedback_scope_mode,
+                'scope_authority': dict(
+                    normalized_scope_authority or {}
+                ),
+                'requested_symbols': list(requested_symbols or ()),
+                'role_symbol_scopes': resolved_role_symbol_scopes,
+                'eligible_symbols': list(requested_symbols or ()),
+                'skipped_symbols': [],
+                'run_id': run.get('run_id'),
+                'status': 'completed',
+                'cycles': [],
+                'final_pending': 0,
+                'completed': True,
+                'idempotency_key': resolved_idempotency_key,
+                'idempotent_replay': True,
+                'progress': run.get('summary_payload'),
+            }
+
+        if resolved_idempotency_key is not None:
+            idempotent_run = find_feedback_retry_run_by_idempotency_key(
+                market_date=config.market_date,
+                idempotency_key=resolved_idempotency_key,
+            )
+            if isinstance(idempotent_run, dict):
+                if not idempotent_binding_is_exact(idempotent_run):
+                    raise ValueError('idempotency_key collision detected')
+                if feedback_retry_run_is_complete_for_weekly_policy_rebind(
+                    idempotent_run,
+                    idempotency_key=resolved_idempotency_key,
+                    role_symbol_scopes=resolved_role_symbol_scopes or {},
+                ):
+                    return idempotent_replay_response(idempotent_run)
 
         previous_run = None
         reuse_parent_run_id = str(
@@ -3537,6 +4341,12 @@ class AgentFeedbackRetryService:
             if not _previous_run_matches_knowledge_cutoff(
                 previous_run,
                 effective_knowledge_cutoff_at,
+            ) or not _previous_run_matches_policy_context_as_of_date(
+                previous_run,
+                market_date=config.market_date,
+                policy_context_as_of_date=(
+                    resolved_policy_context_as_of_date
+                ),
             ) or not _previous_run_matches_fs_div(
                 previous_run,
                 resolved_fs_div,
@@ -3586,15 +4396,37 @@ class AgentFeedbackRetryService:
             admission_knowledge_cutoff_at=(
                 effective_knowledge_cutoff_at.isoformat()
             ),
+            policy_context_as_of_date=resolved_policy_context_as_of_date,
+            idempotency_key=resolved_idempotency_key,
+            role_symbol_scopes=resolved_role_symbol_scopes,
             fs_div=resolved_fs_div,
             scope_authority=normalized_scope_authority,
         )
         if not admission['acquired']:
             active_run = admission.get('conflict_run')
+            if admission.get('idempotency_match'):
+                if not admission.get('exact_scope'):
+                    raise ValueError('idempotency_key collision detected')
+                if feedback_retry_run_is_complete_for_weekly_policy_rebind(
+                    active_run,
+                    idempotency_key=resolved_idempotency_key or '',
+                    role_symbol_scopes=resolved_role_symbol_scopes or {},
+                ):
+                    return idempotent_replay_response(active_run)
             active_run_id = (
                 str(active_run.get('run_id') or '').strip()
                 if isinstance(active_run, dict)
                 else ''
+            )
+            active_status = (
+                str(active_run.get('status') or '').strip().lower()
+                if isinstance(active_run, dict)
+                else ''
+            )
+            idempotent_terminal = bool(
+                admission.get('idempotency_match')
+                and active_status
+                and active_status != 'running'
             )
             progress = self._get_retry_progress(
                 market_date=config.market_date,
@@ -3611,6 +4443,10 @@ class AgentFeedbackRetryService:
             )
             return {
                 'market_date': config.market_date.isoformat(),
+                'policy_context_as_of_date': (
+                    resolved_policy_context_as_of_date.isoformat()
+                ),
+                'idempotency_key': resolved_idempotency_key,
                 'roles': list(roles),
                 'max_cycles': int(getattr(config, 'max_cycles', 3) or 3),
                 'outer_batch_size': int(
@@ -3629,21 +4465,37 @@ class AgentFeedbackRetryService:
                     if requested_symbols is not None
                     else None
                 ),
+                'role_symbol_scopes': resolved_role_symbol_scopes,
                 'eligible_symbols': None,
                 'skipped_symbols': [],
                 'run_id': active_run_id or None,
-                'status': 'running' if active_run_id else 'waiting',
-                'gated': not bool(admission.get('exact_scope')),
+                'status': (
+                    active_status
+                    if idempotent_terminal
+                    else 'running' if active_run_id else 'waiting'
+                ),
+                'gated': bool(
+                    idempotent_terminal
+                    or not admission.get('exact_scope')
+                ),
                 'cycles': [],
                 'final_pending': pending,
                 'completed': False,
                 'joined_existing_run': bool(
-                    active_run_id and admission.get('exact_scope')
+                    active_run_id
+                    and admission.get('exact_scope')
+                    and not idempotent_terminal
                 ),
                 'admission_status': (
+                    'idempotent_terminal_run_incomplete'
+                    if idempotent_terminal
+                    else
                     'active_scope_joined'
                     if admission.get('exact_scope')
                     else 'overlapping_scope_active'
+                ),
+                'idempotent_replay': bool(
+                    admission.get('idempotency_match')
                 ),
                 'progress': progress,
             }
@@ -3678,6 +4530,9 @@ class AgentFeedbackRetryService:
                     normalized_scope_authority=(
                         normalized_scope_authority
                     ),
+                    weekly_policy_session_guard=(
+                        weekly_policy_session_guard
+                    ),
                 )
         except Exception as exc:
             _finish_feedback_retry_claim_if_running(
@@ -3710,12 +4565,32 @@ class AgentFeedbackRetryService:
         knowledge_cutoff_source: str | None = None,
         requested_knowledge_cutoff_at: str | None = None,
         normalized_scope_authority: Mapping[str, Any] | None = None,
+        weekly_policy_session_guard: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
+        resolved_idempotency_key = str(
+            getattr(config, 'idempotency_key', None) or ''
+        ).strip() or None
+        resolved_policy_context_as_of_date = (
+            _normalize_policy_context_as_of_date(
+                getattr(config, 'policy_context_as_of_date', None),
+                market_date=config.market_date,
+            )
+        )
         resolved_fs_div = _normalize_feedback_fs_div(
             getattr(config, 'fs_div', None)
         )
-        progress_callback = getattr(config, 'progress_callback', None)
+        caller_progress_callback = getattr(config, 'progress_callback', None)
+        if weekly_policy_session_guard is not None or (
+            caller_progress_callback is not None
+        ):
+            def progress_callback(**kwargs: Any) -> None:
+                if weekly_policy_session_guard is not None:
+                    weekly_policy_session_guard(**kwargs)
+                if caller_progress_callback is not None:
+                    caller_progress_callback(**kwargs)
+        else:
+            progress_callback = None
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
         should_bypass_prerequisite_gate = bool(force or bypass_prerequisite_gate)
@@ -3724,6 +4599,11 @@ class AgentFeedbackRetryService:
             tuple(_normalize_requested_symbols(raw_requested_symbols))
             if raw_requested_symbols is not None
             else None
+        )
+        resolved_role_symbol_scopes = _normalize_role_symbol_scopes(
+            getattr(config, 'role_symbol_scopes', None),
+            roles=roles,
+            requested_symbols=requested_symbols,
         )
         prerequisites = prerequisites or (
             agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
@@ -3740,6 +4620,10 @@ class AgentFeedbackRetryService:
             )
             return {
                 'market_date': config.market_date.isoformat(),
+                'policy_context_as_of_date': (
+                    resolved_policy_context_as_of_date.isoformat()
+                ),
+                'idempotency_key': resolved_idempotency_key,
                 'roles': list(roles),
                 'max_cycles': config.max_cycles,
                 'outer_batch_size': config.outer_batch_size,
@@ -3747,6 +4631,7 @@ class AgentFeedbackRetryService:
                 'force_recompute': effective_force_recompute,
                 'feedback_scope_mode': feedback_scope_mode,
                 'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
+                'role_symbol_scopes': resolved_role_symbol_scopes,
                 'eligible_symbols': None,
                 'skipped_symbols': [],
                 'run_id': None,
@@ -3786,6 +4671,41 @@ class AgentFeedbackRetryService:
             for role, symbols in role_funnel.get('role_symbols', {}).items()
             if isinstance(symbols, list)
         }
+        explicit_role_symbol_scopes = resolved_role_symbol_scopes
+        if explicit_role_symbol_scopes is not None:
+            eligible_symbol_set = set(eligible_symbols)
+            if any(
+                not set(symbols).issubset(eligible_symbol_set)
+                for symbols in explicit_role_symbol_scopes.values()
+            ):
+                raise ValueError(
+                    'role_symbol_scopes contain currently ineligible symbols'
+                )
+            role_symbol_scopes = {
+                role: tuple(symbols)
+                for role, symbols in explicit_role_symbol_scopes.items()
+            }
+            role_funnel['role_symbols'] = {
+                role: list(symbols)
+                for role, symbols in explicit_role_symbol_scopes.items()
+            }
+            role_funnel['role_symbol_counts'] = {
+                role: len(symbols)
+                for role, symbols in explicit_role_symbol_scopes.items()
+            }
+            exact_decider_symbols = _ordered_symbol_union(
+                list(explicit_role_symbol_scopes.values())
+            )
+            role_funnel['decider_scope'] = {
+                **(
+                    role_funnel.get('decider_scope')
+                    if isinstance(role_funnel.get('decider_scope'), dict)
+                    else {}
+                ),
+                'symbols': exact_decider_symbols,
+                'symbol_count': len(exact_decider_symbols),
+                'authority': 'persisted_role_symbol_scopes',
+            }
         scoped_feedback_symbols = _ordered_symbol_union(
             [role_symbol_scopes.get(role, ()) for role in roles]
         ) or list(eligible_symbols)
@@ -3817,13 +4737,35 @@ class AgentFeedbackRetryService:
             normalized_scope_authority = (
                 _normalize_feedback_scope_authority(
                     getattr(config, 'scope_authority', None),
+                    market_date=config.market_date,
+                    policy_context_as_of_date=(
+                        resolved_policy_context_as_of_date
+                    ),
                     roles=roles,
                     requested_symbols=requested_symbols,
+                    role_symbol_scopes=resolved_role_symbol_scopes,
                     feedback_scope_mode=feedback_scope_mode,
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=resolved_fs_div,
                 )
             )
+        weekly_policy_binding = (
+            normalized_scope_authority.get('policy_binding')
+            if isinstance(normalized_scope_authority, Mapping)
+            and isinstance(
+                normalized_scope_authority.get('policy_binding'), Mapping
+            )
+            else None
+        )
+        if weekly_policy_binding is not None:
+            if requested_symbols is None or (
+                set(eligible_symbols) != set(requested_symbols)
+                or len(eligible_symbols) != len(requested_symbols)
+            ):
+                raise ValueError(
+                    'weekly policy rebind eligibility cohort changed'
+                )
+            eligible_symbols = list(requested_symbols)
         decider_scope_symbols = _ordered_symbol_union(
             [
                 role_symbol_scopes.get(role, ())
@@ -4027,6 +4969,10 @@ class AgentFeedbackRetryService:
 
         request_payload = {
             'market_date': config.market_date.isoformat(),
+            'policy_context_as_of_date': (
+                resolved_policy_context_as_of_date.isoformat()
+            ),
+            'idempotency_key': resolved_idempotency_key,
             'symbols': list(scoped_feedback_symbols),
             'broad_symbols': list(eligible_symbols),
             'broad_symbol_count': len(eligible_symbols),
@@ -4289,6 +5235,9 @@ class AgentFeedbackRetryService:
                                     )
                                 dispatch_result = agent_feedback_orchestrator.dispatch_for_symbols(
                                     market_date=config.market_date,
+                                    policy_context_as_of_date=(
+                                        resolved_policy_context_as_of_date
+                                    ),
                                     symbols=dispatch_chunk,
                                     roles=[role],
                                     fs_div=resolved_fs_div,
@@ -4333,6 +5282,14 @@ class AgentFeedbackRetryService:
                                         and normalized_scope_authority
                                         is not None
                                         else None
+                                    ),
+                                    persistence_guard=(
+                                        progress_callback
+                                        if weekly_policy_binding is not None
+                                        else None
+                                    ),
+                                    expected_weekly_policy_binding=(
+                                        weekly_policy_binding
                                     ),
                                 )
                                 dispatch_results.append(dispatch_result)
@@ -4683,6 +5640,10 @@ class AgentFeedbackRetryService:
 
         return {
             'market_date': config.market_date.isoformat(),
+            'policy_context_as_of_date': (
+                resolved_policy_context_as_of_date.isoformat()
+            ),
+            'idempotency_key': resolved_idempotency_key,
             'roles': list(roles),
             'max_cycles': config.max_cycles,
             'outer_batch_size': config.outer_batch_size,
@@ -4695,6 +5656,14 @@ class AgentFeedbackRetryService:
                 else None
             ),
             'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
+            'role_symbol_scopes': (
+                {
+                    role: list(symbols)
+                    for role, symbols in role_symbol_scopes.items()
+                }
+                if resolved_role_symbol_scopes is not None
+                else None
+            ),
             'eligible_symbols': list(eligible_symbols) if requested_symbols is not None else None,
             'skipped_symbols': skipped_symbols,
             'run_id': request_run_id,

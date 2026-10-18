@@ -5,12 +5,14 @@ import threading
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import delete, select
 
 from app.db import session_scope
@@ -22,6 +24,7 @@ from app.db_models import (
 from app.agent_context.retry_service import (
     AgentFeedbackRetryService,
     EXPECTED_ROLES,
+    FeedbackRetryCycleConfig,
     FeedbackRetryLeaseLostError,
     RetryCyclePlan,
     RoleSequenceRoleState,
@@ -30,10 +33,14 @@ from app.agent_context.retry_service import (
     _FeedbackRetryClaimLease,
     _feedback_retry_admission_lock_key,
     _feedback_retry_owner_token_hash,
+    _normalize_feedback_scope_authority,
+    _validate_weekly_policy_rebind_authority_against_persisted_state,
     _claim_feedback_retry_run,
     _previous_run_matches_fs_div,
     _previous_run_matches_knowledge_cutoff,
     _refresh_feedback_retry_claim,
+    build_weekly_policy_rebind_idempotency_key,
+    feedback_retry_run_is_complete_for_weekly_policy_rebind,
     resolve_latest_completed_summary_knowledge_cutoff,
 )
 from app.agent_context.roles import (
@@ -46,7 +53,11 @@ from app.agent_context.reuse_service import (
     AgentContextReuseService,
     FeedbackReuseStaticInputs,
 )
-from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+from app.agent_context.run_modes import (
+    DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+)
 from app.agent_context.runtime_state import RuntimeFeedbackRunState
 from scripts import run_feedback_retry_cycles
 
@@ -154,6 +165,489 @@ def _snapshot(
         roles=roles,
         role_states=role_states,
     )
+
+
+def test_weekly_policy_rebind_rejects_control_tampering_before_admission() -> None:
+    market_date = date(2026, 10, 16)
+    target_date = date(2026, 10, 19)
+    cutoff = datetime(2026, 10, 16, 7, 0, tzinfo=timezone.utc)
+    symbols = ('005930',)
+    roles = DECISION_SUPPORT_AGENT_NAMES
+    role_symbol_scopes = {role: ['005930'] for role in roles}
+    artifact_version = 'signal_decider_weekly_learning_2026-10-16_test'
+    content_sha256 = 'a' * 64
+    source_run_id = 'feedback-cycle-2026-10-16-summary'
+    idempotency_key = build_weekly_policy_rebind_idempotency_key(
+        artifact_version=artifact_version,
+        content_sha256=content_sha256,
+        source_summary_run_id=source_run_id,
+        source_market_date=market_date,
+        target_trade_date=target_date,
+        policy_context_as_of_date=target_date,
+        knowledge_cutoff_at=cutoff,
+        symbols=symbols,
+        roles=roles,
+        role_symbol_scopes=role_symbol_scopes,
+        fs_div='CFS',
+    )
+    scope_authority = {
+        'schema_version': FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+        'kind': FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+        'source_summary_run_id': source_run_id,
+        'source_feedback_scope_mode': 'broad_feedback_universe',
+        'decision_feedback_scope_mode': 'decider_scope_fast_path',
+        'knowledge_cutoff_at': cutoff.isoformat(),
+        'fs_div': 'CFS',
+        'completed_scope_proof': {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': list(symbols),
+            'admitted_symbols': list(symbols),
+        },
+        'decider_role_symbol_scopes': role_symbol_scopes,
+        'policy_binding': {
+            'schema_version': 'weekly_policy_rebind_v1',
+            'artifact_version': artifact_version,
+            'content_sha256': content_sha256,
+            'source_market_date': market_date.isoformat(),
+            'target_trade_date': target_date.isoformat(),
+            'policy_context_as_of_date': target_date.isoformat(),
+            'idempotency_key': idempotency_key,
+        },
+    }
+    config = FeedbackRetryCycleConfig(
+        market_date=market_date,
+        policy_context_as_of_date=target_date,
+        symbols=symbols,
+        roles=roles,
+        knowledge_cutoff_at=cutoff,
+        feedback_scope_mode='decider_scope_fast_path',
+        fs_div='CFS',
+        max_cycles=3,
+        outer_batch_size=20,
+        reuse_existing=True,
+        force_recompute=True,
+        idempotency_key=idempotency_key,
+        scope_authority=scope_authority,
+        role_symbol_scopes=role_symbol_scopes,
+    )
+    latest_policy = {
+        'available': True,
+        'artifact': {
+            'artifact_version': artifact_version,
+            'content_sha256': content_sha256,
+            'week_start': '2026-10-12',
+            'week_end': market_date.isoformat(),
+        },
+    }
+    variants = (
+        ('force', config, {'force': True}),
+        (
+            'force_recompute',
+            replace(config, force_recompute=False),
+            {'force': False},
+        ),
+        (
+            'reuse_existing',
+            replace(config, reuse_existing=False),
+            {'force': False},
+        ),
+        ('max_cycles', replace(config, max_cycles=2), {'force': False}),
+        (
+            'outer_batch_size',
+            replace(config, outer_batch_size=10),
+            {'force': False},
+        ),
+    )
+    service = AgentFeedbackRetryService()
+
+    with (
+        patch(
+            'app.agent_context.retry_service.resolve_external_news_knowledge_cutoff_for_symbols',
+            return_value=(cutoff, 'requested'),
+        ),
+        patch.object(
+            sys.modules[
+                'app.agent_context.retry_service'
+            ].signal_decider_weekly_learning_service,
+            'get_latest_published',
+            return_value=latest_policy,
+        ),
+        patch(
+            'app.agent_context.retry_service._validate_weekly_policy_rebind_authority_against_persisted_state'
+        ),
+    ):
+        for label, tampered_config, kwargs in variants:
+            with pytest.raises(ValueError, match='weekly policy rebind'):
+                service.run_retry_cycles(config=tampered_config, **kwargs)
+        for current_date, is_open in (
+            (target_date, True),
+            (target_date - timedelta(days=1), False),
+        ):
+            with (
+                patch(
+                    'app.agent_context.retry_service.get_market_state',
+                    return_value=SimpleNamespace(
+                        current_calendar_date=current_date.isoformat(),
+                        state='OPEN',
+                        is_open=is_open,
+                    ),
+                ),
+                pytest.raises(
+                    RuntimeError,
+                    match='target session is not safely before open',
+                ),
+            ):
+                service.run_retry_cycles(config=config, force=False)
+
+
+def test_weekly_policy_rebind_authority_is_rederived_from_persisted_lineage(
+) -> None:
+    market_date = date(2026, 10, 16)
+    cutoff = datetime(2026, 10, 16, 7, 0, tzinfo=timezone.utc)
+    roles = DECISION_SUPPORT_AGENT_NAMES
+    symbols = ['005930']
+    role_scopes = {role: list(symbols) for role in roles}
+    proof = {
+        'schema_version': 'completed_summarizer_intersection_v1',
+        'completed_symbols': list(symbols),
+        'admitted_symbols': list(symbols),
+    }
+    authority = {
+        'source_summary_run_id': 'summary-source-run',
+        'source_feedback_scope_mode': 'broad_feedback_universe',
+        'knowledge_cutoff_at': cutoff.isoformat(),
+        'fs_div': 'CFS',
+        'completed_scope_proof': proof,
+    }
+    parent = {
+        'request_payload': {
+            'mode': DAILY_RETRY_CYCLE_MODE,
+            'roles': list(roles),
+            'scope': 'requested_symbols_scored_by_strategy_aware_prefilter',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'role_symbol_scopes': role_scopes,
+            'scope_authority': {
+                'source_summary_run_id': 'summary-source-run',
+                'source_feedback_scope_mode': 'broad_feedback_universe',
+                'knowledge_cutoff_at': cutoff.isoformat(),
+                'fs_div': 'CFS',
+            },
+        }
+    }
+    exact_summary = {
+        'ready': True,
+        'requested_symbols': list(symbols),
+        'knowledge_cutoff_at': cutoff,
+        'completed_scope_proof': proof,
+    }
+
+    with (
+        patch(
+            'app.agent_context.retry_service.agent_context_feedback_run_state_service.list_runs',
+            return_value=[parent],
+        ),
+        patch(
+            'app.agent_context.retry_service.resolve_latest_completed_summary_knowledge_cutoff',
+            return_value=exact_summary,
+        ),
+    ):
+        _validate_weekly_policy_rebind_authority_against_persisted_state(
+            market_date=market_date,
+            roles=roles,
+            requested_symbols=symbols,
+            role_symbol_scopes=role_scopes,
+            knowledge_cutoff_at=cutoff,
+            fs_div='CFS',
+            normalized_authority=authority,
+        )
+
+        tampered_authority = {
+            **authority,
+            'source_summary_run_id': 'invented-summary-run',
+        }
+        with pytest.raises(ValueError, match='persisted decider lineage'):
+            _validate_weekly_policy_rebind_authority_against_persisted_state(
+                market_date=market_date,
+                roles=roles,
+                requested_symbols=symbols,
+                role_symbol_scopes=role_scopes,
+                knowledge_cutoff_at=cutoff,
+                fs_div='CFS',
+                normalized_authority=tampered_authority,
+            )
+
+        widened_symbols = ['005930', '000660']
+        widened_scopes = {role: widened_symbols for role in roles}
+        with pytest.raises(ValueError, match='role scopes'):
+            _validate_weekly_policy_rebind_authority_against_persisted_state(
+                market_date=market_date,
+                roles=roles,
+                requested_symbols=widened_symbols,
+                role_symbol_scopes=widened_scopes,
+                knowledge_cutoff_at=cutoff,
+                fs_div='CFS',
+                normalized_authority=authority,
+            )
+
+        with pytest.raises(ValueError, match='summary proof'):
+            _validate_weekly_policy_rebind_authority_against_persisted_state(
+                market_date=market_date,
+                roles=roles,
+                requested_symbols=symbols,
+                role_symbol_scopes=role_scopes,
+                knowledge_cutoff_at=cutoff,
+                fs_div='CFS',
+                normalized_authority={
+                    **authority,
+                    'completed_scope_proof': {
+                        **proof,
+                        'admitted_symbols': ['005930', '000660'],
+                    },
+                },
+            )
+
+
+def test_weekly_policy_rebind_replay_requires_exact_complete_role_counts() -> None:
+    scopes = {
+        'short-term-decider': ['005930'],
+        'signal-decider': ['005930'],
+    }
+    idempotency_key = 'weekly-policy-rebind:' + ('a' * 64)
+    run = {
+        'status': 'completed',
+        'completed_at': '2026-10-17T12:00:00+00:00',
+        'symbols_total': 2,
+        'completed_count': 2,
+        'failed_count': 0,
+        'request_payload': {
+            'idempotency_key': idempotency_key,
+            'roles': list(DECISION_SUPPORT_AGENT_NAMES),
+            'requested_symbols': ['005930'],
+            'role_symbol_scopes': scopes,
+            'scope_authority': {
+                'policy_binding': {
+                    'schema_version': 'weekly_policy_rebind_v1',
+                    'idempotency_key': idempotency_key,
+                }
+            },
+        },
+    }
+
+    assert feedback_retry_run_is_complete_for_weekly_policy_rebind(
+        run,
+        idempotency_key=idempotency_key,
+        role_symbol_scopes=scopes,
+    )
+    for field, value in (
+        ('status', 'partial'),
+        ('completed_at', None),
+        ('symbols_total', 1),
+        ('completed_count', 1),
+        ('failed_count', 1),
+    ):
+        tampered = {**run, field: value}
+        assert not feedback_retry_run_is_complete_for_weekly_policy_rebind(
+            tampered,
+            idempotency_key=idempotency_key,
+            role_symbol_scopes=scopes,
+        ), field
+
+
+def test_weekly_policy_rebind_replays_completion_found_under_admission_lock(
+) -> None:
+    market_date = date(2026, 10, 16)
+    target_date = date(2026, 10, 19)
+    cutoff = datetime(2026, 10, 16, 7, 0, tzinfo=timezone.utc)
+    symbols = ('005930',)
+    roles = DECISION_SUPPORT_AGENT_NAMES
+    scopes = {role: list(symbols) for role in roles}
+    idempotency_key = 'weekly-policy-rebind:' + ('c' * 64)
+    authority = {
+        'policy_binding': {
+            'schema_version': 'weekly_policy_rebind_v1',
+            'target_trade_date': target_date.isoformat(),
+            'idempotency_key': idempotency_key,
+        }
+    }
+    config = FeedbackRetryCycleConfig(
+        market_date=market_date,
+        policy_context_as_of_date=target_date,
+        symbols=symbols,
+        roles=roles,
+        knowledge_cutoff_at=cutoff,
+        feedback_scope_mode='decider_scope_fast_path',
+        fs_div='CFS',
+        max_cycles=3,
+        outer_batch_size=20,
+        reuse_existing=True,
+        force_recompute=True,
+        idempotency_key=idempotency_key,
+        scope_authority=authority,
+        role_symbol_scopes=scopes,
+    )
+    completed_run = {
+        'run_id': 'completed-under-admission-lock',
+        'status': 'completed',
+        'completed_at': datetime.now(timezone.utc),
+        'symbols_total': 2,
+        'completed_count': 2,
+        'failed_count': 0,
+        'request_payload': {
+            'idempotency_key': idempotency_key,
+            'roles': list(roles),
+            'requested_symbols': list(symbols),
+            'role_symbol_scopes': scopes,
+            'scope_authority': authority,
+            'policy_context_as_of_date': target_date.isoformat(),
+            'admission_knowledge_cutoff_at': cutoff.isoformat(),
+            'fs_div': 'CFS',
+        },
+        'summary_payload': {'lifecycle_stage': 'completed'},
+    }
+    partial_run = {
+        **completed_run,
+        'run_id': 'partial-under-admission-lock',
+        'status': 'partial',
+        'completed_count': 1,
+        'failed_count': 1,
+    }
+    claims = [
+        {
+            'acquired': False,
+            'conflict_run': completed_run,
+            'exact_scope': True,
+            'idempotency_match': True,
+        },
+        {
+            'acquired': False,
+            'conflict_run': completed_run,
+            'exact_scope': False,
+            'idempotency_match': True,
+        },
+        {
+            'acquired': False,
+            'conflict_run': partial_run,
+            'exact_scope': True,
+            'idempotency_match': True,
+        },
+    ]
+    service = AgentFeedbackRetryService()
+    with (
+        patch(
+            'app.agent_context.retry_service._normalize_feedback_scope_authority',
+            return_value=authority,
+        ),
+        patch(
+            'app.agent_context.retry_service._assert_weekly_policy_target_session_not_open',
+        ),
+        patch(
+            'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            return_value=_feedback_prerequisites(),
+        ),
+        patch.object(
+            service,
+            '_load_eligible_symbols',
+            return_value=list(symbols),
+        ),
+        patch(
+            'app.agent_context.retry_service.resolve_external_news_knowledge_cutoff_for_symbols',
+            return_value=(cutoff, 'requested'),
+        ),
+        patch(
+            'app.agent_context.retry_service.find_feedback_retry_run_by_idempotency_key',
+            return_value=None,
+        ),
+        patch(
+            'app.agent_context.retry_service._claim_feedback_retry_run',
+            side_effect=claims,
+        ),
+        patch.object(
+            service,
+            '_get_retry_progress',
+            return_value={'summary': {'pending_symbols': 1}},
+        ),
+        patch.object(service, '_run_retry_cycles_admitted') as admitted,
+    ):
+        replay = service.run_retry_cycles(config=config)
+        with pytest.raises(ValueError, match='idempotency_key collision'):
+            service.run_retry_cycles(config=config)
+        terminal = service.run_retry_cycles(config=config)
+
+    assert replay['status'] == 'completed'
+    assert replay['completed'] is True
+    assert replay['idempotent_replay'] is True
+    assert replay['cycles'] == []
+    assert replay['eligible_symbols'] == list(symbols)
+    assert terminal['status'] == 'partial'
+    assert terminal['completed'] is False
+    assert terminal['gated'] is True
+    assert terminal['idempotent_replay'] is True
+    assert terminal['admission_status'] == (
+        'idempotent_terminal_run_incomplete'
+    )
+    admitted.assert_not_called()
+
+
+def test_weekly_policy_rebind_rejects_non_next_target_with_recomputed_key() -> None:
+    source_date = date(2026, 10, 16)
+    tampered_target = date(2026, 10, 20)
+    cutoff = datetime(2026, 10, 16, 7, 0, tzinfo=timezone.utc)
+    symbols = ['005930']
+    roles = DECISION_SUPPORT_AGENT_NAMES
+    role_scopes = {role: list(symbols) for role in roles}
+    artifact_version = 'signal_decider_weekly_learning_2026-10-16_test'
+    content_sha256 = 'a' * 64
+    source_run_id = 'feedback-cycle-2026-10-16-summary'
+    recomputed_key = build_weekly_policy_rebind_idempotency_key(
+        artifact_version=artifact_version,
+        content_sha256=content_sha256,
+        source_summary_run_id=source_run_id,
+        source_market_date=source_date,
+        target_trade_date=tampered_target,
+        policy_context_as_of_date=tampered_target,
+        knowledge_cutoff_at=cutoff,
+        symbols=symbols,
+        roles=roles,
+        role_symbol_scopes=role_scopes,
+        fs_div='CFS',
+    )
+    authority = {
+        'schema_version': FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+        'kind': FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+        'source_summary_run_id': source_run_id,
+        'source_feedback_scope_mode': 'broad_feedback_universe',
+        'decision_feedback_scope_mode': 'decider_scope_fast_path',
+        'knowledge_cutoff_at': cutoff.isoformat(),
+        'fs_div': 'CFS',
+        'completed_scope_proof': {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': symbols,
+            'admitted_symbols': symbols,
+        },
+        'decider_role_symbol_scopes': role_scopes,
+        'policy_binding': {
+            'schema_version': 'weekly_policy_rebind_v1',
+            'artifact_version': artifact_version,
+            'content_sha256': content_sha256,
+            'source_market_date': source_date.isoformat(),
+            'target_trade_date': tampered_target.isoformat(),
+            'policy_context_as_of_date': tampered_target.isoformat(),
+            'idempotency_key': recomputed_key,
+        },
+    }
+
+    with pytest.raises(ValueError, match='next KRX trading day'):
+        _normalize_feedback_scope_authority(
+            authority,
+            market_date=source_date,
+            policy_context_as_of_date=tampered_target,
+            roles=roles,
+            requested_symbols=symbols,
+            role_symbol_scopes=role_scopes,
+            feedback_scope_mode='decider_scope_fast_path',
+            knowledge_cutoff_at=cutoff,
+            fs_div='CFS',
+        )
 
 
 class SnapshotSequence:
@@ -1022,6 +1516,88 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             run_admitted.call_args.kwargs['effective_knowledge_cutoff_at'],
             effective_cutoff,
         )
+
+    def test_feedback_retry_admission_lock_rechecks_completed_idempotency(
+        self,
+    ) -> None:
+        suffix = uuid4().hex[:10].upper()
+        market_date = date.fromisoformat('2041-01-02')
+        symbol = f'A{suffix}'
+        first_run_id = f'claim-idempotent-first-{suffix}'
+        duplicate_run_id = f'claim-idempotent-duplicate-{suffix}'
+        idempotency_key = f'weekly-policy-rebind:{uuid4().hex}'
+        cutoff = '2041-01-02T00:00:00+00:00'
+        authority = {'test_authority': suffix}
+        common = {
+            'market_date': market_date,
+            'roles': ('signal-decider',),
+            'requested_symbols': (symbol,),
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'started_at': datetime.now(timezone.utc),
+            'admission_knowledge_cutoff_at': cutoff,
+            'policy_context_as_of_date': market_date,
+            'idempotency_key': idempotency_key,
+            'role_symbol_scopes': {'signal-decider': [symbol]},
+            'fs_div': 'CFS',
+            'scope_authority': authority,
+        }
+
+        def cleanup() -> None:
+            with session_scope() as session:
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.run_id.in_(
+                            [first_run_id, duplicate_run_id]
+                        )
+                    )
+                )
+
+        self.addCleanup(cleanup)
+        first = _claim_feedback_retry_run(
+            **common,
+            run_id=first_run_id,
+        )
+        self.assertTrue(first['acquired'])
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == first_run_id
+                )
+            ).scalar_one()
+            row.status = 'completed'
+            row.symbols_total = 1
+            row.completed_count = 1
+            row.failed_count = 0
+            row.completed_at = datetime.now(timezone.utc)
+
+        replay = _claim_feedback_retry_run(
+            **common,
+            run_id=duplicate_run_id,
+        )
+        self.assertFalse(replay['acquired'])
+        self.assertTrue(replay['idempotency_match'])
+        self.assertTrue(replay['exact_scope'])
+        self.assertEqual(replay['conflict_run']['status'], 'completed')
+
+        collision = _claim_feedback_retry_run(
+            **{
+                **common,
+                'admission_knowledge_cutoff_at': (
+                    '2041-01-02T00:01:00+00:00'
+                ),
+            },
+            run_id=duplicate_run_id,
+        )
+        self.assertFalse(collision['acquired'])
+        self.assertTrue(collision['idempotency_match'])
+        self.assertFalse(collision['exact_scope'])
+        with session_scope() as session:
+            count = session.query(AgentContextFeedbackRun).filter(
+                AgentContextFeedbackRun.run_id.in_(
+                    [first_run_id, duplicate_run_id]
+                )
+            ).count()
+        self.assertEqual(count, 1)
 
     def test_feedback_retry_admission_claim_atomically_rejects_overlapping_scope(self):
         suffix = uuid4().hex[:10].upper()
@@ -4798,6 +5374,9 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                                     market_date=date.fromisoformat('2040-04-16'),
                                     roles=roles,
                                     fs_div='OFS',
+                                    policy_context_as_of_date=date.fromisoformat(
+                                        '2040-04-20'
+                                    ),
                                     max_cycles=1,
                                     outer_batch_size=2,
                                     reuse_existing=True,
@@ -4856,6 +5435,18 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         )
         self.assertTrue(
             all(call['fs_div'] == 'OFS' for call in dispatch_calls)
+        )
+        self.assertEqual(
+            run_state_service.started[0]['request_payload'][
+                'policy_context_as_of_date'
+            ],
+            '2040-04-20',
+        )
+        self.assertTrue(
+            all(
+                call['policy_context_as_of_date'] == date(2040, 4, 20)
+                for call in dispatch_calls
+            )
         )
         self.assertTrue(result['completed'])
         self.assertEqual(result['cycles'][0]['role_batches'][0]['summary']['chunks'], 3)

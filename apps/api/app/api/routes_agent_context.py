@@ -49,6 +49,9 @@ from app.agent_context.retry_service import (
     agent_feedback_retry_service,
 )
 from app.agent_context.status_service import agent_context_status_service
+from app.agent_context.weekly_policy_rebind_service import (
+    weekly_policy_rebind_preparation_service,
+)
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
 
@@ -141,10 +144,24 @@ class AgentSymbolFeedbackDispatchRequest(BaseModel):
         default=None,
         description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
     )
+    policy_context_as_of_date: date | None = None
     reuse_existing: bool = True
     wait_for_completion: bool = True
     force: bool = False
     force_recompute: bool = False
+
+    @model_validator(mode='after')
+    def validate_policy_context_date(
+        self,
+    ) -> 'AgentSymbolFeedbackDispatchRequest':
+        if (
+            self.policy_context_as_of_date is not None
+            and self.policy_context_as_of_date < self.market_date
+        ):
+            raise ValueError(
+                'policy_context_as_of_date must be on or after market_date'
+            )
+        return self
 
 
 class AgentFeedbackRetryCyclesRequest(BaseModel):
@@ -158,6 +175,10 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
         default=None,
         description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
     )
+    policy_context_as_of_date: date | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+    scope_authority: dict[str, Any] | None = None
+    role_symbol_scopes: dict[str, list[str]] | None = None
     feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=200)
@@ -171,6 +192,13 @@ class AgentFeedbackRetryCyclesRequest(BaseModel):
             raise ValueError(
                 'feedback_scope_mode must be one of: '
                 + ', '.join(FEEDBACK_SCOPE_MODES)
+            )
+        if (
+            self.policy_context_as_of_date is not None
+            and self.policy_context_as_of_date < self.market_date
+        ):
+            raise ValueError(
+                'policy_context_as_of_date must be on or after market_date'
             )
         return self
 
@@ -186,6 +214,10 @@ class AgentFeedbackFollowupRequest(BaseModel):
         default=None,
         description=_KNOWLEDGE_CUTOFF_DESCRIPTION,
     )
+    policy_context_as_of_date: date | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+    scope_authority: dict[str, Any] | None = None
+    role_symbol_scopes: dict[str, list[str]] | None = None
     feedback_scope_mode: str = Field(default=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH)
     max_cycles: int = Field(default=3, ge=1, le=20)
     outer_batch_size: int = Field(default=20, ge=1, le=500)
@@ -200,7 +232,21 @@ class AgentFeedbackFollowupRequest(BaseModel):
                 'feedback_scope_mode must be one of: '
                 + ', '.join(FEEDBACK_SCOPE_MODES)
             )
+        if (
+            self.policy_context_as_of_date is not None
+            and self.policy_context_as_of_date < self.market_date
+        ):
+            raise ValueError(
+                'policy_context_as_of_date must be on or after market_date'
+            )
         return self
+
+
+class WeeklyPolicyRebindPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    as_of_date: date
+    market: str = Field(default='KRX', min_length=3, max_length=16)
 
 
 class AgentFeedbackCleanupRunRequest(BaseModel):
@@ -831,6 +877,9 @@ async def dispatch_symbol_agent_feedback(
                 fs_div=payload.fs_div,
                 disclosures_limit=payload.disclosures_limit,
                 knowledge_cutoff_at=effective_knowledge_cutoff_at,
+                policy_context_as_of_date=(
+                    payload.policy_context_as_of_date
+                ),
                 reuse_existing=payload.reuse_existing,
                 force=payload.force,
                 force_recompute=payload.force_recompute,
@@ -853,6 +902,11 @@ async def dispatch_symbol_agent_feedback(
             'disclosures_limit': payload.disclosures_limit,
             'knowledge_cutoff_at': (
                 effective_knowledge_cutoff_at.isoformat()
+            ),
+            'policy_context_as_of_date': (
+                payload.policy_context_as_of_date.isoformat()
+                if payload.policy_context_as_of_date is not None
+                else payload.market_date.isoformat()
             ),
             'reuse_existing': payload.reuse_existing,
             'force_recompute': payload.force_recompute,
@@ -966,6 +1020,9 @@ async def dispatch_symbol_agent_feedback(
                     fs_div=payload.fs_div,
                     disclosures_limit=payload.disclosures_limit,
                     knowledge_cutoff_at=effective_knowledge_cutoff_at,
+                    policy_context_as_of_date=(
+                        payload.policy_context_as_of_date
+                    ),
                     reuse_existing=payload.reuse_existing,
                     request_run_id=request_run_id,
                     force=payload.force,
@@ -1010,6 +1067,11 @@ async def dispatch_symbol_agent_feedback(
                 'knowledge_cutoff_at': (
                     effective_knowledge_cutoff_at.isoformat()
                 ),
+                'policy_context_as_of_date': (
+                    payload.policy_context_as_of_date.isoformat()
+                    if payload.policy_context_as_of_date is not None
+                    else payload.market_date.isoformat()
+                ),
                 'reuse_existing': payload.reuse_existing,
                 'force_recompute': payload.force_recompute,
                 'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
@@ -1038,6 +1100,12 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
             fs_div=payload.fs_div,
             knowledge_cutoff_at=payload.knowledge_cutoff_at,
+            policy_context_as_of_date=(
+                payload.policy_context_as_of_date
+            ),
+            idempotency_key=payload.idempotency_key,
+            scope_authority=payload.scope_authority,
+            role_symbol_scopes=payload.role_symbol_scopes,
             feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,
@@ -1055,6 +1123,25 @@ async def run_agent_feedback_retry_cycles(payload: AgentFeedbackRetryCyclesReque
         raise HTTPException(status_code=500, detail=f'Agent feedback retry cycles failed: {exc}') from exc
 
 
+@router.post('/feedback/rebind/prepare')
+async def prepare_weekly_policy_rebind(
+    payload: WeeklyPolicyRebindPrepareRequest,
+) -> dict:
+    try:
+        return await run_in_threadpool(
+            weekly_policy_rebind_preparation_service.prepare,
+            as_of_date=payload.as_of_date,
+            market=payload.market,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f'Weekly policy rebind preparation failed: {exc}',
+        ) from exc
+
+
 @router.post('/feedback/followup')
 async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> dict:
     try:
@@ -1064,6 +1151,12 @@ async def run_agent_feedback_followup(payload: AgentFeedbackFollowupRequest) -> 
             symbols=tuple(payload.symbols) if payload.symbols is not None else None,
             fs_div=payload.fs_div,
             knowledge_cutoff_at=payload.knowledge_cutoff_at,
+            policy_context_as_of_date=(
+                payload.policy_context_as_of_date
+            ),
+            idempotency_key=payload.idempotency_key,
+            scope_authority=payload.scope_authority,
+            role_symbol_scopes=payload.role_symbol_scopes,
             feedback_scope_mode=payload.feedback_scope_mode,
             max_cycles=payload.max_cycles,
             outer_batch_size=payload.outer_batch_size,

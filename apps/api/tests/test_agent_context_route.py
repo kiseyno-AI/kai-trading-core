@@ -1323,6 +1323,7 @@ class AgentContextRouteTests(unittest.TestCase):
                     'outer_batch_size': 10,
                     'feedback_scope_mode': 'broad_feedback_universe',
                     'knowledge_cutoff_at': '2026-04-14T15:30:00+09:00',
+                    'policy_context_as_of_date': '2026-04-15',
                     'reuse_existing': False,
                 },
             )
@@ -1341,6 +1342,10 @@ class AgentContextRouteTests(unittest.TestCase):
             fake_service.last_config.knowledge_cutoff_at,
             datetime.fromisoformat('2026-04-14T15:30:00+09:00'),
         )
+        self.assertEqual(
+            fake_service.last_config.policy_context_as_of_date,
+            date(2026, 4, 15),
+        )
         self.assertFalse(fake_service.last_config.reuse_existing)
         self.assertEqual(response.json()['feedback_scope_mode'], 'broad_feedback_universe')
         self.assertEqual(response.json()['requested_symbols'], ['005930'])
@@ -1348,6 +1353,34 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(summary['first_feedback_at'], '2026-04-14T01:00:00+00:00')
         self.assertEqual(summary['completed_feedback_per_minute'], 0.6)
         self.assertEqual(summary['estimated_completion_at'], '2026-04-14T01:05:00+00:00')
+
+    def test_weekly_policy_rebind_prepare_route_returns_no_order_contract(self):
+        prepared = {
+            'status': 'ready',
+            'reason': 'weekly_policy_rebind_ready',
+            'source_market_date': '2026-10-16',
+            'target_trade_date': '2026-10-19',
+            'policy_context_as_of_date': '2026-10-19',
+            'symbols': ['005930'],
+            'roles': ['short-term-decider', 'signal-decider'],
+            'retry_request': {'market_date': '2026-10-16'},
+        }
+        with patch.object(
+            routes_agent_context.weekly_policy_rebind_preparation_service,
+            'prepare',
+            return_value=prepared,
+        ) as prepare:
+            response = TestClient(self.app).post(
+                '/agent-context/feedback/rebind/prepare',
+                json={'as_of_date': '2026-10-17', 'market': 'KRX'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), prepared)
+        prepare.assert_called_once_with(
+            as_of_date=date(2026, 10, 17),
+            market='KRX',
+        )
 
     def test_feedback_followup_route_preserves_knowledge_cutoff(self):
         fake_service = FakeAgentFeedbackRetryService()
