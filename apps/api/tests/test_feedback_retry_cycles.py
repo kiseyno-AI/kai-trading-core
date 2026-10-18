@@ -20,6 +20,8 @@ from app.db_models import (
     AgentContextFeedback,
     AgentContextFeedbackFailure,
     AgentContextFeedbackRun,
+    AgentFeedbackSessionCleanupFailure,
+    SignalDeciderDecisionSnapshot,
 )
 from app.agent_context.retry_service import (
     AgentFeedbackRetryService,
@@ -33,6 +35,7 @@ from app.agent_context.retry_service import (
     _FeedbackRetryClaimLease,
     _feedback_retry_admission_lock_key,
     _feedback_retry_owner_token_hash,
+    _finish_feedback_retry_claim_if_running,
     _normalize_feedback_scope_authority,
     _validate_weekly_policy_rebind_authority_against_persisted_state,
     _claim_feedback_retry_run,
@@ -685,6 +688,541 @@ class RecordingRunStateService:
 
 
 class FeedbackRetryCycleTests(unittest.TestCase):
+    def test_progress_callback_includes_current_lifecycle_stage(self):
+        observed: dict[str, object] = {}
+
+        def weekly_policy_guard(*, stage: str, **payload):
+            observed['stage'] = stage
+            observed['current_step'] = payload['current_step']
+
+        AgentFeedbackRetryService._emit_progress_callback(
+            progress_callback=weekly_policy_guard,
+            request_run_id='feedback-cycle-stage-regression',
+            lifecycle_stage='cycle_started',
+            status='running',
+            completed_count=0,
+            failed_count=0,
+            summary_payload={
+                'progress_summary': {'expected_feedback_count': 160},
+            },
+            cycle_result={'cycles_completed': 0},
+        )
+
+        self.assertEqual(observed['stage'], 'cycle_started')
+        self.assertEqual(observed['current_step'], 'cycle_started')
+
+    def _weekly_zero_effect_claim_fixture(self):
+        suffix = uuid4().hex[:10].upper()
+        market_date = date.fromisoformat('2042-01-02')
+        target_date = date.fromisoformat('2042-01-03')
+        symbol = f'Z{suffix}'
+        first_run_id = f'weekly-zero-first-{suffix}'
+        idempotency_key = f'weekly-policy-rebind:{uuid4().hex}'
+        roles = DECISION_SUPPORT_AGENT_NAMES
+        scopes = {role: [symbol] for role in roles}
+        authority = {
+            'policy_binding': {
+                'schema_version': 'weekly_policy_rebind_v1',
+                'target_trade_date': target_date.isoformat(),
+                'idempotency_key': idempotency_key,
+            }
+        }
+        common = {
+            'market_date': market_date,
+            'roles': roles,
+            'requested_symbols': (symbol,),
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'started_at': datetime.now(timezone.utc),
+            'admission_knowledge_cutoff_at': (
+                '2042-01-02T00:00:00+00:00'
+            ),
+            'policy_context_as_of_date': target_date,
+            'idempotency_key': idempotency_key,
+            'role_symbol_scopes': scopes,
+            'fs_div': 'CFS',
+            'scope_authority': authority,
+        }
+        first = _claim_feedback_retry_run(
+            **common,
+            run_id=first_run_id,
+        )
+        self.assertTrue(first['acquired'])
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == first_run_id
+                )
+            ).scalar_one()
+            row.status = 'failed'
+            row.completed_count = 0
+            row.failed_count = 0
+            row.completed_at = datetime.now(timezone.utc)
+            row.summary_payload = {
+                'lifecycle_stage': 'finished',
+                'progress_summary': {
+                    'completed_feedback_count': 0,
+                    'failed_items': 0,
+                },
+                'cycle_result': {'cycles_completed': 0},
+            }
+
+        def cleanup():
+            with session_scope() as session:
+                session.execute(
+                    delete(SignalDeciderDecisionSnapshot).where(
+                        SignalDeciderDecisionSnapshot.symbol == symbol
+                    )
+                )
+                session.execute(
+                    delete(AgentFeedbackSessionCleanupFailure).where(
+                        AgentFeedbackSessionCleanupFailure.symbol == symbol
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackFailure).where(
+                        AgentContextFeedbackFailure.symbol == symbol
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedback).where(
+                        AgentContextFeedback.symbol == symbol
+                    )
+                )
+                session.execute(
+                    delete(AgentContextFeedbackRun).where(
+                        AgentContextFeedbackRun.market_date == market_date,
+                        AgentContextFeedbackRun.run_id.like(
+                            f'%{suffix}%'
+                        ),
+                    )
+                )
+
+        self.addCleanup(cleanup)
+        return common, first_run_id, symbol, suffix
+
+    def test_weekly_zero_effect_failed_attempt_claims_one_successor(self):
+        common, first_run_id, _symbol, suffix = (
+            self._weekly_zero_effect_claim_fixture()
+        )
+        successor_run_id = f'weekly-zero-successor-{suffix}'
+
+        claim = _claim_feedback_retry_run(
+            **common,
+            run_id=successor_run_id,
+        )
+
+        self.assertTrue(claim['acquired'])
+        self.assertEqual(claim['retry_of_run_id'], first_run_id)
+        self.assertEqual(claim['idempotency_attempt'], 2)
+        with session_scope() as session:
+            original = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == first_run_id
+                )
+            ).scalar_one()
+            successor = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == successor_run_id
+                )
+            ).scalar_one()
+            self.assertEqual(original.status, 'failed')
+            self.assertEqual(original.completed_count, 0)
+            self.assertEqual(original.failed_count, 0)
+            self.assertEqual(
+                successor.request_payload['retry_of_run_id'],
+                first_run_id,
+            )
+            self.assertEqual(
+                successor.request_payload['idempotency_attempt'],
+                2,
+            )
+
+    def test_weekly_zero_effect_retry_is_atomic_under_concurrency(self):
+        common, first_run_id, _symbol, suffix = (
+            self._weekly_zero_effect_claim_fixture()
+        )
+        run_ids = [
+            f'weekly-zero-concurrent-a-{suffix}',
+            f'weekly-zero-concurrent-b-{suffix}',
+        ]
+        barrier = threading.Barrier(2)
+
+        def claim(run_id):
+            barrier.wait(timeout=5)
+            return _claim_feedback_retry_run(
+                **common,
+                run_id=run_id,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, run_ids))
+
+        acquired = [result for result in results if result['acquired']]
+        blocked = [result for result in results if not result['acquired']]
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(acquired[0]['retry_of_run_id'], first_run_id)
+        self.assertEqual(
+            blocked[0]['conflict_run']['run_id'],
+            acquired[0]['run_id'],
+        )
+
+    def test_weekly_zero_effect_retry_blocks_any_durable_effect(self):
+        effect_kinds = (
+            'child_run',
+            'feedback',
+            'failure',
+            'cleanup_failure',
+            'decision_snapshot',
+        )
+        for effect_kind in effect_kinds:
+            with self.subTest(effect_kind=effect_kind):
+                common, first_run_id, symbol, suffix = (
+                    self._weekly_zero_effect_claim_fixture()
+                )
+                with session_scope() as session:
+                    if effect_kind == 'child_run':
+                        session.add(
+                            AgentContextFeedbackRun(
+                                run_id=f'weekly-child-{suffix}',
+                                market_date=common['market_date'],
+                                status='failed',
+                                symbols_total=0,
+                                completed_count=0,
+                                failed_count=0,
+                                request_payload={
+                                    'parent_run_id': first_run_id,
+                                },
+                                summary_payload={},
+                                started_at=datetime.now(timezone.utc),
+                                completed_at=datetime.now(timezone.utc),
+                            )
+                        )
+                    elif effect_kind == 'feedback':
+                        session.add(
+                            AgentContextFeedback(
+                                market_date=common['market_date'],
+                                symbol=symbol,
+                                agent_name='signal-decider',
+                                run_id=first_run_id,
+                                summary_payload={},
+                                feedback_payload={},
+                            )
+                        )
+                    elif effect_kind == 'failure':
+                        session.add(
+                            AgentContextFeedbackFailure(
+                                market_date=common['market_date'],
+                                symbol=symbol,
+                                agent_name='signal-decider',
+                                run_id=first_run_id,
+                                failure_kind='dispatch_failed',
+                                retryable=True,
+                                summary_payload={},
+                            )
+                        )
+                    elif effect_kind == 'cleanup_failure':
+                        session.add(
+                            AgentFeedbackSessionCleanupFailure(
+                                market_date=common['market_date'],
+                                symbol=symbol,
+                                agent_name='signal-decider',
+                                run_id=first_run_id,
+                                session_key=f'session-{suffix}',
+                            )
+                        )
+                    else:
+                        session.add(
+                            SignalDeciderDecisionSnapshot(
+                                market_date=common['market_date'],
+                                symbol=symbol,
+                                agent_name='signal-decider',
+                                decision_run_id=first_run_id,
+                                policy_version='signal_decider_policy_v1',
+                                decision_action='wait',
+                                preferred_action='wait',
+                                next_day_open_action='wait',
+                                entry_price_basis='next_open',
+                                thesis_summary='test evidence',
+                                supporting_evidence_payload=[],
+                                decision_risks_payload=[],
+                                invalidation_conditions_payload=[],
+                                data_quality_warnings_payload=[],
+                                specialist_disagreement_payload=[],
+                                traceability_payload={},
+                                input_feature_snapshot_payload={},
+                                request_payload={},
+                                response_payload={},
+                                response_summary_payload={},
+                            )
+                        )
+
+                claim = _claim_feedback_retry_run(
+                    **common,
+                    run_id=f'weekly-blocked-{suffix}',
+                )
+
+                self.assertFalse(claim['acquired'])
+                self.assertEqual(
+                    claim['conflict_run']['run_id'],
+                    first_run_id,
+                )
+
+    def test_weekly_retry_does_not_chain_after_attempt_two(self):
+        common, first_run_id, _symbol, suffix = (
+            self._weekly_zero_effect_claim_fixture()
+        )
+        successor_run_id = f'weekly-attempt-two-{suffix}'
+        successor = _claim_feedback_retry_run(
+            **common,
+            run_id=successor_run_id,
+        )
+        self.assertTrue(successor['acquired'])
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == successor_run_id
+                )
+            ).scalar_one()
+            row.status = 'failed'
+            row.completed_count = 0
+            row.failed_count = 0
+            row.completed_at = datetime.now(timezone.utc)
+            row.summary_payload = {
+                'lifecycle_stage': 'finished',
+                'progress_summary': {
+                    'completed_feedback_count': 0,
+                    'failed_items': 0,
+                },
+                'cycle_result': {'cycles_completed': 0},
+            }
+
+        third = _claim_feedback_retry_run(
+            **common,
+            run_id=f'weekly-attempt-three-{suffix}',
+        )
+
+        self.assertFalse(third['acquired'])
+        self.assertEqual(
+            third['conflict_run']['run_id'],
+            successor_run_id,
+        )
+        self.assertEqual(successor['retry_of_run_id'], first_run_id)
+
+    def test_weekly_zero_effect_retry_fails_closed_on_uncertain_state(self):
+        mutations = {
+            'partial_status': lambda row: setattr(row, 'status', 'partial'),
+            'missing_completed_at': lambda row: setattr(
+                row, 'completed_at', None
+            ),
+            'zero_total': lambda row: setattr(row, 'symbols_total', 0),
+            'completed_effect': lambda row: setattr(
+                row, 'completed_count', 1
+            ),
+            'failed_effect': lambda row: setattr(row, 'failed_count', 1),
+            'wrong_lifecycle': None,
+            'cycle_completed': None,
+            'missing_summary': lambda row: setattr(
+                row, 'summary_payload', None
+            ),
+        }
+        for state_name, mutate in mutations.items():
+            with self.subTest(state_name=state_name):
+                common, first_run_id, _symbol, suffix = (
+                    self._weekly_zero_effect_claim_fixture()
+                )
+                with session_scope() as session:
+                    row = session.execute(
+                        select(AgentContextFeedbackRun).where(
+                            AgentContextFeedbackRun.run_id == first_run_id
+                        )
+                    ).scalar_one()
+                    if state_name == 'wrong_lifecycle':
+                        row.summary_payload = {
+                            **row.summary_payload,
+                            'lifecycle_stage': 'cycle_started',
+                        }
+                    elif state_name == 'cycle_completed':
+                        row.summary_payload = {
+                            **row.summary_payload,
+                            'cycle_result': {
+                                **row.summary_payload['cycle_result'],
+                                'cycles_completed': 1,
+                            },
+                        }
+                    else:
+                        mutate(row)
+
+                claim = _claim_feedback_retry_run(
+                    **common,
+                    run_id=f'weekly-uncertain-{suffix}',
+                )
+
+                self.assertFalse(claim['acquired'])
+                self.assertEqual(
+                    claim['conflict_run']['run_id'],
+                    first_run_id,
+                )
+
+    def test_weekly_rebind_open_session_blocks_before_claim(self):
+        service = AgentFeedbackRetryService()
+        market_date = date.fromisoformat('2042-01-02')
+        target_date = date.fromisoformat('2042-01-03')
+        cutoff = datetime(2042, 1, 2, tzinfo=timezone.utc)
+        idempotency_key = f'weekly-policy-rebind:{uuid4().hex}'
+        authority = {
+            'policy_binding': {
+                'schema_version': 'weekly_policy_rebind_v1',
+                'target_trade_date': target_date.isoformat(),
+                'idempotency_key': idempotency_key,
+            }
+        }
+        config = FeedbackRetryCycleConfig(
+            market_date=market_date,
+            policy_context_as_of_date=target_date,
+            roles=DECISION_SUPPORT_AGENT_NAMES,
+            symbols=('005930',),
+            knowledge_cutoff_at=cutoff,
+            idempotency_key=idempotency_key,
+            fs_div='CFS',
+            max_cycles=3,
+            outer_batch_size=20,
+            reuse_existing=True,
+            force_recompute=True,
+            scope_authority=authority,
+            role_symbol_scopes={
+                role: ['005930']
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+        )
+
+        with (
+            patch(
+                'app.agent_context.retry_service._normalize_feedback_scope_authority',
+                return_value=authority,
+            ),
+            patch(
+                'app.agent_context.retry_service.resolve_external_news_knowledge_cutoff_for_symbols',
+                return_value=(cutoff, 'requested'),
+            ),
+            patch(
+                'app.agent_context.retry_service.get_market_state',
+                return_value=SimpleNamespace(
+                    current_calendar_date=target_date.isoformat(),
+                    state='OPEN',
+                    is_open=True,
+                ),
+            ),
+            patch(
+                'app.agent_context.retry_service._claim_feedback_retry_run',
+            ) as claim,
+            self.assertRaisesRegex(
+                RuntimeError,
+                'stage=admission',
+            ),
+        ):
+            service.run_retry_cycles(config=config)
+
+        claim.assert_not_called()
+
+    def test_weekly_retry_lineage_reaches_admitted_execution(self):
+        service = AgentFeedbackRetryService()
+        market_date = date.fromisoformat('2042-01-02')
+        target_date = date.fromisoformat('2042-01-03')
+        cutoff = datetime(2042, 1, 2, tzinfo=timezone.utc)
+        symbol = '005930'
+        idempotency_key = f'weekly-policy-rebind:{uuid4().hex}'
+        authority = {
+            'policy_binding': {
+                'schema_version': 'weekly_policy_rebind_v1',
+                'target_trade_date': target_date.isoformat(),
+                'idempotency_key': idempotency_key,
+            }
+        }
+        scopes = {
+            role: [symbol] for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        config = FeedbackRetryCycleConfig(
+            market_date=market_date,
+            policy_context_as_of_date=target_date,
+            roles=DECISION_SUPPORT_AGENT_NAMES,
+            symbols=(symbol,),
+            knowledge_cutoff_at=cutoff,
+            idempotency_key=idempotency_key,
+            fs_div='CFS',
+            max_cycles=3,
+            outer_batch_size=20,
+            reuse_existing=True,
+            force_recompute=True,
+            scope_authority=authority,
+            role_symbol_scopes=scopes,
+        )
+
+        class LeaseContext:
+            def __enter__(self):
+                return SimpleNamespace()
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with (
+            patch(
+                'app.agent_context.retry_service._normalize_feedback_scope_authority',
+                return_value=authority,
+            ),
+            patch(
+                'app.agent_context.retry_service._assert_weekly_policy_target_session_not_open',
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
+            patch.object(
+                service,
+                '_load_eligible_symbols',
+                return_value=[symbol],
+            ),
+            patch(
+                'app.agent_context.retry_service.resolve_external_news_knowledge_cutoff_for_symbols',
+                return_value=(cutoff, 'requested'),
+            ),
+            patch(
+                'app.agent_context.retry_service.find_feedback_retry_run_by_idempotency_key',
+                return_value=None,
+            ),
+            patch(
+                'app.agent_context.retry_service._claim_feedback_retry_run',
+                return_value={
+                    'acquired': True,
+                    'owner_token': 'owner-token',
+                    'retry_of_run_id': 'failed-attempt-one',
+                    'idempotency_attempt': 2,
+                },
+            ),
+            patch(
+                'app.agent_context.retry_service._feedback_retry_claim_lease',
+                return_value=LeaseContext(),
+            ),
+            patch(
+                'app.agent_context.retry_service._finish_feedback_retry_claim_if_running',
+            ),
+            patch.object(
+                service,
+                '_run_retry_cycles_admitted',
+                return_value={'status': 'completed'},
+            ) as admitted,
+        ):
+            service.run_retry_cycles(config=config)
+
+        self.assertEqual(
+            admitted.call_args.kwargs['retry_of_run_id'],
+            'failed-attempt-one',
+        )
+        self.assertEqual(
+            admitted.call_args.kwargs['idempotency_attempt'],
+            2,
+        )
+
     def test_resolves_completed_summary_cutoff_for_exact_source_and_symbol_scope(
         self,
     ):
@@ -2159,6 +2697,65 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             self.assertEqual(
                 persisted.summary_payload['admission_owner_error']['type'],
                 'RuntimeError',
+            )
+
+    def test_owner_exception_is_recorded_after_inner_finally_terminalizes(self):
+        suffix = uuid4().hex[:10].upper()
+        market_date = date.fromisoformat('2042-01-04')
+        run_id = f'inner-finalized-{suffix}'
+        claim = _claim_feedback_retry_run(
+            market_date=market_date,
+            roles=('signal-decider',),
+            requested_symbols=(f'E{suffix}',),
+            feedback_scope_mode='decider_scope_fast_path',
+            run_id=run_id,
+            started_at=datetime.now(timezone.utc),
+        )
+        self.addCleanup(
+            lambda: self._delete_feedback_retry_run(run_id)
+        )
+        with session_scope() as session:
+            row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == run_id
+                )
+            ).scalar_one()
+            row.status = 'failed'
+            row.completed_at = datetime.now(timezone.utc)
+            row.summary_payload = {'lifecycle_stage': 'finished'}
+
+        _finish_feedback_retry_claim_if_running(
+            run_id=run_id,
+            owner_token=claim['owner_token'],
+            status='failed',
+            error=RuntimeError(
+                'callback failed token=do-not-persist\nnext line'
+            ),
+        )
+
+        with session_scope() as session:
+            persisted = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == run_id
+                )
+            ).scalar_one()
+            error_payload = persisted.summary_payload[
+                'admission_owner_error'
+            ]
+            self.assertEqual(persisted.status, 'failed')
+            self.assertEqual(persisted.failed_count, 0)
+            self.assertEqual(error_payload['type'], 'RuntimeError')
+            self.assertNotIn('do-not-persist', error_payload['message'])
+            self.assertNotIn('\n', error_payload['message'])
+            self.assertIn('[REDACTED]', error_payload['message'])
+
+    @staticmethod
+    def _delete_feedback_retry_run(run_id: str) -> None:
+        with session_scope() as session:
+            session.execute(
+                delete(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == run_id
+                )
             )
 
     def test_feedback_retry_admission_lock_key_is_market_date_scoped(self):

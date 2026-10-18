@@ -71,6 +71,8 @@ from app.db_models import (
     AgentContextFeedback,
     AgentContextFeedbackFailure,
     AgentContextFeedbackRun,
+    AgentFeedbackSessionCleanupFailure,
+    SignalDeciderDecisionSnapshot,
 )
 from app.eod.summary_cutoff_contract import (
     COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION,
@@ -86,6 +88,9 @@ CHILD_RUN_LINEAGE_SCHEMA_VERSION = 'agent_feedback_child_run_lineage_v1'
 REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION = 'agent_feedback_reuse_evidence_v1'
 _LEASE_LOSS_REUSABLE_PARENT_STATUS = 'abandoned_lease_loss_reusable'
 WEEKLY_POLICY_REBIND_SCHEMA_VERSION = 'weekly_policy_rebind_v1'
+WEEKLY_POLICY_REBIND_RETRY_LINEAGE_SCHEMA_VERSION = (
+    'weekly_policy_rebind_retry_lineage_v1'
+)
 logger = logging.getLogger(__name__)
 
 
@@ -1541,6 +1546,125 @@ def _assert_weekly_policy_target_session_not_open(
         )
 
 
+def _weekly_policy_zero_effect_retry_lineage(
+    *,
+    session: Any,
+    row: AgentContextFeedbackRun,
+    payload: Mapping[str, Any],
+    exact_binding: bool,
+    idempotency_key: str,
+) -> dict[str, Any] | None:
+    """Prove that a failed first weekly attempt had no durable effects."""
+
+    authority = payload.get('scope_authority')
+    policy_binding = (
+        authority.get('policy_binding')
+        if isinstance(authority, Mapping)
+        else None
+    )
+    retry_admission = (
+        payload.get('retry_admission')
+        if isinstance(payload.get('retry_admission'), Mapping)
+        else {}
+    )
+    raw_attempt = payload.get(
+        'idempotency_attempt',
+        retry_admission.get('idempotency_attempt'),
+    )
+    if raw_attempt is not None and type(raw_attempt) is not int:
+        return None
+    try:
+        idempotency_attempt = (
+            1 if raw_attempt is None else raw_attempt
+        )
+        symbols_total = int(row.symbols_total or 0)
+        completed_count = int(row.completed_count or 0)
+        failed_count = int(row.failed_count or 0)
+    except (TypeError, ValueError):
+        return None
+    summary = row.summary_payload
+    cycle_result = (
+        summary.get('cycle_result')
+        if isinstance(summary, Mapping)
+        else None
+    )
+    progress_summary = (
+        summary.get('progress_summary')
+        if isinstance(summary, Mapping)
+        else None
+    )
+    if not (
+        exact_binding
+        and isinstance(policy_binding, Mapping)
+        and str(policy_binding.get('schema_version') or '').strip()
+        == WEEKLY_POLICY_REBIND_SCHEMA_VERSION
+        and str(policy_binding.get('idempotency_key') or '').strip()
+        == idempotency_key
+        and str(row.status or '').strip().lower() == 'failed'
+        and row.completed_at is not None
+        and symbols_total > 0
+        and completed_count == 0
+        and failed_count == 0
+        and isinstance(summary, Mapping)
+        and str(summary.get('lifecycle_stage') or '').strip() == 'finished'
+        and isinstance(cycle_result, Mapping)
+        and type(cycle_result.get('cycles_completed')) is int
+        and cycle_result.get('cycles_completed') == 0
+        and isinstance(progress_summary, Mapping)
+        and type(progress_summary.get('completed_feedback_count')) is int
+        and progress_summary.get('completed_feedback_count') == 0
+        and type(progress_summary.get('failed_items')) is int
+        and progress_summary.get('failed_items') == 0
+        and not str(payload.get('retry_of_run_id') or '').strip()
+        and not str(retry_admission.get('retry_of_run_id') or '').strip()
+        and idempotency_attempt == 1
+    ):
+        return None
+
+    predecessor_run_id = str(row.run_id or '').strip()
+    child_run = session.execute(
+        select(AgentContextFeedbackRun.id).where(
+            AgentContextFeedbackRun.request_payload[
+                'parent_run_id'
+            ].as_string()
+            == predecessor_run_id
+        ).limit(1)
+    ).first()
+    if child_run is not None:
+        return None
+
+    linked_run_ids = (predecessor_run_id,)
+    durable_effect_queries = (
+        select(AgentContextFeedback.id).where(
+            AgentContextFeedback.run_id.in_(linked_run_ids)
+        ),
+        select(AgentContextFeedbackFailure.id).where(
+            AgentContextFeedbackFailure.run_id.in_(linked_run_ids)
+        ),
+        select(AgentFeedbackSessionCleanupFailure.id).where(
+            AgentFeedbackSessionCleanupFailure.run_id.in_(linked_run_ids)
+        ),
+        select(SignalDeciderDecisionSnapshot.id).where(
+            SignalDeciderDecisionSnapshot.decision_run_id.in_(
+                linked_run_ids
+            )
+        ),
+    )
+    if any(
+        session.execute(query.limit(1)).first() is not None
+        for query in durable_effect_queries
+    ):
+        return None
+
+    return {
+        'schema_version': (
+            WEEKLY_POLICY_REBIND_RETRY_LINEAGE_SCHEMA_VERSION
+        ),
+        'retry_of_run_id': predecessor_run_id,
+        'idempotency_attempt': 2,
+    }
+
+
 def _claim_feedback_retry_run(
     *,
     market_date: date,
@@ -1604,6 +1728,7 @@ def _claim_feedback_retry_run(
         roles=normalized_roles,
         symbols=normalized_symbols,
     )
+    retry_lineage: dict[str, Any] | None = None
 
     def exact_admission_binding(payload: Mapping[str, Any]) -> bool:
         active_scope = _admission_scope_from_payload(payload)
@@ -1691,12 +1816,22 @@ def _claim_feedback_retry_run(
                 snapshot = _serialize_feedback_retry_run(row)
                 if _feedback_retry_run_is_stale(snapshot):
                     break
+                exact_binding = exact_admission_binding(payload)
+                retry_lineage = _weekly_policy_zero_effect_retry_lineage(
+                    session=session,
+                    row=row,
+                    payload=payload,
+                    exact_binding=exact_binding,
+                    idempotency_key=normalized_idempotency_key,
+                )
+                if retry_lineage is not None:
+                    break
                 return {
                     'acquired': False,
                     'run_id': None,
                     'owner_token': None,
                     'conflict_run': snapshot,
-                    'exact_scope': exact_admission_binding(payload),
+                    'exact_scope': exact_binding,
                     'idempotency_match': True,
                 }
 
@@ -1773,6 +1908,28 @@ def _claim_feedback_retry_run(
             )
             for role, symbols in requested_scope.items()
         }
+        policy_binding = (
+            scope_authority.get('policy_binding')
+            if isinstance(scope_authority, Mapping)
+            and isinstance(scope_authority.get('policy_binding'), Mapping)
+            else None
+        )
+        initial_weekly_attempt = bool(
+            retry_lineage is None
+            and isinstance(policy_binding, Mapping)
+            and str(policy_binding.get('schema_version') or '').strip()
+            == WEEKLY_POLICY_REBIND_SCHEMA_VERSION
+        )
+        idempotency_attempt = (
+            int(retry_lineage['idempotency_attempt'])
+            if retry_lineage is not None
+            else 1 if initial_weekly_attempt else None
+        )
+        retry_of_run_id = (
+            str(retry_lineage['retry_of_run_id'])
+            if retry_lineage is not None
+            else None
+        )
         session.add(
             AgentContextFeedbackRun(
                 run_id=run_id,
@@ -1804,6 +1961,16 @@ def _claim_feedback_retry_run(
                     'role_symbol_scopes': normalized_role_symbol_scopes,
                     'admission_scope_by_role': admission_scope_payload,
                     **(
+                        {'idempotency_attempt': idempotency_attempt}
+                        if idempotency_attempt is not None
+                        else {}
+                    ),
+                    **(
+                        {'retry_of_run_id': retry_of_run_id}
+                        if retry_of_run_id is not None
+                        else {}
+                    ),
+                    **(
                         {'scope_authority': dict(scope_authority)}
                         if scope_authority is not None
                         else {}
@@ -1814,11 +1981,27 @@ def _claim_feedback_retry_run(
                         'owner_token_hash': (
                             _feedback_retry_owner_token_hash(owner_token)
                         ),
+                        **(
+                            {
+                                'retry_lineage_schema_version': (
+                                    WEEKLY_POLICY_REBIND_RETRY_LINEAGE_SCHEMA_VERSION
+                                ),
+                                'retry_of_run_id': retry_of_run_id,
+                                'idempotency_attempt': idempotency_attempt,
+                            }
+                            if retry_of_run_id is not None
+                            else {}
+                        ),
                     },
                 },
                 summary_payload={
                     'lifecycle_stage': 'admission_claimed',
                     'admission_scope_by_role': admission_scope_payload,
+                    **(
+                        {'idempotency_retry': dict(retry_lineage)}
+                        if retry_lineage is not None
+                        else {}
+                    ),
                 },
                 started_at=started_at,
                 completed_at=None,
@@ -1831,6 +2014,8 @@ def _claim_feedback_retry_run(
         'conflict_run': None,
         'exact_scope': True,
         'idempotency_match': False,
+        'retry_of_run_id': retry_of_run_id,
+        'idempotency_attempt': idempotency_attempt,
     }
 
 
@@ -2174,12 +2359,29 @@ def _finish_feedback_retry_claim_if_running(
         ).scalar_one_or_none()
         if (
             row is None
-            or str(row.status or '').strip().lower() != 'running'
             or not _retry_admission_owner_matches(
                 row,
                 owner_token=owner_token,
             )
         ):
+            return
+        current_status = str(row.status or '').strip().lower()
+        if current_status != 'running':
+            if error is None or current_status not in {
+                'completed',
+                'partial',
+                'failed',
+            }:
+                return
+            summary_payload = dict(row.summary_payload or {})
+            summary_payload['admission_owner_error'] = (
+                _sanitize_feedback_retry_exception(error)
+            )
+            summary_payload['admission_owner_error_observed_at'] = (
+                now.isoformat()
+            )
+            row.summary_payload = summary_payload
+            row.updated_at = now
             return
         resolved_status = (
             status
@@ -2201,11 +2403,49 @@ def _finish_feedback_retry_claim_if_running(
         summary_payload = dict(row.summary_payload or {})
         summary_payload['admission_owner_finalized_at'] = now.isoformat()
         if error is not None:
-            summary_payload['admission_owner_error'] = {
-                'type': type(error).__name__,
-                'message': str(error),
-            }
+            summary_payload['admission_owner_error'] = (
+                _sanitize_feedback_retry_exception(error)
+            )
         row.summary_payload = summary_payload
+
+
+def _sanitize_feedback_retry_exception(
+    error: Exception,
+) -> dict[str, str]:
+    error_type = re.sub(
+        r'[^A-Za-z0-9_.-]+',
+        '',
+        type(error).__name__,
+    )[:128] or 'Exception'
+    message = str(error)
+    configured_secrets = (
+        getattr(settings, 'upstream_bearer_token', None),
+        getattr(settings, 'signal_decider_exec_bearer_token', None),
+        getattr(settings, 'kis_app_key', None),
+        getattr(settings, 'kis_app_secret', None),
+        getattr(settings, 'naver_search_client_id', None),
+        getattr(settings, 'naver_search_client_secret', None),
+        getattr(settings, 'openclaw_gateway_token', None),
+        getattr(settings, 'postgres_password', None),
+    )
+    for secret in configured_secrets:
+        normalized_secret = str(secret or '')
+        if normalized_secret:
+            message = message.replace(normalized_secret, '[REDACTED]')
+    message = re.sub(
+        r'(?i)\b(access[_-]?token|api[_-]?key|authorization|bearer|'
+        r'password|secret|token)\s*[:=]\s*'
+        r'(?:Bearer\s+)?(?:"[^"]*"|\'[^\']*\'|[^\s,;]+)',
+        lambda match: f'{match.group(1)}=[REDACTED]',
+        message,
+    )
+    message = re.sub(
+        r'(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@',
+        r'\1[REDACTED]@',
+        message,
+    )
+    message = ' '.join(message.split())[:1000]
+    return {'type': error_type, 'message': message}
 
 
 @dataclass(frozen=True)
@@ -3835,6 +4075,24 @@ class AgentFeedbackRetryService:
             'funnel_diagnostics': progress_summary.get('funnel_diagnostics'),
             'progress_summary': progress_summary,
             'cycle_result': cycle_result,
+            **(
+                {
+                    'idempotency_retry': {
+                        'schema_version': (
+                            WEEKLY_POLICY_REBIND_RETRY_LINEAGE_SCHEMA_VERSION
+                        ),
+                        'retry_of_run_id': request_payload[
+                            'retry_of_run_id'
+                        ],
+                        'idempotency_attempt': request_payload[
+                            'idempotency_attempt'
+                        ],
+                    }
+                }
+                if request_payload.get('retry_of_run_id') is not None
+                and request_payload.get('idempotency_attempt') is not None
+                else {}
+            ),
             'resumed_from_run_id': request_payload.get('resumed_from_run_id'),
             'last_activity_at': state.last_activity_at.isoformat() if state.last_activity_at else None,
         }
@@ -3912,6 +4170,7 @@ class AgentFeedbackRetryService:
         activity_role = current_role or 'agent feedback'
         progress_callback(
             status=status,
+            stage=lifecycle_stage,
             current_step=lifecycle_stage,
             current_activity=f'Agent feedback {lifecycle_stage.replace("_", " ")}: {activity_role}',
             processed=processed,
@@ -4533,6 +4792,10 @@ class AgentFeedbackRetryService:
                     weekly_policy_session_guard=(
                         weekly_policy_session_guard
                     ),
+                    retry_of_run_id=admission.get('retry_of_run_id'),
+                    idempotency_attempt=admission.get(
+                        'idempotency_attempt'
+                    ),
                 )
         except Exception as exc:
             _finish_feedback_retry_claim_if_running(
@@ -4566,6 +4829,8 @@ class AgentFeedbackRetryService:
         requested_knowledge_cutoff_at: str | None = None,
         normalized_scope_authority: Mapping[str, Any] | None = None,
         weekly_policy_session_guard: Callable[..., Any] | None = None,
+        retry_of_run_id: str | None = None,
+        idempotency_attempt: int | None = None,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
         resolved_idempotency_key = str(
@@ -4973,6 +5238,16 @@ class AgentFeedbackRetryService:
                 resolved_policy_context_as_of_date.isoformat()
             ),
             'idempotency_key': resolved_idempotency_key,
+            **(
+                {'retry_of_run_id': retry_of_run_id}
+                if retry_of_run_id is not None
+                else {}
+            ),
+            **(
+                {'idempotency_attempt': int(idempotency_attempt)}
+                if idempotency_attempt is not None
+                else {}
+            ),
             'symbols': list(scoped_feedback_symbols),
             'broad_symbols': list(eligible_symbols),
             'broad_symbol_count': len(eligible_symbols),
@@ -5029,6 +5304,20 @@ class AgentFeedbackRetryService:
                     )
                     if claim_lease is not None
                     else None
+                ),
+                **(
+                    {
+                        'retry_lineage_schema_version': (
+                            WEEKLY_POLICY_REBIND_RETRY_LINEAGE_SCHEMA_VERSION
+                        ),
+                        'retry_of_run_id': retry_of_run_id,
+                        'idempotency_attempt': int(
+                            idempotency_attempt
+                        ),
+                    }
+                    if retry_of_run_id is not None
+                    and idempotency_attempt is not None
+                    else {}
                 ),
             },
             'role_symbol_counts': {
