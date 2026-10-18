@@ -3246,6 +3246,15 @@ class SignalDeciderExecIntegrationService:
             if retry_plan_refresh_conflict:
                 return await _retry_plan_refresh_revision_conflict(inspect)
             return await asyncio.to_thread(inspect)
+        except _PlanRefreshRevisionConflict as exc:
+            return {
+                'status': 'invalid',
+                'generation_fingerprint': None,
+                'reason_code': 'dispatch_authority_generation_busy',
+                'replacement_action': 'wait',
+                'replacement_actionable': False,
+                'error_type': type(exc).__name__,
+            }
         except Exception as exc:  # noqa: BLE001 - dispatch must fail closed
             return {
                 'status': 'invalid',
@@ -3466,6 +3475,7 @@ class SignalDeciderExecIntegrationService:
             return persisted_group_result, []
 
         activation_request: dict[str, Any] | None = None
+        remote_activation_confirmed = False
         try:
             binding = _core_activation_binding_from_plan(plan_payload)
             if binding is None:
@@ -3546,6 +3556,7 @@ class SignalDeciderExecIntegrationService:
                 activation_response,
                 request_payload=activation_request,
             )
+            remote_activation_confirmed = True
             generation_after = (
                 await self._inspect_dispatch_authority_generation(
                     target_trade_date=target_trade_date,
@@ -3590,7 +3601,10 @@ class SignalDeciderExecIntegrationService:
                 )
             )
         except Exception as exc:  # noqa: BLE001 - classify stale generation separately
-            if _is_superseded_activation_error(exc):
+            if (
+                not remote_activation_confirmed
+                and _is_superseded_activation_error(exc)
+            ):
                 return (
                     {
                         **persisted_group_result,
@@ -3633,10 +3647,21 @@ class SignalDeciderExecIntegrationService:
                     status_code=exc.status_code,
                 )
                 if isinstance(exc, SignalDeciderExecClientError)
-                else _serialize_error(
-                    code='execution_activation_ack_invalid',
-                    message=str(exc),
-                    retryable=isinstance(exc, AttributeError),
+                else (
+                    _serialize_error(
+                        code='execution_activation_core_persistence_busy',
+                        message=str(exc),
+                        retryable=True,
+                    )
+                    if (
+                        remote_activation_confirmed
+                        and isinstance(exc, _PlanRefreshRevisionConflict)
+                    )
+                    else _serialize_error(
+                        code='execution_activation_ack_invalid',
+                        message=str(exc),
+                        retryable=isinstance(exc, AttributeError),
+                    )
                 )
             )
             await asyncio.to_thread(
@@ -3897,6 +3922,7 @@ class SignalDeciderExecIntegrationService:
                     await fail_closed(reason_code='authority_generation_changed')
                 continue
 
+            remote_activation_confirmed = False
             try:
                 activation_response = (
                     await self.client.post_execution_plan_activation(
@@ -3907,6 +3933,7 @@ class SignalDeciderExecIntegrationService:
                     activation_response,
                     request_payload=activation_request,
                 )
+                remote_activation_confirmed = True
                 generation_after = (
                     await self._inspect_dispatch_authority_generation(
                         target_trade_date=target_trade_date,
@@ -3946,7 +3973,10 @@ class SignalDeciderExecIntegrationService:
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - stale generations converge forward
-                if _is_superseded_activation_error(exc):
+                if (
+                    not remote_activation_confirmed
+                    and _is_superseded_activation_error(exc)
+                ):
                     results.append(
                         {
                             'plan_id': plan_id,
@@ -3978,10 +4008,23 @@ class SignalDeciderExecIntegrationService:
                         status_code=exc.status_code,
                     )
                     if isinstance(exc, SignalDeciderExecClientError)
-                    else _serialize_error(
-                        code='execution_activation_recovery_failed',
-                        message=str(exc),
-                        retryable=isinstance(exc, AttributeError),
+                    else (
+                        _serialize_error(
+                            code=(
+                                'execution_activation_core_persistence_busy'
+                            ),
+                            message=str(exc),
+                            retryable=True,
+                        )
+                        if (
+                            remote_activation_confirmed
+                            and isinstance(exc, _PlanRefreshRevisionConflict)
+                        )
+                        else _serialize_error(
+                            code='execution_activation_recovery_failed',
+                            message=str(exc),
+                            retryable=isinstance(exc, AttributeError),
+                        )
                     )
                 )
                 await fail_closed(

@@ -9487,6 +9487,97 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending_ids, [row_id])
         self.assertEqual(first_generation, second_generation)
 
+    def test_preopen_refresh_rearms_acked_monitor_only_market_evidence_revocation(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_short_term_snapshot(
+            symbol='005930',
+            tactical_action='watch_for_trigger',
+        )
+        preopen_service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            initial = preopen_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_monitor_seed',
+            )['items'][0]
+        self.assertEqual(
+            initial['eligibility_status'],
+            ELIGIBILITY_MONITOR_CANDIDATE,
+        )
+        row_id = self._mark_row_as_handed_off()
+
+        staged = preopen_service.stage_market_evidence_unavailable_revocations(
+            target_trade_date=self.target_trade_date,
+            failure_source='api_core_activation_failed',
+        )
+        self.assertEqual(staged, {'staged_count': 1, 'pending_count': 1})
+        pending = preopen_service.list_plan_items(
+            target_trade_date=self.target_trade_date,
+        )['items'][0]
+        self._ack_pending_revocation(service=preopen_service, item=pending)
+
+        open_service = self._service(
+            state='OPEN',
+            server_time='2026-04-30T09:10:00+09:00',
+        )
+        with (
+            patch(
+                'app.orders.next_open_execution.load_current_market_snapshot_context',
+                return_value=None,
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[
+                    {'trade_date': '2026-04-29', 'close_price': 50000}
+                ],
+            ),
+        ):
+            still_revoked = open_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='open_monitor_evidence_still_unavailable',
+            )['items'][0]
+        self.assertEqual(still_revoked['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(
+            still_revoked['execution_status'],
+            EXECUTION_STATUS_REVOKED,
+        )
+        self.assertNotIn(
+            'recovery',
+            still_revoked['submission']['revocation'],
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            recovered = preopen_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_monitor_recovery',
+            )['items'][0]
+
+        self.assertEqual(recovered['plan_item_id'], row_id)
+        self.assertEqual(
+            recovered['eligibility_status'],
+            ELIGIBILITY_MONITOR_CANDIDATE,
+        )
+        self.assertEqual(
+            recovered['execution_status'],
+            EXECUTION_STATUS_AWAITING_TRIGGER,
+        )
+        self.assertIsNone(recovered['submitted_at'])
+        self.assertNotIn('exec_dispatch', recovered['submission'])
+        self.assertEqual(
+            recovered['submission']['revocation']['recovery']['status'],
+            'authority_revalidated',
+        )
+
     def test_risk_off_refresh_recovers_acked_monitor_generation_drift(
         self,
     ) -> None:

@@ -1114,6 +1114,12 @@ def _current_live_market_buy_authority(
         'applies': applies,
         'market_date': target_trade_date.isoformat(),
         'source': 'current_market_snapshot_cache',
+        'session_state': str(
+            getattr(market_state, 'state', '') or ''
+        ).strip().upper(),
+        'is_trading_day': bool(
+            getattr(market_state, 'is_trading_day', False)
+        ),
     }
     if not applies:
         return {
@@ -8930,6 +8936,37 @@ class SignalDeciderNextOpenExecutionService:
             and _row_validation_payload(row).get('handoff_intent')
             == 'intraday_watch_buy'
         )
+        preopen_monitor_only_watch_recovery = bool(
+            reason_code == 'current_live_market_evidence_unavailable'
+            and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            and _row_has_intraday_watch_intent(row)
+            and _short_term_tactical_action(snapshot) == 'watch_for_trigger'
+            and _is_actionable_snapshot(snapshot)
+            and policy_contract_matches
+            and _agent_context_authority_matches(
+                stored=stored_agent_context,
+                current=current_agent_context,
+            )
+            and isinstance(row_validation.get('decision_authority'), dict)
+            and row_validation['decision_authority'].get('trigger_gated')
+            is True
+            and row_validation['decision_authority'].get(
+                'market_order_authority'
+            )
+            is False
+            and current_live_market_authority.get('schema_version')
+            == CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION
+            and current_live_market_authority.get('applies') is False
+            and current_live_market_authority.get('action')
+            == 'not_applicable'
+            and current_live_market_authority.get('reason_code')
+            == 'market_session_not_open'
+            and current_live_market_authority.get('session_state')
+            == 'PREOPEN'
+            and current_live_market_authority.get('is_trading_day') is True
+            and current_live_market_authority.get('market_date')
+            == row.target_trade_date.isoformat()
+        )
         prior_dispatch_revision_fingerprint = _normalize_optional_text(
             revocation.get('prior_dispatch_revision_fingerprint')
         )
@@ -9058,6 +9095,7 @@ class SignalDeciderNextOpenExecutionService:
                 or agent_context_recovered
                 or contract_quarantine_recovered
                 or monitor_generation_drift_recovered
+                or preopen_monitor_only_watch_recovery
             )
             or (
                 not monitor_only_watch_recovery
@@ -9152,6 +9190,8 @@ class SignalDeciderNextOpenExecutionService:
                     'retirement_reason': (
                         'monitor_only_generation_drift_recovered'
                         if monitor_generation_drift_recovered
+                        else 'preopen_monitor_authority_revalidated'
+                        if preopen_monitor_only_watch_recovery
                         else 'exec_contract_quarantine_recovered'
                         if contract_quarantine_recovered
                         else 'transient_buy_authority_recovered'
