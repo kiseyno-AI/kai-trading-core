@@ -2680,6 +2680,60 @@ def _dispatch_write_ahead_links_match_accepted_links(
     return True
 
 
+def _revoked_dispatch_links_match_staged_links(
+    dispatch_links: Any,
+    staged_links: Any,
+) -> bool:
+    """Match an acknowledged revoked readback to its immutable staged items."""
+    if (
+        not isinstance(dispatch_links, list)
+        or not dispatch_links
+        or not isinstance(staged_links, list)
+        or len(dispatch_links) != len(staged_links)
+    ):
+        return False
+    dispatch_by_key = {
+        str(link.get('core_item_key')): link
+        for link in dispatch_links
+        if isinstance(link, dict) and link.get('core_item_key')
+    }
+    staged_by_key = {
+        str(link.get('core_item_key')): link
+        for link in staged_links
+        if isinstance(link, dict) and link.get('core_item_key')
+    }
+    if (
+        len(dispatch_by_key) != len(dispatch_links)
+        or len(staged_by_key) != len(staged_links)
+        or set(dispatch_by_key) != set(staged_by_key)
+    ):
+        return False
+    immutable_keys = (
+        'core_item_key',
+        'intent',
+        'side',
+        'symbol',
+        'trigger_price',
+        'limit_price',
+        'exec_plan_id',
+        'exec_plan_item_id',
+    )
+    for core_item_key, dispatch_link in dispatch_by_key.items():
+        staged_link = staged_by_key[core_item_key]
+        if (
+            not staged_link.get('exec_plan_id')
+            or not staged_link.get('exec_plan_item_id')
+            or any(
+                dispatch_link.get(key) != staged_link.get(key)
+                for key in immutable_keys
+            )
+            or str(dispatch_link.get('remote_status') or '').strip().lower()
+            != 'revoked'
+        ):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class NextOpenAccountTarget:
     label: str
@@ -8967,6 +9021,71 @@ class SignalDeciderNextOpenExecutionService:
             and current_live_market_authority.get('market_date')
             == row.target_trade_date.isoformat()
         )
+        compacted_preopen_archive = False
+        if archived_revision is None and preopen_monitor_only_watch_recovery:
+            compacted_archive = next(
+                (
+                    item
+                    for item in reversed(revision_history)
+                    if str(item.get('decision_snapshot_id') or '')
+                    == str(row.decision_snapshot_id)
+                    and item.get('row_authority_fingerprint') is None
+                    and isinstance(item.get('dispatch_evidence'), dict)
+                    and item['dispatch_evidence'].get('plan_id')
+                    == revocation.get('plan_id')
+                    and item['dispatch_evidence'].get('dispatch_status')
+                    == 'accepted'
+                    and item['dispatch_evidence'].get('destination_binding')
+                    == revocation.get('destination_binding')
+                    and item['dispatch_evidence'].get('item_links')
+                    == expected_links
+                ),
+                None,
+            )
+            if compacted_archive is not None:
+                archived_revision = compacted_archive
+                compacted_preopen_archive = True
+        terminal_state_sync = (
+            row_validation.get('exec_terminal_state_sync')
+            if isinstance(
+                row_validation.get('exec_terminal_state_sync'),
+                dict,
+            )
+            else {}
+        )
+        acknowledged_revocation = (
+            terminal_state_sync.get('acknowledged_revocation')
+            if isinstance(
+                terminal_state_sync.get('acknowledged_revocation'),
+                dict,
+            )
+            else {}
+        )
+        synced_core_state = (
+            terminal_state_sync.get('core_state_after')
+            if isinstance(terminal_state_sync.get('core_state_after'), dict)
+            else {}
+        )
+        compacted_preopen_revoked_readback = bool(
+            compacted_preopen_archive
+            and _revoked_dispatch_links_match_staged_links(
+                dispatch_links,
+                expected_links,
+            )
+            and terminal_state_sync.get('schema_version')
+            == 'exec_terminal_state_sync_v1'
+            and terminal_state_sync.get('acknowledged_revocation_stable')
+            is True
+            and terminal_state_sync.get('derived_status') == 'cancelled'
+            and terminal_state_sync.get('terminal_status') == 'revoked'
+            and acknowledged_revocation.get('plan_id')
+            == revocation.get('plan_id')
+            and acknowledged_revocation.get('reason_code') == reason_code
+            and acknowledged_revocation.get('item_count')
+            == len(expected_links or [])
+            and synced_core_state.get('execution_status') == 'revoked'
+            and synced_core_state.get('eligibility_status') == 'blocked'
+        )
         prior_dispatch_revision_fingerprint = _normalize_optional_text(
             revocation.get('prior_dispatch_revision_fingerprint')
         )
@@ -9084,6 +9203,7 @@ class SignalDeciderNextOpenExecutionService:
                     expected_links,
                 )
             )
+            or compacted_preopen_revoked_readback
         )
 
         if (
@@ -9126,8 +9246,11 @@ class SignalDeciderNextOpenExecutionService:
                 not monitor_generation_drift_recovered
                 and (
                     not revoked_row_authority_fingerprint
-                    or _execution_plan_row_authority_fingerprint(row)
-                    != revoked_row_authority_fingerprint
+                    or (
+                        _execution_plan_row_authority_fingerprint(row)
+                        != revoked_row_authority_fingerprint
+                        and not compacted_preopen_revoked_readback
+                    )
                     or not prior_row_authority_fingerprint
                 )
             )

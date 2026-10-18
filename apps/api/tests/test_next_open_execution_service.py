@@ -59,6 +59,9 @@ from app.orders.execution_handoff_contract import (
     EXECUTION_HANDOFF_CAPABILITY,
     EXECUTION_HANDOFF_CONTRACT_VERSION,
 )
+from app.orders.exec_payload_slimming import (
+    slim_signal_decider_exec_submission_payload,
+)
 from app.orders.next_open_execution import (
     EXECUTION_STATUS_AWAITING_TRIGGER,
     EXECUTION_STATUS_DISPATCH_PENDING_REMOTE_ACK,
@@ -9522,6 +9525,73 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             target_trade_date=self.target_trade_date,
         )['items'][0]
         self._ack_pending_revocation(service=preopen_service, item=pending)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            submission = copy.deepcopy(row.submission_payload)
+            for link in submission['exec_dispatch']['item_links']:
+                link['remote_status'] = 'revoked'
+            revision = submission['revision_history'][-1]
+            revision.setdefault('validation_payload', {})[
+                'oversized_context'
+            ] = 'x' * 100_000
+            submission['latest'] = {'oversized_context': 'x' * 100_000}
+            revocation = submission['revocation']
+            row.validation_payload = {
+                **copy.deepcopy(row.validation_payload),
+                'exec_terminal_state_sync': {
+                    'schema_version': 'exec_terminal_state_sync_v1',
+                    'derived_status': 'cancelled',
+                    'terminal_status': 'revoked',
+                    'acknowledged_revocation_stable': True,
+                    'acknowledged_revocation': {
+                        'plan_id': revocation['plan_id'],
+                        'reason_code': revocation['reason_code'],
+                        'item_count': len(revocation['item_links']),
+                    },
+                    'core_state_after': {
+                        'eligibility_status': ELIGIBILITY_BLOCKED,
+                        'execution_status': EXECUTION_STATUS_REVOKED,
+                    },
+                },
+            }
+            slimmed = slim_signal_decider_exec_submission_payload(submission)
+            self.assertTrue(slimmed.truncated)
+            self.assertNotIn(
+                'row_authority_fingerprint',
+                slimmed.payload['revision_history'][-1],
+            )
+            row.submission_payload = slimmed.payload
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            submission = copy.deepcopy(row.submission_payload)
+            original_exec_item_id = submission['exec_dispatch']['item_links'][0][
+                'exec_plan_item_id'
+            ]
+            submission['exec_dispatch']['item_links'][0][
+                'exec_plan_item_id'
+            ] = 'mismatched-revoked-item'
+            row.submission_payload = submission
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            identity_mismatch = preopen_service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='preopen_monitor_identity_mismatch',
+            )['items'][0]
+        self.assertEqual(
+            identity_mismatch['execution_status'],
+            EXECUTION_STATUS_REVOKED,
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            submission = copy.deepcopy(row.submission_payload)
+            submission['exec_dispatch']['item_links'][0][
+                'exec_plan_item_id'
+            ] = original_exec_item_id
+            row.submission_payload = submission
 
         open_service = self._service(
             state='OPEN',
