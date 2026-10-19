@@ -15,6 +15,7 @@ class FeedbackFailureKind(str, Enum):
     )
     OPENCLAW_AUTH_MISSING = 'openclaw_auth_missing'
     OPENCLAW_AUTH_REJECTED = 'openclaw_auth_rejected'
+    OPENCLAW_PROVIDER_RATE_LIMITED = 'openclaw_provider_rate_limited'
     OPENCLAW_TRANSPORT_TIMEOUT = 'openclaw_transport_timeout'
     OPENCLAW_TRANSPORT_ERROR = 'openclaw_transport_error'
     OPENCLAW_PLUGIN_STATE_CAPACITY_EXHAUSTED = (
@@ -37,6 +38,7 @@ class FeedbackFailureStatus(str, Enum):
     )
     AUTH_MISSING = 'auth/missing'
     AUTH_REJECTED = 'auth/rejected'
+    PROVIDER_RATE_LIMIT = 'provider/rate-limit'
     TRANSPORT_TIMEOUT = 'transport/timeout'
     TRANSPORT_ERROR = 'transport/error'
     CAPACITY_EXHAUSTED = 'capacity/exhausted'
@@ -233,6 +235,21 @@ def classify_feedback_failure(
             reason='OpenClaw gateway rejected the configured bearer token',
         )
 
+    if (
+        'openclaw_provider_rate_limited' in haystack
+        or 'provider/rate-limit' in haystack
+        or 'rate_limit' in haystack
+        or 'rate limit' in haystack
+        or 'too many requests' in haystack
+        or 429 in status_codes
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value,
+            failure_status=FeedbackFailureStatus.PROVIDER_RATE_LIMIT.value,
+            failure_category='provider',
+            reason='OpenClaw provider rate limit prevented feedback dispatch',
+        )
+
     if 'dispatch_incomplete' in haystack or 'terminal feedback missing' in haystack:
         return FeedbackFailureClassification(
             failure_kind=FeedbackFailureKind.DISPATCH_INCOMPLETE.value,
@@ -255,6 +272,31 @@ def classify_feedback_failure(
             failure_status=FeedbackFailureStatus.TRANSPORT_TIMEOUT.value,
             failure_category='transport',
             reason='OpenClaw HTTP request timed out before a usable response was received',
+        )
+
+    if (
+        'connecterror' in haystack
+        or 'networkerror' in haystack
+        or 'proxyerror' in haystack
+        or 'remoteprotocolerror' in haystack
+        or 'connection refused' in haystack
+        or 'connection reset' in haystack
+        or 'connection aborted' in haystack
+        or 'server disconnected' in haystack
+        or 'all connection attempts failed' in haystack
+        or 'name or service not known' in haystack
+        or 'temporary failure in name resolution' in haystack
+        or 'nodename nor servname provided' in haystack
+        or 'no route to host' in haystack
+        or 'network is unreachable' in haystack
+        or 'errno 61' in haystack
+        or 'errno 111' in haystack
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=FeedbackFailureKind.OPENCLAW_TRANSPORT_ERROR.value,
+            failure_status=FeedbackFailureStatus.TRANSPORT_ERROR.value,
+            failure_category='transport',
+            reason='OpenClaw gateway connection failed before feedback could be stored',
         )
 
     if (

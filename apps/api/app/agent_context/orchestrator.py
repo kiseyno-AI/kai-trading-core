@@ -400,6 +400,70 @@ RUN_LEVEL_FAILURE_SYMBOL = '__RUN__'
 OPENCLAW_GATEWAY_AGENT_NAME = 'openclaw-gateway'
 
 
+def _is_shared_openclaw_transport_outage(
+    *,
+    exc: BaseException | None = None,
+    error: str | None = None,
+) -> bool:
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)):
+        return True
+    normalized = ' '.join(
+        part.strip().lower()
+        for part in (type(exc).__name__ if exc is not None else '', str(exc or ''), str(error or ''))
+        if part and part.strip()
+    )
+    return any(
+        marker in normalized
+        for marker in (
+            'connecterror',
+            'connecttimeout',
+            'proxyerror',
+            'remoteprotocolerror',
+            'connection refused',
+            'connection reset',
+            'connection aborted',
+            'server disconnected',
+            'all connection attempts failed',
+            'name or service not known',
+            'temporary failure in name resolution',
+            'nodename nor servname provided',
+            'no route to host',
+            'network is unreachable',
+            'errno 61',
+            'errno 111',
+        )
+    )
+
+
+def _is_shared_openclaw_dispatch_outage(
+    *,
+    exc: BaseException | None = None,
+    error: str | None = None,
+    response_status_code: int | None = None,
+) -> bool:
+    if _is_shared_openclaw_transport_outage(exc=exc, error=error):
+        return True
+    if response_status_code == 429:
+        return True
+    normalized = ' '.join(
+        part.strip().lower()
+        for part in (str(exc or ''), str(error or ''))
+        if part and part.strip()
+    )
+    return any(
+        marker in normalized
+        for marker in (
+            'openclaw_provider_rate_limited',
+            'provider/rate-limit',
+            'rate_limit',
+            'rate limit',
+            'too many requests',
+            'http 429',
+            'error 429',
+        )
+    )
+
+
 class OpenClawAgentClient:
     def __init__(self) -> None:
         self.base_url = settings.openclaw_base_url.rstrip('/')
@@ -542,10 +606,20 @@ class OpenClawAgentClient:
         try:
             url = self._sessions_history_url()
         except AgentDispatchTerminalError as exc:
+            classification = classify_feedback_failure(
+                failure_kind=None,
+                summary={'origin': 'openclaw_auth_preflight'},
+                error=str(exc),
+                exception_type=type(exc).__name__,
+            )
             return {
-                'ok': True,
-                'status': 'inconclusive',
+                'ok': False,
+                'status': 'failed',
                 'reason': 'openclaw_base_url_invalid',
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'retryable': False,
                 'error_type': type(exc).__name__,
                 'error': str(exc),
                 'token_configured': True,
@@ -564,10 +638,26 @@ class OpenClawAgentClient:
             with httpx.Client(timeout=timeout_seconds, headers=self._headers()) as client:
                 response = client.post(url, json=body)
         except Exception as exc:  # noqa: BLE001
+            classification = classify_feedback_failure(
+                failure_kind=None,
+                summary={'origin': 'openclaw_auth_preflight'},
+                error=str(exc),
+                exception_type=type(exc).__name__,
+            )
             return {
-                'ok': True,
-                'status': 'inconclusive',
+                'ok': False,
+                'status': 'failed',
                 'reason': 'openclaw_auth_preflight_transport_unavailable',
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'retryable': classification.failure_category == 'transport',
+                'shared_transport_outage': _is_shared_openclaw_transport_outage(
+                    exc=exc,
+                ),
+                'shared_dispatch_outage': _is_shared_openclaw_dispatch_outage(
+                    exc=exc,
+                ),
                 'error_type': type(exc).__name__,
                 'error': str(exc),
                 'token_configured': True,
@@ -589,10 +679,33 @@ class OpenClawAgentClient:
                 'response_text_excerpt': response_text_excerpt,
             }
         if response.status_code >= 400:
+            classification = classify_feedback_failure(
+                failure_kind=None,
+                summary={
+                    'origin': 'openclaw_auth_preflight',
+                    'response_status_code': response.status_code,
+                },
+                context={'response_status_code': response.status_code},
+                error=(
+                    f'OpenClaw auth preflight HTTP {response.status_code}'
+                ),
+                exception_type='HTTPStatusError',
+            )
             return {
-                'ok': True,
-                'status': 'inconclusive',
+                'ok': False,
+                'status': 'failed',
                 'reason': 'openclaw_auth_preflight_non_auth_http_error',
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'retryable': (
+                    response.status_code in {408, 409, 425, 429}
+                    or response.status_code >= 500
+                ),
+                'shared_dispatch_outage': _is_shared_openclaw_dispatch_outage(
+                    response_status_code=response.status_code,
+                    error=response_text_excerpt,
+                ),
                 'token_configured': True,
                 'response_status_code': response.status_code,
                 'response_text_excerpt': response_text_excerpt,
@@ -738,6 +851,18 @@ class OpenClawAgentClient:
             error=str(exc),
             exception_type=error_type,
         )
+        shared_transport_outage = bool(
+            classification.failure_category == 'transport'
+            and _is_shared_openclaw_transport_outage(
+                exc=exc,
+                error=str(exc),
+            )
+        )
+        shared_dispatch_outage = _is_shared_openclaw_dispatch_outage(
+            exc=exc,
+            error=str(exc),
+            response_status_code=response_status_code,
+        )
         return {
             **context,
             'failure_kind': classification.failure_kind,
@@ -745,6 +870,9 @@ class OpenClawAgentClient:
             'failure_category': classification.failure_category,
             'failure_classification': classification.as_payload(),
             'failure_mode': classification.failure_kind,
+            'retryable': True,
+            'shared_transport_outage': shared_transport_outage,
+            'shared_dispatch_outage': shared_dispatch_outage,
             'exception_type': error_type,
             'error_message': str(exc),
             'response_json_decode_error': response_json_decode_error,
@@ -4274,18 +4402,35 @@ class AgentFeedbackOrchestrator:
         try:
             result = preflight()
         except Exception as exc:  # noqa: BLE001
+            classification = classify_feedback_failure(
+                failure_kind=None,
+                summary={'origin': 'openclaw_auth_preflight'},
+                error=str(exc),
+                exception_type=type(exc).__name__,
+            )
             result = {
-                'ok': True,
-                'status': 'inconclusive',
+                'ok': False,
+                'status': 'failed',
                 'reason': 'openclaw_auth_preflight_exception',
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'retryable': classification.failure_category == 'transport',
+                'shared_transport_outage': _is_shared_openclaw_transport_outage(
+                    exc=exc,
+                ),
                 'error_type': type(exc).__name__,
                 'error': str(exc),
             }
         if not isinstance(result, dict):
             result = {
-                'ok': True,
-                'status': 'skipped',
+                'ok': False,
+                'status': 'failed',
                 'reason': 'client_preflight_returned_non_mapping',
+                'failure_kind': FeedbackFailureKind.DISPATCH_FAILED.value,
+                'failure_status': 'dispatch/error',
+                'failure_category': 'dispatch',
+                'retryable': False,
             }
         log_agent_feedback_event(
             'openclaw_dispatch_auth_preflight',
@@ -5877,6 +6022,7 @@ class AgentFeedbackOrchestrator:
         final_flush_result: dict[str, Any] | None = None
         skip_terminal_reconciliation = False
         openclaw_dispatch_preflight_checked = False
+        openclaw_shared_dispatch_outage: dict[str, Any] | None = None
 
         def run_openclaw_dispatch_preflight(live_dispatch_symbols: Sequence[str]) -> bool:
             nonlocal openclaw_dispatch_preflight_checked
@@ -6255,6 +6401,8 @@ class AgentFeedbackOrchestrator:
                     )
 
                 for spec in ([] if skip_terminal_reconciliation else specs):
+                    if openclaw_shared_dispatch_outage is not None:
+                        break
                     role = spec.role
 
                     def _set_current_role(current: RuntimeFeedbackRunState) -> None:
@@ -6452,7 +6600,7 @@ class AgentFeedbackOrchestrator:
                             return result, time.monotonic()
 
                         def submit_next() -> None:
-                            if not queue:
+                            if openclaw_shared_dispatch_outage is not None or not queue:
                                 return
                             slot, batch = queue.pop(0)
                             mark_activity(role, slot, [item['symbol'] for item in batch], done=False)
@@ -6939,6 +7087,74 @@ class AgentFeedbackOrchestrator:
                                         exc,
                                         AgentDispatchTerminalError,
                                     )
+                                    if bool(
+                                        isinstance(error_details, dict)
+                                        and (
+                                            error_details.get(
+                                                'shared_dispatch_outage'
+                                            )
+                                            or error_details.get(
+                                                'shared_transport_outage'
+                                            )
+                                        )
+                                    ):
+                                        if openclaw_shared_dispatch_outage is None:
+                                            openclaw_shared_dispatch_outage = {
+                                                'failure_kind': str(
+                                                    error_details.get(
+                                                        'failure_kind'
+                                                    )
+                                                    or FeedbackFailureKind
+                                                    .OPENCLAW_TRANSPORT_ERROR
+                                                    .value
+                                                ),
+                                                'failure_status': str(
+                                                    error_details.get(
+                                                        'failure_status'
+                                                    )
+                                                    or 'transport/error'
+                                                ),
+                                                'role': role,
+                                                'slot': slot,
+                                                'error_type': type(exc).__name__,
+                                            }
+                                            request_payload[
+                                                'openclaw_dispatch_circuit_breaker'
+                                            ] = dict(
+                                                openclaw_shared_dispatch_outage
+                                            )
+                                            log_agent_feedback_event(
+                                                'openclaw_dispatch_circuit_opened',
+                                                status='opened',
+                                                market_date=(
+                                                    normalized_market_date
+                                                    .isoformat()
+                                                ),
+                                                request_run_id=request_run_id,
+                                                role=role,
+                                                agent_name=spec.agent_name,
+                                                slot=slot,
+                                                batch_symbols=[
+                                                    str(
+                                                        item.get('symbol')
+                                                        or ''
+                                                    )
+                                                    for item in batch
+                                                ],
+                                                failure_kind=(
+                                                    openclaw_shared_dispatch_outage[
+                                                        'failure_kind'
+                                                    ]
+                                                ),
+                                                failure_context={
+                                                    'remaining_queued_batches': (
+                                                        len(queue)
+                                                    ),
+                                                    'in_flight_batches': (
+                                                        len(future_map)
+                                                    ),
+                                                },
+                                            )
                                     for source_item in batch:
                                         dispatch_context = _resolve_batch_dispatch_context(
                                             batch_result=None,
@@ -7101,7 +7317,9 @@ class AgentFeedbackOrchestrator:
                                             status='running',
                                             persistence_guard=persistence_guard,
                                         )
-                                    should_submit_next = True
+                                    should_submit_next = (
+                                        openclaw_shared_dispatch_outage is None
+                                    )
                                 finally:
                                     mark_activity(role, slot, done=True)
                                 if should_submit_next:
@@ -7165,6 +7383,8 @@ class AgentFeedbackOrchestrator:
                         },
                         flush_result=role_flush_result,
                     )
+                    if openclaw_shared_dispatch_outage is not None:
+                        break
 
                 if not skip_terminal_reconciliation:
                     if accepted_decider_source_items:

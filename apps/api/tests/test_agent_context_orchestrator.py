@@ -3668,6 +3668,61 @@ class RaisingBatchClient(RecordingBatchClient):
         raise RuntimeError('dispatch failed after session allocation')
 
 
+class SharedTransportOutageBatchClient:
+    def __init__(self):
+        self.calls = []
+
+    def dispatch_batch(self, **kwargs):
+        self.calls.append(kwargs)
+        raise orchestrator_module.AgentDispatchRetryableError(
+            '[Errno 61] Connection refused',
+            details={
+                'failure_kind': 'openclaw_transport_error',
+                'failure_status': 'transport/error',
+                'failure_category': 'transport',
+                'shared_transport_outage': True,
+                'retryable': True,
+            },
+        )
+
+
+class SharedProviderRateLimitBatchClient:
+    def __init__(self):
+        self.calls = []
+
+    def dispatch_batch(self, **kwargs):
+        self.calls.append(kwargs)
+        raise orchestrator_module.AgentDispatchRetryableError(
+            'OpenClaw batch retryable error 429: rate_limit',
+            details={
+                'failure_kind': 'openclaw_provider_rate_limited',
+                'failure_status': 'provider/rate-limit',
+                'failure_category': 'provider',
+                'shared_dispatch_outage': True,
+                'retryable': True,
+                'response_status_code': 429,
+            },
+        )
+
+
+class ItemScopedFailureThenSuccessBatchClient(RecordingBatchClient):
+    def dispatch_batch(self, **kwargs):
+        if not self.calls:
+            with self._lock:
+                self.calls.append(kwargs)
+            raise orchestrator_module.AgentDispatchRetryableError(
+                'OpenClaw batch ended with status=failed',
+                details={
+                    'failure_kind': 'dispatch_failed',
+                    'failure_status': 'dispatch/error',
+                    'failure_category': 'dispatch',
+                    'shared_transport_outage': False,
+                    'retryable': True,
+                },
+            )
+        return super().dispatch_batch(**kwargs)
+
+
 class PreflightFailingClient:
     def __init__(self):
         self.preflight_calls = 0
@@ -4795,6 +4850,39 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/tools/invoke')
                 self.assertEqual(http_calls[0]['json']['tool'], 'sessions_history')
 
+    def test_openclaw_auth_preflight_fails_closed_when_gateway_connection_is_refused(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='http://127.0.0.1:18789',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+        http_calls: list[dict] = []
+
+        def fake_client_factory(*args, **kwargs):
+            return RaisingHTTPClient(
+                exc=httpx.ConnectError('[Errno 61] Connection refused'),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            result = OpenClawAgentClient().preflight_dispatch_auth()
+
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['failure_kind'], 'openclaw_transport_error')
+        self.assertEqual(result['failure_status'], 'transport/error')
+        self.assertEqual(result['failure_category'], 'transport')
+        self.assertTrue(result['retryable'])
+        self.assertEqual(result['error_type'], 'ConnectError')
+        self.assertEqual(len(http_calls), 1)
+
     def test_signal_decider_batch_message_requires_exact_symbol_batch_envelope(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
@@ -5552,6 +5640,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         feedback_service = FakeFeedbackService()
         failure_service = RecordingFailureService()
         cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
@@ -8851,6 +8940,56 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(error_log['failure_kind'], 'openclaw_transport_timeout')
         self.assertEqual(error_log['failure_mode'], 'openclaw_transport_timeout')
 
+    def test_openclaw_batch_dispatch_classifies_connection_refused_as_shared_transport_outage(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='http://127.0.0.1:18789',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return RaisingHTTPClient(
+                exc=httpx.ConnectError('[Errno 61] Connection refused'),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            client = OpenClawAgentClient()
+            with self.assertRaises(orchestrator_module.AgentDispatchRetryableError) as raised:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=[
+                        {
+                            'symbol': '005930',
+                            'market_date': '2026-04-14',
+                            'request_run_id': 'symbol-run-2026-04-14-abc123',
+                            'dispatch_id': dispatch_id,
+                            'session_slot': 1,
+                            'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                            'session_reuse_mode': 'fresh_per_batch',
+                        }
+                    ],
+                )
+
+        details = raised.exception.details
+        self.assertEqual(details['failure_kind'], 'openclaw_transport_error')
+        self.assertEqual(details['failure_status'], 'transport/error')
+        self.assertEqual(details['failure_category'], 'transport')
+        self.assertTrue(details['shared_transport_outage'])
+        self.assertEqual(details['exception_type'], 'ConnectError')
+        self.assertEqual(len(http_calls), 1)
+
     def test_openclaw_batch_dispatch_classifies_http_408_as_timeout(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
         http_calls = []
@@ -8905,6 +9044,106 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         error_log = next(entry for entry in captured_logs if entry['stage'] == 'dispatch_batch_response_error')
         self.assertEqual(error_log['failure_kind'], 'openclaw_transport_timeout')
         self.assertEqual(error_log['failure_mode'], 'openclaw_transport_timeout')
+
+    def test_openclaw_batch_dispatch_classifies_http_429_as_shared_provider_rate_limit(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(429, {'error': 'rate_limit'}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            client = OpenClawAgentClient()
+            with self.assertRaises(orchestrator_module.AgentDispatchRetryableError) as raised:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=[
+                        {
+                            'symbol': '005930',
+                            'market_date': '2026-04-14',
+                            'request_run_id': 'symbol-run-2026-04-14-abc123',
+                            'dispatch_id': dispatch_id,
+                            'session_slot': 1,
+                            'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                            'session_reuse_mode': 'fresh_per_batch',
+                        }
+                    ],
+                )
+
+        details = raised.exception.details
+        self.assertEqual(details['failure_kind'], 'openclaw_provider_rate_limited')
+        self.assertEqual(details['failure_status'], 'provider/rate-limit')
+        self.assertEqual(details['failure_category'], 'provider')
+        self.assertTrue(details['shared_dispatch_outage'])
+        self.assertFalse(details['shared_transport_outage'])
+        self.assertEqual(details['response_status_code'], 429)
+        self.assertEqual(len(http_calls), 1)
+
+    def test_openclaw_batch_dispatch_exhausts_configured_429_retries_before_shared_failure(self):
+        dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=1,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(429, {'error': 'rate_limit'}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            client = OpenClawAgentClient()
+            with self.assertRaises(orchestrator_module.AgentDispatchRetryableError) as raised:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=[
+                        {
+                            'symbol': '005930',
+                            'market_date': '2026-04-14',
+                            'request_run_id': 'symbol-run-2026-04-14-abc123',
+                            'dispatch_id': dispatch_id,
+                            'session_slot': 1,
+                            'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                            'session_reuse_mode': 'fresh_per_batch',
+                        }
+                    ],
+                )
+
+        self.assertEqual(len(http_calls), 2)
+        self.assertTrue(raised.exception.details['shared_dispatch_outage'])
+        self.assertEqual(
+            raised.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
 
     def test_openclaw_batch_dispatch_circuit_breaks_plugin_state_capacity_error(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
@@ -9727,6 +9966,120 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         final_log = next(entry for entry in captured_logs if entry['stage'] == 'run_finished')
         self.assertEqual(final_log['terminal_status'], 'failed')
         self.assertEqual(run_state_service.finished[-1]['status'], 'failed')
+
+    def test_dispatch_for_symbols_stops_queued_batches_after_shared_transport_outage(self):
+        service = AgentFeedbackOrchestrator()
+        client = SharedTransportOutageBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        symbols = ['000001', '000002', '000003']
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+            openclaw_agent_subtask_poll_seconds=0.01,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility(*symbols):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=symbols,
+                                        roles=['eod-summarizer', 'technical-summarizer'],
+                                        knowledge_cutoff_at='2026-04-15T00:00:00+09:00',
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertGreaterEqual(result['summary']['failed'], 1)
+        self.assertEqual(
+            failure_service.recorded[0]['failure_kind'],
+            'openclaw_transport_error',
+        )
+
+    def test_dispatch_for_symbols_continues_after_item_scoped_dispatch_failure(self):
+        service = AgentFeedbackOrchestrator()
+        client = ItemScopedFailureThenSuccessBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        symbols = ['000001', '000002', '000003']
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+            openclaw_agent_subtask_poll_seconds=0.01,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility(*symbols):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=symbols,
+                                        roles=['eod-summarizer'],
+                                        knowledge_cutoff_at='2026-04-15T00:00:00+09:00',
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(result['summary']['completed'], 2)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(failure_service.recorded[0]['failure_kind'], 'dispatch_failed')
+
+    def test_dispatch_for_symbols_stops_later_batches_and_roles_after_shared_provider_rate_limit(self):
+        service = AgentFeedbackOrchestrator()
+        client = SharedProviderRateLimitBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        cleanup_service = FakeSessionCleanupService()
+        run_state_service = RecordingRunStateService()
+        symbols = ['000001', '000002', '000003']
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+            openclaw_agent_subtask_poll_seconds=0.01,
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service):
+                with patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()):
+                    with patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service):
+                        with patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service):
+                            with patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service):
+                                with _patch_feedback_eligibility(*symbols):
+                                    result = service.dispatch_for_symbols(
+                                        market_date='2026-04-14',
+                                        symbols=symbols,
+                                        roles=['eod-summarizer', 'technical-summarizer'],
+                                        knowledge_cutoff_at='2026-04-15T00:00:00+09:00',
+                                        reuse_existing=False,
+                                    )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['completed'], 0)
+        self.assertGreaterEqual(result['summary']['failed'], 1)
+        self.assertEqual(
+            failure_service.recorded[0]['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
 
     def test_dispatch_for_symbols_logs_stale_reuse_signal(self):
         service = AgentFeedbackOrchestrator()
