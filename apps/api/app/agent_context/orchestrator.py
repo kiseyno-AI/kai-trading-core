@@ -86,6 +86,9 @@ from app.agent_context.model_identity import (
     build_runtime_contract_provenance,
     expected_decider_model,
 )
+from app.agent_context.openclaw_storage_admission import (
+    inspect_openclaw_storage_admission,
+)
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
 from app.agent_context.payload_builder import agent_payload_builder
@@ -212,6 +215,13 @@ class AgentDispatchRetryableError(AgentDispatchError):
 
 class AgentDispatchTerminalError(AgentDispatchError):
     pass
+
+
+def _is_retryable_dispatch_exception(exc: Exception) -> bool:
+    if not isinstance(exc, AgentDispatchTerminalError):
+        return True
+    details = exc.details if isinstance(exc.details, dict) else {}
+    return details.get('retryable') is True
 
 
 @dataclass(frozen=True)
@@ -513,6 +523,31 @@ class OpenClawAgentClient:
 
     def _raise_if_circuit_broken(self, *, request_run_id: str | None) -> bool:
         normalized_run_id = str(request_run_id or '').strip() or None
+        storage_admission = inspect_openclaw_storage_admission(
+            state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
+            min_free_bytes=getattr(
+                settings,
+                'openclaw_dispatch_min_free_bytes',
+                0,
+            ),
+        )
+        if storage_admission.get('admitted') is not True:
+            error = AgentDispatchTerminalError(
+                'OpenClaw dispatch blocked by local storage admission guard',
+                details={
+                    'failure_kind': 'openclaw_storage_admission_blocked',
+                    'failure_status': 'capacity/storage-admission-blocked',
+                    'failure_category': 'capacity',
+                    'retryable': True,
+                    'storage_admission': storage_admission,
+                },
+            )
+            self._trip_circuit_breaker(
+                error,
+                request_run_id=normalized_run_id,
+            )
+            raise error
+
         with self._circuit_breaker_lock:
             stored = self._circuit_breaker_error
             if (
@@ -7083,9 +7118,8 @@ class AgentFeedbackOrchestrator:
                                     staged_batch_outcomes = True
                                 except Exception as exc:
                                     error_details = exc.details if isinstance(exc, AgentDispatchError) else {}
-                                    retryable_dispatch_error = not isinstance(
-                                        exc,
-                                        AgentDispatchTerminalError,
+                                    retryable_dispatch_error = (
+                                        _is_retryable_dispatch_exception(exc)
                                     )
                                     if bool(
                                         isinstance(error_details, dict)

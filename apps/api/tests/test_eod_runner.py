@@ -1802,3 +1802,64 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         reconcile.assert_not_awaited()
         refresh_snapshot.assert_not_awaited()
         refresh_portfolio.assert_not_awaited()
+
+    async def test_session_cleanup_continues_while_daily_pipeline_is_active(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-10-19T16:00:00+09:00',
+            session_open_at='2026-10-19T09:00:00+09:00',
+            session_close_at='2026-10-19T15:30:00+09:00',
+        )
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        async def run_inline(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        from app.eod.runner import auto_pykrx_eod_scheduler
+
+        auto_pykrx_eod_scheduler.state.active_task = True
+        try:
+            with (
+                patch('app.eod.runner.async_get_market_state', return_value=market_state),
+                patch(
+                    'app.eod.runner.settings.openclaw_session_cleanup_enabled',
+                    True,
+                ),
+                patch(
+                    'app.eod.runner.settings.openclaw_gateway_token',
+                    'configured',
+                ),
+                patch(
+                    'app.eod.runner.settings.openclaw_session_cleanup_batch_limit',
+                    17,
+                ),
+                patch(
+                    'app.eod.runner.settings.openclaw_session_cleanup_run_budget_seconds',
+                    23,
+                ),
+                patch('app.eod.runner.asyncio.to_thread', side_effect=run_inline),
+                patch(
+                    'app.eod.runner.agent_feedback_session_cleanup_service.run_pending_cleanup',
+                    return_value={
+                        'ok': True,
+                        'summary': {'selected': 0, 'deleted': 0, 'failed': 0},
+                        'items': [],
+                    },
+                ) as run_cleanup,
+                patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+            ):
+                runner._running = True
+                await runner._run_loop()
+        finally:
+            auto_pykrx_eod_scheduler.state.active_task = False
+
+        run_cleanup.assert_called_once_with(
+            limit=17,
+            max_runtime_seconds=23,
+        )

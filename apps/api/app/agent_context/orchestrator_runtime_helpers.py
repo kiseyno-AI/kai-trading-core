@@ -383,7 +383,14 @@ def dispatch_and_store(
                     cleanup_session=False,
                 )
         except Exception as exc:  # noqa: BLE001
-            retryable = exc.__class__.__name__ != 'AgentDispatchTerminalError'
+            error_details = getattr(exc, 'details', {})
+            retryable = (
+                exc.__class__.__name__ != 'AgentDispatchTerminalError'
+                or (
+                    isinstance(error_details, dict)
+                    and error_details.get('retryable') is True
+                )
+            )
             failure = build_failed_dispatch_item(
                 role=spec.role,
                 agent_name=spec.agent_name,

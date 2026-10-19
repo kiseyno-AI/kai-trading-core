@@ -311,8 +311,23 @@ class Settings(BaseSettings):
     openclaw_agent_subtask_poll_seconds: float = 2.0
     openclaw_agent_batch_timeout_seconds: float = 300.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
-    openclaw_session_cleanup_timeout_seconds: float = 30.0
-    openclaw_session_cleanup_batch_limit: int = 100
+    openclaw_dispatch_min_free_bytes: int = Field(
+        default=10 * 1024 * 1024 * 1024,
+        ge=0,
+        le=10 * 1024 * 1024 * 1024 * 1024,
+    )
+    openclaw_session_cleanup_enabled: bool = True
+    openclaw_session_cleanup_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=40,
+    )
+    openclaw_session_cleanup_batch_limit: int = Field(default=100, ge=1, le=1000)
+    openclaw_session_cleanup_run_budget_seconds: float = Field(
+        default=40.0,
+        gt=0,
+        le=40,
+    )
 
     @field_validator('upstream_bearer_token', 'signal_decider_exec_bearer_token', mode='before')
     @classmethod

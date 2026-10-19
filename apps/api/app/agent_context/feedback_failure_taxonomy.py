@@ -21,6 +21,7 @@ class FeedbackFailureKind(str, Enum):
     OPENCLAW_PLUGIN_STATE_CAPACITY_EXHAUSTED = (
         'openclaw_plugin_state_capacity_exhausted'
     )
+    OPENCLAW_STORAGE_ADMISSION_BLOCKED = 'openclaw_storage_admission_blocked'
     OPENCLAW_RESPONSE_INVALID_JSON = 'openclaw_response_invalid_json'
     OPENCLAW_ASSISTANT_NON_JSON = 'openclaw_assistant_non_json'
     OPENCLAW_RESPONSE_CONTRACT = 'openclaw_response_contract'
@@ -42,6 +43,7 @@ class FeedbackFailureStatus(str, Enum):
     TRANSPORT_TIMEOUT = 'transport/timeout'
     TRANSPORT_ERROR = 'transport/error'
     CAPACITY_EXHAUSTED = 'capacity/exhausted'
+    STORAGE_ADMISSION_BLOCKED = 'capacity/storage-admission-blocked'
     RESPONSE_INVALID_JSON = 'response/invalid-json'
     RESPONSE_ASSISTANT_NON_JSON = 'response/assistant-non-json'
     RESPONSE_CONTRACT = 'response/contract'
@@ -137,6 +139,14 @@ def classify_feedback_failure(
     context_payload = context if isinstance(context, Mapping) else {}
     summary_payload = summary if isinstance(summary, Mapping) else {}
     status_codes = set(_status_code_values(summary_payload, context_payload))
+
+    if 'openclaw_storage_admission_blocked' in haystack:
+        return FeedbackFailureClassification(
+            failure_kind=FeedbackFailureKind.OPENCLAW_STORAGE_ADMISSION_BLOCKED.value,
+            failure_status=FeedbackFailureStatus.STORAGE_ADMISSION_BLOCKED.value,
+            failure_category='capacity',
+            reason='OpenClaw state filesystem free space is below the dispatch admission minimum',
+        )
 
     if (
         'openclaw_plugin_state_capacity_exhausted' in haystack

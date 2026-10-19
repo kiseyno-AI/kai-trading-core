@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -233,7 +234,17 @@ class AgentFeedbackSessionCleanupService:
             'binding_cleanup': binding_cleanup,
         }
 
-    def run_pending_cleanup(self, *, limit: int = 100) -> dict[str, Any]:
+    def run_pending_cleanup(
+        self,
+        *,
+        limit: int = 100,
+        max_runtime_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        deadline_monotonic = (
+            time.monotonic() + max(0.0, float(max_runtime_seconds))
+            if max_runtime_seconds is not None
+            else None
+        )
         now = datetime.now(UTC)
         with session_scope() as session:
             stmt: Select[tuple[AgentFeedbackSessionCleanupFailure]] = (
@@ -248,13 +259,31 @@ class AgentFeedbackSessionCleanupService:
             rows = session.execute(stmt).scalars().all()
             targets = [self._target_from_failure(row) for row in rows]
 
-        processed = [self.delete_now(target=target) for target in targets]
+        processed: list[dict[str, Any]] = []
+        budget_exhausted = False
+        per_item_timeout_seconds = max(
+            1.0,
+            float(settings.openclaw_session_cleanup_timeout_seconds or 30.0),
+        )
+        for target in targets:
+            if (
+                deadline_monotonic is not None
+                and processed
+                and deadline_monotonic - time.monotonic()
+                < per_item_timeout_seconds
+            ):
+                budget_exhausted = True
+                break
+            processed.append(self.delete_now(target=target))
         return {
             'ok': True,
             'summary': {
                 'selected': len(targets),
+                'attempted': len(processed),
                 'deleted': sum(1 for item in processed if item.get('status') == 'deleted'),
                 'failed': sum(1 for item in processed if item.get('status') == 'failed'),
+                'deferred_for_budget': len(targets) - len(processed),
+                'budget_exhausted': budget_exhausted,
             },
             'items': processed,
         }
@@ -348,8 +377,12 @@ class AgentFeedbackSessionCleanupService:
             ensure_ascii=False,
         )
         cmd = [
-            'openclaw', 'gateway', 'call', 'sessions.delete', '--json', '--token', token, '--params', params,
+            'openclaw', 'gateway', 'call', 'sessions.delete', '--json', '--params', params,
         ]
+        process_env = {
+            **os.environ,
+            'OPENCLAW_GATEWAY_TOKEN': token,
+        }
         timeout_seconds = max(1.0, float(settings.openclaw_session_cleanup_timeout_seconds or 30.0))
         try:
             completed = subprocess.run(
@@ -357,6 +390,7 @@ class AgentFeedbackSessionCleanupService:
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                env=process_env,
             )
         except subprocess.TimeoutExpired as exc:
             stdout = (exc.stdout or '').strip() if isinstance(exc.stdout, str) else ''

@@ -130,6 +130,91 @@ Run "openclaw doctor --fix" to remove stale entries.
         self.assertTrue(result['ok'])
         self.assertIn('--json', run.call_args.args[0])
 
+    def test_invoke_delete_keeps_gateway_token_out_of_process_arguments(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"ok": true, "deleted": true}',
+            stderr='',
+        )
+
+        with (
+            patch(
+                'app.agent_context.session_cleanup_service.settings.openclaw_gateway_token',
+                'secret-token',
+            ),
+            patch(
+                'app.agent_context.session_cleanup_service.subprocess.run',
+                return_value=completed,
+            ) as run,
+        ):
+            result = service._invoke_delete(
+                session_key='feedback/eod-summarizer/slot-01',
+                delete_transcript=True,
+                emit_lifecycle_hooks=False,
+            )
+
+        self.assertTrue(result['ok'])
+        command = run.call_args.args[0]
+        self.assertNotIn('--token', command)
+        self.assertNotIn('secret-token', command)
+        self.assertEqual(
+            run.call_args.kwargs['env']['OPENCLAW_GATEWAY_TOKEN'],
+            'secret-token',
+        )
+
+    def test_pending_cleanup_does_not_start_an_item_that_cannot_fit_run_budget(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        rows = [MagicMock(), MagicMock(), MagicMock()]
+        targets = [
+            SessionCleanupTarget(
+                market_date=date(2026, 10, 19),
+                symbol=f'00593{index}',
+                agent_name='eod-summarizer',
+                run_id='feedback-run-budgeted-cleanup',
+                session_key=f'feedback/eod-summarizer/budget-{index}',
+            )
+            for index in range(3)
+        ]
+        session = MagicMock()
+        session.execute.return_value.scalars.return_value.all.return_value = rows
+
+        with (
+            patch.object(session_cleanup_module, 'session_scope') as scoped_session,
+            patch.object(
+                service,
+                '_target_from_failure',
+                side_effect=targets,
+            ),
+            patch.object(
+                service,
+                'delete_now',
+                return_value={'status': 'deleted'},
+            ) as delete_now,
+            patch.object(
+                session_cleanup_module.settings,
+                'openclaw_session_cleanup_timeout_seconds',
+                30,
+            ),
+            patch.object(
+                session_cleanup_module.time,
+                'monotonic',
+                side_effect=[100.0, 106.0],
+            ),
+        ):
+            scoped_session.return_value.__enter__.return_value = session
+            result = service.run_pending_cleanup(
+                limit=3,
+                max_runtime_seconds=35,
+            )
+
+        delete_now.assert_called_once_with(target=targets[0])
+        self.assertEqual(result['summary']['selected'], 3)
+        self.assertEqual(result['summary']['attempted'], 1)
+        self.assertEqual(result['summary']['deferred_for_budget'], 2)
+        self.assertTrue(result['summary']['budget_exhausted'])
+
     def test_delete_now_treats_already_absent_session_as_idempotent_success(self) -> None:
         service = AgentFeedbackSessionCleanupService()
         target = SessionCleanupTarget(

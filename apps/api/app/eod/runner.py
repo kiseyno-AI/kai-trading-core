@@ -6,6 +6,9 @@ from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from app.agent_context.session_cleanup_service import (
+    agent_feedback_session_cleanup_service,
+)
 from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
@@ -423,6 +426,28 @@ class EODBackgroundRunner:
         else:
             self._buy_authority_critical_failures.pop(name, None)
 
+    async def _run_pending_session_cleanup(self) -> None:
+        if (
+            not settings.openclaw_session_cleanup_enabled
+            or not settings.openclaw_gateway_token
+        ):
+            return
+        try:
+            await self._run_blocking_step(
+                'agent_feedback_session_cleanup',
+                lambda: agent_feedback_session_cleanup_service.run_pending_cleanup(
+                    limit=settings.openclaw_session_cleanup_batch_limit,
+                    max_runtime_seconds=(
+                        settings.openclaw_session_cleanup_run_budget_seconds
+                    ),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Background session cleanup failed without blocking other runner work: %s',
+                exc,
+            )
+
     async def _run_loop(self) -> None:
         live_market_snapshot_loop = asyncio.get_running_loop()
         while self._running:
@@ -433,6 +458,7 @@ class EODBackgroundRunner:
             market: object | None = None
             try:
                 market = await async_get_market_state()
+                await self._run_pending_session_cleanup()
                 if auto_pykrx_eod_scheduler.state.active_task:
                     await asyncio.sleep(self.interval_seconds)
                     continue
