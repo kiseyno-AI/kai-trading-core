@@ -44,7 +44,11 @@ from app.eod.summary_cutoff_contract import (
     summary_cutoff_proof_from_stage,
 )
 from app.eod.master import refresh_master_if_due
-from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_backfill import (
+    DEFAULT_MARKETS,
+    FEEDBACK_RETRY_PARENT_CONTRACT_VERSION,
+    PYKRX_BACKFILL_SERVICE,
+)
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
@@ -651,6 +655,7 @@ class DailyPipelineStageService:
         normalized_inherited_feedback_retry_config: dict[str, Any] | None = (
             None
         )
+        feedback_retry_parent_contract: dict[str, Any] | None = None
         normalized_summary_cutoff_proof = (
             dict(summary_cutoff_proof)
             if isinstance(summary_cutoff_proof, Mapping)
@@ -750,6 +755,30 @@ class DailyPipelineStageService:
                     timezone.utc
                 )
             )
+            feedback_scope_mode = str(
+                normalized_inherited_feedback_retry_config.get(
+                    'feedback_scope_mode'
+                )
+                or ''
+            ).strip()
+            if feedback_scope_mode not in {
+                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            }:
+                raise ValueError(
+                    'inherited feedback retry config requires an exact '
+                    'scope mode'
+                )
+            feedback_retry_parent_contract = {
+                'schema_version': (
+                    FEEDBACK_RETRY_PARENT_CONTRACT_VERSION
+                ),
+                'source_run_id': inherited_feedback_source_run_id,
+                'knowledge_cutoff_at': (
+                    feedback_knowledge_cutoff_at.isoformat()
+                ),
+                'feedback_scope_mode': feedback_scope_mode,
+            }
         elif (
             inherited_feedback_knowledge_cutoff_at is not None
             or inherited_feedback_source_run_id is not None
@@ -1260,14 +1289,23 @@ class DailyPipelineStageService:
                     ),
                     'inherited_feedback_knowledge_cutoff_at': (
                         feedback_knowledge_cutoff_at.isoformat()
-                        if inherit_feedback_prerequisite_admission
+                        if normalized_inherited_feedback_retry_config
                         and feedback_knowledge_cutoff_at is not None
                         else None
                     ),
                     'inherited_feedback_source_run_id': (
                         inherited_feedback_source_run_id
-                        if inherit_feedback_prerequisite_admission
+                        if normalized_inherited_feedback_retry_config
                         else None
+                    ),
+                    **(
+                        {
+                            'feedback_retry_parent_contract': (
+                                feedback_retry_parent_contract
+                            )
+                        }
+                        if feedback_retry_parent_contract is not None
+                        else {}
                     ),
                     'reused_eod_collection_run_id': (
                         int(reused_eod_collection_run_id)

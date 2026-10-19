@@ -118,6 +118,7 @@ MAX_AUTO_PYKRX_DAILY_RUNS_PER_TRADE_DATE = 5
 AUTO_PYKRX_DAILY_RETRY_MIN_INTERVAL_SECONDS = 5 * 60
 MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE = 5
 MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE = 3
+FEEDBACK_RETRY_PARENT_CONTRACT_VERSION = 'feedback_retry_parent_v1'
 AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
 AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS = 60 * 60
 AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
@@ -1085,16 +1086,27 @@ def _is_retryable_feedback_rearm_candidate(
 
     if not isinstance(pipeline_run, Mapping):
         return False
+    run_metadata = (
+        pipeline_run.get('run_metadata')
+        if isinstance(pipeline_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    has_parent_contract = (
+        'feedback_retry_parent_contract' in run_metadata
+    )
     stages = pipeline_run.get('stages')
     if not isinstance(stages, Mapping):
-        return False
+        return has_parent_contract
     stage = stages.get('agent_feedback_summaries')
     if not isinstance(stage, Mapping):
-        return False
-    if str(stage.get('status') or '').strip().lower() not in {
-        'partial',
-        'failed',
-    }:
+        return has_parent_contract
+    stage_status = str(stage.get('status') or '').strip().lower()
+    if has_parent_contract:
+        # Exact retry lineage is written before the retry starts. Preserve
+        # that lane even when execution fails before emitting progress; an
+        # invalid marker is handled as a fail-closed contract error below.
+        return stage_status != 'completed'
+    if stage_status not in {'partial', 'failed'}:
         return False
     details = stage.get('details')
     result_summary = (
@@ -1111,11 +1123,6 @@ def _is_retryable_feedback_rearm_candidate(
         result_summary.get('prerequisites')
         if isinstance(result_summary, Mapping)
         else None
-    )
-    run_metadata = (
-        pipeline_run.get('run_metadata')
-        if isinstance(pipeline_run.get('run_metadata'), Mapping)
-        else {}
     )
     inherited_admission = bool(
         run_metadata.get(
@@ -1182,6 +1189,54 @@ def _is_retryable_feedback_rearm_candidate(
     )
 
 
+def _feedback_retry_parent_contract(
+    pipeline_run: object,
+) -> dict[str, Any] | None:
+    if not isinstance(pipeline_run, Mapping):
+        return None
+    run_metadata = pipeline_run.get('run_metadata')
+    if not isinstance(run_metadata, Mapping):
+        return None
+    raw_contract = run_metadata.get('feedback_retry_parent_contract')
+    if not isinstance(raw_contract, Mapping):
+        return None
+    source_run_id = str(
+        raw_contract.get('source_run_id') or ''
+    ).strip()
+    knowledge_cutoff_at = _parse_activity_datetime(
+        raw_contract.get('knowledge_cutoff_at')
+    )
+    feedback_scope_mode = str(
+        raw_contract.get('feedback_scope_mode') or ''
+    ).strip()
+    persisted_source_run_id = str(
+        run_metadata.get('inherited_feedback_source_run_id') or ''
+    ).strip()
+    persisted_cutoff_at = _parse_activity_datetime(
+        run_metadata.get('inherited_feedback_knowledge_cutoff_at')
+    )
+    if not (
+        str(raw_contract.get('schema_version') or '').strip()
+        == FEEDBACK_RETRY_PARENT_CONTRACT_VERSION
+        and source_run_id
+        and knowledge_cutoff_at is not None
+        and feedback_scope_mode
+        in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and persisted_source_run_id == source_run_id
+        and persisted_cutoff_at == knowledge_cutoff_at
+    ):
+        return None
+    return {
+        'schema_version': FEEDBACK_RETRY_PARENT_CONTRACT_VERSION,
+        'source_run_id': source_run_id,
+        'knowledge_cutoff_at': knowledge_cutoff_at,
+        'feedback_scope_mode': feedback_scope_mode,
+    }
+
+
 def _retryable_feedback_rearm_source_run_id(
     pipeline_run: object,
 ) -> str | None:
@@ -1211,6 +1266,13 @@ def _retryable_feedback_rearm_source_run_id(
         if isinstance(pipeline_run.get('run_metadata'), Mapping)
         else {}
     )
+    if 'feedback_retry_parent_contract' in run_metadata:
+        parent_contract = _feedback_retry_parent_contract(pipeline_run)
+        return (
+            str(parent_contract.get('source_run_id') or '').strip()
+            if isinstance(parent_contract, Mapping)
+            else None
+        )
     inherited_source_run_id = str(
         run_metadata.get('inherited_feedback_source_run_id') or ''
     ).strip()
@@ -1225,6 +1287,18 @@ def _retryable_feedback_rearm_config(
     """Recover the immutable retry inputs from the exact failed parent."""
 
     if not _is_retryable_feedback_rearm_candidate(pipeline_run):
+        return None
+    run_metadata = (
+        pipeline_run.get('run_metadata')
+        if isinstance(pipeline_run, Mapping)
+        and isinstance(pipeline_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    parent_contract = _feedback_retry_parent_contract(pipeline_run)
+    if (
+        'feedback_retry_parent_contract' in run_metadata
+        and parent_contract is None
+    ):
         return None
     source_run_id = _retryable_feedback_rearm_source_run_id(pipeline_run)
     if not source_run_id:
@@ -1244,6 +1318,15 @@ def _retryable_feedback_rearm_config(
         in {'partial', 'failed'}
         and str(request_payload.get('mode') or '').strip()
         == DAILY_RETRY_CYCLE_MODE
+    ):
+        return None
+    if (
+        isinstance(parent_contract, Mapping)
+        and source_run_id != parent_contract['source_run_id']
+        and str(
+            request_payload.get('resumed_from_run_id') or ''
+        ).strip()
+        != parent_contract['source_run_id']
     ):
         return None
 
@@ -1304,6 +1387,11 @@ def _retryable_feedback_rearm_config(
             request_payload.get('outer_batch_size') or 0
         )
     except (TypeError, ValueError):
+        return None
+    if isinstance(parent_contract, Mapping) and not (
+        parent_contract['knowledge_cutoff_at'] == knowledge_cutoff_at
+        and parent_contract['feedback_scope_mode'] == feedback_scope_mode
+    ):
         return None
     if not (
         roles == tuple(SUMMARIZER_AGENT_NAMES)
@@ -1408,23 +1496,36 @@ def _retryable_feedback_rearm_max_cycles(
         if isinstance(progress, Mapping)
         else None
     )
+    if not isinstance(summary, Mapping):
+        parent_contract = _feedback_retry_parent_contract(pipeline_run)
+        run_metadata = pipeline_run.get('run_metadata')
+        if not (
+            isinstance(parent_contract, Mapping)
+            and isinstance(run_metadata, Mapping)
+        ):
+            return None
+        try:
+            persisted_max_cycles = int(
+                run_metadata.get('feedback_max_cycles')
+            )
+        except (TypeError, ValueError):
+            return None
+        return persisted_max_cycles if persisted_max_cycles > 0 else None
+    if not {'completed_cycles', 'cycle_number'}.issubset(summary):
+        return None
     try:
-        completed_cycles = int(
-            summary.get('completed_cycles') or 0
-            if isinstance(summary, Mapping)
-            else 0
-        )
-        cycle_number = int(
-            summary.get('cycle_number') or 0
-            if isinstance(summary, Mapping)
-            else 0
-        )
+        completed_cycles = int(summary['completed_cycles'])
+        cycle_number = int(summary['cycle_number'])
     except (TypeError, ValueError):
         return None
-    next_cycle_limit = max(completed_cycles + 1, cycle_number)
-    if completed_cycles < 0 or cycle_number < 0 or next_cycle_limit < 1:
+    if (
+        completed_cycles < 0
+        or cycle_number < 1
+        or cycle_number
+        not in {completed_cycles, completed_cycles + 1}
+    ):
         return None
-    return next_cycle_limit
+    return max(completed_cycles + 1, cycle_number)
 
 
 def _feedback_suffix_has_stale_prerequisite_ordering(

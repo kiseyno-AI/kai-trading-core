@@ -19,6 +19,7 @@ from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import (
     AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS,
     AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+    FEEDBACK_RETRY_PARENT_CONTRACT_VERSION,
     PYKRX_STAGE_SEQUENCE,
     PykrxBackfillService,
     PykrxSymbol,
@@ -6555,6 +6556,7 @@ class PykrxBackfillServiceTests(TestCase):
                                     'run_status': 'partial',
                                     'failed_items': 1,
                                     'completed_cycles': 2,
+                                    'cycle_number': 2,
                                     'role_progress': {
                                         'eod-summarizer': {
                                             'retry_pending_symbols': 1,
@@ -6574,6 +6576,10 @@ class PykrxBackfillServiceTests(TestCase):
         }
         self.assertTrue(
             _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
+        )
+        self.assertEqual(
+            _retryable_feedback_rearm_max_cycles(latest_pipeline_run),
+            3,
         )
         parent_cutoff = datetime(
             2026,
@@ -6874,6 +6880,205 @@ class PykrxBackfillServiceTests(TestCase):
             date(2026, 4, 6),
         )
         self.assertIsNone(inherited_config['scope_authority'])
+
+        failed_exact_retry_run = {
+            'id': 97,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'failed',
+            'updated_at': (
+                now - timedelta(minutes=10)
+            ).isoformat(),
+            'completed_at': (
+                now - timedelta(minutes=10)
+            ).isoformat(),
+            'run_metadata': {
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'reused_eod_collection_run_id': 7,
+                'symbols': list(parent_symbols),
+                'fs_div': 'OFS',
+                'feedback_max_cycles': 1,
+                'feedback_outer_batch_size': 17,
+                'inherited_feedback_prerequisite_admission': False,
+                'inherited_feedback_knowledge_cutoff_at': (
+                    parent_cutoff.isoformat()
+                ),
+                'inherited_feedback_source_run_id': (
+                    'feedback-cycle-test'
+                ),
+                'feedback_retry_parent_contract': {
+                    'schema_version': (
+                        FEEDBACK_RETRY_PARENT_CONTRACT_VERSION
+                    ),
+                    'source_run_id': 'feedback-cycle-test',
+                    'knowledge_cutoff_at': parent_cutoff.isoformat(),
+                    'feedback_scope_mode': (
+                        'decider_scope_fast_path'
+                    ),
+                },
+            },
+            'stages': {
+                'agent_feedback_summaries': {
+                    'status': 'failed',
+                    'details': {'error_message': 'transport failure'},
+                },
+                'signal_decider': {'status': 'blocked'},
+                'next_open_execution_plan': {'status': 'blocked'},
+                'signal_decider_evaluations': {'status': 'blocked'},
+            },
+        }
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(
+                failed_exact_retry_run
+            )
+        )
+        self.assertEqual(
+            _retryable_feedback_rearm_max_cycles(
+                failed_exact_retry_run
+            ),
+            1,
+        )
+        missing_stage_exact_retry_run = deepcopy(
+            failed_exact_retry_run
+        )
+        missing_stage_exact_retry_run['stages'] = {}
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(
+                missing_stage_exact_retry_run
+            )
+        )
+        blocked_exact_retry_run = deepcopy(failed_exact_retry_run)
+        blocked_exact_retry_run['stages'][
+            'agent_feedback_summaries'
+        ]['status'] = 'blocked'
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(
+                blocked_exact_retry_run
+            )
+        )
+        advanced_exact_retry_run = deepcopy(failed_exact_retry_run)
+        advanced_exact_retry_run['stages'][
+            'agent_feedback_summaries'
+        ] = {
+            'status': 'partial',
+            'details': {
+                'result_summary': {
+                    'run_id': 'feedback-cycle-child',
+                }
+            },
+        }
+        child_feedback_run = deepcopy(parent_feedback_run)
+        child_feedback_run['run_id'] = 'feedback-cycle-child'
+        child_feedback_run['status'] = 'partial'
+        child_feedback_run['request_payload'][
+            'resumed_from_run_id'
+        ] = 'feedback-cycle-test'
+        with patch(
+            'app.eod.pykrx_backfill.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=child_feedback_run,
+        ):
+            advanced_config = _retryable_feedback_rearm_config(
+                advanced_exact_retry_run,
+                market_date='2026-04-03',
+            )
+        self.assertIsNotNone(advanced_config)
+        self.assertEqual(
+            advanced_config['source_run_id'],
+            'feedback-cycle-child',
+        )
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=missing_stage_exact_retry_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=2,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=parent_feedback_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 98,
+                },
+            ) as second_rearmed_followups,
+        ):
+            second_rearmed = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+                markets=('KOSPI', 'KOSDAQ'),
+                point_in_time_recovery=False,
+            )
+
+        self.assertTrue(second_rearmed['triggered'])
+        second_kwargs = second_rearmed_followups.call_args.kwargs
+        self.assertEqual(second_kwargs['symbols'], parent_symbols)
+        self.assertEqual(second_kwargs['fs_div'], 'OFS')
+        self.assertEqual(second_kwargs['feedback_outer_batch_size'], 17)
+        self.assertEqual(second_kwargs['feedback_max_cycles'], 1)
+        self.assertNotIn(
+            'inherit_feedback_prerequisite_admission',
+            second_kwargs,
+        )
+        second_config = second_kwargs[
+            'inherited_feedback_retry_config'
+        ]
+        self.assertEqual(
+            second_config['source_run_id'],
+            'feedback-cycle-test',
+        )
+        self.assertEqual(
+            second_config['feedback_scope_mode'],
+            'decider_scope_fast_path',
+        )
+        self.assertEqual(
+            second_config['requested_symbols'],
+            parent_symbols,
+        )
+        self.assertEqual(
+            second_config['role_symbol_scopes'],
+            parent_role_symbol_scopes,
+        )
+        self.assertEqual(
+            second_config['knowledge_cutoff_at'],
+            parent_cutoff,
+        )
+        self.assertEqual(
+            second_config['policy_context_as_of_date'],
+            date(2026, 4, 6),
+        )
 
         with (
             patch.object(

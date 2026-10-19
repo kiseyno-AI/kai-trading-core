@@ -3338,6 +3338,30 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertIsNone(call['config'].scope_authority)
         self.assertEqual(call['config'].outer_batch_size, 17)
         self.assertEqual(call['config'].max_cycles, 4)
+        historical_metadata = self.run_state_service.runs[-1][
+            'run_metadata'
+        ]
+        self.assertEqual(
+            historical_metadata['inherited_feedback_source_run_id'],
+            'feedback-cycle-parent',
+        )
+        self.assertEqual(
+            historical_metadata[
+                'inherited_feedback_knowledge_cutoff_at'
+            ],
+            cutoff.isoformat(),
+        )
+        self.assertEqual(
+            historical_metadata['feedback_retry_parent_contract'],
+            {
+                'schema_version': 'feedback_retry_parent_v1',
+                'source_run_id': 'feedback-cycle-parent',
+                'knowledge_cutoff_at': cutoff.isoformat(),
+                'feedback_scope_mode': (
+                    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                ),
+            },
+        )
 
         same_day_retry_service = _FakeFeedbackRetryService()
         same_day_service = DailyPipelineStageService(
@@ -3388,6 +3412,19 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(same_day_call['config'].symbols, tuple(symbols))
         self.assertEqual(
             same_day_call['config'].feedback_scope_mode,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        )
+        same_day_metadata = self.run_state_service.runs[-1][
+            'run_metadata'
+        ]
+        self.assertEqual(
+            same_day_metadata['inherited_feedback_source_run_id'],
+            'feedback-cycle-parent',
+        )
+        self.assertEqual(
+            same_day_metadata['feedback_retry_parent_contract'][
+                'feedback_scope_mode'
+            ],
             FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         )
 
