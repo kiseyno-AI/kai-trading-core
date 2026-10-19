@@ -711,6 +711,103 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(observed['stage'], 'cycle_started')
         self.assertEqual(observed['current_step'], 'cycle_started')
 
+    def test_exact_rearm_can_bind_failed_parent(self):
+        service = AgentFeedbackRetryService()
+        market_date = date(2026, 4, 16)
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        roles = SUMMARIZER_AGENT_NAMES
+        symbols = ('005930',)
+        role_scopes = {role: list(symbols) for role in roles}
+        parent_run = {
+            'run_id': 'feedback-cycle-failed-parent',
+            'market_date': market_date,
+            'status': 'failed',
+            'request_payload': {
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(roles),
+                'requested_symbols': list(symbols),
+                'role_symbol_scopes': role_scopes,
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'policy_context_as_of_date': market_date.isoformat(),
+                'fs_div': 'CFS',
+                'knowledge_cutoff_at': cutoff.isoformat(),
+                'outer_batch_size': 20,
+            },
+            'summary_payload': {},
+        }
+        config = FeedbackRetryCycleConfig(
+            market_date=market_date,
+            roles=roles,
+            symbols=symbols,
+            knowledge_cutoff_at=cutoff,
+            policy_context_as_of_date=market_date,
+            fs_div='CFS',
+            feedback_scope_mode='decider_scope_fast_path',
+            reuse_existing=True,
+            reuse_parent_run_id=parent_run['run_id'],
+            role_symbol_scopes=role_scopes,
+        )
+
+        class LeaseContext:
+            def __enter__(self):
+                return SimpleNamespace()
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with (
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
+            patch.object(
+                service,
+                '_load_eligible_symbols',
+                return_value=list(symbols),
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'resolve_external_news_knowledge_cutoff_for_symbols',
+                return_value=(cutoff, 'requested'),
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=parent_run,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                '_claim_feedback_retry_run',
+                return_value={
+                    'acquired': True,
+                    'owner_token': 'owner-token',
+                },
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                '_feedback_retry_claim_lease',
+                return_value=LeaseContext(),
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                '_finish_feedback_retry_claim_if_running',
+            ),
+            patch.object(
+                service,
+                '_run_retry_cycles_admitted',
+                return_value={'status': 'completed'},
+            ) as admitted,
+        ):
+            result = service.run_retry_cycles(config=config)
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertIs(
+            admitted.call_args.kwargs['previous_run'],
+            parent_run,
+        )
+
     def _weekly_zero_effect_claim_fixture(self):
         suffix = uuid4().hex[:10].upper()
         market_date = date.fromisoformat('2042-01-02')

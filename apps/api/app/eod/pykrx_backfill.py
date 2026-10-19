@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from copy import deepcopy
 import logging
 import math
 import time
@@ -11,6 +12,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from app.agent_context.derived_contexts import daily_price_context_service
+from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
 from app.agent_context.prerequisite_service import (
     FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
 )
@@ -18,6 +20,7 @@ from app.agent_context.run_state_service import (
     agent_context_feedback_run_state_service,
 )
 from app.agent_context.run_modes import (
+    DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
@@ -1088,7 +1091,10 @@ def _is_retryable_feedback_rearm_candidate(
     stage = stages.get('agent_feedback_summaries')
     if not isinstance(stage, Mapping):
         return False
-    if str(stage.get('status') or '').strip().lower() != 'partial':
+    if str(stage.get('status') or '').strip().lower() not in {
+        'partial',
+        'failed',
+    }:
         return False
     details = stage.get('details')
     result_summary = (
@@ -1167,7 +1173,8 @@ def _is_retryable_feedback_rearm_candidate(
     except (TypeError, ValueError):
         return False
     return (
-        str(summary.get('run_status') or '').strip().lower() == 'partial'
+        str(summary.get('run_status') or '').strip().lower()
+        in {'partial', 'failed'}
         and failed_items > 0
         and retry_pending_items == failed_items
         and in_progress_items == 0
@@ -1180,16 +1187,6 @@ def _retryable_feedback_rearm_source_run_id(
 ) -> str | None:
     if not isinstance(pipeline_run, Mapping):
         return None
-    run_metadata = (
-        pipeline_run.get('run_metadata')
-        if isinstance(pipeline_run.get('run_metadata'), Mapping)
-        else {}
-    )
-    inherited_source_run_id = str(
-        run_metadata.get('inherited_feedback_source_run_id') or ''
-    ).strip()
-    if inherited_source_run_id:
-        return inherited_source_run_id
     stages = pipeline_run.get('stages')
     stage = (
         stages.get('agent_feedback_summaries')
@@ -1207,7 +1204,159 @@ def _retryable_feedback_rearm_source_run_id(
         if isinstance(result_summary, Mapping)
         else ''
     ).strip()
-    return source_run_id or None
+    if source_run_id:
+        return source_run_id
+    run_metadata = (
+        pipeline_run.get('run_metadata')
+        if isinstance(pipeline_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    inherited_source_run_id = str(
+        run_metadata.get('inherited_feedback_source_run_id') or ''
+    ).strip()
+    return inherited_source_run_id or None
+
+
+def _retryable_feedback_rearm_config(
+    pipeline_run: object,
+    *,
+    market_date: str,
+) -> dict[str, Any] | None:
+    """Recover the immutable retry inputs from the exact failed parent."""
+
+    if not _is_retryable_feedback_rearm_candidate(pipeline_run):
+        return None
+    source_run_id = _retryable_feedback_rearm_source_run_id(pipeline_run)
+    if not source_run_id:
+        return None
+    source_run = agent_context_feedback_run_state_service.get_run(
+        run_id=source_run_id
+    )
+    request_payload = (
+        source_run.get('request_payload')
+        if isinstance(source_run, Mapping)
+        else None
+    )
+    if not (
+        isinstance(request_payload, Mapping)
+        and _to_iso_date(source_run.get('market_date')) == market_date
+        and str(source_run.get('status') or '').strip().lower()
+        in {'partial', 'failed'}
+        and str(request_payload.get('mode') or '').strip()
+        == DAILY_RETRY_CYCLE_MODE
+    ):
+        return None
+
+    raw_roles = request_payload.get('roles')
+    roles = (
+        tuple(str(role or '').strip() for role in raw_roles)
+        if isinstance(raw_roles, list)
+        else ()
+    )
+
+    def exact_symbols(value: object) -> list[str] | None:
+        if not isinstance(value, list):
+            return None
+        normalized = _dedupe_symbol_codes(value)
+        return normalized if normalized and normalized == value else None
+
+    requested_symbols = exact_symbols(
+        request_payload.get('requested_symbols')
+    )
+    raw_role_symbol_scopes = request_payload.get('role_symbol_scopes')
+    role_symbol_scopes = (
+        {
+            role: exact_symbols(raw_role_symbol_scopes.get(role))
+            for role in roles
+        }
+        if isinstance(raw_role_symbol_scopes, Mapping)
+        else {}
+    )
+
+    feedback_scope_mode = str(
+        request_payload.get('feedback_scope_mode') or ''
+    ).strip()
+    knowledge_cutoff_at = _parse_activity_datetime(
+        request_payload.get('knowledge_cutoff_at')
+    )
+    admission_cutoff_at = _parse_activity_datetime(
+        request_payload.get('admission_knowledge_cutoff_at')
+    )
+    fs_div = str(request_payload.get('fs_div') or '').strip().upper()
+    raw_policy_context_as_of_date = request_payload.get(
+        'policy_context_as_of_date'
+    )
+    try:
+        policy_context_as_of_date = (
+            raw_policy_context_as_of_date.date()
+            if isinstance(raw_policy_context_as_of_date, datetime)
+            else raw_policy_context_as_of_date
+            if isinstance(raw_policy_context_as_of_date, date)
+            else date.fromisoformat(
+                str(raw_policy_context_as_of_date or '').strip()
+            )
+        )
+    except ValueError:
+        return None
+    raw_scope_authority = request_payload.get('scope_authority')
+    try:
+        outer_batch_size = int(
+            request_payload.get('outer_batch_size') or 0
+        )
+    except (TypeError, ValueError):
+        return None
+    if not (
+        roles == tuple(SUMMARIZER_AGENT_NAMES)
+        and requested_symbols
+        and isinstance(raw_role_symbol_scopes, Mapping)
+        and set(raw_role_symbol_scopes) == set(roles)
+        and all(role_symbol_scopes.values())
+        and all(
+            set(scope).issubset(requested_symbols)
+            for scope in role_symbol_scopes.values()
+        )
+        and feedback_scope_mode in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and knowledge_cutoff_at is not None
+        and (
+            admission_cutoff_at is None
+            or admission_cutoff_at == knowledge_cutoff_at
+        )
+        and fs_div in {'CFS', 'OFS'}
+        and policy_context_as_of_date >= date.fromisoformat(market_date)
+        and (
+            raw_scope_authority is None
+            or isinstance(raw_scope_authority, Mapping)
+        )
+        and outer_batch_size > 0
+    ):
+        return None
+
+    idempotency_key = str(
+        request_payload.get('idempotency_key') or ''
+    ).strip() or None
+    return {
+        'source_run_id': source_run_id,
+        'roles': list(roles),
+        'requested_symbols': list(requested_symbols),
+        'role_symbol_scopes': {
+            role: list(scope)
+            for role, scope in role_symbol_scopes.items()
+        },
+        'knowledge_cutoff_at': knowledge_cutoff_at,
+        'feedback_scope_mode': feedback_scope_mode,
+        'fs_div': fs_div,
+        'policy_context_as_of_date': policy_context_as_of_date,
+        'scope_authority': (
+            deepcopy(dict(raw_scope_authority))
+            if raw_scope_authority is not None
+            else None
+        ),
+        'idempotency_key': idempotency_key,
+        'outer_batch_size': outer_batch_size,
+    }
 
 
 def _retryable_feedback_rearm_knowledge_cutoff(
@@ -1217,45 +1366,14 @@ def _retryable_feedback_rearm_knowledge_cutoff(
 ) -> datetime | None:
     """Resolve the exact cutoff that made the parent feedback reusable."""
 
-    if not _is_retryable_feedback_rearm_candidate(pipeline_run):
-        return None
-    if not isinstance(pipeline_run, Mapping):
-        return None
-    run_metadata = (
-        pipeline_run.get('run_metadata')
-        if isinstance(pipeline_run.get('run_metadata'), Mapping)
-        else {}
+    config = _retryable_feedback_rearm_config(
+        pipeline_run,
+        market_date=market_date,
     )
-    inherited_cutoff = _parse_activity_datetime(
-        run_metadata.get('inherited_feedback_knowledge_cutoff_at')
-    )
-    if inherited_cutoff is not None:
-        return inherited_cutoff
-
-    source_run_id = _retryable_feedback_rearm_source_run_id(
-        pipeline_run
-    )
-    if not source_run_id:
-        return None
-    source_run = agent_context_feedback_run_state_service.get_run(
-        run_id=source_run_id
-    )
-    if not isinstance(source_run, Mapping):
-        return None
-    if str(source_run.get('market_date') or '') != market_date:
-        return None
-    if str(source_run.get('status') or '').strip().lower() != 'partial':
-        return None
-    request_payload = source_run.get('request_payload')
-    if not isinstance(request_payload, Mapping):
-        return None
-    if (
-        str(request_payload.get('feedback_scope_mode') or '').strip()
-        != FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
-    ):
-        return None
-    return _parse_activity_datetime(
-        request_payload.get('knowledge_cutoff_at')
+    return (
+        config['knowledge_cutoff_at']
+        if isinstance(config, Mapping)
+        else None
     )
 
 
@@ -1292,15 +1410,21 @@ def _retryable_feedback_rearm_max_cycles(
     )
     try:
         completed_cycles = int(
-            summary.get('completed_cycles')
+            summary.get('completed_cycles') or 0
+            if isinstance(summary, Mapping)
+            else 0
+        )
+        cycle_number = int(
+            summary.get('cycle_number') or 0
             if isinstance(summary, Mapping)
             else 0
         )
     except (TypeError, ValueError):
         return None
-    if completed_cycles < 1:
+    next_cycle_limit = max(completed_cycles + 1, cycle_number)
+    if completed_cycles < 0 or cycle_number < 0 or next_cycle_limit < 1:
         return None
-    return completed_cycles + 1
+    return next_cycle_limit
 
 
 def _feedback_suffix_has_stale_prerequisite_ordering(
@@ -3021,40 +3145,70 @@ class PykrxBackfillService:
             >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
             and _is_dart_provider_outage_rearm_candidate(pipeline_run)
         )
+        retryable_feedback_rearm_detected = (
+            _is_retryable_feedback_rearm_candidate(pipeline_run)
+        )
+        retryable_feedback_rearm_config = (
+            _retryable_feedback_rearm_config(
+                pipeline_run,
+                market_date=market_date,
+            )
+            if retryable_feedback_rearm_detected
+            else None
+        )
+        retryable_feedback_source_run_id = (
+            str(
+                retryable_feedback_rearm_config.get('source_run_id')
+                or ''
+            ).strip()
+            if isinstance(retryable_feedback_rearm_config, Mapping)
+            else None
+        )
+        retryable_feedback_knowledge_cutoff_at = (
+            retryable_feedback_rearm_config.get('knowledge_cutoff_at')
+            if isinstance(retryable_feedback_rearm_config, Mapping)
+            else None
+        )
+        retryable_feedback_max_cycles = (
+            _retryable_feedback_rearm_max_cycles(pipeline_run)
+            if retryable_feedback_rearm_detected
+            else None
+        )
         retryable_feedback_rearm_candidate = bool(
-            recovery_attempts
-            >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+            retryable_feedback_rearm_detected
             and recovery_attempts
             < (
                 MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
                 + MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
             )
-            and _is_retryable_feedback_rearm_candidate(pipeline_run)
-        )
-        retryable_feedback_knowledge_cutoff_at = (
-            _retryable_feedback_rearm_knowledge_cutoff(
-                pipeline_run,
-                market_date=market_date,
-            )
-            if retryable_feedback_rearm_candidate
-            else None
-        )
-        retryable_feedback_source_run_id = (
-            _retryable_feedback_rearm_source_run_id(pipeline_run)
-            if retryable_feedback_rearm_candidate
-            else None
-        )
-        retryable_feedback_max_cycles = (
-            _retryable_feedback_rearm_max_cycles(pipeline_run)
-            if retryable_feedback_rearm_candidate
-            else None
-        )
-        retryable_feedback_rearm_candidate = bool(
-            retryable_feedback_rearm_candidate
+            and isinstance(retryable_feedback_rearm_config, Mapping)
             and retryable_feedback_knowledge_cutoff_at is not None
             and retryable_feedback_source_run_id is not None
             and retryable_feedback_max_cycles is not None
         )
+        if (
+            retryable_feedback_rearm_detected
+            and recovery_attempts
+            < (
+                MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                + MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
+            )
+            and not retryable_feedback_rearm_candidate
+        ):
+            result = build_daily_skip_result(
+                reason='followup_feedback_rearm_contract_unavailable',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'attempts': recovery_attempts,
+                'retryable_feedback_rearm': True,
+                'retry_scheduled': False,
+                'blocker': 'exact_parent_feedback_contract_unavailable',
+                'resume_from_stage': incomplete_stages[0],
+            }
+            return result
         provider_outage_retry_after_seconds: int | None = None
         provider_outage_rearm_due = False
         provider_outage_completed_at = _parse_activity_datetime(
@@ -3104,7 +3258,11 @@ class PykrxBackfillService:
                 'attempts': recovery_attempts,
                 'max_attempts': (
                     MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
-                    + (1 if cutoff_contract_repair_proven else 0)
+                    + (
+                        MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
+                        if retryable_feedback_rearm_detected
+                        else (1 if cutoff_contract_repair_proven else 0)
+                    )
                 ),
                 'resume_from_stage': incomplete_stages[0],
             }
@@ -3306,13 +3464,13 @@ class PykrxBackfillService:
             ),
         }
         if retryable_feedback_rearm_candidate:
-            # The parent feedback stage already persisted a ready prerequisite
-            # snapshot. Once the suffix-only child becomes the latest run, the
-            # generic status view no longer contains those completed prefix
-            # stages, so preserve that proven admission for this scoped retry.
-            recovery_kwargs[
-                'inherit_feedback_prerequisite_admission'
-            ] = True
+            # Historical suffix-only retries reuse the parent's prerequisite
+            # admission because their completed prefix is no longer the
+            # latest pipeline row. Same-day retries keep the live gate.
+            if point_in_time_recovery:
+                recovery_kwargs[
+                    'inherit_feedback_prerequisite_admission'
+                ] = True
             recovery_kwargs[
                 'inherited_feedback_knowledge_cutoff_at'
             ] = retryable_feedback_knowledge_cutoff_at
@@ -3321,6 +3479,15 @@ class PykrxBackfillService:
             )
             recovery_kwargs['feedback_max_cycles'] = (
                 retryable_feedback_max_cycles
+            )
+            recovery_kwargs['feedback_outer_batch_size'] = int(
+                retryable_feedback_rearm_config['outer_batch_size']
+            )
+            recovery_kwargs['fs_div'] = str(
+                retryable_feedback_rearm_config['fs_div']
+            )
+            recovery_kwargs['inherited_feedback_retry_config'] = dict(
+                retryable_feedback_rearm_config
             )
         if (
             summary_cutoff_proof is not None
@@ -3357,6 +3524,10 @@ class PykrxBackfillService:
         if terminal_continuation_in_place:
             recovery_symbols = _dedupe_symbol_codes(
                 run_metadata.get('symbols') or []
+            )
+        elif retryable_feedback_rearm_candidate:
+            recovery_symbols = list(
+                retryable_feedback_rearm_config['requested_symbols']
             )
         elif cutoff_contract_repair or cutoff_contract_repair_resume:
             # The decider stage resolves and locks the exact completed

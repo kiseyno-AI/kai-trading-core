@@ -1,6 +1,6 @@
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
@@ -3238,6 +3238,34 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         service = DailyPipelineStageService(
             feedback_retry_service=feedback_retry_service,
         )
+        cutoff = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+        symbols = ['005930', '000660']
+        role_symbol_scopes = {
+            role: list(symbols)
+            for role in SUMMARIZER_AGENT_NAMES
+        }
+        inherited_retry_config = {
+            'source_run_id': 'feedback-cycle-parent',
+            'roles': list(SUMMARIZER_AGENT_NAMES),
+            'requested_symbols': list(symbols),
+            'role_symbol_scopes': role_symbol_scopes,
+            'knowledge_cutoff_at': cutoff,
+            'feedback_scope_mode': (
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            ),
+            'fs_div': 'OFS',
+            'policy_context_as_of_date': date(2026, 4, 15),
+            'scope_authority': None,
+            'idempotency_key': None,
+            'outer_batch_size': 17,
+        }
 
         with patch(
             'app.eod.daily_pipeline_stages.'
@@ -3259,18 +3287,18 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 resume_from_stage='agent_feedback_summaries',
                 trigger='auto_eod_followup_resume',
                 point_in_time_recovery=True,
+                symbols=symbols,
+                fs_div='OFS',
                 inherit_feedback_prerequisite_admission=True,
-                inherited_feedback_knowledge_cutoff_at=datetime(
-                    2026,
-                    4,
-                    14,
-                    8,
-                    30,
-                    tzinfo=timezone.utc,
-                ),
+                inherited_feedback_knowledge_cutoff_at=cutoff,
                 inherited_feedback_source_run_id=(
                     'feedback-cycle-parent'
                 ),
+                inherited_feedback_retry_config=(
+                    inherited_retry_config
+                ),
+                feedback_max_cycles=4,
+                feedback_outer_batch_size=17,
                 reuse_existing_feedback=True,
                 reused_eod_collection_run_id=7,
             )
@@ -3291,7 +3319,76 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             call['config'].knowledge_cutoff_at,
-            datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc),
+            cutoff,
+        )
+        self.assertEqual(call['config'].symbols, tuple(symbols))
+        self.assertEqual(
+            call['config'].role_symbol_scopes,
+            role_symbol_scopes,
+        )
+        self.assertEqual(
+            call['config'].feedback_scope_mode,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        )
+        self.assertEqual(call['config'].fs_div, 'OFS')
+        self.assertEqual(
+            call['config'].policy_context_as_of_date,
+            date(2026, 4, 15),
+        )
+        self.assertIsNone(call['config'].scope_authority)
+        self.assertEqual(call['config'].outer_batch_size, 17)
+        self.assertEqual(call['config'].max_cycles, 4)
+
+        same_day_retry_service = _FakeFeedbackRetryService()
+        same_day_service = DailyPipelineStageService(
+            feedback_retry_service=same_day_retry_service,
+        )
+        with patch(
+            'app.eod.daily_pipeline_stages.'
+            'agent_feedback_prerequisite_service.'
+            'inspect_feedback_prerequisites',
+            return_value=_feedback_prerequisites(),
+        ) as inspect_same_day_prerequisites:
+            same_day_result = same_day_service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                resume_from_stage='agent_feedback_summaries',
+                trigger='auto_eod_followup_resume',
+                symbols=symbols,
+                fs_div='OFS',
+                inherited_feedback_retry_config=inherited_retry_config,
+                feedback_max_cycles=4,
+                feedback_outer_batch_size=17,
+                reuse_existing_feedback=True,
+                reused_eod_collection_run_id=7,
+            )
+
+        self.assertEqual(
+            same_day_result['stages']['agent_feedback_summaries'][
+                'status'
+            ],
+            'completed',
+        )
+        self.assertGreaterEqual(
+            inspect_same_day_prerequisites.call_count,
+            1,
+        )
+        same_day_call = same_day_retry_service.calls[0]
+        self.assertFalse(same_day_call['bypass_prerequisite_gate'])
+        self.assertEqual(
+            same_day_call['config'].reuse_parent_run_id,
+            'feedback-cycle-parent',
+        )
+        self.assertEqual(same_day_call['config'].knowledge_cutoff_at, cutoff)
+        self.assertEqual(same_day_call['config'].symbols, tuple(symbols))
+        self.assertEqual(
+            same_day_call['config'].feedback_scope_mode,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         )
 
     def test_signal_decider_does_not_reuse_summary_parent_lineage(

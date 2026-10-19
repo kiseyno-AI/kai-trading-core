@@ -616,6 +616,7 @@ class DailyPipelineStageService:
         inherit_feedback_prerequisite_admission: bool = False,
         inherited_feedback_knowledge_cutoff_at: datetime | None = None,
         inherited_feedback_source_run_id: str | None = None,
+        inherited_feedback_retry_config: Mapping[str, Any] | None = None,
         provider_admission_fence_owned: bool = False,
         summary_cutoff_proof: Mapping[str, Any] | None = None,
         summary_cutoff_contract_repair: bool = False,
@@ -647,6 +648,9 @@ class DailyPipelineStageService:
         feedback_knowledge_cutoff_at: datetime | None = None
         feedback_cutoff_resolution: dict[str, Any] | None = None
         terminal_summary_source_run_id: str | None = None
+        normalized_inherited_feedback_retry_config: dict[str, Any] | None = (
+            None
+        )
         normalized_summary_cutoff_proof = (
             dict(summary_cutoff_proof)
             if isinstance(summary_cutoff_proof, Mapping)
@@ -683,17 +687,81 @@ class DailyPipelineStageService:
             for stage_id in feedback_prerequisite_stage_ids
             if stage_id not in resolved_stages
         )
-        if inherit_feedback_prerequisite_admission and not (
+        exact_feedback_retry_suffix = bool(
             trigger == 'auto_eod_followup_resume'
             and tuple(resolved_stages)
             == TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER
             and resume_from_stage
             == TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER[0]
             and reused_eod_collection_run_id is not None
-            and point_in_time_recovery
             and reuse_existing_feedback
             and not force
             and existing_pipeline_run_id is None
+        )
+        if inherited_feedback_retry_config is not None:
+            if not (
+                exact_feedback_retry_suffix
+                and isinstance(inherited_feedback_retry_config, Mapping)
+            ):
+                raise ValueError(
+                    'inherited feedback retry config requires the exact '
+                    'automatic feedback suffix'
+                )
+            normalized_inherited_feedback_retry_config = dict(
+                inherited_feedback_retry_config
+            )
+            inherited_feedback_source_run_id = str(
+                normalized_inherited_feedback_retry_config.get(
+                    'source_run_id'
+                )
+                or ''
+            ).strip()
+            raw_config_cutoff = (
+                normalized_inherited_feedback_retry_config.get(
+                    'knowledge_cutoff_at'
+                )
+            )
+            try:
+                inherited_feedback_knowledge_cutoff_at = (
+                    raw_config_cutoff
+                    if isinstance(raw_config_cutoff, datetime)
+                    else datetime.fromisoformat(
+                        str(raw_config_cutoff or '')
+                        .strip()
+                        .replace('Z', '+00:00')
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    'inherited feedback retry config has an invalid cutoff'
+                ) from exc
+            if not (
+                inherited_feedback_source_run_id
+                and inherited_feedback_knowledge_cutoff_at.tzinfo is not None
+                and inherited_feedback_knowledge_cutoff_at.utcoffset()
+                is not None
+            ):
+                raise ValueError(
+                    'inherited feedback retry config requires an exact '
+                    'parent and aware cutoff'
+                )
+            feedback_knowledge_cutoff_at = (
+                inherited_feedback_knowledge_cutoff_at.astimezone(
+                    timezone.utc
+                )
+            )
+        elif (
+            inherited_feedback_knowledge_cutoff_at is not None
+            or inherited_feedback_source_run_id is not None
+        ) and not inherit_feedback_prerequisite_admission:
+            raise ValueError(
+                'inherited feedback knowledge cutoff requires prerequisite '
+                'admission inheritance'
+            )
+        if inherit_feedback_prerequisite_admission and not (
+            exact_feedback_retry_suffix
+            and point_in_time_recovery
+            and normalized_inherited_feedback_retry_config is not None
         ):
             raise ValueError(
                 'feedback prerequisite admission inheritance requires the '
@@ -722,14 +790,6 @@ class DailyPipelineStageService:
                 inherited_feedback_knowledge_cutoff_at.astimezone(
                     timezone.utc
                 )
-            )
-        elif (
-            inherited_feedback_knowledge_cutoff_at is not None
-            or inherited_feedback_source_run_id is not None
-        ):
-            raise ValueError(
-                'inherited feedback knowledge cutoff requires prerequisite '
-                'admission inheritance'
             )
         if (
             existing_pipeline_run_id is None
@@ -1748,7 +1808,13 @@ class DailyPipelineStageService:
                             ),
                             feedback_reuse_parent_run_id=(
                                 inherited_feedback_source_run_id
-                                if inherit_feedback_prerequisite_admission
+                                if normalized_inherited_feedback_retry_config
+                                is not None
+                                else None
+                            ),
+                            feedback_retry_config_override=(
+                                normalized_inherited_feedback_retry_config
+                                if stage_id == 'agent_feedback_summaries'
                                 else None
                             ),
                             feedback_cutoff_resolution=(
@@ -2919,6 +2985,7 @@ class DailyPipelineStageService:
         reuse_existing_feedback: bool,
         feedback_knowledge_cutoff_at: datetime | None = None,
         feedback_reuse_parent_run_id: str | None = None,
+        feedback_retry_config_override: Mapping[str, Any] | None = None,
         feedback_cutoff_resolution: dict[str, Any] | None = None,
         point_in_time_recovery: bool = False,
         provider_admission_fence_owned: bool = False,
@@ -3259,23 +3326,71 @@ class DailyPipelineStageService:
                         ]
                     ),
                 }
+            retry_symbols = tuple(symbols) if symbols else None
+            retry_policy_context_as_of_date: date | str | None = None
+            retry_idempotency_key: str | None = None
+            retry_role_symbol_scopes: Mapping[
+                str,
+                Sequence[str],
+            ] | None = None
+            retry_feedback_scope_mode = (
+                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+                if stage_id == 'agent_feedback_summaries'
+                else FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            )
+            retry_outer_batch_size = feedback_outer_batch_size
+            if (
+                stage_id == 'agent_feedback_summaries'
+                and isinstance(feedback_retry_config_override, Mapping)
+            ):
+                roles = tuple(feedback_retry_config_override['roles'])
+                retry_symbols = tuple(
+                    feedback_retry_config_override['requested_symbols']
+                )
+                retry_policy_context_as_of_date = (
+                    feedback_retry_config_override[
+                        'policy_context_as_of_date'
+                    ]
+                )
+                retry_idempotency_key = (
+                    feedback_retry_config_override.get('idempotency_key')
+                )
+                retry_role_symbol_scopes = (
+                    feedback_retry_config_override['role_symbol_scopes']
+                )
+                retry_feedback_scope_mode = str(
+                    feedback_retry_config_override[
+                        'feedback_scope_mode'
+                    ]
+                )
+                retry_outer_batch_size = int(
+                    feedback_retry_config_override['outer_batch_size']
+                )
+                inherited_scope_authority = (
+                    feedback_retry_config_override.get('scope_authority')
+                )
+                scope_authority = (
+                    dict(inherited_scope_authority)
+                    if isinstance(inherited_scope_authority, Mapping)
+                    else None
+                )
             result = self.feedback_retry_service.run_retry_cycles(
                 config=FeedbackRetryCycleConfig(
                     market_date=date.fromisoformat(market_date),
                     roles=roles,
-                    symbols=tuple(symbols) if symbols else None,
+                    symbols=retry_symbols,
+                    policy_context_as_of_date=(
+                        retry_policy_context_as_of_date
+                    ),
+                    idempotency_key=retry_idempotency_key,
                     fs_div=fs_div,
                     # A production retry of a completed source day must see
                     # information collected after that session close. The
                     # resolved instant remains fixed for every child cycle.
                     knowledge_cutoff_at=resolved_feedback_cutoff,
-                    feedback_scope_mode=(
-                        FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
-                        if stage_id == 'agent_feedback_summaries'
-                        else FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
-                    ),
+                    feedback_scope_mode=retry_feedback_scope_mode,
                     max_cycles=feedback_max_cycles,
-                    outer_batch_size=feedback_outer_batch_size,
+                    outer_batch_size=retry_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
                     reuse_parent_run_id=(
                         feedback_reuse_parent_run_id
@@ -3283,6 +3398,7 @@ class DailyPipelineStageService:
                         else None
                     ),
                     scope_authority=scope_authority,
+                    role_symbol_scopes=retry_role_symbol_scopes,
                     progress_callback=progress_callback,
                 ),
                 # A forced pipeline recovery must bypass stale prerequisite

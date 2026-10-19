@@ -728,6 +728,59 @@ def _previous_run_matches_scope_authority(
     return persisted_authority == dict(scope_authority)
 
 
+def _previous_run_matches_retry_contract(
+    previous_run: dict[str, Any] | None,
+    *,
+    roles: Sequence[str],
+    requested_symbols: Sequence[str] | None,
+    role_symbol_scopes: Mapping[str, Sequence[str]] | None,
+    feedback_scope_mode: str,
+    outer_batch_size: int,
+    idempotency_key: str | None,
+) -> bool:
+    if not isinstance(previous_run, dict):
+        return False
+    request_payload = previous_run.get('request_payload')
+    if not isinstance(request_payload, dict):
+        return False
+    try:
+        prior_roles = tuple(
+            str(role or '').strip().lower()
+            for role in request_payload.get('roles') or ()
+        )
+        prior_symbols = tuple(
+            _normalize_requested_symbols(
+                request_payload.get('requested_symbols') or ()
+            )
+        )
+        prior_role_symbol_scopes = _normalize_role_symbol_scopes(
+            request_payload.get('role_symbol_scopes'),
+            roles=prior_roles,
+            requested_symbols=prior_symbols,
+        )
+        prior_scope_mode = normalize_feedback_scope_mode(
+            request_payload.get('feedback_scope_mode')
+        )
+        prior_outer_batch_size = int(
+            request_payload.get('outer_batch_size') or 0
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        prior_roles
+        == tuple(str(role or '').strip().lower() for role in roles)
+        and prior_symbols == tuple(requested_symbols or ())
+        and prior_role_symbol_scopes == role_symbol_scopes
+        and prior_scope_mode == feedback_scope_mode
+        and prior_outer_batch_size == outer_batch_size
+        and (
+            str(request_payload.get('idempotency_key') or '').strip()
+            or None
+        )
+        == idempotency_key
+    )
+
+
 def resolve_latest_completed_summary_knowledge_cutoff(
     *,
     market_date: date | str,
@@ -4612,6 +4665,19 @@ class AgentFeedbackRetryService:
             ) or not _previous_run_matches_scope_authority(
                 previous_run,
                 normalized_scope_authority,
+            ) or (
+                bool(reuse_parent_run_id)
+                and not _previous_run_matches_retry_contract(
+                    previous_run,
+                    roles=roles,
+                    requested_symbols=requested_symbols,
+                    role_symbol_scopes=resolved_role_symbol_scopes,
+                    feedback_scope_mode=feedback_scope_mode,
+                    outer_batch_size=int(
+                        getattr(config, 'outer_batch_size', 20) or 20
+                    ),
+                    idempotency_key=resolved_idempotency_key,
+                )
             ):
                 previous_run = None
             if reuse_parent_run_id and isinstance(previous_run, dict):
@@ -4628,7 +4694,7 @@ class AgentFeedbackRetryService:
                     and str(
                         previous_run.get('status') or ''
                     ).strip().lower()
-                    == 'partial'
+                    in {'partial', 'failed'}
                     and str(
                         previous_request.get('mode') or ''
                     ).strip()
@@ -4638,7 +4704,8 @@ class AgentFeedbackRetryService:
             if reuse_parent_run_id and previous_run is None:
                 raise ValueError(
                     'required feedback reuse parent does not match the '
-                    'requested cutoff, fs_div, or scope authority'
+                    'requested cutoff, policy context, fs_div, or exact '
+                    'scope contract'
                 )
         request_run_id = (
             f"feedback-cycle-{config.market_date.isoformat()}-"

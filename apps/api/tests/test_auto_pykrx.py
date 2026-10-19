@@ -13,6 +13,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pandas as pd
 
+from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
 from app.core.settings import Settings
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import (
@@ -25,7 +26,9 @@ from app.eod.pykrx_backfill import (
     _feedback_suffix_has_stale_prerequisite_ordering,
     _is_dart_provider_outage_rearm_candidate,
     _is_retryable_feedback_rearm_candidate,
+    _retryable_feedback_rearm_config,
     _retryable_feedback_rearm_knowledge_cutoff,
+    _retryable_feedback_rearm_max_cycles,
     _is_summary_cutoff_contract_repair_candidate,
     _is_terminal_followup_continuation_candidate,
     _select_summary_cutoff_proof,
@@ -6520,7 +6523,7 @@ class PykrxBackfillServiceTests(TestCase):
         resume_followups.assert_not_called()
         run_collection.assert_not_called()
 
-    def test_retryable_feedback_failure_rearms_after_recovery_limit(
+    def test_retryable_feedback_failure_rearms_with_exact_parent_contract(
         self,
     ) -> None:
         service = PykrxBackfillService()
@@ -6572,21 +6575,66 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertTrue(
             _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
         )
+        parent_cutoff = datetime(
+            2026,
+            4,
+            3,
+            8,
+            0,
+            tzinfo=timezone.utc,
+        )
+        parent_symbols = ['005930', '000660']
+        parent_role_symbol_scopes = {
+            role: list(parent_symbols)
+            for role in SUMMARIZER_AGENT_NAMES
+        }
+        parent_feedback_run = {
+            'run_id': 'feedback-cycle-test',
+            'market_date': '2026-04-03',
+            'status': 'partial',
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': list(parent_symbols),
+                'symbols': list(parent_symbols),
+                'role_symbol_scopes': parent_role_symbol_scopes,
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'knowledge_cutoff_at': parent_cutoff.isoformat(),
+                'admission_knowledge_cutoff_at': (
+                    parent_cutoff.isoformat()
+                ),
+                'fs_div': 'OFS',
+                'policy_context_as_of_date': '2026-04-06',
+                'outer_batch_size': 17,
+            },
+        }
         with patch(
             'app.eod.pykrx_backfill.'
             'agent_context_feedback_run_state_service.get_run',
-            return_value={
-                'run_id': 'feedback-cycle-test',
-                'market_date': '2026-04-03',
-                'status': 'partial',
-                'request_payload': {
-                    'feedback_scope_mode': 'broad_feedback_universe',
-                    'knowledge_cutoff_at': (
-                        '2026-04-03T08:00:00+00:00'
-                    ),
-                },
-            },
+            return_value=parent_feedback_run,
         ) as get_feedback_run:
+            rearm_config = _retryable_feedback_rearm_config(
+                latest_pipeline_run,
+                market_date='2026-04-03',
+            )
+            self.assertIsNotNone(rearm_config)
+            self.assertEqual(
+                rearm_config['feedback_scope_mode'],
+                'decider_scope_fast_path',
+            )
+            self.assertEqual(
+                rearm_config['requested_symbols'],
+                parent_symbols,
+            )
+            self.assertEqual(
+                rearm_config['role_symbol_scopes'],
+                parent_role_symbol_scopes,
+            )
+            self.assertEqual(rearm_config['fs_div'], 'OFS')
+            self.assertEqual(
+                rearm_config['policy_context_as_of_date'],
+                date(2026, 4, 6),
+            )
             self.assertEqual(
                 _retryable_feedback_rearm_knowledge_cutoff(
                     latest_pipeline_run,
@@ -6594,9 +6642,44 @@ class PykrxBackfillServiceTests(TestCase):
                 ),
                 datetime(2026, 4, 3, 8, 0, tzinfo=timezone.utc),
             )
-        get_feedback_run.assert_called_once_with(
-            run_id='feedback-cycle-test'
+        self.assertEqual(get_feedback_run.call_count, 2)
+        get_feedback_run.assert_called_with(run_id='feedback-cycle-test')
+        failed_pipeline_run = deepcopy(latest_pipeline_run)
+        failed_pipeline_run['stages']['agent_feedback_summaries'][
+            'status'
+        ] = 'failed'
+        failed_pipeline_run['stages']['agent_feedback_summaries'][
+            'details'
+        ]['result_summary']['progress']['summary'][
+            'run_status'
+        ] = 'failed'
+        failed_summary = failed_pipeline_run['stages'][
+            'agent_feedback_summaries'
+        ]['details']['result_summary']['progress']['summary']
+        failed_summary['completed_cycles'] = 0
+        failed_summary['cycle_number'] = 1
+        failed_parent_run = deepcopy(parent_feedback_run)
+        failed_parent_run['status'] = 'failed'
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(failed_pipeline_run)
         )
+        self.assertEqual(
+            _retryable_feedback_rearm_max_cycles(failed_pipeline_run),
+            1,
+        )
+        with patch(
+            'app.eod.pykrx_backfill.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=failed_parent_run,
+        ):
+            self.assertIsNotNone(
+                _retryable_feedback_rearm_config(
+                    failed_pipeline_run,
+                    market_date='2026-04-03',
+                )
+            )
+        latest_pipeline_run = failed_pipeline_run
+        parent_feedback_run = failed_parent_run
         latest_pipeline_run['stages']['agent_feedback_summaries'][
             'details'
         ]['result_summary']['prerequisites']['ready'] = False
@@ -6639,7 +6722,12 @@ class PykrxBackfillServiceTests(TestCase):
             patch(
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
                 'count_runs',
-                return_value=6,
+                return_value=1,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=parent_feedback_run,
             ),
             patch(
                 'app.eod.daily_pipeline_stages.'
@@ -6677,7 +6765,12 @@ class PykrxBackfillServiceTests(TestCase):
             patch(
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
                 'count_runs',
-                return_value=6,
+                return_value=1,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=parent_feedback_run,
             ),
             patch(
                 'app.eod.pykrx_backfill.'
@@ -6716,17 +6809,16 @@ class PykrxBackfillServiceTests(TestCase):
                     'symbols_failed': 0,
                 },
                 markets=('KOSPI', 'KOSDAQ'),
-                point_in_time_recovery=True,
+                point_in_time_recovery=False,
             )
 
         self.assertTrue(rearmed['triggered'])
         self.assertTrue(
             rearmed['followup_recovery']['retryable_feedback_rearm']
         )
-        self.assertTrue(
-            rearmed_followups.call_args.kwargs[
-                'inherit_feedback_prerequisite_admission'
-            ]
+        self.assertNotIn(
+            'inherit_feedback_prerequisite_admission',
+            rearmed_followups.call_args.kwargs,
         )
         self.assertEqual(
             rearmed_followups.call_args.kwargs[
@@ -6742,8 +6834,46 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertEqual(
             rearmed_followups.call_args.kwargs['feedback_max_cycles'],
-            3,
+            1,
         )
+        self.assertEqual(
+            rearmed_followups.call_args.kwargs['symbols'],
+            parent_symbols,
+        )
+        self.assertEqual(
+            rearmed_followups.call_args.kwargs['fs_div'],
+            'OFS',
+        )
+        self.assertEqual(
+            rearmed_followups.call_args.kwargs[
+                'feedback_outer_batch_size'
+            ],
+            17,
+        )
+        inherited_config = rearmed_followups.call_args.kwargs[
+            'inherited_feedback_retry_config'
+        ]
+        self.assertEqual(
+            inherited_config['feedback_scope_mode'],
+            'decider_scope_fast_path',
+        )
+        self.assertEqual(
+            inherited_config['requested_symbols'],
+            parent_symbols,
+        )
+        self.assertEqual(
+            inherited_config['role_symbol_scopes'],
+            parent_role_symbol_scopes,
+        )
+        self.assertEqual(
+            inherited_config['knowledge_cutoff_at'],
+            parent_cutoff,
+        )
+        self.assertEqual(
+            inherited_config['policy_context_as_of_date'],
+            date(2026, 4, 6),
+        )
+        self.assertIsNone(inherited_config['scope_authority'])
 
         with (
             patch.object(
@@ -6794,6 +6924,7 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertFalse(capped['triggered'])
         self.assertEqual(capped['reason'], 'followup_recovery_limit_reached')
+        self.assertEqual(capped['followup_recovery']['max_attempts'], 8)
         capped_resume_followups.assert_not_called()
         capped_run_collection.assert_not_called()
 
