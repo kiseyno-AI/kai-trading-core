@@ -90,6 +90,10 @@ from app.agent_context.openclaw_storage_admission import (
     inspect_openclaw_storage_admission,
 )
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
+from app.agent_context.run_modes import (
+    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION,
+    OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE,
+)
 from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import (
@@ -518,6 +522,7 @@ class OpenClawAgentClient:
                 'response_status_code': response.status_code,
                 'response_text_excerpt': response_text[:300],
                 'retryable': False,
+                'shared_dispatch_outage': True,
             },
         )
 
@@ -539,6 +544,7 @@ class OpenClawAgentClient:
                     'failure_status': 'capacity/storage-admission-blocked',
                     'failure_category': 'capacity',
                     'retryable': True,
+                    'shared_dispatch_outage': True,
                     'storage_admission': storage_admission,
                 },
             )
@@ -7134,6 +7140,9 @@ class AgentFeedbackOrchestrator:
                                     ):
                                         if openclaw_shared_dispatch_outage is None:
                                             openclaw_shared_dispatch_outage = {
+                                                'schema_version': (
+                                                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                                                ),
                                                 'failure_kind': str(
                                                     error_details.get(
                                                         'failure_kind'
@@ -7151,6 +7160,13 @@ class AgentFeedbackOrchestrator:
                                                 'role': role,
                                                 'slot': slot,
                                                 'error_type': type(exc).__name__,
+                                                'retryable': (
+                                                    error_details.get('retryable')
+                                                    is True
+                                                ),
+                                                'source': (
+                                                    OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE
+                                                ),
                                             }
                                             request_payload[
                                                 'openclaw_dispatch_circuit_breaker'

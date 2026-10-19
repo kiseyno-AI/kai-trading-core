@@ -14,6 +14,9 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 import pandas as pd
 
 from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+from app.agent_context.run_modes import (
+    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION,
+)
 from app.core.settings import Settings
 from app.eod.auto_pykrx import AutoPykrxEODScheduler
 from app.eod.pykrx_backfill import (
@@ -7132,6 +7135,280 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(capped['followup_recovery']['max_attempts'], 8)
         capped_resume_followups.assert_not_called()
         capped_run_collection.assert_not_called()
+
+    def test_shared_openclaw_outage_rearms_only_with_versioned_exact_marker(
+        self,
+    ) -> None:
+        pipeline_run = {
+            'status': 'blocked',
+            'run_metadata': {},
+            'stages': {
+                'agent_feedback_summaries': {
+                    'status': 'failed',
+                    'details': {
+                        'result_summary': {
+                            'run_id': 'feedback-cycle-shared-outage',
+                            'prerequisites': {'ready': True},
+                            'openclaw_dispatch_circuit_breaker': {
+                                'schema_version': (
+                                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                                ),
+                                'failure_kind': (
+                                    'openclaw_provider_rate_limited'
+                                ),
+                                'failure_status': 'provider/rate-limit',
+                                'retryable': True,
+                                'source': (
+                                    'child_dispatch_circuit_breaker'
+                                ),
+                            },
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'failed',
+                                    'failed_items': 0,
+                                    'completed_cycles': 0,
+                                    'cycle_number': 1,
+                                    'role_progress': {
+                                        'eod-summarizer': {
+                                            'retry_pending_symbols': 2,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 2,
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        }
+
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(pipeline_run)
+        )
+        self.assertEqual(
+            _retryable_feedback_rearm_max_cycles(pipeline_run),
+            1,
+        )
+
+        parent_marker_run = deepcopy(pipeline_run)
+        parent_marker_run['run_metadata'][
+            'feedback_retry_parent_contract'
+        ] = {'schema_version': 'feedback_retry_parent_contract_v1'}
+        parent_role = parent_marker_run['stages'][
+            'agent_feedback_summaries'
+        ]['details']['result_summary']['progress']['summary'][
+            'role_progress'
+        ]['eod-summarizer']
+        parent_role['in_progress_symbols'] = 1
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(parent_marker_run)
+        )
+        parent_role['in_progress_symbols'] = 0
+        parent_role['retry_pending_symbols'] = 0
+        parent_role['pending_symbols'] = 0
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(parent_marker_run)
+        )
+
+        for field, value in (
+            ('schema_version', 'unknown'),
+            ('failure_kind', 'dispatch_failed'),
+            ('retryable', False),
+            ('source', 'item_scoped_failure'),
+        ):
+            malformed = deepcopy(pipeline_run)
+            malformed['stages']['agent_feedback_summaries'][
+                'details'
+            ]['result_summary']['openclaw_dispatch_circuit_breaker'][
+                field
+            ] = value
+            self.assertFalse(
+                _is_retryable_feedback_rearm_candidate(malformed),
+                field,
+            )
+
+        without_marker = deepcopy(pipeline_run)
+        del without_marker['stages']['agent_feedback_summaries'][
+            'details'
+        ]['result_summary']['openclaw_dispatch_circuit_breaker']
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(without_marker)
+        )
+
+    def test_feedback_dispatch_circuit_never_falls_back_to_broad_recovery(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        completed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        base_marker = {
+            'schema_version': (
+                OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+            ),
+            'failure_kind': 'openclaw_plugin_state_capacity_exhausted',
+            'failure_status': 'capacity/exhausted',
+            'retryable': False,
+            'source': 'child_dispatch_circuit_breaker',
+        }
+
+        for marker, blocker in (
+            (base_marker, 'non_retryable_dispatch_circuit_breaker'),
+            (
+                {
+                    **base_marker,
+                    'schema_version': 'future_v2',
+                    'failure_kind': 'openclaw_transport_error',
+                    'retryable': True,
+                },
+                'invalid_dispatch_circuit_breaker',
+            ),
+        ):
+            pipeline_run = {
+                'id': 96,
+                'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+                'status': 'failed',
+                'updated_at': completed_at.isoformat(),
+                'completed_at': completed_at.isoformat(),
+                'run_metadata': {
+                    'resolved_stages': [
+                        'agent_feedback_summaries',
+                        'signal_decider',
+                        'next_open_execution_plan',
+                        'signal_decider_evaluations',
+                    ],
+                    'reused_eod_collection_run_id': 7,
+                },
+                'stages': {
+                    'agent_feedback_summaries': {
+                        'status': 'failed',
+                        'details': {
+                            'result_summary': {
+                                'run_id': 'feedback-cycle-circuit-blocked',
+                                'prerequisites': {'ready': True},
+                                'openclaw_dispatch_circuit_breaker': marker,
+                                'progress': {
+                                    'summary': {
+                                        'run_status': 'failed',
+                                        'failed_items': 1,
+                                        'role_progress': {
+                                            'eod-summarizer': {
+                                                'retry_pending_symbols': 1,
+                                                'in_progress_symbols': 0,
+                                                'pending_symbols': 0,
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                    },
+                    'signal_decider': {'status': 'blocked'},
+                    'next_open_execution_plan': {'status': 'blocked'},
+                    'signal_decider_evaluations': {'status': 'blocked'},
+                },
+            }
+            with (
+                self.subTest(marker=marker),
+                patch(
+                    'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                    'get_latest_run_for_context',
+                    return_value=pipeline_run,
+                ),
+                patch(
+                    'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                    'count_runs',
+                    return_value=1,
+                ),
+                patch(
+                    'app.eod.daily_pipeline_stages.'
+                    'daily_pipeline_stage_service.run'
+                ) as resume_followups,
+            ):
+                result = service._resume_auto_daily_followups_if_due(
+                    market_date='2026-04-03',
+                    latest_available_trade_date='2026-04-03',
+                    latest_eod_run={
+                        'id': 7,
+                        'status': 'completed',
+                        'symbols_failed': 0,
+                    },
+                    markets=('KOSPI', 'KOSDAQ'),
+                    point_in_time_recovery=False,
+                )
+
+            self.assertFalse(result['triggered'])
+            self.assertEqual(
+                result['reason'],
+                'followup_feedback_dispatch_circuit_blocked',
+            )
+            self.assertEqual(
+                result['followup_recovery']['blocker'],
+                blocker,
+            )
+            resume_followups.assert_not_called()
+
+        no_marker_run = deepcopy(pipeline_run)
+        no_marker_summary = no_marker_run['stages'][
+            'agent_feedback_summaries'
+        ]['details']['result_summary']
+        del no_marker_summary['openclaw_dispatch_circuit_breaker']
+        no_marker_summary['progress']['summary']['failed_items'] = 0
+        no_marker_role = no_marker_summary['progress']['summary'][
+            'role_progress'
+        ]['eod-summarizer']
+        no_marker_role['retry_pending_symbols'] = 2
+        no_marker_role['pending_symbols'] = 2
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=no_marker_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=1,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 97,
+                },
+            ) as legacy_resume,
+        ):
+            legacy_result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+                markets=('KOSPI', 'KOSDAQ'),
+                point_in_time_recovery=False,
+            )
+
+        self.assertTrue(legacy_result['triggered'])
+        self.assertEqual(
+            legacy_result['reason'],
+            'incomplete_followups_resumed',
+        )
+        self.assertNotIn('symbols', legacy_resume.call_args.kwargs)
+        self.assertNotIn(
+            'inherited_feedback_retry_config',
+            legacy_resume.call_args.kwargs,
+        )
 
     def test_dart_provider_maintenance_waits_then_rearms_after_recovery_limit(
         self,

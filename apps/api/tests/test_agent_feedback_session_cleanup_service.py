@@ -200,7 +200,7 @@ Run "openclaw doctor --fix" to remove stale entries.
             patch.object(
                 session_cleanup_module.time,
                 'monotonic',
-                side_effect=[100.0, 106.0],
+                side_effect=[100.0, 100.0, 106.0],
             ),
         ):
             scoped_session.return_value.__enter__.return_value = session
@@ -213,6 +213,54 @@ Run "openclaw doctor --fix" to remove stale entries.
         self.assertEqual(result['summary']['selected'], 3)
         self.assertEqual(result['summary']['attempted'], 1)
         self.assertEqual(result['summary']['deferred_for_budget'], 2)
+        self.assertTrue(result['summary']['budget_exhausted'])
+
+    def test_pending_cleanup_does_not_exempt_first_item_from_run_budget(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        row = MagicMock()
+        target = SessionCleanupTarget(
+            market_date=date(2026, 10, 19),
+            symbol='005930',
+            agent_name='eod-summarizer',
+            run_id='feedback-run-short-cleanup-budget',
+            session_key='feedback/eod-summarizer/short-budget',
+        )
+        session = MagicMock()
+        session.execute.return_value.scalars.return_value.all.return_value = [
+            row
+        ]
+
+        with (
+            patch.object(
+                session_cleanup_module,
+                'session_scope',
+            ) as scoped_session,
+            patch.object(
+                service,
+                '_target_from_failure',
+                return_value=target,
+            ),
+            patch.object(service, 'delete_now') as delete_now,
+            patch.object(
+                session_cleanup_module.settings,
+                'openclaw_session_cleanup_timeout_seconds',
+                30,
+            ),
+            patch.object(
+                session_cleanup_module.time,
+                'monotonic',
+                side_effect=[100.0, 100.0],
+            ),
+        ):
+            scoped_session.return_value.__enter__.return_value = session
+            result = service.run_pending_cleanup(
+                limit=1,
+                max_runtime_seconds=5,
+            )
+
+        delete_now.assert_not_called()
+        self.assertEqual(result['summary']['attempted'], 0)
+        self.assertEqual(result['summary']['deferred_for_budget'], 1)
         self.assertTrue(result['summary']['budget_exhausted'])
 
     def test_delete_now_treats_already_absent_session_as_idempotent_success(self) -> None:

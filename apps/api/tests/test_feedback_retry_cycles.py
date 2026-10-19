@@ -60,6 +60,8 @@ from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
     FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION,
+    OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE,
 )
 from app.agent_context.runtime_state import RuntimeFeedbackRunState
 from scripts import run_feedback_retry_cycles
@@ -6144,6 +6146,280 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         )
         self.assertTrue(result['completed'])
         self.assertEqual(result['cycles'][0]['role_batches'][0]['summary']['chunks'], 3)
+
+    def test_run_retry_cycles_stops_outer_batches_after_shared_dispatch_outage(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        roles = ('eod-summarizer',)
+        symbols = ('000020', '000040', '000050', '000070', '000080')
+        initial_snapshot = _snapshot(
+            symbols=symbols,
+            role_states={
+                'eod-summarizer': _role_state(
+                    role='eod-summarizer',
+                    symbols=symbols,
+                    boundary_pending=symbols,
+                    retry_pending=symbols,
+                )
+            },
+        )
+        outage_snapshot = _snapshot(
+            symbols=symbols,
+            role_states={
+                'eod-summarizer': _role_state(
+                    role='eod-summarizer',
+                    symbols=symbols,
+                    failed=symbols[:2],
+                    boundary_pending=symbols[2:],
+                    retry_pending=symbols,
+                )
+            },
+        )
+        snapshots = SnapshotSequence(
+            [initial_snapshot, initial_snapshot, outage_snapshot]
+        )
+        dispatch_calls = []
+
+        def dispatch_for_symbols(**kwargs):
+            dispatch_calls.append(kwargs)
+            return {
+                'request': {
+                    'roles': kwargs['roles'],
+                    'symbols': kwargs['symbols'],
+                    'openclaw_dispatch_circuit_breaker': {
+                        'schema_version': (
+                            OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                        ),
+                        'failure_kind': 'openclaw_provider_rate_limited',
+                        'failure_status': 'provider/rate-limit',
+                        'role': 'eod-summarizer',
+                        'retryable': True,
+                        'source': (
+                            OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE
+                        ),
+                    },
+                },
+                'summary': {
+                    'status': 'failed',
+                    'completed': 0,
+                    'failed': len(kwargs['symbols']),
+                },
+            }
+
+        progress = {
+            'request': {'expected_agents': list(roles)},
+            'summary': {'cycle_status': 'partial'},
+        }
+        eligibility_records = [
+            {
+                'symbol': symbol,
+                'candidate_rank': rank,
+                'candidate_score': 100 - rank,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            }
+            for rank, symbol in enumerate(symbols, start=1)
+        ]
+
+        with patch(
+            'app.agent_context.retry_service.load_agent_feedback_eligibility_records',
+            return_value=eligibility_records,
+        ):
+            with patch.object(
+                service,
+                '_build_role_sequence_snapshot',
+                side_effect=snapshots,
+            ):
+                with patch(
+                    'app.agent_context.retry_service.agent_context_feedback_run_state_service',
+                    run_state_service,
+                ):
+                    with patch(
+                        'app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols',
+                        side_effect=dispatch_for_symbols,
+                    ):
+                        with patch(
+                            'app.agent_context.retry_service.agent_context_progress_service.get_feedback_progress',
+                            return_value=progress,
+                        ):
+                            result = service._run_retry_cycles_admitted(
+                                config=SimpleNamespace(
+                                    market_date=date.fromisoformat('2026-04-16'),
+                                    roles=roles,
+                                    symbols=symbols,
+                                    policy_context_as_of_date=date.fromisoformat(
+                                        '2026-04-20'
+                                    ),
+                                    max_cycles=3,
+                                    outer_batch_size=2,
+                                    reuse_existing=True,
+                                    knowledge_cutoff_at=datetime(
+                                        2026,
+                                        4,
+                                        16,
+                                        7,
+                                        tzinfo=timezone.utc,
+                                    ),
+                                ),
+                                request_run_id=(
+                                    'feedback-cycle-shared-outage-test'
+                                ),
+                                parent_started_at=datetime(
+                                    2026,
+                                    4,
+                                    16,
+                                    8,
+                                    tzinfo=timezone.utc,
+                                ),
+                                prerequisites=_feedback_prerequisites(),
+                                preloaded_eligible_symbols=symbols,
+                                effective_knowledge_cutoff_at=datetime(
+                                    2026,
+                                    4,
+                                    16,
+                                    7,
+                                    tzinfo=timezone.utc,
+                                ),
+                                knowledge_cutoff_source='explicit',
+                            )
+
+        self.assertEqual(
+            [call['symbols'] for call in dispatch_calls],
+            [['000020', '000040']],
+        )
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['cycles'][0]['status'], 'blocked')
+        role_result = result['cycles'][0]['role_batches'][0]
+        self.assertEqual(role_result['status'], 'blocked')
+        self.assertEqual(role_result['summary']['chunks'], 1)
+        self.assertEqual(
+            role_result['openclaw_dispatch_circuit_breaker']['failure_status'],
+            'provider/rate-limit',
+        )
+        self.assertTrue(
+            result['openclaw_dispatch_circuit_breaker']['retryable']
+        )
+        self.assertEqual(
+            result['openclaw_dispatch_circuit_breaker']['source'],
+            'child_dispatch_circuit_breaker',
+        )
+
+    def test_parent_circuit_marker_preserves_terminal_capacity_failure(self):
+        marker = AgentFeedbackRetryService._dispatch_circuit_breaker_from_result(
+            {
+                'request': {
+                    'openclaw_dispatch_circuit_breaker': {
+                        'schema_version': (
+                            OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                        ),
+                        'failure_kind': (
+                            'openclaw_plugin_state_capacity_exhausted'
+                        ),
+                        'failure_status': 'capacity/exhausted',
+                        'role': 'eod-summarizer',
+                        'retryable': False,
+                        'source': (
+                            OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE
+                        ),
+                    }
+                },
+                'summary': {'status': 'failed'},
+            },
+            role='eod-summarizer',
+        )
+
+        self.assertIsNotNone(marker)
+        self.assertFalse(marker['retryable'])
+        self.assertEqual(
+            marker['failure_kind'],
+            'openclaw_plugin_state_capacity_exhausted',
+        )
+
+        malformed = AgentFeedbackRetryService._dispatch_circuit_breaker_from_result(
+            {
+                'request': {
+                    'openclaw_dispatch_circuit_breaker': {
+                        'schema_version': 'future_v2',
+                        'failure_kind': 'openclaw_transport_error',
+                        'failure_status': 'transport/error',
+                        'retryable': False,
+                        'source': 'item_scoped_failure',
+                    }
+                }
+            },
+            role='eod-summarizer',
+        )
+        self.assertIsNotNone(malformed)
+        self.assertFalse(malformed['retryable'])
+        self.assertEqual(
+            malformed['source'],
+            'invalid_child_dispatch_circuit_breaker',
+        )
+
+        for raw_marker in (None, 'invalid', ['invalid']):
+            scalar = (
+                AgentFeedbackRetryService
+                ._dispatch_circuit_breaker_from_result(
+                    {
+                        'request': {
+                            'openclaw_dispatch_circuit_breaker': raw_marker,
+                        }
+                    },
+                    role='eod-summarizer',
+                )
+            )
+            self.assertIsNotNone(scalar)
+            self.assertFalse(scalar['retryable'])
+            self.assertEqual(
+                scalar['source'],
+                'invalid_child_dispatch_circuit_breaker',
+            )
+
+    def test_run_level_preflight_failure_builds_versioned_parent_circuit_marker(
+        self,
+    ) -> None:
+        marker = AgentFeedbackRetryService._dispatch_circuit_breaker_from_result(
+            {
+                'request': {},
+                'summary': {
+                    'run_level_failure': True,
+                    'failure_kind': 'openclaw_transport_error',
+                    'openclaw_dispatch_preflight': {
+                        'failure_status': 'transport/error',
+                        'retryable': True,
+                    },
+                },
+            },
+            role='eod-summarizer',
+        )
+
+        self.assertEqual(
+            marker,
+            {
+                'schema_version': (
+                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                ),
+                'failure_kind': 'openclaw_transport_error',
+                'failure_status': 'transport/error',
+                'role': 'eod-summarizer',
+                'retryable': True,
+                'run_level_failure': True,
+                'source': 'child_run_level_failure',
+            },
+        )
+        self.assertIsNone(
+            AgentFeedbackRetryService._dispatch_circuit_breaker_from_result(
+                {
+                    'request': {},
+                    'summary': {
+                        'status': 'partial',
+                        'failed': 1,
+                    },
+                },
+                role='eod-summarizer',
+            )
+        )
 
     def test_force_recompute_batch_checkpoint_does_not_count_old_rows_as_completed(self):
         service = AgentFeedbackRetryService()

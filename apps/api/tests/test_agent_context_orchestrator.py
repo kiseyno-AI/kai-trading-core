@@ -3705,6 +3705,30 @@ class SharedProviderRateLimitBatchClient:
         )
 
 
+class SharedCapacityBatchClient:
+    def __init__(self, *, failure_kind: str, retryable: bool):
+        self.calls = []
+        self.failure_kind = failure_kind
+        self.retryable = retryable
+
+    def dispatch_batch(self, **kwargs):
+        self.calls.append(kwargs)
+        raise orchestrator_module.AgentDispatchTerminalError(
+            'OpenClaw shared capacity guard opened',
+            details={
+                'failure_kind': self.failure_kind,
+                'failure_status': (
+                    'capacity/storage-admission-blocked'
+                    if self.retryable
+                    else 'capacity/exhausted'
+                ),
+                'failure_category': 'capacity',
+                'shared_dispatch_outage': True,
+                'retryable': self.retryable,
+            },
+        )
+
+
 class ItemScopedFailureThenSuccessBatchClient(RecordingBatchClient):
     def dispatch_batch(self, **kwargs):
         if not self.calls:
@@ -9196,6 +9220,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                         'openclaw_plugin_state_capacity_exhausted',
                     )
                     self.assertFalse(raised.exception.details['retryable'])
+                    self.assertTrue(
+                        raised.exception.details['shared_dispatch_outage']
+                    )
 
         self.assertEqual(len(http_calls), 1)
 
@@ -10080,6 +10107,83 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             failure_service.recorded[0]['failure_kind'],
             'openclaw_provider_rate_limited',
         )
+
+    def test_dispatch_for_symbols_stops_all_fanout_for_shared_capacity_guards(self):
+        symbols = ['000001', '000002', '000003']
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+            openclaw_agent_subtask_poll_seconds=0.01,
+        )
+
+        for failure_kind, retryable in (
+            ('openclaw_storage_admission_blocked', True),
+            ('openclaw_plugin_state_capacity_exhausted', False),
+        ):
+            service = AgentFeedbackOrchestrator()
+            client = SharedCapacityBatchClient(
+                failure_kind=failure_kind,
+                retryable=retryable,
+            )
+            service.client = client
+            feedback_service = FakeFeedbackService()
+            failure_service = RecordingFailureService()
+            cleanup_service = FakeSessionCleanupService()
+            run_state_service = RecordingRunStateService()
+
+            with (
+                self.subTest(failure_kind=failure_kind),
+                patch.object(orchestrator_module, 'settings', fake_settings),
+                patch.object(
+                    orchestrator_module,
+                    'agent_context_feedback_run_state_service',
+                    run_state_service,
+                ),
+                patch.object(
+                    orchestrator_module,
+                    'agent_context_read_service',
+                    DynamicFakeAgentContextReadService(),
+                ),
+                patch.object(
+                    orchestrator_module,
+                    'agent_context_feedback_service',
+                    feedback_service,
+                ),
+                patch.object(
+                    orchestrator_module,
+                    'agent_context_feedback_failure_service',
+                    failure_service,
+                ),
+                patch.object(
+                    orchestrator_module,
+                    'agent_feedback_session_cleanup_service',
+                    cleanup_service,
+                ),
+                _patch_feedback_eligibility(*symbols),
+            ):
+                result = service.dispatch_for_symbols(
+                    market_date='2026-04-14',
+                    symbols=symbols,
+                    roles=['eod-summarizer', 'technical-summarizer'],
+                    knowledge_cutoff_at='2026-04-15T00:00:00+09:00',
+                    reuse_existing=False,
+                )
+
+            self.assertEqual(len(client.calls), 1)
+            self.assertEqual(result['summary']['status'], 'failed')
+            marker = result['request'][
+                'openclaw_dispatch_circuit_breaker'
+            ]
+            self.assertEqual(marker['failure_kind'], failure_kind)
+            self.assertIs(marker['retryable'], retryable)
+            self.assertEqual(
+                marker['schema_version'],
+                'openclaw_shared_dispatch_circuit_breaker_v1',
+            )
+            self.assertEqual(
+                marker['source'],
+                'openclaw_orchestrator_shared_dispatch',
+            )
 
     def test_dispatch_for_symbols_logs_stale_reuse_signal(self):
         service = AgentFeedbackOrchestrator()

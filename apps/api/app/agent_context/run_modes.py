@@ -13,6 +13,22 @@ FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION = (
 FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION = (
     'completed_summary_intersection_authoritative_cohort'
 )
+OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION = (
+    'openclaw_shared_dispatch_circuit_breaker_v1'
+)
+OPENCLAW_SHARED_DISPATCH_RETRYABLE_FAILURE_KINDS = (
+    'openclaw_provider_rate_limited',
+    'openclaw_transport_timeout',
+    'openclaw_transport_error',
+    'openclaw_storage_admission_blocked',
+)
+OPENCLAW_SHARED_DISPATCH_STOP_FAILURE_KINDS = (
+    *OPENCLAW_SHARED_DISPATCH_RETRYABLE_FAILURE_KINDS,
+    'openclaw_plugin_state_capacity_exhausted',
+)
+OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE = (
+    'openclaw_orchestrator_shared_dispatch'
+)
 
 
 def normalize_feedback_scope_mode(value: str | None) -> str:

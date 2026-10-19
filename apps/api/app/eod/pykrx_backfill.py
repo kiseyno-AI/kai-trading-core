@@ -23,6 +23,8 @@ from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION,
+    OPENCLAW_SHARED_DISPATCH_RETRYABLE_FAILURE_KINDS,
 )
 from app.core.audit_logging import log_fetch_event
 from app.core.settings import settings
@@ -1079,6 +1081,50 @@ def _is_dart_provider_outage_rearm_candidate(
     )
 
 
+def _feedback_dispatch_circuit_marker(
+    pipeline_run: object,
+) -> tuple[bool, Mapping[str, Any] | None]:
+    if not isinstance(pipeline_run, Mapping):
+        return False, None
+    stages = pipeline_run.get('stages')
+    stage = (
+        stages.get('agent_feedback_summaries')
+        if isinstance(stages, Mapping)
+        else None
+    )
+    details = stage.get('details') if isinstance(stage, Mapping) else None
+    result_summary = (
+        details.get('result_summary')
+        if isinstance(details, Mapping)
+        else None
+    )
+    if not (
+        isinstance(result_summary, Mapping)
+        and 'openclaw_dispatch_circuit_breaker' in result_summary
+    ):
+        return False, None
+    marker = result_summary.get('openclaw_dispatch_circuit_breaker')
+    return True, marker if isinstance(marker, Mapping) else None
+
+
+def _is_valid_retryable_feedback_dispatch_circuit_marker(
+    marker: Mapping[str, Any] | None,
+) -> bool:
+    return bool(
+        isinstance(marker, Mapping)
+        and marker.get('schema_version')
+        == OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+        and marker.get('retryable') is True
+        and str(marker.get('failure_kind') or '').strip()
+        in OPENCLAW_SHARED_DISPATCH_RETRYABLE_FAILURE_KINDS
+        and str(marker.get('source') or '').strip()
+        in {
+            'child_dispatch_circuit_breaker',
+            'child_run_level_failure',
+        }
+    )
+
+
 def _is_retryable_feedback_rearm_candidate(
     pipeline_run: object,
 ) -> bool:
@@ -1094,6 +1140,9 @@ def _is_retryable_feedback_rearm_candidate(
     has_parent_contract = (
         'feedback_retry_parent_contract' in run_metadata
     )
+    circuit_marker_present, shared_dispatch_circuit = (
+        _feedback_dispatch_circuit_marker(pipeline_run)
+    )
     stages = pipeline_run.get('stages')
     if not isinstance(stages, Mapping):
         return has_parent_contract
@@ -1101,10 +1150,10 @@ def _is_retryable_feedback_rearm_candidate(
     if not isinstance(stage, Mapping):
         return has_parent_contract
     stage_status = str(stage.get('status') or '').strip().lower()
-    if has_parent_contract:
+    if has_parent_contract and not circuit_marker_present:
         # Exact retry lineage is written before the retry starts. Preserve
         # that lane even when execution fails before emitting progress; an
-        # invalid marker is handled as a fail-closed contract error below.
+        # explicit marker takes the bounded progress checks below instead.
         return stage_status != 'completed'
     if stage_status not in {'partial', 'failed'}:
         return False
@@ -1179,13 +1228,30 @@ def _is_retryable_feedback_rearm_candidate(
         )
     except (TypeError, ValueError):
         return False
-    return (
+    run_failed = (
         str(summary.get('run_status') or '').strip().lower()
         in {'partial', 'failed'}
-        and failed_items > 0
+    )
+    terminal_retry_only = (
+        failed_items > 0
         and retry_pending_items == failed_items
-        and in_progress_items == 0
         and pending_items == 0
+    )
+    bounded_shared_outage_retry = (
+        circuit_marker_present
+        and _is_valid_retryable_feedback_dispatch_circuit_marker(
+            shared_dispatch_circuit
+        )
+        and retry_pending_items > 0
+        and retry_pending_items == failed_items + pending_items
+    )
+    return bool(
+        run_failed
+        and in_progress_items == 0
+        and (
+            (not circuit_marker_present and terminal_retry_only)
+            or bounded_shared_outage_retry
+        )
     )
 
 
@@ -3249,6 +3315,35 @@ class PykrxBackfillService:
         retryable_feedback_rearm_detected = (
             _is_retryable_feedback_rearm_candidate(pipeline_run)
         )
+        feedback_circuit_marker_present, feedback_circuit_marker = (
+            _feedback_dispatch_circuit_marker(pipeline_run)
+        )
+        if (
+            feedback_circuit_marker_present
+            and not retryable_feedback_rearm_detected
+        ):
+            marker_retryable = bool(
+                isinstance(feedback_circuit_marker, Mapping)
+                and feedback_circuit_marker.get('retryable') is True
+            )
+            result = build_daily_skip_result(
+                reason='followup_feedback_dispatch_circuit_blocked',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'attempts': recovery_attempts,
+                'retryable_feedback_rearm': False,
+                'retry_scheduled': False,
+                'blocker': (
+                    'invalid_dispatch_circuit_breaker'
+                    if marker_retryable
+                    else 'non_retryable_dispatch_circuit_breaker'
+                ),
+                'resume_from_stage': incomplete_stages[0],
+            }
+            return result
         retryable_feedback_rearm_config = (
             _retryable_feedback_rearm_config(
                 pipeline_run,

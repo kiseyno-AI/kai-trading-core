@@ -58,6 +58,10 @@ from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
     FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION,
+    OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE,
+    OPENCLAW_SHARED_DISPATCH_RETRYABLE_FAILURE_KINDS,
+    OPENCLAW_SHARED_DISPATCH_STOP_FAILURE_KINDS,
     normalize_feedback_scope_mode,
 )
 from app.agent_context.run_state_service import (
@@ -4379,6 +4383,121 @@ class AgentFeedbackRetryService:
             'chunks': len(dispatch_results),
         }
 
+    @staticmethod
+    def _dispatch_circuit_breaker_from_result(
+        dispatch_result: Mapping[str, Any],
+        *,
+        role: str,
+    ) -> dict[str, Any] | None:
+        request = (
+            dispatch_result.get('request')
+            if isinstance(dispatch_result.get('request'), Mapping)
+            else {}
+        )
+        explicit_breaker_present = (
+            'openclaw_dispatch_circuit_breaker' in request
+        )
+        explicit_breaker = request.get(
+            'openclaw_dispatch_circuit_breaker'
+        )
+        if explicit_breaker_present:
+            if not isinstance(explicit_breaker, Mapping):
+                return {
+                    'schema_version': (
+                        OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                    ),
+                    'failure_kind': 'dispatch_failed',
+                    'failure_status': 'contract/invalid',
+                    'role': role,
+                    'retryable': False,
+                    'source': 'invalid_child_dispatch_circuit_breaker',
+                }
+            failure_kind = str(
+                explicit_breaker.get('failure_kind') or ''
+            ).strip()
+            failure_status = str(
+                explicit_breaker.get('failure_status') or ''
+            ).strip()
+            retryable = explicit_breaker.get('retryable') is True
+            expected_retryable = (
+                failure_kind
+                in OPENCLAW_SHARED_DISPATCH_RETRYABLE_FAILURE_KINDS
+            )
+            marker_valid = bool(
+                explicit_breaker.get('schema_version')
+                == OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                and explicit_breaker.get('source')
+                == OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE
+                and failure_kind
+                in OPENCLAW_SHARED_DISPATCH_STOP_FAILURE_KINDS
+                and failure_status
+                and str(explicit_breaker.get('role') or '').strip()
+                == role
+                and isinstance(explicit_breaker.get('retryable'), bool)
+                and retryable == expected_retryable
+            )
+            if not marker_valid:
+                return {
+                    'schema_version': (
+                        OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                    ),
+                    'failure_kind': 'dispatch_failed',
+                    'failure_status': 'contract/invalid',
+                    'role': role,
+                    'retryable': False,
+                    'source': 'invalid_child_dispatch_circuit_breaker',
+                }
+            return {
+                'schema_version': (
+                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                ),
+                'failure_kind': failure_kind,
+                'failure_status': failure_status,
+                'role': str(explicit_breaker.get('role') or role),
+                'retryable': retryable,
+                'source': 'child_dispatch_circuit_breaker',
+            }
+
+        summary = (
+            dispatch_result.get('summary')
+            if isinstance(dispatch_result.get('summary'), Mapping)
+            else {}
+        )
+        if summary.get('run_level_failure') is not True:
+            return None
+        preflight = (
+            summary.get('openclaw_dispatch_preflight')
+            if isinstance(
+                summary.get('openclaw_dispatch_preflight'),
+                Mapping,
+            )
+            else {}
+        )
+        failure_kind = str(
+            summary.get('failure_kind')
+            or preflight.get('failure_kind')
+            or FeedbackFailureKind.DISPATCH_FAILED.value
+        )
+        return {
+            'schema_version': (
+                OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+            ),
+            'failure_kind': failure_kind,
+            'failure_status': str(
+                preflight.get('failure_status')
+                or preflight.get('reason')
+                or 'dispatch/run-level-failure'
+            ),
+            'role': role,
+            'retryable': bool(
+                preflight.get('retryable') is True
+                and failure_kind
+                in OPENCLAW_SHARED_DISPATCH_RETRYABLE_FAILURE_KINDS
+            ),
+            'run_level_failure': True,
+            'source': 'child_run_level_failure',
+        }
+
     def run_retry_cycles(
         self,
         *,
@@ -5451,6 +5570,7 @@ class AgentFeedbackRetryService:
 
         cycles: list[dict[str, Any]] = []
         blocked = False
+        shared_dispatch_circuit_open: dict[str, Any] | None = None
         active_plan = next_plan
         completed_cycles = next_plan.completed_cycles if next_plan is not None else previous_completed_cycles
 
@@ -5649,6 +5769,17 @@ class AgentFeedbackRetryService:
                                     ),
                                 )
                                 dispatch_results.append(dispatch_result)
+                                shared_dispatch_circuit_open = (
+                                    self._dispatch_circuit_breaker_from_result(
+                                        dispatch_result,
+                                        role=role,
+                                    )
+                                )
+                                if shared_dispatch_circuit_open is not None:
+                                    request_payload[
+                                        'openclaw_dispatch_circuit_breaker'
+                                    ] = dict(shared_dispatch_circuit_open)
+                                    break
                                 if chunk_index >= len(dispatch_chunks):
                                     continue
                                 snapshot_after_chunk = self._build_role_sequence_snapshot(
@@ -5720,6 +5851,15 @@ class AgentFeedbackRetryService:
                                     ],
                                 }
                             )
+                            if shared_dispatch_circuit_open is not None:
+                                role_result.update(
+                                    {
+                                        'status': 'blocked',
+                                        'openclaw_dispatch_circuit_breaker': dict(
+                                            shared_dispatch_circuit_open
+                                        ),
+                                    }
+                                )
                         except FeedbackRetryLeaseLostError:
                             raise
                         except Exception as exc:  # noqa: BLE001
@@ -5813,6 +5953,9 @@ class AgentFeedbackRetryService:
                             'remaining_roles': list(remaining_roles_after),
                         }
                     )
+                    if shared_dispatch_circuit_open is not None:
+                        blocked = True
+                        break
                     if role_exception is not None and not role_boundary_complete:
                         blocked = True
                         break
@@ -6028,6 +6171,15 @@ class AgentFeedbackRetryService:
             'final_pending': len(final_pending_symbols),
             'completed': final_status == 'completed',
             'progress': progress,
+            **(
+                {
+                    'openclaw_dispatch_circuit_breaker': dict(
+                        shared_dispatch_circuit_open
+                    )
+                }
+                if shared_dispatch_circuit_open is not None
+                else {}
+            ),
         }
 
     def _get_retry_progress(

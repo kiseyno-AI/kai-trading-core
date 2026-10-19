@@ -139,6 +139,9 @@ class OpenClawStorageAdmissionTests(unittest.TestCase):
             'openclaw_storage_admission_blocked',
         )
         self.assertTrue(raised.exception.details['retryable'])
+        self.assertTrue(
+            raised.exception.details['shared_dispatch_outage']
+        )
 
     def test_batch_dispatch_does_not_open_http_client_when_storage_is_blocked(self) -> None:
         client = OpenClawAgentClient()

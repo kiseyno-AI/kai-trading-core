@@ -268,7 +268,6 @@ class AgentFeedbackSessionCleanupService:
         for target in targets:
             if (
                 deadline_monotonic is not None
-                and processed
                 and deadline_monotonic - time.monotonic()
                 < per_item_timeout_seconds
             ):
