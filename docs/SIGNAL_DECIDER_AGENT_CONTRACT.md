@@ -15,10 +15,14 @@ Core requests `OPENCLAW_SIGNAL_DECIDER_EXPECTED_MODEL` (default
 not itself proof of the runtime model. The response `model` value such as
 `openclaw/signal-decider` is only a route alias and is never recorded as the
 actual backend model. After completion, Core independently reads the exact
-session registry entry, binds its terminal status and timestamps to the current
-dispatch attempt, and verifies the observed provider/model against the expected
-model. Decision provenance keeps requested, observed actual, status, reason,
-and verification basis separate from the route alias.
+session entry from OpenClaw's agent-owned SQLite v25 store, binds its terminal
+status and timestamps to the current dispatch attempt, and verifies the store
+owner, Codex harness, session id, and observed provider/model against the
+expected model. Legacy `sessions.json` is never model authority. Core and
+OpenClaw run under the same trusted local OS account; same-UID state mutation is
+outside this attestation boundary. Decision provenance keeps requested,
+observed actual, status, reason, and verification basis separate from the route
+alias.
 
 Reasoning effort remains an OpenClaw agent-runtime setting rather than a Core
 request contract. OpenClaw's `/v1/responses` compatibility endpoint currently

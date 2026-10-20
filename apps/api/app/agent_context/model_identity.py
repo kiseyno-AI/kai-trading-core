@@ -94,6 +94,7 @@ def build_observed_model_identity(
     actual_provider: str | None,
     actual_model: str | None,
     actual_source_fingerprint: dict[str, int] | None = None,
+    actual_identity_source: str = 'openclaw_session_registry',
 ) -> dict[str, Any] | None:
     if role not in DECIDER_ROLES:
         return None
@@ -106,7 +107,7 @@ def build_observed_model_identity(
         'actual_provider': provider,
         'actual_model': model,
         'actual_model_ref': actual_ref,
-        'actual_identity_source': 'openclaw_session_registry',
+        'actual_identity_source': actual_identity_source,
         'actual_source_fingerprint': actual_source_fingerprint,
         'actual_observed_from_response': False,
         'verified': actual_ref is not None,

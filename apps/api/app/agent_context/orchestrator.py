@@ -4,8 +4,11 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -94,7 +97,10 @@ from app.agent_context.run_modes import (
     OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION,
     OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE,
 )
-from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
+from app.agent_context.safe_file import (
+    SafeFileReadError,
+    fingerprint_regular_file,
+)
 from app.agent_context.payload_builder import agent_payload_builder
 from app.agent_context.read_service import (
     agent_context_read_service,
@@ -138,9 +144,8 @@ from app.external_news.store import list_external_news_items
 
 logger = logging.getLogger(__name__)
 
-OPENCLAW_SESSION_REGISTRY_WARNING_BYTES = 64 * 1024 * 1024
-OPENCLAW_SESSION_REGISTRY_MAX_BYTES = 128 * 1024 * 1024
 OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2)
+OPENCLAW_AGENT_SQLITE_SCHEMA_VERSION = 25
 PERSISTED_SNAPSHOT_JSON_MAX_BYTES = 1024 * 1024
 POST_DECISION_NEWS_SCAN_LIMIT = 50
 _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK = threading.Lock()
@@ -1151,6 +1156,135 @@ class OpenClawAgentClient:
     def _session_artifacts_dir(self, *, agent_name: str) -> Path:
         return Path(settings.openclaw_state_dir).expanduser() / 'agents' / agent_name / 'sessions'
 
+    def _session_sqlite_store_path(self, *, agent_name: str) -> Path:
+        return (
+            Path(settings.openclaw_state_dir).expanduser()
+            / 'agents'
+            / agent_name
+            / 'agent'
+            / 'openclaw-agent.sqlite'
+        )
+
+    def _read_sqlite_session_identity_entry(
+        self,
+        *,
+        agent_name: str,
+        session_key: str,
+    ) -> tuple[str, dict[str, Any], dict[str, int] | None]:
+        store_path = self._session_sqlite_store_path(agent_name=agent_name)
+        try:
+            store_path.lstat()
+        except FileNotFoundError:
+            return 'missing', {}, None
+        except OSError:
+            return 'invalid', {}, None
+
+        try:
+            before_fingerprint = fingerprint_regular_file(store_path)
+            if (
+                before_fingerprint['uid'] != os.getuid()
+                or before_fingerprint['mode']
+                & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                return 'invalid', {}, None
+            absolute_store_path = store_path.expanduser().absolute()
+            # The store is owned by the same local OS account as Core and
+            # OpenClaw. sqlite3 cannot consume the verified descriptor while
+            # retaining WAL semantics, so schema ownership and a post-query
+            # inode check close the trusted-local path boundary.
+            connection = sqlite3.connect(
+                f'{absolute_store_path.as_uri()}?mode=ro',
+                uri=True,
+                timeout=0.25,
+            )
+            try:
+                connection.row_factory = sqlite3.Row
+                connection.execute('PRAGMA query_only = ON')
+                connection.execute('BEGIN')
+                user_version_row = connection.execute(
+                    'PRAGMA user_version'
+                ).fetchone()
+                schema_rows = connection.execute(
+                    '''
+                    SELECT role, schema_version, agent_id
+                    FROM schema_meta
+                    WHERE meta_key = 'primary'
+                    LIMIT 2
+                    '''
+                ).fetchall()
+                rows = connection.execute(
+                    '''
+                    SELECT
+                        n.current_session_id,
+                        n.entry_valid,
+                        n.status AS node_status,
+                        n.updated_at AS node_updated_at,
+                        w.session_id,
+                        w.session_key AS window_session_key,
+                        w.status AS window_status,
+                        w.started_at,
+                        w.ended_at,
+                        w.updated_at AS window_updated_at,
+                        w.model_provider,
+                        w.model,
+                        w.agent_harness_id
+                    FROM session_nodes AS n
+                    JOIN session_windows AS w
+                      ON w.session_id = n.current_session_id
+                     AND w.session_key = n.session_key
+                    WHERE n.session_key = ?
+                    LIMIT 2
+                    ''',
+                    (session_key,),
+                ).fetchall()
+            finally:
+                connection.close()
+            after_fingerprint = fingerprint_regular_file(store_path)
+        except (SafeFileReadError, OSError, sqlite3.Error, ValueError):
+            return 'invalid', {}, None
+
+        user_version = (
+            user_version_row[0]
+            if user_version_row is not None and len(user_version_row) == 1
+            else None
+        )
+        schema_row = schema_rows[0] if len(schema_rows) == 1 else None
+        if (
+            user_version != OPENCLAW_AGENT_SQLITE_SCHEMA_VERSION
+            or schema_row is None
+            or schema_row['role'] != 'agent'
+            or schema_row['schema_version']
+            != OPENCLAW_AGENT_SQLITE_SCHEMA_VERSION
+            or schema_row['agent_id'] != agent_name
+            or len(rows) != 1
+            or rows[0]['agent_harness_id'] != 'codex'
+            or any(
+                before_fingerprint[field] != after_fingerprint[field]
+                for field in ('dev', 'ino')
+            )
+        ):
+            return 'invalid', {}, None
+        row = rows[0]
+        entry = {
+            'sessionId': row['current_session_id'],
+            'entryValid': row['entry_valid'],
+            'nodeStatus': row['node_status'],
+            'nodeUpdatedAt': row['node_updated_at'],
+            'status': row['window_status'],
+            'startedAt': row['started_at'],
+            'endedAt': row['ended_at'],
+            'updatedAt': row['node_updated_at'],
+            'modelProvider': row['model_provider'],
+            'model': row['model'],
+        }
+        fingerprint = {
+            **before_fingerprint,
+            'node_updated_at': int(row['node_updated_at'] or 0),
+            'session_updated_at': int(row['node_updated_at'] or 0),
+            'window_updated_at': int(row['window_updated_at'] or 0),
+        }
+        return 'present', entry, fingerprint
+
     def _observe_post_dispatch_model_identity(
         self,
         *,
@@ -1168,45 +1302,31 @@ class OpenClawAgentClient:
                 actual_provider=None,
                 actual_model=None,
             )
-        registry_path = self._session_artifacts_dir(agent_name=agent_name) / 'sessions.json'
-        registry_snapshot = None
         started_ms = int(dispatch_started_at.timestamp() * 1000)
         entry: dict[str, Any] = {}
-        warned_for_size = False
+        source_fingerprint: dict[str, int] | None = None
         retry_delays = (0.0, *OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS)
         with _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK:
             for retry_delay in retry_delays:
                 if retry_delay > 0:
                     time.sleep(retry_delay)
-                try:
-                    candidate_snapshot = read_bounded_regular_file(
-                        registry_path,
-                        max_bytes=OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
+                sqlite_state, candidate, candidate_fingerprint = (
+                    self._read_sqlite_session_identity_entry(
+                        agent_name=agent_name,
+                        session_key=session_key,
                     )
-                    registry_snapshot = candidate_snapshot
-                    registry_size = candidate_snapshot.fingerprint['size']
-                    if (
-                        registry_size >= OPENCLAW_SESSION_REGISTRY_WARNING_BYTES
-                        and not warned_for_size
-                    ):
-                        warned_for_size = True
-                        logger.warning(
-                            'OpenClaw session registry is approaching the model identity verification limit',
-                            extra={
-                                'agent_name': agent_name,
-                                'registry_size_bytes': registry_size,
-                                'registry_max_bytes': OPENCLAW_SESSION_REGISTRY_MAX_BYTES,
-                            },
-                        )
-                    registry = json.loads(candidate_snapshot.content)
-                except (SafeFileReadError, UnicodeError, json.JSONDecodeError, RecursionError):
+                )
+                if sqlite_state != 'present':
                     continue
 
-                candidate = registry.get(session_key) if isinstance(registry, dict) else None
-                if not isinstance(candidate, dict):
-                    continue
                 status = str(candidate.get('status') or '').strip().lower()
                 if status not in {'completed', 'done'}:
+                    continue
+                if (
+                    candidate.get('entryValid') != 1
+                    or str(candidate.get('nodeStatus') or '').strip().lower()
+                    != 'done'
+                ):
                     continue
 
                 entry_started_ms = candidate.get('startedAt')
@@ -1240,15 +1360,15 @@ class OpenClawAgentClient:
                 ).strip():
                     continue
                 entry = candidate
+                source_fingerprint = candidate_fingerprint
                 break
         return build_observed_model_identity(
             role=role,
             expected_model=expected_model,
             actual_provider=str(entry.get('modelProvider') or '') or None,
             actual_model=str(entry.get('model') or '') or None,
-            actual_source_fingerprint=(
-                registry_snapshot.fingerprint if registry_snapshot is not None else None
-            ),
+            actual_source_fingerprint=source_fingerprint,
+            actual_identity_source='openclaw_session_store_sqlite',
         )
 
     def _find_trajectory_file(

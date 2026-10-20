@@ -23,8 +23,12 @@ Core requests `OPENCLAW_SHORT_TERM_DECIDER_EXPECTED_MODEL` (default
 `openai/gpt-6.1-sol`) through OpenClaw's exact model override, but does not
 treat the outbound request as observed fact. The response `model` value such as
 `openclaw/short-term-decider` is a route alias. Core verifies the terminal,
-timestamp-bound session registry entry after dispatch and records its observed
-provider/model separately from expected/requested identity and the route alias.
+timestamp-bound entry in OpenClaw's agent-owned SQLite v25 store after dispatch
+and records its observed provider/model separately from expected/requested
+identity and the route alias. Store ownership, Codex harness, and exact session
+identity are required; legacy `sessions.json` is not accepted. Core and
+OpenClaw share one trusted local OS account, so same-UID state mutation is
+outside this attestation boundary.
 `actual_observed_from_response=false` is explicit because the response alias is
 not the source; `post_dispatch_session_observation` is.
 

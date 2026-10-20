@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from unittest.mock import Mock
 
 import pytest
@@ -53,6 +54,136 @@ def _row(*, identity: dict | None):
             else {}
         },
     )
+
+
+def _write_openclaw_session_store(
+    path,
+    *,
+    agent_name: str,
+    session_key: str,
+    session_id: str,
+    started_ms: int,
+    status: str = 'done',
+    provider: str | None = 'openai',
+    model: str | None = 'gpt-6.1-sol',
+    harness: str | None = 'codex',
+) -> None:
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute('PRAGMA user_version = 25')
+        connection.executescript(
+            '''
+            CREATE TABLE schema_meta (
+                meta_key TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                agent_id TEXT
+            );
+            CREATE TABLE session_nodes (
+                session_key TEXT PRIMARY KEY,
+                current_session_id TEXT NOT NULL,
+                entry_valid INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                status TEXT
+            );
+            CREATE TABLE session_windows (
+                session_id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                updated_at INTEGER NOT NULL,
+                status TEXT,
+                model_provider TEXT,
+                model TEXT,
+                agent_harness_id TEXT
+            );
+            '''
+        )
+        connection.execute(
+            '''
+            INSERT INTO schema_meta (meta_key, role, schema_version, agent_id)
+            VALUES ('primary', 'agent', 25, ?)
+            ''',
+            (agent_name,),
+        )
+        ended_ms = started_ms + 10
+        connection.execute(
+            '''
+            INSERT INTO session_nodes (
+                session_key, current_session_id, entry_valid, updated_at, status
+            ) VALUES (?, ?, 1, ?, ?)
+            ''',
+            (session_key, session_id, ended_ms, status),
+        )
+        connection.execute(
+            '''
+            INSERT INTO session_windows (
+                session_id, session_key, started_at, ended_at, updated_at,
+                status, model_provider, model, agent_harness_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                session_id,
+                session_key,
+                started_ms,
+                ended_ms,
+                ended_ms,
+                status,
+                provider,
+                model,
+                harness,
+            ),
+        )
+
+
+def _replace_openclaw_session_store_entry(
+    path,
+    *,
+    session_key: str,
+    session_id: str,
+    started_ms: int,
+    status: str = 'done',
+    provider: str | None = 'openai',
+    model: str | None = 'gpt-6.1-sol',
+    harness: str | None = 'codex',
+) -> None:
+    ended_ms = started_ms + 10
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            'DELETE FROM session_nodes WHERE session_key = ?',
+            (session_key,),
+        )
+        connection.execute(
+            'DELETE FROM session_windows WHERE session_key = ?',
+            (session_key,),
+        )
+        connection.execute(
+            '''
+            INSERT INTO session_nodes (
+                session_key, current_session_id, entry_valid, updated_at, status
+            ) VALUES (?, ?, 1, ?, ?)
+            ''',
+            (session_key, session_id, ended_ms, status),
+        )
+        connection.execute(
+            '''
+            INSERT INTO session_windows (
+                session_id, session_key, started_at, ended_at, updated_at,
+                status, model_provider, model, agent_harness_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                session_id,
+                session_key,
+                started_ms,
+                ended_ms,
+                ended_ms,
+                status,
+                provider,
+                model,
+                harness,
+            ),
+        )
 
 
 def test_exact_observed_model_identity_is_verified_and_actionable() -> None:
@@ -429,17 +560,139 @@ def test_decider_expected_model_settings_default_to_gpt_6_1_sol(
     assert configured.openclaw_agent_max_prompt_chars == 125_000
 
 
-def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_path, monkeypatch) -> None:
-    session_key = 'feedback/signal-decider/test-run'
+def test_post_dispatch_session_observation_reads_current_openclaw_sqlite_store(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_key = 'feedback/signal-decider/sqlite-run'
+    session_id = 'sqlite-session-1'
     started_at = datetime.now(timezone.utc)
     started_ms = int(started_at.timestamp() * 1000)
-    registry = tmp_path / 'agents' / 'signal-decider' / 'sessions' / 'sessions.json'
-    registry.parent.mkdir(parents=True)
-    registry.write_text(
+    store = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
+    _write_openclaw_session_store(
+        store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id=session_id,
+        started_ms=started_ms,
+    )
+    with sqlite3.connect(store) as connection:
+        connection.execute(
+            'UPDATE session_windows SET updated_at = ? WHERE session_id = ?',
+            (started_ms + 5, session_id),
+        )
+        connection.execute(
+            'UPDATE session_nodes SET updated_at = ? WHERE session_key = ?',
+            (started_ms + 11, session_key),
+        )
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='signal-decider',
+        agent_name='signal-decider',
+        session_key=session_key,
+        expected_model='openai/gpt-6.1-sol',
+        dispatch_started_at=started_at,
+        session_id=session_id,
+    )
+
+    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
+    assert observed['actual_identity_source'] == 'openclaw_session_store_sqlite'
+    assert observed['verification_basis'] == 'post_dispatch_session_observation'
+    assert observed['verified'] is True
+    assert observed['actual_source_fingerprint']['session_updated_at'] == started_ms + 11
+    assert observed['actual_source_fingerprint']['window_updated_at'] == started_ms + 5
+
+
+def test_post_dispatch_sqlite_observation_rejects_wrong_response_session(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_key = 'feedback/short-term-decider/sqlite-run'
+    started_at = datetime.now(timezone.utc)
+    store = (
+        tmp_path
+        / 'agents'
+        / 'short-term-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
+    _write_openclaw_session_store(
+        store,
+        agent_name='short-term-decider',
+        session_key=session_key,
+        session_id='current-session',
+        started_ms=int(started_at.timestamp() * 1000),
+    )
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+    monkeypatch.setattr(
+        orchestrator_module,
+        'OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS',
+        (),
+    )
+
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='short-term-decider',
+        agent_name='short-term-decider',
+        session_key=session_key,
+        expected_model='openai/gpt-6.1-sol',
+        dispatch_started_at=started_at,
+        session_id='different-session',
+    )
+
+    assert observed['actual_model_ref'] is None
+    assert observed['verified'] is False
+
+
+def test_post_dispatch_sqlite_observation_fails_closed_on_symlinked_store(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_key = 'feedback/signal-decider/sqlite-symlink'
+    session_id = 'sqlite-session-1'
+    started_at = datetime.now(timezone.utc)
+    started_ms = int(started_at.timestamp() * 1000)
+    real_store = tmp_path / 'real' / 'openclaw-agent.sqlite'
+    _write_openclaw_session_store(
+        real_store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id=session_id,
+        started_ms=started_ms,
+    )
+    agent_root = tmp_path / 'agents' / 'signal-decider'
+    sqlite_store = agent_root / 'agent' / 'openclaw-agent.sqlite'
+    sqlite_store.parent.mkdir(parents=True)
+    sqlite_store.symlink_to(real_store)
+    legacy_registry = agent_root / 'sessions' / 'sessions.json'
+    legacy_registry.parent.mkdir(parents=True)
+    legacy_registry.write_text(
         json.dumps(
             {
                 session_key: {
-                    'sessionId': 'session-1',
+                    'sessionId': session_id,
                     'status': 'done',
                     'startedAt': started_ms,
                     'endedAt': started_ms + 10,
@@ -450,6 +703,53 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
             }
         ),
         encoding='utf-8',
+    )
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+    monkeypatch.setattr(
+        orchestrator_module,
+        'OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS',
+        (),
+    )
+
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='signal-decider',
+        agent_name='signal-decider',
+        session_key=session_key,
+        expected_model='openai/gpt-6.1-sol',
+        dispatch_started_at=started_at,
+        session_id=session_id,
+    )
+
+    assert observed['actual_model_ref'] is None
+    assert observed['actual_identity_source'] == 'openclaw_session_store_sqlite'
+    assert observed['verified'] is False
+
+
+def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_path, monkeypatch) -> None:
+    session_key = 'feedback/signal-decider/test-run'
+    started_at = datetime.now(timezone.utc)
+    started_ms = int(started_at.timestamp() * 1000)
+    store = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
+    _write_openclaw_session_store(
+        store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id='session-1',
+        started_ms=started_ms,
     )
     fake_settings = SimpleNamespace(
         openclaw_base_url='http://127.0.0.1:18789',
@@ -479,21 +779,11 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
         session_id='session-1',
     )
     future_ms = started_ms + int(timedelta(minutes=10).total_seconds() * 1000)
-    registry.write_text(
-        json.dumps(
-            {
-                session_key: {
-                    'sessionId': 'session-1',
-                    'status': 'done',
-                    'startedAt': future_ms,
-                    'endedAt': future_ms + 10,
-                    'updatedAt': future_ms + 10,
-                    'modelProvider': 'openai',
-                    'model': 'gpt-6.1-sol',
-                }
-            }
-        ),
-        encoding='utf-8',
+    _replace_openclaw_session_store_entry(
+        store,
+        session_key=session_key,
+        session_id='session-1',
+        started_ms=future_ms,
     )
     future = client._observe_post_dispatch_model_identity(
         role='signal-decider',
@@ -517,22 +807,35 @@ def test_post_dispatch_session_observation_retries_until_registry_is_finalized(
     session_key = 'feedback/signal-decider/test-run'
     started_at = datetime.now(timezone.utc)
     started_ms = int(started_at.timestamp() * 1000)
-    registry = tmp_path / 'agents' / 'signal-decider' / 'sessions' / 'sessions.json'
-    registry.parent.mkdir(parents=True)
+    store = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
 
     def write_entry(*, finalized: bool) -> None:
-        entry = {
-            'sessionId': 'session-1',
-            'status': 'done' if finalized else 'running',
-            'startedAt': started_ms,
-            'endedAt': started_ms + 10,
-            'updatedAt': started_ms + 10,
-        }
-        if finalized:
-            entry.update({'modelProvider': 'openai', 'model': 'gpt-6.1-sol'})
-        registry.write_text(json.dumps({session_key: entry}), encoding='utf-8')
+        _replace_openclaw_session_store_entry(
+            store,
+            session_key=session_key,
+            session_id='session-1',
+            started_ms=started_ms,
+            status='done' if finalized else 'running',
+            provider='openai' if finalized else None,
+            model='gpt-6.1-sol' if finalized else None,
+        )
 
-    write_entry(finalized=False)
+    _write_openclaw_session_store(
+        store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id='session-1',
+        started_ms=started_ms,
+        status='running',
+        provider=None,
+        model=None,
+    )
     fake_settings = SimpleNamespace(
         openclaw_base_url='http://127.0.0.1:18789',
         openclaw_gateway_token=None,
@@ -568,48 +871,38 @@ def test_post_dispatch_session_observation_retries_past_reused_terminal_entry(
     session_key = 'feedback/signal-decider/reused-slot'
     started_at = datetime.now(timezone.utc)
     started_ms = int(started_at.timestamp() * 1000)
-    registry = tmp_path / 'agents' / 'signal-decider' / 'sessions' / 'sessions.json'
-    registry.parent.mkdir(parents=True)
-
-    old_entry = {
-        'sessionId': 'old-session',
-        'status': 'done',
-        'startedAt': started_ms,
-        'endedAt': started_ms + 10,
-        'updatedAt': started_ms + 10,
-        'modelProvider': 'openai',
-        'model': 'gpt-5.5',
-    }
+    store = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
+    old_session_id = 'old-session'
+    old_status = 'done'
+    old_started_ms = started_ms
     if stale_field == 'startedAt':
         old_started_ms = started_ms - int(timedelta(minutes=1).total_seconds() * 1000)
-        old_entry.update(
-            {
-                'sessionId': 'session-1',
-                'startedAt': old_started_ms,
-                'endedAt': old_started_ms + 10,
-                'updatedAt': old_started_ms + 10,
-            }
-        )
+        old_session_id = 'session-1'
     elif stale_field == 'status':
-        old_entry.update({'sessionId': 'session-1', 'status': 'failed'})
-    registry.write_text(json.dumps({session_key: old_entry}), encoding='utf-8')
+        old_session_id = 'session-1'
+        old_status = 'failed'
+    _write_openclaw_session_store(
+        store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id=old_session_id,
+        started_ms=old_started_ms,
+        status=old_status,
+        model='gpt-5.5',
+    )
 
     def publish_current_entry(_: float) -> None:
-        registry.write_text(
-            json.dumps(
-                {
-                    session_key: {
-                        'sessionId': 'session-1',
-                        'status': 'done',
-                        'startedAt': started_ms,
-                        'endedAt': started_ms + 20,
-                        'updatedAt': started_ms + 20,
-                        'modelProvider': 'openai',
-                        'model': 'gpt-6.1-sol',
-                    }
-                }
-            ),
-            encoding='utf-8',
+        _replace_openclaw_session_store_entry(
+            store,
+            session_key=session_key,
+            session_id='session-1',
+            started_ms=started_ms,
         )
 
     fake_settings = SimpleNamespace(
@@ -645,21 +938,22 @@ def test_post_dispatch_session_observation_stops_after_bounded_retries(
     session_key = 'feedback/signal-decider/test-run'
     started_at = datetime.now(timezone.utc)
     started_ms = int(started_at.timestamp() * 1000)
-    registry = tmp_path / 'agents' / 'signal-decider' / 'sessions' / 'sessions.json'
-    registry.parent.mkdir(parents=True)
-    registry.write_text(
-        json.dumps(
-            {
-                session_key: {
-                    'sessionId': 'session-1',
-                    'status': 'running',
-                    'startedAt': started_ms,
-                    'endedAt': started_ms + 10,
-                    'updatedAt': started_ms + 10,
-                }
-            }
-        ),
-        encoding='utf-8',
+    store = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
+    _write_openclaw_session_store(
+        store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id='session-1',
+        started_ms=started_ms,
+        status='running',
+        provider=None,
+        model=None,
     )
     fake_settings = SimpleNamespace(
         openclaw_base_url='http://127.0.0.1:18789',
@@ -689,17 +983,175 @@ def test_post_dispatch_session_observation_stops_after_bounded_retries(
     )
 
 
-def test_post_dispatch_session_registry_warns_before_bounded_fail_closed_limit(tmp_path, monkeypatch) -> None:
-    session_key = 'feedback/short-term-decider/test-run'
+@pytest.mark.parametrize(
+    ('mutation_sql', 'mutation_params'),
+    [
+        ('PRAGMA user_version = 24', ()),
+        (
+            "UPDATE schema_meta SET role = 'gateway' WHERE meta_key = 'primary'",
+            (),
+        ),
+        (
+            'UPDATE schema_meta SET schema_version = 24 WHERE meta_key = ?',
+            ('primary',),
+        ),
+        (
+            'UPDATE schema_meta SET agent_id = ? WHERE meta_key = ?',
+            ('other-agent', 'primary'),
+        ),
+        (
+            'UPDATE session_windows SET agent_harness_id = ?',
+            ('other-harness',),
+        ),
+    ],
+)
+def test_post_dispatch_sqlite_observation_rejects_wrong_store_contract(
+    tmp_path,
+    monkeypatch,
+    mutation_sql,
+    mutation_params,
+) -> None:
+    session_key = 'feedback/signal-decider/wrong-store-contract'
+    session_id = 'session-1'
+    started_at = datetime.now(timezone.utc)
+    store = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
+    _write_openclaw_session_store(
+        store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id=session_id,
+        started_ms=int(started_at.timestamp() * 1000),
+    )
+    with sqlite3.connect(store) as connection:
+        connection.execute(mutation_sql, mutation_params)
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+    monkeypatch.setattr(
+        orchestrator_module,
+        'OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS',
+        (),
+    )
+
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='signal-decider',
+        agent_name='signal-decider',
+        session_key=session_key,
+        expected_model='openai/gpt-6.1-sol',
+        dispatch_started_at=started_at,
+        session_id=session_id,
+    )
+
+    assert observed['actual_model_ref'] is None
+    assert observed['verified'] is False
+
+
+def test_post_dispatch_sqlite_observation_reads_committed_wal(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_key = 'feedback/signal-decider/wal-run'
+    session_id = 'wal-session-1'
     started_at = datetime.now(timezone.utc)
     started_ms = int(started_at.timestamp() * 1000)
-    registry = tmp_path / 'agents' / 'short-term-decider' / 'sessions' / 'sessions.json'
+    store = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'agent'
+        / 'openclaw-agent.sqlite'
+    )
+    _write_openclaw_session_store(
+        store,
+        agent_name='signal-decider',
+        session_key=session_key,
+        session_id=session_id,
+        started_ms=started_ms,
+        status='running',
+        provider=None,
+        model=None,
+    )
+    fake_settings = SimpleNamespace(
+        openclaw_base_url='http://127.0.0.1:18789',
+        openclaw_gateway_token=None,
+        openclaw_agent_timeout_seconds=30,
+        openclaw_agent_max_retries=0,
+        openclaw_agent_retry_backoff_seconds=0,
+        openclaw_state_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
+
+    writer = sqlite3.connect(store)
+    try:
+        assert writer.execute('PRAGMA journal_mode = WAL').fetchone()[0] == 'wal'
+        writer.execute('PRAGMA wal_autocheckpoint = 0')
+        writer.execute(
+            '''
+            UPDATE session_windows
+            SET status = 'done', ended_at = ?, updated_at = ?,
+                model_provider = 'openai', model = 'gpt-6.1-sol'
+            WHERE session_id = ?
+            ''',
+            (started_ms + 10, started_ms + 5, session_id),
+        )
+        writer.execute(
+            '''
+            UPDATE session_nodes
+            SET status = 'done', updated_at = ?
+            WHERE session_key = ?
+            ''',
+            (started_ms + 11, session_key),
+        )
+        writer.commit()
+
+        observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+            role='signal-decider',
+            agent_name='signal-decider',
+            session_key=session_key,
+            expected_model='openai/gpt-6.1-sol',
+            dispatch_started_at=started_at,
+            session_id=session_id,
+        )
+    finally:
+        writer.close()
+
+    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
+    assert observed['verified'] is True
+
+
+def test_post_dispatch_observation_ignores_legacy_json_without_sqlite(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_key = 'feedback/signal-decider/legacy-only'
+    session_id = 'legacy-session-1'
+    started_at = datetime.now(timezone.utc)
+    started_ms = int(started_at.timestamp() * 1000)
+    registry = (
+        tmp_path
+        / 'agents'
+        / 'signal-decider'
+        / 'sessions'
+        / 'sessions.json'
+    )
     registry.parent.mkdir(parents=True)
     registry.write_text(
         json.dumps(
             {
                 session_key: {
-                    'sessionId': 'session-1',
+                    'sessionId': session_id,
                     'status': 'done',
                     'startedAt': started_ms,
                     'endedAt': started_ms + 10,
@@ -708,8 +1160,7 @@ def test_post_dispatch_session_registry_warns_before_bounded_fail_closed_limit(t
                     'model': 'gpt-6.1-sol',
                 }
             }
-        )
-        + (' ' * 512),
+        ),
         encoding='utf-8',
     )
     fake_settings = SimpleNamespace(
@@ -720,34 +1171,25 @@ def test_post_dispatch_session_registry_warns_before_bounded_fail_closed_limit(t
         openclaw_agent_retry_backoff_seconds=0,
         openclaw_state_dir=str(tmp_path),
     )
-    warning = Mock()
     monkeypatch.setattr(orchestrator_module, 'settings', fake_settings)
-    monkeypatch.setattr(orchestrator_module, 'OPENCLAW_SESSION_REGISTRY_WARNING_BYTES', 256)
-    monkeypatch.setattr(orchestrator_module, 'OPENCLAW_SESSION_REGISTRY_MAX_BYTES', 1_024)
-    monkeypatch.setattr(orchestrator_module.logger, 'warning', warning)
-    client = OpenClawAgentClient()
+    monkeypatch.setattr(
+        orchestrator_module,
+        'OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS',
+        (),
+    )
 
-    observed = client._observe_post_dispatch_model_identity(
-        role='short-term-decider',
-        agent_name='short-term-decider',
+    observed = OpenClawAgentClient()._observe_post_dispatch_model_identity(
+        role='signal-decider',
+        agent_name='signal-decider',
         session_key=session_key,
         expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
-        session_id='session-1',
+        session_id=session_id,
     )
-    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
-    warning.assert_called_once()
 
-    monkeypatch.setattr(orchestrator_module, 'OPENCLAW_SESSION_REGISTRY_MAX_BYTES', 512)
-    rejected = client._observe_post_dispatch_model_identity(
-        role='short-term-decider',
-        agent_name='short-term-decider',
-        session_key=session_key,
-        expected_model='openai/gpt-6.1-sol',
-        dispatch_started_at=started_at,
-        session_id='session-1',
-    )
-    assert rejected['actual_model_ref'] is None
+    assert observed['actual_model_ref'] is None
+    assert observed['actual_source_fingerprint'] is None
+    assert observed['verified'] is False
 
 
 @pytest.mark.parametrize('symlink_component', ['state-root', 'agents', 'agent', 'sessions', 'registry'])

@@ -193,3 +193,64 @@ def read_bounded_regular_file(
                 pass
         _close_all(second_chain)
         _close_all(first_chain)
+
+
+def fingerprint_regular_file(path: str | Path) -> dict[str, int]:
+    """Return stable metadata for a regular file reached without symlinks.
+
+    This is the metadata-only counterpart to ``read_bounded_regular_file``.
+    It is intended for large local stores that must be opened by another
+    read-only client after their path identity has been verified.
+    """
+
+    first_chain: list[int] = []
+    second_chain: list[int] = []
+    file_descriptor: int | None = None
+    verification_descriptor: int | None = None
+    try:
+        first_chain, first_parent_identities, file_name = _open_parent_chain(
+            Path(path)
+        )
+        file_descriptor, metadata = _open_regular_file(
+            first_chain[-1], file_name
+        )
+        base_fingerprint = _file_fingerprint(metadata)
+        fingerprint = {
+            **base_fingerprint,
+            'mode': metadata.st_mode,
+            'uid': metadata.st_uid,
+            'gid': metadata.st_gid,
+        }
+
+        second_chain, second_parent_identities, second_file_name = (
+            _open_parent_chain(Path(path))
+        )
+        verification_descriptor, verification_metadata = _open_regular_file(
+            second_chain[-1], second_file_name
+        )
+        if (
+            second_file_name != file_name
+            or second_parent_identities != first_parent_identities
+            or _file_fingerprint(verification_metadata) != base_fingerprint
+        ):
+            raise OSError('file path identity changed during verification')
+        return fingerprint
+    except SafeFileReadError:
+        raise
+    except (OSError, UnicodeError, ValueError):
+        raise SafeFileReadError(
+            'regular file metadata could not be verified'
+        ) from None
+    finally:
+        if verification_descriptor is not None:
+            try:
+                os.close(verification_descriptor)
+            except OSError:
+                pass
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        _close_all(second_chain)
+        _close_all(first_chain)
