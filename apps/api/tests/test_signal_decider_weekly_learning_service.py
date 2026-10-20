@@ -18,7 +18,7 @@ def _ready_calibration_report() -> dict:
             'market_date_to': '2026-10-11',
             'horizon_days': 5,
             'evaluation_version': 'signal_decider_eval_v1',
-            'model_identity_cohort': 'signal-decider|openai/gpt-5.6-sol',
+            'model_identity_cohort': 'signal-decider|openai/gpt-6.1-sol',
         },
         'review_boundary': {
             'report_version': 'signal_decider_calibration_report_v1',
@@ -217,7 +217,7 @@ class FakeWeeklyLearningRepository:
             'total_realized_pnl_krw': '12000.00',
             'average_realized_return_pct': 0.4,
             'metric_basis': 'gross_before_transaction_costs',
-            'model_identity_cohort': 'signal-decider|openai/gpt-5.6-sol',
+            'model_identity_cohort': 'signal-decider|openai/gpt-6.1-sol',
             'exclusion_reason_counts': {'actual_lifecycle_not_closed': 1},
         }
 

@@ -253,9 +253,9 @@ def _feedback_row(
             'decision_provenance': {
                 'model_identity': build_observed_model_identity(
                     role='signal-decider',
-                    expected_model='openai/gpt-5.6-sol',
+                    expected_model='openai/gpt-6.1-sol',
                     actual_provider='openai',
-                    actual_model='gpt-5.6-sol',
+                    actual_model='gpt-6.1-sol',
                 )
             },
         },
@@ -4534,9 +4534,9 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         loop_service, calibration_service, bars_by_symbol = _build_signal_decider_calibration_fixture()
         expected_identity = build_observed_model_identity(
             role='signal-decider',
-            expected_model='openai/gpt-5.6-sol',
+            expected_model='openai/gpt-6.1-sol',
             actual_provider='openai',
-            actual_model='gpt-5.6-sol',
+            actual_model='gpt-6.1-sol',
         )
         other_identity = {
             **expected_identity,
@@ -4579,7 +4579,7 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
 
         self.assertEqual(
             result['request']['model_identity_cohort'],
-            'signal-decider|openai/gpt-5.6-sol',
+            'signal-decider|openai/gpt-6.1-sol',
         )
         self.assertEqual(result['summary']['mature_computed_count'], 2)
         self.assertEqual(

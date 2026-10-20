@@ -1715,7 +1715,11 @@ class OpenClawAgentClient:
         retry_contract_anchor: dict[str, Any] | None = None
         dispatch_started_at: datetime | None = None
         capacity_reprobe = False
-        while attempt <= self.max_retries:
+        # Reposting a full prompt under the same OpenClaw session key appends it
+        # to the same native thread. Retries therefore belong to the durable
+        # outer retry cycle, which allocates a fresh per-batch session key.
+        in_session_max_retries = 0
+        while attempt <= in_session_max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             if dispatch_started_at is None:
@@ -1885,7 +1889,7 @@ class OpenClawAgentClient:
                 last_error = exc
                 log_agent_feedback_event(
                     'dispatch_single_response_error',
-                    status='retryable' if attempt <= self.max_retries else 'failed',
+                    status='retryable' if attempt <= in_session_max_retries else 'failed',
                     market_date=str(payload.get('market_date') or payload.get('trade_date') or '') or None,
                     role=spec.role,
                     agent_name=spec.agent_name,
@@ -1899,7 +1903,7 @@ class OpenClawAgentClient:
                     and exc.details.get('shared_dispatch_outage') is True
                 ):
                     break
-                if attempt > self.max_retries:
+                if attempt > in_session_max_retries:
                     break
                 if self.retry_backoff_seconds > 0:
                     time.sleep(self.retry_backoff_seconds * attempt)
@@ -2124,7 +2128,10 @@ class OpenClawAgentClient:
         retry_contract_anchor: dict[str, Any] | None = None
         dispatch_started_at: datetime | None = None
         capacity_reprobe = False
-        while attempt <= self.max_retries:
+        # Keep each OpenClaw thread single-shot. The durable outer retry cycle
+        # owns retries and supplies a fresh per-batch session key.
+        in_session_max_retries = 0
+        while attempt <= in_session_max_retries:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             if dispatch_started_at is None:
@@ -2578,7 +2585,7 @@ class OpenClawAgentClient:
                 last_error_details = error_details
                 log_agent_feedback_event(
                     'dispatch_batch_response_error',
-                    status='retryable' if attempt <= self.max_retries else 'failed',
+                    status='retryable' if attempt <= in_session_max_retries else 'failed',
                     request_run_id=request_run_id,
                     dispatch_id=dispatch_id,
                     attempt_id=attempt_id,
@@ -2632,7 +2639,7 @@ class OpenClawAgentClient:
                     and error_details.get('shared_dispatch_outage') is True
                 ):
                     break
-                if attempt > self.max_retries:
+                if attempt > in_session_max_retries:
                     break
                 if self.retry_backoff_seconds > 0:
                     time.sleep(self.retry_backoff_seconds * attempt)

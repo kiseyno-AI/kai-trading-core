@@ -61,7 +61,7 @@ def test_exact_observed_model_identity_is_verified_and_actionable() -> None:
         role='signal-decider',
         expected_model=expected,
         actual_provider='openai',
-        actual_model='gpt-5.6-sol',
+        actual_model='gpt-6.1-sol',
     )
 
     fenced = apply_decider_model_identity_fence(
@@ -74,11 +74,11 @@ def test_exact_observed_model_identity_is_verified_and_actionable() -> None:
 
     assert fenced['model_identity'] == {
         'schema_version': 'decider_model_identity_v1',
-        'expected_model': 'openai/gpt-5.6-sol',
-        'requested_model': 'openai/gpt-5.6-sol',
+        'expected_model': 'openai/gpt-6.1-sol',
+        'requested_model': 'openai/gpt-6.1-sol',
         'actual_provider': 'openai',
-        'actual_model': 'gpt-5.6-sol',
-        'actual_model_ref': 'openai/gpt-5.6-sol',
+        'actual_model': 'gpt-6.1-sol',
+        'actual_model_ref': 'openai/gpt-6.1-sol',
         'actual_identity_source': 'openclaw_session_registry',
         'actual_source_fingerprint': None,
         'actual_observed_from_response': False,
@@ -86,7 +86,7 @@ def test_exact_observed_model_identity_is_verified_and_actionable() -> None:
         'status': 'verified',
         'reason': None,
         'verification_basis': 'post_dispatch_session_observation',
-        'cohort': 'signal-decider|openai/gpt-5.6-sol',
+        'cohort': 'signal-decider|openai/gpt-6.1-sol',
     }
     assert fenced['next_day_open_action'] == 'buy'
     assert fenced['response_contract_valid'] is True
@@ -174,7 +174,7 @@ def test_model_cohort_selection_does_not_mix_verified_actual_models() -> None:
         role='signal-decider',
         expected_model=DEFAULT_DECIDER_EXPECTED_MODEL,
         actual_provider='openai',
-        actual_model='gpt-5.6-sol',
+        actual_model='gpt-6.1-sol',
     )
     other_identity = {
         **expected_identity,
@@ -194,7 +194,7 @@ def test_model_cohort_selection_does_not_mix_verified_actual_models() -> None:
     )
 
     assert selected == [expected_row]
-    assert cohort == 'signal-decider|openai/gpt-5.6-sol'
+    assert cohort == 'signal-decider|openai/gpt-6.1-sol'
     assert [item['snapshot_id'] for item in exclusions] == [other_row.id, legacy_row.id]
     assert {item['status_reason'] for item in exclusions} == {
         'model_identity_cohort_mismatch',
@@ -213,7 +213,7 @@ def test_legacy_unattributed_rows_are_excluded_from_profitability_cohorts() -> N
     )
 
     assert selected == []
-    assert cohort == 'signal-decider|openai/gpt-5.6-sol'
+    assert cohort == 'signal-decider|openai/gpt-6.1-sol'
     assert [item['status_reason'] for item in exclusions] == [
         'model_identity_unverified',
         'model_identity_unverified',
@@ -225,7 +225,7 @@ def test_model_cohort_selection_reads_normalized_single_dispatch_provenance() ->
         role='signal-decider',
         expected_model=DEFAULT_DECIDER_EXPECTED_MODEL,
         actual_provider='openai',
-        actual_model='gpt-5.6-sol',
+        actual_model='gpt-6.1-sol',
     )
     row = SimpleNamespace(
         id=1,
@@ -234,7 +234,7 @@ def test_model_cohort_selection_reads_normalized_single_dispatch_provenance() ->
                 'model_identity': {
                     **identity,
                     'status': 'verified',
-                    'cohort': 'signal-decider|openai/gpt-5.6-sol',
+                    'cohort': 'signal-decider|openai/gpt-6.1-sol',
                 }
             }
         },
@@ -248,7 +248,7 @@ def test_model_cohort_selection_reads_normalized_single_dispatch_provenance() ->
 
     assert selected == [row]
     assert exclusions == []
-    assert cohort == 'signal-decider|openai/gpt-5.6-sol'
+    assert cohort == 'signal-decider|openai/gpt-6.1-sol'
 
 
 def test_gateway_override_is_requested_only_until_post_dispatch_observation() -> None:
@@ -294,7 +294,7 @@ def test_runtime_contract_mismatch_is_non_actionable(tmp_path) -> None:
         role='signal-decider',
         expected_model=DEFAULT_DECIDER_EXPECTED_MODEL,
         actual_provider='openai',
-        actual_model='gpt-5.6-sol',
+        actual_model='gpt-6.1-sol',
     )
 
     fenced = apply_decider_model_identity_fence(
@@ -408,11 +408,25 @@ def test_runtime_contract_provenance_rejects_symlinked_scope(
     assert provenance['live_sha256'] is None
 
 
-def test_decider_expected_model_settings_default_to_explicit_frontier_identity() -> None:
+@pytest.mark.parametrize(
+    ('role', 'setting_name'),
+    (
+        ('signal-decider', 'openclaw_signal_decider_expected_model'),
+        ('short-term-decider', 'openclaw_short_term_decider_expected_model'),
+    ),
+)
+def test_decider_expected_model_settings_default_to_gpt_6_1_sol(
+    role: str,
+    setting_name: str,
+) -> None:
     configured = Settings(_env_file=None)
 
-    assert configured.openclaw_signal_decider_expected_model == 'openai/gpt-5.6-sol'
-    assert configured.openclaw_short_term_decider_expected_model == 'openai/gpt-5.6-sol'
+    assert getattr(configured, setting_name) == 'openai/gpt-6.1-sol'
+    assert expected_decider_model(role, settings_obj=configured) == 'openai/gpt-6.1-sol'
+    assert configured.openclaw_agent_max_retries == 0
+    assert configured.openclaw_agent_parallel_subtasks == 1
+    assert configured.openclaw_agent_symbol_chunk_size == 1
+    assert configured.openclaw_agent_max_prompt_chars == 125_000
 
 
 def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_path, monkeypatch) -> None:
@@ -431,7 +445,7 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
                     'endedAt': started_ms + 10,
                     'updatedAt': started_ms + 10,
                     'modelProvider': 'openai',
-                    'model': 'gpt-5.6-sol',
+                    'model': 'gpt-6.1-sol',
                 }
             }
         ),
@@ -452,7 +466,7 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
         role='signal-decider',
         agent_name='signal-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
         session_id='session-1',
     )
@@ -460,7 +474,7 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
         role='signal-decider',
         agent_name='signal-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at + timedelta(minutes=1),
         session_id='session-1',
     )
@@ -475,7 +489,7 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
                     'endedAt': future_ms + 10,
                     'updatedAt': future_ms + 10,
                     'modelProvider': 'openai',
-                    'model': 'gpt-5.6-sol',
+                    'model': 'gpt-6.1-sol',
                 }
             }
         ),
@@ -485,12 +499,12 @@ def test_post_dispatch_session_observation_accepts_done_and_rejects_stale(tmp_pa
         role='signal-decider',
         agent_name='signal-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
         session_id='session-1',
     )
 
-    assert observed['actual_model_ref'] == 'openai/gpt-5.6-sol'
+    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
     assert observed['verification_basis'] == 'post_dispatch_session_observation'
     assert stale['actual_model_ref'] is None
     assert future['actual_model_ref'] is None
@@ -515,7 +529,7 @@ def test_post_dispatch_session_observation_retries_until_registry_is_finalized(
             'updatedAt': started_ms + 10,
         }
         if finalized:
-            entry.update({'modelProvider': 'openai', 'model': 'gpt-5.6-sol'})
+            entry.update({'modelProvider': 'openai', 'model': 'gpt-6.1-sol'})
         registry.write_text(json.dumps({session_key: entry}), encoding='utf-8')
 
     write_entry(finalized=False)
@@ -535,12 +549,12 @@ def test_post_dispatch_session_observation_retries_until_registry_is_finalized(
         role='signal-decider',
         agent_name='signal-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
         session_id='session-1',
     )
 
-    assert observed['actual_model_ref'] == 'openai/gpt-5.6-sol'
+    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
     assert observed['verified'] is True
     sleep.assert_called_once()
 
@@ -591,7 +605,7 @@ def test_post_dispatch_session_observation_retries_past_reused_terminal_entry(
                         'endedAt': started_ms + 20,
                         'updatedAt': started_ms + 20,
                         'modelProvider': 'openai',
-                        'model': 'gpt-5.6-sol',
+                        'model': 'gpt-6.1-sol',
                     }
                 }
             ),
@@ -614,12 +628,12 @@ def test_post_dispatch_session_observation_retries_past_reused_terminal_entry(
         role='signal-decider',
         agent_name='signal-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
         session_id='session-1',
     )
 
-    assert observed['actual_model_ref'] == 'openai/gpt-5.6-sol'
+    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
     assert observed['verified'] is True
     sleep.assert_called_once()
 
@@ -663,7 +677,7 @@ def test_post_dispatch_session_observation_stops_after_bounded_retries(
         role='signal-decider',
         agent_name='signal-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
         session_id='session-1',
     )
@@ -691,7 +705,7 @@ def test_post_dispatch_session_registry_warns_before_bounded_fail_closed_limit(t
                     'endedAt': started_ms + 10,
                     'updatedAt': started_ms + 10,
                     'modelProvider': 'openai',
-                    'model': 'gpt-5.6-sol',
+                    'model': 'gpt-6.1-sol',
                 }
             }
         )
@@ -717,11 +731,11 @@ def test_post_dispatch_session_registry_warns_before_bounded_fail_closed_limit(t
         role='short-term-decider',
         agent_name='short-term-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
         session_id='session-1',
     )
-    assert observed['actual_model_ref'] == 'openai/gpt-5.6-sol'
+    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
     warning.assert_called_once()
 
     monkeypatch.setattr(orchestrator_module, 'OPENCLAW_SESSION_REGISTRY_MAX_BYTES', 512)
@@ -729,7 +743,7 @@ def test_post_dispatch_session_registry_warns_before_bounded_fail_closed_limit(t
         role='short-term-decider',
         agent_name='short-term-decider',
         session_key=session_key,
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=started_at,
         session_id='session-1',
     )
@@ -780,7 +794,7 @@ def test_post_dispatch_model_observation_rejects_symlinked_registry_scope(
         role='signal-decider',
         agent_name='signal-decider',
         session_key='feedback/signal-decider/test-run',
-        expected_model='openai/gpt-5.6-sol',
+        expected_model='openai/gpt-6.1-sol',
         dispatch_started_at=datetime.now(timezone.utc),
     )
 

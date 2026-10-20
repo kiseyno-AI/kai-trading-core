@@ -1985,14 +1985,14 @@ class RepairJsonTailTests(unittest.TestCase):
         spec = SimpleNamespace(role='signal-decider', agent_name='signal-decider')
         observed_model_identity = build_observed_model_identity(
             role='signal-decider',
-            expected_model='openai/gpt-5.6-sol',
+            expected_model='openai/gpt-6.1-sol',
             actual_provider='openai',
-            actual_model='gpt-5.6-sol',
+            actual_model='gpt-6.1-sol',
         )
         model_identity = {
             **observed_model_identity,
             'status': 'verified',
-            'cohort': 'signal-decider|openai/gpt-5.6-sol',
+            'cohort': 'signal-decider|openai/gpt-6.1-sol',
         }
         payload = build_response_storage_payload(
             spec=spec,
@@ -3608,9 +3608,9 @@ class RecordingBatchClient:
             'session_ref': {'session_key': kwargs['batch_items'][0]['session_key']},
             'model_identity': build_observed_model_identity(
                 role=spec.role,
-                expected_model='openai/gpt-5.6-sol',
+                expected_model='openai/gpt-6.1-sol',
                 actual_provider='openai',
-                actual_model='gpt-5.6-sol',
+                actual_model='gpt-6.1-sol',
             ),
             'request_provenance': {
                 'runtime_contract': {'version': 'v1', 'verified': True, 'status': 'verified'}
@@ -3927,9 +3927,9 @@ class SignalDeciderBatchClient:
             'output_text': '{}',
             'model_identity': build_observed_model_identity(
                 role=spec.role,
-                expected_model='openai/gpt-5.6-sol',
+                expected_model='openai/gpt-6.1-sol',
                 actual_provider='openai',
-                actual_model='gpt-5.6-sol',
+                actual_model='gpt-6.1-sol',
             ),
             'request_provenance': {
                 'runtime_contract': {'version': 'v1', 'verified': True, 'status': 'verified'}
@@ -4440,9 +4440,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 '_observe_post_dispatch_model_identity',
                 return_value=build_observed_model_identity(
                     role='signal-decider',
-                    expected_model='openai/gpt-5.6-sol',
+                    expected_model='openai/gpt-6.1-sol',
                     actual_provider='openai',
-                    actual_model='gpt-5.6-sol',
+                    actual_model='gpt-6.1-sol',
                 ),
             ):
                 result = client.dispatch(
@@ -4507,9 +4507,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 '_observe_post_dispatch_model_identity',
                 return_value=build_observed_model_identity(
                     role='signal-decider',
-                    expected_model='openai/gpt-5.6-sol',
+                    expected_model='openai/gpt-6.1-sol',
                     actual_provider='openai',
-                    actual_model='gpt-5.6-sol',
+                    actual_model='gpt-6.1-sol',
                 ),
             ):
                 result = client.dispatch_batch(
@@ -4569,113 +4569,34 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(len(http_calls), 1)
 
-    def test_single_dispatch_retry_anchors_model_identity_to_initial_attempt(self):
-        initial_started_at = datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc)
-        retry_started_at = initial_started_at + timedelta(seconds=10)
-        observed_at = retry_started_at + timedelta(seconds=1)
-        completed_at = observed_at + timedelta(seconds=1)
-        clock_values = iter(
-            [initial_started_at, retry_started_at, observed_at, completed_at]
-        )
-
-        class SequenceDateTime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                value = next(clock_values)
-                return value if tz is not None else value.replace(tzinfo=None)
-
+    def test_single_dispatch_never_reposts_to_the_same_session(self):
         http_calls: list[dict] = []
         session_key = 'feedback/signal-decider/lost-response-retry'
-        response_payload = {
-            'id': 'response-after-retry',
-            'session_id': 'session-completed-before-retry',
-            'status': 'completed',
-            'output': [
-                {
-                    'type': 'message',
-                    'content': [
-                        {
-                            'type': 'output_text',
-                            'text': json.dumps(_complete_actionable_signal_feedback()),
-                        }
-                    ],
-                }
-            ],
-        }
-        responses: list[Exception | FakeHTTPResponse] = [
-            httpx.ReadTimeout('response lost after OpenClaw completion'),
-            FakeHTTPResponse(200, response_payload),
-        ]
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
             openclaw_gateway_token='gateway-token',
             openclaw_agent_timeout_seconds=300,
-            openclaw_agent_max_retries=1,
+            openclaw_agent_max_retries=9,
             openclaw_agent_retry_backoff_seconds=1,
             openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent/openclaw-test-state',
         )
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            state_dir = Path(tmp_dir).resolve()
-            fake_settings.openclaw_state_dir = str(state_dir)
-            registry_path = (
-                state_dir
-                / 'agents'
-                / 'signal-decider'
-                / 'sessions'
-                / 'sessions.json'
-            )
-
-            def complete_session_before_retry(_delay):
-                started_ms = int(initial_started_at.timestamp() * 1000)
-                registry_path.parent.mkdir(parents=True)
-                registry_path.write_text(
-                    json.dumps(
-                        {
-                            session_key: {
-                                'sessionId': 'session-completed-before-retry',
-                                'status': 'completed',
-                                'startedAt': started_ms,
-                                'endedAt': started_ms + 1_000,
-                                'updatedAt': started_ms + 1_000,
-                                'modelProvider': 'openai',
-                                'model': 'gpt-5.6-sol',
-                            }
-                        }
-                    ),
-                    encoding='utf-8',
-                )
-
-            def fake_client_factory(*args, **kwargs):
-                outcome = responses.pop(0)
-                if isinstance(outcome, Exception):
-                    return RaisingHTTPClient(
-                        exc=outcome,
-                        calls=http_calls,
-                        **kwargs,
-                    )
-                return FakeHTTPClient(
-                    response=outcome,
-                    calls=http_calls,
-                    **kwargs,
-                )
-
-            with patch.object(orchestrator_module, 'settings', fake_settings), patch.object(
-                orchestrator_module,
-                'datetime',
-                SequenceDateTime,
-            ), patch.object(
-                orchestrator_module.time,
-                'sleep',
-                side_effect=complete_session_before_retry,
-            ), patch(
-                'app.agent_context.orchestrator.build_runtime_contract_provenance',
-                return_value=_runtime_contract_proof('stable'),
-            ), patch(
-                'app.agent_context.orchestrator.httpx.Client',
-                side_effect=fake_client_factory,
-            ):
-                result = OpenClawAgentClient().dispatch(
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.build_runtime_contract_provenance',
+            return_value=_runtime_contract_proof('stable'),
+        ), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=lambda **kwargs: RaisingHTTPClient(
+                exc=httpx.ReadTimeout('response lost after OpenClaw completion'),
+                calls=http_calls,
+                **kwargs,
+            ),
+        ):
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchRetryableError
+            ) as raised:
+                OpenClawAgentClient().dispatch(
                     spec=orchestrator_module.DISPATCH_SPECS[-1],
                     payload={
                         'market_date': '2026-04-23',
@@ -4684,136 +4605,43 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     },
                 )
 
-        self.assertEqual(result['attempt'], 2)
-        self.assertEqual(len(http_calls), 2)
+        self.assertIn('response lost after OpenClaw completion', str(raised.exception))
+        self.assertEqual(len(http_calls), 1)
         self.assertEqual(
             [call['kwargs']['headers']['x-openclaw-session-key'] for call in http_calls],
-            [session_key, session_key],
-        )
-        self.assertEqual(
-            result['model_identity']['actual_model_ref'],
-            'openai/gpt-5.6-sol',
-            result['model_identity'],
-        )
-        self.assertTrue(result['model_identity']['verified'])
-        self.assertEqual(result['normalized_feedback']['next_day_open_action'], 'buy')
-
-    def test_batch_dispatch_retry_anchors_model_identity_to_initial_attempt(self):
-        initial_started_at = datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc)
-        retry_started_at = initial_started_at + timedelta(seconds=10)
-        observed_at = retry_started_at + timedelta(seconds=1)
-        completed_at = observed_at + timedelta(seconds=1)
-        clock_values = iter(
-            [initial_started_at, retry_started_at, observed_at, completed_at]
+            [session_key],
         )
 
-        class SequenceDateTime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                value = next(clock_values)
-                return value if tz is not None else value.replace(tzinfo=None)
-
+    def test_batch_dispatch_never_reposts_to_the_same_session(self):
         http_calls: list[dict] = []
         session_key = 'feedback/signal-decider/lost-batch-response-retry'
-        response_payload = {
-            'id': 'batch-response-after-retry',
-            'metadata': {'session_id': 'batch-session-completed-before-retry'},
-            'status': 'completed',
-            'output': [
-                {
-                    'type': 'message',
-                    'content': [
-                        {
-                            'type': 'output_text',
-                            'text': json.dumps(
-                                {
-                                    'items': [
-                                        {
-                                            'symbol': '005930',
-                                            'feedback': _complete_actionable_signal_feedback(),
-                                        }
-                                    ]
-                                }
-                            ),
-                        }
-                    ],
-                }
-            ],
-        }
-        responses: list[Exception | FakeHTTPResponse] = [
-            httpx.ReadTimeout('batch response lost after OpenClaw completion'),
-            FakeHTTPResponse(200, response_payload),
-        ]
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
             openclaw_gateway_token='gateway-token',
             openclaw_agent_timeout_seconds=300,
-            openclaw_agent_max_retries=1,
+            openclaw_agent_max_retries=9,
             openclaw_agent_retry_backoff_seconds=1,
             openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent/openclaw-test-state',
         )
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            state_dir = Path(tmp_dir).resolve()
-            fake_settings.openclaw_state_dir = str(state_dir)
-            registry_path = (
-                state_dir
-                / 'agents'
-                / 'signal-decider'
-                / 'sessions'
-                / 'sessions.json'
-            )
-
-            def complete_session_before_retry(_delay):
-                started_ms = int(initial_started_at.timestamp() * 1000)
-                registry_path.parent.mkdir(parents=True)
-                registry_path.write_text(
-                    json.dumps(
-                        {
-                            session_key: {
-                                'sessionId': 'batch-session-completed-before-retry',
-                                'status': 'completed',
-                                'startedAt': started_ms,
-                                'endedAt': started_ms + 1_000,
-                                'updatedAt': started_ms + 1_000,
-                                'modelProvider': 'openai',
-                                'model': 'gpt-5.6-sol',
-                            }
-                        }
-                    ),
-                    encoding='utf-8',
-                )
-
-            def fake_client_factory(*args, **kwargs):
-                outcome = responses.pop(0)
-                if isinstance(outcome, Exception):
-                    return RaisingHTTPClient(
-                        exc=outcome,
-                        calls=http_calls,
-                        **kwargs,
-                    )
-                return FakeHTTPClient(
-                    response=outcome,
-                    calls=http_calls,
-                    **kwargs,
-                )
-
-            with patch.object(orchestrator_module, 'settings', fake_settings), patch.object(
-                orchestrator_module,
-                'datetime',
-                SequenceDateTime,
-            ), patch.object(
-                orchestrator_module.time,
-                'sleep',
-                side_effect=complete_session_before_retry,
-            ), patch(
-                'app.agent_context.orchestrator.build_runtime_contract_provenance',
-                return_value=_runtime_contract_proof('stable'),
-            ), patch(
-                'app.agent_context.orchestrator.httpx.Client',
-                side_effect=fake_client_factory,
-            ):
-                result = OpenClawAgentClient().dispatch_batch(
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.build_runtime_contract_provenance',
+            return_value=_runtime_contract_proof('stable'),
+        ), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=lambda **kwargs: RaisingHTTPClient(
+                exc=httpx.ReadTimeout(
+                    'batch response lost after OpenClaw completion'
+                ),
+                calls=http_calls,
+                **kwargs,
+            ),
+        ):
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchRetryableError
+            ) as raised:
+                OpenClawAgentClient().dispatch_batch(
                     spec=orchestrator_module.DISPATCH_SPECS[-1],
                     market_date=date(2026, 4, 23),
                     batch_items=[
@@ -4825,18 +4653,13 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     ],
                 )
 
-        self.assertEqual(result['attempt'], 2)
-        self.assertEqual(len(http_calls), 2)
+        self.assertIn('batch response lost after OpenClaw completion', str(raised.exception))
+        self.assertEqual(raised.exception.details['session_key'], session_key)
+        self.assertEqual(len(http_calls), 1)
         self.assertEqual(
             [call['kwargs']['headers']['x-openclaw-session-key'] for call in http_calls],
-            [session_key, session_key],
+            [session_key],
         )
-        self.assertEqual(
-            result['model_identity']['actual_model_ref'],
-            'openai/gpt-5.6-sol',
-            result['model_identity'],
-        )
-        self.assertTrue(result['model_identity']['verified'])
 
     def test_openclaw_auth_preflight_maps_gateway_auth_rejection(self):
         fake_settings = SimpleNamespace(
@@ -8736,11 +8559,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         decoded_item = result['decoded']['items'][0]
         self.assertEqual(
             http_calls[0]['kwargs']['headers']['x-openclaw-model'],
-            'openai/gpt-5.6-sol',
+            'openai/gpt-6.1-sol',
         )
         self.assertEqual(
             result['request_provenance']['requested_model_identity']['requested_model'],
-            'openai/gpt-5.6-sol',
+            'openai/gpt-6.1-sol',
         )
         self.assertIsNone(result['model_identity']['actual_model_ref'])
         self.assertFalse(result['model_identity']['verified'])

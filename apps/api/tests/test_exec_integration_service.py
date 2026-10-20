@@ -4753,9 +4753,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'decision_provenance': {
                         'model_identity': build_observed_model_identity(
                             role='short-term-decider',
-                            expected_model='openai/gpt-5.6-sol',
+                            expected_model='openai/gpt-6.1-sol',
                             actual_provider='openai',
-                            actual_model='gpt-5.6-sol',
+                            actual_model='gpt-6.1-sol',
                         ),
                     },
                 },

@@ -11,7 +11,7 @@ Canonical runtime source: `apps/api/app/agent_context/response_contract.py`. The
 ## Runtime model identity
 
 Core requests `OPENCLAW_SIGNAL_DECIDER_EXPECTED_MODEL` (default
-`openai/gpt-5.6-sol`) through OpenClaw's exact model override. That request is
+`openai/gpt-6.1-sol`) through OpenClaw's exact model override. That request is
 not itself proof of the runtime model. The response `model` value such as
 `openclaw/signal-decider` is only a route alias and is never recorded as the
 actual backend model. After completion, Core independently reads the exact
@@ -19,6 +19,12 @@ session registry entry, binds its terminal status and timestamps to the current
 dispatch attempt, and verifies the observed provider/model against the expected
 model. Decision provenance keeps requested, observed actual, status, reason,
 and verification basis separate from the route alias.
+
+Reasoning effort remains an OpenClaw agent-runtime setting rather than a Core
+request contract. OpenClaw's `/v1/responses` compatibility endpoint currently
+accepts but ignores `reasoning`, so Core does not claim to enforce it. Configure
+the agent's `thinkingDefault` in OpenClaw; `medium` is the recommended starting
+default for this decider.
 
 `actual_observed_from_response=false` is intentional: actual identity comes
 from the post-dispatch session observation, never from the response route alias.

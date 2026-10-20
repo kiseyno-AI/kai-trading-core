@@ -20,13 +20,19 @@ The agent must not produce execution instructions, position sizing, leverage gui
 ## Runtime model identity
 
 Core requests `OPENCLAW_SHORT_TERM_DECIDER_EXPECTED_MODEL` (default
-`openai/gpt-5.6-sol`) through OpenClaw's exact model override, but does not
+`openai/gpt-6.1-sol`) through OpenClaw's exact model override, but does not
 treat the outbound request as observed fact. The response `model` value such as
 `openclaw/short-term-decider` is a route alias. Core verifies the terminal,
 timestamp-bound session registry entry after dispatch and records its observed
 provider/model separately from expected/requested identity and the route alias.
 `actual_observed_from_response=false` is explicit because the response alias is
 not the source; `post_dispatch_session_observation` is.
+
+Reasoning effort remains an OpenClaw agent-runtime setting rather than a Core
+request contract. OpenClaw's `/v1/responses` compatibility endpoint currently
+accepts but ignores `reasoning`, so Core does not claim to enforce it. Configure
+the agent's `thinkingDefault` in OpenClaw; `medium` is the recommended starting
+default for this decider.
 
 The runtime contract provenance similarly separates the canonical template
 hash from the live workspace `AGENTS.md` hash. Missing, symlinked/non-regular,

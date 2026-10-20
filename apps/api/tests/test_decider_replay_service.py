@@ -257,9 +257,9 @@ def _snapshot_object(*, snapshot_id: int = 1, symbol: str = '005930') -> SignalD
             'decision_provenance': {
                 'model_identity': build_observed_model_identity(
                     role=SHORT_TERM_DECIDER_AGENT_NAME,
-                    expected_model='openai/gpt-5.6-sol',
+                    expected_model='openai/gpt-6.1-sol',
                     actual_provider='openai',
-                    actual_model='gpt-5.6-sol',
+                    actual_model='gpt-6.1-sol',
                 )
             }
         },
@@ -1210,9 +1210,9 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
 
         expected_identity = build_observed_model_identity(
             role=SHORT_TERM_DECIDER_AGENT_NAME,
-            expected_model='openai/gpt-5.6-sol',
+            expected_model='openai/gpt-6.1-sol',
             actual_provider='openai',
-            actual_model='gpt-5.6-sol',
+            actual_model='gpt-6.1-sol',
         )
         other_identity = {
             **expected_identity,
@@ -1279,7 +1279,7 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
             )
             self.assertEqual(
                 dataset.diagnostics['model_identity_cohort'],
-                f'{SHORT_TERM_DECIDER_AGENT_NAME}|openai/gpt-5.6-sol',
+                f'{SHORT_TERM_DECIDER_AGENT_NAME}|openai/gpt-6.1-sol',
             )
         finally:
             Base.metadata.drop_all(engine, tables=list(reversed(tables)))
@@ -1326,9 +1326,9 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                         'decision_provenance': {
                             'model_identity': build_observed_model_identity(
                                 role=agent_name,
-                                expected_model='openai/gpt-5.6-sol',
+                                expected_model='openai/gpt-6.1-sol',
                                 actual_provider='openai',
-                                actual_model='gpt-5.6-sol',
+                                actual_model='gpt-6.1-sol',
                             )
                         }
                     }
@@ -1494,9 +1494,9 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                         'decision_provenance': {
                             'model_identity': build_observed_model_identity(
                                 role=SIGNAL_DECIDER_AGENT_NAME,
-                                expected_model='openai/gpt-5.6-sol',
+                                expected_model='openai/gpt-6.1-sol',
                                 actual_provider='openai',
-                                actual_model='gpt-5.6-sol',
+                                actual_model='gpt-6.1-sol',
                             )
                         }
                     }
@@ -1621,9 +1621,9 @@ class DeciderReplayRepositoryTests(unittest.TestCase):
                     'decision_provenance': {
                         'model_identity': build_observed_model_identity(
                             role=SHORT_TERM_DECIDER_AGENT_NAME,
-                            expected_model='openai/gpt-5.6-sol',
+                            expected_model='openai/gpt-6.1-sol',
                             actual_provider='openai',
-                            actual_model='gpt-5.6-sol',
+                            actual_model='gpt-6.1-sol',
                         )
                     }
                 },

@@ -11,7 +11,7 @@ from app.agent_context.roles import (
 from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
 
 
-DEFAULT_DECIDER_EXPECTED_MODEL = 'openai/gpt-5.6-sol'
+DEFAULT_DECIDER_EXPECTED_MODEL = 'openai/gpt-6.1-sol'
 DECIDER_MODEL_IDENTITY_SCHEMA_VERSION = 'decider_model_identity_v1'
 DECIDER_ROLES = frozenset(
     {SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME}
