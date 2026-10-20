@@ -526,6 +526,30 @@ class OpenClawAgentClient:
             },
         )
 
+    @staticmethod
+    def _provider_rate_limit_error(
+        response: httpx.Response,
+        *,
+        operation: str,
+    ) -> AgentDispatchRetryableError | None:
+        if response.status_code != 429:
+            return None
+        return AgentDispatchRetryableError(
+            f'OpenClaw {operation} retryable error 429: {response.text[:300]}',
+            details={
+                'failure_kind': (
+                    FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                ),
+                'failure_status': 'provider/rate-limit',
+                'failure_category': 'provider',
+                'response_status_code': response.status_code,
+                'response_text_excerpt': response.text[:300],
+                'retryable': True,
+                'shared_dispatch_outage': True,
+                'shared_transport_outage': False,
+            },
+        )
+
     def _raise_if_circuit_broken(self, *, request_run_id: str | None) -> bool:
         normalized_run_id = str(request_run_id or '').strip() or None
         storage_admission = inspect_openclaw_storage_admission(
@@ -571,7 +595,7 @@ class OpenClawAgentClient:
 
     def _trip_circuit_breaker(
         self,
-        error: AgentDispatchTerminalError,
+        error: AgentDispatchError,
         *,
         request_run_id: str | None,
     ) -> None:
@@ -1754,9 +1778,19 @@ class OpenClawAgentClient:
                         request_run_id=request_run_id,
                     )
                     raise capacity_error
+                rate_limit_error = self._provider_rate_limit_error(
+                    response,
+                    operation='dispatch',
+                )
+                if rate_limit_error is not None:
+                    self._trip_circuit_breaker(
+                        rate_limit_error,
+                        request_run_id=request_run_id,
+                    )
+                    raise rate_limit_error
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
-                if response.status_code in (408, 409, 429):
+                if response.status_code in (408, 409):
                     raise AgentDispatchRetryableError(f'OpenClaw retryable error {response.status_code}: {response.text[:300]}')
                 if response.status_code >= 400:
                     raise AgentDispatchTerminalError(f'OpenClaw dispatch failed {response.status_code}: {response.text[:300]}')
@@ -1860,10 +1894,17 @@ class OpenClawAgentClient:
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                 )
+                if (
+                    isinstance(exc, AgentDispatchError)
+                    and exc.details.get('shared_dispatch_outage') is True
+                ):
+                    break
                 if attempt > self.max_retries:
                     break
                 if self.retry_backoff_seconds > 0:
                     time.sleep(self.retry_backoff_seconds * attempt)
+        if isinstance(last_error, AgentDispatchError) and last_error.details:
+            raise last_error
         raise AgentDispatchRetryableError(str(last_error) if last_error else 'unknown dispatch failure')
 
     def spawn_symbol_subagent(
@@ -2179,9 +2220,19 @@ class OpenClawAgentClient:
                         request_run_id=circuit_breaker_run_id,
                     )
                     raise capacity_error
+                rate_limit_error = self._provider_rate_limit_error(
+                    response,
+                    operation='batch',
+                )
+                if rate_limit_error is not None:
+                    self._trip_circuit_breaker(
+                        rate_limit_error,
+                        request_run_id=circuit_breaker_run_id,
+                    )
+                    raise rate_limit_error
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')
-                if response.status_code in (408, 409, 429):
+                if response.status_code in (408, 409):
                     raise AgentDispatchRetryableError(f'OpenClaw batch retryable error {response.status_code}: {response.text[:300]}')
                 if response.status_code >= 400:
                     raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
@@ -2576,6 +2627,11 @@ class OpenClawAgentClient:
                     },
                     exc_info=True,
                 )
+                if (
+                    isinstance(error_details, dict)
+                    and error_details.get('shared_dispatch_outage') is True
+                ):
+                    break
                 if attempt > self.max_retries:
                     break
                 if self.retry_backoff_seconds > 0:

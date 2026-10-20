@@ -9069,6 +9069,55 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(error_log['failure_kind'], 'openclaw_transport_timeout')
         self.assertEqual(error_log['failure_mode'], 'openclaw_transport_timeout')
 
+    def test_openclaw_single_dispatch_opens_shared_circuit_on_first_429(self):
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=1,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(429, {'error': 'rate_limit'}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        payload = {
+            'market_date': '2026-04-14',
+            'symbol': '005930',
+            'request_run_id': 'symbol-run-2026-04-14-abc123',
+            'session_key': 'feedback/eod-summarizer/rate-limit-test',
+        }
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            client = OpenClawAgentClient()
+            with self.assertRaises(orchestrator_module.AgentDispatchRetryableError) as raised:
+                client.dispatch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    payload=payload,
+                )
+            with self.assertRaises(orchestrator_module.AgentDispatchTerminalError) as blocked:
+                client.dispatch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    payload=payload,
+                )
+
+        self.assertEqual(len(http_calls), 1)
+        self.assertTrue(raised.exception.details['shared_dispatch_outage'])
+        self.assertTrue(blocked.exception.details['retryable'])
+        self.assertEqual(
+            blocked.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+
     def test_openclaw_batch_dispatch_classifies_http_429_as_shared_provider_rate_limit(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
         http_calls = []
@@ -9120,7 +9169,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(details['response_status_code'], 429)
         self.assertEqual(len(http_calls), 1)
 
-    def test_openclaw_batch_dispatch_exhausts_configured_429_retries_before_shared_failure(self):
+    def test_openclaw_batch_dispatch_opens_shared_circuit_on_first_429(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:eod-summarizer:slot-1:batch-1'
         http_calls = []
         fake_settings = SimpleNamespace(
@@ -9162,10 +9211,38 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     ],
                 )
 
-        self.assertEqual(len(http_calls), 2)
+        self.assertEqual(len(http_calls), 1)
         self.assertTrue(raised.exception.details['shared_dispatch_outage'])
         self.assertEqual(
             raised.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            with self.assertRaises(orchestrator_module.AgentDispatchTerminalError) as blocked:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                    batch_items=[
+                        {
+                            'symbol': '005930',
+                            'market_date': '2026-04-14',
+                            'request_run_id': 'symbol-run-2026-04-14-abc123',
+                            'dispatch_id': dispatch_id,
+                            'session_slot': 1,
+                            'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/slot-01',
+                            'session_reuse_mode': 'fresh_per_batch',
+                        }
+                    ],
+                )
+
+        self.assertEqual(len(http_calls), 1)
+        self.assertTrue(blocked.exception.details['retryable'])
+        self.assertEqual(
+            blocked.exception.details['failure_kind'],
             'openclaw_provider_rate_limited',
         )
 
