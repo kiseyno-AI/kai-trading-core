@@ -17,9 +17,16 @@ from app.agent_context.orchestrator import (
     OpenClawAgentClient,
     _is_retryable_dispatch_exception,
 )
+from app.core.settings import Settings
 
 
 class OpenClawStorageAdmissionTests(unittest.TestCase):
+    def test_default_dispatch_guard_keeps_twenty_gibibytes_free(self) -> None:
+        self.assertEqual(
+            20 * 1024 * 1024 * 1024,
+            Settings.model_fields['openclaw_dispatch_min_free_bytes'].default,
+        )
+
     def test_admits_when_state_filesystem_has_required_free_space(self) -> None:
         with tempfile.TemporaryDirectory() as state_dir:
             with patch(

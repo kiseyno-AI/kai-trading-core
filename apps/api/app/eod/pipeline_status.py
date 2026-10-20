@@ -1240,6 +1240,13 @@ class EODPipelineStatusService:
         stages = self._mark_preopen_stage_skips(stages=stages)
         stages = self._normalize_stage_contract(stages)
         overall_status = self._resolve_overall_status(stages)
+        if self._is_current_date_waiting_for_official_run(
+            stages=stages,
+            official_run=official_run,
+            pykrx_run=pykrx_run,
+            market_session=market_session,
+        ):
+            overall_status = 'pending'
         official_run_status = str((official_run or {}).get('status') or '').strip().lower()
         if official_run_status in {'running', 'interrupted', 'abandoned'}:
             overall_status = official_run_status
@@ -4277,6 +4284,27 @@ class EODPipelineStatusService:
                 return f'Stored {persisted}/{expected_total} rows for {label}'
             return _default_activity(label, status)
         return _default_activity(label, status)
+
+    @staticmethod
+    def _is_current_date_waiting_for_official_run(
+        *,
+        stages: dict[str, dict[str, Any]],
+        official_run: dict[str, Any] | None,
+        pykrx_run: dict[str, Any] | None,
+        market_session: dict[str, Any],
+    ) -> bool:
+        if official_run is not None or pykrx_run is not None:
+            return False
+        if not bool(market_session.get('requested_date_is_current_calendar_date')):
+            return False
+        if not bool(market_session.get('requested_date_is_trading_day')):
+            return False
+
+        statuses = {
+            str(stage.get('status') or 'pending').strip().lower()
+            for stage in stages.values()
+        }
+        return 'pending' in statuses and statuses <= {'pending', 'completed', 'skipped'}
 
     @staticmethod
     def _resolve_overall_status(stages: dict[str, dict[str, Any]]) -> str:

@@ -1173,6 +1173,83 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ['/disclosures/dart/fundamentals/daily/inspect', '/eod/pipeline/status'],
         )
 
+    def test_read_keeps_current_trading_date_pending_before_official_run(self):
+        official_run_dates = []
+
+        def _load_official_run(*, market_date):
+            official_run_dates.append(market_date)
+            return None
+
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            pykrx_enrichment_loader=lambda **_: {},
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=_load_official_run,
+            price_bar_count_loader=lambda **_: 1,
+        )
+
+        result = service.read(market_date=_FakeMarketState.current_calendar_date)
+
+        self.assertEqual(official_run_dates, [_FakeMarketState.current_calendar_date])
+        self.assertIsNone(result['official_run'])
+        self.assertEqual(result['market_date'], _FakeMarketState.current_calendar_date)
+        self.assertEqual(result['completed_stages'], 1)
+        self.assertGreater(result['pending_stages'], 0)
+        self.assertEqual(result['status'], 'pending')
+
+    def test_read_without_market_date_still_selects_yesterday_official_run(self):
+        latest_run = {
+            'id': 487,
+            'market_date': '2026-04-20',
+            'trigger': 'scheduled',
+            'status': 'partial',
+            'current_stage': 'price_collection',
+            'started_at': '2026-04-20T11:10:00+00:00',
+            'updated_at': '2026-04-20T11:20:00+00:00',
+            'completed_at': '2026-04-20T11:20:00+00:00',
+            'error_message': None,
+            'run_metadata': {},
+            'stages': {},
+        }
+
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda *, market_date: (
+                latest_run if market_date is None else None
+            ),
+        )
+
+        result = service.read()
+
+        self.assertEqual(result['market_date'], '2026-04-20')
+        self.assertEqual(result['official_run']['id'], 487)
+
+    def test_read_keeps_historical_partial_evidence_partial_without_official_run(self):
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            pykrx_enrichment_loader=lambda **_: {},
+            live_symbol_count_loader=lambda: 3579,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            price_bar_count_loader=lambda **_: 1,
+        )
+
+        result = service.read(market_date='2026-04-20')
+
+        self.assertIsNone(result['official_run'])
+        self.assertEqual(result['completed_stages'], 1)
+        self.assertGreater(result['pending_stages'], 0)
+        self.assertEqual(result['status'], 'partial')
+
     def test_read_prefers_official_running_market_risk_filter_before_output_rows_exist(self):
         official_run = {
             'id': 501,

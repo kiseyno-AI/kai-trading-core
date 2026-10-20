@@ -312,7 +312,7 @@ class Settings(BaseSettings):
     openclaw_agent_batch_timeout_seconds: float = 300.0
     openclaw_agent_slot_cooldown_seconds: float = 600.0
     openclaw_dispatch_min_free_bytes: int = Field(
-        default=10 * 1024 * 1024 * 1024,
+        default=20 * 1024 * 1024 * 1024,
         ge=0,
         le=10 * 1024 * 1024 * 1024 * 1024,
     )
