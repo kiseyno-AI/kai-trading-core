@@ -4056,7 +4056,7 @@ class FakeSessionCleanupService:
         self.deferred_batches = []
         self.deferred_completed = threading.Event()
 
-    def delete_now(self, *, target):
+    def delete_now(self, *, target, deadline_monotonic=None):
         self.targets.append(target)
         return {'status': 'deleted', 'session_key': target.session_key}
 
@@ -4082,7 +4082,7 @@ class FakeSessionCleanupService:
 
 
 class RaisingSessionCleanupService(FakeSessionCleanupService):
-    def delete_now(self, *, target):
+    def delete_now(self, *, target, deadline_monotonic=None):
         self.targets.append(target)
         raise RuntimeError('cleanup audit store unavailable')
 
@@ -6278,7 +6278,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         release_delete = threading.Event()
 
         class BlockingSessionCleanupService(FakeSessionCleanupService):
-            def delete_now(self, *, target):
+            def delete_now(self, *, target, deadline_monotonic=None):
                 self.targets.append(target)
                 release_delete.wait(timeout=0.4)
                 return {'status': 'deleted', 'session_key': target.session_key}

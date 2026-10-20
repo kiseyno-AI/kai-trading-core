@@ -4740,7 +4740,8 @@ class AgentFeedbackOrchestrator:
                     try:
                         outcome['result'] = (
                             agent_feedback_session_cleanup_service.delete_now(
-                                target=cleanup_target
+                                target=cleanup_target,
+                                deadline_monotonic=cleanup_deadline,
                             )
                         )
                     except Exception as exc:  # noqa: BLE001
