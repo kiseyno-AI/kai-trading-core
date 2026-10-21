@@ -32,6 +32,7 @@ def build_next_open_window_expired_result(
     *,
     market_date: str,
     market: object,
+    allow_same_day_intraday_watch_continuation: bool = False,
 ) -> dict[str, Any] | None:
     """Return an auditable no-op when a recovered plan's window has passed."""
 
@@ -52,10 +53,17 @@ def build_next_open_window_expired_result(
         default=candidate,
         allow_fallback=True,
     )
-    target_is_still_actionable = (
-        target_trade_date >= current_market_date
-        if market_state == 'PREOPEN'
-        else target_trade_date > current_market_date
+    target_is_still_actionable = bool(
+        (
+            market_state == 'PREOPEN'
+            and target_trade_date >= current_market_date
+        )
+        or target_trade_date > current_market_date
+        or (
+            allow_same_day_intraday_watch_continuation
+            and market_state == 'OPEN'
+            and target_trade_date == current_market_date
+        )
     )
     if target_is_still_actionable:
         return None
@@ -84,6 +92,7 @@ def build_expired_decision_replay_result(
     stage_id: str,
     market_date: str,
     market: object,
+    allow_same_day_intraday_watch_continuation: bool = False,
 ) -> dict[str, Any] | None:
     """Fence decision replay once its next-open action window has passed."""
 
@@ -92,6 +101,9 @@ def build_expired_decision_replay_result(
     expired_result = build_next_open_window_expired_result(
         market_date=market_date,
         market=market,
+        allow_same_day_intraday_watch_continuation=(
+            allow_same_day_intraday_watch_continuation
+        ),
     )
     if expired_result is None:
         return None
@@ -99,6 +111,33 @@ def build_expired_decision_replay_result(
         **expired_result,
         'stage': stage_id,
     }
+
+
+def admits_same_day_intraday_watch_continuation(
+    *,
+    market_date: str,
+    market: object,
+) -> bool:
+    """Admit only a recovery already inside its same-day PREOPEN window."""
+
+    if str(getattr(market, 'state', '') or '').strip().upper() != 'PREOPEN':
+        return False
+    server_time = str(getattr(market, 'server_time', '') or '')
+    try:
+        current_market_date = date.fromisoformat(server_time[:10])
+        source_market_date = date.fromisoformat(market_date)
+    except ValueError:
+        return False
+
+    from app.orders.next_open_execution import normalize_next_open_target_trade_date
+
+    candidate = source_market_date + timedelta(days=1)
+    target_trade_date = normalize_next_open_target_trade_date(
+        candidate,
+        default=candidate,
+        allow_fallback=True,
+    )
+    return target_trade_date == current_market_date
 
 
 def get_run_metadata(run: Mapping[str, Any] | None) -> dict[str, Any]:

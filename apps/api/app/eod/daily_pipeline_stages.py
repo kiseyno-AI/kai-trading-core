@@ -62,6 +62,7 @@ from app.eod.pykrx_pipeline_runner import (
 )
 from app.eod.run_stage_support import (
     EXPIRED_DECISION_REPLAY_STAGE_IDS,
+    admits_same_day_intraday_watch_continuation,
     build_expired_decision_replay_result,
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
@@ -646,6 +647,19 @@ class DailyPipelineStageService:
                 else None
             ),
         )
+        allow_same_day_intraday_watch_continuation = bool(
+            point_in_time_recovery
+            and trigger == 'auto_eod_followup_resume'
+            and {
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+            }.intersection(resolved_stages)
+            and admits_same_day_intraday_watch_continuation(
+                market_date=resolved_market_date,
+                market=get_market_state(),
+            )
+        )
         resolved_symbols = self._normalize_symbols(symbols)
         resolved_markets = self._normalize_markets(markets)
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
@@ -935,6 +949,11 @@ class DailyPipelineStageService:
                 point_in_time_recovery = repair_context[
                     'point_in_time_recovery'
                 ]
+                allow_same_day_intraday_watch_continuation = (
+                    repair_context[
+                        'same_day_intraday_watch_continuation_admitted'
+                    ]
+                )
                 normalized_summary_cutoff_proof = repair_context[
                     'summary_cutoff_proof'
                 ]
@@ -1087,6 +1106,11 @@ class DailyPipelineStageService:
             point_in_time_recovery = continuation_context[
                 'point_in_time_recovery'
             ]
+            allow_same_day_intraday_watch_continuation = (
+                continuation_context[
+                    'same_day_intraday_watch_continuation_admitted'
+                ]
+            )
             terminal_summary_source_run_id = continuation_context[
                 'summary_source_run_id'
             ]
@@ -1313,6 +1337,9 @@ class DailyPipelineStageService:
                         else None
                     ),
                     'point_in_time_recovery': point_in_time_recovery,
+                    'same_day_intraday_watch_continuation_admitted': (
+                        allow_same_day_intraday_watch_continuation
+                    ),
                     **(
                         {
                             'summary_cutoff_contract_repair_version': (
@@ -1860,6 +1887,9 @@ class DailyPipelineStageService:
                             ),
                             point_in_time_recovery=(
                                 point_in_time_recovery
+                            ),
+                            allow_same_day_intraday_watch_continuation=(
+                                allow_same_day_intraday_watch_continuation
                             ),
                             provider_admission_fence_owned=(
                                 provider_admission_fence_owned
@@ -3026,6 +3056,7 @@ class DailyPipelineStageService:
         feedback_retry_config_override: Mapping[str, Any] | None = None,
         feedback_cutoff_resolution: dict[str, Any] | None = None,
         point_in_time_recovery: bool = False,
+        allow_same_day_intraday_watch_continuation: bool = False,
         provider_admission_fence_owned: bool = False,
         run_id: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
@@ -3053,6 +3084,11 @@ class DailyPipelineStageService:
                 stage_id=stage_id,
                 market_date=market_date,
                 market=get_market_state(),
+                allow_same_day_intraday_watch_continuation=bool(
+                    allow_same_day_intraday_watch_continuation
+                    and stage_id
+                    in {'agent_feedback_summaries', 'signal_decider'}
+                ),
             )
             if expired_decision_result is not None:
                 return expired_decision_result
@@ -3449,6 +3485,9 @@ class DailyPipelineStageService:
                 stage_id=stage_id,
                 market_date=market_date,
                 market=get_market_state(),
+                allow_same_day_intraday_watch_continuation=(
+                    allow_same_day_intraday_watch_continuation
+                ),
             )
             if expired_after_completion is not None:
                 return {
@@ -3462,6 +3501,9 @@ class DailyPipelineStageService:
             expired_result = build_next_open_window_expired_result(
                 market_date=market_date,
                 market=get_market_state(),
+                allow_same_day_intraday_watch_continuation=(
+                    allow_same_day_intraday_watch_continuation
+                ),
             )
             if expired_result is not None:
                 return {**expired_result, 'stage': stage_id}
@@ -3830,6 +3872,12 @@ class DailyPipelineStageService:
             'point_in_time_recovery': required_bool(
                 'point_in_time_recovery'
             ),
+            'same_day_intraday_watch_continuation_admitted': (
+                metadata.get(
+                    'same_day_intraday_watch_continuation_admitted'
+                )
+                is True
+            ),
             'summary_cutoff_proof': dict(proof),
         }
 
@@ -4007,6 +4055,12 @@ class DailyPipelineStageService:
             ),
             'point_in_time_recovery': required_bool(
                 'point_in_time_recovery'
+            ),
+            'same_day_intraday_watch_continuation_admitted': (
+                metadata.get(
+                    'same_day_intraday_watch_continuation_admitted'
+                )
+                is True
             ),
             'summary_source_run_id': next(
                 iter(summary_source_run_ids)

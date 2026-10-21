@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.eod.run_stage_support import (
+    admits_same_day_intraday_watch_continuation,
     build_next_open_window_expired_result,
     build_stage_counts,
     extract_fundamentals_refresh_metrics,
@@ -41,6 +42,61 @@ class EODRunStageSupportTests(unittest.TestCase):
                 'market_state': 'OPEN',
             },
         )
+
+    def test_preopen_admission_keeps_only_same_day_open_window_alive(self):
+        preopen = SimpleNamespace(
+            state='PREOPEN',
+            server_time='2026-09-14T08:59:00+09:00',
+        )
+        opened = SimpleNamespace(
+            state='OPEN',
+            server_time='2026-09-14T09:01:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.'
+            'normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            admitted = admits_same_day_intraday_watch_continuation(
+                market_date='2026-09-11',
+                market=preopen,
+            )
+            without_admission = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=opened,
+            )
+            with_admission = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=opened,
+                allow_same_day_intraday_watch_continuation=admitted,
+            )
+
+        self.assertTrue(admitted)
+        self.assertEqual(
+            without_admission['reason'],
+            'next_open_window_expired',
+        )
+        self.assertIsNone(with_admission)
+
+    def test_same_day_admission_never_extends_past_market_close(self):
+        closed = SimpleNamespace(
+            state='CLOSED',
+            server_time='2026-09-14T15:31:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.'
+            'normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            result = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=closed,
+                allow_same_day_intraday_watch_continuation=True,
+            )
+
+        self.assertEqual(result['reason'], 'next_open_window_expired')
 
     def test_closed_current_target_next_open_window_is_skipped(self):
         market = SimpleNamespace(
