@@ -1771,6 +1771,77 @@ class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
     response_summary_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
+class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
+    __tablename__ = 'signal_decider_wait_recheck_events'
+    __table_args__ = (
+        UniqueConstraint(
+            'target_trade_date',
+            'symbol',
+            name='uq_signal_decider_wait_recheck_target_symbol',
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'completed', 'failed', 'expired')",
+            name='ck_signal_decider_wait_recheck_status',
+        ),
+        CheckConstraint(
+            'trigger_price > 0 '
+            'AND (chase_limit_price IS NULL OR '
+            '(chase_limit_price >= trigger_price AND target_price > chase_limit_price)) '
+            'AND target_price > trigger_price AND stop_loss_price < trigger_price',
+            name='ck_signal_decider_wait_recheck_price_band',
+        ),
+        CheckConstraint(
+            'observed_price >= trigger_price AND observed_price < target_price '
+            'AND (chase_limit_price IS NULL OR observed_price <= chase_limit_price)',
+            name='ck_signal_decider_wait_recheck_observed_band',
+        ),
+        Index(
+            'ix_signal_decider_wait_recheck_target_status_updated',
+            'target_trade_date',
+            'status',
+            'updated_at',
+        ),
+        Index(
+            'ix_signal_decider_wait_recheck_source_snapshot',
+            'source_snapshot_id',
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='RESTRICT'),
+        nullable=False,
+    )
+    result_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey('signal_decider_decision_snapshots.id', ondelete='SET NULL'),
+    )
+    source_snapshot_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_market_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    target_trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chase_limit_price: Mapped[int | None] = mapped_column(BigInteger)
+    target_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    stop_loss_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observed_price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observed_current_price: Mapped[int | None] = mapped_column(BigInteger)
+    observed_bid_price: Mapped[int | None] = mapped_column(BigInteger)
+    price_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    quote_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    price_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default='queued', index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_run_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    result_action: Mapped[str | None] = mapped_column(String(32))
+    context_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    context_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_error_payload: Mapped[dict | None] = mapped_column(JSON)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class SignalDeciderRealizedOutcome(Base, TimestampMixin):
     __tablename__ = 'signal_decider_realized_outcomes'
     __table_args__ = (

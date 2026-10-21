@@ -276,6 +276,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup. '
             'Account for market_regime_context when choosing scalp_buy_candidate, watch_for_trigger, wait, or reject: defensive/risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution/normal require setup confirmation; aggressive_open and trend_day can support faster or continuation-oriented entries only inside the supplied bounded window and without sizing or safety-gate claims. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
+            'When intraday_wait_recheck_context is supplied, treat its immutable fresh best-ask observation only as a request to reassess the prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to watch_for_trigger after a fresh conservative review. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
     ),
@@ -3147,6 +3148,48 @@ class AgentFeedbackOrchestrator:
                     )
                 else:
                     refreshed_item.pop('agent_feedback_eligibility', None)
+            expected_wait_recheck_context = (
+                expected_symbol_context.get('intraday_wait_recheck_context')
+                if isinstance(expected_symbol_context, dict)
+                and isinstance(
+                    expected_symbol_context.get(
+                        'intraday_wait_recheck_context'
+                    ),
+                    dict,
+                )
+                else None
+            )
+            if expected_wait_recheck_context is not None:
+                from app.agent_context.wait_recheck_service import (
+                    load_validated_wait_recheck_context,
+                )
+
+                try:
+                    wait_recheck_event_id = int(
+                        expected_wait_recheck_context.get('event_id')
+                    )
+                except (TypeError, ValueError):
+                    wait_recheck_event_id = None
+                validated_wait_recheck_context = (
+                    load_validated_wait_recheck_context(
+                        event_id=wait_recheck_event_id,
+                        symbol=symbol,
+                    )
+                    if wait_recheck_event_id is not None
+                    else None
+                )
+                if (
+                    validated_wait_recheck_context is None
+                    or validated_wait_recheck_context
+                    != expected_wait_recheck_context
+                ):
+                    reasons.append(
+                        {'code': 'intraday_wait_recheck_context_changed'}
+                    )
+                elif isinstance(refreshed_item, dict):
+                    refreshed_item['intraday_wait_recheck_context'] = (
+                        validated_wait_recheck_context
+                    )
             refreshed_policy_context: dict[str, Any] = {}
             try:
                 if decision_role in DECISION_SUPPORT_AGENT_NAMES:
@@ -4355,6 +4398,16 @@ class AgentFeedbackOrchestrator:
                     policy_context_as_of_date.isoformat()
                 ),
                 'upstream_summary_run_id': upstream_summary_run_id,
+                'intraday_wait_recheck_event_id': (
+                    item.get('intraday_wait_recheck_context', {}).get(
+                        'event_id'
+                    )
+                    if isinstance(
+                        item.get('intraday_wait_recheck_context'),
+                        dict,
+                    )
+                    else None
+                ),
             }
             payload['decision_input_generation_fence'] = {
                 'schema_version': 'decision_input_generation_fence_v1',
@@ -5534,6 +5587,7 @@ class AgentFeedbackOrchestrator:
         upstream_summary_run_id: str | None = None,
         persistence_guard: Callable[..., Any] | None = None,
         expected_weekly_policy_binding: Mapping[str, Any] | None = None,
+        source_context_overlays: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         resolved_policy_context_as_of_date = (
@@ -5596,6 +5650,41 @@ class AgentFeedbackOrchestrator:
         specs = self._select_specs(roles=roles)
         requested_role_names = [spec.role for spec in specs]
         requested_symbols = _normalize_requested_symbols(symbols)
+        normalized_source_context_overlays: dict[str, dict[str, Any]] = {}
+        if source_context_overlays is not None:
+            if requested_role_names != [SHORT_TERM_DECIDER_AGENT_NAME]:
+                raise ValueError(
+                    'source_context_overlays require a short-term-decider-only dispatch'
+                )
+            from app.agent_context.wait_recheck_service import (
+                load_validated_wait_recheck_context,
+            )
+
+            for raw_symbol, raw_context in source_context_overlays.items():
+                symbol = str(raw_symbol or '').strip().upper()
+                if symbol not in set(requested_symbols):
+                    raise ValueError(
+                        'source_context_overlays must match requested symbols'
+                    )
+                if not isinstance(raw_context, Mapping):
+                    raise ValueError('source_context_overlays must contain objects')
+                try:
+                    event_id = int(raw_context.get('event_id'))
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        'source_context_overlays require a durable event_id'
+                    ) from None
+                validated_context = load_validated_wait_recheck_context(
+                    event_id=event_id,
+                    symbol=symbol,
+                )
+                if validated_context is None or validated_context != dict(
+                    raw_context
+                ):
+                    raise ValueError(
+                        'source_context_overlays do not match durable WAIT recheck evidence'
+                    )
+                normalized_source_context_overlays[symbol] = validated_context
         prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
             market_date=normalized_market_date,
             fs_div=fs_div,
@@ -5787,6 +5876,11 @@ class AgentFeedbackOrchestrator:
                 normalized_expected_weekly_policy_binding
             ),
         }
+        if normalized_source_context_overlays:
+            request_payload['source_context_overlay_event_ids'] = {
+                symbol: context['event_id']
+                for symbol, context in normalized_source_context_overlays.items()
+            }
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
@@ -6404,6 +6498,12 @@ class AgentFeedbackOrchestrator:
                             ),
                         )
                     )
+                    for context_item in symbol_context.get('items') or []:
+                        overlay = normalized_source_context_overlays.get(
+                            str(context_item.get('symbol') or '').strip().upper()
+                        )
+                        if overlay is not None:
+                            context_item['intraday_wait_recheck_context'] = overlay
                     context_materialized = True
                     _attach_agent_feedback_eligibility_context(
                         items=symbol_context.get('items') or [],
@@ -6590,6 +6690,12 @@ class AgentFeedbackOrchestrator:
                         disclosures_limit=disclosures_limit,
                         knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
+                    for context_item in symbol_context.get('items') or []:
+                        overlay = normalized_source_context_overlays.get(
+                            str(context_item.get('symbol') or '').strip().upper()
+                        )
+                        if overlay is not None:
+                            context_item['intraday_wait_recheck_context'] = overlay
                     _attach_agent_feedback_eligibility_context(
                         items=symbol_context.get('items') or [],
                         diagnostics=eligibility_diagnostics,

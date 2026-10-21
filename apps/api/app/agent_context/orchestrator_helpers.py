@@ -1375,6 +1375,7 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
         'technical_snapshot',
         'action_summary',
         'intraday_execution_context',
+        'intraday_wait_recheck_context',
         'valuation_context',
         'investor_flow_context',
         'short_selling_context',
@@ -1874,6 +1875,20 @@ def compressed_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     dispatched_policy = trimmed.get('signal_decider_policy')
     if isinstance(dispatched_policy, dict):
         compressed['signal_decider_policy'] = dispatched_policy
+    trimmed_symbol_context = trimmed.get('symbol_day_context')
+    compressed_symbol_context = compressed.get('symbol_day_context')
+    wait_recheck_context = (
+        trimmed_symbol_context.get('intraday_wait_recheck_context')
+        if isinstance(trimmed_symbol_context, dict)
+        else None
+    )
+    if (
+        isinstance(wait_recheck_context, dict)
+        and isinstance(compressed_symbol_context, dict)
+    ):
+        compressed_symbol_context['intraday_wait_recheck_context'] = (
+            wait_recheck_context
+        )
     return compressed
 
 

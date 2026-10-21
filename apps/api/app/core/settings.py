@@ -145,6 +145,20 @@ class Settings(BaseSettings):
         'downsize_probe',
     ] = 'report_only'
     signal_decider_wait_conflict_probe_quantity: int = Field(default=1, ge=1, le=100)
+    signal_decider_wait_recheck_monitoring_enabled: bool = False
+    signal_decider_wait_recheck_max_symbols: int = Field(default=20, ge=1, le=40)
+    signal_decider_wait_recheck_max_events_per_cycle: int = Field(default=1, ge=1, le=5)
+    signal_decider_wait_recheck_max_attempts: int = Field(default=2, ge=1, le=3)
+    signal_decider_wait_recheck_retry_cooldown_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=3600,
+    )
+    signal_decider_wait_recheck_running_timeout_seconds: int = Field(
+        default=600,
+        ge=120,
+        le=3600,
+    )
     signal_decider_exec_integration_mode: str = 'disabled'
     signal_decider_exec_base_url: str = 'http://127.0.0.1:8010'
     signal_decider_exec_bearer_token: Optional[str] = None

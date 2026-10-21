@@ -32,6 +32,7 @@ from app.db_models import (
     SignalDeciderDecisionSnapshot,
     SignalDeciderExecutionPlanItem,
     SignalDeciderPolicyVersion,
+    SignalDeciderWaitRecheckEvent,
 )
 from app.market.clock import MarketState
 from app.agent_context.signal_decider_loop_service import (
@@ -1647,6 +1648,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         BrokerOrder.__table__.create(bind=engine, checkfirst=True)
         CurrentMarketSnapshotCache.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderDecisionSnapshot.__table__.create(bind=engine, checkfirst=True)
+        SignalDeciderWaitRecheckEvent.__table__.create(
+            bind=engine,
+            checkfirst=True,
+        )
         SignalDeciderPolicyVersion.__table__.create(bind=engine, checkfirst=True)
         SignalDeciderExecutionPlanItem.__table__.create(bind=engine, checkfirst=True)
 
@@ -1658,6 +1663,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.target_trade_date = date(2026, 4, 30)
         self.feedback_run_ids: list[str] = []
         self.feedback_failure_symbols: list[str] = []
+        self.wait_recheck_event_ids: list[int] = []
         with session_scope() as session:
             self._preexisting_policy_versions = set(
                 session.execute(
@@ -1856,6 +1862,14 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                         AgentContextFeedbackFailure.symbol.in_(
                             self.feedback_failure_symbols
                         ),
+                    )
+                )
+            if self.wait_recheck_event_ids:
+                session.execute(
+                    delete(SignalDeciderWaitRecheckEvent).where(
+                        SignalDeciderWaitRecheckEvent.id.in_(
+                            self.wait_recheck_event_ids
+                        )
                     )
                 )
             session.execute(
@@ -2662,6 +2676,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         ) = None,
         scope: str | None = None,
         scope_authority: dict[str, object] | None = None,
+        source_context_overlay_event_ids: dict[str, int] | None = None,
+        progress_summary: dict[str, int] | None = None,
     ) -> None:
         self.feedback_run_ids.append(run_id)
         request_payload = {
@@ -2695,6 +2711,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
         if parent_run_id is not None:
             request_payload['parent_run_id'] = parent_run_id
+        if source_context_overlay_event_ids is not None:
+            request_payload['source_context_overlay_event_ids'] = (
+                source_context_overlay_event_ids
+            )
         if child_run_lineage:
             request_payload['child_run_lineage'] = {
                 'schema_version': 'agent_feedback_child_run_lineage_v1',
@@ -2724,6 +2744,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                         'reused_feedback_evidence_by_role': (
                             reused_feedback_evidence_by_role or {}
                         ),
+                        'progress_summary': progress_summary or {},
                     },
                     started_at=started_at,
                     completed_at=started_at,
@@ -3429,6 +3450,210 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 ('035420', 'signal-decider')
             ]['snapshot_id'],
             signal_buy_id,
+        )
+
+    def test_wait_recheck_watch_requires_terminal_run_and_event_cas(self) -> None:
+        symbol = '005930'
+        superseded_run_id = 'wait-recheck-2026-04-30-005930-1-1'
+        authoritative_run_id = 'wait-recheck-2026-04-30-005930-1-2'
+        observed_at = datetime(
+            2026,
+            4,
+            30,
+            0,
+            15,
+            tzinfo=timezone.utc,
+        )
+        superseded_snapshot_id = self._seed_short_term_snapshot(
+            symbol=symbol,
+            tactical_action='watch_for_trigger',
+            decision_run_id=superseded_run_id,
+            feedback_received_at=observed_at,
+        )
+        with session_scope() as session:
+            event = SignalDeciderWaitRecheckEvent(
+                source_snapshot_id=superseded_snapshot_id,
+                result_snapshot_id=None,
+                source_snapshot_fingerprint='a' * 64,
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+                symbol=symbol,
+                agent_name='short-term-decider',
+                trigger_price=50_500,
+                chase_limit_price=51_500,
+                target_price=54_000,
+                stop_loss_price=49_000,
+                observed_price=50_600,
+                observed_current_price=50_550,
+                observed_bid_price=50_500,
+                price_basis='best_ask',
+                quote_source='kis_realtime_ws',
+                price_as_of=observed_at,
+                observed_at=observed_at,
+                status='running',
+                attempt_count=2,
+                request_run_id=superseded_run_id,
+                result_action=None,
+                context_payload={'schema_version': 'test'},
+                context_sha256='b' * 64,
+                last_attempt_at=observed_at,
+                completed_at=None,
+            )
+            session.add(event)
+            session.flush()
+            event_id = int(event.id)
+            self.wait_recheck_event_ids.append(event_id)
+
+        exact_progress = {
+            'completed_feedback_count': 1,
+            'computed_feedback_count': 1,
+            'reused_feedback_count': 0,
+            'failed_items': 0,
+        }
+        self._seed_feedback_run(
+            run_id=superseded_run_id,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=observed_at,
+            status='running',
+            force_recompute=True,
+            source_context_overlay_event_ids={symbol: event_id},
+            progress_summary=exact_progress,
+        )
+
+        superseded_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+            allow_post_open_intraday_watch=True,
+        )
+        key = (symbol, 'short-term-decider')
+        self.assertIsNone(superseded_state['selected_by_key'].get(key))
+
+        with session_scope() as session:
+            superseded_run = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == superseded_run_id
+                )
+            ).scalar_one()
+            superseded_run.status = 'completed'
+            superseded_run.completed_at = observed_at + timedelta(seconds=30)
+            event = session.get(SignalDeciderWaitRecheckEvent, event_id)
+            self.assertIsNotNone(event)
+            event.status = 'running'
+            event.request_run_id = authoritative_run_id
+            event.result_snapshot_id = None
+            event.result_action = None
+            event.completed_at = None
+
+        superseded_terminal_state = (
+            self._service()._load_latest_decider_scope_state(
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+                allow_post_open_intraday_watch=True,
+            )
+        )
+        self.assertIsNone(
+            superseded_terminal_state['selected_by_key'].get(key)
+        )
+
+        ordinary_reuse_run_id = 'ordinary-reuse-of-superseded-wait-recheck'
+        self._seed_feedback_run(
+            run_id=ordinary_reuse_run_id,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=observed_at + timedelta(seconds=45),
+            reused_symbols_by_role={
+                'short-term-decider': [symbol],
+            },
+            reused_feedback_evidence_by_role=self._reuse_evidence(
+                symbol=symbol,
+                role='short-term-decider',
+                feedback_run_id=superseded_run_id,
+                feedback_received_at=observed_at,
+                decision_snapshot_id=superseded_snapshot_id,
+            ),
+        )
+        superseded_reuse_state = (
+            self._service()._load_latest_decider_scope_state(
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+                allow_post_open_intraday_watch=True,
+            )
+        )
+        self.assertIsNone(
+            superseded_reuse_state['selected_by_key'].get(key)
+        )
+
+        authoritative_observed_at = observed_at + timedelta(minutes=1)
+        authoritative_snapshot_id = self._seed_short_term_snapshot(
+            symbol=symbol,
+            tactical_action='watch_for_trigger',
+            decision_run_id=authoritative_run_id,
+            feedback_received_at=authoritative_observed_at,
+        )
+        self._seed_feedback_run(
+            run_id=authoritative_run_id,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=authoritative_observed_at,
+            force_recompute=True,
+            source_context_overlay_event_ids={symbol: event_id},
+            progress_summary=exact_progress,
+        )
+        with session_scope() as session:
+            event = session.get(SignalDeciderWaitRecheckEvent, event_id)
+            self.assertIsNotNone(event)
+            event.status = 'completed'
+            event.result_snapshot_id = authoritative_snapshot_id
+            event.result_action = 'watch_for_trigger'
+            event.completed_at = authoritative_observed_at
+
+        authoritative_state = (
+            self._service()._load_latest_decider_scope_state(
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+                allow_post_open_intraday_watch=True,
+            )
+        )
+        self.assertEqual(
+            authoritative_state['selected_by_key'][key].id,
+            authoritative_snapshot_id,
+        )
+        self.assertNotEqual(
+            authoritative_snapshot_id,
+            superseded_snapshot_id,
+        )
+
+    def test_empty_wait_recheck_marker_keeps_ordinary_run_usable(self) -> None:
+        symbol = '005930'
+        run_id = 'ordinary-short-term-run-with-empty-overlay-map'
+        snapshot_id = self._seed_short_term_snapshot(
+            symbol=symbol,
+            tactical_action='watch_for_trigger',
+            decision_run_id=run_id,
+        )
+        self._seed_feedback_run(
+            run_id=run_id,
+            symbols=[symbol],
+            roles=['short-term-decider'],
+            started_at=datetime(
+                2026,
+                4,
+                29,
+                6,
+                tzinfo=timezone.utc,
+            ),
+            source_context_overlay_event_ids={},
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+        )
+
+        self.assertEqual(
+            state['selected_by_key'][(symbol, 'short-term-decider')].id,
+            snapshot_id,
         )
 
     def test_open_refresh_materializes_late_watch_as_trigger_gated_monitor(

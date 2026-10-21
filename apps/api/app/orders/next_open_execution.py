@@ -101,6 +101,7 @@ from app.db_models import (
     SignalDeciderExecutionPlanItem,
     SignalDeciderPolicyVersion,
     SignalDeciderRealizedOutcome,
+    SignalDeciderWaitRecheckEvent,
     Symbol,
 )
 from app.eod.pykrx_enrichment_gate import (
@@ -319,6 +320,7 @@ def _load_projected_decider_feedback_runs(
         'admission_knowledge_cutoff_at',
         'idempotency_key',
         'scope_authority',
+        'source_context_overlay_event_ids',
     )
     summary_fields = (
         'failed_symbols_by_role',
@@ -329,6 +331,10 @@ def _load_projected_decider_feedback_runs(
         'failed_symbols_by_role',
         'reused_symbols_by_role',
         'reused_feedback_evidence_by_role',
+        'completed_feedback_count',
+        'computed_feedback_count',
+        'reused_feedback_count',
+        'failed_items',
     )
     summary_request_fields = (
         'symbols',
@@ -5982,6 +5988,49 @@ class SignalDeciderNextOpenExecutionService:
             session=session,
             market_date=source_market_date,
         )
+        wait_recheck_event_ids = {
+            event_id
+            for run in run_snapshots
+            for event_id in (
+                (run.get('request_payload') or {}).get(
+                    'source_context_overlay_event_ids',
+                    {},
+                ).values()
+                if isinstance(
+                    (run.get('request_payload') or {}).get(
+                        'source_context_overlay_event_ids'
+                    ),
+                    dict,
+                )
+                else ()
+            )
+            if type(event_id) is int and event_id > 0
+        }
+        wait_recheck_events_by_id = {
+            int(row.id): row
+            for row in (
+                session.execute(
+                    select(
+                        SignalDeciderWaitRecheckEvent.id,
+                        SignalDeciderWaitRecheckEvent.source_market_date,
+                        SignalDeciderWaitRecheckEvent.target_trade_date,
+                        SignalDeciderWaitRecheckEvent.symbol,
+                        SignalDeciderWaitRecheckEvent.agent_name,
+                        SignalDeciderWaitRecheckEvent.status,
+                        SignalDeciderWaitRecheckEvent.request_run_id,
+                        SignalDeciderWaitRecheckEvent.result_snapshot_id,
+                        SignalDeciderWaitRecheckEvent.result_action,
+                        SignalDeciderWaitRecheckEvent.completed_at,
+                    ).where(
+                        SignalDeciderWaitRecheckEvent.id.in_(
+                            wait_recheck_event_ids
+                        )
+                    )
+                ).all()
+                if wait_recheck_event_ids
+                else ()
+            )
+        }
         failure_rows = session.execute(
             select(
                 AgentContextFeedbackFailure.symbol,
@@ -6016,6 +6065,119 @@ class SignalDeciderNextOpenExecutionService:
 
         def normalized_run_status(run: dict[str, Any]) -> str:
             return str(run.get('status') or '').strip().lower()
+
+        def wait_recheck_marker(
+            run: dict[str, Any],
+        ) -> dict[str, int] | None:
+            payload = request_payload(run)
+            if 'source_context_overlay_event_ids' not in payload:
+                return None
+            raw_marker = payload.get('source_context_overlay_event_ids')
+            if not isinstance(raw_marker, dict):
+                return {}
+            if not raw_marker:
+                return None
+            if len(raw_marker) != 1:
+                return {}
+            raw_symbol, raw_event_id = next(iter(raw_marker.items()))
+            symbol = str(raw_symbol or '').strip().upper()
+            if (
+                len(symbol) != 6
+                or not symbol.isascii()
+                or not symbol.isdigit()
+                or type(raw_event_id) is not int
+                or raw_event_id <= 0
+            ):
+                return {}
+            return {symbol: raw_event_id}
+
+        def wait_recheck_run_is_terminal(
+            run: dict[str, Any],
+        ) -> bool:
+            marker = wait_recheck_marker(run)
+            if marker is None:
+                return True
+            if not marker:
+                return False
+            symbol = next(iter(marker))
+            payload = request_payload(run)
+            roles = payload.get('roles')
+            scopes = self._decider_role_symbol_scopes(run)
+            summary_payload = run.get('summary_payload')
+            progress = (
+                summary_payload.get('progress_summary')
+                if isinstance(summary_payload, dict)
+                and isinstance(
+                    summary_payload.get('progress_summary'),
+                    dict,
+                )
+                else {}
+            )
+            exact_progress = {
+                'completed_feedback_count': 1,
+                'computed_feedback_count': 1,
+                'reused_feedback_count': 0,
+                'failed_items': 0,
+            }
+            return bool(
+                normalized_run_status(run) == 'completed'
+                and run.get('completed_at') is not None
+                and type(run.get('symbols_total')) is int
+                and run.get('symbols_total') == 1
+                and type(run.get('completed_count')) is int
+                and run.get('completed_count') == 1
+                and type(run.get('failed_count')) is int
+                and run.get('failed_count') == 0
+                and roles == [SHORT_TERM_DECIDER_AGENT_NAME]
+                and scopes == {SHORT_TERM_DECIDER_AGENT_NAME: [symbol]}
+                and payload.get('force_recompute') is True
+                and payload.get('reuse_existing') is True
+                and all(
+                    type(progress.get(field)) is int
+                    and progress.get(field) == expected
+                    for field, expected in exact_progress.items()
+                )
+            )
+
+        def wait_recheck_event_authorizes_snapshot(
+            *,
+            run: dict[str, Any],
+            key: tuple[str, str],
+            snapshot: SignalDeciderDecisionSnapshot | None,
+        ) -> bool:
+            marker = wait_recheck_marker(run)
+            if marker is None:
+                return True
+            if (
+                not marker
+                or snapshot is None
+                or key[1] != SHORT_TERM_DECIDER_AGENT_NAME
+                or _short_term_tactical_action(snapshot)
+                != 'watch_for_trigger'
+            ):
+                return False
+            event_id = marker.get(key[0])
+            event = wait_recheck_events_by_id.get(event_id)
+            run_id = str(run.get('run_id') or '').strip()
+            return bool(
+                event_id is not None
+                and event is not None
+                and event.source_market_date == source_market_date
+                and (
+                    target_trade_date is None
+                    or event.target_trade_date == target_trade_date
+                )
+                and str(event.symbol or '').strip().upper() == key[0]
+                and _normalize_agent_name(event.agent_name)
+                == SHORT_TERM_DECIDER_AGENT_NAME
+                and str(event.status or '').strip().lower() == 'completed'
+                and event.completed_at is not None
+                and str(event.request_run_id or '').strip() == run_id
+                and event.result_snapshot_id == int(snapshot.id)
+                and str(event.result_action or '').strip().lower()
+                == 'watch_for_trigger'
+                and str(snapshot.decision_run_id or '').strip() == run_id
+            )
 
         def weekly_policy_binding(
             run: dict[str, Any],
@@ -6059,6 +6221,7 @@ class SignalDeciderNextOpenExecutionService:
         def is_usable_run(run: dict[str, Any]) -> bool:
             return bool(
                 normalized_run_status(run) != 'abandoned'
+                and wait_recheck_run_is_terminal(run)
                 and weekly_policy_parent_is_complete(run)
                 and not agent_context_feedback_run_state_service._is_stale_running_row(
                     run
@@ -6438,6 +6601,26 @@ class SignalDeciderNextOpenExecutionService:
             for run in run_snapshots
             if str(run.get('run_id') or '').strip()
         }
+
+        def wait_recheck_origin_authorizes_snapshot(
+            *,
+            key: tuple[str, str],
+            snapshot: SignalDeciderDecisionSnapshot | None,
+        ) -> bool:
+            if snapshot is None:
+                return True
+            origin_run_id = str(snapshot.decision_run_id or '').strip()
+            origin_run = run_by_id.get(origin_run_id)
+            if origin_run is None or wait_recheck_marker(origin_run) is None:
+                return True
+            return bool(
+                wait_recheck_run_is_terminal(origin_run)
+                and wait_recheck_event_authorizes_snapshot(
+                    run=origin_run,
+                    key=key,
+                    snapshot=snapshot,
+                )
+            )
 
         def comparable_datetime(value: Any) -> datetime | None:
             if not isinstance(value, datetime):
@@ -6840,6 +7023,16 @@ class SignalDeciderNextOpenExecutionService:
                                 else None
                             ),
                         )
+                    if not wait_recheck_event_authorizes_snapshot(
+                        run=run,
+                        key=key,
+                        snapshot=snapshot,
+                    ) or not wait_recheck_origin_authorizes_snapshot(
+                        key=key,
+                        snapshot=snapshot,
+                    ):
+                        snapshot = None
+                        reused = False
                     destination[key] = snapshot
                     authority_destination[key] = run_id
                     if snapshot is not None:
@@ -6863,6 +7056,19 @@ class SignalDeciderNextOpenExecutionService:
             if not role_scopes:
                 continue
             explicitly_scoped_run_ids.add(run_id)
+            if (
+                wait_recheck_marker(run) is not None
+                and not is_usable_run(run)
+            ):
+                for agent_name, symbols in role_scopes.items():
+                    for symbol in symbols:
+                        key = (symbol, agent_name)
+                        if key in selected_by_key:
+                            continue
+                        selected_by_key[key] = None
+                        authoritative_run_id_by_key[key] = run_id
+                        reused_scope_keys.discard(key)
+                continue
             if is_retry_parent and reuse_existing and not force_recompute:
                 # A logical retry parent is not itself an actual model response.
                 # Only exact persisted reuse attestations may bind an old result.

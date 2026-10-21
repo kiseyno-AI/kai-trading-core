@@ -97,6 +97,10 @@ class KISRealtimeMonitoredSymbolSource:
     membership_complete: bool
     protected_symbols: tuple[str, ...] = ()
     critical_protected_symbols: tuple[str, ...] = ()
+    base_symbols: tuple[str, ...] | None = None
+    wait_recheck_symbols: tuple[str, ...] = ()
+    wait_recheck_membership_complete: bool = False
+    wait_recheck_source_version: datetime | None = None
 
 
 def _utc_now() -> datetime:
@@ -299,12 +303,17 @@ class KISRealtimePriceService:
         self._last_source_refresh_monotonic = 0.0
         self._state_lock = threading.RLock()
         self._prices: dict[str, KISRealtimePriceTick] = {}
+        self._base_symbols: set[str] = set()
+        self._base_symbol_order: list[str] = []
         self._desired_symbols: set[str] = set()
         self._desired_symbol_order: list[str] = []
         self._protected_symbols: set[str] = set()
         self._critical_protected_symbols: set[str] = set()
+        self._wait_recheck_symbols: set[str] = set()
+        self._wait_recheck_symbol_order: list[str] = []
         self._observation_revision = 0
         self._last_source_version: datetime | None = None
+        self._last_wait_recheck_source_version: datetime | None = None
         self._subscribed_symbols: set[str] = set()
         self._limited_symbols: set[str] = set()
         self._last_observed_symbols_at: datetime | None = None
@@ -322,10 +331,12 @@ class KISRealtimePriceService:
             'desired_symbols': [],
             'protected_symbols': [],
             'critical_protected_symbols': [],
+            'wait_recheck_symbols': [],
             'subscribed_symbols': [],
             'limited_symbols': [],
             'last_observed_symbols_at': None,
             'last_source_version': None,
+            'last_wait_recheck_source_version': None,
             'last_subscription_refresh_at': None,
             'last_connected_at': None,
             'last_disconnected_at': None,
@@ -393,6 +404,9 @@ class KISRealtimePriceService:
         self._health['protected_symbols'] = sorted(self._protected_symbols)
         self._health['critical_protected_symbols'] = sorted(
             self._critical_protected_symbols
+        )
+        self._health['wait_recheck_symbols'] = sorted(
+            self._wait_recheck_symbols
         )
         self._health['subscribed_symbols'] = sorted(self._subscribed_symbols)
         self._health['limited_symbols'] = sorted(self._limited_symbols)
@@ -518,12 +532,18 @@ class KISRealtimePriceService:
         with self._state_lock:
             before = set(self._desired_symbols)
             before_order = list(self._desired_symbol_order)
+            self._base_symbols = set(normalized_symbols)
+            self._base_symbol_order = list(normalized_symbols)
             self._desired_symbols = set(normalized_symbols)
             self._desired_symbol_order = list(normalized_symbols)
             self._protected_symbols.intersection_update(self._desired_symbols)
             self._critical_protected_symbols.intersection_update(
                 self._desired_symbols
             )
+            self._wait_recheck_symbols.clear()
+            self._wait_recheck_symbol_order = []
+            self._last_wait_recheck_source_version = None
+            self._health['last_wait_recheck_source_version'] = None
             self._observation_revision += 1
             self._last_observed_symbols_at = _utc_now()
             if source_version is not None:
@@ -725,18 +745,54 @@ class KISRealtimePriceService:
         trigger: str,
         expected_observation_revision: int | None,
     ) -> dict[str, Any]:
-        normalized_symbols = list(source.symbols)
+        normalized_source_symbols = list(dict.fromkeys(source.symbols))
+        declared_wait_order = list(
+            dict.fromkeys(
+                symbol
+                for symbol in source.wait_recheck_symbols
+                if symbol in normalized_source_symbols
+            )
+        )
+        declared_wait_recheck = set(declared_wait_order)
+        if source.base_symbols is None:
+            incoming_base_order = (
+                [
+                    symbol
+                    for symbol in normalized_source_symbols
+                    if symbol not in declared_wait_recheck
+                ]
+                if declared_wait_recheck
+                or source.wait_recheck_membership_complete
+                else list(normalized_source_symbols)
+            )
+        else:
+            incoming_base_order = [
+                symbol
+                for symbol in source.base_symbols
+                if symbol in normalized_source_symbols
+            ]
+            incoming_base_order.extend(
+                symbol
+                for symbol in normalized_source_symbols
+                if symbol not in declared_wait_recheck
+                and symbol not in incoming_base_order
+            )
+        incoming_base_order = list(dict.fromkeys(incoming_base_order))
+        incoming_base_symbols = set(incoming_base_order)
         incoming_protected = set(source.protected_symbols).intersection(
-            normalized_symbols
+            incoming_base_symbols
         )
         incoming_critical = set(
             source.critical_protected_symbols
         ).intersection(incoming_protected)
-        source_membership_complete = source.membership_complete
-        changed = False
-        applied = False
+        wait_recheck_membership_complete = bool(
+            source.wait_recheck_membership_complete
+        )
+        source_membership_complete = bool(source.membership_complete)
+        subscription_changed = False
         with self._state_lock:
-            current_market_date = _utc_now().astimezone(KST).date().isoformat()
+            now = _utc_now()
+            current_market_date = now.astimezone(KST).date().isoformat()
             source_is_stale = bool(
                 source.source_version is not None
                 and self._last_source_version is not None
@@ -745,7 +801,7 @@ class KISRealtimePriceService:
             source_is_future = bool(
                 source.source_version is not None
                 and source.source_version
-                > _utc_now() + KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW
+                > now + KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW
             )
             source_is_superseded = bool(
                 expected_observation_revision is not None
@@ -755,219 +811,351 @@ class KISRealtimePriceService:
                 source.market_date is not None
                 and source.market_date != current_market_date
             )
-            if (
+            source_rejected = bool(
                 source_is_stale
                 or source_is_future
                 or source_is_superseded
                 or wrong_market_date
-            ):
+            )
+            wait_update_requested = bool(
+                wait_recheck_membership_complete
+                or declared_wait_recheck
+                or source.wait_recheck_source_version is not None
+            )
+            wait_source_is_stale = bool(
+                source.wait_recheck_source_version is not None
+                and self._last_wait_recheck_source_version is not None
+                and source.wait_recheck_source_version
+                < self._last_wait_recheck_source_version
+            )
+            wait_source_is_future = bool(
+                source.wait_recheck_source_version is not None
+                and source.wait_recheck_source_version
+                > now + KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW
+            )
+            wait_source_has_no_version = bool(
+                wait_update_requested
+                and source.wait_recheck_source_version is None
+            )
+            wait_source_has_equal_conflict = bool(
+                source.wait_recheck_source_version is not None
+                and source.wait_recheck_source_version
+                == self._last_wait_recheck_source_version
+                and declared_wait_recheck != self._wait_recheck_symbols
+            )
+            wait_source_rejected = bool(
+                source_is_superseded
+                or wrong_market_date
+                or wait_source_is_stale
+                or wait_source_is_future
+                or wait_source_has_no_version
+                or wait_source_has_equal_conflict
+            )
+
+            current_base_order = [
+                symbol
+                for symbol in self._base_symbol_order
+                if symbol in self._base_symbols
+            ]
+            current_base_order.extend(
+                sorted(self._base_symbols.difference(current_base_order))
+            )
+            current_wait_order = [
+                symbol
+                for symbol in self._wait_recheck_symbol_order
+                if symbol in self._wait_recheck_symbols
+            ]
+            current_wait_order.extend(
+                sorted(
+                    self._wait_recheck_symbols.difference(
+                        current_wait_order
+                    )
+                )
+            )
+            same_source_version = bool(
+                source.source_version is not None
+                and source.source_version == self._last_source_version
+            )
+            same_source_facts = bool(
+                incoming_base_order == current_base_order
+                and incoming_protected == self._protected_symbols
+                and incoming_critical == self._critical_protected_symbols
+            )
+            base_is_cached_noop = bool(
+                not source_rejected
+                and same_source_version
+                and same_source_facts
+            )
+            wait_is_cached_noop = bool(
+                not wait_update_requested
+                or (
+                    not wait_source_rejected
+                    and source.wait_recheck_source_version
+                    == self._last_wait_recheck_source_version
+                    and declared_wait_recheck
+                    == self._wait_recheck_symbols
+                )
+            )
+            if base_is_cached_noop and wait_is_cached_noop:
+                return self.subscription_snapshot()
+
+            before_desired = set(self._desired_symbols)
+            before_order = list(self._desired_symbol_order)
+            before_base = set(self._base_symbols)
+            before_wait = set(self._wait_recheck_symbols)
+            before_protected = set(self._protected_symbols)
+            before_critical = set(self._critical_protected_symbols)
+            revision_required = False
+            observed_membership = False
+
+            if source_rejected:
                 self._health['metrics']['source_results_ignored'] += 1
-            else:
-                current_order = self._ordered_desired_symbols_locked()
-                same_source_version = bool(
-                    source.source_version is not None
-                    and source.source_version == self._last_source_version
-                )
-                same_source_facts = bool(
-                    normalized_symbols == current_order
-                    and incoming_protected == self._protected_symbols
-                    and incoming_critical
-                    == self._critical_protected_symbols
-                )
-                if same_source_version and same_source_facts:
-                    return self.subscription_snapshot()
+            elif not base_is_cached_noop:
                 if same_source_version:
                     source_membership_complete = False
+                if not source_membership_complete and not incoming_base_order:
+                    if (
+                        source.market_date == current_market_date
+                        and source.source_version is not None
+                    ):
+                        self._last_source_version = source.source_version
+                        self._health['last_source_version'] = _isoformat(
+                            source.source_version
+                        )
+                        revision_required = True
+                    self._health['metrics']['source_results_ignored'] += 1
+                else:
+                    if source_membership_complete:
+                        next_protected = set(incoming_protected)
+                        next_critical = set(incoming_critical)
+                        next_secondary = next_protected - next_critical
+                        next_base_order = [
+                            *(
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol in next_critical
+                            ),
+                            *(
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol in next_secondary
+                            ),
+                            *(
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol not in next_protected
+                            ),
+                        ]
+                    else:
+                        current_protected = (
+                            self._protected_symbols
+                            & self._base_symbols
+                        )
+                        current_critical = (
+                            self._critical_protected_symbols
+                            & current_protected
+                        )
+                        current_secondary = (
+                            current_protected - current_critical
+                        )
+                        incoming_secondary = (
+                            incoming_protected - incoming_critical
+                        )
+                        next_critical = current_critical | incoming_critical
+                        next_secondary = (
+                            current_secondary | incoming_secondary
+                        ) - next_critical
+                        next_protected = next_critical | next_secondary
+                        seen: set[str] = set()
 
-            if (
-                not (
-                    source_is_stale
-                    or source_is_future
-                    or source_is_superseded
-                    or wrong_market_date
-                )
-                and not source_membership_complete
-                and not normalized_symbols
-            ):
-                if (
-                    source.market_date == current_market_date
-                    and source.source_version is not None
-                ):
-                    self._observation_revision += 1
-                    self._last_source_version = source.source_version
-                    self._health['last_source_version'] = _isoformat(
-                        source.source_version
+                        def append_unseen(
+                            ordered: list[str],
+                            values: Iterable[str],
+                        ) -> None:
+                            for symbol in values:
+                                if symbol not in seen:
+                                    seen.add(symbol)
+                                    ordered.append(symbol)
+
+                        next_base_order: list[str] = []
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol in incoming_critical
+                                and symbol in current_critical
+                            ),
+                        )
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol in incoming_critical
+                                and symbol not in current_critical
+                            ),
+                        )
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in current_base_order
+                                if symbol in current_critical
+                                and symbol not in incoming_critical
+                            ),
+                        )
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol in incoming_secondary
+                                and symbol in current_secondary
+                            ),
+                        )
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol in incoming_secondary
+                                and symbol not in current_secondary
+                            ),
+                        )
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in current_base_order
+                                if symbol in current_secondary
+                                and symbol not in incoming_secondary
+                                and symbol not in next_critical
+                            ),
+                        )
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in current_base_order
+                                if symbol not in next_protected
+                            ),
+                        )
+                        append_unseen(
+                            next_base_order,
+                            (
+                                symbol
+                                for symbol in incoming_base_order
+                                if symbol not in next_protected
+                            ),
+                        )
+                    self._base_symbol_order = list(next_base_order)
+                    self._base_symbols = set(next_base_order)
+                    self._protected_symbols = next_protected.intersection(
+                        self._base_symbols
                     )
-                self._health['metrics']['source_results_ignored'] += 1
-            elif not (
-                source_is_stale
-                or source_is_future
-                or source_is_superseded
-                or wrong_market_date
-            ):
-                if not source_membership_complete:
-                    current_order = self._ordered_desired_symbols_locked()
-                    current_protected = self._protected_symbols.intersection(
-                        current_order
+                    self._critical_protected_symbols = (
+                        next_critical.intersection(self._base_symbols)
                     )
-                    current_critical = (
-                        self._critical_protected_symbols.intersection(
-                            current_protected
+                    if (
+                        source.market_date == current_market_date
+                        and source.source_version is not None
+                    ):
+                        self._last_source_version = source.source_version
+                        self._health['last_source_version'] = _isoformat(
+                            source.source_version
+                        )
+                    revision_required = True
+                    observed_membership = True
+
+            if wait_update_requested:
+                if wait_source_rejected:
+                    self._health['metrics']['source_results_ignored'] += 1
+                elif not wait_is_cached_noop:
+                    if wait_recheck_membership_complete:
+                        next_wait_recheck = set(declared_wait_recheck)
+                    else:
+                        next_wait_recheck = (
+                            self._wait_recheck_symbols
+                            | declared_wait_recheck
+                        )
+                    retained_wait_order = [
+                        symbol
+                        for symbol in current_wait_order
+                        if symbol in next_wait_recheck
+                        and symbol not in declared_wait_recheck
+                    ]
+                    self._wait_recheck_symbol_order = list(
+                        dict.fromkeys(
+                            [
+                                *declared_wait_order,
+                                *retained_wait_order,
+                                *sorted(
+                                    next_wait_recheck.difference(
+                                        declared_wait_order,
+                                        retained_wait_order,
+                                    )
+                                ),
+                            ]
                         )
                     )
-                    current_secondary = current_protected - current_critical
-                    incoming_secondary = incoming_protected - incoming_critical
-                    effective_critical = current_critical | incoming_critical
-                    effective_secondary = (
-                        current_secondary | incoming_secondary
-                    ) - effective_critical
-                    effective_protected = (
-                        effective_critical | effective_secondary
+                    self._wait_recheck_symbols = next_wait_recheck
+                    self._last_wait_recheck_source_version = (
+                        source.wait_recheck_source_version
                     )
-                    seen: set[str] = set()
+                    self._health[
+                        'last_wait_recheck_source_version'
+                    ] = _isoformat(source.wait_recheck_source_version)
+                    if before_wait != self._wait_recheck_symbols:
+                        revision_required = True
+                        observed_membership = True
 
-                    def append_unseen(
-                        ordered: list[str],
-                        values: Iterable[str],
-                    ) -> None:
-                        for symbol in values:
-                            if symbol not in seen:
-                                seen.add(symbol)
-                                ordered.append(symbol)
-
-                    merged_symbols: list[str] = []
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol for symbol in normalized_symbols
-                            if symbol in incoming_critical
-                            and symbol in current_critical
-                        ),
-                    )
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol
-                            for symbol in normalized_symbols
-                            if symbol in incoming_critical
-                            and symbol not in current_critical
-                        ),
-                    )
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol
-                            for symbol in current_order
-                            if symbol in current_critical
-                            and symbol not in incoming_critical
-                        ),
-                    )
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol
-                            for symbol in normalized_symbols
-                            if symbol in incoming_secondary
-                            and symbol in current_secondary
-                        ),
-                    )
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol
-                            for symbol in normalized_symbols
-                            if symbol in incoming_secondary
-                            and symbol not in current_secondary
-                        ),
-                    )
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol
-                            for symbol in current_order
-                            if symbol in current_secondary
-                            and symbol not in incoming_secondary
-                            and symbol not in effective_critical
-                        ),
-                    )
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol
-                            for symbol in current_order
-                            if symbol not in effective_protected
-                        ),
-                    )
-                    append_unseen(
-                        merged_symbols,
-                        (
-                            symbol
-                            for symbol in normalized_symbols
-                            if symbol not in effective_protected
-                        ),
-                    )
-                    normalized_symbols = merged_symbols
-                    next_protected = effective_protected.intersection(
-                        normalized_symbols
-                    )
-                    next_critical = effective_critical.intersection(
-                        normalized_symbols
-                    )
-                else:
-                    next_protected = incoming_protected
-                    next_critical = incoming_critical
-                    next_secondary = next_protected - next_critical
-                    normalized_symbols = [
-                        *(
-                            symbol
-                            for symbol in normalized_symbols
-                            if symbol in next_critical
-                        ),
-                        *(
-                            symbol
-                            for symbol in normalized_symbols
-                            if symbol in next_secondary
-                        ),
-                        *(
-                            symbol
-                            for symbol in normalized_symbols
-                            if symbol not in next_protected
-                        ),
-                    ]
-                before = set(self._desired_symbols)
-                before_order = list(self._desired_symbol_order)
-                self._desired_symbols = set(normalized_symbols)
-                self._desired_symbol_order = normalized_symbols
-                self._protected_symbols = next_protected.intersection(
-                    self._desired_symbols
+            next_base_order = [
+                symbol
+                for symbol in self._base_symbol_order
+                if symbol in self._base_symbols
+            ]
+            next_base_order.extend(
+                sorted(self._base_symbols.difference(next_base_order))
+            )
+            next_wait_order = [
+                symbol
+                for symbol in self._wait_recheck_symbol_order
+                if symbol in self._wait_recheck_symbols
+            ]
+            next_wait_order.extend(
+                sorted(
+                    self._wait_recheck_symbols.difference(next_wait_order)
                 )
-                self._critical_protected_symbols = (
-                    next_critical.intersection(self._desired_symbols)
-                )
+            )
+            self._desired_symbol_order = list(
+                dict.fromkeys([*next_base_order, *next_wait_order])
+            )
+            self._desired_symbols = set(self._desired_symbol_order)
+            subscription_changed = bool(
+                before_desired != self._desired_symbols
+                or before_order != self._desired_symbol_order
+            )
+            partition_state_changed = bool(
+                before_base != self._base_symbols
+                or before_wait != self._wait_recheck_symbols
+                or before_protected != self._protected_symbols
+                or before_critical != self._critical_protected_symbols
+            )
+            if revision_required:
                 self._observation_revision += 1
-                self._last_observed_symbols_at = _utc_now()
-                if (
-                    source.market_date == current_market_date
-                    and source.source_version is not None
-                ):
-                    self._last_source_version = source.source_version
-                    self._health['last_source_version'] = _isoformat(
-                        source.source_version
-                    )
+            if observed_membership:
+                self._last_observed_symbols_at = now
+            if revision_required or partition_state_changed:
                 self._target_symbols_snapshot_locked()
-                changed = (
-                    before != self._desired_symbols
-                    or before_order != self._desired_symbol_order
+            if subscription_changed:
+                self._health['subscription']['message'] = (
+                    f'symbols_observed:{trigger}'
                 )
-                if changed:
-                    self._health['subscription']['message'] = (
-                        f'symbols_observed:{trigger}'
-                    )
-                    self._health['subscription']['updated_at'] = _isoformat(
-                        self._last_observed_symbols_at
-                    )
-                applied = True
-        if applied and changed and self._subscription_changed_event is not None:
+                self._health['subscription']['updated_at'] = _isoformat(
+                    self._last_observed_symbols_at or now
+                )
+        if subscription_changed and self._subscription_changed_event is not None:
             self._subscription_changed_event.set()
         return self.subscription_snapshot()
 
@@ -1076,8 +1264,55 @@ class KISRealtimePriceService:
     ) -> KISRealtimeMonitoredSymbolSource:
         from app.orders.exec_integration import signal_decider_exec_integration_service
 
-        return await signal_decider_exec_integration_service.load_realtime_monitored_symbol_source(
+        base_source = await signal_decider_exec_integration_service.load_realtime_monitored_symbol_source(
             trigger=f'kis_realtime_price:{trigger}',
+        )
+        from app.agent_context.wait_recheck_service import (
+            merge_wait_recheck_monitored_source,
+            signal_decider_wait_recheck_service,
+        )
+
+        if not settings.signal_decider_wait_recheck_monitoring_enabled:
+            signal_decider_wait_recheck_service.replace_candidate_cache(())
+            with self._state_lock:
+                has_wait_recheck_membership = bool(
+                    self._wait_recheck_symbols
+                )
+            if not has_wait_recheck_membership:
+                return base_source
+            return merge_wait_recheck_monitored_source(
+                base_source,
+                symbols=(),
+                source_version=_utc_now(),
+                membership_complete=True,
+            )
+
+        try:
+            target_trade_date = datetime.fromisoformat(
+                str(base_source.market_date)
+            ).date()
+        except (TypeError, ValueError):
+            return KISRealtimeMonitoredSymbolSource(
+                symbols=base_source.symbols,
+                market_date=base_source.market_date,
+                source_version=base_source.source_version,
+                membership_complete=False,
+                protected_symbols=base_source.protected_symbols,
+                critical_protected_symbols=(
+                    base_source.critical_protected_symbols
+                ),
+                wait_recheck_symbols=base_source.wait_recheck_symbols,
+                wait_recheck_membership_complete=False,
+            )
+        wait_source = await asyncio.to_thread(
+            signal_decider_wait_recheck_service.load_subscription_source,
+            target_trade_date=target_trade_date,
+        )
+        return merge_wait_recheck_monitored_source(
+            base_source,
+            symbols=wait_source.symbols,
+            source_version=wait_source.source_version,
+            membership_complete=wait_source.membership_complete,
         )
 
     async def _run(self) -> None:
@@ -1374,6 +1609,7 @@ class KISRealtimePriceService:
             self._health['last_price_received_at'] = _isoformat(received_at)
             for tick in ticks:
                 self._prices[tick.symbol] = tick
+        self._observe_wait_recheck_ticks(ticks)
         return [tick.to_public_dict() for tick in ticks]
 
     def ingest_price_fields(
@@ -1391,7 +1627,28 @@ class KISRealtimePriceService:
             self._prices[tick.symbol] = tick
             self._health['metrics']['prices_ingested'] += 1
             self._health['last_price_received_at'] = _isoformat(tick.received_at)
+        self._observe_wait_recheck_ticks((tick,))
         return tick.to_public_dict()
+
+    def _observe_wait_recheck_ticks(
+        self,
+        ticks: Iterable[KISRealtimePriceTick],
+    ) -> None:
+        if not settings.signal_decider_wait_recheck_monitoring_enabled:
+            return
+        from app.agent_context.wait_recheck_service import (
+            signal_decider_wait_recheck_service,
+        )
+
+        for tick in ticks:
+            with self._state_lock:
+                subscribed = tick.symbol in self._subscribed_symbols
+                limited = tick.symbol in self._limited_symbols
+            signal_decider_wait_recheck_service.observe_realtime_tick(
+                tick,
+                subscribed=subscribed,
+                limited=limited,
+            )
 
     def price_fields_for_symbol(self, symbol: Any) -> dict[str, Any]:
         normalized = _normalize_symbol(symbol)
@@ -1524,6 +1781,9 @@ class KISRealtimePriceService:
                 'protected_symbols': sorted(self._protected_symbols),
                 'critical_protected_symbols': sorted(
                     self._critical_protected_symbols
+                ),
+                'wait_recheck_symbols': sorted(
+                    self._wait_recheck_symbols
                 ),
                 'max_subscriptions': settings.kis_realtime_price_max_subscriptions,
             }

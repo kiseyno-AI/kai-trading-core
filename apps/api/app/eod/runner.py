@@ -9,6 +9,9 @@ from zoneinfo import ZoneInfo
 from app.agent_context.session_cleanup_service import (
     agent_feedback_session_cleanup_service,
 )
+from app.agent_context.wait_recheck_service import (
+    signal_decider_wait_recheck_service,
+)
 from app.core.settings import settings
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
 from app.eod.master import refresh_master_if_due
@@ -29,6 +32,7 @@ MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(9, 0)
 MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(14, 31)
 NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY = 'signal_decider_next_open_execution_refresh_plan_if_due'
 OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY = 'signal_decider_exec_dispatch_open_plan'
+WAIT_RECHECK_SINGLE_FLIGHT_KEY = 'signal_decider_wait_recheck_open_cycle'
 BUY_AUTHORITY_REVOCATION_CONSECUTIVE_FAILURE_THRESHOLD = 3
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
@@ -148,6 +152,9 @@ class EODBackgroundRunner:
                 for name, expires_at in sorted(self._step_timeout_cooldowns.items())
                 if expires_at > current
             },
+            'wait_recheck_monitoring': (
+                signal_decider_wait_recheck_service.runtime_snapshot()
+            ),
         }
 
     @staticmethod
@@ -290,6 +297,27 @@ class EODBackgroundRunner:
             )
             if fail_closed:
                 raise RuntimeError(f'blocking step timed out: {name}')
+
+    def _schedule_blocking_step(self, name: str, func) -> bool:
+        running_task = self._blocking_step_tasks.get(name)
+        if running_task is not None and not running_task.done():
+            return False
+        if running_task is not None:
+            self._finalize_blocking_step(name, running_task)
+        if self._step_in_timeout_cooldown(name):
+            return False
+        task = asyncio.create_task(
+            asyncio.to_thread(func),
+            name=f'eod-background-blocking:{name}',
+        )
+        self._blocking_step_tasks[name] = task
+        task.add_done_callback(
+            lambda completed, step_name=name: self._finalize_blocking_step(
+                step_name,
+                completed,
+            )
+        )
+        return True
 
     def _finalize_blocking_step(self, name: str, task: asyncio.Task) -> None:
         if self._blocking_step_tasks.get(name) is task:
@@ -503,6 +531,15 @@ class EODBackgroundRunner:
                         ),
                     )
                     open_snapshot_refreshed = True
+                    if settings.signal_decider_wait_recheck_monitoring_enabled:
+                        self._schedule_blocking_step(
+                            WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+                            lambda market_snapshot=market: (
+                                signal_decider_wait_recheck_service.run_open_cycle(
+                                    market=market_snapshot
+                                )
+                            ),
+                        )
                 if runtime_background_enabled and market.state == 'PREOPEN':
                     await self._run_buy_authority_critical_step(
                         name='refresh_master_if_due',

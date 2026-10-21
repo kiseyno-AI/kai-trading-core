@@ -38,6 +38,8 @@
    - `KIS_REALTIME_PRICE_TR_ID=H0STCNT0`
    - `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=40`
    - `KIS_REALTIME_PRICE_STALE_AFTER_SECONDS=30`
+   - `SIGNAL_DECIDER_WAIT_RECHECK_MONITORING_ENABLED=false`
+   - `SIGNAL_DECIDER_WAIT_RECHECK_MAX_SYMBOLS=20`
 6. Install dependencies:
    - `pip install -r apps/api/requirements.txt`
 7. Run server:
@@ -62,7 +64,7 @@
 - `GET /market/snapshot` is the exception to the general mock-first guidance: it uses real-domain KIS market data by default because the selected index and investor-flow APIs do not exist on the mock domain. Keep `MARKET_SNAPSHOT_KIS_USE_REAL=true` and set `KOREAEXIM_API_KEY` alongside the KIS credentials when you need that route.
 - KRX open-day checks use KIS `chk-holiday` `opnd_yn` as the primary truth with a small in-process TTL cache. If KIS calendar data is unavailable, read-only market/status views can fall back to `exchange_calendars` with explicit `calendar_source` metadata; live order submission/dispatch paths fail closed unless an operator uses the existing `force=true` override.
 - The intraday snapshot path is separate from PyKRX/DART EOD jobs. When KIS credentials are missing or `KIS_INTRADAY_SNAPSHOT_ENABLED=false`, the collect route returns `status=disabled` instead of failing or trying partial live work.
-- The realtime monitored price path is for dashboard display only. Core opens one KIS websocket, subscribes to current monitored symbols with bounded/deduplicated updates, keeps latest ticks in process memory only, and serves web clients through Core routes. Do not persist these ticks to DB or let browsers open KIS sockets directly.
+- Core opens one KIS websocket, subscribes to current monitored symbols with bounded/deduplicated updates, keeps latest ticks in process memory, and serves web clients through Core routes. When WAIT recheck monitoring is explicitly enabled, a fresh regular-session best ask may also persist a one-shot reassessment event for an eligible prior-session WAIT. That event calls only the short-term decider and grants no direct order authority; stale/pre-open/limited ticks are ignored. Do not persist the raw tick stream or let browsers open KIS sockets directly.
 - Monitored-symbol source refresh is time-bounded. A stalled dashboard/read-model refresh preserves the last observed symbol set, records a retryable health error, and respects the configured refresh interval instead of preventing websocket startup or retrying in a tight loop.
 - KIS's official open-trading-api `ccnl_krx` sample uses `H0STCNT0` for domestic realtime transaction prices in both real and mock environments. Keep `KIS_REALTIME_PRICE_TR_ID=H0STCNT0` unless KIS publishes a replacement.
 - Add account, quote, balance, and order adapters after token flow is confirmed
