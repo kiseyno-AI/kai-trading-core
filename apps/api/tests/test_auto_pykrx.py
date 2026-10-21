@@ -27,6 +27,7 @@ from app.eod.pykrx_backfill import (
     PykrxBackfillService,
     PykrxSymbol,
     _call_pykrx,
+    _feedback_dispatch_rate_limit_backoff,
     _feedback_suffix_has_stale_prerequisite_ordering,
     _is_dart_provider_outage_rearm_candidate,
     _is_retryable_feedback_rearm_candidate,
@@ -7234,6 +7235,159 @@ class PykrxBackfillServiceTests(TestCase):
         ]['result_summary']['openclaw_dispatch_circuit_breaker']
         self.assertFalse(
             _is_retryable_feedback_rearm_candidate(without_marker)
+        )
+
+    def test_feedback_provider_rate_limit_waits_until_retry_deadline(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        now = datetime.now(timezone.utc)
+        retry_not_before = now + timedelta(minutes=10)
+        completed_at = now - timedelta(minutes=10)
+        pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': completed_at.isoformat(),
+            'completed_at': completed_at.isoformat(),
+            'run_metadata': {
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'reused_eod_collection_run_id': 7,
+            },
+            'stages': {
+                'agent_feedback_summaries': {
+                    'status': 'failed',
+                    'details': {
+                        'result_summary': {
+                            'run_id': 'feedback-cycle-rate-limited',
+                            'prerequisites': {'ready': True},
+                            'openclaw_dispatch_circuit_breaker': {
+                                'schema_version': (
+                                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                                ),
+                                'failure_kind': (
+                                    'openclaw_provider_rate_limited'
+                                ),
+                                'failure_status': 'provider/rate-limit',
+                                'retryable': True,
+                                'source': 'child_dispatch_circuit_breaker',
+                                'retry_after_seconds': 1200,
+                                'retry_not_before': (
+                                    retry_not_before.isoformat()
+                                ),
+                                'retry_after_source': (
+                                    'retry-after-seconds'
+                                ),
+                            },
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'failed',
+                                    'failed_items': 1,
+                                    'completed_cycles': 0,
+                                    'cycle_number': 1,
+                                    'role_progress': {
+                                        'eod-summarizer': {
+                                            'retry_pending_symbols': 1,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'signal_decider': {'status': 'blocked'},
+                'next_open_execution_plan': {'status': 'blocked'},
+                'signal_decider_evaluations': {'status': 'blocked'},
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=1,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as resume_followups,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+                markets=('KOSPI', 'KOSDAQ'),
+                point_in_time_recovery=False,
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(
+            result['reason'],
+            'followup_feedback_provider_backoff',
+        )
+        recovery = result['followup_recovery']
+        self.assertTrue(recovery['retry_scheduled'])
+        self.assertTrue(recovery['retryable_feedback_rearm'])
+        self.assertEqual(recovery['provider'], 'openclaw')
+        self.assertEqual(recovery['provider_status'], 'rate_limited')
+        self.assertGreater(recovery['retry_after_seconds'], 0)
+        self.assertLessEqual(recovery['retry_after_seconds'], 600)
+        self.assertEqual(
+            recovery['retry_not_before'],
+            retry_not_before.isoformat(),
+        )
+        self.assertEqual(
+            recovery['retry_after_source'],
+            'retry-after-seconds',
+        )
+        resume_followups.assert_not_called()
+
+    def test_feedback_provider_backoff_caps_untrusted_deadline_from_fixed_anchor(
+        self,
+    ) -> None:
+        completed_at = datetime(2026, 4, 1, 8, tzinfo=timezone.utc)
+        now = completed_at + timedelta(days=8)
+        marker = {
+            'schema_version': (
+                OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+            ),
+            'failure_kind': 'openclaw_provider_rate_limited',
+            'failure_status': 'provider/rate-limit',
+            'retryable': True,
+            'source': 'child_dispatch_circuit_breaker',
+            'retry_after_seconds': float('inf'),
+            'retry_not_before': '2099-01-01T00:00:00+00:00',
+            'retry_after_source': 'retry-after-seconds',
+        }
+
+        backoff = _feedback_dispatch_rate_limit_backoff(
+            marker=marker,
+            pipeline_run={'completed_at': completed_at.isoformat()},
+            now=now,
+        )
+
+        self.assertIsNotNone(backoff)
+        self.assertFalse(backoff['active'])
+        self.assertEqual(backoff['retry_after_seconds'], 0)
+        self.assertEqual(
+            backoff['retry_not_before'],
+            (completed_at + timedelta(days=7)).isoformat(),
         )
 
     def test_feedback_dispatch_circuit_never_falls_back_to_broad_recovery(

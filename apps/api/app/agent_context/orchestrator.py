@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import concurrent.futures
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -149,6 +151,53 @@ OPENCLAW_AGENT_SQLITE_SCHEMA_VERSION = 25
 PERSISTED_SNAPSHOT_JSON_MAX_BYTES = 1024 * 1024
 POST_DECISION_NEWS_SCAN_LIMIT = 50
 _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK = threading.Lock()
+_MAX_OPENCLAW_RATE_LIMIT_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
+
+
+class _OpenClawDispatchPacer:
+    """Serialize model-start admissions across clients in this API process."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._next_dispatch_at: dict[str, float] = {}
+
+    def wait(
+        self,
+        *,
+        key: str,
+        minimum_interval_seconds: float,
+    ) -> dict[str, Any]:
+        interval = max(0.0, float(minimum_interval_seconds or 0.0))
+        if interval <= 0:
+            return {
+                'wait_seconds': 0.0,
+                'minimum_interval_seconds': 0.0,
+            }
+
+        normalized_key = str(key or 'openclaw').strip() or 'openclaw'
+        with self._lock:
+            now = self._clock()
+            scheduled_at = max(
+                now,
+                self._next_dispatch_at.get(normalized_key, now),
+            )
+            self._next_dispatch_at[normalized_key] = scheduled_at + interval
+        wait_seconds = max(0.0, scheduled_at - now)
+        if wait_seconds > 0:
+            self._sleep(wait_seconds)
+        return {
+            'wait_seconds': wait_seconds,
+            'minimum_interval_seconds': interval,
+        }
+
+_OPENCLAW_DISPATCH_PACER = _OpenClawDispatchPacer()
 
 
 def _parse_persisted_snapshot_json_object(
@@ -501,6 +550,32 @@ class OpenClawAgentClient:
         )
         self.max_retries = max(0, settings.openclaw_agent_max_retries)
         self.retry_backoff_seconds = max(0, settings.openclaw_agent_retry_backoff_seconds)
+        self.minimum_dispatch_interval_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    settings,
+                    'openclaw_agent_min_dispatch_interval_seconds',
+                    0.0,
+                )
+                or 0.0
+            ),
+        )
+        self.rate_limit_fallback_cooldown_seconds = min(
+            _MAX_OPENCLAW_RATE_LIMIT_COOLDOWN_SECONDS,
+            max(
+                1,
+                int(
+                    getattr(
+                        settings,
+                        'openclaw_agent_rate_limit_fallback_cooldown_seconds',
+                        900,
+                    )
+                    or 900
+                ),
+            ),
+        )
+        self._dispatch_pacer = _OPENCLAW_DISPATCH_PACER
         self._circuit_breaker_lock = threading.Lock()
         self._circuit_breaker_error: tuple[str, dict[str, Any]] | None = None
         self._circuit_breaker_run_id: str | None = None
@@ -532,14 +607,55 @@ class OpenClawAgentClient:
             },
         )
 
-    @staticmethod
     def _provider_rate_limit_error(
+        self,
         response: httpx.Response,
         *,
         operation: str,
     ) -> AgentDispatchRetryableError | None:
         if response.status_code != 429:
             return None
+        now = datetime.now(timezone.utc)
+        retry_after_seconds = self.rate_limit_fallback_cooldown_seconds
+        retry_after_source = 'configured-fallback'
+        response_headers = getattr(response, 'headers', None) or {}
+        raw_retry_after = str(
+            response_headers.get('Retry-After', '') or ''
+        ).strip()
+        if raw_retry_after:
+            try:
+                parsed_seconds = float(raw_retry_after)
+            except (TypeError, ValueError):
+                try:
+                    parsed_deadline = parsedate_to_datetime(raw_retry_after)
+                    if parsed_deadline.tzinfo is None:
+                        parsed_deadline = parsed_deadline.replace(
+                            tzinfo=timezone.utc
+                        )
+                    parsed_seconds = (
+                        parsed_deadline.astimezone(timezone.utc) - now
+                    ).total_seconds()
+                    retry_after_source = 'retry-after-http-date'
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    parsed_seconds = None
+            else:
+                retry_after_source = 'retry-after-seconds'
+            if (
+                parsed_seconds is not None
+                and math.isfinite(parsed_seconds)
+                and (
+                    retry_after_source != 'retry-after-seconds'
+                    or parsed_seconds >= 0
+                )
+            ):
+                retry_after_seconds = max(1, math.ceil(parsed_seconds))
+            else:
+                retry_after_source = 'configured-fallback'
+        retry_after_seconds = min(
+            _MAX_OPENCLAW_RATE_LIMIT_COOLDOWN_SECONDS,
+            max(1, int(retry_after_seconds)),
+        )
+        retry_not_before = now + timedelta(seconds=retry_after_seconds)
         return AgentDispatchRetryableError(
             f'OpenClaw {operation} retryable error 429: {response.text[:300]}',
             details={
@@ -553,10 +669,39 @@ class OpenClawAgentClient:
                 'retryable': True,
                 'shared_dispatch_outage': True,
                 'shared_transport_outage': False,
+                'retry_after_seconds': retry_after_seconds,
+                'retry_not_before': retry_not_before.isoformat(),
+                'retry_after_source': retry_after_source,
             },
         )
 
-    def _raise_if_circuit_broken(self, *, request_run_id: str | None) -> bool:
+    @staticmethod
+    def _rate_limit_retry_not_before(
+        details: Mapping[str, Any],
+    ) -> datetime | None:
+        raw_value = str(details.get('retry_not_before') or '').strip()
+        if not raw_value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _wait_for_dispatch_slot(self) -> dict[str, Any]:
+        return self._dispatch_pacer.wait(
+            key=self.base_url,
+            minimum_interval_seconds=self.minimum_dispatch_interval_seconds,
+        )
+
+    def _raise_if_circuit_broken(
+        self,
+        *,
+        request_run_id: str | None,
+        allow_reserved_reprobe: bool = False,
+    ) -> bool:
         normalized_run_id = str(request_run_id or '').strip() or None
         storage_admission = inspect_openclaw_storage_admission(
             state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
@@ -584,19 +729,59 @@ class OpenClawAgentClient:
             )
             raise error
 
+        blocked_error: tuple[str, dict[str, Any]] | None = None
         with self._circuit_breaker_lock:
             stored = self._circuit_breaker_error
-            if (
-                stored is not None
-                and normalized_run_id is not None
-                and normalized_run_id != self._circuit_breaker_run_id
-                and self._circuit_breaker_reprobe_run_id is None
-            ):
-                self._circuit_breaker_reprobe_run_id = normalized_run_id
-                return True
-        if stored is not None:
-            message, details = stored
-            raise AgentDispatchTerminalError(message, details=dict(details))
+            if stored is not None:
+                message, stored_details = stored
+                if (
+                    allow_reserved_reprobe
+                    and normalized_run_id is not None
+                    and self._circuit_breaker_reprobe_run_id
+                    == normalized_run_id
+                ):
+                    return True
+                failure_kind = str(
+                    stored_details.get('failure_kind') or ''
+                ).strip()
+                retry_not_before = (
+                    self._rate_limit_retry_not_before(stored_details)
+                    if failure_kind
+                    == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                    else None
+                )
+                now = datetime.now(timezone.utc)
+                rate_limit_cooldown_active = bool(
+                    retry_not_before is not None and now < retry_not_before
+                )
+                if rate_limit_cooldown_active:
+                    blocked_details = dict(stored_details)
+                    blocked_details['retry_after_seconds'] = max(
+                        1,
+                        math.ceil((retry_not_before - now).total_seconds()),
+                    )
+                    blocked_error = (message, blocked_details)
+                else:
+                    rate_limit_cooldown_expired = bool(
+                        failure_kind
+                        == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                        and retry_not_before is not None
+                    )
+                    independent_run = bool(
+                        normalized_run_id is not None
+                        and normalized_run_id != self._circuit_breaker_run_id
+                    )
+                    if (
+                        (rate_limit_cooldown_expired or independent_run)
+                        and normalized_run_id is not None
+                        and self._circuit_breaker_reprobe_run_id is None
+                    ):
+                        self._circuit_breaker_reprobe_run_id = normalized_run_id
+                        return True
+                    blocked_error = (message, dict(stored_details))
+        if blocked_error is not None:
+            message, details = blocked_error
+            raise AgentDispatchTerminalError(message, details=details)
         return False
 
     def _trip_circuit_breaker(
@@ -748,6 +933,23 @@ class OpenClawAgentClient:
                 'token_configured': True,
                 'response_status_code': response.status_code,
                 'response_text_excerpt': response_text_excerpt,
+            }
+        provider_rate_limit_error = self._provider_rate_limit_error(
+            response,
+            operation='auth preflight',
+        )
+        if provider_rate_limit_error is not None:
+            self._trip_circuit_breaker(
+                provider_rate_limit_error,
+                request_run_id=None,
+            )
+            return {
+                'ok': False,
+                'status': 'failed',
+                'reason': 'openclaw_auth_preflight_provider_rate_limited',
+                'error': str(provider_rate_limit_error),
+                'token_configured': True,
+                **provider_rate_limit_error.details,
             }
         if response.status_code >= 400:
             classification = classify_feedback_failure(
@@ -1836,6 +2038,7 @@ class OpenClawAgentClient:
         retry_contract_anchor: dict[str, Any] | None = None
         dispatch_started_at: datetime | None = None
         capacity_reprobe = False
+        dispatch_rate_admission: dict[str, Any] | None = None
         # Reposting a full prompt under the same OpenClaw session key appends it
         # to the same native thread. Retries therefore belong to the durable
         # outer retry cycle, which allocates a fresh per-batch session key.
@@ -1850,6 +2053,7 @@ class OpenClawAgentClient:
                     capacity_reprobe = self._raise_if_circuit_broken(
                         request_run_id=request_run_id,
                     )
+                dispatch_rate_admission = self._wait_for_dispatch_slot()
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
                     'x-openclaw-agent-id': spec.agent_name,
@@ -1862,6 +2066,7 @@ class OpenClawAgentClient:
                     agent_name=spec.agent_name,
                     role=spec.role,
                     session_key=request_session_key,
+                    dispatch_rate_admission=dispatch_rate_admission,
                     http_target={'url': url, 'headers': headers},
                     request_snapshot=build_request_snapshot(body),
                 )
@@ -1881,6 +2086,10 @@ class OpenClawAgentClient:
                             'OpenClaw runtime contract changed between retry attempts',
                             details={'runtime_contract': retry_contract_proof},
                         )
+                capacity_reprobe = self._raise_if_circuit_broken(
+                    request_run_id=request_run_id,
+                    allow_reserved_reprobe=capacity_reprobe,
+                )
                 with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
                 post_runtime_contract = build_runtime_contract_provenance(
@@ -1979,6 +2188,7 @@ class OpenClawAgentClient:
                         'requested_model_identity': requested_model_identity,
                         'model_identity': model_identity,
                         'runtime_contract': runtime_contract,
+                        'dispatch_rate_admission': dispatch_rate_admission,
                     },
                 }
             except AgentDispatchTerminalError as exc:
@@ -2085,6 +2295,7 @@ class OpenClawAgentClient:
             attempt += 1
             started_at = datetime.now(timezone.utc)
             try:
+                self._wait_for_dispatch_slot()
                 with httpx.Client(timeout=self.http_timeout_seconds + 30, headers=headers) as client:
                     response = client.post(url, json=body)
                 if response.status_code >= 500:
@@ -2249,6 +2460,7 @@ class OpenClawAgentClient:
         retry_contract_anchor: dict[str, Any] | None = None
         dispatch_started_at: datetime | None = None
         capacity_reprobe = False
+        dispatch_rate_admission: dict[str, Any] | None = None
         # Keep each OpenClaw thread single-shot. The durable outer retry cycle
         # owns retries and supplies a fresh per-batch session key.
         in_session_max_retries = 0
@@ -2285,6 +2497,10 @@ class OpenClawAgentClient:
                     capacity_reprobe = self._raise_if_circuit_broken(
                         request_run_id=circuit_breaker_run_id,
                     )
+                dispatch_rate_admission = self._wait_for_dispatch_slot()
+                request_provenance[
+                    'dispatch_rate_admission'
+                ] = dispatch_rate_admission
                 request_session_key = fixed_session_key
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
@@ -2306,6 +2522,7 @@ class OpenClawAgentClient:
                     slot=slot,
                     session_reuse_mode=session_reuse_mode,
                     request_marker=request_marker,
+                    dispatch_rate_admission=dispatch_rate_admission,
                     request_snapshot=build_request_snapshot(body),
                     http_target={'url': url, 'headers': headers},
                 )
@@ -2325,6 +2542,10 @@ class OpenClawAgentClient:
                             'OpenClaw runtime contract changed between batch retry attempts',
                             details={'runtime_contract': retry_contract_proof},
                         )
+                capacity_reprobe = self._raise_if_circuit_broken(
+                    request_run_id=circuit_breaker_run_id,
+                    allow_reserved_reprobe=capacity_reprobe,
+                )
                 with httpx.Client(timeout=self.batch_http_timeout_seconds, headers=headers) as client:
                     response = client.post(url, json=body)
                 post_runtime_contract = build_runtime_contract_provenance(
@@ -6915,6 +7136,21 @@ class AgentFeedbackOrchestrator:
                                 DEFAULT_OPENCLAW_AGENT_BATCH_TIMEOUT_SECONDS,
                             ),
                         )
+                        dispatch_admission_allowance_seconds = max(
+                            0.0,
+                            float(
+                                getattr(
+                                    self._get_client(),
+                                    'minimum_dispatch_interval_seconds',
+                                    0.0,
+                                )
+                                or 0.0
+                            ),
+                        ) * max(1, role_parallelism)
+                        batch_future_timeout_seconds = (
+                            batch_timeout_seconds
+                            + dispatch_admission_allowance_seconds
+                        )
                         poll_seconds = max(0.25, float(getattr(settings, 'openclaw_agent_subtask_poll_seconds', 2.0) or 2.0))
 
                         def dispatch_batch_with_completion(
@@ -6961,7 +7197,8 @@ class AgentFeedbackOrchestrator:
                                 if (
                                     future in future_map
                                     and future in not_done
-                                    and now_monotonic - started_at >= batch_timeout_seconds
+                                    and now_monotonic - started_at
+                                    >= batch_future_timeout_seconds
                                 )
                             }
                             done = set(done) | timed_out
@@ -6975,11 +7212,14 @@ class AgentFeedbackOrchestrator:
                                     if future in timed_out:
                                         future.cancel()
                                         raise AgentDispatchRetryableError(
-                                            f'OpenClaw batch dispatch timed out after {batch_timeout_seconds:.1f}s',
+                                            'OpenClaw batch dispatch timed out '
+                                            'after model and rate-admission budgets',
                                             details={
                                                 'failure_kind': FeedbackFailureKind.OPENCLAW_TRANSPORT_TIMEOUT.value,
                                                 'failure_mode': FeedbackFailureKind.OPENCLAW_TRANSPORT_TIMEOUT.value,
-                                                'timeout_seconds': batch_timeout_seconds,
+                                                'timeout_seconds': batch_future_timeout_seconds,
+                                                'model_timeout_seconds': batch_timeout_seconds,
+                                                'dispatch_admission_allowance_seconds': dispatch_admission_allowance_seconds,
                                                 'elapsed_seconds': round(now_monotonic - started_at, 3),
                                             },
                                         )
@@ -7458,6 +7698,49 @@ class AgentFeedbackOrchestrator:
                                                     OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE
                                                 ),
                                             }
+                                            retry_after_seconds = (
+                                                error_details.get(
+                                                    'retry_after_seconds'
+                                                )
+                                            )
+                                            if (
+                                                isinstance(
+                                                    retry_after_seconds,
+                                                    (int, float),
+                                                )
+                                                and not isinstance(
+                                                    retry_after_seconds,
+                                                    bool,
+                                                )
+                                                and math.isfinite(
+                                                    retry_after_seconds
+                                                )
+                                                and retry_after_seconds > 0
+                                            ):
+                                                openclaw_shared_dispatch_outage[
+                                                    'retry_after_seconds'
+                                                ] = math.ceil(
+                                                    retry_after_seconds
+                                                )
+                                            for optional_field in (
+                                                'retry_not_before',
+                                                'retry_after_source',
+                                            ):
+                                                optional_value = (
+                                                    error_details.get(
+                                                        optional_field
+                                                    )
+                                                )
+                                                if (
+                                                    isinstance(
+                                                        optional_value,
+                                                        str,
+                                                    )
+                                                    and optional_value.strip()
+                                                ):
+                                                    openclaw_shared_dispatch_outage[
+                                                        optional_field
+                                                    ] = optional_value.strip()
                                             request_payload[
                                                 'openclaw_dispatch_circuit_breaker'
                                             ] = dict(

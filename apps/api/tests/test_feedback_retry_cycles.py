@@ -6376,6 +6376,71 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 'invalid_child_dispatch_circuit_breaker',
             )
 
+    def test_parent_circuit_marker_preserves_rate_limit_cooldown_metadata(self):
+        marker = AgentFeedbackRetryService._dispatch_circuit_breaker_from_result(
+            {
+                'request': {
+                    'openclaw_dispatch_circuit_breaker': {
+                        'schema_version': (
+                            OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                        ),
+                        'failure_kind': 'openclaw_provider_rate_limited',
+                        'failure_status': 'provider/rate-limit',
+                        'role': 'eod-summarizer',
+                        'retryable': True,
+                        'source': (
+                            OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE
+                        ),
+                        'retry_after_seconds': 120,
+                        'retry_not_before': '2026-04-14T02:00:00+00:00',
+                        'retry_after_source': 'retry-after-seconds',
+                    }
+                },
+                'summary': {'status': 'failed'},
+            },
+            role='eod-summarizer',
+        )
+
+        self.assertEqual(marker['retry_after_seconds'], 120)
+        self.assertEqual(
+            marker['retry_not_before'],
+            '2026-04-14T02:00:00+00:00',
+        )
+        self.assertEqual(
+            marker['retry_after_source'],
+            'retry-after-seconds',
+        )
+        self.assertEqual(marker['source'], 'child_dispatch_circuit_breaker')
+
+        for invalid_seconds in (True, float('inf')):
+            malformed_optional = (
+                AgentFeedbackRetryService._dispatch_circuit_breaker_from_result(
+                    {
+                        'request': {
+                            'openclaw_dispatch_circuit_breaker': {
+                                'schema_version': (
+                                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                                ),
+                                'failure_kind': 'openclaw_provider_rate_limited',
+                                'failure_status': 'provider/rate-limit',
+                                'role': 'eod-summarizer',
+                                'retryable': True,
+                                'source': (
+                                    OPENCLAW_SHARED_DISPATCH_ORCHESTRATOR_SOURCE
+                                ),
+                                'retry_after_seconds': invalid_seconds,
+                                'retry_not_before': {'invalid': True},
+                                'retry_after_source': [],
+                            }
+                        }
+                    },
+                    role='eod-summarizer',
+                )
+            )
+            self.assertNotIn('retry_after_seconds', malformed_optional)
+            self.assertNotIn('retry_not_before', malformed_optional)
+            self.assertNotIn('retry_after_source', malformed_optional)
+
     def test_run_level_preflight_failure_builds_versioned_parent_circuit_marker(
         self,
     ) -> None:
@@ -6420,6 +6485,38 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 role='eod-summarizer',
             )
         )
+
+    def test_run_level_rate_limit_marker_preserves_preflight_cooldown(
+        self,
+    ) -> None:
+        marker = AgentFeedbackRetryService._dispatch_circuit_breaker_from_result(
+            {
+                'request': {},
+                'summary': {
+                    'run_level_failure': True,
+                    'failure_kind': 'openclaw_provider_rate_limited',
+                    'openclaw_dispatch_preflight': {
+                        'failure_status': 'provider/rate-limit',
+                        'retryable': True,
+                        'retry_after_seconds': 3600,
+                        'retry_not_before': '2026-04-14T03:00:00+00:00',
+                        'retry_after_source': 'retry-after-seconds',
+                    },
+                },
+            },
+            role='eod-summarizer',
+        )
+
+        self.assertEqual(marker['retry_after_seconds'], 3600)
+        self.assertEqual(
+            marker['retry_not_before'],
+            '2026-04-14T03:00:00+00:00',
+        )
+        self.assertEqual(
+            marker['retry_after_source'],
+            'retry-after-seconds',
+        )
+        self.assertEqual(marker['source'], 'child_run_level_failure')
 
     def test_force_recompute_batch_checkpoint_does_not_count_old_rows_as_completed(self):
         service = AgentFeedbackRetryService()

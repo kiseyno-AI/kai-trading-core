@@ -275,6 +275,16 @@ class Settings(BaseSettings):
     openclaw_agent_timeout_seconds: float = 0.0
     openclaw_agent_max_retries: int = 0
     openclaw_agent_retry_backoff_seconds: float = 30.0
+    openclaw_agent_min_dispatch_interval_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=3_600.0,
+    )
+    openclaw_agent_rate_limit_fallback_cooldown_seconds: int = Field(
+        default=900,
+        ge=1,
+        le=7 * 24 * 60 * 60,
+    )
     openclaw_agent_parallel_subtasks: int = 1
     openclaw_agent_symbol_chunk_size: int = 1
     openclaw_agent_max_prompt_chars: int = 125_000

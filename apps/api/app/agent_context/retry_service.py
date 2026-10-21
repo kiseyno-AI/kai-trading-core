@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -4447,7 +4448,7 @@ class AgentFeedbackRetryService:
                     'retryable': False,
                     'source': 'invalid_child_dispatch_circuit_breaker',
                 }
-            return {
+            marker = {
                 'schema_version': (
                     OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
                 ),
@@ -4457,6 +4458,29 @@ class AgentFeedbackRetryService:
                 'retryable': retryable,
                 'source': 'child_dispatch_circuit_breaker',
             }
+            retry_after_seconds = explicit_breaker.get(
+                'retry_after_seconds'
+            )
+            if (
+                isinstance(retry_after_seconds, (int, float))
+                and not isinstance(retry_after_seconds, bool)
+                and math.isfinite(retry_after_seconds)
+                and retry_after_seconds > 0
+            ):
+                marker['retry_after_seconds'] = math.ceil(
+                    retry_after_seconds
+                )
+            for optional_field in (
+                'retry_not_before',
+                'retry_after_source',
+            ):
+                optional_value = explicit_breaker.get(optional_field)
+                if (
+                    isinstance(optional_value, str)
+                    and optional_value.strip()
+                ):
+                    marker[optional_field] = optional_value.strip()
+            return marker
 
         summary = (
             dispatch_result.get('summary')
@@ -4478,7 +4502,7 @@ class AgentFeedbackRetryService:
             or preflight.get('failure_kind')
             or FeedbackFailureKind.DISPATCH_FAILED.value
         )
-        return {
+        marker = {
             'schema_version': (
                 OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
             ),
@@ -4497,6 +4521,27 @@ class AgentFeedbackRetryService:
             'run_level_failure': True,
             'source': 'child_run_level_failure',
         }
+        retry_after_seconds = preflight.get('retry_after_seconds')
+        if (
+            isinstance(retry_after_seconds, (int, float))
+            and not isinstance(retry_after_seconds, bool)
+            and math.isfinite(retry_after_seconds)
+            and retry_after_seconds > 0
+        ):
+            marker['retry_after_seconds'] = math.ceil(
+                retry_after_seconds
+            )
+        for optional_field in (
+            'retry_not_before',
+            'retry_after_source',
+        ):
+            optional_value = preflight.get(optional_field)
+            if (
+                isinstance(optional_value, str)
+                and optional_value.strip()
+            ):
+                marker[optional_field] = optional_value.strip()
+        return marker
 
     def run_retry_cycles(
         self,

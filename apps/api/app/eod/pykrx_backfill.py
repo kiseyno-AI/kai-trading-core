@@ -1125,6 +1125,83 @@ def _is_valid_retryable_feedback_dispatch_circuit_marker(
     )
 
 
+def _feedback_dispatch_rate_limit_backoff(
+    *,
+    marker: Mapping[str, Any] | None,
+    pipeline_run: Mapping[str, Any],
+    now: datetime,
+) -> dict[str, Any] | None:
+    if not (
+        _is_valid_retryable_feedback_dispatch_circuit_marker(marker)
+        and str(marker.get('failure_kind') or '').strip()
+        == 'openclaw_provider_rate_limited'
+    ):
+        return None
+
+    completed_at = _parse_activity_datetime(
+        pipeline_run.get('completed_at')
+        or pipeline_run.get('updated_at')
+        or pipeline_run.get('started_at')
+    )
+    if completed_at is None:
+        return None
+    maximum_retry_not_before = completed_at + timedelta(
+        seconds=7 * 24 * 60 * 60
+    )
+    retry_not_before = _parse_activity_datetime(
+        marker.get('retry_not_before')
+    )
+    retry_after_source = str(
+        marker.get('retry_after_source') or ''
+    ).strip()
+    if retry_not_before is None:
+        raw_retry_after_seconds = marker.get('retry_after_seconds')
+        if (
+            isinstance(raw_retry_after_seconds, (int, float))
+            and not isinstance(raw_retry_after_seconds, bool)
+            and math.isfinite(raw_retry_after_seconds)
+            and raw_retry_after_seconds > 0
+        ):
+            retry_after_seconds = math.ceil(raw_retry_after_seconds)
+            retry_after_source = (
+                retry_after_source or 'persisted-retry-after-seconds'
+            )
+        else:
+            retry_after_seconds = max(
+                1,
+                int(
+                    getattr(
+                        settings,
+                        'openclaw_agent_rate_limit_fallback_cooldown_seconds',
+                        900,
+                    )
+                    or 900
+                ),
+            )
+            retry_after_source = 'configured-fallback'
+        retry_after_seconds = min(
+            retry_after_seconds,
+            7 * 24 * 60 * 60,
+        )
+        retry_not_before = completed_at + timedelta(
+            seconds=retry_after_seconds
+        )
+    elif retry_not_before > maximum_retry_not_before:
+        retry_not_before = maximum_retry_not_before
+        retry_after_source = 'persisted-deadline-capped-7d'
+
+    remaining_seconds = max(
+        0,
+        math.ceil((retry_not_before - now).total_seconds()),
+    )
+    return {
+        'active': remaining_seconds > 0,
+        'retry_after_seconds': remaining_seconds,
+        'retry_not_before': retry_not_before.isoformat(),
+        'retry_after_source': retry_after_source or 'persisted-deadline',
+    }
+
+
 def _is_retryable_feedback_rearm_candidate(
     pipeline_run: object,
 ) -> bool:
@@ -3341,6 +3418,40 @@ class PykrxBackfillService:
                     if marker_retryable
                     else 'non_retryable_dispatch_circuit_breaker'
                 ),
+                'resume_from_stage': incomplete_stages[0],
+            }
+            return result
+        feedback_provider_backoff = _feedback_dispatch_rate_limit_backoff(
+            marker=feedback_circuit_marker,
+            pipeline_run=pipeline_run,
+            now=now,
+        )
+        if (
+            retryable_feedback_rearm_detected
+            and isinstance(feedback_provider_backoff, Mapping)
+            and feedback_provider_backoff.get('active') is True
+        ):
+            result = build_daily_skip_result(
+                reason='followup_feedback_provider_backoff',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'attempts': recovery_attempts,
+                'retryable_feedback_rearm': True,
+                'retry_scheduled': True,
+                'provider': 'openclaw',
+                'provider_status': 'rate_limited',
+                'retry_after_seconds': feedback_provider_backoff[
+                    'retry_after_seconds'
+                ],
+                'retry_not_before': feedback_provider_backoff[
+                    'retry_not_before'
+                ],
+                'retry_after_source': feedback_provider_backoff[
+                    'retry_after_source'
+                ],
                 'resume_from_stage': incomplete_stages[0],
             }
             return result
