@@ -8493,9 +8493,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['attempt_id'], f'{dispatch_id}:attempt-1')
         self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/v1/responses')
         self.assertEqual(http_calls[0]['json']['model'], 'openclaw/eod-summarizer')
-        self.assertEqual(
-            http_calls[0]['json']['tool_choice'],
-            {'type': 'function', 'name': 'submit_agent_feedback_batch'},
+        self.assertEqual(http_calls[0]['json']['tool_choice'], 'auto')
+        self.assertIn(
+            'submit_agent_feedback_batch exactly once',
+            http_calls[0]['json']['instructions'],
+        )
+        self.assertIn(
+            'canonical JSON object as plain output text',
+            http_calls[0]['json']['instructions'],
         )
         self.assertEqual(len(http_calls[0]['json']['tools']), 1)
         batch_tool = http_calls[0]['json']['tools'][0]

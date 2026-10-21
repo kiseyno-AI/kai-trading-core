@@ -2583,16 +2583,28 @@ class OpenClawAgentClient:
             body = {
                 'model': model_name,
                 'input': prompt_text,
+                'instructions': (
+                    'Return the batch by calling '
+                    f'{OPENCLAW_BATCH_RESPONSE_TOOL_NAME} exactly once with '
+                    'the canonical items envelope. If this runtime cannot '
+                    'emit a client function call, return only that same '
+                    'canonical JSON object as plain output text; do not add '
+                    'Markdown or explanatory prose.'
+                ),
                 'tools': [
                     self._build_batch_response_tool(
                         spec=spec,
                         batch_symbols=batch_symbols,
                     )
                 ],
-                'tool_choice': {
-                    'type': 'function',
-                    'name': OPENCLAW_BATCH_RESPONSE_TOOL_NAME,
-                },
+                # Some installed Codex-backed OpenClaw agents currently
+                # serialize the requested envelope as JSON text even when a
+                # client function is pinned. OpenClaw turns that otherwise
+                # valid response into HTTP 502. ``auto`` keeps the schema
+                # visible and accepts a real function call when supported,
+                # while the existing strict JSON/correlation checks retain a
+                # fail-closed text fallback without consuming retry capacity.
+                'tool_choice': 'auto',
             }
             try:
                 if not capacity_reprobe:
