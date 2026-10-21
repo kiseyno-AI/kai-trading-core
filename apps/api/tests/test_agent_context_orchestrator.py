@@ -8493,6 +8493,21 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['attempt_id'], f'{dispatch_id}:attempt-1')
         self.assertEqual(http_calls[0]['url'], 'https://openclaw.example/v1/responses')
         self.assertEqual(http_calls[0]['json']['model'], 'openclaw/eod-summarizer')
+        self.assertEqual(
+            http_calls[0]['json']['tool_choice'],
+            {'type': 'function', 'name': 'submit_agent_feedback_batch'},
+        )
+        self.assertEqual(len(http_calls[0]['json']['tools']), 1)
+        batch_tool = http_calls[0]['json']['tools'][0]
+        self.assertEqual(batch_tool['type'], 'function')
+        self.assertEqual(batch_tool['name'], 'submit_agent_feedback_batch')
+        items_schema = batch_tool['parameters']['properties']['items']
+        self.assertEqual(items_schema['minItems'], 1)
+        self.assertEqual(items_schema['maxItems'], 1)
+        self.assertEqual(
+            items_schema['items']['properties']['symbol']['enum'],
+            ['005930'],
+        )
         self.assertNotIn('x-openclaw-model', http_calls[0]['kwargs']['headers'])
         self.assertEqual(result['request_provenance']['model'], 'openclaw/eod-summarizer')
         self.assertEqual(result['request_provenance']['contract_version'], 'agent_role_contract_v1')
@@ -8509,6 +8524,156 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(mismatch_log['missing_symbols'], [])
         self.assertEqual(mismatch_log['failure_class'], 'batch_response_attribution_mismatch')
         self.assertEqual(mismatch_log['session_reuse_mode'], 'slot_reused')
+
+    def test_openclaw_batch_dispatch_parses_pinned_function_call_arguments(self):
+        arguments = json.dumps(
+            {
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'feedback': {
+                            'role': 'eod-summarizer',
+                            'summary': 'Constructive close.',
+                            'confidence': 0.6,
+                            'risk_flags': [],
+                            'details': {},
+                            'improvement_notes': [],
+                        },
+                    }
+                ]
+            }
+        )
+        response_payload = {
+            'id': 'resp-function-call-1',
+            'status': 'completed',
+            'model': 'openclaw/eod-summarizer',
+            'output': [
+                {
+                    'type': 'function_call',
+                    'name': 'submit_agent_feedback_batch',
+                    'call_id': 'call-1',
+                    'arguments': arguments,
+                }
+            ],
+        }
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(orchestrator_module, 'log_agent_feedback_event'):
+                    result = OpenClawAgentClient().dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=[
+                            {
+                                'symbol': '005930',
+                                'request_run_id': 'symbol-run-2026-04-14-function-call',
+                                'session_slot': 1,
+                                'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/function-call-01',
+                            }
+                        ],
+                    )
+
+        self.assertEqual(result['decoded'], json.loads(arguments))
+        self.assertEqual(
+            result['response_correlation']['decoded_source'],
+            'function_call_arguments',
+        )
+        self.assertEqual(result['response_correlation']['attribution_status'], 'matched')
+        self.assertIsNone(result['response_correlation']['failure_class'])
+
+    def test_openclaw_batch_dispatch_does_not_fall_back_to_text_after_wrong_function_call(self):
+        valid_text = json.dumps(
+            {
+                'items': [
+                    {
+                        'symbol': '005930',
+                        'feedback': {
+                            'role': 'eod-summarizer',
+                            'summary': 'This text must not bypass the pinned tool.',
+                            'confidence': 0.9,
+                            'risk_flags': [],
+                            'details': {},
+                            'improvement_notes': [],
+                        },
+                    }
+                ]
+            }
+        )
+        response_payload = {
+            'id': 'resp-wrong-function-call-1',
+            'status': 'completed',
+            'model': 'openclaw/eod-summarizer',
+            'output': [
+                {
+                    'type': 'function_call',
+                    'name': 'wrong_feedback_tool',
+                    'arguments': valid_text,
+                },
+                {
+                    'type': 'message',
+                    'content': [{'type': 'output_text', 'text': valid_text}],
+                },
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=[],
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(orchestrator_module, 'log_agent_feedback_event'):
+                    result = OpenClawAgentClient().dispatch_batch(
+                        spec=orchestrator_module.DISPATCH_SPECS[0],
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=[
+                            {
+                                'symbol': '005930',
+                                'request_run_id': 'symbol-run-2026-04-14-wrong-tool',
+                                'session_slot': 1,
+                                'session_key': 'agent:eod-summarizer:feedback/eod-summarizer/wrong-tool-01',
+                            }
+                        ],
+                    )
+
+        self.assertEqual(
+            result['response_correlation']['decoded_source'],
+            'core_structured_fallback',
+        )
+        feedback = result['decoded']['items'][0]['feedback']
+        self.assertTrue(feedback['details']['fallback_generated_by_core'])
+        self.assertEqual(
+            feedback['details']['failure_mode'],
+            'function_call_name_mismatch',
+        )
+        self.assertNotEqual(feedback['summary'], 'This text must not bypass the pinned tool.')
 
     def test_signal_decider_one_symbol_batch_rejects_missing_symbol_without_fallback_attribution(self):
         dispatch_id = 'symbol-run-2026-04-14-abc123:signal-decider:slot-1:batch-1'

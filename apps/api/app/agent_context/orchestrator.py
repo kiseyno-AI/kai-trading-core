@@ -290,6 +290,7 @@ class AgentDispatchSpec:
 
 
 UPSTREAM_SUMMARY_ROLES: tuple[str, ...] = SUMMARIZER_AGENT_NAMES
+OPENCLAW_BATCH_RESPONSE_TOOL_NAME = 'submit_agent_feedback_batch'
 
 
 DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
@@ -1048,6 +1049,97 @@ class OpenClawAgentClient:
     @staticmethod
     def _decode_candidate_json(candidate_text: str | None) -> tuple[dict[str, Any] | None, str | None]:
         return decode_strict_agent_json_object(candidate_text)
+
+    @staticmethod
+    def _build_batch_response_tool(
+        *,
+        spec: AgentDispatchSpec,
+        batch_symbols: Sequence[str],
+    ) -> dict[str, Any]:
+        symbols = list(dict.fromkeys(str(symbol).strip() for symbol in batch_symbols if str(symbol).strip()))
+        item_count = len(symbols)
+        return {
+            'type': 'function',
+            'name': OPENCLAW_BATCH_RESPONSE_TOOL_NAME,
+            'description': (
+                'Submit exactly one canonical feedback envelope for every assigned symbol. '
+                'Do not omit, duplicate, or add symbols.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['items'],
+                'properties': {
+                    'items': {
+                        'type': 'array',
+                        'minItems': item_count,
+                        'maxItems': item_count,
+                        'items': {
+                            'type': 'object',
+                            'additionalProperties': False,
+                            'required': ['symbol', 'feedback'],
+                            'properties': {
+                                'symbol': {
+                                    'type': 'string',
+                                    'enum': symbols,
+                                },
+                                'feedback': {
+                                    'type': 'object',
+                                    'additionalProperties': True,
+                                    'required': [
+                                        'role',
+                                        'summary',
+                                        'confidence',
+                                        'risk_flags',
+                                        'details',
+                                        'improvement_notes',
+                                    ],
+                                    'properties': {
+                                        'role': {'type': 'string', 'enum': [spec.role]},
+                                        'summary': {'type': 'string'},
+                                        'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                                        'risk_flags': {
+                                            'type': 'array',
+                                            'items': {'type': 'string'},
+                                        },
+                                        'details': {'type': 'object'},
+                                        'improvement_notes': {
+                                            'type': 'array',
+                                            'items': {'type': 'string'},
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    }
+                },
+            },
+        }
+
+    @staticmethod
+    def _extract_batch_function_call_arguments(
+        parsed: dict[str, Any],
+    ) -> tuple[str | None, str | None, bool]:
+        output = parsed.get('output')
+        output_items = output if isinstance(output, list) else []
+        function_calls = [
+            item
+            for item in output_items
+            if isinstance(item, dict) and item.get('type') == 'function_call'
+        ]
+        if not function_calls:
+            return None, None, False
+        if len(function_calls) != 1:
+            return None, 'function_call_cardinality_mismatch', True
+        function_call = function_calls[0]
+        if function_call.get('name') != OPENCLAW_BATCH_RESPONSE_TOOL_NAME:
+            return None, 'function_call_name_mismatch', True
+        arguments = function_call.get('arguments')
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, ensure_ascii=False), None, True
+        if isinstance(arguments, str) and arguments.strip():
+            return arguments.strip(), None, True
+        return None, 'function_call_arguments_missing', True
 
     @staticmethod
     def _failure_class_for_mode(failure_mode: str | None) -> str:
@@ -2491,6 +2583,16 @@ class OpenClawAgentClient:
             body = {
                 'model': model_name,
                 'input': prompt_text,
+                'tools': [
+                    self._build_batch_response_tool(
+                        spec=spec,
+                        batch_symbols=batch_symbols,
+                    )
+                ],
+                'tool_choice': {
+                    'type': 'function',
+                    'name': OPENCLAW_BATCH_RESPONSE_TOOL_NAME,
+                },
             }
             try:
                 if not capacity_reprobe:
@@ -2586,16 +2688,26 @@ class OpenClawAgentClient:
                 if response.status_code >= 400:
                     raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
                 parsed = response.json()
-                output_text = None
+                message_output_text = None
                 for item in parsed.get('output', []):
-                    if item.get('type') != 'message':
+                    if not isinstance(item, dict) or item.get('type') != 'message':
                         continue
                     for content in item.get('content', []):
-                        if content.get('type') == 'output_text':
-                            output_text = content.get('text')
+                        if isinstance(content, dict) and content.get('type') == 'output_text':
+                            message_output_text = content.get('text')
                             break
-                    if output_text:
+                    if message_output_text:
                         break
+                (
+                    function_call_arguments,
+                    function_call_failure_mode,
+                    function_call_seen,
+                ) = self._extract_batch_function_call_arguments(parsed)
+                output_text = (
+                    function_call_arguments
+                    if function_call_seen
+                    else message_output_text
+                )
                 log_agent_feedback_event(
                     'dispatch_batch_response',
                     status='received',
@@ -2620,7 +2732,11 @@ class OpenClawAgentClient:
                         f"OpenClaw batch ended with status={parsed.get('status')}"
                     )
                 decoded, json_failure_class = self._decode_candidate_json(output_text)
-                decoded_source = 'output_text'
+                decoded_source = (
+                    'function_call_arguments'
+                    if function_call_seen
+                    else 'output_text'
+                )
                 session_ref = self._extract_session_ref(parsed, explicit_session_key=request_session_key) or {
                     'session_key': request_session_key,
                     'session_id': None,
@@ -2650,8 +2766,12 @@ class OpenClawAgentClient:
                 session_history_diagnostics: dict[str, Any] = {'checked': False, 'request_marker': request_marker}
                 trajectory_diagnostics: dict[str, Any] = {'checked': False}
                 history_marker_found = None
-                failure_mode = json_failure_class
-                if decoded is None and request_session_key:
+                failure_mode = function_call_failure_mode or json_failure_class
+                if (
+                    decoded is None
+                    and request_session_key
+                    and not function_call_seen
+                ):
                     session_history = self.fetch_session_history(session_key=request_session_key, limit=80, include_tools=True)
                     history_recovery = self._recover_from_session_history(
                         session_history=session_history,
