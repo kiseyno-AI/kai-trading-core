@@ -1250,6 +1250,15 @@ def _is_retryable_feedback_rearm_candidate(
         if isinstance(result_summary, Mapping)
         else None
     )
+    if not isinstance(prerequisites, Mapping) and isinstance(
+        progress,
+        Mapping,
+    ):
+        # Persisted stage results compact the retry service response under
+        # ``progress``.  Accept that canonical stored shape as well as the
+        # older top-level fixture shape, otherwise a valid partial parent is
+        # incorrectly treated as non-retryable after process recovery.
+        prerequisites = progress.get('prerequisites')
     inherited_admission = bool(
         run_metadata.get(
             'inherited_feedback_prerequisite_admission'

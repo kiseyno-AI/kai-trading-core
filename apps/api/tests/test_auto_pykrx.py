@@ -6585,6 +6585,18 @@ class PykrxBackfillServiceTests(TestCase):
             _retryable_feedback_rearm_max_cycles(latest_pipeline_run),
             3,
         )
+        persisted_shape_pipeline_run = deepcopy(latest_pipeline_run)
+        persisted_result = persisted_shape_pipeline_run['stages'][
+            'agent_feedback_summaries'
+        ]['details']['result_summary']
+        persisted_result['progress']['prerequisites'] = (
+            persisted_result.pop('prerequisites')
+        )
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(
+                persisted_shape_pipeline_run
+            )
+        )
         parent_cutoff = datetime(
             2026,
             4,
