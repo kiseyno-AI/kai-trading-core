@@ -367,14 +367,21 @@ def _completion_status_for_gap(
     return 'partial'
 
 
-def _gap_policy_details(*, failed: int, total: int) -> dict[str, Any]:
+def _gap_policy_details(
+    *,
+    failed: int,
+    total: int,
+    treat_minor_gap_as_completed: bool = False,
+) -> dict[str, Any]:
     ratio = _missing_ratio(failed=failed, total=total)
     is_minor_missing_gap = _is_non_blocking_gap(failed=failed, total=total)
     return {
         'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
         'missing_ratio': round(ratio, 6) if ratio is not None else None,
         'is_minor_missing_gap': is_minor_missing_gap,
-        'minor_missing_gap_treated_as_success': is_minor_missing_gap,
+        'minor_missing_gap_treated_as_success': (
+            treat_minor_gap_as_completed and is_minor_missing_gap
+        ),
     }
 
 
@@ -3168,7 +3175,11 @@ def run_market_data_pipeline(
                     'passed_count': market_risk_filter_result.get('summary', {}).get('passed_count'),
                     'watchlist_count': market_risk_filter_result.get('summary', {}).get('watchlist_count'),
                     **_bounded_failure_diagnostics(market_risk_filter_result),
-                    **_gap_policy_details(failed=market_risk_failed, total=market_risk_total),
+                    **_gap_policy_details(
+                        failed=market_risk_failed,
+                        total=market_risk_total,
+                        treat_minor_gap_as_completed=True,
+                    ),
                 },
             )
         except Exception as exc:
