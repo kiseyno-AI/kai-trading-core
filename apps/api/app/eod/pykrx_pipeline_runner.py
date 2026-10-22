@@ -354,16 +354,52 @@ def _is_non_blocking_gap(*, failed: int, total: int) -> bool:
 def _completion_status_for_gap(*, failed: int, total: int) -> str:
     if failed <= 0:
         return 'completed'
+    if _is_non_blocking_gap(failed=failed, total=total):
+        return 'completed'
     return 'partial'
 
 
 def _gap_policy_details(*, failed: int, total: int) -> dict[str, Any]:
     ratio = _missing_ratio(failed=failed, total=total)
+    is_minor_missing_gap = _is_non_blocking_gap(failed=failed, total=total)
     return {
         'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
         'missing_ratio': round(ratio, 6) if ratio is not None else None,
-        'is_minor_missing_gap': _is_non_blocking_gap(failed=failed, total=total),
-        'minor_missing_gap_treated_as_success': False,
+        'is_minor_missing_gap': is_minor_missing_gap,
+        'minor_missing_gap_treated_as_success': is_minor_missing_gap,
+    }
+
+
+def _bounded_failure_diagnostics(
+    result: dict[str, Any],
+    *,
+    limit: int = 50,
+    error_length_limit: int = 1000,
+) -> dict[str, Any]:
+    failed_symbols = [
+        str(symbol)
+        for symbol in (result.get('failed_symbols') or [])
+        if str(symbol).strip()
+    ][:limit]
+    failed_symbol_errors: list[dict[str, str]] = []
+    for item in result.get('failed_symbol_errors') or []:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get('symbol') or '').strip()
+        error = str(item.get('error') or '').strip()
+        if not symbol and not error:
+            continue
+        failed_symbol_errors.append(
+            {
+                'symbol': symbol,
+                'error': error[:error_length_limit],
+            }
+        )
+        if len(failed_symbol_errors) >= limit:
+            break
+    return {
+        'failed_symbols': failed_symbols,
+        'failed_symbol_errors': failed_symbol_errors,
     }
 
 
@@ -3119,6 +3155,7 @@ def run_market_data_pipeline(
                     ),
                     'passed_count': market_risk_filter_result.get('summary', {}).get('passed_count'),
                     'watchlist_count': market_risk_filter_result.get('summary', {}).get('watchlist_count'),
+                    **_bounded_failure_diagnostics(market_risk_filter_result),
                     **_gap_policy_details(failed=market_risk_failed, total=market_risk_total),
                 },
             )
@@ -3167,6 +3204,11 @@ def run_market_data_pipeline(
         ('signal_features', signal_feature_result),
     ):
         stage_failed_symbols = _consume_retry_failed_symbols(stage_result)
+        if failed_stage_id == 'market_risk_filter' and _is_non_blocking_gap(
+            failed=int(stage_result.get('results_failed') or 0),
+            total=len(stage_result.get('matched_symbols') or []),
+        ):
+            continue
         if stage_failed_symbols:
             downstream_failures_by_stage.setdefault(
                 failed_stage_id,
@@ -3284,6 +3326,7 @@ def run_market_data_pipeline(
         failed_key='results_failed',
         incomplete_prefix='Market risk filter persistence incomplete for symbols: ',
         total_keys=('matched_symbols', 'matched_symbol_count', 'requested_symbol_count', 'results_persisted'),
+        max_non_blocking_missing_ratio=MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
     )
     if pending_inherited_downstream_symbols:
         run_errors.append(

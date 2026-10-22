@@ -58,7 +58,10 @@ from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_TRACKED_STAGE_ORDER,
     HISTORICAL_BACKFILL_STAGE_ORDER,
     _OfficialDailyPipelineTracker,
+    _bounded_failure_diagnostics,
     _classify_pykrx_enrichment_categories,
+    _completion_status_for_gap,
+    _gap_policy_details,
     _enrich_bars_with_market_turnover,
     _execute_factor_stage_with_heartbeat,
     _extract_followup_source_run_ids,
@@ -97,6 +100,46 @@ class _AnySymbolTurnoverFrame:
 
 
 class PykrxPipelineResultStatusTests(TestCase):
+    def test_minor_market_risk_gap_is_completed_and_audited(self) -> None:
+        self.assertEqual(
+            _completion_status_for_gap(failed=7, total=2675),
+            'completed',
+        )
+        details = _gap_policy_details(failed=7, total=2675)
+        self.assertTrue(details['is_minor_missing_gap'])
+        self.assertTrue(details['minor_missing_gap_treated_as_success'])
+
+    def test_market_risk_gap_at_threshold_remains_partial(self) -> None:
+        self.assertEqual(
+            _completion_status_for_gap(failed=10, total=100),
+            'partial',
+        )
+
+    def test_failed_symbol_diagnostics_are_bounded_for_stage_persistence(
+        self,
+    ) -> None:
+        diagnostics = _bounded_failure_diagnostics(
+            {
+                'failed_symbols': ['027830', '299170'],
+                'failed_symbol_errors': [
+                    {'symbol': '027830', 'error': 'temporary KIS failure'},
+                    {'symbol': '299170', 'error': 'x' * 1200},
+                ],
+            },
+            limit=2,
+            error_length_limit=1000,
+        )
+
+        self.assertEqual(diagnostics['failed_symbols'], ['027830', '299170'])
+        self.assertEqual(
+            diagnostics['failed_symbol_errors'][0],
+            {'symbol': '027830', 'error': 'temporary KIS failure'},
+        )
+        self.assertEqual(
+            len(diagnostics['failed_symbol_errors'][1]['error']),
+            1000,
+        )
+
     def test_preopen_previous_session_market_risk_is_not_safety_skipped(
         self,
     ) -> None:
@@ -12203,7 +12246,7 @@ class PykrxBackfillServiceTests(TestCase):
                 'downstream_recovery_pending',
             )
 
-    def test_run_market_data_pipeline_preserves_minor_stage_gaps_as_retryable_errors(self) -> None:
+    def test_run_market_data_pipeline_does_not_retry_minor_market_risk_gap(self) -> None:
         service = PykrxBackfillService()
         symbols = [
             PykrxSymbol(symbol=f'{index:06d}', market='KOSPI', name_ko=f'Symbol {index}')
@@ -12250,7 +12293,7 @@ class PykrxBackfillServiceTests(TestCase):
             ),
             patch(
                 'app.eod.pykrx_backfill.daily_signal_feature_service.refresh_for_market_date',
-                return_value={'features_persisted': 19, 'features_failed': 1, 'failed_symbols': ['000020']},
+                return_value={'features_persisted': 19, 'features_failed': 1, 'failed_symbols': ['000019']},
             ),
             patch(
                 'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
@@ -12284,15 +12327,15 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['status'], 'completed_with_errors')
         self.assertEqual(result['signal_features']['features_failed'], 1)
         self.assertEqual(result['market_risk_filter']['results_failed'], 1)
-        self.assertEqual(result['retry_symbols'], ['000020'])
+        self.assertEqual(result['retry_symbols'], ['000019'])
+        self.assertEqual(result['downstream_retry_symbols'], ['000019'])
         complete_run.assert_called_once_with(
             12,
             status='completed_with_errors',
             symbols_succeeded=20,
             symbols_failed=0,
             error_message=(
-                'Daily signal feature persistence incomplete for symbols: 000020 | '
-                'Market risk filter persistence incomplete for symbols: 000020'
+                'Daily signal feature persistence incomplete for symbols: 000019'
             ),
             run_metadata=ANY,
         )
