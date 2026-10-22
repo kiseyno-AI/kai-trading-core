@@ -351,10 +351,18 @@ def _is_non_blocking_gap(*, failed: int, total: int) -> bool:
     return failed > 0 and ratio is not None and ratio < MAX_NON_BLOCKING_STAGE_MISSING_RATIO
 
 
-def _completion_status_for_gap(*, failed: int, total: int) -> str:
+def _completion_status_for_gap(
+    *,
+    failed: int,
+    total: int,
+    treat_minor_gap_as_completed: bool = False,
+) -> str:
     if failed <= 0:
         return 'completed'
-    if _is_non_blocking_gap(failed=failed, total=total):
+    if treat_minor_gap_as_completed and _is_non_blocking_gap(
+        failed=failed,
+        total=total,
+    ):
         return 'completed'
     return 'partial'
 
@@ -3139,7 +3147,11 @@ def run_market_data_pipeline(
             )
             market_risk_total = len(market_risk_filter_result.get('matched_symbols') or [])
             market_risk_failed = int(market_risk_filter_result.get('results_failed') or 0)
-            market_risk_status = _completion_status_for_gap(failed=market_risk_failed, total=market_risk_total)
+            market_risk_status = _completion_status_for_gap(
+                failed=market_risk_failed,
+                total=market_risk_total,
+                treat_minor_gap_as_completed=True,
+            )
             persist_stage_progress(
                 stage='market_risk_filter',
                 status=market_risk_status,

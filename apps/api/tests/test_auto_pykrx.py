@@ -102,7 +102,11 @@ class _AnySymbolTurnoverFrame:
 class PykrxPipelineResultStatusTests(TestCase):
     def test_minor_market_risk_gap_is_completed_and_audited(self) -> None:
         self.assertEqual(
-            _completion_status_for_gap(failed=7, total=2675),
+            _completion_status_for_gap(
+                failed=7,
+                total=2675,
+                treat_minor_gap_as_completed=True,
+            ),
             'completed',
         )
         details = _gap_policy_details(failed=7, total=2675)
@@ -111,7 +115,17 @@ class PykrxPipelineResultStatusTests(TestCase):
 
     def test_market_risk_gap_at_threshold_remains_partial(self) -> None:
         self.assertEqual(
-            _completion_status_for_gap(failed=10, total=100),
+            _completion_status_for_gap(
+                failed=10,
+                total=100,
+                treat_minor_gap_as_completed=True,
+            ),
+            'partial',
+        )
+
+    def test_other_stage_minor_gap_remains_partial_by_default(self) -> None:
+        self.assertEqual(
+            _completion_status_for_gap(failed=1, total=100),
             'partial',
         )
 
