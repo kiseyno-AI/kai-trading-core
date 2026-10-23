@@ -555,6 +555,7 @@ def test_decider_expected_model_settings_default_to_gpt_6_1_sol(
     assert getattr(configured, setting_name) == 'openai/gpt-6.1-sol'
     assert expected_decider_model(role, settings_obj=configured) == 'openai/gpt-6.1-sol'
     assert configured.openclaw_agent_max_retries == 0
+    assert configured.openclaw_agent_min_dispatch_interval_seconds == 0
     assert configured.openclaw_agent_parallel_subtasks == 1
     assert configured.openclaw_agent_symbol_chunk_size == 1
     assert configured.openclaw_agent_max_prompt_chars == 125_000

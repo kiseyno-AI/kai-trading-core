@@ -4332,6 +4332,13 @@ def _patch_feedback_eligibility(*symbols: str):
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.dispatch_coordinator_patcher = patch.object(
+            orchestrator_module,
+            '_OPENCLAW_DISPATCH_COORDINATOR',
+            orchestrator_module._OpenClawDispatchCoordinator(),
+        )
+        self.dispatch_coordinator_patcher.start()
+        self.addCleanup(self.dispatch_coordinator_patcher.stop)
         self.prerequisite_patcher = patch(
             'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
             side_effect=lambda **_: _feedback_prerequisites(),
@@ -9220,6 +9227,673 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(len(http_calls), 1)
 
+    def test_openclaw_completion_coordinator_serializes_same_gateway_only(self):
+        coordinator = orchestrator_module._OpenClawDispatchCoordinator()
+        same_gateway_attempted = threading.Event()
+        same_gateway_entered = threading.Event()
+        other_gateway_entered = threading.Event()
+        admissions = []
+
+        def admit(*, key, entered, attempted=None):
+            if attempted is not None:
+                attempted.set()
+            with coordinator.admit(key=key) as admission:
+                admissions.append(admission)
+                entered.set()
+
+        with coordinator.admit(key='https://openclaw.example'):
+            same_gateway_thread = threading.Thread(
+                target=admit,
+                kwargs={
+                    'key': 'https://openclaw.example',
+                    'entered': same_gateway_entered,
+                    'attempted': same_gateway_attempted,
+                },
+            )
+            other_gateway_thread = threading.Thread(
+                target=admit,
+                kwargs={
+                    'key': 'https://another-openclaw.example',
+                    'entered': other_gateway_entered,
+                },
+            )
+            same_gateway_thread.start()
+            other_gateway_thread.start()
+
+            self.assertTrue(same_gateway_attempted.wait(timeout=1.0))
+            self.assertTrue(other_gateway_entered.wait(timeout=1.0))
+            self.assertFalse(same_gateway_entered.wait(timeout=0.05))
+
+        self.assertTrue(same_gateway_entered.wait(timeout=1.0))
+        same_gateway_thread.join(timeout=1.0)
+        other_gateway_thread.join(timeout=1.0)
+
+        self.assertFalse(same_gateway_thread.is_alive())
+        self.assertFalse(other_gateway_thread.is_alive())
+        self.assertEqual(
+            {admission['coordination_mode'] for admission in admissions},
+            {'completion_single_flight'},
+        )
+
+    def test_openclaw_completion_coordinator_releases_without_fixed_delay(self):
+        coordinator = orchestrator_module._OpenClawDispatchCoordinator(
+            clock=lambda: 100.0
+        )
+        waiter_attempted = threading.Event()
+        waiter_entered = threading.Event()
+
+        def wait_for_admission():
+            waiter_attempted.set()
+            with coordinator.admit(key='https://openclaw.example') as admission:
+                self.assertEqual(admission['wait_seconds'], 0)
+                waiter_entered.set()
+
+        with self.assertRaisesRegex(RuntimeError, 'dispatch failed'):
+            with coordinator.admit(key='https://openclaw.example') as first:
+                self.assertEqual(first['wait_seconds'], 0)
+                waiter = threading.Thread(target=wait_for_admission)
+                waiter.start()
+                self.assertTrue(waiter_attempted.wait(timeout=1.0))
+                self.assertFalse(waiter_entered.wait(timeout=0.05))
+                raise RuntimeError('dispatch failed')
+
+        self.assertTrue(waiter_entered.wait(timeout=1.0))
+        waiter.join(timeout=1.0)
+        self.assertFalse(waiter.is_alive())
+
+    def test_successful_reprobe_clears_circuit_before_postprocessing(self):
+        http_calls = []
+        first_response_classified = threading.Event()
+        release_first_postprocessing = threading.Event()
+        errors = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, {'status': 'completed'}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        def post_once(client, *, request_run_id):
+            reprobe = client._raise_if_circuit_broken(
+                request_run_id=request_run_id,
+            )
+            return client._post_model_request(
+                role='eod-summarizer',
+                operation='batch',
+                url='https://openclaw.example/v1/responses',
+                body={'model': 'openclaw/eod-summarizer', 'input': 'test'},
+                headers=client._headers(),
+                timeout_seconds=30,
+                request_run_id=request_run_id,
+                capacity_reprobe=reprobe,
+                retry_contract_anchor=None,
+                retry_contract_change_message='retry contract changed',
+                failed_contract_change_message='failed contract changed',
+                started_event='dispatch_batch_request',
+                started_log_fields={},
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ), patch.object(
+            orchestrator_module,
+            'build_runtime_contract_provenance',
+            return_value={'generation': 'stable'},
+        ), patch.object(
+            orchestrator_module,
+            'build_dispatch_runtime_contract_provenance',
+            return_value={'verified': True},
+        ), patch.object(
+            orchestrator_module,
+            'log_agent_feedback_event',
+        ):
+            client = OpenClawAgentClient()
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchRetryableError(
+                    'OpenClaw gateway unavailable',
+                    details={
+                        'failure_kind': 'openclaw_transport_error',
+                        'failure_status': 'transport/error',
+                        'failure_category': 'transport',
+                        'retryable': True,
+                        'shared_transport_outage': True,
+                        'shared_dispatch_outage': True,
+                    },
+                ),
+                request_run_id='failed-run',
+            )
+
+            def first_reprobe():
+                try:
+                    post_once(client, request_run_id='reprobe-run')
+                    first_response_classified.set()
+                    release_first_postprocessing.wait(timeout=2.0)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    first_response_classified.set()
+
+            first_thread = threading.Thread(target=first_reprobe)
+            first_thread.start()
+            self.assertTrue(first_response_classified.wait(timeout=1.0))
+
+            try:
+                post_once(client, request_run_id='next-run')
+            finally:
+                release_first_postprocessing.set()
+                first_thread.join(timeout=1.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(http_calls), 2)
+
+    def test_queued_client_observes_shared_429_before_second_post(self):
+        first_post_started = threading.Event()
+        second_post_started = threading.Event()
+        release_first_post = threading.Event()
+        post_lock = threading.Lock()
+        http_calls = []
+        errors = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        class BlockingRateLimitClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json):
+                with post_lock:
+                    call_number = len(http_calls) + 1
+                    http_calls.append(
+                        {'url': url, 'json': json, 'kwargs': self.kwargs}
+                    )
+                if call_number == 1:
+                    first_post_started.set()
+                    if not release_first_post.wait(timeout=2.0):
+                        raise TimeoutError('test did not release first OpenClaw request')
+                else:
+                    second_post_started.set()
+                return FakeHTTPResponse(
+                    429,
+                    {'error': 'rate_limit'},
+                    headers={'Retry-After': '120'},
+                )
+
+        batch_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'request_run_id': 'symbol-run-2026-04-14-shared-429',
+                'dispatch_id': 'shared-429-dispatch',
+                'session_slot': 1,
+                'session_key': 'feedback/eod-summarizer/shared-429',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+        ]
+
+        def dispatch(client):
+            try:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=BlockingRateLimitClient,
+        ):
+            first_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            second_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            first_thread.start()
+            self.assertTrue(first_post_started.wait(timeout=1.0))
+            second_thread.start()
+            self.assertFalse(second_post_started.wait(timeout=0.1))
+            release_first_post.set()
+            first_thread.join(timeout=2.0)
+            second_thread.join(timeout=2.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(http_calls), 1)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(
+            any(
+                isinstance(error, orchestrator_module.AgentDispatchRetryableError)
+                for error in errors
+            )
+        )
+        blocked_errors = [
+            error
+            for error in errors
+            if isinstance(error, orchestrator_module.AgentDispatchTerminalError)
+        ]
+        self.assertEqual(len(blocked_errors), 1)
+        self.assertTrue(blocked_errors[0].details['retryable'])
+        self.assertEqual(
+            blocked_errors[0].details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+
+    def test_queued_client_observes_wrapped_shared_transport_before_second_post(self):
+        first_post_started = threading.Event()
+        second_post_started = threading.Event()
+        release_first_post = threading.Event()
+        post_lock = threading.Lock()
+        http_calls = []
+        errors = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        class BlockingTransportClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json):
+                with post_lock:
+                    call_number = len(http_calls) + 1
+                    http_calls.append(
+                        {'url': url, 'json': json, 'kwargs': self.kwargs}
+                    )
+                if call_number == 1:
+                    first_post_started.set()
+                    if not release_first_post.wait(timeout=2.0):
+                        raise TimeoutError('test did not release first request')
+                    return FakeHTTPResponse(
+                        502,
+                        {'error': 'connection refused'},
+                    )
+                second_post_started.set()
+                return FakeHTTPResponse(
+                    502,
+                    {'error': 'unexpected second request'},
+                )
+
+        batch_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'request_run_id': 'symbol-run-2026-04-14-shared-transport',
+                'dispatch_id': 'shared-transport-dispatch',
+                'session_slot': 1,
+                'session_key': 'feedback/eod-summarizer/shared-transport',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+        ]
+
+        def dispatch(client):
+            try:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=BlockingTransportClient,
+        ):
+            first_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            second_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            first_thread.start()
+            self.assertTrue(first_post_started.wait(timeout=1.0))
+            second_thread.start()
+            self.assertFalse(second_post_started.wait(timeout=0.1))
+            release_first_post.set()
+            first_thread.join(timeout=2.0)
+            second_thread.join(timeout=2.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(http_calls), 1)
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(
+            sorted(error.details['failure_kind'] for error in errors),
+            ['openclaw_transport_error', 'openclaw_transport_error'],
+        )
+        self.assertEqual(
+            sum(
+                isinstance(error, orchestrator_module.AgentDispatchTerminalError)
+                for error in errors
+            ),
+            1,
+        )
+
+    def test_rate_limit_circuit_is_not_weakened_by_capacity_trip(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_rate_limit_fallback_cooldown_seconds=900,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            rate_limit_error = client._provider_rate_limit_error(
+                FakeHTTPResponse(
+                    429,
+                    {'error': 'rate_limit'},
+                    headers={'Retry-After': '120'},
+                ),
+                operation='batch',
+            )
+            client._trip_circuit_breaker(
+                rate_limit_error,
+                request_run_id='run-a',
+            )
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchTerminalError(
+                    'local capacity unavailable',
+                    details={
+                        'failure_kind': 'openclaw_storage_admission_blocked',
+                        'failure_status': 'capacity/storage-admission-blocked',
+                        'failure_category': 'capacity',
+                        'retryable': True,
+                        'shared_dispatch_outage': True,
+                    },
+                ),
+                request_run_id='run-b',
+            )
+
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchTerminalError
+            ) as blocked:
+                client._raise_if_circuit_broken(request_run_id='run-c')
+
+        self.assertEqual(
+            blocked.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertGreater(blocked.exception.details['retry_after_seconds'], 0)
+
+    def test_http_429_trips_circuit_before_runtime_contract_drift_error(self):
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(
+                    429,
+                    {'error': 'rate_limit'},
+                    headers={'Retry-After': '120'},
+                ),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ), patch.object(
+            orchestrator_module,
+            'build_runtime_contract_provenance',
+            side_effect=[{'generation': 'before'}, {'generation': 'after'}],
+        ), patch.object(
+            orchestrator_module,
+            'build_dispatch_runtime_contract_provenance',
+            return_value={'verified': False},
+        ):
+            client = OpenClawAgentClient()
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchRetryableError
+            ) as raised:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=[
+                        {
+                            'symbol': '005930',
+                            'market_date': '2026-04-14',
+                            'request_run_id': 'runtime-drift-429-run',
+                            'dispatch_id': 'runtime-drift-429-dispatch',
+                            'session_slot': 1,
+                            'session_key': 'feedback/eod-summarizer/drift-429',
+                            'session_reuse_mode': 'fresh_per_batch',
+                        }
+                    ],
+                )
+
+        self.assertEqual(
+            raised.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertEqual(len(http_calls), 1)
+
+    def test_wrapped_provider_429_opens_circuit_before_next_post(self):
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_agent_rate_limit_fallback_cooldown_seconds=900,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(
+                    502,
+                    {
+                        'error': (
+                            'exceeded retry limit, last status: '
+                            '429 Too Many Requests'
+                        )
+                    },
+                ),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        batch_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'request_run_id': 'wrapped-provider-429-run',
+                'dispatch_id': 'wrapped-provider-429-dispatch',
+                'session_slot': 1,
+                'session_key': 'feedback/eod-summarizer/wrapped-429',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+        ]
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            first_client = OpenClawAgentClient()
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchRetryableError
+            ) as raised:
+                first_client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchTerminalError
+            ) as blocked:
+                OpenClawAgentClient().dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+
+        self.assertEqual(len(http_calls), 1)
+        self.assertEqual(
+            raised.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertEqual(
+            blocked.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertEqual(
+            raised.exception.details['response_status_code'],
+            502,
+        )
+
+    def test_connection_refused_http_error_is_not_provider_rate_limit(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_agent_rate_limit_fallback_cooldown_seconds=900,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            error = client._provider_rate_limit_error(
+                FakeHTTPResponse(502, {'error': 'connection refused'}),
+                operation='batch dispatch',
+            )
+
+        self.assertIsNone(error)
+
+    def test_inner_reprobe_reservation_is_released_when_post_raises(self):
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=lambda **kwargs: RaisingHTTPClient(
+                exc=httpx.ReadTimeout('provider read timed out'),
+                calls=http_calls,
+                **kwargs,
+            ),
+        ), patch.object(
+            orchestrator_module,
+            'build_runtime_contract_provenance',
+            return_value={'verified': True},
+        ):
+            client = OpenClawAgentClient()
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchTerminalError(
+                    'shared capacity unavailable',
+                    details={
+                        'failure_kind': (
+                            'openclaw_plugin_state_capacity_exhausted'
+                        ),
+                        'failure_status': 'capacity/exhausted',
+                        'failure_category': 'capacity',
+                        'retryable': False,
+                        'shared_dispatch_outage': True,
+                    },
+                ),
+                request_run_id='run-a',
+            )
+            with self.assertRaises(httpx.ReadTimeout):
+                client._post_model_request(
+                    role='eod-summarizer',
+                    operation='batch',
+                    url='https://openclaw.example/v1/responses',
+                    body={'model': 'openclaw/eod-summarizer', 'input': 'x'},
+                    headers={},
+                    timeout_seconds=30,
+                    request_run_id='run-b',
+                    capacity_reprobe=False,
+                    retry_contract_anchor=None,
+                    retry_contract_change_message='retry contract changed',
+                    failed_contract_change_message='runtime contract changed',
+                    started_event='test_dispatch_started',
+                    started_log_fields={},
+                )
+
+            self.assertTrue(
+                client._raise_if_circuit_broken(request_run_id='run-c')
+            )
+
     def test_openclaw_dispatch_pacer_spaces_model_starts_without_real_sleep(self):
         monotonic_now = [100.0]
         sleep_calls = []
@@ -9351,12 +10025,20 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 client._raise_if_circuit_broken(request_run_id='run-b')
 
             self.assertGreater(blocked.exception.details['retry_after_seconds'], 0)
-            with client._circuit_breaker_lock:
-                message, details = client._circuit_breaker_error
-                details['retry_not_before'] = (
-                    datetime.now(timezone.utc) - timedelta(seconds=1)
-                ).isoformat()
-                client._circuit_breaker_error = (message, details)
+            expired_details = dict(rate_limit_error.details)
+            expired_details['retry_not_before'] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            client._dispatch_coordinator = (
+                orchestrator_module._OpenClawDispatchCoordinator()
+            )
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchRetryableError(
+                    str(rate_limit_error),
+                    details=expired_details,
+                ),
+                request_run_id='run-a',
+            )
 
             self.assertTrue(
                 client._raise_if_circuit_broken(request_run_id='run-b')
@@ -9381,12 +10063,22 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     allow_reserved_reprobe=True,
                 )
 
-            with client._circuit_breaker_lock:
-                message, details = client._circuit_breaker_error
-                details['retry_not_before'] = (
-                    datetime.now(timezone.utc) - timedelta(seconds=1)
-                ).isoformat()
-                client._circuit_breaker_error = (message, details)
+            expired_replacement_details = dict(
+                replacement_rate_limit.details
+            )
+            expired_replacement_details['retry_not_before'] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            client._dispatch_coordinator = (
+                orchestrator_module._OpenClawDispatchCoordinator()
+            )
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchRetryableError(
+                    str(replacement_rate_limit),
+                    details=expired_replacement_details,
+                ),
+                request_run_id='run-z',
+            )
             self.assertTrue(
                 client._raise_if_circuit_broken(request_run_id='run-b')
             )

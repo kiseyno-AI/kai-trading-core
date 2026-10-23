@@ -276,7 +276,7 @@ class Settings(BaseSettings):
     openclaw_agent_max_retries: int = 0
     openclaw_agent_retry_backoff_seconds: float = 30.0
     openclaw_agent_min_dispatch_interval_seconds: float = Field(
-        default=30.0,
+        default=0.0,
         ge=0.0,
         le=3_600.0,
     )

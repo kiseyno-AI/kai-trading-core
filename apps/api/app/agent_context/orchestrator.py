@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
@@ -154,6 +155,200 @@ _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK = threading.Lock()
 _MAX_OPENCLAW_RATE_LIMIT_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
 
 
+def _openclaw_rate_limit_retry_not_before(
+    details: Mapping[str, Any],
+) -> datetime | None:
+    raw_value = str(details.get('retry_not_before') or '').strip()
+    if not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass
+class _OpenClawGatewayCircuitState:
+    error: tuple[str, dict[str, Any]] | None = None
+    run_id: str | None = None
+    reprobe_run_id: str | None = None
+
+
+class _OpenClawDispatchCoordinator:
+    """Coordinate model dispatches and shared outage state per gateway."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._clock = clock
+        self._condition = threading.Condition()
+        self._active_keys: set[str] = set()
+        self._circuit_states: dict[str, _OpenClawGatewayCircuitState] = {}
+
+    @staticmethod
+    def _normalized_key(key: str) -> str:
+        return str(key or 'openclaw').strip() or 'openclaw'
+
+    @contextmanager
+    def admit(self, *, key: str):
+        normalized_key = self._normalized_key(key)
+        wait_started_at = self._clock()
+        with self._condition:
+            while normalized_key in self._active_keys:
+                self._condition.wait()
+            self._active_keys.add(normalized_key)
+        admission = {
+            'coordination_mode': 'completion_single_flight',
+            'wait_seconds': max(0.0, self._clock() - wait_started_at),
+            'max_in_flight': 1,
+        }
+        try:
+            yield admission
+        finally:
+            with self._condition:
+                self._active_keys.discard(normalized_key)
+                self._condition.notify_all()
+
+    def check_circuit(
+        self,
+        *,
+        key: str,
+        request_run_id: str | None,
+        allow_reserved_reprobe: bool,
+    ) -> bool:
+        normalized_key = self._normalized_key(key)
+        normalized_run_id = str(request_run_id or '').strip() or None
+        blocked_error: tuple[str, dict[str, Any]] | None = None
+        with self._condition:
+            state = self._circuit_states.get(normalized_key)
+            stored = state.error if state is not None else None
+            if stored is None:
+                return False
+            message, stored_details = stored
+            if (
+                allow_reserved_reprobe
+                and normalized_run_id is not None
+                and state is not None
+                and state.reprobe_run_id == normalized_run_id
+            ):
+                return True
+            failure_kind = str(
+                stored_details.get('failure_kind') or ''
+            ).strip()
+            retry_not_before = (
+                _openclaw_rate_limit_retry_not_before(stored_details)
+                if failure_kind
+                == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                else None
+            )
+            now = datetime.now(timezone.utc)
+            rate_limit_cooldown_active = bool(
+                retry_not_before is not None and now < retry_not_before
+            )
+            if rate_limit_cooldown_active:
+                blocked_details = dict(stored_details)
+                blocked_details['retry_after_seconds'] = max(
+                    1,
+                    math.ceil((retry_not_before - now).total_seconds()),
+                )
+                blocked_error = (message, blocked_details)
+            else:
+                rate_limit_cooldown_expired = bool(
+                    failure_kind
+                    == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                    and retry_not_before is not None
+                )
+                independent_run = bool(
+                    normalized_run_id is not None
+                    and state is not None
+                    and normalized_run_id != state.run_id
+                )
+                if (
+                    (rate_limit_cooldown_expired or independent_run)
+                    and normalized_run_id is not None
+                    and state is not None
+                    and state.reprobe_run_id is None
+                ):
+                    state.reprobe_run_id = normalized_run_id
+                    return True
+                blocked_error = (message, dict(stored_details))
+        if blocked_error is not None:
+            message, details = blocked_error
+            raise AgentDispatchTerminalError(message, details=details)
+        return False
+
+    def trip_circuit(
+        self,
+        *,
+        key: str,
+        error: AgentDispatchError,
+        request_run_id: str | None,
+    ) -> None:
+        normalized_key = self._normalized_key(key)
+        with self._condition:
+            existing_state = self._circuit_states.get(normalized_key)
+            existing_details = (
+                existing_state.error[1]
+                if existing_state is not None
+                and existing_state.error is not None
+                else None
+            )
+            existing_rate_limit_deadline = (
+                _openclaw_rate_limit_retry_not_before(existing_details)
+                if isinstance(existing_details, dict)
+                and existing_details.get('failure_kind')
+                == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                else None
+            )
+            incoming_rate_limit_deadline = (
+                _openclaw_rate_limit_retry_not_before(error.details)
+                if error.details.get('failure_kind')
+                == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                else None
+            )
+            now = datetime.now(timezone.utc)
+            if (
+                existing_rate_limit_deadline is not None
+                and existing_rate_limit_deadline > now
+                and (
+                    incoming_rate_limit_deadline is None
+                    or incoming_rate_limit_deadline
+                    <= existing_rate_limit_deadline
+                )
+            ):
+                return
+            self._circuit_states[normalized_key] = (
+                _OpenClawGatewayCircuitState(
+                    error=(str(error), dict(error.details)),
+                    run_id=str(request_run_id or '').strip() or None,
+                )
+            )
+
+    def finish_reprobe(
+        self,
+        *,
+        key: str,
+        request_run_id: str | None,
+        recovered: bool,
+    ) -> None:
+        normalized_key = self._normalized_key(key)
+        normalized_run_id = str(request_run_id or '').strip() or None
+        with self._condition:
+            state = self._circuit_states.get(normalized_key)
+            if state is None or state.reprobe_run_id != normalized_run_id:
+                return
+            if recovered:
+                self._circuit_states.pop(normalized_key, None)
+                return
+            state.run_id = normalized_run_id
+            state.reprobe_run_id = None
+
+
 class _OpenClawDispatchPacer:
     """Serialize model-start admissions across clients in this API process."""
 
@@ -197,6 +392,7 @@ class _OpenClawDispatchPacer:
             'minimum_interval_seconds': interval,
         }
 
+_OPENCLAW_DISPATCH_COORDINATOR = _OpenClawDispatchCoordinator()
 _OPENCLAW_DISPATCH_PACER = _OpenClawDispatchPacer()
 
 
@@ -505,21 +701,11 @@ def _is_shared_openclaw_transport_outage(
     )
 
 
-def _is_shared_openclaw_dispatch_outage(
+def _has_openclaw_provider_rate_limit_marker(
     *,
-    exc: BaseException | None = None,
     error: str | None = None,
-    response_status_code: int | None = None,
 ) -> bool:
-    if _is_shared_openclaw_transport_outage(exc=exc, error=error):
-        return True
-    if response_status_code == 429:
-        return True
-    normalized = ' '.join(
-        part.strip().lower()
-        for part in (str(exc or ''), str(error or ''))
-        if part and part.strip()
-    )
+    normalized = str(error or '').strip().lower()
     return any(
         marker in normalized
         for marker in (
@@ -530,7 +716,27 @@ def _is_shared_openclaw_dispatch_outage(
             'too many requests',
             'http 429',
             'error 429',
+            'status: 429',
         )
+    )
+
+
+def _is_shared_openclaw_dispatch_outage(
+    *,
+    exc: BaseException | None = None,
+    error: str | None = None,
+    response_status_code: int | None = None,
+) -> bool:
+    if _is_shared_openclaw_transport_outage(exc=exc, error=error):
+        return True
+    if response_status_code == 429:
+        return True
+    return _has_openclaw_provider_rate_limit_marker(
+        error=' '.join(
+            part.strip()
+            for part in (str(exc or ''), str(error or ''))
+            if part and part.strip()
+        ),
     )
 
 
@@ -576,11 +782,8 @@ class OpenClawAgentClient:
                 ),
             ),
         )
+        self._dispatch_coordinator = _OPENCLAW_DISPATCH_COORDINATOR
         self._dispatch_pacer = _OPENCLAW_DISPATCH_PACER
-        self._circuit_breaker_lock = threading.Lock()
-        self._circuit_breaker_error: tuple[str, dict[str, Any]] | None = None
-        self._circuit_breaker_run_id: str | None = None
-        self._circuit_breaker_reprobe_run_id: str | None = None
 
     @staticmethod
     def _plugin_state_capacity_error(
@@ -614,7 +817,13 @@ class OpenClawAgentClient:
         *,
         operation: str,
     ) -> AgentDispatchRetryableError | None:
-        if response.status_code != 429:
+        wrapped_provider_rate_limit = bool(
+            response.status_code >= 400
+            and _has_openclaw_provider_rate_limit_marker(
+                error=response.text[:1000],
+            )
+        )
+        if response.status_code != 429 and not wrapped_provider_rate_limit:
             return None
         now = datetime.now(timezone.utc)
         retry_after_seconds = self.rate_limit_fallback_cooldown_seconds
@@ -658,7 +867,8 @@ class OpenClawAgentClient:
         )
         retry_not_before = now + timedelta(seconds=retry_after_seconds)
         return AgentDispatchRetryableError(
-            f'OpenClaw {operation} retryable error 429: {response.text[:300]}',
+            f'OpenClaw {operation} provider rate limit '
+            f'({response.status_code}): {response.text[:300]}',
             details={
                 'failure_kind': (
                     FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
@@ -680,22 +890,35 @@ class OpenClawAgentClient:
     def _rate_limit_retry_not_before(
         details: Mapping[str, Any],
     ) -> datetime | None:
-        raw_value = str(details.get('retry_not_before') or '').strip()
-        if not raw_value:
-            return None
-        try:
-            parsed = datetime.fromisoformat(raw_value.replace('Z', '+00:00'))
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+        return _openclaw_rate_limit_retry_not_before(details)
 
     def _wait_for_dispatch_slot(self) -> dict[str, Any]:
         return self._dispatch_pacer.wait(
             key=self.base_url,
             minimum_interval_seconds=self.minimum_dispatch_interval_seconds,
         )
+
+    @contextmanager
+    def _admit_model_dispatch(self):
+        with self._dispatch_coordinator.admit(
+            key=self.base_url
+        ) as completion_admission:
+            pacing_admission = self._wait_for_dispatch_slot()
+            completion_wait_seconds = float(
+                completion_admission.get('wait_seconds') or 0.0
+            )
+            pacing_wait_seconds = float(
+                pacing_admission.get('wait_seconds') or 0.0
+            )
+            yield {
+                **pacing_admission,
+                **completion_admission,
+                'wait_seconds': (
+                    completion_wait_seconds + pacing_wait_seconds
+                ),
+                'completion_wait_seconds': completion_wait_seconds,
+                'fixed_pacing_wait_seconds': pacing_wait_seconds,
+            }
 
     def _raise_if_circuit_broken(
         self,
@@ -730,60 +953,11 @@ class OpenClawAgentClient:
             )
             raise error
 
-        blocked_error: tuple[str, dict[str, Any]] | None = None
-        with self._circuit_breaker_lock:
-            stored = self._circuit_breaker_error
-            if stored is not None:
-                message, stored_details = stored
-                if (
-                    allow_reserved_reprobe
-                    and normalized_run_id is not None
-                    and self._circuit_breaker_reprobe_run_id
-                    == normalized_run_id
-                ):
-                    return True
-                failure_kind = str(
-                    stored_details.get('failure_kind') or ''
-                ).strip()
-                retry_not_before = (
-                    self._rate_limit_retry_not_before(stored_details)
-                    if failure_kind
-                    == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
-                    else None
-                )
-                now = datetime.now(timezone.utc)
-                rate_limit_cooldown_active = bool(
-                    retry_not_before is not None and now < retry_not_before
-                )
-                if rate_limit_cooldown_active:
-                    blocked_details = dict(stored_details)
-                    blocked_details['retry_after_seconds'] = max(
-                        1,
-                        math.ceil((retry_not_before - now).total_seconds()),
-                    )
-                    blocked_error = (message, blocked_details)
-                else:
-                    rate_limit_cooldown_expired = bool(
-                        failure_kind
-                        == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
-                        and retry_not_before is not None
-                    )
-                    independent_run = bool(
-                        normalized_run_id is not None
-                        and normalized_run_id != self._circuit_breaker_run_id
-                    )
-                    if (
-                        (rate_limit_cooldown_expired or independent_run)
-                        and normalized_run_id is not None
-                        and self._circuit_breaker_reprobe_run_id is None
-                    ):
-                        self._circuit_breaker_reprobe_run_id = normalized_run_id
-                        return True
-                    blocked_error = (message, dict(stored_details))
-        if blocked_error is not None:
-            message, details = blocked_error
-            raise AgentDispatchTerminalError(message, details=details)
-        return False
+        return self._dispatch_coordinator.check_circuit(
+            key=self.base_url,
+            request_run_id=normalized_run_id,
+            allow_reserved_reprobe=allow_reserved_reprobe,
+        )
 
     def _trip_circuit_breaker(
         self,
@@ -791,10 +965,11 @@ class OpenClawAgentClient:
         *,
         request_run_id: str | None,
     ) -> None:
-        with self._circuit_breaker_lock:
-            self._circuit_breaker_error = (str(error), dict(error.details))
-            self._circuit_breaker_run_id = str(request_run_id or '').strip() or None
-            self._circuit_breaker_reprobe_run_id = None
+        self._dispatch_coordinator.trip_circuit(
+            key=self.base_url,
+            error=error,
+            request_run_id=request_run_id,
+        )
 
     def _finish_circuit_breaker_reprobe(
         self,
@@ -802,16 +977,251 @@ class OpenClawAgentClient:
         request_run_id: str | None,
         recovered: bool,
     ) -> None:
-        normalized_run_id = str(request_run_id or '').strip() or None
-        with self._circuit_breaker_lock:
-            if self._circuit_breaker_reprobe_run_id != normalized_run_id:
-                return
-            if recovered:
-                self._circuit_breaker_error = None
-                self._circuit_breaker_run_id = None
-            else:
-                self._circuit_breaker_run_id = normalized_run_id
-            self._circuit_breaker_reprobe_run_id = None
+        self._dispatch_coordinator.finish_reprobe(
+            key=self.base_url,
+            request_run_id=request_run_id,
+            recovered=recovered,
+        )
+
+    def _shared_transport_circuit_error(
+        self,
+        *,
+        exc: Exception,
+        operation: str,
+    ) -> AgentDispatchRetryableError | None:
+        if not _is_shared_openclaw_transport_outage(exc=exc):
+            return None
+        classification = classify_feedback_failure(
+            failure_kind=None,
+            summary={
+                'origin': f'openclaw_{operation}',
+                'exception_type': type(exc).__name__,
+                'error': str(exc),
+            },
+            error=str(exc),
+            exception_type=type(exc).__name__,
+        )
+        return AgentDispatchRetryableError(
+            f'OpenClaw {operation} shared transport outage: {exc}',
+            details={
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'failure_classification': classification.as_payload(),
+                'failure_mode': classification.failure_kind,
+                'retryable': True,
+                'shared_transport_outage': True,
+                'shared_dispatch_outage': True,
+                'exception_type': type(exc).__name__,
+                'error_message': str(exc),
+            },
+        )
+
+    @staticmethod
+    def _shared_transport_response_circuit_error(
+        response: httpx.Response,
+        *,
+        operation: str,
+    ) -> AgentDispatchRetryableError | None:
+        response_text = response.text[:1000]
+        if (
+            response.status_code < 500
+            or not _is_shared_openclaw_transport_outage(error=response_text)
+        ):
+            return None
+        error_message = (
+            f'OpenClaw {operation} HTTP {response.status_code}: '
+            f'{response_text[:300]}'
+        )
+        classification = classify_feedback_failure(
+            failure_kind=None,
+            summary={
+                'origin': f'openclaw_{operation}',
+                'response_status_code': response.status_code,
+                'error': error_message,
+            },
+            context={'response_status_code': response.status_code},
+            error=error_message,
+            exception_type='HTTPStatusError',
+        )
+        return AgentDispatchRetryableError(
+            f'OpenClaw {operation} shared transport outage: '
+            f'{response_text[:300]}',
+            details={
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'failure_classification': classification.as_payload(),
+                'failure_mode': classification.failure_kind,
+                'retryable': True,
+                'shared_transport_outage': True,
+                'shared_dispatch_outage': True,
+                'exception_type': 'HTTPStatusError',
+                'response_status_code': response.status_code,
+                'response_text_excerpt': response_text[:300],
+                'error_message': error_message,
+            },
+        )
+
+    def _post_model_request(
+        self,
+        *,
+        role: str,
+        operation: str,
+        url: str,
+        body: dict[str, Any],
+        headers: dict[str, str],
+        timeout_seconds: float,
+        request_run_id: str | None,
+        capacity_reprobe: bool,
+        retry_contract_anchor: dict[str, Any] | None,
+        retry_contract_change_message: str,
+        failed_contract_change_message: str,
+        started_event: str,
+        started_log_fields: dict[str, Any],
+    ) -> tuple[
+        httpx.Response,
+        dict[str, Any] | None,
+        dict[str, Any],
+        dict[str, Any],
+        bool,
+    ]:
+        with self._admit_model_dispatch() as dispatch_admission:
+            try:
+                log_agent_feedback_event(
+                    started_event,
+                    status='started',
+                    dispatch_rate_admission=dispatch_admission,
+                    http_target={'url': url, 'headers': headers},
+                    request_snapshot=build_request_snapshot(body),
+                    **started_log_fields,
+                )
+                pre_runtime_contract = build_runtime_contract_provenance(
+                    role,
+                    openclaw_state_dir=getattr(
+                        settings,
+                        'openclaw_state_dir',
+                        '~/.openclaw',
+                    ),
+                )
+                if retry_contract_anchor is None:
+                    retry_contract_anchor = pre_runtime_contract
+                else:
+                    retry_contract_proof = (
+                        build_dispatch_runtime_contract_provenance(
+                            pre_dispatch=retry_contract_anchor,
+                            post_dispatch=pre_runtime_contract,
+                        )
+                    )
+                    if (
+                        retry_contract_proof is not None
+                        and retry_contract_proof.get('verified') is not True
+                    ):
+                        raise AgentDispatchTerminalError(
+                            retry_contract_change_message,
+                            details={
+                                'runtime_contract': retry_contract_proof
+                            },
+                        )
+                capacity_reprobe = self._raise_if_circuit_broken(
+                    request_run_id=request_run_id,
+                    allow_reserved_reprobe=capacity_reprobe,
+                )
+                try:
+                    with httpx.Client(
+                        timeout=timeout_seconds,
+                        headers=headers,
+                    ) as client:
+                        response = client.post(url, json=body)
+                except Exception as exc:
+                    transport_error = self._shared_transport_circuit_error(
+                        exc=exc,
+                        operation=operation,
+                    )
+                    if transport_error is not None:
+                        self._trip_circuit_breaker(
+                            transport_error,
+                            request_run_id=request_run_id,
+                        )
+                    raise
+
+                capacity_error = self._plugin_state_capacity_error(response)
+                if capacity_error is not None:
+                    self._trip_circuit_breaker(
+                        capacity_error,
+                        request_run_id=request_run_id,
+                    )
+                    raise capacity_error
+                rate_limit_error = self._provider_rate_limit_error(
+                    response,
+                    operation=operation,
+                )
+                if rate_limit_error is not None:
+                    self._trip_circuit_breaker(
+                        rate_limit_error,
+                        request_run_id=request_run_id,
+                    )
+                    raise rate_limit_error
+                transport_response_error = (
+                    self._shared_transport_response_circuit_error(
+                        response,
+                        operation=operation,
+                    )
+                )
+                if transport_response_error is not None:
+                    self._trip_circuit_breaker(
+                        transport_response_error,
+                        request_run_id=request_run_id,
+                    )
+                    raise transport_response_error
+
+                post_runtime_contract = build_runtime_contract_provenance(
+                    role,
+                    openclaw_state_dir=getattr(
+                        settings,
+                        'openclaw_state_dir',
+                        '~/.openclaw',
+                    ),
+                )
+                runtime_contract = (
+                    build_dispatch_runtime_contract_provenance(
+                        pre_dispatch=pre_runtime_contract,
+                        post_dispatch=post_runtime_contract,
+                    )
+                )
+                if (
+                    response.status_code >= 400
+                    and runtime_contract is not None
+                    and runtime_contract.get('verified') is not True
+                ):
+                    raise AgentDispatchTerminalError(
+                        failed_contract_change_message,
+                        details={
+                            'runtime_contract': runtime_contract,
+                            'response_status_code': response.status_code,
+                            'response_text_excerpt': response.text[:300],
+                        },
+                    )
+                if capacity_reprobe and response.status_code < 400:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=request_run_id,
+                        recovered=True,
+                    )
+                    capacity_reprobe = False
+                return (
+                    response,
+                    runtime_contract,
+                    dispatch_admission,
+                    retry_contract_anchor,
+                    capacity_reprobe,
+                )
+            except Exception:
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=request_run_id,
+                        recovered=False,
+                    )
+                raise
 
     def _tool_invoke_url(self) -> str:
         parsed = urlparse(self.base_url)
@@ -2145,81 +2555,57 @@ class OpenClawAgentClient:
                     capacity_reprobe = self._raise_if_circuit_broken(
                         request_run_id=request_run_id,
                     )
-                dispatch_rate_admission = self._wait_for_dispatch_slot()
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
                     'x-openclaw-agent-id': spec.agent_name,
                 }
                 if expected_model is not None:
                     headers['x-openclaw-model'] = expected_model
-                log_agent_feedback_event(
-                    'dispatch_single_http_target',
-                    status='started',
-                    agent_name=spec.agent_name,
-                    role=spec.role,
-                    session_key=request_session_key,
-                    dispatch_rate_admission=dispatch_rate_admission,
-                    http_target={'url': url, 'headers': headers},
-                    request_snapshot=build_request_snapshot(body),
-                )
-                pre_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                if retry_contract_anchor is None:
-                    retry_contract_anchor = pre_runtime_contract
-                else:
-                    retry_contract_proof = build_dispatch_runtime_contract_provenance(
-                        pre_dispatch=retry_contract_anchor,
-                        post_dispatch=pre_runtime_contract,
-                    )
-                    if retry_contract_proof is not None and retry_contract_proof.get('verified') is not True:
-                        raise AgentDispatchTerminalError(
-                            'OpenClaw runtime contract changed between retry attempts',
-                            details={'runtime_contract': retry_contract_proof},
-                        )
-                capacity_reprobe = self._raise_if_circuit_broken(
-                    request_run_id=request_run_id,
-                    allow_reserved_reprobe=capacity_reprobe,
-                )
-                with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
-                    response = client.post(url, json=body)
-                post_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                runtime_contract = build_dispatch_runtime_contract_provenance(
-                    pre_dispatch=pre_runtime_contract,
-                    post_dispatch=post_runtime_contract,
-                )
-                if response.status_code >= 400 and runtime_contract is not None and runtime_contract.get('verified') is not True:
-                    raise AgentDispatchTerminalError(
-                        'OpenClaw runtime contract changed during failed dispatch attempt',
-                        details={'runtime_contract': runtime_contract},
-                    )
-                capacity_error = self._plugin_state_capacity_error(response)
-                if capacity_error is not None:
-                    self._trip_circuit_breaker(
-                        capacity_error,
-                        request_run_id=request_run_id,
-                    )
-                    raise capacity_error
-                rate_limit_error = self._provider_rate_limit_error(
+                (
                     response,
+                    runtime_contract,
+                    dispatch_rate_admission,
+                    retry_contract_anchor,
+                    capacity_reprobe,
+                ) = self._post_model_request(
+                    role=spec.role,
                     operation='dispatch',
+                    url=url,
+                    body=body,
+                    headers=headers,
+                    timeout_seconds=self.timeout_seconds,
+                    request_run_id=request_run_id,
+                    capacity_reprobe=capacity_reprobe,
+                    retry_contract_anchor=retry_contract_anchor,
+                    retry_contract_change_message=(
+                        'OpenClaw runtime contract changed between retry attempts'
+                    ),
+                    failed_contract_change_message=(
+                        'OpenClaw runtime contract changed during failed '
+                        'dispatch attempt'
+                    ),
+                    started_event='dispatch_single_http_target',
+                    started_log_fields={
+                        'agent_name': spec.agent_name,
+                        'role': spec.role,
+                        'session_key': request_session_key,
+                    },
                 )
-                if rate_limit_error is not None:
-                    self._trip_circuit_breaker(
-                        rate_limit_error,
-                        request_run_id=request_run_id,
-                    )
-                    raise rate_limit_error
                 if response.status_code >= 500:
-                    raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw server error {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 if response.status_code in (408, 409):
-                    raise AgentDispatchRetryableError(f'OpenClaw retryable error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw retryable error {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 if response.status_code >= 400:
-                    raise AgentDispatchTerminalError(f'OpenClaw dispatch failed {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchTerminalError(
+                        f'OpenClaw dispatch failed {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 parsed = response.json()
                 output_text = None
                 for item in parsed.get('output', []):
@@ -2611,10 +2997,6 @@ class OpenClawAgentClient:
                     capacity_reprobe = self._raise_if_circuit_broken(
                         request_run_id=circuit_breaker_run_id,
                     )
-                dispatch_rate_admission = self._wait_for_dispatch_slot()
-                request_provenance[
-                    'dispatch_rate_admission'
-                ] = dispatch_rate_admission
                 request_session_key = fixed_session_key
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
@@ -2622,83 +3004,64 @@ class OpenClawAgentClient:
                 }
                 if expected_model is not None:
                     headers['x-openclaw-model'] = expected_model
-                log_agent_feedback_event(
-                    'dispatch_batch_request',
-                    status='started',
-                    request_run_id=request_run_id,
-                    dispatch_id=dispatch_id,
-                    attempt_id=attempt_id,
-                    agent_name=spec.agent_name,
-                    role=spec.role,
-                    market_date=market_date.isoformat(),
-                    session_key=request_session_key,
-                    batch_symbols=batch_symbols,
-                    slot=slot,
-                    session_reuse_mode=session_reuse_mode,
-                    request_marker=request_marker,
-                    dispatch_rate_admission=dispatch_rate_admission,
-                    request_snapshot=build_request_snapshot(body),
-                    http_target={'url': url, 'headers': headers},
-                )
-                pre_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                if retry_contract_anchor is None:
-                    retry_contract_anchor = pre_runtime_contract
-                else:
-                    retry_contract_proof = build_dispatch_runtime_contract_provenance(
-                        pre_dispatch=retry_contract_anchor,
-                        post_dispatch=pre_runtime_contract,
-                    )
-                    if retry_contract_proof is not None and retry_contract_proof.get('verified') is not True:
-                        raise AgentDispatchTerminalError(
-                            'OpenClaw runtime contract changed between batch retry attempts',
-                            details={'runtime_contract': retry_contract_proof},
-                        )
-                capacity_reprobe = self._raise_if_circuit_broken(
-                    request_run_id=circuit_breaker_run_id,
-                    allow_reserved_reprobe=capacity_reprobe,
-                )
-                with httpx.Client(timeout=self.batch_http_timeout_seconds, headers=headers) as client:
-                    response = client.post(url, json=body)
-                post_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                runtime_contract = build_dispatch_runtime_contract_provenance(
-                    pre_dispatch=pre_runtime_contract,
-                    post_dispatch=post_runtime_contract,
-                )
-                request_provenance['runtime_contract'] = runtime_contract
-                if response.status_code >= 400 and runtime_contract is not None and runtime_contract.get('verified') is not True:
-                    raise AgentDispatchTerminalError(
-                        'OpenClaw runtime contract changed during failed batch dispatch attempt',
-                        details={'runtime_contract': runtime_contract},
-                    )
-                capacity_error = self._plugin_state_capacity_error(response)
-                if capacity_error is not None:
-                    self._trip_circuit_breaker(
-                        capacity_error,
-                        request_run_id=circuit_breaker_run_id,
-                    )
-                    raise capacity_error
-                rate_limit_error = self._provider_rate_limit_error(
+                (
                     response,
+                    runtime_contract,
+                    dispatch_rate_admission,
+                    retry_contract_anchor,
+                    capacity_reprobe,
+                ) = self._post_model_request(
+                    role=spec.role,
                     operation='batch',
+                    url=url,
+                    body=body,
+                    headers=headers,
+                    timeout_seconds=self.batch_http_timeout_seconds,
+                    request_run_id=circuit_breaker_run_id,
+                    capacity_reprobe=capacity_reprobe,
+                    retry_contract_anchor=retry_contract_anchor,
+                    retry_contract_change_message=(
+                        'OpenClaw runtime contract changed between batch '
+                        'retry attempts'
+                    ),
+                    failed_contract_change_message=(
+                        'OpenClaw runtime contract changed during failed '
+                        'batch dispatch attempt'
+                    ),
+                    started_event='dispatch_batch_request',
+                    started_log_fields={
+                        'request_run_id': request_run_id,
+                        'dispatch_id': dispatch_id,
+                        'attempt_id': attempt_id,
+                        'agent_name': spec.agent_name,
+                        'role': spec.role,
+                        'market_date': market_date.isoformat(),
+                        'session_key': request_session_key,
+                        'batch_symbols': batch_symbols,
+                        'slot': slot,
+                        'session_reuse_mode': session_reuse_mode,
+                        'request_marker': request_marker,
+                    },
                 )
-                if rate_limit_error is not None:
-                    self._trip_circuit_breaker(
-                        rate_limit_error,
-                        request_run_id=circuit_breaker_run_id,
-                    )
-                    raise rate_limit_error
+                request_provenance[
+                    'dispatch_rate_admission'
+                ] = dispatch_rate_admission
+                request_provenance['runtime_contract'] = runtime_contract
                 if response.status_code >= 500:
-                    raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw batch server error '
+                        f'{response.status_code}: {response.text[:300]}'
+                    )
                 if response.status_code in (408, 409):
-                    raise AgentDispatchRetryableError(f'OpenClaw batch retryable error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw batch retryable error '
+                        f'{response.status_code}: {response.text[:300]}'
+                    )
                 if response.status_code >= 400:
-                    raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchTerminalError(
+                        f'OpenClaw batch failed {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 parsed = response.json()
                 message_output_text = None
                 for item in parsed.get('output', []):

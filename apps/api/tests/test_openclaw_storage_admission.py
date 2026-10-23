@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.feedback_failure_taxonomy import classify_feedback_failure
 from app.agent_context.openclaw_storage_admission import (
     inspect_openclaw_storage_admission,
@@ -21,6 +22,15 @@ from app.core.settings import Settings
 
 
 class OpenClawStorageAdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dispatch_coordinator_patcher = patch.object(
+            orchestrator_module,
+            '_OPENCLAW_DISPATCH_COORDINATOR',
+            orchestrator_module._OpenClawDispatchCoordinator(),
+        )
+        self.dispatch_coordinator_patcher.start()
+        self.addCleanup(self.dispatch_coordinator_patcher.stop)
+
     def test_default_dispatch_guard_keeps_twenty_gibibytes_free(self) -> None:
         self.assertEqual(
             20 * 1024 * 1024 * 1024,
