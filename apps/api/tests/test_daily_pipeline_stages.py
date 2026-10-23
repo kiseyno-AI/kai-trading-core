@@ -4526,6 +4526,55 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(feedback_retry_service.calls, [])
         self.assertEqual(evaluation_service.calls, [])
 
+    def test_execute_stage_allows_expired_analysis_replay_without_plan(self) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        evaluation_service = _FakeSignalDeciderEvaluationService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+            decision_loop_service=evaluation_service,
+        )
+        market = MagicMock(
+            state='OPEN',
+            server_time='2026-09-14T10:00:00+09:00',
+        )
+        call_kwargs = {
+            'market_date': '2026-09-11',
+            'symbols': ['005930'],
+            'markets': [],
+            'force': False,
+            'bypass_prerequisite_gate': True,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+            'allow_expired_analysis_replay': True,
+        }
+
+        with patch(
+            'app.eod.daily_pipeline_stages.get_market_state',
+            return_value=market,
+        ):
+            feedback_result = service._execute_stage(
+                stage_id='agent_feedback_summaries',
+                **call_kwargs,
+            )
+            evaluation_result = service._execute_stage(
+                stage_id='signal_decider_evaluations',
+                **call_kwargs,
+            )
+
+        self.assertTrue(feedback_result['completed'])
+        self.assertEqual(
+            evaluation_result['summary']['evaluations_upserted'],
+            4,
+        )
+        self.assertEqual(len(feedback_retry_service.calls), 1)
+        self.assertEqual(len(evaluation_service.calls), 1)
+
     def test_execute_decider_crossing_market_open_finishes_as_expired(
         self,
     ) -> None:

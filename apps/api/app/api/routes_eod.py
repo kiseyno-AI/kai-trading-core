@@ -127,6 +127,7 @@ class EODPipelineRunRequest(BaseModel):
     markets: list[str] | None = None
     force: bool = False
     bypass_prerequisite_gate: bool = False
+    allow_expired_analysis_replay: bool = False
     refresh_universe: bool | None = None
     fs_div: str | None = None
     symbol_limit: int | None = Field(default=None, ge=1)
