@@ -838,6 +838,10 @@ class DailyPipelineStageService:
         if (
             existing_pipeline_run_id is None
             and not inherit_feedback_prerequisite_admission
+            and not (
+                bypass_prerequisite_gate
+                and allow_expired_analysis_replay
+            )
             and self._requires_persisted_feedback_prerequisite_preflight(
                 resolved_stages,
                 required_stage_ids=feedback_prerequisite_stage_ids,
