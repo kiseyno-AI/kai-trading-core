@@ -2792,6 +2792,39 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(self.run_state_service.runs, [])
         self.assertEqual(feedback_retry_service.calls, [])
 
+    def test_expired_analysis_replay_can_explicitly_bypass_preflight(self) -> None:
+        service = DailyPipelineStageService()
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+            ) as inspect_prerequisites,
+            patch.object(
+                service,
+                '_execute_stage',
+                return_value={'status': 'completed'},
+            ) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['agent_feedback_summaries'],
+                bypass_prerequisite_gate=True,
+                allow_expired_analysis_replay=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        inspect_prerequisites.assert_not_called()
+        self.assertTrue(
+            execute_stage.call_args.kwargs['bypass_prerequisite_gate']
+        )
+        self.assertTrue(
+            execute_stage.call_args.kwargs[
+                'allow_expired_analysis_replay'
+            ]
+        )
+
     def test_point_in_time_suffix_keeps_date_bounded_numeric_prerequisites(
         self,
     ) -> None:
