@@ -102,18 +102,49 @@ class _AnySymbolTurnoverFrame:
 class PykrxPipelineResultStatusTests(TestCase):
     def test_minor_market_risk_gap_is_completed_and_audited(self) -> None:
         self.assertEqual(
-            _completion_status_for_gap(failed=7, total=2675),
+            _completion_status_for_gap(
+                failed=7,
+                total=2675,
+                treat_minor_gap_as_completed=True,
+            ),
             'completed',
         )
-        details = _gap_policy_details(failed=7, total=2675)
+        details = _gap_policy_details(
+            failed=7,
+            total=2675,
+            treat_minor_gap_as_completed=True,
+        )
         self.assertTrue(details['is_minor_missing_gap'])
         self.assertTrue(details['minor_missing_gap_treated_as_success'])
 
     def test_market_risk_gap_at_threshold_remains_partial(self) -> None:
         self.assertEqual(
-            _completion_status_for_gap(failed=10, total=100),
+            _completion_status_for_gap(
+                failed=10,
+                total=100,
+                treat_minor_gap_as_completed=True,
+            ),
             'partial',
         )
+
+    def test_non_market_risk_minor_gap_remains_partial_and_retryable(self) -> None:
+        for stage in (
+            'price_collection',
+            'technical_snapshots',
+            'action_summaries',
+            'trending_ranks',
+            'signal_features',
+        ):
+            with self.subTest(stage=stage):
+                self.assertEqual(
+                    _completion_status_for_gap(failed=1, total=100),
+                    'partial',
+                )
+                details = _gap_policy_details(failed=1, total=100)
+                self.assertTrue(details['is_minor_missing_gap'])
+                self.assertFalse(
+                    details['minor_missing_gap_treated_as_success']
+                )
 
     def test_failed_symbol_diagnostics_are_bounded_for_stage_persistence(
         self,
@@ -12329,6 +12360,19 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['market_risk_filter']['results_failed'], 1)
         self.assertEqual(result['retry_symbols'], ['000019'])
         self.assertEqual(result['downstream_retry_symbols'], ['000019'])
+        stage_progress = complete_run.call_args.kwargs['run_metadata']['stage_progress']
+        self.assertEqual(stage_progress['signal_features']['status'], 'partial')
+        self.assertFalse(
+            stage_progress['signal_features'][
+                'minor_missing_gap_treated_as_success'
+            ]
+        )
+        self.assertEqual(stage_progress['market_risk_filter']['status'], 'completed')
+        self.assertTrue(
+            stage_progress['market_risk_filter'][
+                'minor_missing_gap_treated_as_success'
+            ]
+        )
         complete_run.assert_called_once_with(
             12,
             status='completed_with_errors',
