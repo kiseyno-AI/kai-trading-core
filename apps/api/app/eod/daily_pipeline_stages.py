@@ -602,6 +602,7 @@ class DailyPipelineStageService:
         markets: Sequence[str] | None = None,
         force: bool = False,
         bypass_prerequisite_gate: bool = False,
+        allow_expired_analysis_replay: bool = False,
         refresh_universe: bool | None = None,
         fs_div: str | None = None,
         symbol_limit: int | None = None,
@@ -1308,6 +1309,9 @@ class DailyPipelineStageService:
                     'reuse_existing_feedback': reuse_existing_feedback,
                     'feedback_force_recompute': bool(force and not reuse_existing_feedback),
                     'bypass_prerequisite_gate': bypass_prerequisite_gate,
+                    'allow_expired_analysis_replay': (
+                        allow_expired_analysis_replay
+                    ),
                     'inherited_feedback_prerequisite_admission': (
                         inherit_feedback_prerequisite_admission
                     ),
@@ -1855,6 +1859,9 @@ class DailyPipelineStageService:
                             bypass_prerequisite_gate=(
                                 bypass_prerequisite_gate
                                 or inherit_feedback_prerequisite_admission
+                            ),
+                            allow_expired_analysis_replay=(
+                                allow_expired_analysis_replay
                             ),
                             fs_div=resolved_fs_div,
                             symbol_limit=symbol_limit,
@@ -3060,6 +3067,7 @@ class DailyPipelineStageService:
         provider_admission_fence_owned: bool = False,
         run_id: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
+        allow_expired_analysis_replay: bool = False,
     ) -> dict[str, Any]:
         if (
             point_in_time_recovery
@@ -3079,7 +3087,10 @@ class DailyPipelineStageService:
                 'market_date': market_date,
                 'stage': stage_id,
             }
-        if stage_id in EXPIRED_DECISION_REPLAY_STAGE_IDS:
+        if (
+            stage_id in EXPIRED_DECISION_REPLAY_STAGE_IDS
+            and not allow_expired_analysis_replay
+        ):
             expired_decision_result = build_expired_decision_replay_result(
                 stage_id=stage_id,
                 market_date=market_date,
@@ -3481,13 +3492,17 @@ class DailyPipelineStageService:
                 force=force and not reuse_existing_feedback,
                 bypass_prerequisite_gate=bypass_prerequisite_gate,
             )
-            expired_after_completion = build_expired_decision_replay_result(
-                stage_id=stage_id,
-                market_date=market_date,
-                market=get_market_state(),
-                allow_same_day_intraday_watch_continuation=(
-                    allow_same_day_intraday_watch_continuation
-                ),
+            expired_after_completion = (
+                None
+                if allow_expired_analysis_replay
+                else build_expired_decision_replay_result(
+                    stage_id=stage_id,
+                    market_date=market_date,
+                    market=get_market_state(),
+                    allow_same_day_intraday_watch_continuation=(
+                        allow_same_day_intraday_watch_continuation
+                    ),
+                )
             )
             if expired_after_completion is not None:
                 return {
@@ -3530,10 +3545,14 @@ class DailyPipelineStageService:
                 symbols=symbols,
                 force_recompute=force,
             )
-            expired_after_completion = build_expired_decision_replay_result(
-                stage_id=stage_id,
-                market_date=market_date,
-                market=get_market_state(),
+            expired_after_completion = (
+                None
+                if allow_expired_analysis_replay
+                else build_expired_decision_replay_result(
+                    stage_id=stage_id,
+                    market_date=market_date,
+                    market=get_market_state(),
+                )
             )
             if expired_after_completion is not None:
                 return {
