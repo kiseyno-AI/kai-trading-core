@@ -650,6 +650,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch('app.eod.runner.async_get_market_state', return_value=market_state),
+            patch(
+                'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                new=AsyncMock(),
+            ),
             patch('app.eod.runner.refresh_master_if_due') as refresh_master,
             patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due') as refresh_plan,
             patch(
@@ -696,6 +700,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch('app.eod.runner.asyncio.to_thread', side_effect=run_inline) as to_thread,
             patch('app.eod.runner.async_get_market_state', return_value=market_state),
+            patch(
+                'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                new=AsyncMock(),
+            ),
             patch('app.eod.runner.refresh_master_if_due'),
             patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'),
             patch(
@@ -969,6 +977,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch('app.eod.runner.async_get_market_state', return_value=market_state),
+            patch(
+                'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                new=AsyncMock(),
+            ),
             patch('app.eod.runner.refresh_master_if_due'),
             patch('app.eod.runner.signal_decider_next_open_execution_service.refresh_plan_if_due'),
             patch('app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution', return_value=True),
@@ -1483,6 +1495,72 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         refresh_snapshot.assert_not_awaited()
         refresh_portfolio.assert_not_awaited()
 
+    async def test_closed_loop_refreshes_snapshot_before_starting_daily_pipeline_when_startup_maintenance_disabled(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        market_state = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-10-23T16:00:00+09:00',
+            session_open_at='2026-10-23T09:00:00+09:00',
+            session_close_at='2026-10-23T15:30:00+09:00',
+        )
+        events: list[str] = []
+
+        async def refresh_snapshot(**_kwargs: object) -> None:
+            events.append('snapshot')
+
+        async def schedule_daily(**_kwargs: object) -> None:
+            events.append('schedule')
+            from app.eod.runner import auto_pykrx_eod_scheduler
+
+            auto_pykrx_eod_scheduler.state.active_task = True
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        with (
+            patch('app.eod.runner.settings.background_runner_enabled', True),
+            patch('app.eod.runner.settings.startup_maintenance_enabled', False),
+            patch('app.eod.runner.async_get_market_state', return_value=market_state),
+            patch(
+                'app.eod.runner.auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due',
+                new=AsyncMock(side_effect=schedule_daily),
+            ) as schedule_daily_pipeline,
+            patch(
+                'app.eod.runner.market_snapshot_service.refresh_market_snapshot_if_due',
+                new=AsyncMock(side_effect=refresh_snapshot),
+            ) as refresh_market_snapshot,
+            patch(
+                'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
+                new=AsyncMock(),
+            ) as reconcile,
+            patch(
+                'app.eod.runner.portfolio_summary_service.refresh_portfolio_summary_if_due',
+                new=AsyncMock(),
+            ) as refresh_portfolio,
+            patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+        ):
+            try:
+                runner._running = True
+                await runner._run_loop()
+            finally:
+                from app.eod.runner import auto_pykrx_eod_scheduler
+
+                auto_pykrx_eod_scheduler.state.active_task = False
+
+        self.assertEqual(events, ['snapshot', 'schedule'])
+        refresh_market_snapshot.assert_awaited_once_with(
+            trigger='background_runner:closed:daily_pipeline_preflight',
+            force_index=False,
+        )
+        schedule_daily_pipeline.assert_awaited_once_with()
+        reconcile.assert_not_awaited()
+        refresh_portfolio.assert_not_awaited()
+
     async def test_open_loop_defers_heavy_prior_eod_recovery_until_market_close(
         self,
     ) -> None:
@@ -1613,6 +1691,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         try:
             with (
                 patch('app.eod.runner.settings.background_runner_enabled', True),
+                patch('app.eod.runner.settings.startup_maintenance_enabled', False),
                 patch('app.eod.runner.async_get_market_state', return_value=market_state),
                 patch('app.eod.runner.refresh_master_if_due') as refresh_master,
                 patch(
@@ -1750,7 +1829,9 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         schedule_daily.assert_awaited_once_with()
 
-    async def test_closed_loop_skips_noncritical_background_work_when_daily_pipeline_active(self) -> None:
+    async def test_closed_loop_preflights_snapshot_but_skips_other_background_work_when_daily_pipeline_starts(
+        self,
+    ) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)
         market_state = MarketState(
             market='KRX',
@@ -1800,7 +1881,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         schedule_daily.assert_awaited_once_with()
         reconcile.assert_not_awaited()
-        refresh_snapshot.assert_not_awaited()
+        refresh_snapshot.assert_awaited_once_with(
+            trigger='background_runner:closed:daily_pipeline_preflight',
+            force_index=False,
+        )
         refresh_portfolio.assert_not_awaited()
 
     async def test_session_cleanup_continues_while_daily_pipeline_is_active(self) -> None:

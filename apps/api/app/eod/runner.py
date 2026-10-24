@@ -491,8 +491,21 @@ class EODBackgroundRunner:
                     await asyncio.sleep(self.interval_seconds)
                     continue
                 runtime_background_enabled = settings.background_runner_enabled
-                open_snapshot_refreshed = False
+                market_snapshot_refreshed = False
                 if market.state in {'PREOPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}:
+                    if runtime_background_enabled:
+                        await self._run_async_step(
+                            'market_snapshot_refresh_if_due',
+                            market_snapshot_service.refresh_market_snapshot_if_due(
+                                trigger=(
+                                    f'background_runner:{market.state.lower()}:'
+                                    'daily_pipeline_preflight'
+                                ),
+                                force_index=False,
+                            ),
+                            fail_closed=True,
+                        )
+                        market_snapshot_refreshed = True
                     await self._run_async_step(
                         'auto_pykrx_schedule_daily_pipeline_if_due',
                         auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(
@@ -530,7 +543,7 @@ class EODBackgroundRunner:
                             fail_closed=True,
                         ),
                     )
-                    open_snapshot_refreshed = True
+                    market_snapshot_refreshed = True
                     if settings.signal_decider_wait_recheck_monitoring_enabled:
                         self._schedule_blocking_step(
                             WAIT_RECHECK_SINGLE_FLIGHT_KEY,
@@ -649,7 +662,7 @@ class EODBackgroundRunner:
                         'trading_order_reconciliation_periodic',
                         trading_order_reconciliation_service.run_periodic_if_due(),
                     )
-                    if not open_snapshot_refreshed:
+                    if not market_snapshot_refreshed:
                         await self._run_async_step(
                             'market_snapshot_refresh_if_due',
                             market_snapshot_service.refresh_market_snapshot_if_due(
