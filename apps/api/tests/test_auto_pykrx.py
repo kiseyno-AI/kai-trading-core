@@ -7639,6 +7639,273 @@ class PykrxBackfillServiceTests(TestCase):
             _is_retryable_feedback_rearm_candidate(rate_limited)
         )
 
+    def test_signal_decider_terminal_retry_only_rearms_through_exact_eighth_attempt(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        completed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        latest_pipeline_run = {
+            'id': 581,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': completed_at.isoformat(),
+            'completed_at': completed_at.isoformat(),
+            'run_metadata': {
+                'resolved_stages': [
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'resume_from_stage': 'signal_decider',
+                'reused_eod_collection_run_id': 7,
+                'fs_div': 'CFS',
+                'feedback_knowledge_cutoff': {
+                    'knowledge_cutoff_at': (
+                        '2026-10-20T08:00:00+00:00'
+                    ),
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': ['005930'],
+                },
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'partial',
+                    'details': {
+                        'result_summary': {
+                            'progress': {
+                                'prerequisites': {'ready': True},
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 20,
+                                    'completed_cycles': 1,
+                                    'cycle_number': 2,
+                                    'failure_groups': {
+                                        'dependency/upstream-changed-during-dispatch': {
+                                            # Persisted failure groups can be
+                                            # narrower than aggregate retry
+                                            # counters.
+                                            'count': 7,
+                                            'retryable_count': 7,
+                                            'failure_kinds': [
+                                                'dependency_upstream_changed_during_dispatch'
+                                            ],
+                                        }
+                                    },
+                                    'role_progress': {
+                                        'short-term-decider': {
+                                            'status': 'partial',
+                                            'total_symbols': 80,
+                                            'processed_symbols': 80,
+                                            'completed_symbols': 60,
+                                            'failed_items': 20,
+                                            'retry_pending_symbols': 20,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        },
+                                        'signal-decider': {
+                                            'status': 'completed',
+                                            'total_symbols': 80,
+                                            'processed_symbols': 80,
+                                            'completed_symbols': 80,
+                                            'failed_items': 0,
+                                            'retry_pending_symbols': 0,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete',
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': [
+                                'signal_decider'
+                            ],
+                        }
+                    },
+                },
+            },
+        }
+
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
+        )
+        self.assertEqual(
+            _retryable_feedback_rearm_max_cycles(latest_pipeline_run),
+            2,
+        )
+
+        without_visible_failure_groups = deepcopy(latest_pipeline_run)
+        del without_visible_failure_groups['stages']['signal_decider'][
+            'details'
+        ]['result_summary']['progress']['summary']['failure_groups']
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(
+                without_visible_failure_groups
+            )
+        )
+
+        nonretryable = deepcopy(latest_pipeline_run)
+        failure_group = nonretryable['stages']['signal_decider'][
+            'details'
+        ]['result_summary']['progress']['summary']['failure_groups'][
+            'dependency/upstream-changed-during-dispatch'
+        ]
+        failure_group['retryable_count'] = 6
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(nonretryable)
+        )
+
+        failed_without_marker = deepcopy(latest_pipeline_run)
+        failed_without_marker['stages']['signal_decider'][
+            'status'
+        ] = 'failed'
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(
+                failed_without_marker
+            )
+        )
+
+        invalid_cutoff = deepcopy(latest_pipeline_run)
+        invalid_cutoff['run_metadata']['feedback_knowledge_cutoff'][
+            'knowledge_cutoff_at'
+        ] = '2026-10-20T08:00:00'
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(invalid_cutoff)
+        )
+
+        latest_eod_run = {
+            'id': 7,
+            'status': 'completed',
+            'symbols_failed': 0,
+            'run_metadata': {},
+        }
+        for recovery_attempts in (6, 7):
+            with (
+                self.subTest(recovery_attempts=recovery_attempts),
+                patch(
+                    'app.eod.pykrx_backfill.'
+                    'daily_pipeline_run_state_service.'
+                    'get_latest_run_for_context',
+                    return_value=latest_pipeline_run,
+                ),
+                patch(
+                    'app.eod.pykrx_backfill.'
+                    'daily_pipeline_run_state_service.count_runs',
+                    return_value=recovery_attempts,
+                ),
+                patch.object(
+                    service,
+                    '_preflight_untracked_followup_price_scope',
+                    return_value={
+                        'result': None,
+                        'symbols': [],
+                        'downstream_symbols': [],
+                    },
+                ),
+                patch(
+                    'app.eod.daily_pipeline_stages.'
+                    'daily_pipeline_stage_service.run',
+                    return_value={
+                        'status': 'partial',
+                        'pipeline_run_id': 582,
+                    },
+                ) as resume_followups,
+            ):
+                rearmed = service._resume_auto_daily_followups_if_due(
+                    market_date='2026-10-20',
+                    latest_available_trade_date='2026-10-20',
+                    latest_eod_run=latest_eod_run,
+                    markets=('KOSPI',),
+                )
+
+            self.assertTrue(rearmed['triggered'])
+            self.assertEqual(
+                rearmed['followup_recovery']['attempt'],
+                recovery_attempts + 1,
+            )
+            self.assertEqual(
+                rearmed['followup_recovery']['max_attempts'],
+                8,
+            )
+            self.assertTrue(
+                rearmed['followup_recovery'][
+                    'retryable_feedback_rearm'
+                ]
+            )
+            recovery_kwargs = resume_followups.call_args.kwargs
+            self.assertEqual(recovery_kwargs['feedback_max_cycles'], 2)
+            self.assertEqual(recovery_kwargs['fs_div'], 'CFS')
+            self.assertEqual(
+                recovery_kwargs['summary_cutoff_proof'],
+                {
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': None,
+                    'expected_completed_symbols': ['005930'],
+                    'knowledge_cutoff_at': (
+                        '2026-10-20T08:00:00+00:00'
+                    ),
+                    'fs_div': 'CFS',
+                },
+            )
+            self.assertNotIn('symbols', recovery_kwargs)
+            self.assertNotIn(
+                'inherited_feedback_retry_config',
+                recovery_kwargs,
+            )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.'
+                'daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'daily_pipeline_run_state_service.count_runs',
+                return_value=8,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as capped_resume_followups,
+        ):
+            capped = service._resume_auto_daily_followups_if_due(
+                market_date='2026-10-20',
+                latest_available_trade_date='2026-10-20',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+            )
+
+        self.assertFalse(capped['triggered'])
+        self.assertEqual(capped['reason'], 'followup_recovery_limit_reached')
+        self.assertEqual(capped['followup_recovery']['attempts'], 8)
+        self.assertEqual(capped['followup_recovery']['max_attempts'], 8)
+        capped_resume_followups.assert_not_called()
+
     def test_retired_zero_work_chain_rearms_from_contiguous_prior_signal_evidence(
         self,
     ) -> None:

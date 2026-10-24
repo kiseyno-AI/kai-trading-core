@@ -1382,6 +1382,91 @@ def _feedback_dispatch_circuit_evidence(
     return True, stage_id, marker
 
 
+def _is_exact_signal_decider_retry_suffix(
+    pipeline_run: object,
+) -> bool:
+    if not isinstance(pipeline_run, Mapping):
+        return False
+    run_metadata = pipeline_run.get('run_metadata')
+    stages = pipeline_run.get('stages')
+    if not isinstance(run_metadata, Mapping) or not isinstance(
+        stages,
+        Mapping,
+    ):
+        return False
+    expected_stages = (
+        'signal_decider',
+        'next_open_execution_plan',
+        'signal_decider_evaluations',
+    )
+    return bool(
+        str(pipeline_run.get('trigger') or '').strip()
+        == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        and str(pipeline_run.get('status') or '').strip().lower()
+        == 'blocked'
+        and tuple(run_metadata.get('resolved_stages') or ())
+        == expected_stages
+        and str(run_metadata.get('resume_from_stage') or '').strip()
+        == 'signal_decider'
+        and set(stages) == set(expected_stages)
+        and all(
+            str(
+                (
+                    stages.get(stage_id)
+                    if isinstance(stages.get(stage_id), Mapping)
+                    else {}
+                ).get('status')
+                or ''
+            ).strip().lower()
+            == 'blocked'
+            for stage_id in expected_stages[1:]
+        )
+        and str(
+            _stage_result_summary(
+                stages.get('next_open_execution_plan')
+            ).get('reason')
+            or ''
+        ).strip()
+        == 'signal_decider_stage_incomplete'
+        and str(
+            _stage_result_summary(
+                stages.get('signal_decider_evaluations')
+            ).get('reason')
+            or ''
+        ).strip()
+        == 'declared_dependencies_incomplete'
+        and _stage_result_summary(
+            stages.get('signal_decider_evaluations')
+        ).get('incomplete_dependencies')
+        == ['signal_decider']
+    )
+
+
+def _feedback_retry_stage_id(pipeline_run: object) -> str:
+    marker_present, marker_stage_id, _ = (
+        _feedback_dispatch_circuit_evidence(pipeline_run)
+    )
+    if marker_present and marker_stage_id is not None:
+        return marker_stage_id
+    if not isinstance(pipeline_run, Mapping):
+        return 'agent_feedback_summaries'
+    stages = pipeline_run.get('stages')
+    signal_stage = (
+        stages.get('signal_decider')
+        if isinstance(stages, Mapping)
+        else None
+    )
+    if (
+        not marker_present
+        and _is_exact_signal_decider_retry_suffix(pipeline_run)
+        and isinstance(signal_stage, Mapping)
+        and str(signal_stage.get('status') or '').strip().lower()
+        == 'partial'
+    ):
+        return 'signal_decider'
+    return 'agent_feedback_summaries'
+
+
 def _is_valid_retryable_feedback_dispatch_circuit_marker(
     marker: Mapping[str, Any] | None,
 ) -> bool:
@@ -1499,66 +1584,16 @@ def _is_retryable_feedback_rearm_candidate(
     ) = _feedback_dispatch_circuit_evidence(pipeline_run)
     if circuit_marker_present and circuit_stage_id is None:
         return False
-    retry_stage_id = circuit_stage_id or 'agent_feedback_summaries'
+    retry_stage_id = _feedback_retry_stage_id(pipeline_run)
     if (
         retry_stage_id == 'signal_decider'
         and _summary_cutoff_proof_from_run_metadata(run_metadata) is None
     ):
         return False
     stages = pipeline_run.get('stages')
-    if retry_stage_id == 'signal_decider' and not (
-        str(pipeline_run.get('trigger') or '').strip()
-        == AUTO_FOLLOWUP_RECOVERY_TRIGGER
-        and str(pipeline_run.get('status') or '').strip().lower()
-        == 'blocked'
-        and isinstance(stages, Mapping)
-        and tuple(run_metadata.get('resolved_stages') or ())
-        == (
-            'signal_decider',
-            'next_open_execution_plan',
-            'signal_decider_evaluations',
-        )
-        and str(run_metadata.get('resume_from_stage') or '').strip()
-        == 'signal_decider'
-        and set(stages)
-        == {
-            'signal_decider',
-            'next_open_execution_plan',
-            'signal_decider_evaluations',
-        }
-        and all(
-            str(
-                (
-                    stages.get(stage_id)
-                    if isinstance(stages.get(stage_id), Mapping)
-                    else {}
-                ).get('status')
-                or ''
-            ).strip().lower()
-            == 'blocked'
-            for stage_id in (
-                'next_open_execution_plan',
-                'signal_decider_evaluations',
-            )
-        )
-        and str(
-            _stage_result_summary(
-                stages.get('next_open_execution_plan')
-            ).get('reason')
-            or ''
-        ).strip()
-        == 'signal_decider_stage_incomplete'
-        and str(
-            _stage_result_summary(
-                stages.get('signal_decider_evaluations')
-            ).get('reason')
-            or ''
-        ).strip()
-        == 'declared_dependencies_incomplete'
-        and _stage_result_summary(
-            stages.get('signal_decider_evaluations')
-        ).get('incomplete_dependencies')
-        == ['signal_decider']
+    if (
+        retry_stage_id == 'signal_decider'
+        and not _is_exact_signal_decider_retry_suffix(pipeline_run)
     ):
         return False
     if not isinstance(stages, Mapping):
@@ -1639,16 +1674,53 @@ def _is_retryable_feedback_rearm_candidate(
     )
     if not isinstance(role_progress, Mapping):
         return False
-    if retry_stage_id == 'signal_decider' and not (
-        role_progress
-        and set(role_progress).issubset(DECISION_SUPPORT_AGENT_NAMES)
-        and isinstance(shared_dispatch_circuit, Mapping)
-        and str(shared_dispatch_circuit.get('role') or '').strip()
-        in DECISION_SUPPORT_AGENT_NAMES
-        and str(shared_dispatch_circuit.get('role') or '').strip()
-        in role_progress
-    ):
-        return False
+    if retry_stage_id == 'signal_decider':
+        if not (
+            role_progress
+            and set(role_progress).issubset(
+                DECISION_SUPPORT_AGENT_NAMES
+            )
+            and all(
+                isinstance(role, Mapping)
+                for role in role_progress.values()
+            )
+        ):
+            return False
+        if circuit_marker_present and not (
+            isinstance(shared_dispatch_circuit, Mapping)
+            and str(
+                shared_dispatch_circuit.get('role') or ''
+            ).strip()
+            in DECISION_SUPPORT_AGENT_NAMES
+            and str(
+                shared_dispatch_circuit.get('role') or ''
+            ).strip()
+            in role_progress
+        ):
+            return False
+        if not circuit_marker_present:
+            failure_groups = summary.get('failure_groups')
+            if failure_groups is not None and not isinstance(
+                failure_groups,
+                Mapping,
+            ):
+                return False
+            try:
+                visible_failures_are_retryable = all(
+                    isinstance(group, Mapping)
+                    and int(group.get('count') or 0) > 0
+                    and int(group.get('retryable_count') or 0)
+                    == int(group.get('count') or 0)
+                    for group in (
+                        failure_groups.values()
+                        if isinstance(failure_groups, Mapping)
+                        else ()
+                    )
+                )
+            except (TypeError, ValueError):
+                return False
+            if not visible_failures_are_retryable:
+                return False
     try:
         failed_items = int(summary.get('failed_items') or 0)
         retry_pending_items = sum(
@@ -1749,10 +1821,7 @@ def _retryable_feedback_rearm_source_run_id(
     if not isinstance(pipeline_run, Mapping):
         return None
     stages = pipeline_run.get('stages')
-    _, circuit_stage_id, _ = _feedback_dispatch_circuit_evidence(
-        pipeline_run
-    )
-    retry_stage_id = circuit_stage_id or 'agent_feedback_summaries'
+    retry_stage_id = _feedback_retry_stage_id(pipeline_run)
     stage = (
         stages.get(retry_stage_id)
         if isinstance(stages, Mapping)
@@ -1985,10 +2054,7 @@ def _retryable_feedback_rearm_max_cycles(
     if not isinstance(pipeline_run, Mapping):
         return None
     stages = pipeline_run.get('stages')
-    _, circuit_stage_id, _ = _feedback_dispatch_circuit_evidence(
-        pipeline_run
-    )
-    retry_stage_id = circuit_stage_id or 'agent_feedback_summaries'
+    retry_stage_id = _feedback_retry_stage_id(pipeline_run)
     stage = (
         stages.get(retry_stage_id)
         if isinstance(stages, Mapping)
@@ -3826,9 +3892,12 @@ class PykrxBackfillService:
         )
         (
             feedback_circuit_marker_present,
-            feedback_circuit_stage_id,
+            _,
             feedback_circuit_marker,
         ) = _feedback_dispatch_circuit_evidence(
+            feedback_rearm_evidence_run
+        )
+        feedback_retry_stage_id = _feedback_retry_stage_id(
             feedback_rearm_evidence_run
         )
         if (
@@ -3897,7 +3966,7 @@ class PykrxBackfillService:
                 market_date=market_date,
             )
             if retryable_feedback_rearm_detected
-            and feedback_circuit_stage_id != 'signal_decider'
+            and feedback_retry_stage_id != 'signal_decider'
             else None
         )
         retryable_feedback_source_run_id = (
@@ -3930,11 +3999,11 @@ class PykrxBackfillService:
             and retryable_feedback_max_cycles is not None
             and (
                 (
-                    feedback_circuit_stage_id == 'signal_decider'
+                    feedback_retry_stage_id == 'signal_decider'
                     and summary_cutoff_proof is not None
                 )
                 or (
-                    feedback_circuit_stage_id != 'signal_decider'
+                    feedback_retry_stage_id != 'signal_decider'
                     and isinstance(
                         retryable_feedback_rearm_config,
                         Mapping,
@@ -4226,7 +4295,7 @@ class PykrxBackfillService:
             recovery_kwargs['feedback_max_cycles'] = (
                 retryable_feedback_max_cycles
             )
-            if feedback_circuit_stage_id == 'signal_decider':
+            if feedback_retry_stage_id == 'signal_decider':
                 recovery_kwargs['fs_div'] = str(
                     summary_cutoff_proof['fs_div']
                 )
@@ -4293,7 +4362,7 @@ class PykrxBackfillService:
         elif retryable_feedback_rearm_candidate:
             recovery_symbols = (
                 []
-                if feedback_circuit_stage_id == 'signal_decider'
+                if feedback_retry_stage_id == 'signal_decider'
                 else list(
                     retryable_feedback_rearm_config[
                         'requested_symbols'
