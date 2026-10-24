@@ -41,6 +41,7 @@ from app.eod.summary_cutoff_contract import (
     LEGACY_CUTOFF_REPAIR_STAGE_IDS,
     SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION,
     completed_summary_scope_matches_parent,
+    normalize_symbol_codes,
     summary_cutoff_proof_from_stage,
 )
 from app.eod.master import refresh_master_if_due
@@ -675,6 +676,66 @@ class DailyPipelineStageService:
             dict(summary_cutoff_proof)
             if isinstance(summary_cutoff_proof, Mapping)
             else None
+        )
+        summary_cutoff_expected_at_provided = bool(
+            isinstance(normalized_summary_cutoff_proof, dict)
+            and 'knowledge_cutoff_at' in normalized_summary_cutoff_proof
+        )
+        expected_summary_cutoff_at: datetime | None = None
+        if summary_cutoff_expected_at_provided:
+            raw_expected_cutoff_at = normalized_summary_cutoff_proof.get(
+                'knowledge_cutoff_at'
+            )
+            try:
+                parsed_expected_cutoff_at = (
+                    raw_expected_cutoff_at
+                    if isinstance(raw_expected_cutoff_at, datetime)
+                    else datetime.fromisoformat(
+                        str(raw_expected_cutoff_at or '')
+                    )
+                )
+            except (TypeError, ValueError):
+                parsed_expected_cutoff_at = None
+            if (
+                parsed_expected_cutoff_at is not None
+                and parsed_expected_cutoff_at.tzinfo is not None
+                and parsed_expected_cutoff_at.utcoffset() is not None
+            ):
+                expected_summary_cutoff_at = (
+                    parsed_expected_cutoff_at.astimezone(timezone.utc)
+                )
+        expected_completed_symbols_provided = bool(
+            isinstance(normalized_summary_cutoff_proof, dict)
+            and 'expected_completed_symbols'
+            in normalized_summary_cutoff_proof
+        )
+        expected_completed_symbols: list[str] | None = None
+        if expected_completed_symbols_provided:
+            raw_expected_completed_symbols = (
+                normalized_summary_cutoff_proof.get(
+                    'expected_completed_symbols'
+                )
+            )
+            if isinstance(raw_expected_completed_symbols, list):
+                normalized_expected_completed_symbols = (
+                    normalize_symbol_codes(
+                        raw_expected_completed_symbols
+                    )
+                )
+                if (
+                    normalized_expected_completed_symbols
+                    and normalized_expected_completed_symbols
+                    == raw_expected_completed_symbols
+                ):
+                    expected_completed_symbols = (
+                        normalized_expected_completed_symbols
+                    )
+        proof_fs_div = str(
+            (normalized_summary_cutoff_proof or {}).get('fs_div') or ''
+        ).strip().upper()
+        proof_fs_div_provided = bool(
+            isinstance(normalized_summary_cutoff_proof, dict)
+            and 'fs_div' in normalized_summary_cutoff_proof
         )
         if summary_cutoff_contract_repair and not (
             trigger == 'auto_eod_followup_resume'
@@ -1612,6 +1673,18 @@ class DailyPipelineStageService:
                                     (list, tuple),
                                 )
                             )
+                            and (
+                                not summary_cutoff_expected_at_provided
+                                or expected_summary_cutoff_at is not None
+                            )
+                            and (
+                                not expected_completed_symbols_provided
+                                or expected_completed_symbols is not None
+                            )
+                            and (
+                                not proof_fs_div_provided
+                                or proof_fs_div == resolved_fs_div
+                            )
                         )
                         if (
                             trigger == 'auto_eod_followup_resume'
@@ -1653,6 +1726,41 @@ class DailyPipelineStageService:
                                     ),
                                 )
                             )
+                            if (
+                                feedback_cutoff_resolution.get('ready')
+                                is True
+                                and expected_summary_cutoff_at is not None
+                                and feedback_cutoff_resolution.get(
+                                    'knowledge_cutoff_at'
+                                )
+                                != expected_summary_cutoff_at
+                            ):
+                                feedback_cutoff_resolution = {
+                                    **feedback_cutoff_resolution,
+                                    'ready': False,
+                                    'reason': (
+                                        'summary_knowledge_cutoff_mismatch'
+                                    ),
+                                }
+                            resolved_completed_symbols = (
+                                feedback_cutoff_resolution.get(
+                                    'requested_symbols'
+                                )
+                            )
+                            if (
+                                feedback_cutoff_resolution.get('ready')
+                                is True
+                                and expected_completed_symbols is not None
+                                and resolved_completed_symbols
+                                != expected_completed_symbols
+                            ):
+                                feedback_cutoff_resolution = {
+                                    **feedback_cutoff_resolution,
+                                    'ready': False,
+                                    'reason': (
+                                        'summary_completed_scope_mismatch'
+                                    ),
+                                }
                             if (
                                 stage_id == 'signal_decider'
                                 and not proof_source_run_id

@@ -2533,6 +2533,63 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertIn('reused_eod_collection_run_id', compiled.params.values())
         self.assertIn(7, compiled.params.values())
 
+    def test_list_prior_followups_uses_exact_lineage_and_bounded_order(
+        self,
+    ) -> None:
+        prior_runs = [SimpleNamespace(id=579), SimpleNamespace(id=578)]
+        runs_result = MagicMock()
+        runs_result.scalars.return_value = prior_runs
+        first_stages_result = MagicMock()
+        first_stages_result.scalars.return_value = []
+        second_stages_result = MagicMock()
+        second_stages_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.side_effect = [
+            runs_result,
+            first_stages_result,
+            second_stages_result,
+        ]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+        service = DailyPipelineRunStateService()
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch.object(
+                service,
+                '_serialize_run',
+                side_effect=lambda run, _stages: {'id': run.id},
+            ),
+        ):
+            result = service.list_prior_followup_runs_for_lineage(
+                market_date='2026-10-23',
+                reused_eod_collection_run_id=579,
+                before_pipeline_run_id=580,
+                limit=99,
+            )
+
+        self.assertEqual(result, [{'id': 579}, {'id': 578}])
+        statement = session.execute.call_args_list[0].args[0]
+        compiled = statement.compile()
+        compiled_sql = str(compiled)
+        self.assertIn('daily_pipeline_runs.market_date =', compiled_sql)
+        self.assertIn('daily_pipeline_runs.trigger =', compiled_sql)
+        self.assertIn('daily_pipeline_runs.id <', compiled_sql)
+        self.assertIn('reused_eod_collection_run_id', compiled.params.values())
+        self.assertIn(date(2026, 10, 23), compiled.params.values())
+        self.assertIn('auto_eod_followup_resume', compiled.params.values())
+        self.assertIn(579, compiled.params.values())
+        self.assertIn(580, compiled.params.values())
+        self.assertIn(8, compiled.params.values())
+        self.assertIn(
+            'ORDER BY daily_pipeline_runs.started_at DESC, '
+            'daily_pipeline_runs.id DESC',
+            compiled_sql,
+        )
+
     def test_claim_terminal_continuation_accepts_ready_enrichment_warning(
         self,
     ) -> None:

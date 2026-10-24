@@ -12,7 +12,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from app.agent_context.derived_contexts import daily_price_context_service
-from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+from app.agent_context.roles import (
+    DECISION_SUPPORT_AGENT_NAMES,
+    SUMMARIZER_AGENT_NAMES,
+)
 from app.agent_context.prerequisite_service import (
     FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
 )
@@ -286,6 +289,7 @@ def _dedupe_symbol_codes(symbols: Sequence[object]) -> list[str]:
 def _select_summary_cutoff_proof(
     *,
     pipeline_stages: Mapping[str, Any],
+    run_metadata: Mapping[str, Any] | None = None,
     eod_stage_progress: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """Prefer the newest summary and never mask its invalid lineage."""
@@ -294,9 +298,269 @@ def _select_summary_cutoff_proof(
         return _summary_cutoff_proof_from_stage(
             pipeline_stages.get('agent_feedback_summaries')
         )
+    if (
+        isinstance(run_metadata, Mapping)
+        and 'feedback_knowledge_cutoff' in run_metadata
+    ):
+        metadata_proof = _summary_cutoff_proof_from_run_metadata(
+            run_metadata
+        )
+        if metadata_proof is not None:
+            return metadata_proof
+        persisted_cutoff = run_metadata.get(
+            'feedback_knowledge_cutoff'
+        )
+        legacy_missing_summary_marker = bool(
+            isinstance(persisted_cutoff, Mapping)
+            and persisted_cutoff.get('ready') is False
+            and str(persisted_cutoff.get('reason') or '').strip()
+            == 'summary_run_missing'
+            and not str(
+                persisted_cutoff.get('source_run_id') or ''
+            ).strip()
+            and str(
+                persisted_cutoff.get('feedback_scope_mode') or ''
+            ).strip()
+            == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+        )
+        if not legacy_missing_summary_marker:
+            return None
     return _summary_cutoff_proof_from_stage(
         eod_stage_progress.get('agent_feedback_summaries')
     )
+
+
+def _summary_cutoff_proof_from_run_metadata(
+    run_metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    persisted_cutoff = run_metadata.get('feedback_knowledge_cutoff')
+    if not isinstance(persisted_cutoff, Mapping):
+        return None
+    raw_cutoff_at = persisted_cutoff.get('knowledge_cutoff_at')
+    try:
+        cutoff_at = (
+            raw_cutoff_at
+            if isinstance(raw_cutoff_at, datetime)
+            else datetime.fromisoformat(str(raw_cutoff_at or ''))
+        )
+    except (TypeError, ValueError):
+        return None
+    if not (
+        persisted_cutoff.get('ready') is True
+        and cutoff_at.tzinfo is not None
+        and cutoff_at.utcoffset() is not None
+    ):
+        return None
+    source_run_id = str(
+        persisted_cutoff.get('source_run_id') or ''
+    ).strip()
+    feedback_scope_mode = str(
+        persisted_cutoff.get('feedback_scope_mode') or ''
+    ).strip()
+    fs_div = str(run_metadata.get('fs_div') or '').strip().upper()
+    requested_symbols = persisted_cutoff.get('requested_symbols')
+    if not (
+        source_run_id
+        and feedback_scope_mode
+        in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and fs_div in {'CFS', 'OFS'}
+        and isinstance(requested_symbols, list)
+    ):
+        return None
+    normalized_symbols = _dedupe_symbol_codes(requested_symbols)
+    if not normalized_symbols or normalized_symbols != requested_symbols:
+        return None
+    return {
+        'source_run_id': source_run_id,
+        'feedback_scope_mode': feedback_scope_mode,
+        # Persisted feedback metadata stores the completed summarizer
+        # intersection, not the original admitted request scope. Re-resolve
+        # the exact source without narrowing its request, then compare the
+        # returned completed symbols below the stage boundary.
+        'requested_symbols': None,
+        'expected_completed_symbols': normalized_symbols,
+        'knowledge_cutoff_at': cutoff_at.astimezone(
+            timezone.utc
+        ).isoformat(),
+        'fs_div': fs_div,
+    }
+
+
+def _is_retired_decider_cutoff_zero_work_run(
+    pipeline_run: object,
+) -> bool:
+    """Recognize only the zero-work suffix emitted by the retired bug."""
+
+    if not isinstance(pipeline_run, Mapping):
+        return False
+    metadata = pipeline_run.get('run_metadata')
+    stages = pipeline_run.get('stages')
+    if not isinstance(metadata, Mapping) or not isinstance(stages, Mapping):
+        return False
+    cutoff = metadata.get('feedback_knowledge_cutoff')
+    expected_stage_ids = (
+        'signal_decider',
+        'next_open_execution_plan',
+        'signal_decider_evaluations',
+    )
+    if not (
+        str(pipeline_run.get('trigger') or '').strip()
+        == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        and str(pipeline_run.get('status') or '').strip().lower()
+        == 'blocked'
+        and str(pipeline_run.get('current_stage') or '').strip()
+        == 'signal_decider_evaluations'
+        and tuple(metadata.get('resolved_stages') or ())
+        == expected_stage_ids
+        and str(metadata.get('resume_from_stage') or '').strip()
+        == 'signal_decider'
+        and type(metadata.get('reused_eod_collection_run_id')) is int
+        and int(metadata['reused_eod_collection_run_id']) > 0
+        and isinstance(cutoff, Mapping)
+        and cutoff.get('ready') is False
+        and str(cutoff.get('reason') or '').strip()
+        == 'summary_cutoff_proof_unavailable'
+        and all(
+            cutoff.get(field) is None
+            for field in (
+                'knowledge_cutoff_at',
+                'source_run_id',
+                'feedback_scope_mode',
+                'requested_symbols',
+            )
+        )
+        and set(stages) == set(expected_stage_ids)
+        and str(metadata.get('fs_div') or '').strip().upper()
+        in {'CFS', 'OFS'}
+        and isinstance(metadata.get('markets'), list)
+        and bool(metadata.get('markets'))
+        and type(metadata.get('point_in_time_recovery')) is bool
+    ):
+        return False
+
+    def zero_work_stage(stage_id: str, status: str) -> bool:
+        stage = stages.get(stage_id)
+        return bool(
+            isinstance(stage, Mapping)
+            and str(stage.get('status') or '').strip().lower() == status
+            and isinstance(stage.get('source_run_ids'), Mapping)
+            and not stage.get('source_run_ids')
+            and all(
+                type(stage.get(field)) is int
+                and stage.get(field) == 0
+                for field in (
+                    'processed',
+                    'total',
+                    'succeeded',
+                    'failed',
+                    'remaining',
+                )
+            )
+        )
+
+    signal_summary = _stage_result_summary(stages['signal_decider'])
+    plan_summary = _stage_result_summary(
+        stages['next_open_execution_plan']
+    )
+    evaluation_summary = _stage_result_summary(
+        stages['signal_decider_evaluations']
+    )
+    cutoff_resolution = signal_summary.get(
+        'knowledge_cutoff_resolution'
+    )
+    return bool(
+        all(zero_work_stage(stage_id, 'blocked') for stage_id in expected_stage_ids)
+        and str(signal_summary.get('reason') or '').strip()
+        == 'summary_knowledge_cutoff_unavailable'
+        and not signal_summary.get('run_id')
+        and 'openclaw_dispatch_circuit_breaker'
+        not in signal_summary
+        and isinstance(cutoff_resolution, Mapping)
+        and cutoff_resolution.get('ready') is False
+        and str(cutoff_resolution.get('reason') or '').strip()
+        == 'summary_cutoff_proof_unavailable'
+        and all(
+            cutoff_resolution.get(field) is None
+            for field in (
+                'knowledge_cutoff_at',
+                'source_run_id',
+                'feedback_scope_mode',
+                'requested_symbols',
+            )
+        )
+        and str(plan_summary.get('reason') or '').strip()
+        == 'signal_decider_stage_incomplete'
+        and str(evaluation_summary.get('reason') or '').strip()
+        == 'declared_dependencies_incomplete'
+        and evaluation_summary.get('incomplete_dependencies')
+        == ['signal_decider']
+    )
+
+
+def _select_prior_signal_rearm_evidence(
+    *,
+    current_pipeline_run: Mapping[str, Any],
+    prior_pipeline_runs: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], dict[str, Any]] | None:
+    """Select one coherent prior signal circuit row from the same lineage."""
+
+    if not _is_retired_decider_cutoff_zero_work_run(current_pipeline_run):
+        return None
+    current_metadata = current_pipeline_run['run_metadata']
+    current_eod_run_id = int(
+        current_metadata['reused_eod_collection_run_id']
+    )
+    current_market_date = _to_iso_date(
+        current_pipeline_run.get('market_date')
+    )
+    current_run_id = int(current_pipeline_run.get('id') or 0)
+    current_context = {
+        'fs_div': str(current_metadata.get('fs_div') or '')
+        .strip()
+        .upper(),
+        'markets': current_metadata.get('markets'),
+        'point_in_time_recovery': current_metadata.get(
+            'point_in_time_recovery'
+        ),
+    }
+    previous_run_id = current_run_id
+    for prior_run in prior_pipeline_runs:
+        prior_metadata = prior_run.get('run_metadata')
+        if not (
+            isinstance(prior_metadata, Mapping)
+            and 0 < int(prior_run.get('id') or 0) < previous_run_id
+            and _to_iso_date(prior_run.get('market_date'))
+            == current_market_date
+            and prior_metadata.get('reused_eod_collection_run_id')
+            == current_eod_run_id
+            and str(prior_metadata.get('fs_div') or '')
+            .strip()
+            .upper()
+            == current_context['fs_div']
+            and prior_metadata.get('markets')
+            == current_context['markets']
+            and prior_metadata.get('point_in_time_recovery')
+            is current_context['point_in_time_recovery']
+        ):
+            return None
+        previous_run_id = int(prior_run['id'])
+        if _is_retired_decider_cutoff_zero_work_run(prior_run):
+            continue
+        if not _is_retryable_feedback_rearm_candidate(prior_run):
+            return None
+        _, circuit_stage_id, _ = _feedback_dispatch_circuit_evidence(
+            prior_run
+        )
+        proof = _summary_cutoff_proof_from_run_metadata(
+            prior_metadata
+        )
+        if circuit_stage_id == 'signal_decider' and proof is not None:
+            return prior_run, proof
+        return None
+    return None
 
 
 def _is_retryable_missing_upstream_decider_failure(stage: object) -> bool:
@@ -1084,27 +1348,38 @@ def _is_dart_provider_outage_rearm_candidate(
 def _feedback_dispatch_circuit_marker(
     pipeline_run: object,
 ) -> tuple[bool, Mapping[str, Any] | None]:
+    marker_present, _, marker = _feedback_dispatch_circuit_evidence(
+        pipeline_run
+    )
+    return marker_present, marker
+
+
+def _feedback_dispatch_circuit_evidence(
+    pipeline_run: object,
+) -> tuple[bool, str | None, Mapping[str, Any] | None]:
     if not isinstance(pipeline_run, Mapping):
-        return False, None
+        return False, None, None
     stages = pipeline_run.get('stages')
-    stage = (
-        stages.get('agent_feedback_summaries')
-        if isinstance(stages, Mapping)
-        else None
-    )
-    details = stage.get('details') if isinstance(stage, Mapping) else None
-    result_summary = (
-        details.get('result_summary')
-        if isinstance(details, Mapping)
-        else None
-    )
-    if not (
-        isinstance(result_summary, Mapping)
-        and 'openclaw_dispatch_circuit_breaker' in result_summary
-    ):
-        return False, None
-    marker = result_summary.get('openclaw_dispatch_circuit_breaker')
-    return True, marker if isinstance(marker, Mapping) else None
+    if not isinstance(stages, Mapping):
+        return False, None, None
+    evidence: list[tuple[str, Mapping[str, Any] | None]] = []
+    for stage_id in ('agent_feedback_summaries', 'signal_decider'):
+        result_summary = _stage_result_summary(stages.get(stage_id))
+        if 'openclaw_dispatch_circuit_breaker' not in result_summary:
+            continue
+        marker = result_summary.get(
+            'openclaw_dispatch_circuit_breaker'
+        )
+        evidence.append(
+            (
+                stage_id,
+                marker if isinstance(marker, Mapping) else None,
+            )
+        )
+    if len(evidence) != 1:
+        return bool(evidence), None, None
+    stage_id, marker = evidence[0]
+    return True, stage_id, marker
 
 
 def _is_valid_retryable_feedback_dispatch_circuit_marker(
@@ -1217,17 +1492,86 @@ def _is_retryable_feedback_rearm_candidate(
     has_parent_contract = (
         'feedback_retry_parent_contract' in run_metadata
     )
-    circuit_marker_present, shared_dispatch_circuit = (
-        _feedback_dispatch_circuit_marker(pipeline_run)
-    )
+    (
+        circuit_marker_present,
+        circuit_stage_id,
+        shared_dispatch_circuit,
+    ) = _feedback_dispatch_circuit_evidence(pipeline_run)
+    if circuit_marker_present and circuit_stage_id is None:
+        return False
+    retry_stage_id = circuit_stage_id or 'agent_feedback_summaries'
+    if (
+        retry_stage_id == 'signal_decider'
+        and _summary_cutoff_proof_from_run_metadata(run_metadata) is None
+    ):
+        return False
     stages = pipeline_run.get('stages')
+    if retry_stage_id == 'signal_decider' and not (
+        str(pipeline_run.get('trigger') or '').strip()
+        == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        and str(pipeline_run.get('status') or '').strip().lower()
+        == 'blocked'
+        and isinstance(stages, Mapping)
+        and tuple(run_metadata.get('resolved_stages') or ())
+        == (
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        )
+        and str(run_metadata.get('resume_from_stage') or '').strip()
+        == 'signal_decider'
+        and set(stages)
+        == {
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        }
+        and all(
+            str(
+                (
+                    stages.get(stage_id)
+                    if isinstance(stages.get(stage_id), Mapping)
+                    else {}
+                ).get('status')
+                or ''
+            ).strip().lower()
+            == 'blocked'
+            for stage_id in (
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            )
+        )
+        and str(
+            _stage_result_summary(
+                stages.get('next_open_execution_plan')
+            ).get('reason')
+            or ''
+        ).strip()
+        == 'signal_decider_stage_incomplete'
+        and str(
+            _stage_result_summary(
+                stages.get('signal_decider_evaluations')
+            ).get('reason')
+            or ''
+        ).strip()
+        == 'declared_dependencies_incomplete'
+        and _stage_result_summary(
+            stages.get('signal_decider_evaluations')
+        ).get('incomplete_dependencies')
+        == ['signal_decider']
+    ):
+        return False
     if not isinstance(stages, Mapping):
         return has_parent_contract
-    stage = stages.get('agent_feedback_summaries')
+    stage = stages.get(retry_stage_id)
     if not isinstance(stage, Mapping):
-        return has_parent_contract
+        return has_parent_contract and retry_stage_id == 'agent_feedback_summaries'
     stage_status = str(stage.get('status') or '').strip().lower()
-    if has_parent_contract and not circuit_marker_present:
+    if (
+        has_parent_contract
+        and retry_stage_id == 'agent_feedback_summaries'
+        and not circuit_marker_present
+    ):
         # Exact retry lineage is written before the retry starts. Preserve
         # that lane even when execution fails before emitting progress; an
         # explicit marker takes the bounded progress checks below instead.
@@ -1294,6 +1638,16 @@ def _is_retryable_feedback_rearm_candidate(
         else None
     )
     if not isinstance(role_progress, Mapping):
+        return False
+    if retry_stage_id == 'signal_decider' and not (
+        role_progress
+        and set(role_progress).issubset(DECISION_SUPPORT_AGENT_NAMES)
+        and isinstance(shared_dispatch_circuit, Mapping)
+        and str(shared_dispatch_circuit.get('role') or '').strip()
+        in DECISION_SUPPORT_AGENT_NAMES
+        and str(shared_dispatch_circuit.get('role') or '').strip()
+        in role_progress
+    ):
         return False
     try:
         failed_items = int(summary.get('failed_items') or 0)
@@ -1395,8 +1749,12 @@ def _retryable_feedback_rearm_source_run_id(
     if not isinstance(pipeline_run, Mapping):
         return None
     stages = pipeline_run.get('stages')
+    _, circuit_stage_id, _ = _feedback_dispatch_circuit_evidence(
+        pipeline_run
+    )
+    retry_stage_id = circuit_stage_id or 'agent_feedback_summaries'
     stage = (
-        stages.get('agent_feedback_summaries')
+        stages.get(retry_stage_id)
         if isinstance(stages, Mapping)
         else None
     )
@@ -1627,8 +1985,12 @@ def _retryable_feedback_rearm_max_cycles(
     if not isinstance(pipeline_run, Mapping):
         return None
     stages = pipeline_run.get('stages')
+    _, circuit_stage_id, _ = _feedback_dispatch_circuit_evidence(
+        pipeline_run
+    )
+    retry_stage_id = circuit_stage_id or 'agent_feedback_summaries'
     stage = (
-        stages.get('agent_feedback_summaries')
+        stages.get(retry_stage_id)
         if isinstance(stages, Mapping)
         else None
     )
@@ -3103,7 +3465,17 @@ class PykrxBackfillService:
         )
         summary_cutoff_proof = _select_summary_cutoff_proof(
             pipeline_stages=stage_rows,
+            run_metadata=run_metadata,
             eod_stage_progress=latest_eod_stage_progress,
+        )
+        feedback_rearm_evidence_run: Mapping[str, Any] = pipeline_run
+        prior_signal_rearm_evidence_used = False
+        prior_signal_rearm_evidence: (
+            tuple[Mapping[str, Any], dict[str, Any]] | None
+        ) = None
+        needs_prior_signal_rearm_evidence = bool(
+            summary_cutoff_proof is None
+            and _is_retired_decider_cutoff_zero_work_run(pipeline_run)
         )
         resolved_stage_ids = {
             str(stage_id).strip()
@@ -3358,8 +3730,57 @@ class PykrxBackfillService:
             }
             return result
 
+        if (
+            needs_prior_signal_rearm_evidence
+            and recovery_attempts
+            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+        ):
+            try:
+                prior_pipeline_runs = (
+                    daily_pipeline_run_state_service
+                    .list_prior_followup_runs_for_lineage(
+                        market_date=market_date,
+                        reused_eod_collection_run_id=int(
+                            run_metadata[
+                                'reused_eod_collection_run_id'
+                            ]
+                        ),
+                        before_pipeline_run_id=int(pipeline_run['id']),
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.exception(
+                    'Unable to inspect prior feedback recovery evidence for %s',
+                    market_date,
+                )
+                result = build_daily_skip_result(
+                    reason='followup_recovery_state_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'state_unavailable',
+                    'error_type': type(exc).__name__,
+                }
+                return result
+            prior_signal_rearm_evidence = (
+                _select_prior_signal_rearm_evidence(
+                    current_pipeline_run=pipeline_run,
+                    prior_pipeline_runs=prior_pipeline_runs,
+                )
+            )
+            if prior_signal_rearm_evidence is not None:
+                feedback_rearm_evidence_run, summary_cutoff_proof = (
+                    prior_signal_rearm_evidence
+                )
+                prior_signal_rearm_evidence_used = True
+
         cutoff_contract_repair_eligible = (
-            _is_summary_cutoff_contract_repair_candidate(
+            not prior_signal_rearm_evidence_used
+            and _is_summary_cutoff_contract_repair_candidate(
                 pipeline_run=pipeline_run,
                 summary_cutoff_proof=summary_cutoff_proof,
                 price_retry_symbols=price_retry_symbols,
@@ -3399,10 +3820,16 @@ class PykrxBackfillService:
             and _is_dart_provider_outage_rearm_candidate(pipeline_run)
         )
         retryable_feedback_rearm_detected = (
-            _is_retryable_feedback_rearm_candidate(pipeline_run)
+            _is_retryable_feedback_rearm_candidate(
+                feedback_rearm_evidence_run
+            )
         )
-        feedback_circuit_marker_present, feedback_circuit_marker = (
-            _feedback_dispatch_circuit_marker(pipeline_run)
+        (
+            feedback_circuit_marker_present,
+            feedback_circuit_stage_id,
+            feedback_circuit_marker,
+        ) = _feedback_dispatch_circuit_evidence(
+            feedback_rearm_evidence_run
         )
         if (
             feedback_circuit_marker_present
@@ -3432,7 +3859,7 @@ class PykrxBackfillService:
             return result
         feedback_provider_backoff = _feedback_dispatch_rate_limit_backoff(
             marker=feedback_circuit_marker,
-            pipeline_run=pipeline_run,
+            pipeline_run=feedback_rearm_evidence_run,
             now=now,
         )
         if (
@@ -3470,6 +3897,7 @@ class PykrxBackfillService:
                 market_date=market_date,
             )
             if retryable_feedback_rearm_detected
+            and feedback_circuit_stage_id != 'signal_decider'
             else None
         )
         retryable_feedback_source_run_id = (
@@ -3486,7 +3914,9 @@ class PykrxBackfillService:
             else None
         )
         retryable_feedback_max_cycles = (
-            _retryable_feedback_rearm_max_cycles(pipeline_run)
+            _retryable_feedback_rearm_max_cycles(
+                feedback_rearm_evidence_run
+            )
             if retryable_feedback_rearm_detected
             else None
         )
@@ -3497,10 +3927,23 @@ class PykrxBackfillService:
                 MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
                 + MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
             )
-            and isinstance(retryable_feedback_rearm_config, Mapping)
-            and retryable_feedback_knowledge_cutoff_at is not None
-            and retryable_feedback_source_run_id is not None
             and retryable_feedback_max_cycles is not None
+            and (
+                (
+                    feedback_circuit_stage_id == 'signal_decider'
+                    and summary_cutoff_proof is not None
+                )
+                or (
+                    feedback_circuit_stage_id != 'signal_decider'
+                    and isinstance(
+                        retryable_feedback_rearm_config,
+                        Mapping,
+                    )
+                    and retryable_feedback_knowledge_cutoff_at
+                    is not None
+                    and retryable_feedback_source_run_id is not None
+                )
+            )
         )
         if (
             retryable_feedback_rearm_detected
@@ -3780,31 +4223,37 @@ class PykrxBackfillService:
             ),
         }
         if retryable_feedback_rearm_candidate:
-            # Historical suffix-only retries reuse the parent's prerequisite
-            # admission because their completed prefix is no longer the
-            # latest pipeline row. Same-day retries keep the live gate.
-            if point_in_time_recovery:
-                recovery_kwargs[
-                    'inherit_feedback_prerequisite_admission'
-                ] = True
-            recovery_kwargs[
-                'inherited_feedback_knowledge_cutoff_at'
-            ] = retryable_feedback_knowledge_cutoff_at
-            recovery_kwargs['inherited_feedback_source_run_id'] = (
-                retryable_feedback_source_run_id
-            )
             recovery_kwargs['feedback_max_cycles'] = (
                 retryable_feedback_max_cycles
             )
-            recovery_kwargs['feedback_outer_batch_size'] = int(
-                retryable_feedback_rearm_config['outer_batch_size']
-            )
-            recovery_kwargs['fs_div'] = str(
-                retryable_feedback_rearm_config['fs_div']
-            )
-            recovery_kwargs['inherited_feedback_retry_config'] = dict(
-                retryable_feedback_rearm_config
-            )
+            if feedback_circuit_stage_id == 'signal_decider':
+                recovery_kwargs['fs_div'] = str(
+                    summary_cutoff_proof['fs_div']
+                )
+            else:
+                # Historical suffix-only retries reuse the parent's
+                # prerequisite admission because their completed prefix is
+                # no longer the latest pipeline row. Same-day retries keep
+                # the live gate.
+                if point_in_time_recovery:
+                    recovery_kwargs[
+                        'inherit_feedback_prerequisite_admission'
+                    ] = True
+                recovery_kwargs[
+                    'inherited_feedback_knowledge_cutoff_at'
+                ] = retryable_feedback_knowledge_cutoff_at
+                recovery_kwargs['inherited_feedback_source_run_id'] = (
+                    retryable_feedback_source_run_id
+                )
+                recovery_kwargs['feedback_outer_batch_size'] = int(
+                    retryable_feedback_rearm_config['outer_batch_size']
+                )
+                recovery_kwargs['fs_div'] = str(
+                    retryable_feedback_rearm_config['fs_div']
+                )
+                recovery_kwargs[
+                    'inherited_feedback_retry_config'
+                ] = dict(retryable_feedback_rearm_config)
         if (
             summary_cutoff_proof is not None
             and 'signal_decider' in recovery_stages
@@ -3842,8 +4291,14 @@ class PykrxBackfillService:
                 run_metadata.get('symbols') or []
             )
         elif retryable_feedback_rearm_candidate:
-            recovery_symbols = list(
-                retryable_feedback_rearm_config['requested_symbols']
+            recovery_symbols = (
+                []
+                if feedback_circuit_stage_id == 'signal_decider'
+                else list(
+                    retryable_feedback_rearm_config[
+                        'requested_symbols'
+                    ]
+                )
             )
         elif cutoff_contract_repair or cutoff_contract_repair_resume:
             # The decider stage resolves and locks the exact completed
@@ -3981,6 +4436,10 @@ class PykrxBackfillService:
             recovery_result['followup_recovery'][
                 'retryable_feedback_rearm'
             ] = True
+            if prior_signal_rearm_evidence_used:
+                recovery_result['followup_recovery'][
+                    'feedback_rearm_evidence_pipeline_run_id'
+                ] = feedback_rearm_evidence_run.get('id')
         if ordering_repair_stage is not None:
             recovery_result['followup_recovery'][
                 'ordering_repair'

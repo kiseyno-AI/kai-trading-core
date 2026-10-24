@@ -1,6 +1,6 @@
 import threading
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
@@ -1280,6 +1280,117 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             source_run_id='feedback-cycle-summary',
             requested_symbols=None,
         )
+
+    def test_decider_only_persisted_cutoff_revalidates_broad_intersection(
+        self,
+    ) -> None:
+        cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+        completed_symbols = ['005930']
+        admitted_symbols = ['000660', '005930']
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+        )
+        resolution = {
+            'ready': True,
+            'reason': 'latest_completed_summary_cutoff',
+            'knowledge_cutoff_at': cutoff,
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'requested_symbols': completed_symbols,
+            'completed_scope_proof': {
+                'schema_version': (
+                    'completed_summarizer_intersection_v1'
+                ),
+                'completed_symbols': completed_symbols,
+                'admitted_symbols': admitted_symbols,
+            },
+        }
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'requested_symbols': None,
+            'expected_completed_symbols': completed_symbols,
+            'knowledge_cutoff_at': cutoff.isoformat(),
+            'fs_div': 'CFS',
+        }
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value=resolution,
+            ) as resolve_cutoff,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['signal_decider'],
+                trigger='auto_eod_followup_resume',
+                summary_cutoff_proof=proof,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            feedback_retry_service.calls[0]['config'].symbols,
+            tuple(completed_symbols),
+        )
+        resolve_cutoff.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            feedback_scope_mode='broad_feedback_universe',
+            fs_div='CFS',
+            source_run_id='feedback-cycle-summary',
+            requested_symbols=None,
+        )
+
+        for mismatch, reason in (
+            (
+                {
+                    **resolution,
+                    'knowledge_cutoff_at': cutoff + timedelta(seconds=1),
+                },
+                'summary_knowledge_cutoff_mismatch',
+            ),
+            (
+                {**resolution, 'requested_symbols': ['000660']},
+                'summary_completed_scope_mismatch',
+            ),
+        ):
+            mismatched_retry_service = _FakeFeedbackRetryService()
+            mismatched_service = DailyPipelineStageService(
+                feedback_retry_service=mismatched_retry_service,
+            )
+            with (
+                self.subTest(reason=reason),
+                patch.object(
+                    mismatched_service,
+                    '_normalize_market_date',
+                    return_value='2026-04-14',
+                ),
+                patch(
+                    'app.eod.daily_pipeline_stages.'
+                    'resolve_latest_completed_summary_knowledge_cutoff',
+                    return_value=mismatch,
+                ),
+            ):
+                blocked = mismatched_service.run(
+                    market_date='2026-04-14',
+                    stages=['signal_decider'],
+                    trigger='auto_eod_followup_resume',
+                    summary_cutoff_proof=proof,
+                )
+            self.assertEqual(blocked['status'], 'blocked')
+            self.assertEqual(
+                blocked['stages']['signal_decider']['result'][
+                    'knowledge_cutoff_resolution'
+                ]['reason'],
+                reason,
+            )
+            self.assertEqual(mismatched_retry_service.calls, [])
 
     def test_decider_only_latest_summary_is_pinned_to_exact_completed_scope(
         self,

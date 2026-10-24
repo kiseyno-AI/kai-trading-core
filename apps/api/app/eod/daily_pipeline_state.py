@@ -1049,6 +1049,59 @@ class DailyPipelineRunStateService:
             ).scalars()
             return sum(1 for _ in run_ids)
 
+    def list_prior_followup_runs_for_lineage(
+        self,
+        *,
+        market_date: str | date,
+        reused_eod_collection_run_id: int,
+        before_pipeline_run_id: int,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Load a bounded prior recovery chain for one exact EOD lineage."""
+
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_eod_run_id = int(reused_eod_collection_run_id)
+        normalized_before_run_id = int(before_pipeline_run_id)
+        if normalized_eod_run_id <= 0 or normalized_before_run_id <= 0:
+            raise ValueError('lineage and pipeline run ids must be positive')
+
+        with session_scope() as session:
+            rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.trigger
+                        == 'auto_eod_followup_resume',
+                        DailyPipelineRun.id < normalized_before_run_id,
+                        DailyPipelineRun.run_metadata[
+                            'reused_eod_collection_run_id'
+                        ].as_integer()
+                        == normalized_eod_run_id,
+                    )
+                    .order_by(
+                        DailyPipelineRun.started_at.desc(),
+                        DailyPipelineRun.id.desc(),
+                    )
+                    .limit(max(1, min(int(limit), 8)))
+                ).scalars()
+            )
+            serialized: list[dict[str, Any]] = []
+            for row in rows:
+                stage_rows = list(
+                    session.execute(
+                        select(DailyPipelineStageRun)
+                        .where(
+                            DailyPipelineStageRun.pipeline_run_id
+                            == row.id
+                        )
+                        .order_by(DailyPipelineStageRun.id.asc())
+                    ).scalars()
+                )
+                serialized.append(self._serialize_run(row, stage_rows))
+            return serialized
+
     def claim_summary_cutoff_contract_repair_resume(
         self,
         *,

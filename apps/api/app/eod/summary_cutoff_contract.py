@@ -224,21 +224,43 @@ def is_summary_cutoff_contract_repair_candidate(
     if not isinstance(metadata, Mapping) or not isinstance(stages, Mapping):
         return False
     persisted_cutoff = metadata.get('feedback_knowledge_cutoff')
+
+    def retired_missing_summary_marker(value: object) -> bool:
+        if not (
+            isinstance(value, Mapping)
+            and value.get('ready') is False
+        ):
+            return False
+        reason = str(value.get('reason') or '').strip()
+        scope_mode = str(
+            value.get('feedback_scope_mode') or ''
+        ).strip()
+        if reason == 'summary_run_missing':
+            return bool(
+                not str(value.get('source_run_id') or '').strip()
+                and scope_mode
+                == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+            )
+        return bool(
+            reason == 'summary_cutoff_proof_unavailable'
+            and all(
+                value.get(field) is None
+                for field in (
+                    'knowledge_cutoff_at',
+                    'source_run_id',
+                    'feedback_scope_mode',
+                    'requested_symbols',
+                )
+            )
+        )
+
     if not (
         metadata.get('synthetic_recovery_parent') is not True
         and str(metadata.get('resume_from_stage') or '').strip()
         == 'signal_decider'
         and str(pipeline_run.get('current_stage') or '').strip()
         == 'signal_decider_evaluations'
-        and isinstance(persisted_cutoff, Mapping)
-        and persisted_cutoff.get('ready') is False
-        and str(persisted_cutoff.get('reason') or '').strip()
-        == 'summary_run_missing'
-        and not str(persisted_cutoff.get('source_run_id') or '').strip()
-        and str(
-            persisted_cutoff.get('feedback_scope_mode') or ''
-        ).strip()
-        == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+        and retired_missing_summary_marker(persisted_cutoff)
     ):
         return False
 
@@ -292,14 +314,7 @@ def is_summary_cutoff_contract_repair_candidate(
         and str(decider_summary.get('reason') or '').strip()
         == 'summary_knowledge_cutoff_unavailable'
         and isinstance(cutoff_resolution, Mapping)
-        and cutoff_resolution.get('ready') is False
-        and str(cutoff_resolution.get('reason') or '').strip()
-        == 'summary_run_missing'
-        and not str(cutoff_resolution.get('source_run_id') or '').strip()
-        and str(
-            cutoff_resolution.get('feedback_scope_mode') or ''
-        ).strip()
-        == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+        and retired_missing_summary_marker(cutoff_resolution)
     ):
         return False
 
