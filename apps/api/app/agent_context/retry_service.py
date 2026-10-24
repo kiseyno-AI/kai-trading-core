@@ -3152,6 +3152,74 @@ class AgentFeedbackRetryService:
             ),
         }
 
+    @staticmethod
+    def _exact_retry_parent_failed_scope(
+        *,
+        containers: Sequence[Mapping[str, Any]],
+        failed_count: int,
+        all_scope_keys: set[tuple[str, str]],
+        normalized_roles: set[str],
+    ) -> set[tuple[str, str]] | None:
+        def parse_field(
+            field: str,
+        ) -> tuple[bool, set[tuple[str, str]] | None]:
+            parsed_values: list[set[tuple[str, str]]] = []
+            for container in containers:
+                if field not in container:
+                    continue
+                raw_by_role = container.get(field)
+                if not isinstance(raw_by_role, dict):
+                    return True, None
+                parsed: set[tuple[str, str]] = set()
+                for raw_role, raw_symbols in raw_by_role.items():
+                    role = str(raw_role or '').strip().lower()
+                    if role not in normalized_roles or not isinstance(
+                        raw_symbols,
+                        list,
+                    ):
+                        return True, None
+                    for raw_symbol in raw_symbols:
+                        symbol = str(raw_symbol or '').strip().upper()
+                        key = (symbol, role)
+                        if (
+                            not symbol
+                            or key not in all_scope_keys
+                            or key in parsed
+                        ):
+                            return True, None
+                        parsed.add(key)
+                parsed_values.append(parsed)
+            if not parsed_values:
+                return False, None
+            first = parsed_values[0]
+            if any(value != first for value in parsed_values[1:]):
+                return True, None
+            return True, first
+
+        canonical_present, canonical = parse_field(
+            'failed_symbols_by_role'
+        )
+        if canonical_present:
+            return (
+                canonical
+                if canonical is not None
+                and len(canonical) == failed_count
+                else None
+            )
+        if failed_count == 0:
+            return set()
+
+        # Older retry-parent checkpoints persisted only the immutable
+        # first-pass set.  Accept it as final failure evidence only when the
+        # raw scope is exact and its unique cardinality matches the durable
+        # aggregate count.  Any conflict remains fail-closed.
+        legacy_present, legacy = parse_field(
+            'first_pass_failed_symbols_by_role'
+        )
+        if not legacy_present or legacy is None:
+            return None
+        return legacy if len(legacy) == failed_count else None
+
     def _load_reuse_lineage_context(
         self,
         *,
@@ -3313,28 +3381,20 @@ class AgentFeedbackRetryService:
             )
             if isinstance(progress_summary, dict):
                 containers.append(progress_summary)
-            failed_keys: set[tuple[str, str]] = set()
-            for container in containers:
-                raw_by_role = container.get('failed_symbols_by_role')
-                if not isinstance(raw_by_role, dict):
-                    continue
-                for raw_role, raw_symbols in raw_by_role.items():
-                    role = str(raw_role or '').strip().lower()
-                    if role not in normalized_roles or not isinstance(
-                        raw_symbols,
-                        list,
-                    ):
-                        continue
-                    failed_keys.update(
-                        (str(symbol or '').strip().upper(), role)
-                        for symbol in raw_symbols
-                        if str(symbol or '').strip()
-                    )
-            if row.get('status') == 'failed' or int(
-                row.get('failed_count') or 0
-            ) > len(failed_keys):
+            failed_count = max(0, int(row.get('failed_count') or 0))
+            if row.get('status') == 'failed':
                 return all_scope_keys
-            return failed_keys & all_scope_keys
+            exact_failed_keys = self._exact_retry_parent_failed_scope(
+                containers=containers,
+                failed_count=failed_count,
+                all_scope_keys=all_scope_keys,
+                normalized_roles=normalized_roles,
+            )
+            return (
+                exact_failed_keys
+                if exact_failed_keys is not None
+                else all_scope_keys
+            )
 
         for row in rows:
             run_id = str(row['run_id'] or '').strip()

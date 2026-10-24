@@ -3483,8 +3483,10 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                             mode='daily_retry_cycle_role_sequenced'
                         ),
                         summary_payload={
-                            'failed_symbols_by_role': {
-                                role: [failed_symbol]
+                            'progress_summary': {
+                                'first_pass_failed_symbols_by_role': {
+                                    role: [failed_symbol]
+                                }
                             }
                         },
                         started_at=datetime(
@@ -3567,6 +3569,75 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 (prior_parent, failed_symbol, role)
             ],
             (prior_child, 'failed'),
+        )
+
+    def test_retry_parent_failure_scope_rejects_ambiguous_evidence(self):
+        service = AgentFeedbackRetryService()
+        role = 'signal-decider'
+        success_key = ('005930', role)
+        failed_key = ('000660', role)
+        scope = {success_key, failed_key}
+
+        cases = {
+            'canonical_conflicts_with_legacy': [
+                {
+                    'failed_symbols_by_role': {
+                        role: ['005930', '000660']
+                    },
+                    'first_pass_failed_symbols_by_role': {
+                        role: ['000660']
+                    },
+                }
+            ],
+            'legacy_contains_out_of_scope_symbol': [
+                {
+                    'first_pass_failed_symbols_by_role': {
+                        role: ['000660', 'OUTSIDE']
+                    }
+                }
+            ],
+            'legacy_contains_unknown_role': [
+                {
+                    'first_pass_failed_symbols_by_role': {
+                        role: ['000660'],
+                        'unknown-role': ['005930'],
+                    }
+                }
+            ],
+            'canonical_containers_disagree': [
+                {
+                    'failed_symbols_by_role': {role: ['000660']}
+                },
+                {
+                    'failed_symbols_by_role': {role: ['005930']}
+                },
+            ],
+        }
+        for name, containers in cases.items():
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    service._exact_retry_parent_failed_scope(
+                        containers=containers,
+                        failed_count=1,
+                        all_scope_keys=scope,
+                        normalized_roles={role},
+                    )
+                )
+
+        self.assertEqual(
+            service._exact_retry_parent_failed_scope(
+                containers=[
+                    {
+                        'first_pass_failed_symbols_by_role': {
+                            role: ['000660']
+                        }
+                    }
+                ],
+                failed_count=1,
+                all_scope_keys=scope,
+                normalized_roles={role},
+            ),
+            {failed_key},
         )
 
     def test_exact_lease_loss_parent_reuses_only_persisted_child_success(
@@ -6921,6 +6992,13 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(run_state_service.finished[0]['status'], 'partial')
         self.assertFalse(result['completed'])
         self.assertEqual(result['final_pending'], 1)
+        final_progress = run_state_service.finished[0][
+            'summary_payload'
+        ]['progress_summary']
+        self.assertEqual(
+            final_progress['failed_symbols_by_role'],
+            {'technical-summarizer': ['000660']},
+        )
 
     def test_signal_decider_finishes_first_pass_then_retries_only_failed_symbols(self):
         service = AgentFeedbackRetryService()
