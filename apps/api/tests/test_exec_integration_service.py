@@ -16143,6 +16143,136 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.service.list_signal_decider_exec_overview = original_overview
 
+    async def test_dashboard_background_refresh_preserves_passive_wait_observation_cache(self) -> None:
+        wait_symbol = '032080'
+        self._seed_symbol(symbol=wait_symbol, name_ko='Passive wait')
+        passive_observation = {
+            'symbol': wait_symbol,
+            'decision_snapshot_id': 13,
+            'decision_agent_name': 'signal-decider',
+            'source_market_date': self.market_date.isoformat(),
+            'observed_at': '2026-04-29T07:13:00+00:00',
+        }
+        original_overview = self.service.list_signal_decider_exec_overview
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+
+        async def delayed_background_overview(**kwargs):
+            if kwargs.get('refresh'):
+                refresh_started.set()
+                await release_refresh.wait()
+            return await original_overview(**kwargs)
+
+        self.service.list_signal_decider_exec_overview = delayed_background_overview
+        with session_scope() as session:
+            plan_count_before = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+        try:
+            with (
+                patch.object(
+                    self.service,
+                    '_load_passive_signal_wait_observations',
+                    return_value=[passive_observation],
+                ),
+                patch.object(
+                    self.service,
+                    '_load_live_portfolio_holding_membership',
+                    new=AsyncMock(
+                        return_value=PortfolioHoldingSymbolMembership(
+                            symbols=frozenset(),
+                            membership_complete=True,
+                        )
+                    ),
+                ),
+                patch.object(
+                    self.service,
+                    '_load_live_exec_monitoring_symbols',
+                    new=AsyncMock(
+                        return_value=ExecRuntimeMonitoredSymbolMembership(
+                            symbols=frozenset(),
+                            membership_complete=True,
+                        )
+                    ),
+                ),
+                patch(
+                    'app.orders.exec_integration.kis_realtime_price_service'
+                ) as price_service,
+            ):
+                price_service.price_fields_for_symbol.return_value = {
+                    'current_price': None,
+                    'price_as_of': None,
+                    'price_received_at': None,
+                    'price_source': None,
+                    'price_status': 'unavailable',
+                    'display_price_available': False,
+                    'realtime_subscribed': False,
+                    'realtime_subscription_reason': 'not_subscribed',
+                }
+                initial = await self.service.list_runtime_monitored_symbols(
+                    market_date=self.target_trade_date,
+                    refresh=True,
+                    trigger='test',
+                )
+                self.assertIn(
+                    wait_symbol,
+                    initial['realtime_subscription'][
+                        'observation_only_symbols'
+                    ],
+                )
+                await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+                release_refresh.set()
+                tasks = list(self.service._dashboard_refresh_tasks.values())
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+                cached = await self.service.list_runtime_monitored_symbols(
+                    market_date=self.target_trade_date,
+                    refresh=False,
+                    trigger='test',
+                )
+        finally:
+            release_refresh.set()
+            tasks = list(self.service._dashboard_refresh_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.service.list_signal_decider_exec_overview = original_overview
+
+        self.assertIn(
+            wait_symbol,
+            cached['realtime_subscription']['desired_symbols'],
+        )
+        self.assertIn(
+            wait_symbol,
+            cached['realtime_subscription']['observation_only_symbols'],
+        )
+        item = next(
+            item for item in cached['items'] if item['symbol'] == wait_symbol
+        )
+        self.assertEqual(
+            item['monitoring_statuses'],
+            ['signal_wait_observation_only'],
+        )
+        self.assertEqual(item['planned_intents'], [])
+        self.assertEqual(item['tactical_actions'], [])
+        self.assertEqual(item['handoff_intents'], [])
+        self.assertIsNone(item['approved_quantity'])
+        self.assertIsNone(item['approved_notional'])
+        self.assertIsNone(item['trigger_price'])
+        self.assertIsNone(item['chase_limit_price'])
+        self.assertIsNone(item['target_price'])
+        self.assertIsNone(item['stop_loss_price'])
+        self.assertEqual(item['account_references'], [])
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertIsNone(item['exec_agent_action'])
+        self.assertEqual(item['status_counts'], {})
+        self.assertEqual(self.client.post_calls, [])
+        with session_scope() as session:
+            plan_count_after = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+        self.assertEqual(plan_count_after, plan_count_before)
+
     async def test_dashboard_background_refresh_stores_monitored_cache_with_live_holding_filter(self) -> None:
         key = self.service._dashboard_refresh_key(
             target_trade_date=self.target_trade_date,
