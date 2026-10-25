@@ -4019,6 +4019,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
         self.client = FakeExecClient()
         self.service = SignalDeciderExecIntegrationService(client=self.client)
+        self.passive_wait_loader_patcher = patch.object(
+            self.service,
+            '_load_passive_signal_wait_observations',
+            return_value=[],
+        )
+        self.passive_wait_loader_patcher.start()
+        self.addCleanup(self.passive_wait_loader_patcher.stop)
         self.utcnow_patcher = patch(
             'app.orders.exec_integration._utcnow',
             return_value=datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc),
@@ -12832,6 +12839,349 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['current_price'], 50200)
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
+
+    def test_passive_signal_wait_observations_use_latest_validated_krx_snapshot(self) -> None:
+        def snapshot(
+            *,
+            snapshot_id: int,
+            symbol: str,
+            action: str = 'wait',
+            agent_name: str = 'signal-decider',
+            market: str = 'KOSPI',
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                id=snapshot_id,
+                market_date=self.market_date,
+                symbol=symbol,
+                agent_name=agent_name,
+                decision_action=action,
+                next_day_open_action=action,
+                feedback_received_at=datetime(
+                    2026,
+                    4,
+                    29,
+                    7,
+                    snapshot_id % 60,
+                    tzinfo=timezone.utc,
+                ),
+                created_at=datetime(
+                    2026,
+                    4,
+                    29,
+                    7,
+                    snapshot_id % 60,
+                    tzinfo=timezone.utc,
+                ),
+                request_payload={
+                    'symbol_day_context': {
+                        'company': {'market': market},
+                    },
+                },
+            )
+
+        generation_state = {
+            'snapshots': [
+                snapshot(snapshot_id=11, symbol='012030'),
+                snapshot(snapshot_id=12, symbol='012030', action='reject'),
+                snapshot(snapshot_id=13, symbol='032080'),
+                snapshot(snapshot_id=14, symbol='USWAIT', market='NASDAQ'),
+                snapshot(
+                    snapshot_id=15,
+                    symbol='070590',
+                    agent_name='short-term-decider',
+                ),
+                snapshot(snapshot_id=16, symbol='089890', action='reject'),
+                snapshot(snapshot_id=17, symbol='089890'),
+            ],
+        }
+
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            '_load_latest_snapshot_generation_state',
+            return_value=generation_state,
+        ) as generation_loader:
+            observations = (
+                SignalDeciderExecIntegrationService
+                ._load_passive_signal_wait_observations(
+                    source_market_date=self.market_date,
+                    target_trade_date=self.target_trade_date,
+                )
+            )
+
+        self.assertEqual(
+            observations,
+            [
+                {
+                    'symbol': '032080',
+                    'decision_snapshot_id': 13,
+                    'decision_agent_name': 'signal-decider',
+                    'source_market_date': self.market_date.isoformat(),
+                    'observed_at': '2026-04-29T07:13:00+00:00',
+                }
+            ],
+        )
+        generation_loader.assert_called_once_with(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+            allow_post_open_intraday_watch=False,
+        )
+
+    def test_runtime_monitored_symbols_adds_signal_wait_as_observation_only(self) -> None:
+        wait_symbol = '032080'
+        self._seed_symbol(symbol=wait_symbol, name_ko='Passive wait')
+        with session_scope() as session:
+            plan_count_before = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+
+        with patch(
+            'app.orders.exec_integration.kis_realtime_price_service'
+        ) as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {
+                        'status': 'ready',
+                        'mode': 'mock',
+                        'active_monitoring_items': [],
+                        'active_monitoring_facts_complete': True,
+                    },
+                    'items': [],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols=set(),
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=True,
+                    )
+                ),
+                passive_signal_wait_observations=[
+                    {
+                        'symbol': wait_symbol,
+                        'decision_snapshot_id': 13,
+                        'decision_agent_name': 'signal-decider',
+                        'source_market_date': self.market_date.isoformat(),
+                        'observed_at': '2026-04-29T07:13:00+00:00',
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            payload['realtime_subscription']['desired_symbols'],
+            [wait_symbol],
+        )
+        self.assertEqual(
+            payload['realtime_subscription']['observation_only_symbols'],
+            [wait_symbol],
+        )
+        self.assertEqual(payload['realtime_subscription']['desired_symbol_count'], 1)
+        self.assertEqual(payload['summary']['items_total'], 1)
+        item = payload['items'][0]
+        self.assertEqual(item['symbol'], wait_symbol)
+        self.assertEqual(item['name'], 'Passive wait')
+        self.assertEqual(item['market'], 'KOSPI')
+        self.assertEqual(item['monitoring_state'], 'idle')
+        self.assertFalse(item['exec_monitoring_active'])
+        self.assertFalse(item['exec_runtime_showable'])
+        self.assertEqual(
+            item['exec_runtime_state'],
+            'signal_wait_observation_requested',
+        )
+        self.assertEqual(
+            item['exec_runtime_exclusion_reason'],
+            'observation_only_no_order_authority',
+        )
+        self.assertEqual(
+            item['exec_runtime_exclusion_reasons'],
+            ['observation_only_no_order_authority'],
+        )
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertIsNone(item['exec_agent_action'])
+        self.assertFalse(item['held_position'])
+        self.assertEqual(
+            item['monitoring_statuses'],
+            ['signal_wait_observation_only'],
+        )
+        self.assertEqual(item['planned_intents'], [])
+        self.assertEqual(item['tactical_actions'], [])
+        self.assertEqual(item['handoff_intents'], [])
+        self.assertIsNone(item['target_price'])
+        self.assertIsNone(item['stop_loss_price'])
+        self.assertIsNone(item['trigger_price'])
+        self.assertIsNone(item['chase_limit_price'])
+        self.assertEqual(item['decision_agent_names'], ['signal-decider'])
+        self.assertEqual(item['account_references'], [])
+        self.assertEqual(item['status_counts'], {})
+        self.assertEqual(self.client.post_calls, [])
+        with session_scope() as session:
+            plan_count_after = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+        self.assertEqual(plan_count_after, plan_count_before)
+
+    def test_live_exec_membership_wins_over_passive_wait_label(self) -> None:
+        wait_symbol = '032080'
+        self._seed_symbol(symbol=wait_symbol, name_ko='Already monitored')
+        with patch(
+            'app.orders.exec_integration.kis_realtime_price_service'
+        ) as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {
+                        'status': 'ready',
+                        'mode': 'mock',
+                        'active_monitoring_items': [],
+                        'active_monitoring_facts_complete': True,
+                    },
+                    'items': [],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols=set(),
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({wait_symbol}),
+                        membership_complete=True,
+                    )
+                ),
+                passive_signal_wait_observations=[
+                    {
+                        'symbol': wait_symbol,
+                        'decision_snapshot_id': 13,
+                        'decision_agent_name': 'signal-decider',
+                        'source_market_date': self.market_date.isoformat(),
+                        'observed_at': '2026-04-29T07:13:00+00:00',
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            payload['realtime_subscription']['desired_symbols'],
+            [wait_symbol],
+        )
+        self.assertEqual(
+            payload['realtime_subscription']['observation_only_symbols'],
+            [],
+        )
+        item = payload['items'][0]
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertTrue(item['exec_runtime_showable'])
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertEqual(item['exec_runtime_state'], 'runtime_membership_only')
+        self.assertEqual(item['planned_intents'], [])
+        self.assertEqual(item['handoff_intents'], [])
+        self.assertIsNone(item['trigger_price'])
+        self.assertIsNone(item['chase_limit_price'])
+
+    async def test_passive_wait_loader_failure_preserves_base_monitored_symbols(self) -> None:
+        held_symbol = '070590'
+        self._seed_symbol(symbol=held_symbol, name_ko='Protected holding')
+        board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {
+                'status': 'ready',
+                'mode': 'mock',
+                'active_monitoring_items': [],
+                'active_monitoring_facts_complete': True,
+            },
+            'freshness': None,
+            'items': [],
+        }
+        portfolio_membership = PortfolioHoldingSymbolMembership(
+            symbols=frozenset({held_symbol}),
+            membership_complete=True,
+        )
+
+        with (
+            patch.object(
+                self.service,
+                'get_runtime_daily_board',
+                new=AsyncMock(return_value=board),
+            ),
+            patch.object(
+                self.service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(return_value=portfolio_membership),
+            ),
+            patch.object(
+                self.service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(
+                    return_value=ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=True,
+                    )
+                ),
+            ),
+            patch(
+                'app.orders.exec_integration._async_previous_trading_day',
+                new=AsyncMock(return_value=self.market_date),
+            ),
+            patch.object(
+                self.service,
+                '_load_passive_signal_wait_observations',
+                side_effect=RuntimeError('validation unavailable'),
+            ),
+            patch(
+                'app.orders.exec_integration.kis_realtime_price_service'
+            ) as price_service,
+            self.assertLogs('app.orders.exec_integration', level='WARNING'),
+        ):
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            payload = await self.service._build_and_cache_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                refresh_state={
+                    'requested': False,
+                    'status': 'not_requested',
+                },
+                trigger='test',
+            )
+
+        self.assertEqual(
+            payload['realtime_subscription']['desired_symbols'],
+            [held_symbol],
+        )
+        self.assertEqual(
+            payload['realtime_subscription']['observation_only_symbols'],
+            [],
+        )
+        self.assertTrue(payload['items'][0]['held_position'])
+        self.assertEqual(payload['items'][0]['planned_intents'], [])
 
     async def test_runtime_monitored_symbols_flags_exec_approved_watch_candidate(self) -> None:
         self.client.agent_sizing_payloads_by_agent['signal-decider'] = {

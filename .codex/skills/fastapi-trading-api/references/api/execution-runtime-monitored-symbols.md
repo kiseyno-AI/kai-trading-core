@@ -9,6 +9,8 @@ If a short-term watch is active or pending in Exec while the original core row s
 
 Price fields are display-oriented: realtime websocket prices are preferred, then local current-quote/cache fallback, then recent daily close. Fallback prices are labeled with `price_source`, `price_status`, `display_price_available`, and realtime subscription metadata so capacity-limited symbols do not look like true data gaps.
 
+The latest validated prior-session `signal-decider` WAIT symbols may also appear as passive price observations. They are listed in `realtime_subscription.observation_only_symbols`, carry `monitoring_statuses=["signal_wait_observation_only"]`, and remain explicitly non-actionable: no plan/handoff intent, trigger, chase limit, target, stop, account scope, exec-agent approval, job, or order authority is created. `observation_only_symbols` is always a subset of `desired_symbols`; an existing holding or live Exec membership keeps its stronger runtime classification instead of being relabeled passive.
+
 ## Contract source
 The monitored-symbol item keys, monitoring states, exec-card flags, freshness, and price fields are validated by `apps/api/app/orders/execution_handoff_contract.py`. Core owns this symbol-level read model, Exec owns runtime/order/position truth, and Web consumes it for display-only monitored cards.
 
@@ -80,6 +82,7 @@ GET /execution/runtime/monitored-symbols?market_date=2026-04-30&refresh=true
       "005930"
     ],
     "desired_symbol_count": 1,
+    "observation_only_symbols": [],
     "max_subscriptions": 40
   },
   "items": [
