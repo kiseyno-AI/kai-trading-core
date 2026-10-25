@@ -8259,6 +8259,7 @@ class SignalDeciderExecIntegrationService:
         live_holding_symbols = None
         live_portfolio_holding_membership = None
         live_exec_monitoring_membership = None
+        passive_signal_wait_observations: list[dict[str, Any]] = []
         if symbol is None:
             background_trigger = f'{trigger}:dashboard_background_refresh'
             live_portfolio_holding_membership = (
@@ -8276,6 +8277,21 @@ class SignalDeciderExecIntegrationService:
                 market_date=target_trade_date,
                 trigger=background_trigger,
             )
+            try:
+                source_market_date = await _async_previous_trading_day(
+                    target_trade_date
+                )
+                passive_signal_wait_observations = await asyncio.to_thread(
+                    self._load_passive_signal_wait_observations,
+                    source_market_date=source_market_date,
+                    target_trade_date=target_trade_date,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'Could not load passive signal WAIT observations for %s: %s',
+                    target_trade_date.isoformat(),
+                    exc,
+                )
         await self._store_dashboard_caches_from_overview(
             market_date=target_trade_date,
             symbol=symbol,
@@ -8286,6 +8302,9 @@ class SignalDeciderExecIntegrationService:
                 live_portfolio_holding_membership
             ),
             live_exec_monitoring_membership=live_exec_monitoring_membership,
+            passive_signal_wait_observations=(
+                passive_signal_wait_observations
+            ),
         )
 
     def _finalize_dashboard_refresh_task(
@@ -8325,6 +8344,7 @@ class SignalDeciderExecIntegrationService:
             PortfolioHoldingSymbolMembership | None
         ) = None,
         live_exec_monitoring_membership: ExecRuntimeMonitoredSymbolMembership | None = None,
+        passive_signal_wait_observations: Sequence[dict[str, Any]] = (),
     ) -> None:
         if symbol:
             detail_cache_key = self._dashboard_cache_key(
@@ -8402,6 +8422,9 @@ class SignalDeciderExecIntegrationService:
                 ),
                 live_exec_monitoring_membership=(
                     live_exec_monitoring_membership
+                ),
+                passive_signal_wait_observations=(
+                    passive_signal_wait_observations
                 ),
             )
             self._store_dashboard_cached_payload(
