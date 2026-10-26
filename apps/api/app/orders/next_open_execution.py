@@ -218,8 +218,6 @@ STRUCTURED_CLOSE_MISMATCH_TOLERANCE_BPS = Decimal('100')
 SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
 SHORT_TERM_WATCH_DELEGATED_ENTRY_QUALITY_BLOCK_CODES = frozenset(
     {
-        'signal_decider_reject_veto',
-        'signal_decider_wait_blocks_scalp_buy',
         'short_term_downtrend_or_breakdown_block',
         'short_term_ret20_deep_negative_block',
         'short_term_high_atr_weak_trend_block',
@@ -2273,24 +2271,17 @@ def _short_term_entry_quality_blocks(
     warnings: list[dict[str, str]] = []
     signal_action = str((signal_decider_crosscheck or {}).get('action') or '').lower()
     if signal_action == 'reject':
-        blocks.append(
+        warnings.append(
             _reason(
-                'signal_decider_reject_veto',
-                'Same-day signal-decider rejected the setup; short-term buy handoff is blocked.',
-            )
-        )
-    elif signal_action == 'wait' and tactical_action == 'scalp_buy_candidate':
-        blocks.append(
-            _reason(
-                'signal_decider_wait_blocks_scalp_buy',
-                'Same-day signal-decider is wait; immediate scalp buy is blocked and should be monitored only after a new trigger.',
+                'signal_decider_reject_cross_lane_observation',
+                'Same-day signal-decider rejected its independent thesis; the disagreement is recorded without changing short-term eligibility.',
             )
         )
     elif signal_action == 'wait':
         warnings.append(
             _reason(
-                'signal_decider_wait_requires_trigger_confirmation',
-                'Same-day signal-decider is wait; exec must require live trigger-time confirmation before buying.',
+                'signal_decider_wait_cross_lane_observation',
+                'Same-day signal-decider is waiting on its independent thesis; short-term eligibility remains governed by short-term and Exec gates.',
             )
         )
 

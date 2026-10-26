@@ -5314,11 +5314,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items_by_agent['signal-decider']['eligibility_status'], 'blocked')
         self.assertEqual(items_by_agent['short-term-decider']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
 
-    async def test_short_term_entry_quality_blocks_scalp_when_signal_decider_waits(self) -> None:
+    async def test_short_term_entry_quality_keeps_signal_lane_disagreement_report_only(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             tactical_action='scalp_buy_candidate',
             request_payload={
                 'symbol_day_context': {
+                    'pre_decider_enrichment_context': (
+                        self._closed_market_pre_decider_context()
+                    ),
                     'technical_snapshot': {
                         'trend_state': 'uptrend',
                         'breakout_20d': True,
@@ -5344,20 +5347,68 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         with session_scope() as session:
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
-            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
-                snapshot=snapshot,
-                signal_decider_crosscheck={
-                    'action': 'wait',
-                    'decision_snapshot_id': self.snapshot_id,
-                    'policy_version': self.policy_version,
-                },
-                tactical_action='scalp_buy_candidate',
-            )
+            for signal_action, expected_warning in (
+                ('wait', 'signal_decider_wait_cross_lane_observation'),
+                ('reject', 'signal_decider_reject_cross_lane_observation'),
+            ):
+                with self.subTest(signal_action=signal_action):
+                    signal_decider_crosscheck = {
+                        'action': signal_action,
+                        'decision_snapshot_id': self.snapshot_id,
+                        'policy_version': self.policy_version,
+                    }
+                    blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                        snapshot=snapshot,
+                        signal_decider_crosscheck=signal_decider_crosscheck,
+                        tactical_action='scalp_buy_candidate',
+                    )
 
-        blocking_codes = {entry['code'] for entry in blocks}
-        self.assertIn('signal_decider_wait_blocks_scalp_buy', blocking_codes)
-        self.assertEqual(warnings, [])
-        self.assertEqual(feature_snapshot['signal_decider_crosscheck']['action'], 'wait')
+                    blocking_codes = {entry['code'] for entry in blocks}
+                    warning_codes = {entry['code'] for entry in warnings}
+                    self.assertNotIn('signal_decider_wait_blocks_scalp_buy', blocking_codes)
+                    self.assertNotIn('signal_decider_reject_veto', blocking_codes)
+                    self.assertIn(expected_warning, warning_codes)
+                    self.assertEqual(
+                        feature_snapshot['signal_decider_crosscheck']['action'],
+                        signal_action,
+                    )
+                    validation, _traceability = (
+                        signal_decider_next_open_execution_service._build_validation_payload(
+                            snapshot=snapshot,
+                            target=NextOpenAccountTarget(
+                                label='Main',
+                                account_reference=self.account_reference,
+                                budget_krw=Decimal('1500000'),
+                            ),
+                            policy_context=None,
+                            price_cache={},
+                            signal_decider_crosscheck=signal_decider_crosscheck,
+                        )
+                    )
+                    validation_block_codes = {
+                        entry['code'] for entry in validation['blocking_reasons']
+                    }
+                    validation_warning_codes = {
+                        entry['code'] for entry in validation['warnings']
+                    }
+                    self.assertEqual(validation['blocking_reasons'], [])
+                    self.assertNotIn(
+                        'signal_decider_wait_blocks_scalp_buy',
+                        validation_block_codes,
+                    )
+                    self.assertNotIn(
+                        'signal_decider_reject_veto',
+                        validation_block_codes,
+                    )
+                    self.assertIn(expected_warning, validation_warning_codes)
+                    self.assertEqual(
+                        validation['pricing']['requested_quantity'],
+                        validation['pricing']['final_quantity'],
+                    )
+                    self.assertEqual(
+                        validation['handoff']['approval_state'],
+                        'pending_exec_agent',
+                    )
 
     async def test_short_term_entry_quality_warns_low_buy_quality_score(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
