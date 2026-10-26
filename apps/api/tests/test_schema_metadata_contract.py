@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib
 import unittest
+from unittest.mock import MagicMock, patch
 
 from sqlalchemy import Index, UniqueConstraint
 from sqlalchemy.dialects import postgresql
@@ -29,6 +31,72 @@ def _postgres_index_ddl(table_name: str, index_name: str) -> str:
 
 
 class SchemaMetadataContractTests(unittest.TestCase):
+    def test_wait_recheck_event_uniqueness_is_agent_aware(self) -> None:
+        constraints = _unique_constraints(
+            'signal_decider_wait_recheck_events'
+        )
+
+        self.assertEqual(
+            constraints[
+                'uq_signal_decider_wait_recheck_target_symbol_agent'
+            ],
+            ('target_trade_date', 'symbol', 'agent_name'),
+        )
+
+    def test_wait_recheck_agent_unique_downgrade_refuses_dual_lane_data(
+        self,
+    ) -> None:
+        migration = importlib.import_module(
+            'db_migrations.versions.'
+            '20261025_0085_agent_aware_wait_recheck_events'
+        )
+        bind = MagicMock()
+        bind.execute.return_value.first.return_value = (
+            '2026-10-26',
+            '005930',
+            2,
+        )
+
+        with (
+            patch.object(migration.op, 'get_bind', return_value=bind),
+            patch.object(migration.op, 'drop_constraint') as drop_constraint,
+            patch.object(
+                migration.op,
+                'create_unique_constraint',
+            ) as create_unique_constraint,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'forward-only.*dual-lane',
+            ):
+                migration.downgrade()
+
+        drop_constraint.assert_not_called()
+        create_unique_constraint.assert_not_called()
+
+        bind.reset_mock()
+        bind.execute.return_value.first.return_value = None
+        with (
+            patch.object(migration.op, 'get_bind', return_value=bind),
+            patch.object(migration.op, 'drop_constraint') as drop_constraint,
+            patch.object(
+                migration.op,
+                'create_unique_constraint',
+            ) as create_unique_constraint,
+        ):
+            migration.downgrade()
+
+        drop_constraint.assert_called_once_with(
+            'uq_signal_decider_wait_recheck_target_symbol_agent',
+            'signal_decider_wait_recheck_events',
+            type_='unique',
+        )
+        create_unique_constraint.assert_called_once_with(
+            'uq_signal_decider_wait_recheck_target_symbol',
+            'signal_decider_wait_recheck_events',
+            ['target_trade_date', 'symbol'],
+        )
+
     def test_weekly_learning_artifact_metadata_is_versioned_and_queryable(self) -> None:
         table_name = 'signal_decider_weekly_learning_artifacts'
         table = Base.metadata.tables[table_name]

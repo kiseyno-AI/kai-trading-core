@@ -2554,6 +2554,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         pre_decider_enrichment_context: dict[str, object] | None = None,
         decision_run_id: str | None = None,
         feedback_received_at: datetime | None = None,
+        entry_price_basis: str = 'next_open',
+        trigger_price: int | None = None,
+        chase_limit_price: int | None = None,
+        trigger_conditions: list[str] | None = None,
     ) -> int:
         symbol_day_context = {
             'decider_data_quality_context': self._quality_context(),
@@ -2580,7 +2584,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 decision_action=next_day_open_action,
                 preferred_action=next_day_open_action,
                 next_day_open_action=next_day_open_action,
-                entry_price_basis='next_open',
+                entry_price_basis=entry_price_basis,
                 target_price=target_price,
                 expected_return_pct=expected_return_pct,
                 stop_loss_price=stop_loss_price,
@@ -2616,7 +2620,15 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     },
                     'symbol_day_context': symbol_day_context,
                 },
-                response_payload={'next_day_open_action': next_day_open_action},
+                response_payload={
+                    'next_day_open_action': next_day_open_action,
+                    'preferred_action': next_day_open_action,
+                    'trigger_price': trigger_price,
+                    'chase_limit_price': chase_limit_price,
+                    'target_price': target_price,
+                    'stop_loss_price': stop_loss_price,
+                    'trigger_conditions': trigger_conditions or [],
+                },
                 response_summary_payload={'policy_version': self.policy_version},
             )
             session.add(row)
@@ -3622,6 +3634,186 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(
             authoritative_snapshot_id,
             superseded_snapshot_id,
+        )
+
+    def test_signal_wait_recheck_buy_is_authorized_for_its_exact_agent(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        symbol = '005930'
+        run_id = 'wait-recheck-2026-04-30-signal-decider-005930-2-1'
+        observed_at = datetime(2026, 4, 30, 0, 15, tzinfo=timezone.utc)
+        snapshot_id = self._seed_snapshot(
+            symbol=symbol,
+            next_day_open_action='buy',
+            decision_run_id=run_id,
+            feedback_received_at=observed_at,
+            entry_price_basis='trigger_limit',
+            trigger_price=50_500,
+            chase_limit_price=51_500,
+            stop_loss_price=50_000,
+            trigger_conditions=['50,500원 회복을 확인합니다.'],
+        )
+        with session_scope() as session:
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                snapshot_id,
+            )
+            self.assertIsNotNone(snapshot)
+            snapshot.target_price = None
+            snapshot.stop_loss_price = None
+            event = SignalDeciderWaitRecheckEvent(
+                source_snapshot_id=snapshot_id,
+                result_snapshot_id=snapshot_id,
+                source_snapshot_fingerprint='c' * 64,
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+                symbol=symbol,
+                agent_name='signal-decider',
+                trigger_price=50_500,
+                chase_limit_price=51_500,
+                target_price=54_000,
+                stop_loss_price=50_000,
+                observed_price=50_600,
+                observed_current_price=50_550,
+                observed_bid_price=50_500,
+                price_basis='best_ask',
+                quote_source='kis_realtime_ws',
+                price_as_of=observed_at,
+                observed_at=observed_at,
+                status='completed',
+                attempt_count=1,
+                request_run_id=run_id,
+                result_action='buy',
+                context_payload={'schema_version': 'test'},
+                context_sha256='d' * 64,
+                last_attempt_at=observed_at,
+                completed_at=observed_at,
+            )
+            session.add(event)
+            session.flush()
+            event_id = int(event.id)
+            self.wait_recheck_event_ids.append(event_id)
+
+        self._seed_feedback_run(
+            run_id=run_id,
+            symbols=[symbol],
+            roles=['signal-decider'],
+            started_at=observed_at,
+            force_recompute=True,
+            source_context_overlay_event_ids={symbol: event_id},
+            progress_summary={
+                'completed_feedback_count': 1,
+                'computed_feedback_count': 1,
+                'reused_feedback_count': 0,
+                'failed_items': 0,
+            },
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+            allow_post_open_intraday_watch=True,
+        )
+
+        self.assertEqual(
+            state['selected_by_key'][(symbol, 'signal-decider')].id,
+            snapshot_id,
+        )
+
+        service = self._service(
+            state='OPEN',
+            server_time='2026-04-30T09:20:00+09:00',
+        )
+        with (
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[
+                    {'trade_date': '2026-04-29', 'close_price': 50_000}
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution._current_live_market_buy_authority',
+                return_value={'applies': True, 'action': 'allow'},
+            ),
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='late_signal_wait_recheck',
+            )
+
+        item = next(
+            row
+            for row in result['items']
+            if row['decision_agent_name'] == 'signal-decider'
+        )
+        self.assertEqual(item['decision_snapshot_id'], snapshot_id)
+        self.assertEqual(
+            item['eligibility_status'],
+            ELIGIBILITY_MONITOR_CANDIDATE,
+        )
+        self.assertEqual(
+            item['execution_status'],
+            EXECUTION_STATUS_AWAITING_TRIGGER,
+        )
+        self.assertEqual(item['planned_order_type'], 'limit')
+        self.assertEqual(item['handoff_intent'], 'intraday_watch_buy')
+        self.assertEqual(item['entry_execution_mode'], 'pending_trigger_limit')
+        self.assertEqual(item['trigger_price'], 50_500)
+        self.assertEqual(item['chase_limit_price'], 51_500)
+        self.assertEqual(
+            item['validation']['pricing']['estimated_reference_price'],
+            51_500,
+        )
+        self.assertEqual(
+            item['validation']['pricing'][
+                'estimated_reference_price_basis'
+            ],
+            'max(previous_close,chase_limit_price)',
+        )
+        self.assertEqual(item['target_price'], 54_000)
+        self.assertEqual(item['stop_loss_price'], 50_000)
+
+    def test_signal_trigger_buy_with_invalid_geometry_is_blocked_not_market(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='buy',
+            entry_price_basis='trigger_limit',
+            trigger_price=50_500,
+            chase_limit_price=51_500,
+            target_price=51_000,
+            stop_loss_price=50_000,
+            trigger_conditions=['50,500원 회복을 확인합니다.'],
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50_000}
+            ],
+        ):
+            result = self._service(
+                state='PREOPEN',
+                server_time='2026-04-30T08:40:00+09:00',
+            ).refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test_invalid_signal_trigger_geometry',
+            )
+
+        item = next(
+            row
+            for row in result['items']
+            if row['decision_agent_name'] == 'signal-decider'
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(item['planned_order_type'], 'limit')
+        self.assertEqual(item['handoff_intent'], 'intraday_watch_buy')
+        self.assertFalse(item['handoff_active'])
+        self.assertIn(
+            'invalid_signal_trigger_geometry',
+            {
+                reason['code']
+                for reason in item['validation']['blocking_reasons']
+            },
         )
 
     def test_empty_wait_recheck_marker_keeps_ordinary_run_usable(self) -> None:
@@ -5148,6 +5340,99 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('signal_decider_wait_conflict_gate', block_codes)
         self.assertEqual(result['summary']['short_term_wait_conflict_block_count'], 1)
         self.assertEqual(result['summary']['short_term_wait_conflict_override_count'], 0)
+
+    def test_report_only_signal_context_never_changes_short_lane_quantity_or_eligibility(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        settings.signal_decider_wait_conflict_gate_mode = 'report_only'
+        symbols = ('005930', '000660', '035420', '068270')
+        for symbol in symbols:
+            self._seed_short_term_snapshot(symbol=symbol)
+        signal_contexts = {
+            '005930': {
+                'action': 'wait',
+                'market_date': self.market_date.isoformat(),
+                'decision_snapshot_id': 101,
+            },
+            '000660': {
+                'action': 'reject',
+                'market_date': self.market_date.isoformat(),
+                'decision_snapshot_id': 102,
+            },
+            # 035420 intentionally has no signal context.
+            '068270': {
+                'action': 'wait',
+                'market_date': date(2026, 4, 28).isoformat(),
+                'decision_snapshot_id': 103,
+            },
+        }
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[
+                    {'trade_date': '2026-04-29', 'close_price': 50_000}
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution._latest_signal_decider_action_by_symbol',
+                return_value=signal_contexts,
+            ),
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='report_only_lane_independence',
+            )
+
+        items = {
+            item['symbol']: item
+            for item in result['items']
+            if item['decision_agent_name'] == 'short-term-decider'
+        }
+        self.assertEqual(set(items), set(symbols))
+        self.assertEqual(
+            {
+                symbol: items[symbol]['signal_decider_alignment']
+                for symbol in symbols
+            },
+            {
+                '005930': 'wait_conflict_block',
+                '000660': 'reject_conflict_block',
+                '035420': 'no_signal_decider_context',
+                '068270': 'stale_signal_decider_context',
+            },
+        )
+        for item in items.values():
+            self.assertEqual(
+                item['eligibility_status'],
+                ELIGIBILITY_MONITOR_CANDIDATE,
+            )
+            self.assertEqual(
+                item['execution_status'],
+                EXECUTION_STATUS_AWAITING_TRIGGER,
+            )
+            self.assertEqual(
+                item['final_enforcement_decision'],
+                'allowed_report_only',
+            )
+            self.assertEqual(
+                item['requested_quantity'],
+                item['final_quantity'],
+            )
+            self.assertEqual(
+                Decimal(str(item['planned_quantity'])),
+                Decimal(str(item['final_quantity'])),
+            )
+            self.assertNotIn(
+                'signal_decider_wait_conflict_gate',
+                {
+                    reason['code']
+                    for reason in item['validation']['blocking_reasons']
+                },
+            )
 
     def test_refresh_plan_items_allows_wait_conflict_override_for_strong_watch_setup(self) -> None:
         settings.signal_decider_wait_conflict_gate_mode = 'hard_block'

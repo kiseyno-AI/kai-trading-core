@@ -9131,6 +9131,192 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('agent_name', handoff['decider_output']['response_payload'])
         self.assertEqual(handoff['decider_output']['response_payload']['next_day_open_action'], 'buy')
 
+    def _configure_signal_trigger_plan_contract(self) -> None:
+        with session_scope() as session:
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                self.snapshot_id,
+            )
+            snapshot.entry_price_basis = 'trigger_limit'
+            snapshot.response_payload = {
+                **(snapshot.response_payload or {}),
+                'next_day_open_action': 'buy',
+                'preferred_action': 'buy',
+                'trigger_price': 50_500,
+                'chase_limit_price': 51_500,
+                'target_price': 54_000,
+                'stop_loss_price': 49_200,
+                'trigger_conditions': ['50,500원 회복을 확인합니다.'],
+            }
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            row.planned_order_type = 'limit'
+            row.eligibility_status = 'monitor_candidate'
+            row.execution_status = 'awaiting_trigger'
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'handoff_intent': 'intraday_watch_buy',
+                'handoff_active': True,
+                'exec_monitoring_active': True,
+                'entry_execution_mode': 'pending_trigger_limit',
+                'trigger_price': 50_500,
+                'chase_limit_price': 51_500,
+                'target_price': 54_000,
+                'stop_loss_price': 49_200,
+            }
+
+    async def test_dispatch_signal_trigger_buy_preserves_watch_prices_and_chase_cap(self) -> None:
+        self._configure_signal_trigger_plan_contract()
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        entry_item = self.client.post_calls[0]['items'][0]
+        self.assertEqual(entry_item['decision_agent_name'], 'signal-decider')
+        self.assertEqual(entry_item['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
+        self.assertEqual(entry_item['trigger_price'], 50_500)
+        self.assertEqual(entry_item['limit_price'], 51_500)
+        self.assertEqual(
+            entry_item['risk_context']['entry_execution_mode'],
+            'pending_trigger_limit',
+        )
+        self.assertTrue(entry_item['risk_context']['monitoring_candidate'])
+        self.assertEqual(
+            entry_item['risk_context']['original_watch_trigger_price'],
+            50_500,
+        )
+        self.assertEqual(
+            entry_item['risk_context']['original_watch_chase_limit_price'],
+            51_500,
+        )
+
+    def test_signal_trigger_handoff_rejects_stale_planned_row_contract(self) -> None:
+        self._configure_signal_trigger_plan_contract()
+
+        def replace_trace_value(row, field, value) -> None:
+            traceability = copy.deepcopy(row.traceability_payload or {})
+            traceability[field] = value
+            row.traceability_payload = traceability
+
+        tamper_cases = (
+            (
+                'planned_order_type',
+                lambda row: setattr(row, 'planned_order_type', 'market'),
+            ),
+            (
+                'eligibility_status',
+                lambda row: setattr(row, 'eligibility_status', 'eligible'),
+            ),
+            (
+                'handoff_intent',
+                lambda row: replace_trace_value(
+                    row,
+                    'handoff_intent',
+                    'next_open_buy',
+                ),
+            ),
+            (
+                'handoff_active',
+                lambda row: replace_trace_value(
+                    row,
+                    'handoff_active',
+                    False,
+                ),
+            ),
+            (
+                'entry_execution_mode',
+                lambda row: replace_trace_value(
+                    row,
+                    'entry_execution_mode',
+                    'next_open_market',
+                ),
+            ),
+            (
+                'trigger_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'trigger_price',
+                    50_600,
+                ),
+            ),
+            (
+                'chase_limit_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'chase_limit_price',
+                    51_600,
+                ),
+            ),
+            (
+                'target_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'target_price',
+                    54_100,
+                ),
+            ),
+            (
+                'stop_loss_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'stop_loss_price',
+                    49_100,
+                ),
+            ),
+        )
+
+        for field, tamper in tamper_cases:
+            with self.subTest(field=field):
+                rows = self.service._load_next_open_rows(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                )
+                snapshots = self.service._load_snapshots(rows)
+                tamper(rows[0])
+                with self.assertRaisesRegex(
+                    SignalDeciderExecPayloadContractError,
+                    f'signal_trigger_plan_contract_mismatch:{field}',
+                ):
+                    self.service._build_exec_plan_payload(
+                        rows=rows,
+                        snapshots=snapshots,
+                        trigger='tampered_signal_trigger_contract',
+                    )
+
+    async def test_signal_trigger_contract_drift_never_posts_or_falls_back(self) -> None:
+        self._configure_signal_trigger_plan_contract()
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            row.planned_order_type = 'market'
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='tampered_signal_trigger_contract',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'contract_error')
+        self.assertEqual(group['translated_item_count'], 0)
+        self.assertIn(
+            'signal_trigger_plan_contract_mismatch:planned_order_type',
+            group['error']['message'],
+        )
+
     async def test_dispatch_next_open_plan_uses_next_open_dry_run_default(self) -> None:
         settings.signal_decider_next_open_enabled = False
         settings.signal_decider_next_open_dry_run = True

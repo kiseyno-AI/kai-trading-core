@@ -13,6 +13,10 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 
+from app.agent_context.roles import (
+    SHORT_TERM_DECIDER_AGENT_NAME,
+    SIGNAL_DECIDER_AGENT_NAME,
+)
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
@@ -28,8 +32,14 @@ from app.quotes.kis_realtime_prices import (
 
 logger = logging.getLogger(__name__)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
-SHORT_TERM_DECIDER_AGENT_NAME = 'short-term-decider'
-WAIT_RECHECK_CONTEXT_SCHEMA_VERSION = 'intraday_wait_recheck_context_v1'
+WAIT_RECHECK_AGENT_NAMES = frozenset(
+    {SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME}
+)
+WAIT_RECHECK_PROMOTABLE_ACTION_BY_AGENT = {
+    SIGNAL_DECIDER_AGENT_NAME: 'buy',
+    SHORT_TERM_DECIDER_AGENT_NAME: 'watch_for_trigger',
+}
+WAIT_RECHECK_CONTEXT_SCHEMA_VERSION = 'intraday_wait_recheck_context_v2'
 WAIT_RECHECK_QUOTE_SOURCE = 'kis_realtime_ws'
 WAIT_RECHECK_PRICE_BASIS = 'best_ask'
 KRX_MARKETS = frozenset({'KRX', 'KOSPI', 'KOSDAQ', 'KONEX'})
@@ -112,6 +122,7 @@ class WaitRecheckCandidate:
     source_market_date: date
     target_trade_date: date
     symbol: str
+    agent_name: str
     trigger_price: int
     chase_limit_price: int | None
     target_price: int
@@ -149,7 +160,10 @@ def build_wait_recheck_candidate(
     symbol = str(getattr(snapshot, 'symbol', '') or '').strip().upper()
     if not (len(symbol) == 6 and symbol.isascii() and symbol.isdigit()):
         return None
-    if str(getattr(snapshot, 'agent_name', '') or '').strip() != SHORT_TERM_DECIDER_AGENT_NAME:
+    agent_name = str(
+        getattr(snapshot, 'agent_name', '') or ''
+    ).strip().lower()
+    if agent_name not in WAIT_RECHECK_AGENT_NAMES:
         return None
     claims = _market_claims(snapshot)
     if not claims or any(claim not in KRX_MARKETS for claim in claims):
@@ -177,10 +191,12 @@ def build_wait_recheck_candidate(
     decision_delta = decision_delta if isinstance(decision_delta, dict) else {}
     upgrade_trigger = decision_delta.get('upgrade_trigger')
     upgrade_trigger = upgrade_trigger if isinstance(upgrade_trigger, dict) else {}
-    if (
-        str(upgrade_trigger.get('target_action') or '').strip().lower()
-        != 'watch_for_trigger'
-    ):
+    expected_target_action = WAIT_RECHECK_PROMOTABLE_ACTION_BY_AGENT[
+        agent_name
+    ]
+    if str(
+        upgrade_trigger.get('target_action') or ''
+    ).strip().lower() != expected_target_action:
         return None
 
     trigger_price = _positive_int(response.get('trigger_price'))
@@ -247,6 +263,7 @@ def build_wait_recheck_candidate(
         source_market_date=source_market_date,
         target_trade_date=target_trade_date,
         symbol=symbol,
+        agent_name=agent_name,
         trigger_price=trigger_price,
         chase_limit_price=chase_limit_price,
         target_price=target_price,
@@ -267,6 +284,7 @@ def canonical_wait_recheck_context(
         'schema_version': WAIT_RECHECK_CONTEXT_SCHEMA_VERSION,
         'event_id': int(event_id),
         'symbol': candidate.symbol,
+        'agent_name': candidate.agent_name,
         'source_snapshot': {
             'id': candidate.source_snapshot_id,
             'content_fingerprint': candidate.source_snapshot_fingerprint,
@@ -299,7 +317,11 @@ def canonical_wait_recheck_context(
         'execution_authority': {
             'direct_order_authority': False,
             'fresh_decider_required': True,
-            'only_promotable_action': 'watch_for_trigger',
+            'only_promotable_action': (
+                WAIT_RECHECK_PROMOTABLE_ACTION_BY_AGENT[
+                    candidate.agent_name
+                ]
+            ),
             'fresh_decider_must_supply_complete_price_levels': True,
         },
     }
@@ -316,12 +338,15 @@ def validate_wait_recheck_context(
     execution_authority = context.get('execution_authority')
     observation = context.get('observation')
     trigger_contract = context.get('trigger_contract')
+    agent_name = str(context.get('agent_name') or '').strip().lower()
     if not (
         context.get('schema_version') == WAIT_RECHECK_CONTEXT_SCHEMA_VERSION
+        and agent_name in WAIT_RECHECK_AGENT_NAMES
         and isinstance(execution_authority, dict)
         and execution_authority.get('direct_order_authority') is False
         and execution_authority.get('fresh_decider_required') is True
-        and execution_authority.get('only_promotable_action') == 'watch_for_trigger'
+        and execution_authority.get('only_promotable_action')
+        == WAIT_RECHECK_PROMOTABLE_ACTION_BY_AGENT[agent_name]
         and execution_authority.get(
             'fresh_decider_must_supply_complete_price_levels'
         )
@@ -362,6 +387,139 @@ def validate_wait_recheck_context(
     return bool(
         len(normalized_sha256) == 64
         and _canonical_json_sha256(context) == normalized_sha256
+    )
+
+
+def validate_wait_recheck_event_binding(
+    *,
+    event: SignalDeciderWaitRecheckEvent,
+    context: Any,
+    source_snapshot: SignalDeciderDecisionSnapshot | None,
+) -> bool:
+    """Bind one immutable context to its durable event and source snapshot."""
+
+    if not validate_wait_recheck_context(
+        context,
+        expected_sha256=event.context_sha256,
+    ) or source_snapshot is None:
+        return False
+    source_context = context.get('source_snapshot')
+    trigger_contract = context.get('trigger_contract')
+    observation = context.get('observation')
+    if not all(
+        isinstance(value, dict)
+        for value in (source_context, trigger_contract, observation)
+    ):
+        return False
+    try:
+        event_id = int(event.id)
+        event_snapshot_id = int(event.source_snapshot_id)
+        actual_snapshot_id = int(source_snapshot.id)
+    except (TypeError, ValueError):
+        return False
+    event_symbol = str(event.symbol or '')
+    event_agent_name = str(event.agent_name or '')
+    event_fingerprint = str(event.source_snapshot_fingerprint or '')
+    actual_fingerprint = str(source_snapshot.content_fingerprint or '')
+    if not (
+        context.get('event_id') == event_id
+        and context.get('symbol')
+        == event_symbol
+        == source_snapshot.symbol
+        and context.get('agent_name')
+        == event_agent_name
+        == source_snapshot.agent_name
+        and source_context.get('id')
+        == event_snapshot_id
+        == actual_snapshot_id
+        and source_context.get('content_fingerprint')
+        == event_fingerprint
+        == actual_fingerprint
+        and source_context.get('market_date')
+        == event.source_market_date.isoformat()
+        == source_snapshot.market_date.isoformat()
+        and context.get('target_trade_date')
+        == event.target_trade_date.isoformat()
+    ):
+        return False
+
+    candidate = build_wait_recheck_candidate(
+        source_snapshot,
+        target_trade_date=event.target_trade_date,
+    )
+    if candidate is None or not (
+        candidate.source_snapshot_id == event_snapshot_id
+        and candidate.source_snapshot_fingerprint == event_fingerprint
+        and candidate.source_market_date == event.source_market_date
+        and candidate.target_trade_date == event.target_trade_date
+        and candidate.symbol == event_symbol
+        and candidate.agent_name == event_agent_name
+        and candidate.trigger_price == event.trigger_price
+        and candidate.chase_limit_price == event.chase_limit_price
+        and candidate.target_price == event.target_price
+        and candidate.stop_loss_price == event.stop_loss_price
+    ):
+        return False
+
+    def exact_price_matches(raw_value: Any, durable_value: Any) -> bool:
+        if durable_value is None:
+            return raw_value is None
+        return bool(
+            isinstance(raw_value, int)
+            and not isinstance(raw_value, bool)
+            and raw_value == int(durable_value)
+        )
+
+    def exact_timestamp_matches(raw_value: Any, durable_value: Any) -> bool:
+        durable_timestamp = _aware_utc(durable_value)
+        return bool(
+            isinstance(raw_value, str)
+            and durable_timestamp is not None
+            and raw_value == durable_timestamp.isoformat()
+        )
+
+    return bool(
+        exact_price_matches(
+            trigger_contract.get('trigger_price'),
+            event.trigger_price,
+        )
+        and int(event.trigger_price) == candidate.trigger_price
+        and exact_price_matches(
+            trigger_contract.get('chase_limit_price'),
+            event.chase_limit_price,
+        )
+        and exact_price_matches(
+            trigger_contract.get('target_price'),
+            event.target_price,
+        )
+        and int(event.target_price) == candidate.target_price
+        and exact_price_matches(
+            trigger_contract.get('stop_loss_price'),
+            event.stop_loss_price,
+        )
+        and int(event.stop_loss_price) == candidate.stop_loss_price
+        and exact_price_matches(
+            observation.get('observed_price'),
+            event.observed_price,
+        )
+        and exact_price_matches(
+            observation.get('current_price'),
+            event.observed_current_price,
+        )
+        and exact_price_matches(
+            observation.get('bid_price'),
+            event.observed_bid_price,
+        )
+        and observation.get('price_basis') == event.price_basis
+        and observation.get('source') == event.quote_source
+        and exact_timestamp_matches(
+            observation.get('price_as_of'),
+            event.price_as_of,
+        )
+        and exact_timestamp_matches(
+            observation.get('received_at'),
+            event.observed_at,
+        )
     )
 
 
@@ -415,11 +573,13 @@ def merge_wait_recheck_monitored_source(
 class SignalDeciderWaitRecheckService:
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._candidates_by_symbol: dict[str, WaitRecheckCandidate] = {}
-        self._pending_by_key: dict[
-            tuple[date, str], WaitRecheckObservation
+        self._candidates_by_key: dict[
+            tuple[str, str], WaitRecheckCandidate
         ] = {}
-        self._reserved_keys: set[tuple[date, str]] = set()
+        self._pending_by_key: dict[
+            tuple[date, str, str], WaitRecheckObservation
+        ] = {}
+        self._reserved_keys: set[tuple[date, str, str]] = set()
         self._last_source_refresh_at: datetime | None = None
         self._last_cycle_at: datetime | None = None
         self._last_cycle_result: dict[str, Any] | None = None
@@ -430,8 +590,13 @@ class SignalDeciderWaitRecheckService:
                 'enabled': bool(
                     settings.signal_decider_wait_recheck_monitoring_enabled
                 ),
-                'candidate_symbols': sorted(self._candidates_by_symbol),
-                'candidate_count': len(self._candidates_by_symbol),
+                'candidate_symbols': sorted(
+                    {
+                        candidate.symbol
+                        for candidate in self._candidates_by_key.values()
+                    }
+                ),
+                'candidate_count': len(self._candidates_by_key),
                 'pending_count': len(self._pending_by_key),
                 'last_source_refresh_at': (
                     self._last_source_refresh_at.isoformat()
@@ -452,15 +617,19 @@ class SignalDeciderWaitRecheckService:
         candidates: Iterable[WaitRecheckCandidate],
     ) -> None:
         normalized = {
-            candidate.symbol: candidate
+            (candidate.symbol, candidate.agent_name): candidate
             for candidate in candidates
         }
         active_keys = {
-            (candidate.target_trade_date, candidate.symbol)
+            (
+                candidate.target_trade_date,
+                candidate.symbol,
+                candidate.agent_name,
+            )
             for candidate in normalized.values()
         }
         with self._lock:
-            self._candidates_by_symbol = normalized
+            self._candidates_by_key = normalized
             self._pending_by_key = {
                 key: observation
                 for key, observation in self._pending_by_key.items()
@@ -501,42 +670,54 @@ class SignalDeciderWaitRecheckService:
             return False
         symbol = str(tick.symbol or '').strip().upper()
         with self._lock:
-            candidate = self._candidates_by_symbol.get(symbol)
-            if candidate is None:
-                return False
-            key = (candidate.target_trade_date, symbol)
-            pending_observation = self._pending_by_key.get(key)
-            if key in self._reserved_keys and pending_observation is None:
-                return False
-            if received_at.astimezone(SEOUL_TZ).date() != candidate.target_trade_date:
-                return False
-            if (
-                observed_price < candidate.trigger_price
-                or observed_price >= candidate.target_price
-                or (
-                    candidate.chase_limit_price is not None
-                    and observed_price > candidate.chase_limit_price
+            candidates = tuple(
+                candidate
+                for (candidate_symbol, _agent_name), candidate in sorted(
+                    self._candidates_by_key.items()
                 )
-            ):
-                return False
-            if (
-                pending_observation is not None
-                and received_at < pending_observation.received_at
-            ):
-                return False
-            observation = WaitRecheckObservation(
-                candidate=candidate,
-                observed_price=observed_price,
-                current_price=_positive_int(tick.current_price),
-                bid_price=_positive_int(tick.bid_price),
-                price_basis=WAIT_RECHECK_PRICE_BASIS,
-                price_as_of=price_as_of,
-                received_at=received_at,
-                quote_source=WAIT_RECHECK_QUOTE_SOURCE,
+                if candidate_symbol == symbol
             )
-            self._pending_by_key[key] = observation
-            self._reserved_keys.add(key)
-            return pending_observation is None
+            if not candidates:
+                return False
+            queued_new = False
+            for candidate in candidates:
+                key = (
+                    candidate.target_trade_date,
+                    symbol,
+                    candidate.agent_name,
+                )
+                pending_observation = self._pending_by_key.get(key)
+                if key in self._reserved_keys and pending_observation is None:
+                    continue
+                if (
+                    received_at.astimezone(SEOUL_TZ).date()
+                    != candidate.target_trade_date
+                    or observed_price < candidate.trigger_price
+                    or observed_price >= candidate.target_price
+                    or (
+                        candidate.chase_limit_price is not None
+                        and observed_price > candidate.chase_limit_price
+                    )
+                    or (
+                        pending_observation is not None
+                        and received_at < pending_observation.received_at
+                    )
+                ):
+                    continue
+                observation = WaitRecheckObservation(
+                    candidate=candidate,
+                    observed_price=observed_price,
+                    current_price=_positive_int(tick.current_price),
+                    bid_price=_positive_int(tick.bid_price),
+                    price_basis=WAIT_RECHECK_PRICE_BASIS,
+                    price_as_of=price_as_of,
+                    received_at=received_at,
+                    quote_source=WAIT_RECHECK_QUOTE_SOURCE,
+                )
+                self._pending_by_key[key] = observation
+                self._reserved_keys.add(key)
+                queued_new = queued_new or pending_observation is None
+            return queued_new
 
     def pop_pending_observations(
         self,
@@ -557,6 +738,7 @@ class SignalDeciderWaitRecheckService:
         key = (
             observation.candidate.target_trade_date,
             observation.candidate.symbol,
+            observation.candidate.agent_name,
         )
         with self._lock:
             self._reserved_keys.discard(key)
@@ -629,46 +811,68 @@ class SignalDeciderWaitRecheckService:
             )
         try:
             with session_scope() as session:
-                claimed_symbols = set(
-                    session.execute(
-                        select(SignalDeciderWaitRecheckEvent.symbol).where(
+                claimed_keys = {
+                    (str(symbol), str(agent_name))
+                    for symbol, agent_name in session.execute(
+                        select(
+                            SignalDeciderWaitRecheckEvent.symbol,
+                            SignalDeciderWaitRecheckEvent.agent_name,
+                        ).where(
                             SignalDeciderWaitRecheckEvent.target_trade_date
                             == target_trade_date
                         )
-                    ).scalars()
-                )
+                    ).all()
+                }
                 snapshots = session.execute(
                     select(SignalDeciderDecisionSnapshot)
                     .where(
                         SignalDeciderDecisionSnapshot.market_date
                         == source_market_date,
-                        SignalDeciderDecisionSnapshot.agent_name
-                        == SHORT_TERM_DECIDER_AGENT_NAME,
+                        SignalDeciderDecisionSnapshot.agent_name.in_(
+                            WAIT_RECHECK_AGENT_NAMES
+                        ),
                     )
                     .order_by(
                         SignalDeciderDecisionSnapshot.symbol.asc(),
+                        SignalDeciderDecisionSnapshot.agent_name.asc(),
                         SignalDeciderDecisionSnapshot.created_at.desc(),
                         SignalDeciderDecisionSnapshot.id.desc(),
                     )
                 ).scalars().all()
 
-                latest_by_symbol: dict[
-                    str, SignalDeciderDecisionSnapshot
+                latest_by_key: dict[
+                    tuple[str, str], SignalDeciderDecisionSnapshot
                 ] = {}
                 for snapshot in snapshots:
-                    latest_by_symbol.setdefault(snapshot.symbol, snapshot)
-                candidates = [
+                    latest_by_key.setdefault(
+                        (snapshot.symbol, snapshot.agent_name),
+                        snapshot,
+                    )
+                eligible_candidates = [
                     candidate
-                    for symbol in sorted(latest_by_symbol)
-                    if symbol not in claimed_symbols
+                    for key in sorted(latest_by_key)
+                    if key not in claimed_keys
                     and (
                         candidate := build_wait_recheck_candidate(
-                            latest_by_symbol[symbol],
+                            latest_by_key[key],
                             target_trade_date=target_trade_date,
                         )
                     )
                     is not None
-                ][: settings.signal_decider_wait_recheck_max_symbols]
+                ]
+                selected_symbols = set(
+                    sorted(
+                        {
+                            candidate.symbol
+                            for candidate in eligible_candidates
+                        }
+                    )[: settings.signal_decider_wait_recheck_max_symbols]
+                )
+                candidates = [
+                    candidate
+                    for candidate in eligible_candidates
+                    if candidate.symbol in selected_symbols
+                ]
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 'WAIT recheck candidate lookup failed closed: %s',
@@ -683,7 +887,9 @@ class SignalDeciderWaitRecheckService:
 
         self.replace_candidate_cache(candidates)
         return WaitRecheckSubscriptionSource(
-            symbols=tuple(candidate.symbol for candidate in candidates),
+            symbols=tuple(
+                dict.fromkeys(candidate.symbol for candidate in candidates)
+            ),
             # This version identifies the successful membership observation,
             # not the newest candidate snapshot.  Candidate removal can make
             # the latter move backwards and cause the realtime source's
@@ -709,6 +915,8 @@ class SignalDeciderWaitRecheckService:
                         == candidate.target_trade_date,
                         SignalDeciderWaitRecheckEvent.symbol
                         == candidate.symbol,
+                        SignalDeciderWaitRecheckEvent.agent_name
+                        == candidate.agent_name,
                     )
                 ).scalar_one_or_none()
                 if existing_id is not None:
@@ -721,7 +929,7 @@ class SignalDeciderWaitRecheckService:
                         SignalDeciderDecisionSnapshot.symbol
                         == candidate.symbol,
                         SignalDeciderDecisionSnapshot.agent_name
-                        == SHORT_TERM_DECIDER_AGENT_NAME,
+                        == candidate.agent_name,
                     )
                     .order_by(
                         SignalDeciderDecisionSnapshot.created_at.desc(),
@@ -745,7 +953,7 @@ class SignalDeciderWaitRecheckService:
                     source_market_date=candidate.source_market_date,
                     target_trade_date=candidate.target_trade_date,
                     symbol=candidate.symbol,
-                    agent_name=SHORT_TERM_DECIDER_AGENT_NAME,
+                    agent_name=candidate.agent_name,
                     trigger_price=candidate.trigger_price,
                     chase_limit_price=candidate.chase_limit_price,
                     target_price=candidate.target_price,
@@ -781,6 +989,8 @@ class SignalDeciderWaitRecheckService:
                         == candidate.target_trade_date,
                         SignalDeciderWaitRecheckEvent.symbol
                         == candidate.symbol,
+                        SignalDeciderWaitRecheckEvent.agent_name
+                        == candidate.agent_name,
                     )
                 ).scalar_one_or_none()
                 return int(existing_id) if existing_id is not None else None
@@ -878,11 +1088,18 @@ class SignalDeciderWaitRecheckService:
                 SignalDeciderDecisionSnapshot,
                 event.source_snapshot_id,
             )
-            if source_snapshot is None:
+            event_agent_name = str(
+                event.agent_name or ''
+            ).strip().lower()
+            if not validate_wait_recheck_event_binding(
+                event=event,
+                context=context,
+                source_snapshot=source_snapshot,
+            ):
                 event.status = 'expired'
                 event.last_attempt_at = now
                 event.last_error_payload = {
-                    'code': 'source_snapshot_missing',
+                    'code': 'wait_recheck_context_lineage_mismatch',
                 }
                 return None
             request_payload = _json_object(source_snapshot.request_payload)
@@ -891,7 +1108,8 @@ class SignalDeciderWaitRecheckService:
             attempt_number = int(event.attempt_count) + 1
             request_run_id = (
                 f'wait-recheck-{event.target_trade_date.isoformat()}-'
-                f'{event.symbol}-{event.id}-{attempt_number}'
+                f'{event_agent_name}-{event.symbol}-{event.id}-'
+                f'{attempt_number}'
             )
             event.status = 'running'
             event.attempt_count = attempt_number
@@ -901,6 +1119,7 @@ class SignalDeciderWaitRecheckService:
             return {
                 'event_id': int(event.id),
                 'symbol': event.symbol,
+                'agent_name': event_agent_name,
                 'source_market_date': event.source_market_date,
                 'target_trade_date': event.target_trade_date,
                 'source_snapshot_id': int(event.source_snapshot_id),
@@ -960,7 +1179,7 @@ class SignalDeciderWaitRecheckService:
             result = agent_feedback_orchestrator.dispatch_for_symbols(
                 market_date=attempt['source_market_date'],
                 symbols=[attempt['symbol']],
-                roles=(SHORT_TERM_DECIDER_AGENT_NAME,),
+                roles=(attempt['agent_name'],),
                 fs_div=attempt['fs_div'],
                 disclosures_limit=attempt['disclosures_limit'],
                 knowledge_cutoff_at=attempt['knowledge_cutoff_at'],
@@ -1006,7 +1225,7 @@ class SignalDeciderWaitRecheckService:
                     == attempt['request_run_id'],
                     SignalDeciderDecisionSnapshot.symbol == attempt['symbol'],
                     SignalDeciderDecisionSnapshot.agent_name
-                    == SHORT_TERM_DECIDER_AGENT_NAME,
+                    == attempt['agent_name'],
                 )
                 .order_by(
                     SignalDeciderDecisionSnapshot.created_at.desc(),
@@ -1025,7 +1244,12 @@ class SignalDeciderWaitRecheckService:
                 else {}
             )
             result_action = str(
-                response_payload.get('tactical_action')
+                (
+                    response_payload.get('tactical_action')
+                    if attempt['agent_name']
+                    == SHORT_TERM_DECIDER_AGENT_NAME
+                    else response_payload.get('next_day_open_action')
+                )
                 or response_payload.get('preferred_action')
                 or ''
             ).strip().lower() or None
@@ -1157,17 +1381,30 @@ def load_validated_wait_recheck_context(
     *,
     event_id: int,
     symbol: str,
+    agent_name: str | None = None,
 ) -> dict[str, Any] | None:
     with session_scope() as session:
         event = session.get(SignalDeciderWaitRecheckEvent, int(event_id))
         if event is None or event.status not in WAIT_RECHECK_ALLOWED_EVENT_STATUSES:
             return None
         context = _json_object(event.context_payload)
+        expected_agent_name = str(agent_name or '').strip().lower() or None
+        event_agent_name = str(event.agent_name or '').strip().lower()
+        source_snapshot = session.get(
+            SignalDeciderDecisionSnapshot,
+            event.source_snapshot_id,
+        )
         if (
             event.symbol != str(symbol or '').strip().upper()
-            or not validate_wait_recheck_context(
-                context,
-                expected_sha256=event.context_sha256,
+            or event_agent_name not in WAIT_RECHECK_AGENT_NAMES
+            or (
+                expected_agent_name is not None
+                and expected_agent_name != event_agent_name
+            )
+            or not validate_wait_recheck_event_binding(
+                event=event,
+                context=context,
+                source_snapshot=source_snapshot,
             )
         ):
             return None

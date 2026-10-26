@@ -1777,7 +1777,8 @@ class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
         UniqueConstraint(
             'target_trade_date',
             'symbol',
-            name='uq_signal_decider_wait_recheck_target_symbol',
+            'agent_name',
+            name='uq_signal_decider_wait_recheck_target_symbol_agent',
         ),
         CheckConstraint(
             "status IN ('queued', 'running', 'completed', 'failed', 'expired')",

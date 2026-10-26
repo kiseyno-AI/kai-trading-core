@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import re
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -839,6 +839,114 @@ def _sanitize_key(value: str) -> str:
 def _normalize_decision_agent_name(value: Any) -> str:
     normalized = _normalize_optional_text(value, lowercase=True)
     return normalized or SIGNAL_DECIDER_AGENT_NAME
+
+
+def _snapshot_requests_signal_trigger_entry(
+    snapshot: SignalDeciderDecisionSnapshot | None,
+) -> bool:
+    return bool(
+        snapshot is not None
+        and _normalize_decision_agent_name(snapshot.agent_name)
+        == SIGNAL_DECIDER_AGENT_NAME
+        and _normalize_optional_text(snapshot.next_day_open_action, lowercase=True)
+        == 'buy'
+        and _normalize_optional_text(snapshot.entry_price_basis, lowercase=True)
+        == 'trigger_limit'
+    )
+
+
+def _validated_signal_trigger_entry_levels(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> dict[str, Any] | None:
+    response_payload = (
+        snapshot.response_payload
+        if isinstance(snapshot.response_payload, dict)
+        else {}
+    )
+    trigger_price = _positive_decimal(response_payload.get('trigger_price'))
+    chase_limit_price = _positive_decimal(
+        response_payload.get('chase_limit_price')
+    )
+    target_price = _positive_decimal(
+        response_payload.get('target_price')
+        if response_payload.get('target_price') is not None
+        else snapshot.target_price
+    )
+    stop_loss_price = _positive_decimal(
+        response_payload.get('stop_loss_price')
+        if response_payload.get('stop_loss_price') is not None
+        else snapshot.stop_loss_price
+    )
+    trigger_conditions = response_payload.get('trigger_conditions')
+    if (
+        trigger_price is None
+        or chase_limit_price is None
+        or target_price is None
+        or stop_loss_price is None
+        or not isinstance(trigger_conditions, list)
+        or not any(_normalize_optional_text(item) for item in trigger_conditions)
+        or not (
+            stop_loss_price
+            < trigger_price
+            <= chase_limit_price
+            < target_price
+        )
+    ):
+        return None
+    return {
+        'trigger_price': trigger_price,
+        'chase_limit_price': chase_limit_price,
+        'target_price': target_price,
+        'stop_loss_price': stop_loss_price,
+        'trigger_conditions': copy.deepcopy(trigger_conditions),
+    }
+
+
+def _signal_trigger_plan_contract_mismatch(
+    *,
+    row: SignalDeciderExecutionPlanItem,
+    levels: Mapping[str, Any],
+) -> str | None:
+    traceability = (
+        row.traceability_payload
+        if isinstance(row.traceability_payload, dict)
+        else {}
+    )
+    exact_text_fields = (
+        ('planned_order_type', row.planned_order_type, 'limit'),
+        (
+            'eligibility_status',
+            row.eligibility_status,
+            ELIGIBILITY_MONITOR_CANDIDATE,
+        ),
+        (
+            'handoff_intent',
+            traceability.get('handoff_intent'),
+            EXEC_INTENT_INTRADAY_WATCH_BUY,
+        ),
+        (
+            'entry_execution_mode',
+            traceability.get('entry_execution_mode'),
+            'pending_trigger_limit',
+        ),
+    )
+    for field, observed, expected in exact_text_fields:
+        if _normalize_optional_text(observed, lowercase=True) != expected:
+            return field
+    for field in ('handoff_active', 'exec_monitoring_active'):
+        if traceability.get(field) is not True:
+            return field
+    for field in (
+        'trigger_price',
+        'chase_limit_price',
+        'target_price',
+        'stop_loss_price',
+    ):
+        if _safe_decimal(traceability.get(field)) != _safe_decimal(
+            levels.get(field)
+        ):
+            return field
+    return None
 
 
 def _normalize_short_term_generic_action(*, raw_action: Any, generic_action: Any) -> Any:
@@ -9023,7 +9131,7 @@ class SignalDeciderExecIntegrationService:
             return False
         decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
         if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
-            if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
+            if not _row_is_monitor_only_intraday_watch(row):
                 return False
         elif row.eligibility_status != ELIGIBILITY_ELIGIBLE:
             return False
@@ -9408,6 +9516,33 @@ class SignalDeciderExecIntegrationService:
                 decision_agent_name=row_decision_agent_name,
             )
             is_short_term = row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            signal_trigger_entry = _snapshot_requests_signal_trigger_entry(
+                snapshot
+            )
+            signal_trigger_levels = (
+                _validated_signal_trigger_entry_levels(snapshot)
+                if signal_trigger_entry and snapshot is not None
+                else None
+            )
+            if signal_trigger_entry and signal_trigger_levels is None:
+                raise SignalDeciderExecPayloadContractError(
+                    f'{row_decision_agent_name}:{row.id}:'
+                    'invalid_signal_trigger_geometry'
+                )
+            if signal_trigger_levels is not None:
+                trigger_contract_mismatch = (
+                    _signal_trigger_plan_contract_mismatch(
+                        row=row,
+                        levels=signal_trigger_levels,
+                    )
+                )
+                if trigger_contract_mismatch is not None:
+                    raise SignalDeciderExecPayloadContractError(
+                        f'{row_decision_agent_name}:{row.id}:'
+                        'signal_trigger_plan_contract_mismatch:'
+                        f'{trigger_contract_mismatch}'
+                    )
+            uses_trigger_entry = is_short_term or signal_trigger_entry
             short_term_context = (
                 validation.get('short_term')
                 if isinstance(validation.get('short_term'), dict)
@@ -9436,17 +9571,39 @@ class SignalDeciderExecIntegrationService:
                 SIGNAL_DECIDER_AGENT_NAME,
                 SHORT_TERM_DECIDER_AGENT_NAME,
             }
-            target_price = snapshot.target_price if snapshot is not None else traceability.get('target_price')
-            stop_loss_price = snapshot.stop_loss_price if snapshot is not None else traceability.get('stop_loss_price')
-            trigger_price = traceability.get('trigger_price')
-            chase_limit_price = traceability.get('chase_limit_price')
+            target_price = (
+                signal_trigger_levels['target_price']
+                if signal_trigger_levels is not None
+                else snapshot.target_price
+                if snapshot is not None
+                else traceability.get('target_price')
+            )
+            stop_loss_price = (
+                signal_trigger_levels['stop_loss_price']
+                if signal_trigger_levels is not None
+                else snapshot.stop_loss_price
+                if snapshot is not None
+                else traceability.get('stop_loss_price')
+            )
+            trigger_price = (
+                signal_trigger_levels['trigger_price']
+                if signal_trigger_levels is not None
+                else traceability.get('trigger_price')
+            )
+            chase_limit_price = (
+                signal_trigger_levels['chase_limit_price']
+                if signal_trigger_levels is not None
+                else traceability.get('chase_limit_price')
+            )
             raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
             generic_action = _normalize_short_term_generic_action(
                 raw_action=raw_action,
                 generic_action=traceability.get('generic_action'),
             )
             handoff_intent = (
-                _normalize_optional_text(traceability.get('handoff_intent'), lowercase=True)
+                EXEC_INTENT_INTRADAY_WATCH_BUY
+                if signal_trigger_entry
+                else _normalize_optional_text(traceability.get('handoff_intent'), lowercase=True)
                 or (
                     'tactical_buy'
                     if is_short_term and raw_action == 'scalp_buy_candidate'
@@ -9455,16 +9612,49 @@ class SignalDeciderExecIntegrationService:
                     else EXEC_INTENT_NEXT_OPEN_BUY
                 )
             )
-            entry_intent = EXEC_INTENT_INTRADAY_WATCH_BUY if is_short_term else EXEC_INTENT_NEXT_OPEN_BUY
+            entry_intent = (
+                EXEC_INTENT_INTRADAY_WATCH_BUY
+                if uses_trigger_entry
+                else EXEC_INTENT_NEXT_OPEN_BUY
+            )
             entry_execution_mode = (
-                _normalize_optional_text(traceability.get('entry_execution_mode'))
+                'pending_trigger_limit'
+                if signal_trigger_entry
+                else _normalize_optional_text(traceability.get('entry_execution_mode'))
                 or ('pending_trigger_limit' if is_short_term else 'next_open_market')
             )
             core_entry_key = f'core-plan-{row.id}:{entry_intent}'
+            dispatch_traceability = {
+                **traceability,
+                **(
+                    {
+                        'handoff_intent': handoff_intent,
+                        'handoff_active': True,
+                        'entry_execution_mode': entry_execution_mode,
+                        'trigger_price': _to_json_number(
+                            _safe_decimal(trigger_price)
+                        ),
+                        'chase_limit_price': _to_json_number(
+                            _safe_decimal(chase_limit_price)
+                        ),
+                        'target_price': _to_json_number(
+                            _safe_decimal(target_price)
+                        ),
+                        'stop_loss_price': _to_json_number(
+                            _safe_decimal(stop_loss_price)
+                        ),
+                        'trigger_conditions': copy.deepcopy(
+                            signal_trigger_levels['trigger_conditions']
+                        ),
+                    }
+                    if signal_trigger_levels is not None
+                    else {}
+                ),
+            }
             full_decider_handoff_context = self._build_decider_handoff_context(
                 row=row,
                 snapshot=snapshot,
-                traceability=traceability,
+                traceability=dispatch_traceability,
                 validation=validation,
                 decision_traceability=decision_traceability,
             )
@@ -9745,9 +9935,17 @@ class SignalDeciderExecIntegrationService:
                 'final_enforcement_decision': final_enforcement_decision,
                 'requested_quantity': _decimal_to_text(requested_enforcement_quantity),
                 'final_quantity': _decimal_to_text(final_enforcement_quantity),
-                'handoff_active': bool(traceability.get('handoff_active')) if is_short_term else True,
-                'original_watch_trigger_price': trigger_price,
-                'original_watch_chase_limit_price': chase_limit_price,
+                'handoff_active': (
+                    bool(dispatch_traceability.get('handoff_active'))
+                    if uses_trigger_entry
+                    else True
+                ),
+                'original_watch_trigger_price': _to_json_number(
+                    _safe_decimal(trigger_price)
+                ),
+                'original_watch_chase_limit_price': _to_json_number(
+                    _safe_decimal(chase_limit_price)
+                ),
                 'allocation_mode': (
                     _normalize_optional_text(traceability.get('allocation_mode'))
                     or (
@@ -9757,8 +9955,10 @@ class SignalDeciderExecIntegrationService:
                     )
                 ),
                 'entry_execution_mode': entry_execution_mode,
-                'monitoring_candidate': bool(is_short_term),
-                'monitoring_intent': entry_intent if is_short_term else None,
+                'monitoring_candidate': bool(uses_trigger_entry),
+                'monitoring_intent': (
+                    entry_intent if uses_trigger_entry else None
+                ),
                 'decider_handoff_context_digest': decider_handoff_context_digest,
             }
             entry_common_risk_context = {
@@ -9975,8 +10175,16 @@ class SignalDeciderExecIntegrationService:
                 'tactical_action': traceability.get('tactical_action'),
                 'generic_action': generic_action,
                 'quantity_policy': quantity_policy,
-                'limit_price': _to_json_number(_safe_decimal(chase_limit_price)) if is_short_term else None,
-                'trigger_price': _to_json_number(_safe_decimal(trigger_price)) if is_short_term else None,
+                'limit_price': (
+                    _to_json_number(_safe_decimal(chase_limit_price))
+                    if uses_trigger_entry
+                    else None
+                ),
+                'trigger_price': (
+                    _to_json_number(_safe_decimal(trigger_price))
+                    if uses_trigger_entry
+                    else None
+                ),
                 'time_in_force': row.planned_time_in_force,
                 'risk_context': entry_risk_context,
                 'decision_snapshot_id': str(row.decision_snapshot_id),
@@ -9991,12 +10199,12 @@ class SignalDeciderExecIntegrationService:
                     'symbol': row.symbol,
                     'trigger_price': (
                         _to_json_number(_safe_decimal(trigger_price))
-                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        if uses_trigger_entry
                         else None
                     ),
                     'limit_price': (
                         _to_json_number(_safe_decimal(chase_limit_price))
-                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        if uses_trigger_entry
                         else None
                     ),
                 }
@@ -11246,7 +11454,15 @@ class SignalDeciderExecIntegrationService:
                     ),
                 }
                 row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
-                if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+                row_uses_trigger_watch = any(
+                    _normalize_optional_text(link.get('intent'), lowercase=True)
+                    == EXEC_INTENT_INTRADAY_WATCH_BUY
+                    for link in row_links.get(row.id, [])
+                )
+                if (
+                    row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    or row_uses_trigger_watch
+                ):
                     row.execution_status = EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
                 elif row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
                     row.execution_status = (
@@ -12335,7 +12551,7 @@ class SignalDeciderExecIntegrationService:
         watch_expired_reconciliation = bool(
             acknowledged_revocation is None
             and terminal_status == 'watch_expired'
-            and cls._is_short_term_watch_buy_row(row)
+            and cls._is_intraday_watch_buy_row(row)
             and all(
                 (derived_state.get('endpoint_statuses') or {}).get(endpoint)
                 == REMOTE_FETCH_STATUS_OK
@@ -12515,8 +12731,14 @@ class SignalDeciderExecIntegrationService:
         }
 
     @classmethod
-    def _is_short_term_watch_buy_row(cls, row: SignalDeciderExecutionPlanItem) -> bool:
-        if _normalize_decision_agent_name(row.decision_agent_name) != SHORT_TERM_DECIDER_AGENT_NAME:
+    def _is_intraday_watch_buy_row(cls, row: SignalDeciderExecutionPlanItem) -> bool:
+        decision_agent_name = _normalize_decision_agent_name(
+            row.decision_agent_name
+        )
+        if decision_agent_name not in {
+            SIGNAL_DECIDER_AGENT_NAME,
+            SHORT_TERM_DECIDER_AGENT_NAME,
+        }:
             return False
         if _normalize_optional_text(row.planned_side, lowercase=True) != 'buy':
             return False
@@ -12534,12 +12756,47 @@ class SignalDeciderExecIntegrationService:
             traceability.get('handoff_intent') or short_term.get('handoff_intent'),
             lowercase=True,
         )
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+            return bool(
+                raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}
+                or handoff_intent
+                in {
+                    'tactical_buy',
+                    EXEC_INTENT_INTRADAY_WATCH_BUY,
+                    EXEC_INTENT_NEXT_OPEN_BUY,
+                }
+            )
+        trigger_price = _positive_decimal(traceability.get('trigger_price'))
+        chase_limit_price = _positive_decimal(
+            traceability.get('chase_limit_price')
+        )
+        target_price = _positive_decimal(traceability.get('target_price'))
+        stop_loss_price = _positive_decimal(
+            traceability.get('stop_loss_price')
+        )
         return bool(
-            raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}
-            or handoff_intent in {'tactical_buy', EXEC_INTENT_INTRADAY_WATCH_BUY, EXEC_INTENT_NEXT_OPEN_BUY}
+            _normalize_optional_text(
+                traceability.get('entry_price_basis'),
+                lowercase=True,
+            )
+            == 'trigger_limit'
+            and handoff_intent == EXEC_INTENT_INTRADAY_WATCH_BUY
+            and _normalize_optional_text(
+                traceability.get('entry_execution_mode'),
+                lowercase=True,
+            )
+            == 'pending_trigger_limit'
+            and trigger_price is not None
+            and chase_limit_price is not None
+            and target_price is not None
+            and stop_loss_price is not None
+            and stop_loss_price
+            < trigger_price
+            <= chase_limit_price
+            < target_price
         )
 
-    def _sync_short_term_exec_watch_state(
+    def _sync_intraday_exec_watch_state(
         self,
         *,
         row: SignalDeciderExecutionPlanItem,
@@ -12547,7 +12804,7 @@ class SignalDeciderExecIntegrationService:
         now: datetime,
         trigger: str,
     ) -> dict[str, Any] | None:
-        if not self._is_short_term_watch_buy_row(row):
+        if not self._is_intraday_watch_buy_row(row):
             return None
         if _normalize_optional_text(row.execution_status, lowercase=True) in {
             'revocation_pending',
@@ -12923,7 +13180,7 @@ class SignalDeciderExecIntegrationService:
                 )
                 core_state_sync = exec_dispatch.get('core_state_sync')
                 if observed_terminal_state_sync is None and terminal_state_sync is None:
-                    core_state_sync = self._sync_short_term_exec_watch_state(
+                    core_state_sync = self._sync_intraday_exec_watch_state(
                         row=row,
                         item_links=item_links,
                         now=now,

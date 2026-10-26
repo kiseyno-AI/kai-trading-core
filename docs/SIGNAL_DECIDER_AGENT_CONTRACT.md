@@ -6,7 +6,7 @@ Canonical runtime source: `apps/api/app/agent_context/response_contract.py`. The
 
 ## Purpose
 
-`signal-decider` combines the bounded EOD, technical, fundamental, market-regime, liquidity, data-quality, and prior-decision context supplied by Core. It provides conservative next-session decision support. It does not place orders, size positions, or bypass Core/Exec risk controls.
+`signal-decider` combines the bounded EOD, technical, fundamental, market-regime, liquidity, data-quality, and prior-decision context supplied by Core. It is the independent swing/position lane: it may recommend a next-session entry or a trigger-gated entry with a multi-session or longer-horizon holding thesis. The separate `short-term-decider` normally targets 2–3 trading days, may exit earlier on target/stop/invalidation, and has a maximum three-session safety close; neither lane vetoes or relabels the other. The signal decider does not place orders, size positions, or bypass shared Core/Exec account, symbol-exposure, quality, pause, or kill-switch controls.
 
 ## Runtime model identity
 
@@ -53,8 +53,8 @@ excluded from profitability aggregation and policy-promotion evidence.
 
 `preferred_action` and `next_day_open_action` must both use exactly one of `buy`, `wait`, `reject`.
 
-- `buy` requires supportable entry, target, stop, execution quality, and invalidation evidence.
-- `wait` requires a concrete normalized `wait_reason` and an upgrade trigger when prior decision context exists.
+- `buy` requires supportable entry, target, stop, execution quality, and invalidation evidence. It may use ordinary `entry_price_basis=next_open` or the complete bounded `trigger_limit` contract.
+- `wait` requires a concrete normalized `wait_reason`. A monitorable WAIT uses an explicit `buy` upgrade trigger and the same complete bounded trigger contract; a non-monitorable WAIT keeps trigger fields null/empty.
 - `reject` marks a broken, unsuitable, or structurally invalid setup.
 
 ## Identity and attribution
@@ -65,9 +65,9 @@ Any role/symbol/market_date mismatch, missing response symbol, traceability.symb
 
 ## Schema integrity
 
-Every declared contract key is required, even when its value is `null` or an empty list. Prices, returns, confidence, and score fields must be numbers or `null`; list fields must be arrays of strings; `decision_delta`, `traceability`, and `details` must be objects. Both action aliases must be present and equal. A missing key, invalid type, contradictory action alias, or malformed wait reason hard-fails the response before it can be persisted, counted as completed, or supplied to another agent.
+Every declared contract key is required, even when its value is `null` or an empty list. This includes `trigger_price`, `chase_limit_price`, and `trigger_conditions`. Prices, returns, confidence, and score fields must be numbers or `null`; list fields must be arrays of strings; `decision_delta`, `traceability`, and `details` must be objects. Both action aliases must be present and equal. A missing key, invalid type, contradictory action alias, or malformed wait reason hard-fails the response before it can be persisted, counted as completed, or supplied to another agent.
 
-For `buy`, target, expected return, stop, confidence and conviction scores must be positive, target must exceed stop, holding period must be non-empty, and supporting evidence plus invalidation conditions must be non-empty. For `wait`, numeric fields may be `null`, but `wait_reason` must contain a supported `code` and a concrete non-empty `summary`. For `reject`, numeric fields may be `null` and `wait_reason` must be `null`.
+For `buy`, target, expected return, stop, confidence and conviction scores must be positive, target must exceed stop, holding period must be non-empty, and supporting evidence plus invalidation conditions must be non-empty. A `trigger_limit` BUY, or a WAIT that supplies any trigger-contract field, must supply all of `trigger_price`, `chase_limit_price`, `target_price`, `stop_loss_price`, and non-empty `trigger_conditions`, with `stop_loss_price < trigger_price <= chase_limit_price < target_price`. For ordinary `next_open` BUY, trigger prices may be `null` and `trigger_conditions` empty. For non-monitorable `wait`, numeric fields may be `null`, but `wait_reason` must contain a supported `code` and a concrete non-empty `summary`. For `reject`, numeric fields may be `null` and `wait_reason` must be `null`.
 
 ## Buy economics
 

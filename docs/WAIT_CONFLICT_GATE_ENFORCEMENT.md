@@ -2,14 +2,14 @@
 
 ## Safety default and modes
 
-`SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE` remains `report_only`. A mode change requires an explicit configuration update and API restart.
+`SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE` remains `report_only`. Live Exec dispatch intentionally keeps signal-decider and short-term-decider authority independent. A mode change requires an explicit configuration update and API restart.
 
-- `report_only`: records the conflict and preserves trigger-gated monitoring. It does not grant BUY authority; Exec must still pass trigger-time quote, chase-limit, quality, market-authority, portfolio, pause, and kill-switch gates before submitting an order.
-- `hard_block`: makes a non-override conflict ineligible and sets final quantity to zero.
-- `downsize_probe`: deterministically caps final quantity at `SIGNAL_DECIDER_WAIT_CONFLICT_PROBE_QUANTITY` without increasing a smaller request.
+- `report_only`: records WAIT/reject/missing/stale signal context without changing short-term eligibility or quantity and preserves trigger-gated monitoring. It does not grant BUY authority; Exec must still pass trigger-time quote, chase-limit, quality, aggregate account/symbol exposure, market-authority, portfolio, pause, and kill-switch gates before submitting an order.
+- `hard_block`: available for observe/offline evaluation and replay, but rejected by settings validation when integration mode is `dispatch`.
+- `downsize_probe`: available for observe/offline evaluation and replay, but rejected by settings validation when integration mode is `dispatch`.
 - `disabled`: retains an explicit disabled audit state.
 
-`allow_by_override` remains valid only when every documented continuation, reward/risk, quality/return, volume, and raw-liquidity check passes. Missing or stale same-date signal-decider context is explicitly classified and follows the configured conflict action; it is never silently approved. Core persists `enforcement_decision`, `requested_quantity`, and `final_quantity` in the plan validation, traceability, Exec handoff, and item risk context. A downsized v4 handoff remains `exec_agent_sized` and carries the probe as a binding `max_quantity` ceiling; Exec may reduce or reject it but cannot size above the cap.
+`allow_by_override`, enforcement decisions, and modeled probe quantities remain replay/audit evidence. They cannot turn cross-decider disagreement into a dispatch-time veto or quantity cap. In dispatch mode only `disabled` and `report_only` are accepted; common deterministic exposure and safety gates remain authoritative for both lanes.
 
 ## Weekly operator replay
 
@@ -38,7 +38,7 @@ The report exposes these checks under `promotion_readiness`:
 - unresolved WAIT-conflict ratio no greater than 25%;
 - manual approval for any live configuration change.
 
-Passing the numeric checks does not activate enforcement automatically. Keep `report_only` unless all checks pass and the operational owner explicitly approves either `hard_block` or `downsize_probe`.
+Passing the numeric checks does not make cross-agent enforcement dispatch-safe. Keep live dispatch at `report_only` or `disabled`; any `hard_block` or `downsize_probe` experiment remains confined to observe/offline evaluation and requires a separately reviewed future code/configuration change before it could be reconsidered for live dispatch.
 
 ## Monitoring is not BUY authority
 

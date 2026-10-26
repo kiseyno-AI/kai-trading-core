@@ -530,11 +530,13 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
         role=SIGNAL_DECIDER_AGENT_NAME,
         agent_name=SIGNAL_DECIDER_AGENT_NAME,
         instruction=(
-            'Synthesize the three specialist summaries into conservative next-trading-day decision support only, '
+            'Operate as an independent swing, position, and long-horizon lane rather than a duplicate of or subordinate filter for the short-term lane, which normally holds 2-3 trading days, may exit earlier on invalidation, stop, or target, and never exceeds 3 trading sessions. '
+            'Synthesize the three specialist summaries into conservative decision support using this lane\'s own entry, target, stop, invalidation, and holding-horizon evidence, '
             'choosing buy, wait, or reject while surfacing evidence, disagreement, invalidation, data-quality warnings, '
             'and explicit realistic target and stop-loss levels for every symbol. '
             'Every wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to buy. '
+            'When intraday_wait_recheck_context is supplied, treat its immutable fresh best-ask observation only as a request to reassess this lane\'s prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to buy with complete fresh trigger, chase-limit, target, and stop geometry after a conservative review. '
             'Account for market_regime_context when choosing buy, wait, or reject: defensive/risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution/normal require setup confirmation; aggressive_open and trend_day can support faster or continuation-oriented entries only inside the supplied bounded window and without sizing or safety-gate claims. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the thesis explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
@@ -3890,6 +3892,7 @@ class AgentFeedbackOrchestrator:
                     load_validated_wait_recheck_context(
                         event_id=wait_recheck_event_id,
                         symbol=symbol,
+                        agent_name=decision_role,
                     )
                     if wait_recheck_event_id is not None
                     else None
@@ -6368,10 +6371,18 @@ class AgentFeedbackOrchestrator:
         requested_symbols = _normalize_requested_symbols(symbols)
         normalized_source_context_overlays: dict[str, dict[str, Any]] = {}
         if source_context_overlays is not None:
-            if requested_role_names != [SHORT_TERM_DECIDER_AGENT_NAME]:
+            if (
+                len(requested_role_names) != 1
+                or requested_role_names[0]
+                not in {
+                    SIGNAL_DECIDER_AGENT_NAME,
+                    SHORT_TERM_DECIDER_AGENT_NAME,
+                }
+            ):
                 raise ValueError(
-                    'source_context_overlays require a short-term-decider-only dispatch'
+                    'source_context_overlays require one supported decider role'
                 )
+            overlay_agent_name = requested_role_names[0]
             from app.agent_context.wait_recheck_service import (
                 load_validated_wait_recheck_context,
             )
@@ -6393,6 +6404,7 @@ class AgentFeedbackOrchestrator:
                 validated_context = load_validated_wait_recheck_context(
                     event_id=event_id,
                     symbol=symbol,
+                    agent_name=overlay_agent_name,
                 )
                 if validated_context is None or validated_context != dict(
                     raw_context

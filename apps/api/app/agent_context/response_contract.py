@@ -28,6 +28,8 @@ SIGNAL_DECIDER_REQUIRED_RESPONSE_KEYS = (
     'next_day_open_action',
     'wait_reason',
     'entry_price_basis',
+    'trigger_price',
+    'chase_limit_price',
     'target_price',
     'expected_return_pct',
     'stop_loss_price',
@@ -35,6 +37,7 @@ SIGNAL_DECIDER_REQUIRED_RESPONSE_KEYS = (
     'confidence_score_10',
     'conviction_score_10',
     'thesis_summary',
+    'trigger_conditions',
     'supporting_evidence',
     'decision_risks',
     'decision_delta',
@@ -430,7 +433,14 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
     )
     _validate_nullable_number_fields(
         payload=payload,
-        fields=('target_price', 'expected_return_pct', 'stop_loss_price', 'confidence'),
+        fields=(
+            'trigger_price',
+            'chase_limit_price',
+            'target_price',
+            'expected_return_pct',
+            'stop_loss_price',
+            'confidence',
+        ),
         flags=flags,
     )
     _validate_score_fields(
@@ -441,6 +451,7 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
     _validate_string_list_fields(
         payload=payload,
         fields=(
+            'trigger_conditions',
             'supporting_evidence',
             'decision_risks',
             'invalidation_conditions',
@@ -488,6 +499,19 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
         if isinstance(next_day_open_action, str)
         else None
     )
+    entry_price_basis = str(
+        payload.get('entry_price_basis') or ''
+    ).strip().lower()
+    trigger_conditions = payload.get('trigger_conditions')
+    has_trigger_contract = bool(
+        entry_price_basis == 'trigger_limit'
+        or payload.get('trigger_price') is not None
+        or payload.get('chase_limit_price') is not None
+        or (
+            isinstance(trigger_conditions, list)
+            and bool(trigger_conditions)
+        )
+    )
     if action == 'buy':
         _append_actionable_common_requirements(
             payload=payload,
@@ -511,6 +535,38 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
             flags.append('action_requirement_invalid:wait_reason')
     elif action == 'reject' and payload.get('wait_reason') is not None:
         flags.append('action_requirement_invalid:wait_reason')
+    if action in {'buy', 'wait'} and has_trigger_contract:
+        _append_actionable_common_requirements(
+            payload=payload,
+            numeric_fields=(
+                'trigger_price',
+                'chase_limit_price',
+                'target_price',
+                'stop_loss_price',
+            ),
+            evidence_fields=('trigger_conditions',),
+            holding_period_field='suggested_holding_period',
+            flags=flags,
+        )
+        trigger_price = payload.get('trigger_price')
+        chase_limit_price = payload.get('chase_limit_price')
+        target_price = payload.get('target_price')
+        stop_loss_price = payload.get('stop_loss_price')
+        if all(
+            _is_raw_number(value)
+            for value in (
+                trigger_price,
+                chase_limit_price,
+                target_price,
+                stop_loss_price,
+            )
+        ) and not (
+            float(stop_loss_price)
+            < float(trigger_price)
+            <= float(chase_limit_price)
+            < float(target_price)
+        ):
+            flags.append('action_requirement_invalid:price_order')
     return list(dict.fromkeys(flags))
 
 
@@ -652,12 +708,15 @@ def _build_signal_decider_details(
     next_day_open_action: str,
     wait_reason: dict[str, Any] | None,
     entry_price_basis: str,
+    trigger_price: float | None,
+    chase_limit_price: float | None,
     target_price: float | None,
     expected_return_pct: float | None,
     stop_loss_price: float | None,
     suggested_holding_period: str | None,
     confidence_score_10: float | None,
     conviction_score_10: float | None,
+    trigger_conditions: list[str],
     supporting_evidence: list[str],
     decision_risks: list[str],
     invalidation_conditions: list[str],
@@ -672,12 +731,15 @@ def _build_signal_decider_details(
             'wait_reason': wait_reason,
             'decision_delta': decision_delta,
             'entry_price_basis': entry_price_basis,
+            'trigger_price': trigger_price,
+            'chase_limit_price': chase_limit_price,
             'target_price': target_price,
             'expected_return_pct': expected_return_pct,
             'stop_loss_price': stop_loss_price,
             'suggested_holding_period': suggested_holding_period,
             'confidence_score_10': confidence_score_10,
             'conviction_score_10': conviction_score_10,
+            'trigger_conditions': trigger_conditions,
             'supporting_evidence': supporting_evidence,
             'decision_risks': decision_risks,
             'invalidation_conditions': invalidation_conditions,
@@ -719,6 +781,8 @@ def _normalize_signal_decider_response(
         payload.get('next_day_open_action') or payload.get('preferred_action')
     )
     entry_price_basis = str(payload.get('entry_price_basis') or 'next_open').strip() or 'next_open'
+    trigger_price = _normalize_number(payload.get('trigger_price'))
+    chase_limit_price = _normalize_number(payload.get('chase_limit_price'))
     target_price = _normalize_number(payload.get('target_price'))
     expected_return_pct = _normalize_number(payload.get('expected_return_pct'))
     stop_loss_price = _normalize_number(payload.get('stop_loss_price'))
@@ -726,6 +790,7 @@ def _normalize_signal_decider_response(
     confidence_score_10 = _normalize_score_10(payload.get('confidence_score_10'))
     conviction_score_10 = _normalize_score_10(payload.get('conviction_score_10'))
     thesis_summary = str(payload.get('thesis_summary') or payload.get('summary') or output_text or '').strip()
+    trigger_conditions = _normalize_text_list(payload.get('trigger_conditions'))
     supporting_evidence = _normalize_text_list(payload.get('supporting_evidence'))
     decision_risks = _normalize_text_list(payload.get('decision_risks'))
     invalidation_conditions = _normalize_text_list(payload.get('invalidation_conditions'))
@@ -893,6 +958,8 @@ def _normalize_signal_decider_response(
         'next_day_open_action': next_day_open_action,
         'wait_reason': wait_reason,
         'entry_price_basis': entry_price_basis,
+        'trigger_price': trigger_price,
+        'chase_limit_price': chase_limit_price,
         'target_price': target_price,
         'expected_return_pct': expected_return_pct,
         'stop_loss_price': stop_loss_price,
@@ -900,6 +967,7 @@ def _normalize_signal_decider_response(
         'confidence_score_10': confidence_score_10,
         'conviction_score_10': conviction_score_10,
         'thesis_summary': thesis_summary,
+        'trigger_conditions': trigger_conditions,
         'supporting_evidence': supporting_evidence,
         'decision_risks': decision_risks,
         'invalidation_conditions': invalidation_conditions,
@@ -919,12 +987,15 @@ def _normalize_signal_decider_response(
             next_day_open_action=next_day_open_action,
             wait_reason=wait_reason,
             entry_price_basis=entry_price_basis,
+            trigger_price=trigger_price,
+            chase_limit_price=chase_limit_price,
             target_price=target_price,
             expected_return_pct=expected_return_pct,
             stop_loss_price=stop_loss_price,
             suggested_holding_period=suggested_holding_period,
             confidence_score_10=confidence_score_10,
             conviction_score_10=conviction_score_10,
+            trigger_conditions=trigger_conditions,
             supporting_evidence=supporting_evidence,
             decision_risks=decision_risks,
             invalidation_conditions=invalidation_conditions,
@@ -1256,7 +1327,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'decision_delta should include previous_market_date, previous_recommendation, previous_recommendation_class, previous_wait_reason, current_recommendation, current_recommendation_class, current_wait_reason, transition, persistence_trend, changed_fields, stable_fields, what_changed, what_stayed_same, and upgrade_trigger. '
             'When a wait-like recommendation repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to scalp_buy_candidate or watch_for_trigger. '
             'trigger_price, chase_limit_price, target_price, and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; use null rather than fake precision when unsupported and explain why in data_quality_warnings. '
-            'expected_holding_period should be 1-3 trading days when the setup and evidence support a short-term position. '
+            'expected_holding_period should normally be 2-3 trading days when the setup and evidence support a short-term position; this is not a minimum holding lock, so an invalidation, stop, or target may close the position earlier, and the maximum remains 3 trading sessions. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
             'thesis_summary must be a concise short-term tactical decision-support explanation in Korean. '
             'trigger_conditions, supporting_evidence, tactical_risks, invalidation_conditions, data_quality_warnings, risk_flags, and improvement_notes must be arrays of short Korean strings. '
@@ -1279,9 +1350,10 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
     if role == SIGNAL_DECIDER_AGENT_NAME:
         return (
             'Return JSON only. Do not wrap in markdown. '
+            'This agent is an independent swing, position, and long-horizon lane; do not copy, cancel, or subordinate its thesis and price levels to the separate short-term lane that normally holds 2-3 trading days, may exit earlier on invalidation, stop, or target, and never exceeds 3 trading sessions. '
             'For every signal-decider feedback object, required keys are: role, agent_name, symbol, market_date, preferred_action, next_day_open_action, '
-            'wait_reason, entry_price_basis, target_price, expected_return_pct, stop_loss_price, suggested_holding_period, '
-            'confidence_score_10, conviction_score_10, thesis_summary, supporting_evidence, decision_risks, '
+            'wait_reason, entry_price_basis, trigger_price, chase_limit_price, target_price, expected_return_pct, stop_loss_price, suggested_holding_period, '
+            'confidence_score_10, conviction_score_10, thesis_summary, trigger_conditions, supporting_evidence, decision_risks, '
             'decision_delta, '
             'invalidation_conditions, data_quality_warnings, specialist_disagreement, traceability, summary, confidence, '
             'risk_flags, details, improvement_notes. '
@@ -1301,13 +1373,14 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'decision_delta must be an object, not prose, and should summarize prior-vs-current change metadata when previous_decision_context is available in the request. '
             'decision_delta should include previous_market_date, previous_recommendation, previous_recommendation_class, previous_wait_reason, current_recommendation, current_recommendation_class, current_wait_reason, transition, persistence_trend, changed_fields, stable_fields, what_changed, what_stayed_same, and upgrade_trigger. '
             'When wait repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that would upgrade the setup to buy. '
-            'entry_price_basis should be next_open unless the supplied inputs justify a different explicit basis. '
+            'entry_price_basis should be next_open for an ordinary next-open BUY, or trigger_limit when this lane supplies an independently justified monitored trigger entry. '
+            'For trigger_limit BUY or a monitorable WAIT, trigger_price, chase_limit_price, target_price, stop_loss_price, and trigger_conditions must be complete and must satisfy stop_loss_price < trigger_price <= chase_limit_price < target_price. '
             'target_price and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; if a concrete level is genuinely not supportable, keep the keys and explain the limitation in data_quality_warnings instead of omitting them. '
             'expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis; never report an upside that the supplied price levels do not support. Core recomputes a conservative slippage-adjusted pre-screen return from target, reference entry, and trusted quote-spread evidence; Core-local orders also include the server-owned non-spread round-trip allowance, while Exec applies its final full-cost check in dispatch mode before any live buy can qualify. '
             'Use null rather than fake precision when a numeric field is not well-supported by the inputs. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
             'thesis_summary must be a concise decision-support explanation in Korean. '
-            'supporting_evidence, decision_risks, invalidation_conditions, data_quality_warnings, specialist_disagreement, '
+            'trigger_conditions, supporting_evidence, decision_risks, invalidation_conditions, data_quality_warnings, specialist_disagreement, '
             'risk_flags, and improvement_notes must be arrays of short Korean strings. '
             'details must be an object with structured decision-support fields and traceability. '
             'Treat core execution/liquidity inputs such as liquidity, quote freshness, spread/slippage, and execution context as the main blocker domain. '

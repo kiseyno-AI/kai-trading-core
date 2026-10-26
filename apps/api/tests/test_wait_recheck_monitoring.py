@@ -12,6 +12,7 @@ from app.agent_context.wait_recheck_service import (
     WAIT_RECHECK_CONTEXT_SCHEMA_VERSION,
     SignalDeciderWaitRecheckService,
     WaitRecheckObservation,
+    _canonical_json_sha256,
     build_wait_recheck_candidate,
     canonical_wait_recheck_context,
     merge_wait_recheck_monitored_source,
@@ -43,13 +44,14 @@ def _snapshot(
     stop_loss_price: int | None = 69_500,
     upgrade_target_action: str = 'watch_for_trigger',
     upgrade_trigger_price: int | None = 71_000,
+    agent_name: str = 'short-term-decider',
 ) -> SimpleNamespace:
     created_at = datetime(2026, 10, 20, 11, 0, tzinfo=timezone.utc)
     return SimpleNamespace(
         id=snapshot_id,
         market_date=date(2026, 10, 20),
         symbol=symbol,
-        agent_name='short-term-decider',
+        agent_name=agent_name,
         decision_action=action,
         preferred_action=action,
         next_day_open_action=action,
@@ -154,6 +156,42 @@ def test_wait_candidate_requires_explicit_bounded_watch_upgrade() -> None:
         _snapshot(upgrade_trigger_price=71_100),
         target_trade_date=target_trade_date,
     ) is None
+
+
+def test_same_symbol_wait_candidates_remain_independent_by_agent() -> None:
+    target_trade_date = date(2026, 10, 21)
+    short_candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=target_trade_date,
+    )
+    signal_candidate = build_wait_recheck_candidate(
+        _snapshot(
+            snapshot_id=12,
+            agent_name='signal-decider',
+            upgrade_target_action='buy',
+        ),
+        target_trade_date=target_trade_date,
+    )
+
+    assert short_candidate is not None
+    assert signal_candidate is not None
+    assert short_candidate.agent_name == 'short-term-decider'
+    assert signal_candidate.agent_name == 'signal-decider'
+
+    service = SignalDeciderWaitRecheckService()
+    service.replace_candidate_cache([short_candidate, signal_candidate])
+    now = datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc)
+
+    assert service.observe_realtime_tick(
+        _tick(ask_price=71_200, received_at=now),
+        subscribed=True,
+        limited=False,
+        now=now,
+    ) is True
+    observations = service.pop_pending_observations(limit=10)
+    assert {
+        observation.candidate.agent_name for observation in observations
+    } == {'signal-decider', 'short-term-decider'}
 
 
 def test_realtime_tick_queues_once_only_for_fresh_subscribed_ask_inside_band() -> None:
@@ -414,6 +452,39 @@ def test_wait_recheck_context_is_immutable_and_grants_no_order_authority() -> No
     assert validate_wait_recheck_context(context, expected_sha256=fingerprint)
     context['observation']['observed_price'] = 71_300
     assert not validate_wait_recheck_context(context, expected_sha256=fingerprint)
+
+
+def test_signal_wait_recheck_context_only_promotes_fresh_buy() -> None:
+    candidate = build_wait_recheck_candidate(
+        _snapshot(
+            snapshot_id=12,
+            agent_name='signal-decider',
+            upgrade_target_action='buy',
+        ),
+        target_trade_date=date(2026, 10, 21),
+    )
+    assert candidate is not None
+    observation = SimpleNamespace(
+        candidate=candidate,
+        observed_price=71_200,
+        current_price=71_100,
+        bid_price=71_100,
+        price_basis='best_ask',
+        price_as_of=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+        received_at=datetime(2026, 10, 21, 0, 5, 1, tzinfo=timezone.utc),
+        quote_source='kis_realtime_ws',
+    )
+
+    context, fingerprint = canonical_wait_recheck_context(
+        event_id=8,
+        observation=observation,
+        market_state='OPEN',
+        market_server_time='2026-10-21T09:05:01+09:00',
+    )
+
+    assert context['agent_name'] == 'signal-decider'
+    assert context['execution_authority']['only_promotable_action'] == 'buy'
+    assert validate_wait_recheck_context(context, expected_sha256=fingerprint)
 
 
 def test_wait_membership_is_appended_below_holdings_and_exec_protection() -> None:
@@ -819,10 +890,12 @@ def test_dispatch_event_calls_only_fresh_short_term_recompute_contract() -> None
     context = {
         'schema_version': WAIT_RECHECK_CONTEXT_SCHEMA_VERSION,
         'event_id': 9,
+        'agent_name': 'short-term-decider',
     }
     attempt = {
         'event_id': 9,
         'symbol': '005930',
+        'agent_name': 'short-term-decider',
         'source_market_date': date(2026, 10, 20),
         'target_trade_date': date(2026, 10, 21),
         'source_snapshot_id': 1,
@@ -899,6 +972,111 @@ def test_dispatch_event_calls_only_fresh_short_term_recompute_contract() -> None
             },
         }
     ) is False
+
+
+def test_dispatch_event_recomputes_exact_signal_agent_and_reads_signal_buy() -> None:
+    request_run_id = 'wait-recheck-2026-10-21-signal-decider-005930-10-1'
+    with session_scope() as session:
+        result_snapshot = SignalDeciderDecisionSnapshot(
+            feedback_id=None,
+            content_fingerprint='d' * 64,
+            market_date=date(2026, 10, 20),
+            symbol='005930',
+            agent_name='signal-decider',
+            agent_version='test',
+            decision_run_id=request_run_id,
+            feedback_received_at=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+            policy_version='signal_decider_policy_v1',
+            decision_action='buy',
+            preferred_action='buy',
+            next_day_open_action='buy',
+            entry_price_basis='trigger_limit',
+            target_price=74_000,
+            expected_return_pct=3.9,
+            stop_loss_price=69_500,
+            suggested_holding_period='10-30 trading days',
+            confidence_score_10=7,
+            conviction_score_10=7,
+            thesis_summary='test',
+            supporting_evidence_payload=[],
+            decision_risks_payload=[],
+            invalidation_conditions_payload=[],
+            data_quality_warnings_payload=[],
+            specialist_disagreement_payload=[],
+            traceability_payload={},
+            input_feature_snapshot_payload={},
+            request_payload={},
+            response_payload={
+                'next_day_open_action': 'buy',
+                'preferred_action': 'buy',
+                'trigger_price': 71_000,
+                'chase_limit_price': 71_500,
+            },
+            response_summary_payload={},
+        )
+        session.add(result_snapshot)
+        session.flush()
+        result_snapshot_id = result_snapshot.id
+
+    attempt = {
+        'event_id': 10,
+        'symbol': '005930',
+        'agent_name': 'signal-decider',
+        'source_market_date': date(2026, 10, 20),
+        'target_trade_date': date(2026, 10, 21),
+        'source_snapshot_id': 1,
+        'source_decision_run_id': 'source-run',
+        'request_run_id': request_run_id,
+        'context': {'schema_version': WAIT_RECHECK_CONTEXT_SCHEMA_VERSION},
+        'fs_div': 'CFS',
+        'disclosures_limit': 5,
+        'knowledge_cutoff_at': '2026-10-20T11:00:00+00:00',
+        'upstream_summary_run_id': 'summary-run',
+    }
+    completed = {
+        'summary': {
+            'status': 'completed',
+            'completed': 1,
+            'computed_count': 1,
+            'reused_count': 0,
+            'failed': 0,
+        }
+    }
+    service = SignalDeciderWaitRecheckService()
+    try:
+        with (
+            patch.object(service, '_begin_attempt', return_value=attempt),
+            patch.object(service, '_finish_event') as finish_event,
+            patch(
+                'app.agent_context.orchestrator.agent_feedback_orchestrator.'
+                'dispatch_for_symbols',
+                return_value=completed,
+            ) as dispatch,
+        ):
+            result = service._dispatch_event(
+                10,
+                now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+            )
+
+        assert result['status'] == 'completed'
+        assert result['result_action'] == 'buy'
+        dispatch.assert_called_once()
+        assert dispatch.call_args.kwargs['roles'] == ('signal-decider',)
+        finish_event.assert_called_once_with(
+            event_id=10,
+            request_run_id=request_run_id,
+            status='completed',
+            result_snapshot_id=result_snapshot_id,
+            result_action='buy',
+        )
+    finally:
+        with session_scope() as session:
+            session.execute(
+                delete(SignalDeciderDecisionSnapshot).where(
+                    SignalDeciderDecisionSnapshot.id == result_snapshot_id
+                )
+            )
+
 def test_durable_claim_is_unique_and_context_readback_is_verified() -> None:
     target_trade_date = date(2026, 10, 21)
     source_market_date = date(2026, 10, 20)
@@ -1032,6 +1210,16 @@ def test_durable_claim_is_unique_and_context_readback_is_verified() -> None:
             symbol='005930',
         )
         assert context is not None
+        assert load_validated_wait_recheck_context(
+            event_id=event_id,
+            symbol='005930',
+            agent_name='short-term-decider',
+        ) == context
+        assert load_validated_wait_recheck_context(
+            event_id=event_id,
+            symbol='005930',
+            agent_name='signal-decider',
+        ) is None
         assert context['execution_authority']['direct_order_authority'] is False
         with session_scope() as session:
             rows = session.execute(
@@ -1041,6 +1229,114 @@ def test_durable_claim_is_unique_and_context_readback_is_verified() -> None:
             assert rows[0].status == 'completed'
             assert rows[0].result_action == 'wait'
 
+            original_context = rows[0].context_payload
+            original_context_sha256 = rows[0].context_sha256
+
+        exact_binding_drift = {
+            **original_context,
+            'symbol': ' 005930 ',
+        }
+        with session_scope() as session:
+            drifted = session.get(SignalDeciderWaitRecheckEvent, event_id)
+            assert drifted is not None
+            drifted.context_payload = exact_binding_drift
+            drifted.context_sha256 = _canonical_json_sha256(
+                exact_binding_drift
+            )
+        assert load_validated_wait_recheck_context(
+            event_id=event_id,
+            symbol='005930',
+            agent_name='short-term-decider',
+        ) is None
+        with session_scope() as session:
+            drifted = session.get(SignalDeciderWaitRecheckEvent, event_id)
+            assert drifted is not None
+            drifted.context_payload = original_context
+            drifted.context_sha256 = original_context_sha256
+
+        swapped_candidate = build_wait_recheck_candidate(
+            _snapshot(
+                snapshot_id=snapshot_id + 100,
+                symbol='000660',
+                chase_limit_price=None,
+                upgrade_trigger_price=None,
+            ),
+            target_trade_date=target_trade_date,
+        )
+        assert swapped_candidate is not None
+        swapped_observation = WaitRecheckObservation(
+            candidate=swapped_candidate,
+            observed_price=71_300,
+            current_price=71_250,
+            bid_price=71_200,
+            price_basis='best_ask',
+            price_as_of=datetime(
+                2026,
+                10,
+                21,
+                0,
+                5,
+                10,
+                tzinfo=timezone.utc,
+            ),
+            received_at=datetime(
+                2026,
+                10,
+                21,
+                0,
+                5,
+                11,
+                tzinfo=timezone.utc,
+            ),
+            quote_source='kis_realtime_ws',
+        )
+        swapped_context, swapped_context_sha256 = (
+            canonical_wait_recheck_context(
+                event_id=event_id + 1,
+                observation=swapped_observation,
+                market_state='OPEN',
+                market_server_time='2026-10-21T09:05:11+09:00',
+            )
+        )
+        with session_scope() as session:
+            swapped = session.get(SignalDeciderWaitRecheckEvent, event_id)
+            assert swapped is not None
+            swapped.status = 'queued'
+            swapped.attempt_count = 0
+            swapped.request_run_id = None
+            swapped.context_payload = swapped_context
+            swapped.context_sha256 = swapped_context_sha256
+
+        assert load_validated_wait_recheck_context(
+            event_id=event_id,
+            symbol='005930',
+            agent_name='short-term-decider',
+        ) is None
+        swapped_attempt = service._begin_attempt(
+            event_id,
+            now=datetime(2026, 10, 21, 0, 5, 30, tzinfo=timezone.utc),
+        )
+        assert swapped_attempt is None
+        with session_scope() as session:
+            expired = session.get(SignalDeciderWaitRecheckEvent, event_id)
+            assert expired is not None
+            assert expired.status == 'expired'
+            assert expired.last_error_payload == {
+                'code': 'wait_recheck_context_lineage_mismatch',
+            }
+
+            expired.status = 'queued'
+            expired.attempt_count = 0
+            expired.request_run_id = None
+            expired.context_payload = original_context
+            expired.context_sha256 = original_context_sha256
+            expired.last_attempt_at = None
+            expired.last_error_payload = None
+
+        with session_scope() as session:
+            rows = session.execute(
+                select(SignalDeciderWaitRecheckEvent)
+            ).scalars().all()
             rows[0].status = 'queued'
             rows[0].attempt_count = 0
             rows[0].request_run_id = None
