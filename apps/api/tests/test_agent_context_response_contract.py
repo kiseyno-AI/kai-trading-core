@@ -21,6 +21,8 @@ def _complete_signal_decider_feedback(**overrides):
         'next_day_open_action': 'buy',
         'wait_reason': None,
         'entry_price_basis': 'next_open',
+        'trigger_price': None,
+        'chase_limit_price': None,
         'target_price': 91200,
         'expected_return_pct': 6.4,
         'stop_loss_price': 82900,
@@ -28,6 +30,7 @@ def _complete_signal_decider_feedback(**overrides):
         'confidence_score_10': 7,
         'conviction_score_10': 6,
         'thesis_summary': '모멘텀과 실행 여건이 매수 후보를 지지합니다.',
+        'trigger_conditions': [],
         'supporting_evidence': ['상대강도와 거래량이 함께 개선됐습니다.'],
         'decision_risks': ['장 초반 변동성이 확대될 수 있습니다.'],
         'decision_delta': {},
@@ -80,6 +83,51 @@ def _complete_short_term_decider_feedback(**overrides):
 
 
 class AgentContextResponseContractTests(unittest.TestCase):
+    def test_signal_wait_preserves_monitoring_levels_and_synthesizes_buy_upgrade(self):
+        payload = _complete_signal_decider_feedback(
+            preferred_action='wait',
+            next_day_open_action='wait',
+            wait_reason={
+                'code': 'extended_entry_price',
+                'summary': '71,000원 회복 확인이 필요합니다.',
+            },
+            entry_price_basis='trigger_limit',
+            trigger_price=71_000,
+            chase_limit_price=71_500,
+            target_price=74_000,
+            stop_loss_price=69_500,
+            expected_return_pct=None,
+            trigger_conditions=['71,000원 회복과 거래량 회복을 확인합니다.'],
+            decision_delta={},
+        )
+
+        result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(payload, ensure_ascii=False),
+            raw_response=payload,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertTrue(result['response_contract_valid'])
+        self.assertEqual(result['trigger_price'], 71_000.0)
+        self.assertEqual(result['chase_limit_price'], 71_500.0)
+        self.assertEqual(
+            result['trigger_conditions'],
+            ['71,000원 회복과 거래량 회복을 확인합니다.'],
+        )
+        self.assertEqual(
+            result['decision_delta']['upgrade_trigger'],
+            {
+                'target_action': 'buy',
+                'summary': '71,000원 회복과 거래량 회복을 확인합니다.',
+                'conditions': ['71,000원 회복과 거래량 회복을 확인합니다.'],
+                'trigger_price': 71_000,
+                'chase_limit_price': 71_500,
+            },
+        )
+
     def test_deciders_reject_noncanonical_batch_envelopes_in_single_response_normalization(self):
         cases = (
             (
@@ -762,6 +810,9 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertNotIn('conservative net return', suffix)
         self.assertIn('Core recomputes a conservative slippage-adjusted pre-screen return', suffix)
         self.assertIn('Exec applies its final full-cost check in dispatch mode', suffix)
+        self.assertIn('independent swing, position, and long-horizon lane', suffix)
+        self.assertIn('trigger_price, chase_limit_price', suffix)
+        self.assertIn('trigger_conditions', suffix)
 
     def test_fundamental_summarizer_contract_accepts_market_specific_dart_or_sec_inputs(self):
         suffix = build_contract_prompt_suffix(role='fundamental-summarizer')
@@ -781,8 +832,11 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('Do not summarize headline-only, paywalled, or fetch-failed news as if the full article text was read', suffix)
         self.assertIn('If only auxiliary context is absent, a structured scalp_buy_candidate or watch_for_trigger decision may still be valid', suffix)
         self.assertIn('wait_reason must be an object with code and summary when tactical_action/preferred_action is watch_for_trigger, avoid_chase, or wait; otherwise use null.', suffix)
-        self.assertIn('1-3 trading days', suffix)
+        self.assertNotIn('1-3 trading days', suffix)
         self.assertNotIn('1-2 trading days', suffix)
+        self.assertIn('normally be 2-3 trading days', suffix)
+        self.assertIn('not a minimum holding lock', suffix)
+        self.assertIn('maximum remains 3 trading sessions', suffix)
 
         output_text = json.dumps(
             _complete_short_term_decider_feedback(

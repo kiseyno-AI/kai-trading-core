@@ -374,6 +374,23 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode='after')
+    def validate_dispatch_decider_lane_independence(self):
+        integration_mode = str(
+            self.signal_decider_exec_integration_mode or ''
+        ).strip().lower()
+        if (
+            integration_mode == 'dispatch'
+            and self.signal_decider_wait_conflict_gate_mode
+            in {'hard_block', 'downsize_probe'}
+        ):
+            raise ValueError(
+                'Exec dispatch mode requires independent decider lanes; '
+                'SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE must be disabled '
+                'or report_only.'
+            )
+        return self
+
+    @model_validator(mode='after')
     def validate_kis_token_issuance_timing(self):
         required_lease_seconds = (
             self.kis_token_request_timeout_seconds

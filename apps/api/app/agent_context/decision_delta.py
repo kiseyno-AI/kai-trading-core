@@ -290,7 +290,7 @@ def build_decision_reference(
         decision_risks = _normalize_text_list(
             normalized_payload.get('tactical_risks') or normalized_payload.get('decision_risks')
         )
-        fallback_target_action = 'scalp_buy_candidate'
+        fallback_target_action = _fallback_target_action_for_wait(role=role)
     else:
         recommendation = _normalize_recommendation(
             role,
@@ -317,10 +317,23 @@ def build_decision_reference(
             fallback_target_action=fallback_target_action,
         )
     )
-    if upgrade_trigger is None and role == SHORT_TERM_DECIDER_AGENT_NAME and (
-        trigger_conditions
-        or normalized_payload.get('trigger_price') is not None
-        or normalized_payload.get('chase_limit_price') is not None
+    if (
+        upgrade_trigger is None
+        and role
+        in {
+            SIGNAL_DECIDER_AGENT_NAME,
+            SHORT_TERM_DECIDER_AGENT_NAME,
+        }
+        and recommendation_class_for_role(
+            role=role,
+            recommendation=recommendation,
+        )
+        == 'wait'
+        and (
+            trigger_conditions
+            or normalized_payload.get('trigger_price') is not None
+            or normalized_payload.get('chase_limit_price') is not None
+        )
     ):
         upgrade_trigger = {
             'target_action': fallback_target_action,
@@ -497,11 +510,14 @@ def _auto_upgrade_trigger(
     if current_upgrade_trigger is not None:
         return current_upgrade_trigger
 
-    if role == SHORT_TERM_DECIDER_AGENT_NAME:
+    if role in {
+        SIGNAL_DECIDER_AGENT_NAME,
+        SHORT_TERM_DECIDER_AGENT_NAME,
+    }:
         trigger_conditions = _normalize_text_list(current_reference.get('trigger_conditions'))
         if trigger_conditions or current_reference.get('trigger_price') is not None:
             return {
-                'target_action': 'scalp_buy_candidate',
+                'target_action': target_action,
                 'summary': trigger_conditions[0] if trigger_conditions else None,
                 'conditions': trigger_conditions,
                 'trigger_price': _normalize_int(current_reference.get('trigger_price')),

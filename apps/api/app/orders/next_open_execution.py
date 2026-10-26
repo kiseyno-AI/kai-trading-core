@@ -191,6 +191,7 @@ SIGNAL_DECIDER_POLICY_AUTHORITY_SCHEMA_VERSION = (
     'signal_decider_policy_authority_v2'
 )
 KRX_NEXT_OPEN_MARKETS = frozenset({'KRX', 'KOSPI', 'KOSDAQ', 'KONEX'})
+SIGNAL_TRIGGER_ENTRY_PRICE_BASES = frozenset({'trigger_limit'})
 SHORT_TERM_ACTIONABLE_ACTIONS = {'scalp_buy_candidate', 'watch_for_trigger'}
 SHORT_TERM_GENERIC_ACTION_BY_TACTICAL_ACTION = {
     'scalp_buy_candidate': 'buy',
@@ -217,8 +218,6 @@ STRUCTURED_CLOSE_MISMATCH_TOLERANCE_BPS = Decimal('100')
 SHORT_TERM_RELAXED_DECISION_INPUT_HARD_BLOCK_CODES = frozenset({'source_turnover_missing'})
 SHORT_TERM_WATCH_DELEGATED_ENTRY_QUALITY_BLOCK_CODES = frozenset(
     {
-        'signal_decider_reject_veto',
-        'signal_decider_wait_blocks_scalp_buy',
         'short_term_downtrend_or_breakdown_block',
         'short_term_ret20_deep_negative_block',
         'short_term_high_atr_weak_trend_block',
@@ -1848,9 +1847,16 @@ def _is_bounded_intraday_watch_snapshot(
     """Return whether a late decision can only create a trigger-gated watch."""
 
     return bool(
-        _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
-        and _is_krx_next_open_snapshot(snapshot)
-        and _short_term_tactical_action(snapshot) == 'watch_for_trigger'
+        _is_krx_next_open_snapshot(snapshot)
+        and (
+            (
+                _snapshot_agent_name(snapshot)
+                == SHORT_TERM_DECIDER_AGENT_NAME
+                and _short_term_tactical_action(snapshot)
+                == 'watch_for_trigger'
+            )
+            or _is_signal_trigger_entry_snapshot(snapshot)
+        )
     )
 
 
@@ -1901,8 +1907,14 @@ def _decision_authority_context(
         'observed_after_target_open': bool(
             observed_at is not None and observed_at >= target_open_at
         ),
-        'trigger_gated': tactical_action in SHORT_TERM_ACTIONABLE_ACTIONS,
-        'market_order_authority': tactical_action is None,
+        'trigger_gated': bool(
+            tactical_action in SHORT_TERM_ACTIONABLE_ACTIONS
+            or _is_signal_trigger_entry_snapshot(snapshot)
+        ),
+        'market_order_authority': bool(
+            tactical_action is None
+            and not _is_signal_trigger_entry_snapshot(snapshot)
+        ),
         'late_feedback_exception': is_late_intraday_watch,
     }
 
@@ -1938,6 +1950,63 @@ def _short_term_entry_execution_mode(tactical_action: str) -> str | None:
     if tactical_action == 'watch_for_trigger':
         return 'pending_trigger_limit'
     return None
+
+
+def _is_signal_trigger_entry_snapshot(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> bool:
+    return bool(
+        _snapshot_agent_name(snapshot) == SIGNAL_DECIDER_AGENT_NAME
+        and _normalize_action(
+            snapshot.next_day_open_action or snapshot.decision_action
+        )
+        == 'buy'
+        and str(snapshot.entry_price_basis or '').strip().lower()
+        in SIGNAL_TRIGGER_ENTRY_PRICE_BASES
+    )
+
+
+def _signal_trigger_entry_levels(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> dict[str, Decimal] | None:
+    if not _is_signal_trigger_entry_snapshot(snapshot):
+        return None
+    response_payload = _snapshot_response_payload(snapshot)
+    trigger_price = _to_decimal(response_payload.get('trigger_price'))
+    chase_limit_price = _to_decimal(
+        response_payload.get('chase_limit_price')
+    )
+    target_price = _to_decimal(
+        snapshot.target_price
+        if snapshot.target_price is not None
+        else response_payload.get('target_price')
+    )
+    stop_loss_price = _to_decimal(
+        snapshot.stop_loss_price
+        if snapshot.stop_loss_price is not None
+        else response_payload.get('stop_loss_price')
+    )
+    trigger_conditions = _normalize_text_list(
+        response_payload.get('trigger_conditions')
+    )
+    if not (
+        trigger_price is not None
+        and chase_limit_price is not None
+        and target_price is not None
+        and stop_loss_price is not None
+        and trigger_conditions
+        and stop_loss_price
+        < trigger_price
+        <= chase_limit_price
+        < target_price
+    ):
+        return None
+    return {
+        'trigger_price': trigger_price,
+        'chase_limit_price': chase_limit_price,
+        'target_price': target_price,
+        'stop_loss_price': stop_loss_price,
+    }
 
 
 def _short_term_field_text(snapshot: SignalDeciderDecisionSnapshot, key: str) -> str | None:
@@ -2202,24 +2271,17 @@ def _short_term_entry_quality_blocks(
     warnings: list[dict[str, str]] = []
     signal_action = str((signal_decider_crosscheck or {}).get('action') or '').lower()
     if signal_action == 'reject':
-        blocks.append(
+        warnings.append(
             _reason(
-                'signal_decider_reject_veto',
-                'Same-day signal-decider rejected the setup; short-term buy handoff is blocked.',
-            )
-        )
-    elif signal_action == 'wait' and tactical_action == 'scalp_buy_candidate':
-        blocks.append(
-            _reason(
-                'signal_decider_wait_blocks_scalp_buy',
-                'Same-day signal-decider is wait; immediate scalp buy is blocked and should be monitored only after a new trigger.',
+                'signal_decider_reject_cross_lane_observation',
+                'Same-day signal-decider rejected its independent thesis; the disagreement is recorded without changing short-term eligibility.',
             )
         )
     elif signal_action == 'wait':
         warnings.append(
             _reason(
-                'signal_decider_wait_requires_trigger_confirmation',
-                'Same-day signal-decider is wait; exec must require live trigger-time confirmation before buying.',
+                'signal_decider_wait_cross_lane_observation',
+                'Same-day signal-decider is waiting on its independent thesis; short-term eligibility remains governed by short-term and Exec gates.',
             )
         )
 
@@ -2599,11 +2661,9 @@ def _row_validation_payload(row: SignalDeciderExecutionPlanItem) -> dict[str, An
 def _row_has_intraday_watch_intent(
     row: SignalDeciderExecutionPlanItem,
 ) -> bool:
-    if (
-        _normalize_agent_name(getattr(row, 'decision_agent_name', None))
-        != SHORT_TERM_DECIDER_AGENT_NAME
-        or _normalize_optional_text(getattr(row, 'planned_side', None)) != 'buy'
-    ):
+    if _normalize_optional_text(
+        getattr(row, 'planned_side', None)
+    ) != 'buy':
         return False
     validation_payload = getattr(row, 'validation_payload', None)
     validation = (
@@ -2761,6 +2821,7 @@ class _DecisionSnapshotAuthorityProjection:
     updated_at: datetime
     decision_action: str
     next_day_open_action: str
+    entry_price_basis: str
     projected_tactical_action: str | None
     symbol_day_market_claim: str | None
     company_market_claim: str | None
@@ -3278,8 +3339,7 @@ class SignalDeciderNextOpenExecutionService:
                         'decision_authority'
                     )
                     if not (
-                        decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                        and latest_action == 'watch_for_trigger'
+                        _is_bounded_intraday_watch_snapshot(latest)
                         and isinstance(decision_authority, dict)
                         and decision_authority.get('scope')
                         == 'same_day_intraday_watch'
@@ -4863,9 +4923,7 @@ class SignalDeciderNextOpenExecutionService:
                             continue
                         authority_action = current_live_market_authority.get('action')
                         monitor_only_watch = bool(
-                            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                            and (_row_validation_payload(row).get('handoff_intent'))
-                            == 'intraday_watch_buy'
+                            _row_has_intraday_watch_intent(row)
                         )
                         if (
                             planned_side == 'buy'
@@ -4944,8 +5002,8 @@ class SignalDeciderNextOpenExecutionService:
                         )
                         authority_action = current_live_market_authority.get('action')
                         monitor_only_watch = bool(
-                            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-                            and validation.get('handoff_intent') == 'intraday_watch_buy'
+                            validation.get('handoff_intent')
+                            == 'intraday_watch_buy'
                         )
                         if authority_action == 'reject' and not monitor_only_watch:
                             validation['blocking_reasons'] = [
@@ -5953,6 +6011,7 @@ class SignalDeciderNextOpenExecutionService:
                 SignalDeciderDecisionSnapshot.updated_at,
                 SignalDeciderDecisionSnapshot.decision_action,
                 SignalDeciderDecisionSnapshot.next_day_open_action,
+                SignalDeciderDecisionSnapshot.entry_price_basis,
                 SignalDeciderDecisionSnapshot.response_payload[
                     'tactical_action'
                 ]
@@ -6103,6 +6162,11 @@ class SignalDeciderNextOpenExecutionService:
             payload = request_payload(run)
             roles = payload.get('roles')
             scopes = self._decider_role_symbol_scopes(run)
+            role = (
+                _normalize_agent_name(roles[0])
+                if isinstance(roles, list) and len(roles) == 1
+                else None
+            )
             summary_payload = run.get('summary_payload')
             progress = (
                 summary_payload.get('progress_summary')
@@ -6128,8 +6192,13 @@ class SignalDeciderNextOpenExecutionService:
                 and run.get('completed_count') == 1
                 and type(run.get('failed_count')) is int
                 and run.get('failed_count') == 0
-                and roles == [SHORT_TERM_DECIDER_AGENT_NAME]
-                and scopes == {SHORT_TERM_DECIDER_AGENT_NAME: [symbol]}
+                and role
+                in {
+                    SIGNAL_DECIDER_AGENT_NAME,
+                    SHORT_TERM_DECIDER_AGENT_NAME,
+                }
+                and roles == [role]
+                and scopes == {role: [symbol]}
                 and payload.get('force_recompute') is True
                 and payload.get('reuse_existing') is True
                 and all(
@@ -6148,12 +6217,33 @@ class SignalDeciderNextOpenExecutionService:
             marker = wait_recheck_marker(run)
             if marker is None:
                 return True
+            agent_name = _normalize_agent_name(key[1])
+            expected_action = (
+                'buy'
+                if agent_name == SIGNAL_DECIDER_AGENT_NAME
+                else 'watch_for_trigger'
+            )
+            snapshot_action = (
+                _normalize_action(
+                    snapshot.next_day_open_action
+                    or snapshot.decision_action
+                )
+                if snapshot is not None
+                and agent_name == SIGNAL_DECIDER_AGENT_NAME
+                else _short_term_tactical_action(snapshot)
+                if snapshot is not None
+                and agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                else None
+            )
             if (
                 not marker
                 or snapshot is None
-                or key[1] != SHORT_TERM_DECIDER_AGENT_NAME
-                or _short_term_tactical_action(snapshot)
-                != 'watch_for_trigger'
+                or agent_name
+                not in {
+                    SIGNAL_DECIDER_AGENT_NAME,
+                    SHORT_TERM_DECIDER_AGENT_NAME,
+                }
+                or snapshot_action != expected_action
             ):
                 return False
             event_id = marker.get(key[0])
@@ -6169,13 +6259,13 @@ class SignalDeciderNextOpenExecutionService:
                 )
                 and str(event.symbol or '').strip().upper() == key[0]
                 and _normalize_agent_name(event.agent_name)
-                == SHORT_TERM_DECIDER_AGENT_NAME
+                == agent_name
                 and str(event.status or '').strip().lower() == 'completed'
                 and event.completed_at is not None
                 and str(event.request_run_id or '').strip() == run_id
                 and event.result_snapshot_id == int(snapshot.id)
                 and str(event.result_action or '').strip().lower()
-                == 'watch_for_trigger'
+                == expected_action
                 and str(snapshot.decision_run_id or '').strip() == run_id
             )
 
@@ -6620,6 +6710,28 @@ class SignalDeciderNextOpenExecutionService:
                     key=key,
                     snapshot=snapshot,
                 )
+            )
+
+        def completed_wait_recheck_authorizes_late_signal_snapshot(
+            *,
+            key: tuple[str, str],
+            snapshot: SignalDeciderDecisionSnapshot | None,
+        ) -> bool:
+            if _normalize_agent_name(key[1]) != SIGNAL_DECIDER_AGENT_NAME:
+                return True
+            if snapshot is None:
+                return False
+            origin_run = run_by_id.get(
+                str(snapshot.decision_run_id or '').strip()
+            )
+            if (
+                origin_run is None
+                or wait_recheck_marker(origin_run) is None
+            ):
+                return False
+            return wait_recheck_origin_authorizes_snapshot(
+                key=key,
+                snapshot=snapshot,
             )
 
         def comparable_datetime(value: Any) -> datetime | None:
@@ -7326,6 +7438,10 @@ class SignalDeciderNextOpenExecutionService:
                 )
                 and allow_post_open_intraday_watch
                 and _is_bounded_intraday_watch_snapshot(snapshot)
+                and completed_wait_recheck_authorizes_late_signal_snapshot(
+                    key=key,
+                    snapshot=snapshot,
+                )
             }
             for key, snapshot in list(selected_by_key.items()):
                 if snapshot is None:
@@ -7348,6 +7464,10 @@ class SignalDeciderNextOpenExecutionService:
                 if (
                     allow_post_open_intraday_watch
                     and _is_bounded_intraday_watch_snapshot(snapshot)
+                    and completed_wait_recheck_authorizes_late_signal_snapshot(
+                        key=key,
+                        snapshot=snapshot,
+                    )
                 ):
                     late_intraday_watch_by_key[key] = {
                         **timing_evidence,
@@ -7778,9 +7898,13 @@ class SignalDeciderNextOpenExecutionService:
             if short_term_tactical_action is not None
             else _normalize_action(snapshot.next_day_open_action or snapshot.decision_action)
         )
+        signal_trigger_entry = _is_signal_trigger_entry_snapshot(snapshot)
+        signal_trigger_levels = _signal_trigger_entry_levels(snapshot)
         handoff_intent = (
             _short_term_handoff_intent(short_term_tactical_action)
             if short_term_tactical_action is not None
+            else 'intraday_watch_buy'
+            if signal_trigger_entry
             else 'next_open_buy'
             if generic_action == 'buy'
             else None
@@ -8042,11 +8166,22 @@ class SignalDeciderNextOpenExecutionService:
                         'authoritative policy rule bundle.',
                     )
                 )
-            if snapshot.entry_price_basis != 'next_open':
+            if signal_trigger_entry and signal_trigger_levels is None:
+                blocking_reasons.append(
+                    _reason(
+                        'invalid_signal_trigger_geometry',
+                        'Signal trigger entry requires non-empty trigger conditions and positive prices satisfying stop < trigger <= chase < target.',
+                    )
+                )
+            elif (
+                str(snapshot.entry_price_basis or '').strip().lower()
+                != 'next_open'
+                and not signal_trigger_entry
+            ):
                 blocking_reasons.append(
                     _reason(
                         'unsupported_entry_price_basis',
-                        f'Entry price basis {snapshot.entry_price_basis} is not next_open.',
+                        f'Entry price basis {snapshot.entry_price_basis} is neither next_open nor trigger_limit.',
                     )
                 )
             expected_return = _to_decimal(snapshot.expected_return_pct)
@@ -8062,7 +8197,13 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
             if settings.signal_decider_next_open_require_target_and_stop and (
-                snapshot.target_price is None or snapshot.stop_loss_price is None
+                (
+                    signal_trigger_levels is None
+                    and (
+                        snapshot.target_price is None
+                        or snapshot.stop_loss_price is None
+                    )
+                )
             ):
                 blocking_reasons.append(
                     _reason(
@@ -8173,6 +8314,28 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
 
+        if signal_trigger_levels is not None:
+            chase_limit_reference = int(
+                signal_trigger_levels['chase_limit_price']
+            )
+            if (
+                estimated_reference_price is not None
+                and estimated_reference_price > chase_limit_reference
+            ):
+                warnings.append(
+                    _reason(
+                        'reference_price_above_chase_limit_delegated_to_exec_watch',
+                        'Latest available reference price is above the signal chase_limit_price; keep monitoring, but Exec must not buy above the chase limit.',
+                    )
+                )
+            estimated_reference_price = max(
+                int(estimated_reference_price or 0),
+                chase_limit_reference,
+            )
+            estimated_reference_price_basis = (
+                'max(previous_close,chase_limit_price)'
+            )
+
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME and _uses_exec_agent_sizing_for_dispatch(decision_agent_name):
             if estimated_reference_price is None or estimated_reference_price <= 0:
                 warnings.append(
@@ -8245,18 +8408,6 @@ class SignalDeciderNextOpenExecutionService:
 
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and alignment_gate_payload is not None:
             requested_quantity = planned_quantity
-            if (
-                requested_quantity is None
-                and target.account_reference == UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
-                and not settings.signal_decider_next_open_account_targets.strip()
-                and alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE
-            ):
-                requested_quantity = settings.signal_decider_wait_conflict_probe_quantity
-            alignment_gate_payload = apply_alignment_quantity_enforcement(
-                alignment_gate_payload,
-                requested_quantity=requested_quantity,
-                probe_quantity=settings.signal_decider_wait_conflict_probe_quantity,
-            )
             alignment = alignment_gate_payload.get('signal_decider_alignment')
             action = alignment_gate_payload.get('alignment_gate_action')
             reason_text = (
@@ -8267,34 +8418,37 @@ class SignalDeciderNextOpenExecutionService:
                 SIGNAL_DECIDER_ALIGNMENT_NO_CONTEXT,
                 SIGNAL_DECIDER_ALIGNMENT_STALE_CONTEXT,
             }
-            if action == ALIGNMENT_GATE_ACTION_BLOCK:
-                blocking_reasons.append(
-                    _reason(
-                        'signal_decider_context_unavailable_gate'
-                        if unavailable_context
-                        else 'signal_decider_wait_conflict_gate',
-                        reason_text,
-                    )
-                )
-                planned_quantity = Decimal('0')
-                estimated_notional = Decimal('0')
-            elif action == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE:
+            legacy_cross_lane_enforcement = bool(
+                action in {
+                    ALIGNMENT_GATE_ACTION_BLOCK,
+                    ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE,
+                }
+            )
+            if legacy_cross_lane_enforcement:
+                quantity_text = _decimal_to_text(requested_quantity)
+                alignment_gate_payload = {
+                    **alignment_gate_payload,
+                    'audit_only': True,
+                    'enforcement_decision': 'ignored_independent_lane',
+                    'requested_quantity': quantity_text,
+                    'final_quantity': quantity_text,
+                }
                 warnings.append(
                     _reason(
-                        'signal_decider_context_unavailable_gate_downsized'
-                        if unavailable_context
-                        else 'signal_decider_wait_conflict_gate_downsized',
-                        reason_text,
+                        'signal_decider_alignment_audit_only',
+                        (
+                            f'{reason_text} The signal and short-term lanes execute independently, '
+                            'so this legacy cross-lane gate is retained for Core audit only.'
+                        ),
                     )
                 )
-                planned_quantity = _to_decimal(alignment_gate_payload.get('final_quantity'))
-                estimated_notional = (
-                    planned_quantity * Decimal(str(estimated_reference_price))
-                    if planned_quantity is not None and estimated_reference_price is not None
-                    else None
+            else:
+                alignment_gate_payload = apply_alignment_quantity_enforcement(
+                    alignment_gate_payload,
+                    requested_quantity=requested_quantity,
+                    probe_quantity=settings.signal_decider_wait_conflict_probe_quantity,
                 )
-                pricing_note = 'Core enforced a deterministic WAIT-conflict probe quantity before exec handoff.'
-            elif action == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
+            if action == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
                 warnings.append(
                     _reason(
                         'signal_decider_context_unavailable_gate_report_only'
@@ -8343,8 +8497,16 @@ class SignalDeciderNextOpenExecutionService:
                 confidence_score_10=snapshot.confidence_score_10,
                 expected_return_pct=snapshot.expected_return_pct,
                 reference_price=estimated_reference_price,
-                target_price=snapshot.target_price,
-                stop_loss_price=snapshot.stop_loss_price,
+                target_price=(
+                    signal_trigger_levels['target_price']
+                    if signal_trigger_levels is not None
+                    else snapshot.target_price
+                ),
+                stop_loss_price=(
+                    signal_trigger_levels['stop_loss_price']
+                    if signal_trigger_levels is not None
+                    else snapshot.stop_loss_price
+                ),
                 expected_slippage_bps=expected_slippage_bps,
                 expected_slippage_basis=expected_slippage_basis,
                 allow_pending_live_cost_confirmation=allow_pending_live_cost_confirmation,
@@ -8450,13 +8612,23 @@ class SignalDeciderNextOpenExecutionService:
                 'generic_action': generic_action,
                 'handoff_intent': handoff_intent,
                 'exec_monitoring_active': bool(
-                    decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    (
+                        decision_agent_name
+                        == SHORT_TERM_DECIDER_AGENT_NAME
+                        or signal_trigger_entry
+                    )
                     and handoff_intent is not None
                     and not blocking_reasons
                 ),
                 'approval_state': (
                     'pending_exec_agent'
-                    if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and handoff_intent is not None and not blocking_reasons
+                    if (
+                        decision_agent_name
+                        == SHORT_TERM_DECIDER_AGENT_NAME
+                        or signal_trigger_entry
+                    )
+                    and handoff_intent is not None
+                    and not blocking_reasons
                     else 'blocked'
                     if blocking_reasons
                     else None
@@ -8559,15 +8731,22 @@ class SignalDeciderNextOpenExecutionService:
             if short_term_tactical_action is not None
             else _normalize_action(snapshot.next_day_open_action or snapshot.decision_action)
         )
+        signal_trigger_entry = _is_signal_trigger_entry_snapshot(snapshot)
+        signal_trigger_levels = _signal_trigger_entry_levels(snapshot)
         handoff_intent = (
             _short_term_handoff_intent(short_term_tactical_action)
             if short_term_tactical_action is not None
+            else 'intraday_watch_buy'
+            if signal_trigger_entry
             else 'next_open_buy'
             if generic_action == 'buy'
             else None
         )
         handoff_active = bool(
-            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            (
+                decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                or signal_trigger_entry
+            )
             and handoff_intent is not None
             and not blocking_reasons
         )
@@ -8588,7 +8767,10 @@ class SignalDeciderNextOpenExecutionService:
         target_price = snapshot.target_price
         stop_loss_price = snapshot.stop_loss_price
         suggested_holding_period = snapshot.suggested_holding_period
-        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+        if signal_trigger_entry and signal_trigger_levels is not None:
+            target_price = int(signal_trigger_levels['target_price'])
+            stop_loss_price = int(signal_trigger_levels['stop_loss_price'])
+        elif decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
             target_price = snapshot.target_price if snapshot.target_price is not None else _to_int(response_payload.get('target_price'))
             stop_loss_price = (
                 snapshot.stop_loss_price if snapshot.stop_loss_price is not None else _to_int(response_payload.get('stop_loss_price'))
@@ -8604,7 +8786,12 @@ class SignalDeciderNextOpenExecutionService:
         row.symbol = snapshot.symbol
         row.policy_version = snapshot.policy_version
         row.planned_side = 'buy'
-        row.planned_order_type = 'market' if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME else 'limit'
+        row.planned_order_type = (
+            'limit'
+            if signal_trigger_entry
+            or decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            else 'market'
+        )
         row.planned_time_in_force = 'day'
         row.allocation_budget_krw = target.budget_krw
         row.estimated_reference_price = computed.get('estimated_reference_price')
@@ -8658,11 +8845,17 @@ class SignalDeciderNextOpenExecutionService:
             'entry_execution_mode': (
                 _short_term_entry_execution_mode(short_term_tactical_action or 'wait')
                 if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                else 'pending_trigger_limit'
+                if signal_trigger_entry
                 else 'next_open_market'
             ),
-            'trigger_price': response_payload.get('trigger_price') if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME else None,
+            'trigger_price': response_payload.get('trigger_price')
+            if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            or signal_trigger_entry
+            else None,
             'chase_limit_price': response_payload.get('chase_limit_price')
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            or signal_trigger_entry
             else None,
             'confidence_score_10': _to_json_safe(snapshot.confidence_score_10),
             'conviction_score_10': _to_json_safe(snapshot.conviction_score_10),
@@ -8704,8 +8897,13 @@ class SignalDeciderNextOpenExecutionService:
             )
         row.last_evaluated_at = now
         is_monitor_candidate = (
-            decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
-            and short_term_tactical_action == 'watch_for_trigger'
+            (
+                (
+                    decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    and short_term_tactical_action == 'watch_for_trigger'
+                )
+                or signal_trigger_entry
+            )
             and not blocking_reasons
         )
         row.eligibility_status = (

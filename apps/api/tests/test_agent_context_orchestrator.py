@@ -3885,6 +3885,8 @@ class SignalDeciderBatchClient:
                     'next_day_open_action': 'buy',
                     'wait_reason': None,
                     'entry_price_basis': 'next_open',
+                    'trigger_price': None,
+                    'chase_limit_price': None,
                     'target_price': 91200,
                     'expected_return_pct': 6.4,
                     'stop_loss_price': 82900,
@@ -3892,6 +3894,7 @@ class SignalDeciderBatchClient:
                     'confidence_score_10': 7,
                     'conviction_score_10': 6,
                     'thesis_summary': 'Specialists align on a tactical next-day long setup.',
+                    'trigger_conditions': [],
                     'supporting_evidence': ['Breadth improved.', 'Support held above 80000.'],
                     'decision_risks': ['Leadership remains narrow.'],
                     'invalidation_conditions': ['Gap below 82900 at the next open.'],
@@ -4828,6 +4831,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('manual_review_only', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
         self.assertNotIn('tighten or relax the actual action threshold', message)
+        example_text = message.split('JSON example:\n', 1)[1].split(
+            '\n\nMarket date:',
+            1,
+        )[0]
+        example_feedback = json.loads(example_text)['items'][0]['feedback']
+        self.assertIsNone(example_feedback['trigger_price'])
+        self.assertIsNone(example_feedback['chase_limit_price'])
+        self.assertEqual(example_feedback['trigger_conditions'], [])
 
     def test_short_term_and_fundamental_prompts_use_canonical_horizon_and_market_specific_sources(self):
         fake_settings = SimpleNamespace(
