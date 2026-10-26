@@ -868,14 +868,14 @@ def _validated_signal_trigger_entry_levels(
         response_payload.get('chase_limit_price')
     )
     target_price = _positive_decimal(
-        response_payload.get('target_price')
-        if response_payload.get('target_price') is not None
-        else snapshot.target_price
+        snapshot.target_price
+        if snapshot.target_price is not None
+        else response_payload.get('target_price')
     )
     stop_loss_price = _positive_decimal(
-        response_payload.get('stop_loss_price')
-        if response_payload.get('stop_loss_price') is not None
-        else snapshot.stop_loss_price
+        snapshot.stop_loss_price
+        if snapshot.stop_loss_price is not None
+        else response_payload.get('stop_loss_price')
     )
     trigger_conditions = response_payload.get('trigger_conditions')
     if (

@@ -2389,6 +2389,8 @@ class OpenClawAgentClient:
                 'next_day_open_action': 'wait',
                 'wait_reason': signal_wait_reason,
                 'entry_price_basis': 'next_open',
+                'trigger_price': None,
+                'chase_limit_price': None,
                 'target_price': signal_example_levels[0],
                 'expected_return_pct': None,
                 'stop_loss_price': signal_example_levels[1],
@@ -2396,6 +2398,7 @@ class OpenClawAgentClient:
                 'confidence_score_10': 6,
                 'conviction_score_10': 5,
                 'thesis_summary': 'brief conservative decision-support thesis',
+                'trigger_conditions': [],
                 'supporting_evidence': ['example evidence'],
                 'decision_risks': ['example decision risk'],
                 'decision_delta': {

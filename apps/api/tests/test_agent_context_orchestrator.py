@@ -4831,6 +4831,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('manual_review_only', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
         self.assertNotIn('tighten or relax the actual action threshold', message)
+        example_text = message.split('JSON example:\n', 1)[1].split(
+            '\n\nMarket date:',
+            1,
+        )[0]
+        example_feedback = json.loads(example_text)['items'][0]['feedback']
+        self.assertIsNone(example_feedback['trigger_price'])
+        self.assertIsNone(example_feedback['chase_limit_price'])
+        self.assertEqual(example_feedback['trigger_conditions'], [])
 
     def test_short_term_and_fundamental_prompts_use_canonical_horizon_and_market_specific_sources(self):
         fake_settings = SimpleNamespace(

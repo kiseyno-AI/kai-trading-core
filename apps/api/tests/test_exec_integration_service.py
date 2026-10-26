@@ -9138,6 +9138,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.snapshot_id,
             )
             snapshot.entry_price_basis = 'trigger_limit'
+            snapshot.target_price = 54_000
+            snapshot.stop_loss_price = 47_000
             snapshot.response_payload = {
                 **(snapshot.response_payload or {}),
                 'next_day_open_action': 'buy',
@@ -9145,7 +9147,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'trigger_price': 50_500,
                 'chase_limit_price': 51_500,
                 'target_price': 54_000,
-                'stop_loss_price': 49_200,
+                'stop_loss_price': 47_000,
                 'trigger_conditions': ['50,500원 회복을 확인합니다.'],
             }
             row = session.get(
@@ -9164,8 +9166,72 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 'trigger_price': 50_500,
                 'chase_limit_price': 51_500,
                 'target_price': 54_000,
-                'stop_loss_price': 49_200,
+                'stop_loss_price': 47_000,
             }
+
+    async def test_fresh_signal_trigger_plan_uses_persisted_rounded_snapshot_prices(
+        self,
+    ) -> None:
+        with session_scope() as session:
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                self.snapshot_id,
+            )
+            snapshot.entry_price_basis = 'trigger_limit'
+            snapshot.target_price = 54_001
+            snapshot.stop_loss_price = 49_800
+            snapshot.request_payload = {
+                'signal_decider_policy': (
+                    self._signal_decider_policy_request_fixture()
+                ),
+                'symbol_day_context': {
+                    'company': {'market': 'KOSPI'},
+                    'pre_decider_enrichment_context': (
+                        self._closed_market_pre_decider_context()
+                    ),
+                },
+            }
+            snapshot.response_payload = {
+                **(snapshot.response_payload or {}),
+                'next_day_open_action': 'buy',
+                'preferred_action': 'buy',
+                'trigger_price': 50_500,
+                'chase_limit_price': 51_500,
+                'target_price': 54_000.75,
+                'stop_loss_price': 49_799.75,
+                'trigger_conditions': ['50,500원 회복을 확인합니다.'],
+            }
+
+        with (
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[
+                    {'trade_date': '2026-04-29', 'close_price': 50_000}
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution.signal_decider_loop_service.get_policy_prompt_context',
+                return_value={'status': 'active'},
+            ),
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=True,
+                dry_run=True,
+                force=True,
+                trigger='persisted_rounded_signal_trigger_prices',
+            )
+
+        self.assertEqual(result['summary']['failed_group_count'], 0)
+        self.assertEqual(result['summary']['preview_group_count'], 1, result)
+        payload = result['dispatch']['preview_plans'][0]['payload']
+        entry_item = next(
+            item
+            for item in payload['items']
+            if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
+        )
+        self.assertEqual(entry_item['risk_context']['target_price'], '54001')
+        self.assertEqual(entry_item['risk_context']['stop_loss_price'], '49800')
 
     async def test_dispatch_signal_trigger_buy_preserves_watch_prices_and_chase_cap(self) -> None:
         self._configure_signal_trigger_plan_contract()
