@@ -6721,6 +6721,28 @@ class SignalDeciderNextOpenExecutionService:
                 )
             )
 
+        def completed_wait_recheck_authorizes_late_signal_snapshot(
+            *,
+            key: tuple[str, str],
+            snapshot: SignalDeciderDecisionSnapshot | None,
+        ) -> bool:
+            if _normalize_agent_name(key[1]) != SIGNAL_DECIDER_AGENT_NAME:
+                return True
+            if snapshot is None:
+                return False
+            origin_run = run_by_id.get(
+                str(snapshot.decision_run_id or '').strip()
+            )
+            if (
+                origin_run is None
+                or wait_recheck_marker(origin_run) is None
+            ):
+                return False
+            return wait_recheck_origin_authorizes_snapshot(
+                key=key,
+                snapshot=snapshot,
+            )
+
         def comparable_datetime(value: Any) -> datetime | None:
             if not isinstance(value, datetime):
                 return None
@@ -7425,6 +7447,10 @@ class SignalDeciderNextOpenExecutionService:
                 )
                 and allow_post_open_intraday_watch
                 and _is_bounded_intraday_watch_snapshot(snapshot)
+                and completed_wait_recheck_authorizes_late_signal_snapshot(
+                    key=key,
+                    snapshot=snapshot,
+                )
             }
             for key, snapshot in list(selected_by_key.items()):
                 if snapshot is None:
@@ -7447,6 +7473,10 @@ class SignalDeciderNextOpenExecutionService:
                 if (
                     allow_post_open_intraday_watch
                     and _is_bounded_intraday_watch_snapshot(snapshot)
+                    and completed_wait_recheck_authorizes_late_signal_snapshot(
+                        key=key,
+                        snapshot=snapshot,
+                    )
                 ):
                     late_intraday_watch_by_key[key] = {
                         **timing_evidence,

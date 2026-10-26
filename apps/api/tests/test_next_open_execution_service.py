@@ -3667,7 +3667,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 source_market_date=self.market_date,
                 target_trade_date=self.target_trade_date,
                 symbol=symbol,
-                agent_name='signal-decider',
+                agent_name='short-term-decider',
                 trigger_price=50_500,
                 chase_limit_price=51_500,
                 target_price=54_000,
@@ -3707,6 +3707,21 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 'failed_items': 0,
             },
         )
+
+        mismatched_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+            allow_post_open_intraday_watch=True,
+        )
+        self.assertIsNone(
+            mismatched_state['selected_by_key'].get(
+                (symbol, 'signal-decider')
+            )
+        )
+        with session_scope() as session:
+            event = session.get(SignalDeciderWaitRecheckEvent, event_id)
+            self.assertIsNotNone(event)
+            event.agent_name = 'signal-decider'
 
         state = self._service()._load_latest_decider_scope_state(
             source_market_date=self.market_date,
@@ -3771,6 +3786,88 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(item['target_price'], 54_000)
         self.assertEqual(item['stop_loss_price'], 50_000)
+
+    def test_late_signal_trigger_buy_requires_wait_recheck_provenance(
+        self,
+    ) -> None:
+        observed_at = datetime(2026, 4, 30, 0, 15, tzinfo=timezone.utc)
+        legacy_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='buy',
+            feedback_received_at=observed_at,
+            entry_price_basis='trigger_limit',
+        )
+        legacy_state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+            allow_post_open_intraday_watch=True,
+        )
+
+        legacy_key = ('005930', 'signal-decider')
+        self.assertIsNone(legacy_state['selected_by_key'][legacy_key])
+        self.assertEqual(
+            legacy_state['expired_snapshot_by_key'][legacy_key][
+                'snapshot_id'
+            ],
+            legacy_snapshot_id,
+        )
+        self.assertNotIn(
+            legacy_key,
+            legacy_state['late_intraday_watch_by_key'],
+        )
+
+        ordinary_run_id = 'ordinary-post-open-signal-recompute'
+        ordinary_snapshot_id = self._seed_snapshot(
+            symbol='000660',
+            next_day_open_action='buy',
+            decision_run_id=ordinary_run_id,
+            feedback_received_at=observed_at,
+            entry_price_basis='trigger_limit',
+        )
+        self._seed_feedback_run(
+            run_id=ordinary_run_id,
+            symbols=['000660'],
+            roles=['signal-decider'],
+            started_at=observed_at,
+        )
+        preopen_snapshot_id = self._seed_snapshot(
+            symbol='035420',
+            next_day_open_action='buy',
+            feedback_received_at=datetime(
+                2026,
+                4,
+                29,
+                23,
+                59,
+                59,
+                tzinfo=timezone.utc,
+            ),
+            entry_price_basis='trigger_limit',
+        )
+
+        state = self._service()._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+            allow_post_open_intraday_watch=True,
+        )
+
+        ordinary_key = ('000660', 'signal-decider')
+        self.assertIsNone(state['selected_by_key'][ordinary_key])
+        self.assertEqual(
+            state['expired_snapshot_by_key'][ordinary_key]['snapshot_id'],
+            ordinary_snapshot_id,
+        )
+        self.assertNotIn(
+            ordinary_key,
+            state['late_intraday_watch_by_key'],
+        )
+
+        preopen_key = ('035420', 'signal-decider')
+        self.assertEqual(
+            state['selected_by_key'][preopen_key].id,
+            preopen_snapshot_id,
+        )
+        self.assertNotIn(preopen_key, state['expired_snapshot_by_key'])
 
     def test_signal_trigger_buy_with_invalid_geometry_is_blocked_not_market(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
