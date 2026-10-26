@@ -1399,16 +1399,39 @@ def _is_exact_signal_decider_retry_suffix(
         'next_open_execution_plan',
         'signal_decider_evaluations',
     )
+    resolved_stages = tuple(run_metadata.get('resolved_stages') or ())
+    resume_from_stage = str(
+        run_metadata.get('resume_from_stage') or ''
+    ).strip()
+    completed_prefix = ('agent_feedback_summaries',)
+    exact_suffix_scope = bool(
+        resolved_stages == expected_stages
+        and resume_from_stage == expected_stages[0]
+        and set(stages) == set(expected_stages)
+    )
+    normalized_suffix_scope = bool(
+        resolved_stages == completed_prefix + expected_stages
+        and resume_from_stage == completed_prefix[0]
+        and set(stages) == set(resolved_stages)
+        and all(
+            str(
+                (
+                    stages.get(stage_id)
+                    if isinstance(stages.get(stage_id), Mapping)
+                    else {}
+                ).get('status')
+                or ''
+            ).strip().lower()
+            == 'completed'
+            for stage_id in completed_prefix
+        )
+    )
     return bool(
         str(pipeline_run.get('trigger') or '').strip()
         == AUTO_FOLLOWUP_RECOVERY_TRIGGER
         and str(pipeline_run.get('status') or '').strip().lower()
         == 'blocked'
-        and tuple(run_metadata.get('resolved_stages') or ())
-        == expected_stages
-        and str(run_metadata.get('resume_from_stage') or '').strip()
-        == 'signal_decider'
-        and set(stages) == set(expected_stages)
+        and (exact_suffix_scope or normalized_suffix_scope)
         and all(
             str(
                 (
@@ -3534,6 +3557,17 @@ class PykrxBackfillService:
             run_metadata=run_metadata,
             eod_stage_progress=latest_eod_stage_progress,
         )
+        if (
+            'agent_feedback_summaries' in stage_rows
+            and _is_exact_signal_decider_retry_suffix(pipeline_run)
+        ):
+            # A completed summary prefix may remain in the persisted run even
+            # though recovery has narrowed to the signal-decider suffix. Keep
+            # using the suffix-bound immutable cutoff instead of treating the
+            # historical prefix as a new summary lineage.
+            summary_cutoff_proof = (
+                _summary_cutoff_proof_from_run_metadata(run_metadata)
+            )
         feedback_rearm_evidence_run: Mapping[str, Any] = pipeline_run
         prior_signal_rearm_evidence_used = False
         prior_signal_rearm_evidence: (

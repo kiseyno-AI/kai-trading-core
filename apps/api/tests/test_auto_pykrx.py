@@ -7382,6 +7382,181 @@ class PykrxBackfillServiceTests(TestCase):
             _is_retryable_feedback_rearm_candidate(without_marker)
         )
 
+    def test_completed_feedback_prefix_normalizes_to_signal_decider_retry_suffix(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        completed_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        pipeline_run = {
+            'id': 584,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': completed_at.isoformat(),
+            'completed_at': completed_at.isoformat(),
+            'run_metadata': {
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'resume_from_stage': 'agent_feedback_summaries',
+                'reused_eod_collection_run_id': 7,
+                'fs_div': 'CFS',
+                'feedback_knowledge_cutoff': {
+                    'knowledge_cutoff_at': (
+                        '2026-10-20T08:00:00+00:00'
+                    ),
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': ['005930'],
+                },
+            },
+            'stages': {
+                'agent_feedback_summaries': {'status': 'completed'},
+                'signal_decider': {
+                    'status': 'partial',
+                    'details': {
+                        'result_summary': {
+                            'run_id': 'decider-cycle-run-584',
+                            'prerequisites': {'ready': True},
+                            'openclaw_dispatch_circuit_breaker': {
+                                'schema_version': (
+                                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                                ),
+                                'failure_kind': (
+                                    'openclaw_provider_rate_limited'
+                                ),
+                                'failure_status': 'provider/rate-limit',
+                                'role': 'short-term-decider',
+                                'retryable': True,
+                                'source': 'child_dispatch_circuit_breaker',
+                            },
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 20,
+                                    'completed_cycles': 1,
+                                    'cycle_number': 2,
+                                    'role_progress': {
+                                        'short-term-decider': {
+                                            'retry_pending_symbols': 80,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 60,
+                                        },
+                                        'signal-decider': {
+                                            'retry_pending_symbols': 80,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 80,
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete',
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            },
+        }
+
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(pipeline_run)
+        )
+
+        incomplete_prefix = deepcopy(pipeline_run)
+        incomplete_prefix['stages']['agent_feedback_summaries'][
+            'status'
+        ] = 'partial'
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(incomplete_prefix)
+        )
+
+        invalid_cutoff = deepcopy(pipeline_run)
+        invalid_cutoff['run_metadata']['feedback_knowledge_cutoff'][
+            'knowledge_cutoff_at'
+        ] = '2026-10-20T08:00:00'
+        self.assertFalse(
+            _is_retryable_feedback_rearm_candidate(invalid_cutoff)
+        )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.'
+                'daily_pipeline_run_state_service.get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'daily_pipeline_run_state_service.count_runs',
+                return_value=6,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 585,
+                },
+            ) as resume_followups,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-10-20',
+                latest_available_trade_date='2026-10-20',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                    'run_metadata': {},
+                },
+                markets=('KOSPI',),
+            )
+
+        self.assertTrue(result['triggered'], result)
+        recovery_kwargs = resume_followups.call_args.kwargs
+        self.assertEqual(
+            recovery_kwargs['stages'],
+            [
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            ],
+        )
+        self.assertEqual(
+            recovery_kwargs['resume_from_stage'],
+            'signal_decider',
+        )
+        self.assertNotIn(
+            'agent_feedback_summaries',
+            recovery_kwargs['stages'],
+        )
+
     def test_signal_decider_dispatch_circuit_rearms_two_consecutive_retries(
         self,
     ) -> None:
