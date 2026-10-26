@@ -8881,30 +8881,21 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'projection_digest',
             json.dumps(entry['risk_context']['flow_short_sector_context']),
         )
-        self.assertEqual(
-            entry['risk_context']['signal_decider_alignment'],
-            'wait_conflict_block',
+        forbidden_alignment_keys = {
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_signal_decider_decision_snapshot_id',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+        }
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(entry['risk_context']))
+        self.assertNotIn(
+            'signal_decider_alignment',
+            json.dumps(handoff, sort_keys=True),
         )
-        self.assertEqual(
-            entry['risk_context']['alignment_gate_action'],
-            'report_only_block_candidate',
-        )
-        self.assertEqual(
-            entry['risk_context']['alignment_gate_reason'],
-            'signal_decider_wait_conflict',
-        )
-        self.assertEqual(
-            entry['risk_context'][
-                'alignment_signal_decider_decision_snapshot_id'
-            ],
-            991,
-        )
-        self.assertEqual(
-            entry['risk_context']['final_enforcement_decision'],
-            'allowed_report_only',
-        )
-        self.assertEqual(entry['risk_context']['requested_quantity'], '29')
-        self.assertEqual(entry['risk_context']['final_quantity'], '29')
         self.assertEqual(
             entry['risk_context']['data_quality_warnings'],
             ['Intraday order-book evidence requires a live recheck.'],
@@ -11068,11 +11059,22 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             signal_row.validation_payload = {
                 **(signal_row.validation_payload or {}),
                 'pre_decider_enrichment_context': self._closed_market_pre_decider_context(),
+                'legacy_cross_lane_audit': {
+                    'signal_decider_alignment': 'short_term_reject_conflict',
+                    'alignment_gate_action': 'block',
+                    'final_enforcement_decision': 'blocked',
+                    'requested_quantity': 31,
+                    'final_quantity': 0,
+                },
                 'warnings': [
                     {
                         'code': 'transaction_cost_evidence_pending_live_delegated_to_exec_watch',
                         'message': 'Exec must confirm live cost before any buy.',
-                    }
+                    },
+                    {
+                        'code': 'signal_decider_reject_cross_lane_observation',
+                        'message': 'Legacy opposite-lane observation.',
+                    },
                 ],
                 'performance_gate': {
                     'expected_return_economics': {
@@ -11084,6 +11086,24 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     }
                 },
             }
+            signal_traceability = dict(signal_row.traceability_payload or {})
+            signal_decision_traceability = dict(
+                signal_traceability.get('decision_traceability') or {}
+            )
+            signal_decision_traceability['legacy_cross_lane_audit'] = {
+                'alignment_gate': {
+                    **alignment_gate,
+                    'signal_decider_alignment': 'short_term_reject_conflict',
+                },
+                'final_enforcement_decision': 'blocked',
+                'requested_quantity': 31,
+                'final_quantity': 0,
+                'signal_decider_crosscheck': {'action': 'reject'},
+            }
+            signal_traceability['decision_traceability'] = (
+                signal_decision_traceability
+            )
+            signal_row.traceability_payload = signal_traceability
             row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
             row.validation_payload = {
                 **(row.validation_payload or {}),
@@ -11096,10 +11116,19 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'code': 'short_term_reward_risk_ratio_block_delegated_to_exec_watch',
                         'message': 'Exec must confirm reward/risk at trigger time.',
                     },
+                    {
+                        'code': 'signal_decider_wait_cross_lane_observation',
+                        'message': 'Legacy opposite-lane observation.',
+                    },
+                    {
+                        'code': 'signal_decider_wait_conflict_gate_report_only',
+                        'message': 'Legacy opposite-lane gate audit.',
+                    },
                 ],
                 'short_term_entry_quality': {
                     'raw_trading_value_krw': 2_500_000_000,
                     'reward_risk_ratio': '1.50',
+                    'signal_decider_crosscheck': {'action': 'wait'},
                 },
                 'alignment_gate': alignment_gate,
                 'signal_decider_alignment': 'wait_conflict_block',
@@ -11150,6 +11179,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(short_payload['metadata']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_payload['strategy_run_id'], f'short-term-decider:2026-04-30:{self.account_reference.replace(":", "_").replace("-", "_")}')
+        forbidden_alignment_keys = {
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_signal_decider_decision_snapshot_id',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+            'signal_decider_crosscheck',
+        }
         signal_entry = signal_payload['items'][0]
         self.assertEqual(signal_entry['quantity_policy']['type'], 'exec_agent_sized')
         self.assertNotIn('quantity', signal_entry['quantity_policy'])
@@ -11158,6 +11198,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_entry['risk_context']['market_regime_context']['recommended_exec_action'], 'downsize')
         self.assertEqual(signal_entry['risk_context']['max_holding_close_policy']['enabled'], False)
         self.assertIsNone(signal_entry['risk_context']['max_holding_close_policy']['max_holding_trading_sessions'])
+        signal_risk_json = json.dumps(signal_entry['risk_context'], sort_keys=True)
+        for forbidden_key in forbidden_alignment_keys:
+            self.assertNotIn(f'"{forbidden_key}"', signal_risk_json)
+        self.assertNotIn(
+            'signal_decider_reject_cross_lane_observation',
+            signal_risk_json,
+        )
         self.assertEqual(
             signal_entry['risk_context']['delegated_gate_codes'],
             ['transaction_cost_evidence_pending_live_delegated_to_exec_watch'],
@@ -11197,12 +11244,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(short_entry['risk_context']['generic_action'], 'monitor_candidate')
-        self.assertEqual(short_entry['risk_context']['signal_decider_alignment'], 'wait_conflict_block')
-        self.assertEqual(short_entry['risk_context']['alignment_gate_action'], 'report_only_block_candidate')
-        self.assertEqual(short_entry['risk_context']['final_enforcement_decision'], 'allowed_report_only')
-        self.assertEqual(short_entry['risk_context']['requested_quantity'], '29')
-        self.assertEqual(short_entry['risk_context']['final_quantity'], '29')
-        self.assertEqual(short_entry['risk_context']['alignment_signal_decider_decision_snapshot_id'], 991)
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(short_entry['risk_context']))
+        short_risk_json = json.dumps(short_entry['risk_context'], sort_keys=True)
+        for forbidden_key in forbidden_alignment_keys:
+            self.assertNotIn(f'"{forbidden_key}"', short_risk_json)
+        self.assertNotIn(
+            'signal_decider_wait_cross_lane_observation',
+            short_risk_json,
+        )
+        self.assertNotIn(
+            'signal_decider_wait_conflict_gate_report_only',
+            short_risk_json,
+        )
         self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
         self.assertTrue(short_entry['risk_context']['monitoring_candidate'])
         self.assertEqual(short_entry['risk_context']['monitoring_intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
@@ -11219,13 +11272,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['conviction_score_10'], 6.5)
         self.assertEqual(short_entry['risk_context']['decision_run_id'], 'short-run-1')
         self.assertEqual(short_entry['quantity_policy']['type'], 'exec_agent_sized')
-        self.assertEqual(short_entry['quantity_policy']['final_enforcement_decision'], 'allowed_report_only')
-        self.assertEqual(short_entry['quantity_policy']['requested_quantity'], '29')
-        self.assertEqual(short_entry['quantity_policy']['final_quantity'], '29')
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(short_entry['quantity_policy']))
         self.assertEqual(Decimal(str(short_entry['quantity_policy']['budget_krw'])), Decimal('1500000'))
         self.assertEqual(short_entry['quantity_policy']['allocation_mode'], 'specified')
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
         self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
+        self.assertEqual(
+            Decimal(
+                short_entry['quantity_policy']['estimated_notional_krw']
+            ),
+            Decimal('1493500'),
+        )
         self.assertEqual(short_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(short_entry['risk_context']['market_regime_context']['schema_version'], 'market_regime_context_v1')
         self.assertEqual(short_entry['risk_context']['market_regime_context']['recommended_exec_action'], 'downsize')
@@ -11257,15 +11314,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff['source_market_date'], '2026-04-29')
         self.assertEqual(handoff['traceability']['decision_snapshot_id'], short_snapshot_id)
         self.assertEqual(handoff['traceability']['handoff_intent'], 'intraday_watch_buy')
-        self.assertEqual(handoff['traceability']['signal_decider_alignment'], 'wait_conflict_block')
-        self.assertEqual(handoff['traceability']['alignment_gate_action'], 'report_only_block_candidate')
-        self.assertEqual(handoff['traceability']['final_enforcement_decision'], 'allowed_report_only')
-        self.assertEqual(handoff['traceability']['requested_quantity'], 29)
-        self.assertEqual(handoff['traceability']['final_quantity'], 29)
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(handoff['traceability']))
         self.assertEqual(handoff['decider_output']['generic_action'], 'monitor_candidate')
         self.assertEqual(handoff['decider_output']['handoff_intent'], 'intraday_watch_buy')
-        self.assertEqual(handoff['decider_output']['signal_decider_alignment'], 'wait_conflict_block')
-        self.assertEqual(handoff['decider_output']['final_enforcement_decision'], 'allowed_report_only')
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(handoff['decider_output']))
         self.assertEqual(handoff['traceability']['core_plan_item_id'], short_entry['risk_context']['core_plan_item_id'])
         self.assertEqual(handoff['decider_input_context']['request_payload'], decider_request_payload)
         self.assertEqual(handoff['decider_input_context']['input_feature_snapshot_payload'], decider_input_features)
@@ -11358,7 +11410,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 2)
 
-    async def test_dispatch_next_open_plan_binds_core_downsize_quantity(self) -> None:
+    async def test_dispatch_next_open_plan_ignores_stale_core_downsize_quantity(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
         short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
         alignment_gate = {
@@ -11406,14 +11458,241 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         entry = next(item for item in short_payload['items'] if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY)
         self.assertEqual(entry['quantity_policy']['type'], 'exec_agent_sized')
-        self.assertEqual(entry['quantity_policy']['max_quantity'], '2')
+        self.assertNotIn('max_quantity', entry['quantity_policy'])
         self.assertNotIn('quantity', entry['quantity_policy'])
-        self.assertEqual(entry['quantity_policy']['enforcement_source'], 'core_wait_conflict_alignment_gate')
-        self.assertEqual(entry['quantity_policy']['requested_quantity'], '29')
-        self.assertEqual(entry['quantity_policy']['final_quantity'], '2')
-        self.assertEqual(entry['risk_context']['final_enforcement_decision'], 'downsized')
-        self.assertEqual(entry['risk_context']['requested_quantity'], '29')
-        self.assertEqual(entry['risk_context']['final_quantity'], '2')
+        forbidden_alignment_keys = {
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_signal_decider_decision_snapshot_id',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+            'enforcement_source',
+        }
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(entry['quantity_policy']))
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(entry['risk_context']))
+        self.assertNotIn(
+            'signal_decider_alignment',
+            json.dumps(
+                entry['risk_context']['decider_handoff_context'],
+                sort_keys=True,
+            ),
+        )
+        with session_scope() as session:
+            persisted = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            self.assertEqual(
+                persisted.validation_payload['alignment_gate'][
+                    'enforcement_decision'
+                ],
+                'downsized',
+            )
+
+    async def test_dispatch_next_open_plan_recovers_stale_alignment_only_hard_blocks_per_lane(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        short_plan_item_id = self._seed_short_term_plan_item(
+            snapshot_id=short_snapshot_id,
+        )
+        alignment_gate = {
+            'schema_version': 'signal_decider_alignment_gate_v1',
+            'enforcement_mode': 'hard_block',
+            'signal_decider_alignment': 'wait_conflict_block',
+            'alignment_gate_action': 'block',
+            'alignment_gate_reason': 'Legacy opposite-lane WAIT veto.',
+            'signal_decider_decision_snapshot_id': 991,
+            'enforcement_decision': 'blocked',
+            'requested_quantity': 29,
+            'final_quantity': 0,
+        }
+        with session_scope() as session:
+            signal_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            signal_row.eligibility_status = 'blocked'
+            signal_row.planned_quantity = Decimal('0')
+            signal_row.estimated_notional_krw = Decimal('0')
+            signal_row.validation_payload = {
+                **(signal_row.validation_payload or {}),
+                'blocking_reasons': [
+                    {
+                        'code': 'signal_decider_reject_cross_lane_observation',
+                        'message': 'Legacy opposite-lane REJECT veto.',
+                    }
+                ],
+                'legacy_alignment_enforcement': {
+                    'signal_decider_alignment': 'short_term_reject_conflict',
+                    'alignment_gate_action': 'block',
+                    'final_enforcement_decision': 'blocked',
+                    'requested_quantity': 5,
+                    'final_quantity': 0,
+                },
+            }
+            signal_row.traceability_payload = {
+                **(signal_row.traceability_payload or {}),
+                'decision_traceability': {
+                    **(
+                        (signal_row.traceability_payload or {}).get(
+                            'decision_traceability'
+                        )
+                        or {}
+                    ),
+                    'legacy_alignment_enforcement': {
+                        'signal_decider_alignment': 'short_term_reject_conflict',
+                        'alignment_gate_action': 'block',
+                        'final_enforcement_decision': 'blocked',
+                        'requested_quantity': 5,
+                        'final_quantity': 0,
+                    },
+                },
+            }
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            row.eligibility_status = 'blocked'
+            row.planned_quantity = Decimal('0')
+            row.estimated_notional_krw = Decimal('0')
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'blocking_reasons': [
+                    {
+                        'code': 'signal_decider_wait_conflict_gate',
+                        'message': 'Legacy opposite-lane WAIT veto.',
+                    }
+                ],
+                'legacy_alignment_enforcement': {
+                    'alignment_gate': alignment_gate,
+                    'final_enforcement_decision': 'blocked',
+                    'requested_quantity': 29,
+                    'final_quantity': 0,
+                },
+                'pricing': {
+                    'planned_quantity': 0,
+                    'estimated_notional_krw': '0',
+                    'requested_quantity': 29,
+                    'final_quantity': 0,
+                },
+            }
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'decision_traceability': {
+                    **(
+                        (row.traceability_payload or {}).get(
+                            'decision_traceability'
+                        )
+                        or {}
+                    ),
+                    'legacy_alignment_enforcement': {
+                        'alignment_gate': alignment_gate,
+                        'final_enforcement_decision': 'blocked',
+                        'requested_quantity': 29,
+                        'final_quantity': 0,
+                    },
+                },
+            }
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        by_agent = {
+            payload['metadata']['decision_agent_name']: payload
+            for payload in self.client.post_calls
+        }
+        self.assertEqual(
+            set(by_agent),
+            {'signal-decider', 'short-term-decider'},
+        )
+        signal_entry = next(
+            item
+            for item in by_agent['signal-decider']['items']
+            if item['intent'] == EXEC_INTENT_NEXT_OPEN_BUY
+        )
+        self.assertEqual(
+            signal_entry['quantity_policy']['type'],
+            'exec_agent_sized',
+        )
+        self.assertNotIn('quantity', signal_entry['quantity_policy'])
+        self.assertNotIn('max_quantity', signal_entry['quantity_policy'])
+        self.assertIsNone(
+            signal_entry['quantity_policy']['estimated_notional_krw']
+        )
+        signal_risk_json = json.dumps(
+            signal_entry['risk_context'],
+            sort_keys=True,
+        )
+        for forbidden_text in (
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'final_enforcement_decision',
+            'signal_decider_reject_cross_lane_observation',
+            '"planned_quantity": 0',
+            '"estimated_notional_krw": "0"',
+        ):
+            self.assertNotIn(forbidden_text, signal_risk_json)
+        short_entry = next(
+            item
+            for item in by_agent['short-term-decider']['items']
+            if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
+        )
+        self.assertEqual(
+            short_entry['quantity_policy']['type'],
+            'exec_agent_sized',
+        )
+        self.assertNotIn('quantity', short_entry['quantity_policy'])
+        self.assertNotIn('max_quantity', short_entry['quantity_policy'])
+        self.assertIsNone(
+            short_entry['quantity_policy']['estimated_notional_krw']
+        )
+        short_risk_json = json.dumps(
+            short_entry['risk_context'],
+            sort_keys=True,
+        )
+        for forbidden_text in (
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'signal_decider_wait_conflict_gate',
+            '"planned_quantity": 0',
+            '"estimated_notional_krw": "0"',
+        ):
+            self.assertNotIn(forbidden_text, short_risk_json)
+        with session_scope() as session:
+            persisted = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            self.assertEqual(persisted.eligibility_status, 'blocked')
+            self.assertEqual(persisted.planned_quantity, Decimal('0'))
+            self.assertEqual(
+                persisted.validation_payload['legacy_alignment_enforcement'][
+                    'alignment_gate'
+                ]['enforcement_decision'],
+                'blocked',
+            )
+            persisted_signal = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                persisted_signal.eligibility_status,
+                'blocked',
+            )
+            self.assertEqual(
+                persisted_signal.planned_quantity,
+                Decimal('0'),
+            )
 
     async def test_readback_promotes_blocked_planned_short_term_watch_to_delegated(self) -> None:
         overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(

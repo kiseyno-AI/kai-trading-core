@@ -5587,7 +5587,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['short_term_wait_conflict_block_count'], 0)
         self.assertEqual(result['summary']['short_term_wait_conflict_override_count'], 1)
 
-    def test_refresh_plan_items_hard_blocks_wait_conflict(self) -> None:
+    def test_refresh_treats_legacy_hard_block_as_audit_only_in_non_dispatch_mode(self) -> None:
         settings.signal_decider_wait_conflict_gate_mode = 'hard_block'
         self._seed_snapshot(symbol='005930', next_day_open_action='wait')
         self._seed_short_term_snapshot(symbol='005930')
@@ -5600,17 +5600,25 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
         item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
-        self.assertEqual(item['final_enforcement_decision'], 'blocked')
-        self.assertGreater(item['requested_quantity'], 0)
-        self.assertEqual(item['final_quantity'], 0)
-        self.assertEqual(Decimal(item['planned_quantity']), Decimal('0'))
-        self.assertIn(
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertEqual(item['alignment_gate_action'], 'block')
+        self.assertEqual(item['final_enforcement_decision'], 'ignored_independent_lane')
+        self.assertEqual(item['requested_quantity'], item['final_quantity'])
+        self.assertEqual(
+            Decimal(item['planned_quantity']),
+            Decimal(str(item['final_quantity'])),
+        )
+        self.assertNotIn(
             'signal_decider_wait_conflict_gate',
             {reason['code'] for reason in item['validation']['blocking_reasons']},
         )
+        self.assertIn(
+            'signal_decider_alignment_audit_only',
+            {warning['code'] for warning in item['validation']['warnings']},
+        )
 
-    def test_refresh_plan_items_downsizes_wait_conflict_to_configured_probe(self) -> None:
+    def test_dispatch_refresh_treats_legacy_downsize_as_audit_only(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
         settings.signal_decider_wait_conflict_gate_mode = 'downsize_probe'
         settings.signal_decider_wait_conflict_probe_quantity = 2
         self._seed_snapshot(symbol='005930', next_day_open_action='wait')
@@ -5626,10 +5634,13 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         item = next(item for item in result['items'] if item['decision_agent_name'] == 'short-term-decider')
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(item['alignment_gate_action'], 'downsize_probe')
-        self.assertEqual(item['final_enforcement_decision'], 'downsized')
-        self.assertGreater(item['requested_quantity'], 2)
-        self.assertEqual(item['final_quantity'], 2)
-        self.assertEqual(Decimal(item['planned_quantity']), Decimal('2'))
+        self.assertEqual(item['final_enforcement_decision'], 'ignored_independent_lane')
+        self.assertEqual(item['requested_quantity'], item['final_quantity'])
+        self.assertGreater(Decimal(str(item['final_quantity'])), Decimal('2'))
+        self.assertEqual(
+            Decimal(item['planned_quantity']),
+            Decimal(str(item['final_quantity'])),
+        )
 
     def test_refresh_plan_items_marks_short_term_buy_aligned_with_signal_buy(self) -> None:
         signal_snapshot_id = self._seed_snapshot(symbol='005930', next_day_open_action='buy')
@@ -6017,7 +6028,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(item['planned_quantity'])
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
 
-    async def test_paper_unspecified_route_wait_conflict_dispatches_configured_probe_quantity(self) -> None:
+    async def test_paper_unspecified_route_ignores_legacy_wait_conflict_probe_quantity(self) -> None:
         settings.signal_decider_wait_conflict_gate_mode = 'downsize_probe'
         settings.signal_decider_wait_conflict_probe_quantity = 2
         settings.signal_decider_exec_integration_mode = 'dispatch'
@@ -6045,10 +6056,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['traceability']['allocation_budget_krw'], '0')
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertEqual(item['alignment_gate_action'], 'downsize_probe')
-        self.assertEqual(item['final_enforcement_decision'], 'downsized')
-        self.assertEqual(item['requested_quantity'], 2)
-        self.assertEqual(item['final_quantity'], 2)
-        self.assertEqual(Decimal(item['planned_quantity']), Decimal('2'))
+        self.assertEqual(item['final_enforcement_decision'], 'ignored_independent_lane')
+        self.assertIsNone(item['requested_quantity'])
+        self.assertIsNone(item['final_quantity'])
+        self.assertIsNone(item['planned_quantity'])
 
         dispatched_payloads = []
 
@@ -6136,8 +6147,11 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             if dispatched_item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
         )
         self.assertEqual(entry['quantity_policy']['type'], 'exec_agent_sized')
-        self.assertEqual(entry['quantity_policy']['max_quantity'], '2')
-        self.assertEqual(entry['quantity_policy']['enforcement_source'], 'core_wait_conflict_alignment_gate')
+        self.assertNotIn('max_quantity', entry['quantity_policy'])
+        self.assertNotIn('enforcement_source', entry['quantity_policy'])
+        self.assertNotIn('final_enforcement_decision', entry['quantity_policy'])
+        self.assertNotIn('alignment_gate', entry['risk_context'])
+        self.assertNotIn('signal_decider_alignment', entry['risk_context'])
 
     def test_refresh_plan_items_blocks_short_term_rows_with_invalid_account_targets(self) -> None:
         self._seed_short_term_snapshot(symbol='005930')

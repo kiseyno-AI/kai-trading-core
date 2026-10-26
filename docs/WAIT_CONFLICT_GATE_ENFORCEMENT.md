@@ -5,11 +5,13 @@
 `SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE` remains `report_only`. Live Exec dispatch intentionally keeps signal-decider and short-term-decider authority independent. A mode change requires an explicit configuration update and API restart.
 
 - `report_only`: records WAIT/reject/missing/stale signal context without changing short-term eligibility or quantity and preserves trigger-gated monitoring. It does not grant BUY authority; Exec must still pass trigger-time quote, chase-limit, quality, aggregate account/symbol exposure, market-authority, portfolio, pause, and kill-switch gates before submitting an order.
-- `hard_block`: available for observe/offline evaluation and replay, but rejected by settings validation when integration mode is `dispatch`.
-- `downsize_probe`: available for observe/offline evaluation and replay, but rejected by settings validation when integration mode is `dispatch`.
+- `hard_block`: retained as observe/offline counterfactual audit evidence, but never changes either lane's plan eligibility or quantity; settings validation also rejects it when integration mode is `dispatch`.
+- `downsize_probe`: retained as observe/offline counterfactual audit evidence, but never caps either lane's plan or Exec quantity; settings validation also rejects it when integration mode is `dispatch`.
 - `disabled`: retains an explicit disabled audit state.
 
-`allow_by_override`, enforcement decisions, and modeled probe quantities remain replay/audit evidence. They cannot turn cross-decider disagreement into a dispatch-time veto or quantity cap. In dispatch mode only `disabled` and `report_only` are accepted; common deterministic exposure and safety gates remain authoritative for both lanes.
+`allow_by_override`, enforcement decisions, and modeled probe quantities remain Core-only replay/audit evidence. They cannot turn cross-decider disagreement into a plan-time or dispatch-time veto or quantity cap, and they are stripped from Exec LLM risk context. In dispatch mode only `disabled` and `report_only` are accepted; common deterministic exposure and safety gates remain authoritative for both lanes.
+
+Pre-existing rows keep their historical blocked/downsize fields unchanged for audit. Compatibility dispatch ignores those fields only when every persisted blocker is an allowlisted opposite-lane alignment reason and all normal lane-specific geometry and safety checks still pass; any unrelated blocker remains fail-closed.
 
 ## Weekly operator replay
 
@@ -38,7 +40,7 @@ The report exposes these checks under `promotion_readiness`:
 - unresolved WAIT-conflict ratio no greater than 25%;
 - manual approval for any live configuration change.
 
-Passing the numeric checks does not make cross-agent enforcement dispatch-safe. Keep live dispatch at `report_only` or `disabled`; any `hard_block` or `downsize_probe` experiment remains confined to observe/offline evaluation and requires a separately reviewed future code/configuration change before it could be reconsidered for live dispatch.
+Passing the numeric checks does not make cross-agent enforcement dispatch-safe. Keep live dispatch at `report_only` or `disabled`; any `hard_block` or `downsize_probe` experiment remains a Core-only observe/offline counterfactual and cannot alter either lane's executable plan.
 
 ## Monitoring is not BUY authority
 

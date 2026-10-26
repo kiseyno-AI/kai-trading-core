@@ -178,6 +178,37 @@ EXEC_DECIDER_HANDOFF_MAX_BYTES = 12 * 1024
 EXEC_FLOW_SHORT_SECTOR_CONTEXT_MAX_BYTES = 8 * 1024
 EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES = 32 * 1024
 EXEC_EXIT_RISK_CONTEXT_MAX_BYTES = 8 * 1024
+_CROSS_LANE_ALIGNMENT_MARKER_KEYS = frozenset(
+    {
+        'signal_decider_alignment',
+        'alignment_gate_action',
+        'alignment_gate_reason',
+        'alignment_signal_decider_decision_snapshot_id',
+        'alignment_gate',
+        'final_enforcement_decision',
+        'signal_decider_crosscheck',
+    }
+)
+_CROSS_LANE_ALIGNMENT_QUANTITY_KEYS = frozenset(
+    {'requested_quantity', 'final_quantity', 'enforcement_source'}
+)
+_CROSS_LANE_ALIGNMENT_STALE_SIZING_KEYS = frozenset(
+    {'planned_quantity', 'estimated_notional_krw', 'max_quantity'}
+)
+_CROSS_LANE_ALIGNMENT_REASON_CODES = frozenset(
+    {
+        'signal_decider_alignment_audit_only',
+        'signal_decider_context_unavailable_gate',
+        'signal_decider_context_unavailable_gate_downsized',
+        'signal_decider_context_unavailable_gate_report_only',
+        'signal_decider_reject_cross_lane_observation',
+        'signal_decider_wait_conflict_gate',
+        'signal_decider_wait_conflict_gate_downsized',
+        'signal_decider_wait_conflict_gate_report_only',
+        'signal_decider_wait_conflict_override',
+        'signal_decider_wait_cross_lane_observation',
+    }
+)
 EXEC_PROTECTIVE_EXIT_RISK_CONTEXT_ESSENTIAL_KEYS = (
     '_core_activation',
     'trigger_rule',
@@ -1200,6 +1231,95 @@ def _strip_signal_decider_only_labels(payload: dict[str, Any], *, decision_agent
         for key, value in payload.items()
         if key not in {'role', 'agent_name'}
     }
+
+
+def _contains_cross_lane_quantity_enforcement(value: Any) -> bool:
+    if isinstance(value, dict):
+        alignment_context = any(
+            key in value for key in _CROSS_LANE_ALIGNMENT_MARKER_KEYS
+        )
+        gate_action = _normalize_optional_text(
+            value.get('alignment_gate_action'),
+            lowercase=True,
+        )
+        enforcement_mode = _normalize_optional_text(
+            value.get('enforcement_mode'),
+            lowercase=True,
+        )
+        enforcement_decision = _normalize_optional_text(
+            value.get('final_enforcement_decision')
+            or value.get('enforcement_decision'),
+            lowercase=True,
+        )
+        reason_code = str(value.get('code') or '')
+        if (
+            alignment_context
+            and (
+                gate_action in {'block', 'downsize_probe'}
+                or enforcement_mode in {'hard_block', 'downsize_probe'}
+                or enforcement_decision in {'blocked', 'downsized'}
+            )
+            or reason_code
+            in {
+                'signal_decider_context_unavailable_gate',
+                'signal_decider_context_unavailable_gate_downsized',
+                'signal_decider_wait_conflict_gate',
+                'signal_decider_wait_conflict_gate_downsized',
+            }
+        ):
+            return True
+        return any(
+            _contains_cross_lane_quantity_enforcement(item)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_cross_lane_quantity_enforcement(item)
+            for item in value
+        )
+    return False
+
+
+def _strip_cross_lane_alignment_audit(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep opposite-lane alignment evidence in Core, never in Exec decision input."""
+
+    sizing_enforcement_present = _contains_cross_lane_quantity_enforcement(
+        payload
+    )
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            alignment_context = any(
+                key in value for key in _CROSS_LANE_ALIGNMENT_MARKER_KEYS
+            )
+            return {
+                key: sanitize(item)
+                for key, item in value.items()
+                if key not in _CROSS_LANE_ALIGNMENT_MARKER_KEYS
+                and not (
+                    alignment_context
+                    and key in _CROSS_LANE_ALIGNMENT_QUANTITY_KEYS
+                )
+                and not (
+                    sizing_enforcement_present
+                    and key in _CROSS_LANE_ALIGNMENT_STALE_SIZING_KEYS
+                )
+            }
+        if isinstance(value, list):
+            return [
+                sanitize(item)
+                for item in value
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get('code') or '')
+                    in _CROSS_LANE_ALIGNMENT_REASON_CODES
+                )
+            ]
+        return copy.deepcopy(value)
+
+    sanitized = sanitize(payload)
+
+    return sanitized
 
 
 def _decision_input_quality_from_payloads(
@@ -9130,12 +9250,41 @@ class SignalDeciderExecIntegrationService:
         ):
             return False
         decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
+        raw_validation = (
+            row.validation_payload
+            if isinstance(row.validation_payload, dict)
+            else {}
+        )
+        validation = _strip_cross_lane_alignment_audit(raw_validation)
+        raw_blocking_reasons = raw_validation.get('blocking_reasons')
+        legacy_alignment_only_block = bool(
+            decision_agent_name
+            in {
+                SIGNAL_DECIDER_AGENT_NAME,
+                SHORT_TERM_DECIDER_AGENT_NAME,
+            }
+            and row.eligibility_status == ELIGIBILITY_BLOCKED
+            and _normalize_optional_text(
+                getattr(row, 'execution_status', None),
+                lowercase=True,
+            )
+            in {
+                EXECUTION_STATUS_PLANNED,
+                EXECUTION_STATUS_SUBMIT_FAILED,
+            }
+            and _contains_cross_lane_quantity_enforcement(raw_validation)
+            and isinstance(raw_blocking_reasons, list)
+            and bool(raw_blocking_reasons)
+            and not validation.get('blocking_reasons')
+        )
         if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
             if not _row_is_monitor_only_intraday_watch(row):
                 return False
-        elif row.eligibility_status != ELIGIBILITY_ELIGIBLE:
+        elif (
+            row.eligibility_status != ELIGIBILITY_ELIGIBLE
+            and not legacy_alignment_only_block
+        ):
             return False
-        validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
             if (
                 validation.get('execution_cost_evidence_policy_version')
@@ -9228,8 +9377,14 @@ class SignalDeciderExecIntegrationService:
         traceability: dict[str, Any],
         validation: dict[str, Any],
         decision_traceability: dict[str, Any],
+        ignore_row_planned_notional: bool = False,
     ) -> dict[str, Any]:
         row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
+        traceability = _strip_cross_lane_alignment_audit(traceability)
+        validation = _strip_cross_lane_alignment_audit(validation)
+        decision_traceability = _strip_cross_lane_alignment_audit(
+            decision_traceability
+        )
         pre_decider_enrichment_context = (
             traceability.get('pre_decider_enrichment_context')
             if isinstance(traceability.get('pre_decider_enrichment_context'), dict)
@@ -9252,20 +9407,31 @@ class SignalDeciderExecIntegrationService:
                 dict,
             ):
                 pre_decider_enrichment_context = symbol_day_context['pre_decider_enrichment_context']
+        pre_decider_enrichment_context = _strip_cross_lane_alignment_audit(
+            pre_decider_enrichment_context
+        )
+        request_payload = _strip_cross_lane_alignment_audit(request_payload)
         input_feature_snapshot_payload = (
             snapshot.input_feature_snapshot_payload
             if snapshot is not None and isinstance(snapshot.input_feature_snapshot_payload, dict)
             else {}
+        )
+        input_feature_snapshot_payload = _strip_cross_lane_alignment_audit(
+            input_feature_snapshot_payload
         )
         response_payload = (
             snapshot.response_payload
             if snapshot is not None and isinstance(snapshot.response_payload, dict)
             else {}
         )
+        response_payload = _strip_cross_lane_alignment_audit(response_payload)
         response_summary_payload = (
             snapshot.response_summary_payload
             if snapshot is not None and isinstance(snapshot.response_summary_payload, dict)
             else {}
+        )
+        response_summary_payload = _strip_cross_lane_alignment_audit(
+            response_summary_payload
         )
         decision_input_quality_context = _decision_input_quality_from_payloads(
             symbol=row.symbol,
@@ -9275,7 +9441,11 @@ class SignalDeciderExecIntegrationService:
             traceability=traceability,
             allocation_budget_krw=row.allocation_budget_krw,
             estimated_reference_price=row.estimated_reference_price,
-            planned_notional_krw=row.estimated_notional_krw,
+            planned_notional_krw=(
+                None
+                if ignore_row_planned_notional
+                else row.estimated_notional_krw
+            ),
         )
         market_regime_context = _market_regime_context_from_payloads(
             request_payload=request_payload,
@@ -9301,33 +9471,6 @@ class SignalDeciderExecIntegrationService:
                 handoff_intent = 'tactical_buy'
             elif raw_action == 'watch_for_trigger':
                 handoff_intent = EXEC_INTENT_INTRADAY_WATCH_BUY
-        alignment_gate = (
-            traceability.get('alignment_gate')
-            if isinstance(traceability.get('alignment_gate'), dict)
-            else validation.get('alignment_gate')
-            if isinstance(validation.get('alignment_gate'), dict)
-            else None
-        )
-        final_enforcement_decision = (
-            alignment_gate.get('enforcement_decision')
-            if isinstance(alignment_gate, dict)
-            else traceability.get('final_enforcement_decision')
-            or validation.get('final_enforcement_decision')
-        )
-        requested_quantity = (
-            alignment_gate.get('requested_quantity')
-            if isinstance(alignment_gate, dict)
-            else traceability.get('requested_quantity')
-            if traceability.get('requested_quantity') is not None
-            else validation.get('requested_quantity')
-        )
-        final_quantity = (
-            alignment_gate.get('final_quantity')
-            if isinstance(alignment_gate, dict)
-            else traceability.get('final_quantity')
-            if traceability.get('final_quantity') is not None
-            else validation.get('final_quantity')
-        )
         return serialize_exec_agent_decider_handoff_payload(
             _json_safe(
                 {
@@ -9349,20 +9492,6 @@ class SignalDeciderExecIntegrationService:
                         'tactical_action': traceability.get('tactical_action'),
                         'generic_action': generic_action,
                         'handoff_intent': handoff_intent,
-                        'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                        or validation.get('signal_decider_alignment'),
-                        'alignment_gate_action': traceability.get('alignment_gate_action')
-                        or validation.get('alignment_gate_action'),
-                        'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                        or validation.get('alignment_gate_reason'),
-                        'alignment_signal_decider_decision_snapshot_id': traceability.get(
-                            'alignment_signal_decider_decision_snapshot_id'
-                        )
-                        or validation.get('alignment_signal_decider_decision_snapshot_id'),
-                        'alignment_gate': alignment_gate,
-                        'final_enforcement_decision': final_enforcement_decision,
-                        'requested_quantity': requested_quantity,
-                        'final_quantity': final_quantity,
                         'decision_traceability': decision_traceability,
                     },
                     'decider_input_context': {
@@ -9382,16 +9511,6 @@ class SignalDeciderExecIntegrationService:
                         'tactical_action': traceability.get('tactical_action'),
                         'generic_action': generic_action,
                         'handoff_intent': handoff_intent,
-                        'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                        or validation.get('signal_decider_alignment'),
-                        'alignment_gate_action': traceability.get('alignment_gate_action')
-                        or validation.get('alignment_gate_action'),
-                        'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                        or validation.get('alignment_gate_reason'),
-                        'alignment_gate': alignment_gate,
-                        'final_enforcement_decision': final_enforcement_decision,
-                        'requested_quantity': requested_quantity,
-                        'final_quantity': final_quantity,
                         'entry_price_basis': snapshot.entry_price_basis
                         if snapshot is not None
                         else traceability.get('entry_price_basis'),
@@ -9487,7 +9606,33 @@ class SignalDeciderExecIntegrationService:
         for row in rows:
             snapshot = snapshots.get(int(row.decision_snapshot_id))
             row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
-            traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
+            raw_traceability = (
+                row.traceability_payload
+                if isinstance(row.traceability_payload, dict)
+                else {}
+            )
+            raw_validation = (
+                row.validation_payload
+                if isinstance(row.validation_payload, dict)
+                else {}
+            )
+            alignment_sizing_enforcement_present = any(
+                _contains_cross_lane_quantity_enforcement(payload)
+                for payload in (
+                    raw_traceability,
+                    raw_validation,
+                    snapshot.request_payload if snapshot is not None else {},
+                    snapshot.input_feature_snapshot_payload
+                    if snapshot is not None
+                    else {},
+                    snapshot.response_payload if snapshot is not None else {},
+                    snapshot.response_summary_payload
+                    if snapshot is not None
+                    else {},
+                )
+                if isinstance(payload, dict)
+            )
+            traceability = raw_traceability
             unsupported_route_reason = _unsupported_exec_sizing_route_reason(
                 traceability
             )
@@ -9496,6 +9641,7 @@ class SignalDeciderExecIntegrationService:
                     f'{row_decision_agent_name}:{row.id}:'
                     f'{unsupported_route_reason}'
                 )
+            traceability = _strip_cross_lane_alignment_audit(traceability)
             execution_scope = {
                 'asset_class': 'stock',
                 'market': 'KRX',
@@ -9510,11 +9656,12 @@ class SignalDeciderExecIntegrationService:
                     'allow_extended_hours': False,
                 },
             }
-            validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+            validation = raw_validation
             validation = _strip_signal_decider_fixed_sizing_preview(
                 validation,
                 decision_agent_name=row_decision_agent_name,
             )
+            validation = _strip_cross_lane_alignment_audit(validation)
             is_short_term = row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
             signal_trigger_entry = _snapshot_requests_signal_trigger_entry(
                 snapshot
@@ -9551,6 +9698,9 @@ class SignalDeciderExecIntegrationService:
             decision_traceability = traceability.get('decision_traceability') or traceability.get('signal_traceability') or {}
             if not isinstance(decision_traceability, dict):
                 decision_traceability = {}
+            decision_traceability = _strip_cross_lane_alignment_audit(
+                decision_traceability
+            )
             response_summary = (
                 short_term_context.get('response_summary')
                 if short_term_context.get('response_summary') is not None
@@ -9657,6 +9807,9 @@ class SignalDeciderExecIntegrationService:
                 traceability=dispatch_traceability,
                 validation=validation,
                 decision_traceability=decision_traceability,
+                ignore_row_planned_notional=(
+                    alignment_sizing_enforcement_present
+                ),
             )
             decision_input_quality_context = (
                 full_decider_handoff_context.get('decision_input_quality_context')
@@ -9745,31 +9898,6 @@ class SignalDeciderExecIntegrationService:
                 )
             delegated_gate_codes = [gate['code'] for gate in delegated_gates]
             delegated_gate_confirmation_required = bool(delegated_gates)
-            alignment_gate = (
-                traceability.get('alignment_gate')
-                if isinstance(traceability.get('alignment_gate'), dict)
-                else validation.get('alignment_gate')
-                if isinstance(validation.get('alignment_gate'), dict)
-                else None
-            )
-            final_enforcement_decision = (
-                alignment_gate.get('enforcement_decision')
-                if isinstance(alignment_gate, dict)
-                else traceability.get('final_enforcement_decision')
-                or validation.get('final_enforcement_decision')
-            )
-            requested_enforcement_quantity = (
-                _safe_decimal(alignment_gate.get('requested_quantity'))
-                if isinstance(alignment_gate, dict)
-                else _safe_decimal(traceability.get('requested_quantity'))
-                or _safe_decimal(validation.get('requested_quantity'))
-            )
-            final_enforcement_quantity = (
-                _safe_decimal(alignment_gate.get('final_quantity'))
-                if isinstance(alignment_gate, dict)
-                else _safe_decimal(traceability.get('final_quantity'))
-                or _safe_decimal(validation.get('final_quantity'))
-            )
             max_holding_close_policy = (
                 {
                     'enabled': True,
@@ -9825,17 +9953,11 @@ class SignalDeciderExecIntegrationService:
                     'warnings',
                     'short_term_entry_quality',
                     'performance_gate',
-                    'alignment_gate',
-                    'signal_decider_alignment',
-                    'alignment_gate_action',
-                    'alignment_gate_reason',
-                    'alignment_signal_decider_decision_snapshot_id',
                     'pricing_note',
                 ),
                 compact_nested_keys=(
                     'short_term_entry_quality',
                     'performance_gate',
-                    'alignment_gate',
                 ),
             )
             traceability_projection = _bounded_dispatch_object(
@@ -9921,20 +10043,6 @@ class SignalDeciderExecIntegrationService:
                 'tactical_action': traceability.get('tactical_action'),
                 'generic_action': generic_action,
                 'handoff_intent': handoff_intent,
-                'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                or validation.get('signal_decider_alignment'),
-                'alignment_gate_action': traceability.get('alignment_gate_action')
-                or validation.get('alignment_gate_action'),
-                'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                or validation.get('alignment_gate_reason'),
-                'alignment_signal_decider_decision_snapshot_id': traceability.get(
-                    'alignment_signal_decider_decision_snapshot_id'
-                )
-                or validation.get('alignment_signal_decider_decision_snapshot_id'),
-                'alignment_gate': alignment_gate,
-                'final_enforcement_decision': final_enforcement_decision,
-                'requested_quantity': _decimal_to_text(requested_enforcement_quantity),
-                'final_quantity': _decimal_to_text(final_enforcement_quantity),
                 'handoff_active': (
                     bool(dispatch_traceability.get('handoff_active'))
                     if uses_trigger_entry
@@ -9976,33 +10084,16 @@ class SignalDeciderExecIntegrationService:
                     else {}
                 ),
             }
-            enforced_probe = bool(
-                is_short_term
-                and final_enforcement_decision == 'downsized'
-                and final_enforcement_quantity is not None
-                and final_enforcement_quantity > Decimal('0')
-            )
-            if enforced_probe:
-                quantity_policy = {
-                    'type': 'exec_agent_sized',
-                    # The v4 boundary delegates the final order quantity to
-                    # Exec. Core's WAIT-conflict decision is a hard ceiling,
-                    # not executable fixed sizing.
-                    'max_quantity': _decimal_to_text(final_enforcement_quantity),
-                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
-                    'allocation_mode': traceability.get('allocation_mode') or 'specified',
-                    'account_reference': row.account_reference,
-                    'account_label': row.account_label,
-                    'estimated_reference_price': row.estimated_reference_price,
-                    'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
-                    'pricing_note': 'Core-enforced deterministic WAIT-conflict probe quantity.',
-                    'enforcement_source': 'core_wait_conflict_alignment_gate',
-                    'market_regime_sizing': market_regime_sizing_policy,
-                }
-            elif uses_exec_agent_sizing:
+            if uses_exec_agent_sizing:
                 if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
                     estimated_notional_krw = None
                     pricing_note = 'Sizing for signal-decider dispatch is delegated to exec-agent.'
+                elif alignment_sizing_enforcement_present:
+                    estimated_notional_krw = None
+                    pricing_note = (
+                        'Sizing for short-term-decider dispatch is delegated '
+                        'to exec-agent; opposite-lane alignment is Core audit only.'
+                    )
                 else:
                     estimated_notional_krw = _decimal_to_text(_safe_decimal(row.estimated_notional_krw))
                     pricing_note = (
@@ -10035,9 +10126,6 @@ class SignalDeciderExecIntegrationService:
                 }
             quantity_policy.update(
                 {
-                    'final_enforcement_decision': final_enforcement_decision,
-                    'requested_quantity': _decimal_to_text(requested_enforcement_quantity),
-                    'final_quantity': _decimal_to_text(final_enforcement_quantity),
                     'market_regime': market_regime_sizing_policy['market_regime'],
                     'quantity_multiplier': market_regime_sizing_policy['quantity_multiplier'],
                     'quantity_multiplier_cap': market_regime_sizing_policy['quantity_multiplier_cap'],
@@ -10092,13 +10180,6 @@ class SignalDeciderExecIntegrationService:
                     'target_price',
                     'stop_loss_price',
                     'allocation_budget_krw',
-                    'signal_decider_alignment',
-                    'alignment_gate_action',
-                    'alignment_gate_reason',
-                    'alignment_signal_decider_decision_snapshot_id',
-                    'final_enforcement_decision',
-                    'requested_quantity',
-                    'final_quantity',
                     'entry_execution_mode',
                     'delegated_gate_codes',
                     'delegated_gate_confirmation_required',

@@ -8408,18 +8408,6 @@ class SignalDeciderNextOpenExecutionService:
 
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and alignment_gate_payload is not None:
             requested_quantity = planned_quantity
-            if (
-                requested_quantity is None
-                and target.account_reference == UNSPECIFIED_ROUTE_ACCOUNT_REFERENCE
-                and not settings.signal_decider_next_open_account_targets.strip()
-                and alignment_gate_payload.get('alignment_gate_action') == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE
-            ):
-                requested_quantity = settings.signal_decider_wait_conflict_probe_quantity
-            alignment_gate_payload = apply_alignment_quantity_enforcement(
-                alignment_gate_payload,
-                requested_quantity=requested_quantity,
-                probe_quantity=settings.signal_decider_wait_conflict_probe_quantity,
-            )
             alignment = alignment_gate_payload.get('signal_decider_alignment')
             action = alignment_gate_payload.get('alignment_gate_action')
             reason_text = (
@@ -8430,34 +8418,37 @@ class SignalDeciderNextOpenExecutionService:
                 SIGNAL_DECIDER_ALIGNMENT_NO_CONTEXT,
                 SIGNAL_DECIDER_ALIGNMENT_STALE_CONTEXT,
             }
-            if action == ALIGNMENT_GATE_ACTION_BLOCK:
-                blocking_reasons.append(
-                    _reason(
-                        'signal_decider_context_unavailable_gate'
-                        if unavailable_context
-                        else 'signal_decider_wait_conflict_gate',
-                        reason_text,
-                    )
-                )
-                planned_quantity = Decimal('0')
-                estimated_notional = Decimal('0')
-            elif action == ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE:
+            legacy_cross_lane_enforcement = bool(
+                action in {
+                    ALIGNMENT_GATE_ACTION_BLOCK,
+                    ALIGNMENT_GATE_ACTION_DOWNSIZE_PROBE,
+                }
+            )
+            if legacy_cross_lane_enforcement:
+                quantity_text = _decimal_to_text(requested_quantity)
+                alignment_gate_payload = {
+                    **alignment_gate_payload,
+                    'audit_only': True,
+                    'enforcement_decision': 'ignored_independent_lane',
+                    'requested_quantity': quantity_text,
+                    'final_quantity': quantity_text,
+                }
                 warnings.append(
                     _reason(
-                        'signal_decider_context_unavailable_gate_downsized'
-                        if unavailable_context
-                        else 'signal_decider_wait_conflict_gate_downsized',
-                        reason_text,
+                        'signal_decider_alignment_audit_only',
+                        (
+                            f'{reason_text} The signal and short-term lanes execute independently, '
+                            'so this legacy cross-lane gate is retained for Core audit only.'
+                        ),
                     )
                 )
-                planned_quantity = _to_decimal(alignment_gate_payload.get('final_quantity'))
-                estimated_notional = (
-                    planned_quantity * Decimal(str(estimated_reference_price))
-                    if planned_quantity is not None and estimated_reference_price is not None
-                    else None
+            else:
+                alignment_gate_payload = apply_alignment_quantity_enforcement(
+                    alignment_gate_payload,
+                    requested_quantity=requested_quantity,
+                    probe_quantity=settings.signal_decider_wait_conflict_probe_quantity,
                 )
-                pricing_note = 'Core enforced a deterministic WAIT-conflict probe quantity before exec handoff.'
-            elif action == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
+            if action == ALIGNMENT_GATE_ACTION_REPORT_ONLY_BLOCK:
                 warnings.append(
                     _reason(
                         'signal_decider_context_unavailable_gate_report_only'
