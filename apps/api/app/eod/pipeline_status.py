@@ -2092,16 +2092,38 @@ class EODPipelineStatusService:
             return False
         if 'current_role' in summary and summary.get('current_role') is not None:
             return False
-        for terminal_count_key in (
-            'computed_feedback_count',
-            'terminal_feedback_count',
+        if (
+            'terminal_feedback_count' in summary
+            and _strict_non_negative_int(summary, 'terminal_feedback_count')
+            != completed
         ):
+            return False
+        computed_feedback_count = _strict_non_negative_int(
+            summary,
+            'computed_feedback_count',
+        )
+        if 'reused_feedback_count' in summary:
+            reused_feedback_count = _strict_non_negative_int(
+                summary,
+                'reused_feedback_count',
+            )
             if (
-                terminal_count_key in summary
-                and _strict_non_negative_int(summary, terminal_count_key)
+                computed_feedback_count is None
+                or reused_feedback_count is None
+                or computed_feedback_count + reused_feedback_count
                 != completed
             ):
                 return False
+        elif (
+            'computed_feedback_count' in summary
+            and computed_feedback_count != completed
+        ):
+            return False
+        if (
+            'stale_feedback_count' in summary
+            and _strict_non_negative_int(summary, 'stale_feedback_count') != 0
+        ):
+            return False
         for failure_timestamp_key in (
             'first_failed_feedback_at',
             'latest_failed_feedback_at',
@@ -2173,6 +2195,26 @@ class EODPipelineStatusService:
                 or requested_count != total_symbols
                 or completed_count != completed_symbols
                 or error_count != 0
+            ):
+                return False
+            if 'reused_symbols' in role_state:
+                computed_symbols = _strict_non_negative_int(
+                    role_state,
+                    'computed_symbols',
+                )
+                reused_symbols = _strict_non_negative_int(
+                    role_state,
+                    'reused_symbols',
+                )
+                if (
+                    computed_symbols is None
+                    or reused_symbols is None
+                    or computed_symbols + reused_symbols != completed_symbols
+                ):
+                    return False
+            if (
+                'stale_symbols' in role_state
+                and _strict_non_negative_int(role_state, 'stale_symbols') != 0
             ):
                 return False
             for pending_key in (

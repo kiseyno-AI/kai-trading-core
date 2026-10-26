@@ -4506,6 +4506,79 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(built_stage['status'], 'partial')
 
+    def test_canonical_decider_proof_accepts_complete_reused_recovery_cohort(
+        self,
+    ) -> None:
+        item = _legacy_completed_signal_decider_stage(
+            market_date='2026-10-07',
+            updated_at='2026-10-07T14:00:00+00:00',
+        )
+        candidate = item['stage']
+        summary = candidate['details']['result_summary']['progress']['summary']
+        summary['computed_feedback_count'] = 2
+        summary['reused_feedback_count'] = 158
+        summary['stale_feedback_count'] = 0
+        summary['role_progress']['short-term-decider'].update(
+            computed_symbols=0,
+            reused_symbols=80,
+            stale_symbols=0,
+        )
+        summary['role_progress']['signal-decider'].update(
+            computed_symbols=2,
+            reused_symbols=78,
+            stale_symbols=0,
+        )
+
+        self.assertTrue(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='signal_decider',
+                candidate=candidate,
+            )
+        )
+        built_stage = EODPipelineStatusService()._build_official_stage(
+            stage_id='signal_decider',
+            market_date='2026-10-07',
+            official_run=item['run'],
+            official_stage=candidate,
+            fallback_stage={
+                'status': 'pending',
+                'details': {},
+                'source_run_ids': {},
+            },
+        )
+
+        self.assertEqual(built_stage['status'], 'completed')
+
+    def test_canonical_decider_proof_rejects_invalid_reuse_accounting(
+        self,
+    ) -> None:
+        cases = (
+            ('missing_reused', None, 0),
+            ('string_reused', '158', 0),
+            ('overcounted_reused', 159, 0),
+            ('stale_reuse', 158, 1),
+        )
+        for label, reused, stale in cases:
+            with self.subTest(label=label):
+                item = _legacy_completed_signal_decider_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )
+                candidate = item['stage']
+                summary = candidate['details']['result_summary']['progress'][
+                    'summary'
+                ]
+                summary['computed_feedback_count'] = 2
+                summary['reused_feedback_count'] = reused
+                summary['stale_feedback_count'] = stale
+
+                self.assertFalse(
+                    EODPipelineStatusService._history_stage_has_authoritative_completion(
+                        stage_id='signal_decider',
+                        candidate=candidate,
+                    )
+                )
+
     def test_canonical_decider_proof_rejects_contradictory_terminal_controls(
         self,
     ) -> None:
