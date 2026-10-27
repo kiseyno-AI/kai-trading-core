@@ -4963,6 +4963,79 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('usage_policy.model_guidance_eligible=true', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
 
+    def test_wait_recheck_forces_compact_batch_prompt_and_preserves_exact_context(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=60000,
+        )
+        wait_recheck_context = {
+            'schema_version': 'intraday_wait_recheck_context_v3',
+            'context_sha256': 'sha256:exact-wait-context',
+            'event': {
+                'event_id': 321,
+                'generation': 2,
+                'rearmed_from_event_id': 123,
+            },
+            'observation': {
+                'ask_price': 3995,
+                'observed_at': '2026-10-27T00:29:41+00:00',
+                'evidence': {
+                    'sample_count': 4,
+                    'support_ratio': 1.0,
+                    'span_seconds': 6,
+                },
+            },
+            'direct_order_authority': False,
+        }
+        ordinary_item = {
+            'symbol': '011690',
+            'market_date': '2026-10-27',
+            'symbol_day_context': {
+                'market': 'KRX',
+                'price_context': {'close': 3985},
+            },
+        }
+        wait_item = deepcopy(ordinary_item)
+        wait_item['symbol_day_context']['intraday_wait_recheck_context'] = (
+            deepcopy(wait_recheck_context)
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            ordinary_message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-10-27'),
+                batch_items=[ordinary_item],
+                request_marker='batch-request::ordinary-under-cap',
+            )
+            wait_message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-10-27'),
+                batch_items=[wait_item],
+                request_marker='batch-request::wait-recheck-under-cap',
+            )
+
+        self.assertLess(len(ordinary_message), fake_settings.openclaw_agent_max_prompt_chars)
+        self.assertLess(len(wait_message), fake_settings.openclaw_agent_max_prompt_chars)
+        self.assertIn(
+            'Analyze each assigned symbol directly using only the supplied payload.',
+            ordinary_message,
+        )
+        self.assertIn(
+            'Analyze every assigned symbol directly and return one aggregated JSON object.',
+            wait_message,
+        )
+        encoded_payload = wait_message.split('Assigned batch payload:\n', 1)[1]
+        prompt_items = json.loads(encoded_payload)
+        self.assertEqual(
+            prompt_items[0]['symbol_day_context']['intraday_wait_recheck_context'],
+            wait_recheck_context,
+        )
+
     def test_compressed_batch_prompt_builds_and_includes_contract_suffix_once(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',

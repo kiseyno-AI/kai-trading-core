@@ -4,7 +4,7 @@ import importlib
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import Index, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKeyConstraint, Index, UniqueConstraint
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex
 
@@ -25,22 +25,240 @@ def _unique_constraints(table_name: str) -> dict[str | None, tuple[str, ...]]:
     }
 
 
+def _check_constraints(table_name: str) -> dict[str | None, str]:
+    table = Base.metadata.tables[table_name]
+    return {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+
+def _foreign_keys(
+    table_name: str,
+) -> dict[str | None, tuple[tuple[str, ...], tuple[str, ...], str | None]]:
+    table = Base.metadata.tables[table_name]
+    return {
+        constraint.name: (
+            tuple(element.parent.name for element in constraint.elements),
+            tuple(element.target_fullname for element in constraint.elements),
+            constraint.ondelete,
+        )
+        for constraint in table.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    }
+
+
 def _postgres_index_ddl(table_name: str, index_name: str) -> str:
     index = _indexes(table_name)[index_name]
     return str(CreateIndex(index).compile(dialect=postgresql.dialect()))
 
 
 class SchemaMetadataContractTests(unittest.TestCase):
-    def test_wait_recheck_event_uniqueness_is_agent_aware(self) -> None:
+    def test_wait_recheck_event_metadata_supports_lineage_generations(self) -> None:
+        table_name = 'signal_decider_wait_recheck_events'
+        table = Base.metadata.tables[table_name]
         constraints = _unique_constraints(
-            'signal_decider_wait_recheck_events'
+            table_name
         )
 
         self.assertEqual(
             constraints[
-                'uq_signal_decider_wait_recheck_target_symbol_agent'
+                'uq_signal_decider_wait_recheck_target_symbol_agent_source'
             ],
-            ('target_trade_date', 'symbol', 'agent_name'),
+            (
+                'target_trade_date',
+                'symbol',
+                'agent_name',
+                'source_snapshot_id',
+            ),
+        )
+        self.assertFalse(table.c.generation.nullable)
+        self.assertEqual(str(table.c.generation.server_default.arg), '1')
+        self.assertTrue(table.c.rearmed_from_event_id.nullable)
+        self.assertEqual(
+            _foreign_keys(table_name)[
+                'fk_signal_decider_wait_recheck_rearmed_from'
+            ],
+            (
+                ('rearmed_from_event_id',),
+                ('signal_decider_wait_recheck_events.id',),
+                'RESTRICT',
+            ),
+        )
+        generation_check = _check_constraints(table_name)[
+            'ck_signal_decider_wait_recheck_generation_lineage'
+        ]
+        self.assertIn('generation >= 1', generation_check)
+        self.assertIn('generation = 1', generation_check)
+        self.assertIn('generation > 1', generation_check)
+        self.assertEqual(
+            tuple(
+                column.name
+                for column in _indexes(table_name)[
+                    'ix_signal_decider_wait_recheck_rearmed_from'
+                ].columns
+            ),
+            ('rearmed_from_event_id',),
+        )
+
+    def test_wait_recheck_generation_migration_refuses_lossy_downgrade(
+        self,
+    ) -> None:
+        migration = importlib.import_module(
+            'db_migrations.versions.'
+            '20261027_0086_wait_recheck_generations'
+        )
+        bind = MagicMock()
+        bind.execute.return_value.first.return_value = (
+            '2026-10-27',
+            '005930',
+            'signal-decider',
+            2,
+        )
+
+        with (
+            patch.object(migration.op, 'get_bind', return_value=bind),
+            patch.object(migration.op, 'drop_constraint') as drop_constraint,
+            patch.object(migration.op, 'drop_index') as drop_index,
+            patch.object(migration.op, 'drop_column') as drop_column,
+            patch.object(
+                migration.op,
+                'create_unique_constraint',
+            ) as create_unique_constraint,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'forward-only.*same-lane.*multi-generation',
+            ):
+                migration.downgrade()
+
+        drop_constraint.assert_not_called()
+        drop_index.assert_not_called()
+        drop_column.assert_not_called()
+        create_unique_constraint.assert_not_called()
+        downgrade_guard_sql = str(bind.execute.call_args.args[0])
+        self.assertIn('attempt_history_payload::jsonb', downgrade_guard_sql)
+        self.assertIn("'[]'::jsonb", downgrade_guard_sql)
+
+        bind.reset_mock()
+        bind.execute.return_value.first.return_value = None
+        with (
+            patch.object(migration.op, 'get_bind', return_value=bind),
+            patch.object(migration.op, 'drop_constraint') as drop_constraint,
+            patch.object(migration.op, 'drop_index') as drop_index,
+            patch.object(migration.op, 'drop_column') as drop_column,
+            patch.object(
+                migration.op,
+                'create_unique_constraint',
+            ) as create_unique_constraint,
+        ):
+            migration.downgrade()
+
+        drop_constraint.assert_any_call(
+            'uq_signal_decider_wait_recheck_target_symbol_agent_source',
+            'signal_decider_wait_recheck_events',
+            type_='unique',
+        )
+        drop_constraint.assert_any_call(
+            'ck_signal_decider_wait_recheck_generation_lineage',
+            'signal_decider_wait_recheck_events',
+            type_='check',
+        )
+        drop_constraint.assert_any_call(
+            'fk_signal_decider_wait_recheck_rearmed_from',
+            'signal_decider_wait_recheck_events',
+            type_='foreignkey',
+        )
+        create_unique_constraint.assert_called_once_with(
+            'uq_signal_decider_wait_recheck_target_symbol_agent',
+            'signal_decider_wait_recheck_events',
+            ['target_trade_date', 'symbol', 'agent_name'],
+        )
+        drop_index.assert_called_once_with(
+            'ix_signal_decider_wait_recheck_rearmed_from',
+            table_name='signal_decider_wait_recheck_events',
+        )
+        self.assertEqual(
+            [call.args[1] for call in drop_column.call_args_list],
+            [
+                'rearmed_from_event_id',
+                'attempt_history_payload',
+                'generation',
+            ],
+        )
+
+    def test_wait_recheck_generation_migration_upgrades_existing_rows_safely(
+        self,
+    ) -> None:
+        migration = importlib.import_module(
+            'db_migrations.versions.'
+            '20261027_0086_wait_recheck_generations'
+        )
+
+        with (
+            patch.object(migration.op, 'add_column') as add_column,
+            patch.object(migration.op, 'create_foreign_key') as create_foreign_key,
+            patch.object(migration.op, 'create_index') as create_index,
+            patch.object(
+                migration.op,
+                'create_check_constraint',
+            ) as create_check_constraint,
+            patch.object(migration.op, 'drop_constraint') as drop_constraint,
+            patch.object(
+                migration.op,
+                'create_unique_constraint',
+            ) as create_unique_constraint,
+        ):
+            migration.upgrade()
+
+        self.assertEqual(add_column.call_count, 3)
+        generation_column = add_column.call_args_list[0].args[1]
+        self.assertEqual(generation_column.name, 'generation')
+        self.assertFalse(generation_column.nullable)
+        self.assertEqual(str(generation_column.server_default.arg), '1')
+        rearmed_column = add_column.call_args_list[1].args[1]
+        self.assertEqual(rearmed_column.name, 'rearmed_from_event_id')
+        self.assertTrue(rearmed_column.nullable)
+        attempt_history_column = add_column.call_args_list[2].args[1]
+        self.assertEqual(
+            attempt_history_column.name,
+            'attempt_history_payload',
+        )
+        self.assertFalse(attempt_history_column.nullable)
+        self.assertEqual(
+            str(attempt_history_column.server_default.arg),
+            "'[]'::json",
+        )
+        create_foreign_key.assert_called_once_with(
+            'fk_signal_decider_wait_recheck_rearmed_from',
+            'signal_decider_wait_recheck_events',
+            'signal_decider_wait_recheck_events',
+            ['rearmed_from_event_id'],
+            ['id'],
+            ondelete='RESTRICT',
+        )
+        create_index.assert_called_once_with(
+            'ix_signal_decider_wait_recheck_rearmed_from',
+            'signal_decider_wait_recheck_events',
+            ['rearmed_from_event_id'],
+            unique=False,
+        )
+        create_check_constraint.assert_called_once()
+        drop_constraint.assert_called_once_with(
+            'uq_signal_decider_wait_recheck_target_symbol_agent',
+            'signal_decider_wait_recheck_events',
+            type_='unique',
+        )
+        create_unique_constraint.assert_called_once_with(
+            'uq_signal_decider_wait_recheck_target_symbol_agent_source',
+            'signal_decider_wait_recheck_events',
+            [
+                'target_trade_date',
+                'symbol',
+                'agent_name',
+                'source_snapshot_id',
+            ],
         )
 
     def test_wait_recheck_agent_unique_downgrade_refuses_dual_lane_data(

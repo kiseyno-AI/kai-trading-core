@@ -1778,7 +1778,15 @@ class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
             'target_trade_date',
             'symbol',
             'agent_name',
-            name='uq_signal_decider_wait_recheck_target_symbol_agent',
+            'source_snapshot_id',
+            name='uq_signal_decider_wait_recheck_target_symbol_agent_source',
+        ),
+        CheckConstraint(
+            'generation >= 1 '
+            'AND ((generation = 1 AND rearmed_from_event_id IS NULL) '
+            'OR (generation > 1 AND rearmed_from_event_id IS NOT NULL)) '
+            'AND (rearmed_from_event_id IS NULL OR rearmed_from_event_id <> id)',
+            name='ck_signal_decider_wait_recheck_generation_lineage',
         ),
         CheckConstraint(
             "status IN ('queued', 'running', 'completed', 'failed', 'expired')",
@@ -1806,9 +1814,26 @@ class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
             'ix_signal_decider_wait_recheck_source_snapshot',
             'source_snapshot_id',
         ),
+        Index(
+            'ix_signal_decider_wait_recheck_rearmed_from',
+            'rearmed_from_event_id',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    generation: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text('1'),
+    )
+    rearmed_from_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            'signal_decider_wait_recheck_events.id',
+            ondelete='RESTRICT',
+            name='fk_signal_decider_wait_recheck_rearmed_from',
+        ),
+    )
     source_snapshot_id: Mapped[int] = mapped_column(
         ForeignKey('signal_decider_decision_snapshots.id', ondelete='RESTRICT'),
         nullable=False,
@@ -1838,6 +1863,12 @@ class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
     result_action: Mapped[str | None] = mapped_column(String(32))
     context_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     context_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt_history_payload: Mapped[list | dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
     last_error_payload: Mapped[dict | None] = mapped_column(JSON)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

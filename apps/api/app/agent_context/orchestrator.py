@@ -522,7 +522,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup. '
             'Account for market_regime_context when choosing scalp_buy_candidate, watch_for_trigger, wait, or reject: defensive/risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution/normal require setup confirmation; aggressive_open and trend_day can support faster or continuation-oriented entries only inside the supplied bounded window and without sizing or safety-gate claims. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
-            'When intraday_wait_recheck_context is supplied, treat its immutable fresh best-ask observation only as a request to reassess the prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to watch_for_trigger after a fresh conservative review. '
+            'When intraday_wait_recheck_context is supplied, use its immutable fresh best-ask observation, deterministic reward/risk prefilter, and bounded rolling price/volume/order-book evidence only to reassess the prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to watch_for_trigger after a fresh conservative review. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
     ),
@@ -536,7 +536,7 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'and explicit realistic target and stop-loss levels for every symbol. '
             'Every wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to buy. '
-            'When intraday_wait_recheck_context is supplied, treat its immutable fresh best-ask observation only as a request to reassess this lane\'s prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to buy with complete fresh trigger, chase-limit, target, and stop geometry after a conservative review. '
+            'When intraday_wait_recheck_context is supplied, use its immutable fresh best-ask observation, deterministic reward/risk prefilter, and bounded rolling price/volume/order-book evidence only to reassess this lane\'s prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to buy with complete fresh trigger, chase-limit, target, and stop geometry after a conservative review. '
             'Account for market_regime_context when choosing buy, wait, or reject: defensive/risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution/normal require setup confirmation; aggressive_open and trend_day can support faster or continuation-oriented entries only inside the supplied bounded window and without sizing or safety-gate claims. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the thesis explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
@@ -2485,7 +2485,20 @@ class OpenClawAgentClient:
             f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
         )
         max_chars = int(settings.openclaw_agent_max_prompt_chars or 0)
-        if max_chars <= 0 or len(base_message) <= max_chars:
+        force_compressed_prompt = any(
+            isinstance(item, dict)
+            and isinstance(item.get('symbol_day_context'), dict)
+            and isinstance(
+                item['symbol_day_context'].get(
+                    'intraday_wait_recheck_context'
+                ),
+                dict,
+            )
+            for item in batch_items
+        )
+        if not force_compressed_prompt and (
+            max_chars <= 0 or len(base_message) <= max_chars
+        ):
             return base_message
         compressed_items = [_compressed_batch_item_for_prompt(item) for item in batch_items]
         compact_message = (
@@ -2511,7 +2524,7 @@ class OpenClawAgentClient:
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False)}"
         )
-        if len(compact_message) <= max_chars:
+        if max_chars <= 0 or len(compact_message) <= max_chars:
             return compact_message
         raise AgentDispatchTerminalError(
             'OpenClaw prompt budget is too small to encode the requested batch without dropping assigned symbols',

@@ -54,3 +54,30 @@ def test_non_dispatch_runtime_preserves_alignment_evaluation_modes(
     )
 
     assert configured.signal_decider_wait_conflict_gate_mode == gate_mode
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'message'),
+    [
+        (
+            {
+                'signal_decider_wait_recheck_evidence_window_seconds': 5,
+                'signal_decider_wait_recheck_evidence_min_span_seconds': 6,
+            },
+            'MIN_SPAN_SECONDS cannot exceed',
+        ),
+        (
+            {
+                'signal_decider_wait_recheck_evidence_max_samples': 3,
+                'signal_decider_wait_recheck_evidence_min_samples': 4,
+            },
+            'MIN_SAMPLES cannot exceed',
+        ),
+    ],
+)
+def test_wait_recheck_rejects_impossible_evidence_windows(
+    overrides: dict[str, int],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        Settings(_env_file=None, **overrides)

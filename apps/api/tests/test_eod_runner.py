@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -9,12 +10,369 @@ from app.eod.runner import (
     NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS,
     NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY,
     OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY,
+    WAIT_RECHECK_SINGLE_FLIGHT_KEY,
     is_preopen_exec_dispatch_due,
 )
 from app.market.clock import MarketState
 
 
 class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_registers_threadsafe_wait_recheck_wake_and_stop_clears_it(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        parked = asyncio.Event()
+
+        async def parked_loop() -> None:
+            await parked.wait()
+
+        with (
+            patch.object(runner, '_run_loop', new=parked_loop),
+            patch(
+                'app.eod.runner.signal_decider_wait_recheck_service.'
+                'set_wake_callback'
+            ) as set_wake_callback,
+            patch(
+                'app.eod.runner.auto_pykrx_eod_scheduler.stop',
+                new=AsyncMock(),
+            ),
+        ):
+            await runner.start()
+            callback = set_wake_callback.call_args_list[0].args[0]
+
+            await asyncio.to_thread(callback)
+            await asyncio.sleep(0)
+
+            self.assertIsNotNone(runner._wait_recheck_wake_event)
+            self.assertTrue(runner._wait_recheck_wake_event.is_set())
+            self.assertEqual(runner._wait_recheck_wake_generation, 1)
+
+            await runner.stop()
+
+            self.assertEqual(set_wake_callback.call_count, 2)
+            self.assertIsNone(set_wake_callback.call_args_list[-1].args[0])
+            self.assertIsNone(runner._wait_recheck_wake_event)
+            self.assertIsNone(runner._wait_recheck_wake_callback)
+
+            # A provider thread may retain a stale callback briefly. It must
+            # not resurrect or mutate the stopped runner.
+            await asyncio.to_thread(callback)
+            await asyncio.sleep(0)
+            self.assertEqual(runner._wait_recheck_wake_generation, 1)
+
+    async def test_observation_and_completion_wakes_break_poll_once_without_idle_spin(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        runner._running = True
+        wake_event = asyncio.Event()
+        runner._wait_recheck_wake_event = wake_event
+
+        for source in ('new_observation', 'dispatch_completion'):
+            with self.subTest(source=source):
+                wait_task = asyncio.create_task(
+                    runner._wait_for_wake_or_timeout(60)
+                )
+                await asyncio.sleep(0)
+
+                runner._signal_wait_recheck_wake(wake_event)
+
+                self.assertTrue(
+                    await asyncio.wait_for(wait_task, timeout=0.25)
+                )
+                self.assertEqual(
+                    runner._wait_recheck_consumed_generation,
+                    runner._wait_recheck_wake_generation,
+                )
+
+                idle_wait = asyncio.create_task(
+                    runner._wait_for_wake_or_timeout(60)
+                )
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                self.assertFalse(idle_wait.done())
+                idle_wait.cancel()
+                await asyncio.gather(idle_wait, return_exceptions=True)
+
+    async def test_scheduled_wait_recheck_wakes_only_for_explicit_follow_up(
+        self,
+    ) -> None:
+        cases = (
+            ({'status': 'completed', 'follow_up_required': True}, True),
+            ({'status': 'idle', 'follow_up_required': False}, False),
+            ({'status': 'completed', 'events_processed': 1}, False),
+        )
+
+        for result, expected_wake in cases:
+            with self.subTest(result=result):
+                runner = EODBackgroundRunner(interval_seconds=60)
+                runner._running = True
+                wake_event = asyncio.Event()
+                runner._wait_recheck_wake_event = wake_event
+
+                self.assertTrue(
+                    runner._schedule_blocking_step(
+                        WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+                        lambda cycle_result=result: cycle_result,
+                        wake_on_follow_up=True,
+                    )
+                )
+                task = runner._blocking_step_tasks[
+                    WAIT_RECHECK_SINGLE_FLIGHT_KEY
+                ]
+                await asyncio.wait_for(task, timeout=0.25)
+                await asyncio.sleep(0)
+
+                self.assertNotIn(
+                    WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+                    runner._blocking_step_tasks,
+                )
+                self.assertEqual(
+                    runner._wait_recheck_wake_generation,
+                    1 if expected_wake else 0,
+                )
+                self.assertEqual(wake_event.is_set(), expected_wake)
+
+                if expected_wake:
+                    self.assertTrue(
+                        await runner._wait_for_wake_or_timeout(60)
+                    )
+                    idle_wait = asyncio.create_task(
+                        runner._wait_for_wake_or_timeout(60)
+                    )
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    self.assertFalse(idle_wait.done())
+                    idle_wait.cancel()
+                    await asyncio.gather(
+                        idle_wait,
+                        return_exceptions=True,
+                    )
+
+    async def test_wake_during_inflight_idle_cycle_is_preserved_until_completion(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        runner._running = True
+        wake_event = asyncio.Event()
+        runner._wait_recheck_wake_event = wake_event
+        cycle_started = threading.Event()
+        release_cycle = threading.Event()
+
+        def blocked_idle_cycle() -> dict[str, object]:
+            cycle_started.set()
+            release_cycle.wait(timeout=1)
+            return {'status': 'idle', 'follow_up_required': False}
+
+        self.assertTrue(
+            runner._schedule_blocking_step(
+                WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+                blocked_idle_cycle,
+                wake_on_follow_up=True,
+            )
+        )
+        first_task = runner._blocking_step_tasks[
+            WAIT_RECHECK_SINGLE_FLIGHT_KEY
+        ]
+        self.assertTrue(await asyncio.to_thread(cycle_started.wait, 1))
+
+        # A new observation wakes the runner, but the prior WAIT task still
+        # owns the slot. Consuming the sleep edge must not consume the request.
+        runner._signal_wait_recheck_wake(wake_event)
+        self.assertTrue(await runner._wait_for_wake_or_timeout(60))
+        self.assertTrue(runner._wait_recheck_dispatch_requested)
+        self.assertFalse(
+            runner._schedule_blocking_step(
+                WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+                lambda: {'status': 'idle', 'follow_up_required': False},
+                wake_on_follow_up=True,
+            )
+        )
+        self.assertFalse(wake_event.is_set())
+
+        # Even though the old task computed an idle result, its completion
+        # re-signals the preserved observation wake after releasing the slot.
+        release_cycle.set()
+        await asyncio.wait_for(first_task, timeout=0.25)
+        await asyncio.sleep(0)
+        self.assertTrue(wake_event.is_set())
+        self.assertTrue(runner._wait_recheck_dispatch_requested)
+        self.assertTrue(await runner._wait_for_wake_or_timeout(60))
+
+        # The follow-up cycle now owns the slot and consumes the request. Its
+        # idle result must not manufacture another wake or cause idle spin.
+        self.assertTrue(
+            runner._schedule_blocking_step(
+                WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+                lambda: {'status': 'idle', 'follow_up_required': False},
+                wake_on_follow_up=True,
+            )
+        )
+        follow_up_task = runner._blocking_step_tasks[
+            WAIT_RECHECK_SINGLE_FLIGHT_KEY
+        ]
+        await asyncio.wait_for(follow_up_task, timeout=0.25)
+        await asyncio.sleep(0)
+        self.assertFalse(runner._wait_recheck_dispatch_requested)
+        self.assertFalse(wake_event.is_set())
+
+    async def test_wake_during_failed_inflight_cycle_is_preserved(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        runner._running = True
+        wake_event = asyncio.Event()
+        runner._wait_recheck_wake_event = wake_event
+        cycle_started = threading.Event()
+        release_cycle = threading.Event()
+
+        def blocked_failed_cycle() -> dict[str, object]:
+            cycle_started.set()
+            release_cycle.wait(timeout=1)
+            raise RuntimeError('synthetic wait-recheck failure')
+
+        self.assertTrue(
+            runner._schedule_blocking_step(
+                WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+                blocked_failed_cycle,
+                wake_on_follow_up=True,
+            )
+        )
+        task = runner._blocking_step_tasks[
+            WAIT_RECHECK_SINGLE_FLIGHT_KEY
+        ]
+        self.assertTrue(await asyncio.to_thread(cycle_started.wait, 1))
+
+        runner._signal_wait_recheck_wake(wake_event)
+        self.assertTrue(await runner._wait_for_wake_or_timeout(60))
+        release_cycle.set()
+        with self.assertRaises(RuntimeError):
+            await task
+        await asyncio.sleep(0)
+
+        self.assertTrue(runner._wait_recheck_dispatch_requested)
+        self.assertTrue(wake_event.is_set())
+
+    async def test_active_daily_pipeline_wait_can_be_woken(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        runner._running = True
+        wake_event = asyncio.Event()
+        runner._wait_recheck_wake_event = wake_event
+        market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T10:00:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        cycle_started = [asyncio.Event(), asyncio.Event()]
+        market_call_count = 0
+
+        async def load_market() -> MarketState:
+            nonlocal market_call_count
+            market_call_count += 1
+            cycle_started[market_call_count - 1].set()
+            return market
+
+        from app.eod.runner import auto_pykrx_eod_scheduler
+
+        auto_pykrx_eod_scheduler.state.active_task = True
+        try:
+            with (
+                patch(
+                    'app.eod.runner.async_get_market_state',
+                    side_effect=load_market,
+                ),
+                patch.object(
+                    runner,
+                    '_run_pending_session_cleanup',
+                    new=AsyncMock(),
+                ),
+            ):
+                run_task = asyncio.create_task(runner._run_loop())
+                await asyncio.wait_for(
+                    cycle_started[0].wait(),
+                    timeout=0.25,
+                )
+                await asyncio.sleep(0)
+
+                runner._signal_wait_recheck_wake(wake_event)
+                await asyncio.wait_for(
+                    cycle_started[1].wait(),
+                    timeout=0.25,
+                )
+                await asyncio.sleep(0)
+                self.assertTrue(runner._wait_recheck_dispatch_requested)
+
+                runner._signal_wait_recheck_wake(wake_event)
+                runner._running = False
+                await asyncio.wait_for(run_task, timeout=0.25)
+        finally:
+            auto_pykrx_eod_scheduler.state.active_task = False
+
+        self.assertEqual(market_call_count, 2)
+
+    async def test_run_loop_wakes_for_observation_and_completion_without_idle_spin(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        runner._running = True
+        wake_event = asyncio.Event()
+        runner._wait_recheck_wake_event = wake_event
+        market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-04-30T10:00:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at='2026-04-30T15:30:00+09:00',
+        )
+        cycle_started = [asyncio.Event() for _ in range(4)]
+        market_call_count = 0
+
+        async def load_market() -> MarketState:
+            nonlocal market_call_count
+            market_call_count += 1
+            cycle_started[market_call_count - 1].set()
+            return market
+
+        with (
+            patch('app.eod.runner.settings.background_runner_enabled', False),
+            patch(
+                'app.eod.runner.async_get_market_state',
+                side_effect=load_market,
+            ),
+            patch.object(
+                runner,
+                '_run_pending_session_cleanup',
+                new=AsyncMock(),
+            ),
+        ):
+            run_task = asyncio.create_task(runner._run_loop())
+            try:
+                await asyncio.wait_for(cycle_started[0].wait(), timeout=0.25)
+
+                # The same loop-safe callback is used by the service for a new
+                # observation and for dispatch completion. Each signal should
+                # cut short one 60-second poll wait.
+                runner._signal_wait_recheck_wake(wake_event)
+                await asyncio.wait_for(cycle_started[1].wait(), timeout=0.25)
+
+                runner._signal_wait_recheck_wake(wake_event)
+                await asyncio.wait_for(cycle_started[2].wait(), timeout=0.25)
+
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        cycle_started[3].wait(),
+                        timeout=0.02,
+                    )
+                self.assertEqual(market_call_count, 3)
+            finally:
+                runner._running = False
+                wake_event.set()
+                await asyncio.wait_for(run_task, timeout=0.25)
+
     def test_snapshot_exposes_fresh_runner_heartbeat(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=60)
         now = datetime(2026, 10, 7, 5, 0, tzinfo=timezone.utc)

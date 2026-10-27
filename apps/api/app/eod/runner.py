@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -67,6 +68,11 @@ class EODBackgroundRunner:
         self._last_tick_succeeded_at: datetime | None = None
         self._last_tick_error: dict[str, str] | None = None
         self._tick_count = 0
+        self._wait_recheck_wake_event: asyncio.Event | None = None
+        self._wait_recheck_wake_callback: Callable[[], None] | None = None
+        self._wait_recheck_wake_generation = 0
+        self._wait_recheck_consumed_generation = 0
+        self._wait_recheck_dispatch_requested = False
 
     def snapshot(self, *, now: datetime | None = None) -> dict:
         current = now or datetime.now(timezone.utc)
@@ -236,6 +242,30 @@ class EODBackgroundRunner:
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
+        loop = asyncio.get_running_loop()
+        wake_event = asyncio.Event()
+
+        def wake_wait_recheck_runner() -> None:
+            if loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(
+                    self._signal_wait_recheck_wake,
+                    wake_event,
+                )
+            except RuntimeError:
+                # The loop can close between is_closed() and the thread-safe
+                # scheduling call. A stale provider callback must stay inert.
+                return
+
+        self._wait_recheck_wake_event = wake_event
+        self._wait_recheck_wake_callback = wake_wait_recheck_runner
+        self._wait_recheck_wake_generation = 0
+        self._wait_recheck_consumed_generation = 0
+        self._wait_recheck_dispatch_requested = False
+        signal_decider_wait_recheck_service.set_wake_callback(
+            wake_wait_recheck_runner
+        )
         self._running = True
         self._started_at = datetime.now(timezone.utc)
         self._stopped_at = None
@@ -244,6 +274,12 @@ class EODBackgroundRunner:
     async def stop(self) -> None:
         self._running = False
         self._stopped_at = datetime.now(timezone.utc)
+        if self._wait_recheck_wake_callback is not None:
+            signal_decider_wait_recheck_service.set_wake_callback(None)
+            self._wait_recheck_wake_callback = None
+        wake_event = self._wait_recheck_wake_event
+        if wake_event is not None:
+            wake_event.set()
         await auto_pykrx_eod_scheduler.stop()
         # Cancelling an asyncio.to_thread wrapper cannot stop its worker thread.
         # Keep the task registered until its callback observes real completion so
@@ -253,6 +289,67 @@ class EODBackgroundRunner:
             with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        self._wait_recheck_wake_event = None
+        self._wait_recheck_dispatch_requested = False
+
+    def _signal_wait_recheck_wake(self, wake_event: asyncio.Event) -> None:
+        if (
+            not self._running
+            or self._wait_recheck_wake_event is not wake_event
+        ):
+            return
+        self._wait_recheck_dispatch_requested = True
+        self._wait_recheck_wake_generation += 1
+        wake_event.set()
+
+    def _consume_wait_recheck_wake(self) -> None:
+        wake_event = self._wait_recheck_wake_event
+        if wake_event is None:
+            return
+        self._wait_recheck_consumed_generation = (
+            self._wait_recheck_wake_generation
+        )
+        wake_event.clear()
+
+    async def _wait_for_wake_or_timeout(self, timeout_seconds: float) -> bool:
+        wake_event = self._wait_recheck_wake_event
+        if wake_event is None:
+            await asyncio.sleep(timeout_seconds)
+            return False
+        if (
+            self._wait_recheck_wake_generation
+            > self._wait_recheck_consumed_generation
+        ):
+            self._consume_wait_recheck_wake()
+            return True
+
+        wake_event.clear()
+        wake_task = asyncio.create_task(
+            wake_event.wait(),
+            name='eod-background-wait-recheck-wake',
+        )
+        timeout_task = asyncio.create_task(
+            asyncio.sleep(timeout_seconds),
+            name='eod-background-poll-timeout',
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {wake_task, timeout_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if wake_task in done and wake_task.result():
+                self._consume_wait_recheck_wake()
+                return True
+            return False
+        finally:
+            for task in (wake_task, timeout_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                wake_task,
+                timeout_task,
+                return_exceptions=True,
+            )
 
     async def _run_blocking_step(
         self,
@@ -298,7 +395,13 @@ class EODBackgroundRunner:
             if fail_closed:
                 raise RuntimeError(f'blocking step timed out: {name}')
 
-    def _schedule_blocking_step(self, name: str, func) -> bool:
+    def _schedule_blocking_step(
+        self,
+        name: str,
+        func,
+        *,
+        wake_on_follow_up: bool = False,
+    ) -> bool:
         running_task = self._blocking_step_tasks.get(name)
         if running_task is not None and not running_task.done():
             return False
@@ -311,13 +414,46 @@ class EODBackgroundRunner:
             name=f'eod-background-blocking:{name}',
         )
         self._blocking_step_tasks[name] = task
+        if wake_on_follow_up:
+            # A wake is not served merely because it broke the runner's sleep.
+            # It is served only after a new WAIT cycle owns the single-flight
+            # slot. A later observation can set this flag again while the task
+            # is running, and the completion callback will preserve that wake.
+            self._wait_recheck_dispatch_requested = False
         task.add_done_callback(
-            lambda completed, step_name=name: self._finalize_blocking_step(
-                step_name,
-                completed,
+            lambda completed, step_name=name, should_wake=wake_on_follow_up: (
+                self._finalize_scheduled_blocking_step(
+                    step_name,
+                    completed,
+                    wake_on_follow_up=should_wake,
+                )
             )
         )
         return True
+
+    def _finalize_scheduled_blocking_step(
+        self,
+        name: str,
+        task: asyncio.Task,
+        *,
+        wake_on_follow_up: bool,
+    ) -> None:
+        self._finalize_blocking_step(name, task)
+        if not wake_on_follow_up or task.cancelled():
+            return
+        result = None if task.exception() is not None else task.result()
+        follow_up_required = bool(
+            isinstance(result, dict)
+            and result.get('follow_up_required') is True
+        )
+        if not (
+            follow_up_required
+            or self._wait_recheck_dispatch_requested
+        ):
+            return
+        wake_event = self._wait_recheck_wake_event
+        if wake_event is not None:
+            self._signal_wait_recheck_wake(wake_event)
 
     def _finalize_blocking_step(self, name: str, task: asyncio.Task) -> None:
         if self._blocking_step_tasks.get(name) is task:
@@ -479,6 +615,10 @@ class EODBackgroundRunner:
     async def _run_loop(self) -> None:
         live_market_snapshot_loop = asyncio.get_running_loop()
         while self._running:
+            # Clear the sleep edge at cycle start. The separate dispatch-
+            # requested flag remains set until a WAIT task actually acquires
+            # the single-flight slot, so an early continue cannot lose work.
+            self._consume_wait_recheck_wake()
             self._tick_count += 1
             self._last_tick_started_at = datetime.now(timezone.utc)
             self._last_tick_error = None
@@ -488,7 +628,9 @@ class EODBackgroundRunner:
                 market = await async_get_market_state()
                 await self._run_pending_session_cleanup()
                 if auto_pykrx_eod_scheduler.state.active_task:
-                    await asyncio.sleep(self.interval_seconds)
+                    await self._wait_for_wake_or_timeout(
+                        self.interval_seconds
+                    )
                     continue
                 runtime_background_enabled = settings.background_runner_enabled
                 market_snapshot_refreshed = False
@@ -518,7 +660,9 @@ class EODBackgroundRunner:
                         fail_closed=True,
                     )
                     if auto_pykrx_eod_scheduler.state.active_task:
-                        await asyncio.sleep(self.interval_seconds)
+                        await self._wait_for_wake_or_timeout(
+                            self.interval_seconds
+                        )
                         continue
                 if runtime_background_enabled and market.state == 'OPEN':
                     await self._run_buy_authority_critical_step(
@@ -552,6 +696,7 @@ class EODBackgroundRunner:
                                     market=market_snapshot
                                 )
                             ),
+                            wake_on_follow_up=True,
                         )
                 if runtime_background_enabled and market.state == 'PREOPEN':
                     await self._run_buy_authority_critical_step(
@@ -687,7 +832,9 @@ class EODBackgroundRunner:
                 self._last_tick_completed_at = datetime.now(timezone.utc)
                 if not tick_failed and self._running:
                     self._last_tick_succeeded_at = self._last_tick_completed_at
-            await asyncio.sleep(self._next_poll_interval_seconds(market))
+            await self._wait_for_wake_or_timeout(
+                self._next_poll_interval_seconds(market)
+            )
 
 
 background_runner = EODBackgroundRunner(interval_seconds=settings.eod_auto_pykrx_poll_seconds)
