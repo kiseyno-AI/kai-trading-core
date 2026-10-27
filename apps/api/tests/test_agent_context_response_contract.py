@@ -622,6 +622,232 @@ class AgentContextResponseContractTests(unittest.TestCase):
                 self.assertTrue(result['response_contract_valid'])
                 self.assertEqual(result['response_schema_violation_flags'], [])
 
+    def test_signal_wait_distinguishes_non_monitorable_null_levels_from_incomplete_trigger_contract(self):
+        non_monitorable_wait = _complete_signal_decider_feedback(
+            preferred_action='wait',
+            next_day_open_action='wait',
+            wait_reason={
+                'code': 'unattractive_risk_reward',
+                'summary': '확인된 저항까지의 보상이 하방 위험보다 작습니다.',
+            },
+            entry_price_basis='next_open',
+            trigger_price=None,
+            chase_limit_price=None,
+            target_price=89_000,
+            expected_return_pct=None,
+            stop_loss_price=83_000,
+            trigger_conditions=[],
+        )
+
+        valid_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(non_monitorable_wait, ensure_ascii=False),
+            raw_response=non_monitorable_wait,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertTrue(valid_result['response_contract_valid'])
+        self.assertEqual(valid_result['response_schema_violation_flags'], [])
+        self.assertIsNone(valid_result['trigger_price'])
+        self.assertIsNone(valid_result['chase_limit_price'])
+
+        incomplete_monitorable_wait = {
+            **non_monitorable_wait,
+            'entry_price_basis': 'trigger_limit',
+        }
+        invalid_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(incomplete_monitorable_wait, ensure_ascii=False),
+            raw_response=incomplete_monitorable_wait,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertFalse(invalid_result['response_contract_valid'])
+        self.assertIn(
+            'action_requirement_invalid:trigger_price',
+            invalid_result['response_schema_violation_flags'],
+        )
+        self.assertIn(
+            'action_requirement_invalid:chase_limit_price',
+            invalid_result['response_schema_violation_flags'],
+        )
+
+        unsupported_basis_wait = {
+            **non_monitorable_wait,
+            'entry_price_basis': 'bogus_basis',
+        }
+        unsupported_basis_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(unsupported_basis_wait, ensure_ascii=False),
+            raw_response=unsupported_basis_wait,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertFalse(unsupported_basis_result['response_contract_valid'])
+        self.assertIn(
+            'required_field_invalid_value:entry_price_basis',
+            unsupported_basis_result['response_schema_violation_flags'],
+        )
+
+        uppercase_basis_wait = {
+            **non_monitorable_wait,
+            'entry_price_basis': 'NEXT_OPEN',
+        }
+        uppercase_basis_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(uppercase_basis_wait, ensure_ascii=False),
+            raw_response=uppercase_basis_wait,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertFalse(uppercase_basis_result['response_contract_valid'])
+        self.assertIn(
+            'required_field_invalid_value:entry_price_basis',
+            uppercase_basis_result['response_schema_violation_flags'],
+        )
+
+        padded_basis_wait = {
+            **non_monitorable_wait,
+            'entry_price_basis': ' next_open ',
+        }
+        padded_basis_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(padded_basis_wait, ensure_ascii=False),
+            raw_response=padded_basis_wait,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertFalse(padded_basis_result['response_contract_valid'])
+        self.assertIn(
+            'required_field_invalid_value:entry_price_basis',
+            padded_basis_result['response_schema_violation_flags'],
+        )
+
+        mismatched_basis_wait = {
+            **non_monitorable_wait,
+            'trigger_price': 85_000,
+            'chase_limit_price': 86_000,
+            'target_price': 90_000,
+            'stop_loss_price': 83_000,
+            'trigger_conditions': ['85,000원 회복을 확인합니다.'],
+        }
+        mismatched_basis_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(mismatched_basis_wait, ensure_ascii=False),
+            raw_response=mismatched_basis_wait,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertFalse(mismatched_basis_result['response_contract_valid'])
+        self.assertIn(
+            'action_requirement_invalid:entry_price_basis',
+            mismatched_basis_result['response_schema_violation_flags'],
+        )
+
+        reject_with_levels = {
+            **mismatched_basis_wait,
+            'preferred_action': 'reject',
+            'next_day_open_action': 'reject',
+            'wait_reason': None,
+        }
+        reject_with_levels_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(reject_with_levels, ensure_ascii=False),
+            raw_response=reject_with_levels,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+        self.assertFalse(reject_with_levels_result['response_contract_valid'])
+        self.assertIn(
+            'action_requirement_invalid:entry_price_basis',
+            reject_with_levels_result['response_schema_violation_flags'],
+        )
+
+        reject_with_empty_trigger_limit = {
+            **non_monitorable_wait,
+            'preferred_action': 'reject',
+            'next_day_open_action': 'reject',
+            'wait_reason': None,
+            'entry_price_basis': 'trigger_limit',
+        }
+        reject_with_empty_trigger_limit_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(
+                reject_with_empty_trigger_limit,
+                ensure_ascii=False,
+            ),
+            raw_response=reject_with_empty_trigger_limit,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+        self.assertFalse(
+            reject_with_empty_trigger_limit_result[
+                'response_contract_valid'
+            ]
+        )
+        self.assertIn(
+            'action_requirement_invalid:entry_price_basis',
+            reject_with_empty_trigger_limit_result[
+                'response_schema_violation_flags'
+            ],
+        )
+
+    def test_signal_trigger_limit_buy_rejects_return_unsupported_by_chase_limit(self):
+        coherent_buy = _complete_signal_decider_feedback(
+            entry_price_basis='trigger_limit',
+            trigger_price=100,
+            chase_limit_price=110,
+            target_price=120,
+            stop_loss_price=90,
+            expected_return_pct=9.0,
+            trigger_conditions=['100원 회복과 거래량 증가를 확인합니다.'],
+        )
+
+        coherent_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(coherent_buy, ensure_ascii=False),
+            raw_response=coherent_buy,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertTrue(coherent_result['response_contract_valid'])
+        self.assertEqual(coherent_result['response_schema_violation_flags'], [])
+
+        contradictory_buy = {
+            **coherent_buy,
+            'expected_return_pct': 99,
+        }
+        contradictory_result = normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(contradictory_buy, ensure_ascii=False),
+            raw_response=contradictory_buy,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+
+        self.assertFalse(contradictory_result['response_contract_valid'])
+        self.assertIn(
+            'action_requirement_invalid:expected_return_pct',
+            contradictory_result['response_schema_violation_flags'],
+        )
+
     def test_decider_wait_actions_reject_unknown_wait_reason_codes(self):
         cases = (
             (
@@ -804,7 +1030,11 @@ class AgentContextResponseContractTests(unittest.TestCase):
         )
         self.assertIn('next_day_open_action and preferred_action must be one of buy, wait, reject exactly as written.', suffix)
         self.assertIn(
-            'expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis',
+            'For BUY, expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis',
+            suffix,
+        )
+        self.assertIn(
+            'for WAIT or REJECT it may be null when no supportable return can be calculated',
             suffix,
         )
         self.assertNotIn('conservative net return', suffix)
@@ -813,6 +1043,34 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('independent swing, position, and long-horizon lane', suffix)
         self.assertIn('trigger_price, chase_limit_price', suffix)
         self.assertIn('trigger_conditions', suffix)
+        self.assertIn(
+            'For a non-monitorable wait, use entry_price_basis=next_open as a non-executable schema placeholder',
+            suffix,
+        )
+        self.assertIn(
+            'Do not use entry_price_basis=trigger_limit unless trigger_price, chase_limit_price, target_price, stop_loss_price, and trigger_conditions are all complete',
+            suffix,
+        )
+
+    def test_signal_decider_runtime_contract_matches_non_monitorable_wait_level_semantics(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        runtime_contract = (
+            repo_root
+            / 'runtime_contracts'
+            / 'openclaw'
+            / 'v1'
+            / 'signal-decider'
+            / 'AGENTS.md'
+        ).read_text()
+
+        self.assertIn(
+            'For a non-monitorable `wait`, use `entry_price_basis=next_open` as a non-executable schema placeholder',
+            runtime_contract,
+        )
+        self.assertIn(
+            'Never use `entry_price_basis=trigger_limit` unless `trigger_price`, `chase_limit_price`, `target_price`, `stop_loss_price`, and `trigger_conditions` are all complete',
+            runtime_contract,
+        )
 
     def test_fundamental_summarizer_contract_accepts_market_specific_dart_or_sec_inputs(self):
         suffix = build_contract_prompt_suffix(role='fundamental-summarizer')

@@ -499,18 +499,25 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
         if isinstance(next_day_open_action, str)
         else None
     )
-    entry_price_basis = str(
-        payload.get('entry_price_basis') or ''
-    ).strip().lower()
+    entry_price_basis_raw = payload.get('entry_price_basis')
+    entry_price_basis = (
+        entry_price_basis_raw
+        if isinstance(entry_price_basis_raw, str)
+        else ''
+    )
+    if entry_price_basis not in {'next_open', 'trigger_limit'}:
+        flags.append('required_field_invalid_value:entry_price_basis')
     trigger_conditions = payload.get('trigger_conditions')
-    has_trigger_contract = bool(
-        entry_price_basis == 'trigger_limit'
-        or payload.get('trigger_price') is not None
+    has_trigger_fields = bool(
+        payload.get('trigger_price') is not None
         or payload.get('chase_limit_price') is not None
         or (
             isinstance(trigger_conditions, list)
             and bool(trigger_conditions)
         )
+    )
+    has_trigger_contract = bool(
+        entry_price_basis == 'trigger_limit' or has_trigger_fields
     )
     if action == 'buy':
         _append_actionable_common_requirements(
@@ -535,6 +542,10 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
             flags.append('action_requirement_invalid:wait_reason')
     elif action == 'reject' and payload.get('wait_reason') is not None:
         flags.append('action_requirement_invalid:wait_reason')
+    if has_trigger_fields and entry_price_basis != 'trigger_limit':
+        flags.append('action_requirement_invalid:entry_price_basis')
+    if action == 'reject' and has_trigger_contract:
+        flags.append('action_requirement_invalid:entry_price_basis')
     if action in {'buy', 'wait'} and has_trigger_contract:
         _append_actionable_common_requirements(
             payload=payload,
@@ -567,6 +578,25 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
             < float(target_price)
         ):
             flags.append('action_requirement_invalid:price_order')
+        expected_return_pct = payload.get('expected_return_pct')
+        if (
+            action == 'buy'
+            and entry_price_basis == 'trigger_limit'
+            and _is_raw_number(expected_return_pct)
+            and _is_raw_number(chase_limit_price)
+            and _is_raw_number(target_price)
+            and float(chase_limit_price) > 0
+            and float(target_price) > float(chase_limit_price)
+        ):
+            conservative_upside_pct = (
+                (float(target_price) - float(chase_limit_price))
+                / float(chase_limit_price)
+                * 100.0
+            )
+            if float(expected_return_pct) > conservative_upside_pct + 0.1:
+                flags.append(
+                    'action_requirement_invalid:expected_return_pct'
+                )
     return list(dict.fromkeys(flags))
 
 
@@ -1374,9 +1404,12 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'decision_delta should include previous_market_date, previous_recommendation, previous_recommendation_class, previous_wait_reason, current_recommendation, current_recommendation_class, current_wait_reason, transition, persistence_trend, changed_fields, stable_fields, what_changed, what_stayed_same, and upgrade_trigger. '
             'When wait repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that would upgrade the setup to buy. '
             'entry_price_basis should be next_open for an ordinary next-open BUY, or trigger_limit when this lane supplies an independently justified monitored trigger entry. '
+            'For a non-monitorable wait, use entry_price_basis=next_open as a non-executable schema placeholder, set trigger_price and chase_limit_price to null, and set trigger_conditions to an empty array; this placeholder does not grant next-open execution authority. target_price and stop_loss_price may remain numeric when independently supportable or null when unsupported. '
+            'For reject, also use entry_price_basis=next_open only as a non-executable schema placeholder and keep trigger_price and chase_limit_price null with empty trigger_conditions. '
+            'Do not use entry_price_basis=trigger_limit unless trigger_price, chase_limit_price, target_price, stop_loss_price, and trigger_conditions are all complete, positive, and coherent. '
             'For trigger_limit BUY or a monitorable WAIT, trigger_price, chase_limit_price, target_price, stop_loss_price, and trigger_conditions must be complete and must satisfy stop_loss_price < trigger_price <= chase_limit_price < target_price. '
             'target_price and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; if a concrete level is genuinely not supportable, keep the keys and explain the limitation in data_quality_warnings instead of omitting them. '
-            'expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis; never report an upside that the supplied price levels do not support. Core recomputes a conservative slippage-adjusted pre-screen return from target, reference entry, and trusted quote-spread evidence; Core-local orders also include the server-owned non-spread round-trip allowance, while Exec applies its final full-cost check in dispatch mode before any live buy can qualify. '
+            'For BUY, expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis; for WAIT or REJECT it may be null when no supportable return can be calculated. Never report an upside that the supplied price levels do not support. Core recomputes a conservative slippage-adjusted pre-screen return from target, reference entry, and trusted quote-spread evidence; Core-local orders also include the server-owned non-spread round-trip allowance, while Exec applies its final full-cost check in dispatch mode before any live buy can qualify. '
             'Use null rather than fake precision when a numeric field is not well-supported by the inputs. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
             'thesis_summary must be a concise decision-support explanation in Korean. '

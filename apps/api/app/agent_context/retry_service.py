@@ -3233,6 +3233,7 @@ class AgentFeedbackRetryService:
         dict[tuple[str, str], tuple[str, str]],
         dict[str, str | None],
         dict[tuple[str, str, str], tuple[str, str]],
+        dict[tuple[str, str, str], dict[str, Any]],
     ]:
         normalized_roles = {
             str(role or '').strip().lower()
@@ -3349,6 +3350,10 @@ class AgentFeedbackRetryService:
             tuple[str, str, str],
             tuple[str, str],
         ] = {}
+        reuse_attestation_by_parent_key: dict[
+            tuple[str, str, str],
+            dict[str, Any],
+        ] = {}
         current_parent_row_id = next(
             (
                 int(row['id'])
@@ -3395,6 +3400,62 @@ class AgentFeedbackRetryService:
                 if exact_failed_keys is not None
                 else all_scope_keys
             )
+
+        def reused_evidence_by_key_for_run(
+            *,
+            row: dict[str, Any],
+            scopes: dict[str, list[str]],
+        ) -> dict[tuple[str, str], dict[str, Any]]:
+            summary_payload = row.get('summary_payload')
+            if not isinstance(summary_payload, dict):
+                return {}
+            raw_reused_by_role = summary_payload.get(
+                'reused_symbols_by_role'
+            )
+            raw_evidence_by_role = summary_payload.get(
+                'reused_feedback_evidence_by_role'
+            )
+            if not isinstance(raw_reused_by_role, dict) or not isinstance(
+                raw_evidence_by_role,
+                dict,
+            ):
+                return {}
+
+            reused_evidence_by_key: dict[
+                tuple[str, str],
+                dict[str, Any],
+            ] = {}
+            for role, scoped_symbols in scopes.items():
+                raw_reused_symbols = raw_reused_by_role.get(role)
+                role_evidence = raw_evidence_by_role.get(role)
+                if not isinstance(raw_reused_symbols, list) or not isinstance(
+                    role_evidence,
+                    dict,
+                ):
+                    continue
+                reused_symbols = _normalize_optional_symbol_scope(
+                    raw_reused_symbols
+                )
+                if (
+                    len(reused_symbols) != len(raw_reused_symbols)
+                    or not set(reused_symbols).issubset(scoped_symbols)
+                ):
+                    continue
+                for symbol in reused_symbols:
+                    evidence = role_evidence.get(symbol)
+                    if not isinstance(evidence, dict) or not (
+                        str(evidence.get('schema_version') or '').strip()
+                        == REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION
+                        and str(
+                            evidence.get('feedback_run_id') or ''
+                        ).strip()
+                        and str(
+                            evidence.get('feedback_received_at') or ''
+                        ).strip()
+                    ):
+                        continue
+                    reused_evidence_by_key[(symbol, role)] = dict(evidence)
+            return reused_evidence_by_key
 
         for row in rows:
             run_id = str(row['run_id'] or '').strip()
@@ -3456,10 +3517,30 @@ class AgentFeedbackRetryService:
                 row=row,
                 scopes=scopes,
             )
+            reused_parent_evidence_by_key = reused_evidence_by_key_for_run(
+                row=row,
+                scopes=scopes,
+            )
+            for (symbol, role), evidence in (
+                reused_parent_evidence_by_key.items()
+            ):
+                reuse_attestation_by_parent_key[
+                    (run_id, symbol, role)
+                ] = evidence
             lease_loss_parent_reusable = lease_loss_parent_is_reusable(row)
             for role, scoped_symbols in scopes.items():
                 for symbol in scoped_symbols:
                     key = (symbol, role)
+                    if (
+                        key in reused_parent_evidence_by_key
+                        and (run_id, symbol, role)
+                        not in latest_child_by_parent_key
+                        and required_prior_parent_run_id is None
+                    ):
+                        # A reuse-only parent did not create new authority for
+                        # this scope. Keep walking to the original parent/child
+                        # whose durable feedback receipt it attested.
+                        continue
                     if symbol in normalized_symbols and key not in latest_parent_by_key:
                         latest_parent_by_key[key] = (
                             run_id,
@@ -3476,6 +3557,7 @@ class AgentFeedbackRetryService:
             latest_parent_by_key,
             parent_by_child_run_id,
             latest_child_by_parent_key,
+            reuse_attestation_by_parent_key,
         )
 
     def _filter_decider_retry_ready_symbols(
@@ -3707,11 +3789,16 @@ class AgentFeedbackRetryService:
             tuple[str, str, str],
             tuple[str, str],
         ] = {}
+        reuse_attestation_by_parent_key: dict[
+            tuple[str, str, str],
+            dict[str, Any],
+        ] = {}
         if parent_run_id and normalized_parent_started_at is not None:
             (
                 latest_prior_parent_by_key,
                 parent_by_child_run_id,
                 latest_child_by_parent_key,
+                reuse_attestation_by_parent_key,
             ) = self._load_reuse_lineage_context(
                 market_date=market_date,
                 roles=normalized_roles,
@@ -3781,6 +3868,8 @@ class AgentFeedbackRetryService:
 
             prior_parent = latest_prior_parent_by_key.get((symbol, role))
             if prior_parent is None:
+                if reuse_parent_run_id is not None:
+                    return False
                 return not failure_shadowed_by_latest_lineage
             prior_parent_run_id, prior_parent_status = prior_parent
             feedback_run_id = str(
@@ -3790,13 +3879,57 @@ class AgentFeedbackRetryService:
                 (prior_parent_run_id, symbol, role)
             )
             if reuse_parent_run_id is not None:
-                return (
+                direct_child_matches = (
                     prior_parent_run_id == reuse_parent_run_id
                     and parent_by_child_run_id.get(feedback_run_id)
                     == reuse_parent_run_id
                     and prior_child is not None
                     and prior_child[0] == feedback_run_id
                     and prior_child[1]
+                    in {
+                        'completed',
+                        'completed_with_failures',
+                        'partial',
+                    }
+                )
+                if direct_child_matches:
+                    return True
+                if prior_child is not None:
+                    # Once the exact reuse parent dispatched this scope, its
+                    # latest child is authoritative. A stale reuse attestation
+                    # must never shadow a pending, failed, or newer child.
+                    return False
+                attested_evidence = reuse_attestation_by_parent_key.get(
+                    (reuse_parent_run_id, symbol, role)
+                )
+                if not isinstance(attested_evidence, dict) or any(
+                    attested_evidence.get(field)
+                    != (reuse_evidence or {}).get(field)
+                    for field in (
+                        'schema_version',
+                        'feedback_id',
+                        'feedback_run_id',
+                        'feedback_received_at',
+                        'decision_snapshot_id',
+                        'decision_snapshot_fingerprint',
+                        'decision_snapshot_observed_at',
+                    )
+                ):
+                    return False
+                source_parent_run_id = parent_by_child_run_id.get(
+                    feedback_run_id
+                )
+                source_child = (
+                    latest_child_by_parent_key.get(
+                        (source_parent_run_id, symbol, role)
+                    )
+                    if source_parent_run_id is not None
+                    else None
+                )
+                return (
+                    source_child is not None
+                    and source_child[0] == feedback_run_id
+                    and source_child[1]
                     in {
                         'completed',
                         'completed_with_failures',
@@ -3988,7 +4121,10 @@ class AgentFeedbackRetryService:
     ) -> RetryCyclePlan | None:
         boundary_pending_roles = snapshot.boundary_pending_roles()
         if boundary_pending_roles:
-            cycle_number = previous_cycle_number or 1
+            cycle_number = max(
+                previous_cycle_number or 1,
+                previous_completed_cycles + 1,
+            )
             if enforce_max_cycles and cycle_number > max_cycles:
                 return None
             current_role = boundary_pending_roles[0]
