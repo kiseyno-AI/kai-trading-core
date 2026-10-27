@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo('Asia/Seoul')
 KIS_REALTIME_PRICE_TR_ID = 'H0STCNT0'
 KIS_REALTIME_PRICE_SOURCE = 'kis_realtime_ws'
+KIS_REALTIME_PRICE_PING_INTERVAL_SECONDS = 30.0
+KIS_REALTIME_PRICE_PING_TIMEOUT_SECONDS = 10.0
 KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS = 10.0
 KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW = timedelta(seconds=30)
 KIS_REALTIME_MONITORED_SOURCE_SCHEMA_VERSION = (
@@ -1340,7 +1342,8 @@ class KISRealtimePriceService:
                 stage = 'connect'
                 async with websockets.connect(
                     self.client.websocket_url(),
-                    ping_interval=None,
+                    ping_interval=KIS_REALTIME_PRICE_PING_INTERVAL_SECONDS,
+                    ping_timeout=KIS_REALTIME_PRICE_PING_TIMEOUT_SECONDS,
                 ) as websocket:
                     self._websocket = websocket
                     self._mark_connected()
@@ -1348,7 +1351,10 @@ class KISRealtimePriceService:
 
                     while not self._stop_requested:
                         stage = 'receive'
-                        await self._receive_or_refresh(websocket, approval_key=approval['approval_key'])
+                        await self._receive_or_refresh(
+                            websocket,
+                            approval_key=approval['approval_key'],
+                        )
                         allowed_symbols, _ = self._target_symbols_snapshot()
                         if not allowed_symbols:
                             break
@@ -1375,7 +1381,12 @@ class KISRealtimePriceService:
                 self._mark_disconnected()
                 self._websocket = None
 
-    async def _receive_or_refresh(self, websocket: Any, *, approval_key: str) -> None:
+    async def _receive_or_refresh(
+        self,
+        websocket: Any,
+        *,
+        approval_key: str,
+    ) -> None:
         interval = max(1.0, float(settings.kis_realtime_price_subscription_refresh_seconds))
         event = self._subscription_changed_event
         wait_timeout = min(1.0, interval)
@@ -1389,7 +1400,10 @@ class KISRealtimePriceService:
 
         if event is not None and event.is_set():
             event.clear()
-            await self._sync_subscriptions(websocket, approval_key=approval_key)
+            await self._sync_subscriptions(
+                websocket,
+                approval_key=approval_key,
+            )
             return
         await self.refresh_subscription_source_if_due(trigger='background', force=False)
         await self._sync_subscriptions(websocket, approval_key=approval_key)

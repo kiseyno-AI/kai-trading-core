@@ -3,7 +3,7 @@ import inspect
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -221,6 +221,55 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(msg['header']['tr_type'], msg['body']['input']['tr_key']) for msg in sent_after_update],
             [('2', '000660'), ('2', '005930'), ('1', '035420')],
+        )
+
+    async def test_background_connection_uses_official_transport_heartbeat(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        service.client.issue_approval_key = AsyncMock(
+            return_value={'approval_key': 'approval-test'}
+        )
+        websocket = FakeWebSocket()
+        ping_message = json.dumps(
+            {'header': {'tr_id': 'PINGPONG'}, 'body': {}}
+        )
+
+        async def receive_ping_once() -> str:
+            service._stop_requested = True
+            return ping_message
+
+        websocket.recv = AsyncMock(side_effect=receive_ping_once)
+
+        class FakeConnection:
+            async def __aenter__(self) -> FakeWebSocket:
+                return websocket
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+        connect = Mock(return_value=FakeConnection())
+        refresh = AsyncMock(return_value={})
+        with (
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+        ):
+            await service._run()
+
+        connect.assert_called_once_with(
+            'ws://example.test:31000',
+            ping_interval=30.0,
+            ping_timeout=10.0,
+        )
+        self.assertIn({'pong': ping_message}, websocket.sent)
+        self.assertEqual(
+            service.health_snapshot()['metrics']['system_messages'],
+            1,
         )
 
     async def test_subscription_limit_preserves_priority_order_when_requested(self) -> None:
