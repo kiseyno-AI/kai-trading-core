@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -55,6 +56,39 @@ def _postgres_index_ddl(table_name: str, index_name: str) -> str:
 
 
 class SchemaMetadataContractTests(unittest.TestCase):
+    def test_live_production_index_contract_matches_repair_ddl(self) -> None:
+        migration = importlib.import_module(
+            'db_migrations.versions.'
+            '20261027_0087_core_schema_drift_repair'
+        )
+        self.assertEqual(len(migration.PRESERVED_INDEX_DDLS), 39)
+        self.assertEqual(
+            len({name for name, _table, _ddl in migration.PRESERVED_INDEX_DDLS}),
+            39,
+        )
+
+        for index_name, table_name, repair_ddl in migration.PRESERVED_INDEX_DDLS:
+            with self.subTest(index_name=index_name):
+                metadata_ddl = _postgres_index_ddl(table_name, index_name)
+                expected_ddl = repair_ddl.replace(
+                    'CREATE INDEX CONCURRENTLY IF NOT EXISTS ',
+                    'CREATE INDEX ',
+                )
+                metadata_ddl = re.sub(r'\s+', ' ', metadata_ddl).strip()
+                expected_ddl = re.sub(r'\s+', ' ', expected_ddl).strip()
+                self.assertEqual(metadata_ddl, expected_ddl)
+
+        desired_name, desired_table, desired_ddl = (
+            migration.DESIRED_TECHNICAL_INDEX_DDL
+        )
+        self.assertEqual(
+            _postgres_index_ddl(desired_table, desired_name),
+            desired_ddl.replace(
+                'CREATE INDEX CONCURRENTLY IF NOT EXISTS ',
+                'CREATE INDEX ',
+            ),
+        )
+
     def test_wait_recheck_event_metadata_supports_lineage_generations(self) -> None:
         table_name = 'signal_decider_wait_recheck_events'
         table = Base.metadata.tables[table_name]
@@ -475,9 +509,6 @@ class SchemaMetadataContractTests(unittest.TestCase):
                 'ix_daily_advanced_value_factor_results_ev_to_ebitda_valid_for_scoring',
                 'ix_daily_advanced_value_factor_results_fcf_yield_valid_for_scoring',
             },
-            'daily_composite_factor_results': {
-                'ix_daily_composite_factor_results_composite_classification',
-            },
             'daily_market_risk_snapshots': {
                 'ix_daily_market_risk_snapshots_is_management_item',
                 'ix_daily_market_risk_snapshots_is_trade_halted',
@@ -488,32 +519,6 @@ class SchemaMetadataContractTests(unittest.TestCase):
             'daily_piotroski_filter_results': {
                 'ix_daily_piotroski_filter_results_passed_filter',
                 'ix_daily_piotroski_filter_results_piotroski_score',
-            },
-            'daily_pykrx_enrichment_rows': {
-                'ix_daily_pykrx_enrichment_rows_category',
-                'ix_daily_pykrx_enrichment_rows_market',
-                'ix_daily_pykrx_enrichment_rows_market_date',
-                'ix_daily_pykrx_enrichment_rows_scope_key',
-                'ix_daily_pykrx_enrichment_rows_scope_type',
-                'ix_daily_pykrx_enrichment_rows_source',
-                'ix_daily_pykrx_enrichment_rows_symbol_id',
-            },
-            'daily_quality_factor_results': {
-                'ix_daily_quality_factor_results_accruals_ratio_rank',
-                'ix_daily_quality_factor_results_debt_ratio_rank',
-                'ix_daily_quality_factor_results_gross_profit_to_assets_rank',
-                'ix_daily_quality_factor_results_operating_cash_flow_to_net_income_rank',
-                'ix_daily_quality_factor_results_roa_rank',
-                'ix_daily_quality_factor_results_roe_rank',
-            },
-            'daily_unified_value_factor_results': {
-                'ix_daily_unified_value_factor_results_dividend_yield_rank',
-                'ix_daily_unified_value_factor_results_ev_to_ebitda_rank',
-                'ix_daily_unified_value_factor_results_fcf_yield_rank',
-                'ix_daily_unified_value_factor_results_pbr_rank',
-                'ix_daily_unified_value_factor_results_per_rank',
-                'ix_daily_unified_value_factor_results_unified_value_rank',
-                'ix_daily_unified_value_factor_results_unified_value_status',
             },
             'daily_value_factor_results': {
                 'ix_daily_value_factor_results_value_status',
@@ -545,11 +550,11 @@ class SchemaMetadataContractTests(unittest.TestCase):
 
         advanced_indexes = _indexes('daily_advanced_value_factor_results')
         self.assertIn(
-            'ix_daily_advanced_value_factor_results_fcf_yield_valid',
+            'ix_daily_advanced_value_factor_results_fcf_yield_valid__ba82',
             advanced_indexes,
         )
         self.assertIn(
-            'ix_daily_advanced_value_factor_results_ev_to_ebitda_valid',
+            'ix_daily_advanced_value_factor_results_ev_to_ebitda_val_13f1',
             advanced_indexes,
         )
 
