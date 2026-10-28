@@ -92,6 +92,9 @@ EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
 CHILD_RUN_LINEAGE_SCHEMA_VERSION = 'agent_feedback_child_run_lineage_v1'
 REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION = 'agent_feedback_reuse_evidence_v1'
 _LEASE_LOSS_REUSABLE_PARENT_STATUS = 'abandoned_lease_loss_reusable'
+_POINT_IN_TIME_MODE_MISMATCH_CHILD_STATUS = (
+    'point_in_time_recovery_mode_mismatch'
+)
 WEEKLY_POLICY_REBIND_SCHEMA_VERSION = 'weekly_policy_rebind_v1'
 WEEKLY_POLICY_REBIND_RETRY_LINEAGE_SCHEMA_VERSION = (
     'weekly_policy_rebind_retry_lineage_v1'
@@ -246,6 +249,32 @@ def _previous_run_matches_knowledge_cutoff(
         )
     except (TypeError, ValueError):
         return False
+
+
+def _request_payload_matches_point_in_time_recovery(
+    request_payload: Mapping[str, Any],
+    point_in_time_recovery: bool,
+) -> bool:
+    persisted = request_payload.get('point_in_time_recovery', False)
+    return type(persisted) is bool and persisted is bool(
+        point_in_time_recovery
+    )
+
+
+def _previous_run_matches_point_in_time_recovery(
+    previous_run: dict[str, Any] | None,
+    point_in_time_recovery: bool,
+) -> bool:
+    if not isinstance(previous_run, dict):
+        return False
+    request_payload = previous_run.get('request_payload')
+    return bool(
+        isinstance(request_payload, Mapping)
+        and _request_payload_matches_point_in_time_recovery(
+            request_payload,
+            point_in_time_recovery,
+        )
+    )
 
 
 def _normalize_feedback_fs_div(value: str | None) -> str:
@@ -742,6 +771,7 @@ def _previous_run_matches_retry_contract(
     feedback_scope_mode: str,
     outer_batch_size: int,
     idempotency_key: str | None,
+    point_in_time_recovery: bool,
 ) -> bool:
     if not isinstance(previous_run, dict):
         return False
@@ -778,6 +808,10 @@ def _previous_run_matches_retry_contract(
         and prior_role_symbol_scopes == role_symbol_scopes
         and prior_scope_mode == feedback_scope_mode
         and prior_outer_batch_size == outer_batch_size
+        and _request_payload_matches_point_in_time_recovery(
+            request_payload,
+            point_in_time_recovery,
+        )
         and (
             str(request_payload.get('idempotency_key') or '').strip()
             or None
@@ -1501,6 +1535,7 @@ def feedback_retry_run_is_complete_for_weekly_policy_rebind(
     *,
     idempotency_key: str,
     role_symbol_scopes: Mapping[str, Sequence[str]],
+    point_in_time_recovery: bool = False,
 ) -> bool:
     if not isinstance(run, Mapping):
         return False
@@ -1521,6 +1556,10 @@ def feedback_retry_run_is_complete_for_weekly_policy_rebind(
         == str(idempotency_key or '').strip()
         and str(policy_binding.get('idempotency_key') or '').strip()
         == str(idempotency_key or '').strip()
+        and _request_payload_matches_point_in_time_recovery(
+            payload,
+            point_in_time_recovery,
+        )
     ):
         return False
     try:
@@ -1737,6 +1776,7 @@ def _claim_feedback_retry_run(
     role_symbol_scopes: Mapping[str, Sequence[str]] | None = None,
     fs_div: str | None = None,
     scope_authority: Mapping[str, Any] | None = None,
+    point_in_time_recovery: bool = False,
 ) -> dict[str, Any]:
     """Atomically claim a durable retry scope without holding a pool slot."""
 
@@ -1775,6 +1815,7 @@ def _claim_feedback_retry_run(
         requested_symbols=normalized_symbols,
     )
     normalized_fs_div = _normalize_feedback_fs_div(fs_div)
+    normalized_point_in_time_recovery = bool(point_in_time_recovery)
     requested_scope = _normalized_admission_scope(
         roles=normalized_roles,
         symbols=normalized_symbols,
@@ -1834,6 +1875,10 @@ def _claim_feedback_retry_run(
             and payload.get('role_symbol_scopes')
             == normalized_role_symbol_scopes
             and normalized_fs_div == active_fs_div
+            and _request_payload_matches_point_in_time_recovery(
+                payload,
+                normalized_point_in_time_recovery,
+            )
             and payload.get('scope_authority')
             == (
                 dict(scope_authority)
@@ -2017,6 +2062,9 @@ def _claim_feedback_retry_run(
                     ),
                     'idempotency_key': normalized_idempotency_key,
                     'role_symbol_scopes': normalized_role_symbol_scopes,
+                    'point_in_time_recovery': (
+                        normalized_point_in_time_recovery
+                    ),
                     'admission_scope_by_role': admission_scope_payload,
                     **(
                         {'idempotency_attempt': idempotency_attempt}
@@ -2520,6 +2568,7 @@ class FeedbackRetryCycleConfig:
     outer_batch_size: int = 20
     reuse_existing: bool = True
     force_recompute: bool = False
+    point_in_time_recovery: bool = False
     reuse_parent_run_id: str | None = None
     scope_authority: Mapping[str, Any] | None = None
     role_symbol_scopes: Mapping[str, Sequence[str]] | None = None
@@ -3229,6 +3278,7 @@ class AgentFeedbackRetryService:
         current_parent_run_id: str,
         current_parent_started_at: datetime,
         required_prior_parent_run_id: str | None = None,
+        point_in_time_recovery: bool = False,
     ) -> tuple[
         dict[tuple[str, str], tuple[str, str]],
         dict[str, str | None],
@@ -3260,30 +3310,52 @@ class AgentFeedbackRetryService:
                     AgentContextFeedbackRun.id.desc(),
                 )
             ).scalars().all()
-            rows = [
-                {
-                    'id': int(row.id),
-                    'run_id': str(row.run_id or ''),
-                    'request_payload': (
-                        dict(row.request_payload)
-                        if isinstance(row.request_payload, dict)
-                        else {}
-                    ),
-                    'status': str(row.status or '').strip().lower(),
-                    'market_date': row.market_date,
-                    'symbols_total': row.symbols_total,
-                    'completed_count': row.completed_count,
-                    'failed_count': max(0, int(row.failed_count or 0)),
-                    'summary_payload': (
-                        dict(row.summary_payload)
-                        if isinstance(row.summary_payload, dict)
-                        else {}
-                    ),
-                    'started_at': row.started_at,
-                    'completed_at': row.completed_at,
-                }
-                for row in persisted_rows
-            ]
+            rows = []
+            for row in persisted_rows:
+                raw_request_payload = row.request_payload
+                request_payload_is_mapping = isinstance(
+                    raw_request_payload,
+                    Mapping,
+                )
+                request_payload = (
+                    dict(raw_request_payload)
+                    if request_payload_is_mapping
+                    else {}
+                )
+                rows.append(
+                    {
+                        'id': int(row.id),
+                        'run_id': str(row.run_id or ''),
+                        'request_payload': request_payload,
+                        'point_in_time_recovery_matches': (
+                            request_payload_is_mapping
+                            and _request_payload_matches_point_in_time_recovery(
+                                request_payload,
+                                point_in_time_recovery,
+                            )
+                        ),
+                        'status': str(row.status or '').strip().lower(),
+                        'market_date': row.market_date,
+                        'symbols_total': row.symbols_total,
+                        'completed_count': row.completed_count,
+                        'failed_count': max(0, int(row.failed_count or 0)),
+                        'summary_payload': (
+                            dict(row.summary_payload)
+                            if isinstance(row.summary_payload, dict)
+                            else {}
+                        ),
+                        'started_at': row.started_at,
+                        'completed_at': row.completed_at,
+                    }
+                )
+
+        mode_matches_by_run_id = {
+            str(row['run_id'] or '').strip(): bool(
+                row['point_in_time_recovery_matches']
+            )
+            for row in rows
+            if str(row['run_id'] or '').strip()
+        }
 
         def scopes_for_payload(payload: dict[str, Any]) -> dict[str, list[str]]:
             scopes: dict[str, list[str]] = {}
@@ -3460,10 +3532,22 @@ class AgentFeedbackRetryService:
         for row in rows:
             run_id = str(row['run_id'] or '').strip()
             payload = row['request_payload']
-            parent_by_child_run_id[run_id] = str(
+            child_parent_run_id = str(
                 payload.get('parent_run_id') or ''
             ).strip() or None
-            child_parent_run_id = parent_by_child_run_id[run_id]
+            row_mode_matches = bool(
+                row['point_in_time_recovery_matches']
+            )
+            lineage_mode_matches = bool(
+                row_mode_matches
+                and (
+                    child_parent_run_id is None
+                    or mode_matches_by_run_id.get(child_parent_run_id)
+                    is True
+                )
+            )
+            if lineage_mode_matches:
+                parent_by_child_run_id[run_id] = child_parent_run_id
             scopes = scopes_for_payload(payload)
             status = str(row['status'] or '').strip().lower()
             if child_parent_run_id:
@@ -3478,21 +3562,32 @@ class AgentFeedbackRetryService:
                             symbol in normalized_symbols
                             and child_key not in latest_child_by_parent_key
                         ):
+                            # Keep an incompatible newest child as a barrier;
+                            # dropping it would revive an older matching child.
                             latest_child_by_parent_key[child_key] = (
                                 run_id,
-                                'failed'
-                                if status
-                                in {
-                                    'completed',
-                                    'completed_with_failures',
-                                    'partial',
-                                    'failed',
-                                }
-                                and (symbol, role) in failed_scope_keys
-                                else status,
+                                (
+                                    _POINT_IN_TIME_MODE_MISMATCH_CHILD_STATUS
+                                    if not lineage_mode_matches
+                                    else (
+                                        'failed'
+                                        if status
+                                        in {
+                                            'completed',
+                                            'completed_with_failures',
+                                            'partial',
+                                            'failed',
+                                        }
+                                        and (symbol, role)
+                                        in failed_scope_keys
+                                        else status
+                                    )
+                                ),
                             )
 
             if run_id == current_parent_run_id:
+                continue
+            if not row_mode_matches:
                 continue
             row_started_at = row['started_at']
             if row_started_at.tzinfo is None or row_started_at.utcoffset() is None:
@@ -3682,6 +3777,7 @@ class AgentFeedbackRetryService:
         knowledge_cutoff_at: datetime | str | None = None,
         fs_div: str | None = None,
         reuse_static_inputs: FeedbackReuseStaticInputs | None = None,
+        point_in_time_recovery: bool = False,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
@@ -3806,6 +3902,7 @@ class AgentFeedbackRetryService:
                 current_parent_run_id=parent_run_id,
                 current_parent_started_at=normalized_parent_started_at,
                 required_prior_parent_run_id=reuse_parent_run_id,
+                point_in_time_recovery=point_in_time_recovery,
             )
 
         def decision_is_reusable(symbol: str, role: str) -> bool:
@@ -3866,15 +3963,20 @@ class AgentFeedbackRetryService:
             if received_at > normalized_parent_started_at:
                 return False
 
+            feedback_run_id = str(
+                (reuse_evidence or {}).get('feedback_run_id') or ''
+            ).strip()
+            if feedback_run_id not in parent_by_child_run_id:
+                # Reuse authority must come from a run in the requested
+                # point-in-time mode. Legacy rows without the flag are normal
+                # mode only; malformed or opposite-mode rows are rejected.
+                return False
             prior_parent = latest_prior_parent_by_key.get((symbol, role))
             if prior_parent is None:
                 if reuse_parent_run_id is not None:
                     return False
                 return not failure_shadowed_by_latest_lineage
             prior_parent_run_id, prior_parent_status = prior_parent
-            feedback_run_id = str(
-                (reuse_evidence or {}).get('feedback_run_id') or ''
-            ).strip()
             prior_child = latest_child_by_parent_key.get(
                 (prior_parent_run_id, symbol, role)
             )
@@ -4747,6 +4849,9 @@ class AgentFeedbackRetryService:
         bypass_prerequisite_gate: bool = False,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
+        point_in_time_recovery = bool(
+            getattr(config, 'point_in_time_recovery', False)
+        )
         resolved_idempotency_key = str(
             getattr(config, 'idempotency_key', None) or ''
         ).strip() or None
@@ -4929,6 +5034,10 @@ class AgentFeedbackRetryService:
                 == _normalize_admission_knowledge_cutoff(
                     effective_knowledge_cutoff_at
                 )
+                and _request_payload_matches_point_in_time_recovery(
+                    prior_request,
+                    point_in_time_recovery,
+                )
             )
 
         def idempotent_replay_response(
@@ -4952,6 +5061,7 @@ class AgentFeedbackRetryService:
                 'force_recompute': bool(
                     force or getattr(config, 'force_recompute', False)
                 ),
+                'point_in_time_recovery': point_in_time_recovery,
                 'feedback_scope_mode': feedback_scope_mode,
                 'scope_authority': dict(
                     normalized_scope_authority or {}
@@ -4982,6 +5092,7 @@ class AgentFeedbackRetryService:
                     idempotent_run,
                     idempotency_key=resolved_idempotency_key,
                     role_symbol_scopes=resolved_role_symbol_scopes or {},
+                    point_in_time_recovery=point_in_time_recovery,
                 ):
                     return idempotent_replay_response(idempotent_run)
 
@@ -5025,6 +5136,9 @@ class AgentFeedbackRetryService:
             ) or not _previous_run_matches_scope_authority(
                 previous_run,
                 normalized_scope_authority,
+            ) or not _previous_run_matches_point_in_time_recovery(
+                previous_run,
+                point_in_time_recovery,
             ) or (
                 bool(reuse_parent_run_id)
                 and not _previous_run_matches_retry_contract(
@@ -5037,6 +5151,7 @@ class AgentFeedbackRetryService:
                         getattr(config, 'outer_batch_size', 20) or 20
                     ),
                     idempotency_key=resolved_idempotency_key,
+                    point_in_time_recovery=point_in_time_recovery,
                 )
             ):
                 previous_run = None
@@ -5087,6 +5202,7 @@ class AgentFeedbackRetryService:
             role_symbol_scopes=resolved_role_symbol_scopes,
             fs_div=resolved_fs_div,
             scope_authority=normalized_scope_authority,
+            point_in_time_recovery=point_in_time_recovery,
         )
         if not admission['acquired']:
             active_run = admission.get('conflict_run')
@@ -5097,6 +5213,7 @@ class AgentFeedbackRetryService:
                     active_run,
                     idempotency_key=resolved_idempotency_key or '',
                     role_symbol_scopes=resolved_role_symbol_scopes or {},
+                    point_in_time_recovery=point_in_time_recovery,
                 ):
                     return idempotent_replay_response(active_run)
             active_run_id = (
@@ -5285,6 +5402,9 @@ class AgentFeedbackRetryService:
             progress_callback = None
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
+        point_in_time_recovery = bool(
+            getattr(config, 'point_in_time_recovery', False)
+        )
         should_bypass_prerequisite_gate = bool(force or bypass_prerequisite_gate)
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
@@ -5651,6 +5771,7 @@ class AgentFeedbackRetryService:
             knowledge_cutoff_at=knowledge_cutoff_at,
             fs_div=resolved_fs_div,
             reuse_static_inputs=reuse_static_inputs,
+            point_in_time_recovery=point_in_time_recovery,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -5698,6 +5819,7 @@ class AgentFeedbackRetryService:
             'parallel_subtasks': max(1, int(settings.openclaw_agent_parallel_subtasks)),
             'reuse_existing': config.reuse_existing,
             'force_recompute': effective_force_recompute,
+            'point_in_time_recovery': point_in_time_recovery,
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             **(
                 {'scope_authority': dict(normalized_scope_authority)}
@@ -5880,6 +6002,7 @@ class AgentFeedbackRetryService:
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
                         reuse_static_inputs=reuse_static_inputs,
+                        point_in_time_recovery=point_in_time_recovery,
                     )
                     completed_roles_before = tuple(
                         list(active_plan.completed_roles) + list(active_plan.plan_roles[:index])
@@ -5972,6 +6095,9 @@ class AgentFeedbackRetryService:
                                     # blocked again inside every child batch.
                                     force=should_bypass_prerequisite_gate,
                                     force_recompute=effective_force_recompute,
+                                    point_in_time_recovery=(
+                                        point_in_time_recovery
+                                    ),
                                     auto_scope=requested_symbols is None,
                                     role_symbol_scopes={role: dispatch_chunk},
                                     funnel_diagnostics={
@@ -6038,6 +6164,9 @@ class AgentFeedbackRetryService:
                                     knowledge_cutoff_at=knowledge_cutoff_at,
                                     fs_div=resolved_fs_div,
                                     reuse_static_inputs=reuse_static_inputs,
+                                    point_in_time_recovery=(
+                                        point_in_time_recovery
+                                    ),
                                 )
                                 self._sync_runtime_state(
                                     market_date=config.market_date,
@@ -6135,6 +6264,7 @@ class AgentFeedbackRetryService:
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
                         reuse_static_inputs=reuse_static_inputs,
+                        point_in_time_recovery=point_in_time_recovery,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
                     role_boundary_complete = len(role_state_after.boundary_pending_symbols) == 0
@@ -6214,6 +6344,7 @@ class AgentFeedbackRetryService:
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=resolved_fs_div,
                     reuse_static_inputs=reuse_static_inputs,
+                    point_in_time_recovery=point_in_time_recovery,
                 )
                 cycle_state = runtime_feedback_state_store.get_run(
                     config.market_date,
@@ -6272,6 +6403,7 @@ class AgentFeedbackRetryService:
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
                 reuse_static_inputs=reuse_static_inputs,
+                point_in_time_recovery=point_in_time_recovery,
             )
             final_state_before_finish = runtime_feedback_state_store.get_run(
                 config.market_date,
@@ -6370,6 +6502,7 @@ class AgentFeedbackRetryService:
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
                 reuse_static_inputs=reuse_static_inputs,
+                point_in_time_recovery=point_in_time_recovery,
             ),
             retry_attempted_symbols_by_role=(
                 final_state.retry_attempted_symbols_by_role
@@ -6389,6 +6522,7 @@ class AgentFeedbackRetryService:
             'outer_batch_size': config.outer_batch_size,
             'reuse_existing': config.reuse_existing,
             'force_recompute': effective_force_recompute,
+            'point_in_time_recovery': point_in_time_recovery,
             'feedback_scope_mode': feedback_scope_mode,
             'scope_authority': (
                 dict(normalized_scope_authority)

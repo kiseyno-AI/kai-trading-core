@@ -3558,6 +3558,72 @@ class MutatingDeciderInputReadService:
         return payload
 
 
+class SessionMutatingDeciderInputReadService:
+    def __init__(self):
+        self.calls = 0
+        self.delegate = DeciderReadyAgentContextReadService()
+
+    def get_symbol_day_context(self, **kwargs):
+        self.calls += 1
+        payload = self.delegate.get_symbol_day_context(**kwargs)
+        market_open = self.calls > 1
+        for item in payload['items']:
+            item.update(
+                {
+                    'market_session': {
+                        'current_market_session': (
+                            'open' if market_open else 'closed'
+                        ),
+                    },
+                    'market_data_phase_contract': {
+                        'current_market_state': (
+                            'OPEN' if market_open else 'PREOPEN'
+                        ),
+                    },
+                    'quote_context': {
+                        'price': 90100 if market_open else 85700,
+                    },
+                    'intraday_execution_context': {
+                        'quote': {
+                            'price': 90100 if market_open else 85700
+                        },
+                    },
+                    'pre_decider_enrichment_context': {
+                        'quote_orderbook_snapshot': {
+                            'current_price': (
+                                90100 if market_open else 85700
+                            ),
+                        },
+                    },
+                    'market_regime_context': {
+                        'open_drive': {
+                            'index_change_percent': (
+                                -1.3 if market_open else None
+                            ),
+                        },
+                    },
+                }
+            )
+            item['liquidity_context']['intraday'] = {
+                'status': 'available',
+                'quote_balance_rank': 1 if market_open else 5,
+            }
+        return payload
+
+
+class NonDurableDeciderInputReadService(
+    DeciderReadyAgentContextReadService
+):
+    def get_symbol_day_context(self, **kwargs):
+        payload = super().get_symbol_day_context(**kwargs)
+        for item in payload['items']:
+            item['market_breadth_context'] = {
+                'status': 'available',
+                'source': 'kis_market_snapshot_v1',
+            }
+        return payload
+
+
 class FakeMarketContextBuilder:
     def __init__(self, payload: dict):
         self.payload = payload
@@ -7713,6 +7779,156 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 for call in changed_lookup_calls
             )
         )
+
+    def test_point_in_time_dispatch_accepts_session_change_only_with_durable_source(
+        self,
+    ):
+        cases = (
+            (
+                'preopen_to_open',
+                SessionMutatingDeciderInputReadService(),
+                'completed',
+            ),
+            (
+                'non_durable_live_breadth',
+                NonDurableDeciderInputReadService(),
+                'partial',
+            ),
+            (
+                'material_eod_change',
+                MutatingDeciderInputReadService(),
+                'partial',
+            ),
+        )
+
+        for case_name, read_service, expected_status in cases:
+            with self.subTest(case=case_name):
+                service = AgentFeedbackOrchestrator()
+                service.client = SignalDeciderBatchClient()
+                feedback_service = FakeFeedbackService()
+                failure_service = RecordingFailureService()
+                cleanup_service = FakeSessionCleanupService()
+                revalidation_calls = []
+                original_revalidate = (
+                    service._revalidate_decider_dispatch_inputs
+                )
+
+                def recording_revalidate(**kwargs):
+                    revalidation_calls.append(kwargs)
+                    return original_revalidate(**kwargs)
+
+                service._revalidate_decider_dispatch_inputs = (
+                    recording_revalidate
+                )
+                fake_settings = SimpleNamespace(
+                    openclaw_agent_symbol_chunk_size=1,
+                    openclaw_agent_parallel_subtasks=1,
+                )
+                market_context_builder = FakeMarketContextBuilder(
+                    {
+                        'status': 'ready',
+                        'market_date': '2026-04-14',
+                        'summary': {'market_bias': 'risk_on'},
+                        'flows': {},
+                        'missing_fields': [],
+                    }
+                )
+
+                with patch.object(
+                    orchestrator_module,
+                    'settings',
+                    fake_settings,
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_read_service',
+                        read_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_context_reuse_service',
+                            SimpleNamespace(
+                                build_latest_decisions=lambda **kwargs: {}
+                            ),
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'agent_context_feedback_service',
+                                feedback_service,
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'agent_context_feedback_failure_service',
+                                    failure_service,
+                                ):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'agent_feedback_session_cleanup_service',
+                                        cleanup_service,
+                                    ):
+                                        with patch.object(
+                                            orchestrator_module,
+                                            'signal_decider_market_context_builder',
+                                            market_context_builder,
+                                        ):
+                                            with patch.object(
+                                                service,
+                                                '_load_post_decision_material_context_failures',
+                                                return_value={},
+                                            ):
+                                                with _patch_feedback_eligibility(
+                                                    '005930'
+                                                ):
+                                                    result = (
+                                                        service.dispatch_for_symbols(
+                                                            market_date=(
+                                                                '2026-04-14'
+                                                            ),
+                                                            symbols=['005930'],
+                                                            reuse_existing=False,
+                                                            point_in_time_recovery=True,
+                                                        )
+                                                    )
+
+                self.assertEqual(
+                    result['summary']['status'],
+                    expected_status,
+                )
+                self.assertTrue(revalidation_calls)
+                self.assertTrue(
+                    all(
+                        call['durable_source_generation'] is True
+                        and call['revalidate_market_context'] is False
+                        for call in revalidation_calls
+                    )
+                )
+                if case_name == 'preopen_to_open':
+                    self.assertTrue(
+                        any(
+                            call.get(
+                                'revalidate_post_decision_material_context'
+                            )
+                            for call in revalidation_calls
+                        )
+                    )
+                    self.assertEqual(result['summary']['completed'], 5)
+                    self.assertEqual(failure_service.recorded, [])
+                else:
+                    revalidation_codes = {
+                        reason['code']
+                        for failure in failure_service.recorded
+                        for reason in failure['context'][
+                            'input_generation_revalidation'
+                        ]['reasons']
+                    }
+                    self.assertIn(
+                        (
+                            'durable_source_generation_ineligible'
+                            if case_name == 'non_durable_live_breadth'
+                            else 'source_context_changed'
+                        ),
+                        revalidation_codes,
+                    )
 
     def test_decider_response_is_rejected_when_source_context_changes_during_dispatch(self):
         service = AgentFeedbackOrchestrator()

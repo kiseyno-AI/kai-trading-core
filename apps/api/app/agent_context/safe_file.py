@@ -31,7 +31,7 @@ _FILE_FLAGS = (
 )
 
 
-DirectoryFingerprint = tuple[int, int, int, int, int, int]
+DirectoryFingerprint = tuple[int, int, int]
 
 
 def _directory_identity(metadata: os.stat_result) -> DirectoryFingerprint:
@@ -39,9 +39,6 @@ def _directory_identity(metadata: os.stat_result) -> DirectoryFingerprint:
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
     )
 
 
@@ -50,7 +47,7 @@ def _directory_fingerprint_payload(
 ) -> dict[str, int]:
     return dict(
         zip(
-            ('dev', 'ino', 'mode', 'size', 'mtime_ns', 'ctime_ns'),
+            ('dev', 'ino', 'mode'),
             identity,
             strict=True,
         )

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 import hashlib
 import os
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
@@ -83,6 +85,60 @@ from app.eod.pykrx_pipeline_runner import (
 )
 from app.market.clock import KST, MarketState
 from app.repositories.eod_run_repository import AutoEODRecoveryTarget
+
+
+class FeedbackRetryConfigCallsiteTests(TestCase):
+    def test_production_callsites_have_audited_recovery_modes(self) -> None:
+        api_root = Path(__file__).resolve().parents[1]
+        expected = {
+            'app/agent_context/weekly_policy_rebind_service.py': [
+                '<default_false>'
+            ],
+            'app/api/routes_agent_context.py': [
+                '<default_false>',
+                '<default_false>',
+            ],
+            'app/dart/fundamentals_capture_service.py': [
+                '<default_false>'
+            ],
+            'app/eod/daily_pipeline_stages.py': [
+                'point_in_time_recovery'
+            ],
+            'app/eod/pykrx_pipeline_runner.py': [
+                'point_in_time_recovery'
+            ],
+            'app/internal/ops.py': ['<default_false>'],
+            'scripts/run_feedback_retry_cycles.py': ['<default_false>'],
+        }
+        observed: dict[str, list[str]] = {}
+
+        for source_root in (api_root / 'app', api_root / 'scripts'):
+            for source_path in sorted(source_root.rglob('*.py')):
+                tree = ast.parse(source_path.read_text(encoding='utf-8'))
+                for node in ast.walk(tree):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == 'FeedbackRetryCycleConfig'
+                    ):
+                        continue
+                    recovery_keyword = next(
+                        (
+                            keyword
+                            for keyword in node.keywords
+                            if keyword.arg == 'point_in_time_recovery'
+                        ),
+                        None,
+                    )
+                    mode = (
+                        ast.unparse(recovery_keyword.value)
+                        if recovery_keyword is not None
+                        else '<default_false>'
+                    )
+                    relative_path = source_path.relative_to(api_root).as_posix()
+                    observed.setdefault(relative_path, []).append(mode)
+
+        self.assertEqual(observed, expected)
 
 
 class _AnySymbolTurnoverFrame:
@@ -1640,6 +1696,53 @@ class PykrxBackfillServiceTests(TestCase):
             [config.knowledge_cutoff_at for config in configs],
             [shared_cutoff, shared_cutoff],
         )
+        self.assertEqual(
+            [config.point_in_time_recovery for config in configs],
+            [False, False],
+        )
+
+    def test_auto_feedback_followups_propagate_point_in_time_recovery(
+        self,
+    ) -> None:
+        configs = []
+
+        def run_retry_cycles(*, config, **_kwargs):
+            configs.append(config)
+            return {'status': 'completed'}
+
+        with (
+            patch(
+                'app.agent_context.prerequisite_service.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value={'ready': True, 'status': 'ready'},
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_retry_service.run_retry_cycles',
+                side_effect=run_retry_cycles,
+            ),
+            patch(
+                'app.eod.pykrx_pipeline_runner.'
+                'build_expired_decision_replay_result',
+                return_value=None,
+            ),
+        ):
+            _run_daily_feedback_followup(
+                market_date='2026-04-03',
+                enabled=True,
+                point_in_time_recovery=True,
+            )
+            _run_daily_signal_decider_followup(
+                market_date='2026-04-03',
+                enabled=True,
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(
+            [config.point_in_time_recovery for config in configs],
+            [True, True],
+        )
 
     def test_auto_followup_order_matches_canonical_news_macro_feedback_dependencies(self) -> None:
         signal_index = AUTO_DAILY_FOLLOWUP_STAGE_ORDER.index('signal_features')
@@ -2140,6 +2243,23 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_pipeline_runner._run_daily_factor_followup',
                 return_value=_completed_factor_followup_result(),
             ) as rebuild_factors,
+            patch(
+                'app.eod.pykrx_pipeline_runner.'
+                '_run_daily_feedback_followup',
+                return_value={
+                    'triggered': True,
+                    'status': 'completed',
+                },
+            ) as feedback_followup,
+            patch(
+                'app.eod.pykrx_pipeline_runner.'
+                '_run_daily_signal_decider_followup',
+                return_value={
+                    'triggered': False,
+                    'status': 'skipped',
+                    'reason': 'next_open_window_expired',
+                },
+            ) as signal_decider_followup,
             patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
         ):
             result = service._run_market_data_pipeline(
@@ -2179,6 +2299,16 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-09-11',
             stage_executor=ANY,
             stage_result_callback=ANY,
+        )
+        self.assertTrue(
+            feedback_followup.call_args.kwargs[
+                'point_in_time_recovery'
+            ]
+        )
+        self.assertTrue(
+            signal_decider_followup.call_args.kwargs[
+                'point_in_time_recovery'
+            ]
         )
         self.assertEqual(
             result['piotroski_filter_followup']['status'],

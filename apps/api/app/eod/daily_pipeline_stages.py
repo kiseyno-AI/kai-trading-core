@@ -3589,6 +3589,7 @@ class DailyPipelineStageService:
                     max_cycles=feedback_max_cycles,
                     outer_batch_size=retry_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
+                    point_in_time_recovery=point_in_time_recovery,
                     reuse_parent_run_id=(
                         feedback_reuse_parent_run_id
                         if stage_id == 'agent_feedback_summaries'

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 import json
+import os
 import sqlite3
 from unittest.mock import Mock
 
@@ -471,14 +472,54 @@ def test_dispatch_runtime_contract_rejects_same_hash_with_changed_file_fingerpri
     assert proof['live_file_fingerprint'] is None
 
 
+def test_dispatch_runtime_contract_ignores_unrelated_ancestor_mtime_change(
+    tmp_path,
+) -> None:
+    target = tmp_path / 'workspace-signal-decider' / 'AGENTS.md'
+    target.parent.mkdir(parents=True)
+    repo_root = __import__('pathlib').Path(__file__).resolve().parents[3]
+    source = repo_root / 'runtime_contracts/openclaw/v1/signal-decider/AGENTS.md'
+    target.write_bytes(source.read_bytes())
+    pre = build_runtime_contract_provenance(
+        'signal-decider',
+        openclaw_state_dir=tmp_path,
+    )
+    ancestor_stat = tmp_path.stat()
+
+    os.utime(
+        tmp_path,
+        ns=(
+            ancestor_stat.st_atime_ns,
+            ancestor_stat.st_mtime_ns + 1_000_000_000,
+        ),
+    )
+    post = build_runtime_contract_provenance(
+        'signal-decider',
+        openclaw_state_dir=tmp_path,
+    )
+    proof = build_dispatch_runtime_contract_provenance(
+        pre_dispatch=pre,
+        post_dispatch=post,
+    )
+
+    assert pre['expected_sha256'] == post['expected_sha256']
+    assert (
+        pre['expected_file_fingerprint']
+        == post['expected_file_fingerprint']
+    )
+    assert pre['expected_path_fingerprint'] == post['expected_path_fingerprint']
+    assert pre['live_sha256'] == post['live_sha256']
+    assert pre['live_file_fingerprint'] == post['live_file_fingerprint']
+    assert pre['live_path_fingerprint'] == post['live_path_fingerprint']
+    assert proof['verified'] is True
+    assert proof['status'] == 'verified'
+
+
 def test_dispatch_runtime_contract_rejects_restored_file_after_parent_chain_change() -> None:
     directory = {
         'dev': 1,
         'ino': 2,
         'mode': 16877,
-        'size': 96,
-        'mtime_ns': 4,
-        'ctime_ns': 5,
     }
     pre = {
         'role': 'signal-decider',
@@ -494,7 +535,7 @@ def test_dispatch_runtime_contract_rejects_restored_file_after_parent_chain_chan
     }
     post = {
         **pre,
-        'live_path_fingerprint': [{**directory, 'ctime_ns': 6}],
+        'live_path_fingerprint': [{**directory, 'ino': 6}],
     }
 
     proof = build_dispatch_runtime_contract_provenance(

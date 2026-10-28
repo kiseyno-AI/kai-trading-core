@@ -1397,6 +1397,7 @@ def _run_daily_feedback_followup(
     enabled: bool,
     knowledge_cutoff_at: datetime | str | None = None,
     progress_callback: Callable[..., None] | None = None,
+    point_in_time_recovery: bool = False,
 ) -> dict[str, Any]:
     from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
     from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
@@ -1409,6 +1410,7 @@ def _run_daily_feedback_followup(
         feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         knowledge_cutoff_at=knowledge_cutoff_at,
         progress_callback=progress_callback,
+        point_in_time_recovery=point_in_time_recovery,
     )
 
 
@@ -1418,6 +1420,7 @@ def _run_daily_signal_decider_followup(
     enabled: bool,
     knowledge_cutoff_at: datetime | str | None = None,
     progress_callback: Callable[..., None] | None = None,
+    point_in_time_recovery: bool = False,
 ) -> dict[str, Any]:
     from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
     from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
@@ -1430,6 +1433,7 @@ def _run_daily_signal_decider_followup(
         feedback_scope_mode=FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         knowledge_cutoff_at=knowledge_cutoff_at,
         progress_callback=progress_callback,
+        point_in_time_recovery=point_in_time_recovery,
     )
 
 
@@ -1467,6 +1471,7 @@ def _run_daily_agent_feedback_followup(
     feedback_scope_mode: str,
     knowledge_cutoff_at: datetime | str | None = None,
     progress_callback: Callable[..., None] | None = None,
+    point_in_time_recovery: bool = False,
 ) -> dict[str, Any]:
     if not enabled:
         return {
@@ -1513,6 +1518,7 @@ def _run_daily_agent_feedback_followup(
             max_cycles=settings.openclaw_feedback_retry_max_cycles,
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
             reuse_existing=True,
+            point_in_time_recovery=point_in_time_recovery,
             progress_callback=progress_callback,
         ),
         bypass_prerequisite_gate=False,
@@ -3921,6 +3927,7 @@ def run_market_data_pipeline(
                             resolve_feedback_knowledge_cutoff()
                         ),
                         progress_callback=feedback_progress_callback,
+                        point_in_time_recovery=point_in_time_recovery,
                     ),
                 )
             else:
@@ -3950,6 +3957,7 @@ def run_market_data_pipeline(
                             resolve_feedback_knowledge_cutoff()
                         ),
                         progress_callback=signal_decider_progress_callback,
+                        point_in_time_recovery=point_in_time_recovery,
                     ),
                 )
             else:

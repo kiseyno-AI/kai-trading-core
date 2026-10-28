@@ -3856,6 +3856,20 @@ class AgentFeedbackOrchestrator:
                 if durable_source_generation
                 else 'decision_input_generation'
             )
+            if (
+                durable_source_generation
+                and isinstance(expected_generation, dict)
+                and expected_generation.get('durable_reuse_eligible') is not True
+            ):
+                reasons.append(
+                    {
+                        'code': 'durable_source_generation_ineligible',
+                        'non_durable_reasons': list(
+                            expected_generation.get('non_durable_reasons')
+                            or []
+                        ),
+                    }
+                )
             raw_refreshed_item = refreshed_by_symbol.get(symbol)
             refreshed_item = (
                 dict(raw_refreshed_item)
@@ -6316,6 +6330,7 @@ class AgentFeedbackOrchestrator:
         parent_run_id: str | None = None,
         force: bool = False,
         force_recompute: bool = False,
+        point_in_time_recovery: bool = False,
         auto_scope: bool = False,
         role_symbol_scopes: dict[str, Sequence[str]] | None = None,
         funnel_diagnostics: dict[str, Any] | None = None,
@@ -6598,6 +6613,7 @@ class AgentFeedbackOrchestrator:
             'total_parallel_subtasks': role_parallelism,
             'reuse_existing': reuse_existing,
             'force_recompute': force_recompute,
+            'point_in_time_recovery': point_in_time_recovery,
             'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
             'auto_scope': auto_scope,
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -7895,6 +7911,12 @@ class AgentFeedbackOrchestrator:
                                                     authoritative_summary_run_id=(
                                                         normalized_upstream_summary_run_id
                                                     ),
+                                                    revalidate_market_context=(
+                                                        not point_in_time_recovery
+                                                    ),
+                                                    durable_source_generation=(
+                                                        point_in_time_recovery
+                                                    ),
                                                 )
                                             )
                                             input_revalidation_snapshot = {
@@ -8557,6 +8579,12 @@ class AgentFeedbackOrchestrator:
                                 ),
                                 authoritative_summary_run_id=(
                                     normalized_upstream_summary_run_id
+                                ),
+                                revalidate_market_context=(
+                                    not point_in_time_recovery
+                                ),
+                                durable_source_generation=(
+                                    point_in_time_recovery
                                 ),
                                 revalidate_post_decision_material_context=True,
                                 allow_current_run_feedback=True,

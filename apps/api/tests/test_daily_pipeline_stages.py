@@ -3377,6 +3377,43 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertTrue(call['bypass_prerequisite_gate'])
         self.assertTrue(call['config'].reuse_existing)
 
+    def test_point_in_time_feedback_recovery_enables_durable_revalidation(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service
+        )
+
+        with patch(
+            'app.eod.daily_pipeline_stages.build_expired_decision_replay_result',
+            return_value=None,
+        ):
+            result = service._execute_stage(
+                stage_id='agent_feedback_summaries',
+                market_date='2026-04-14',
+                symbols=['005930'],
+                markets=['KOSPI'],
+                force=False,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['completed'])
+        self.assertTrue(
+            feedback_retry_service.calls[0][
+                'config'
+            ].point_in_time_recovery
+        )
+
     def test_feedback_rearm_keeps_parent_prerequisite_admission(self) -> None:
         feedback_retry_service = _FakeFeedbackRetryService()
         service = DailyPipelineStageService(
