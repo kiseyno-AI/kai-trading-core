@@ -1434,7 +1434,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
     if role == 'fundamental-summarizer':
         return (
             'Return JSON only. Do not wrap in markdown. '
-            'Required top-level keys: role, summary, confidence, risk_flags, details, improvement_notes. '
+            'For every fundamental-summarizer feedback object, required keys are: role, summary, confidence, risk_flags, details, improvement_notes. '
             'role must equal the requested role. '
             'Use the supplied market and source metadata to interpret fundamentals from either KRX DART filings/XBRL or US SEC EDGAR filings/company facts. '
             'Do not assume every payload is a DART payload, and do not reinterpret SEC fields as DART-specific fields. '
@@ -1445,7 +1445,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
         )
     return (
         'Return JSON only. Do not wrap in markdown. '
-        'Required top-level keys: role, summary, confidence, risk_flags, details, improvement_notes. '
+        f'For every {role or "requested-role"} feedback object, required keys are: role, summary, confidence, risk_flags, details, improvement_notes. '
         'role must equal the requested role. '
         'summary must be a concise string. '
         'confidence must be a number between 0 and 1. '

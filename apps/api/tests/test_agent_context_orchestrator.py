@@ -4906,6 +4906,50 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIsNone(example_feedback['chase_limit_price'])
         self.assertEqual(example_feedback['trigger_conditions'], [])
 
+    def test_technical_summarizer_batch_message_has_one_unambiguous_envelope_contract(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+        technical_spec = next(
+            spec
+            for spec in orchestrator_module.DISPATCH_SPECS
+            if spec.role == 'technical-summarizer'
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            message = client._build_batch_message(
+                spec=technical_spec,
+                market_date=orchestrator_module.date.fromisoformat('2026-10-28'),
+                batch_items=[{'symbol': '028050', 'market_date': '2026-10-28'}],
+                request_marker='batch-request::technical-contract-test',
+            )
+            single_message = client._build_message(
+                spec=technical_spec,
+                payload={'symbol': '028050', 'market_date': '2026-10-28'},
+            )
+
+        self.assertIn(
+            'exactly one top-level object in this batch envelope: '
+            '{"items": [{"symbol": "...", "feedback": {...}}]}',
+            message,
+        )
+        self.assertIn(
+            'For every technical-summarizer feedback object, required keys are:',
+            message,
+        )
+        self.assertNotIn('Required top-level keys:', message)
+        self.assertIn(
+            'For every technical-summarizer feedback object, required keys are:',
+            single_message,
+        )
+        self.assertNotIn('Required top-level keys:', single_message)
+
     def test_short_term_and_fundamental_prompts_use_canonical_horizon_and_market_specific_sources(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',

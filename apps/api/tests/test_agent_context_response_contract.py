@@ -1080,6 +1080,17 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('market and source metadata', suffix)
         self.assertIn('Do not assume every payload is a DART payload', suffix)
 
+    def test_summarizer_contracts_describe_nested_feedback_without_top_level_conflict(self):
+        for role in ('technical-summarizer', 'fundamental-summarizer'):
+            with self.subTest(role=role):
+                suffix = build_contract_prompt_suffix(role=role)
+
+                self.assertIn(
+                    f'For every {role} feedback object, required keys are:',
+                    suffix,
+                )
+                self.assertNotIn('Required top-level keys:', suffix)
+
     def test_short_term_decider_contract_and_normalizer_preserve_tactical_fields(self):
         suffix = build_contract_prompt_suffix(role='short-term-decider')
         self.assertIn('scalp_buy_candidate, watch_for_trigger, avoid_chase, wait, reject', suffix)
