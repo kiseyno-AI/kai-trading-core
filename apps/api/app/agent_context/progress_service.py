@@ -417,6 +417,7 @@ class AgentContextProgressService:
                 'reused_feedback_count',
                 'stale_feedback_count',
                 'failed_items',
+                'failed_symbols_by_role',
             ):
                 if runtime_summary.get(key) is not None:
                     merged[key] = runtime_summary[key]

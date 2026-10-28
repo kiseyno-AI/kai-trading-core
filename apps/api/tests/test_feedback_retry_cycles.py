@@ -45,6 +45,7 @@ from app.agent_context.retry_service import (
     build_weekly_policy_rebind_idempotency_key,
     feedback_retry_run_is_complete_for_weekly_policy_rebind,
     resolve_latest_completed_summary_knowledge_cutoff,
+    resolve_terminal_role_success_intersection,
 )
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
@@ -118,6 +119,59 @@ def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[st
             for stage_id in missing_stage_ids
         ],
         'stages': {},
+    }
+
+
+def _terminal_partial_progress_summary(
+    *,
+    roles: list[str],
+    run_id: str,
+    completed_at: str,
+) -> dict:
+    symbols = ['000660', '005930']
+    failed_role = roles[-1]
+    return {
+        'run_id': run_id,
+        'run_status': 'partial',
+        'run_table_status': 'partial',
+        'is_live': False,
+        'run_completed_at': completed_at,
+        'expected_feedback_count': len(symbols) * len(roles),
+        'completed_feedback_count': len(symbols) * len(roles) - 1,
+        'failed_items': 1,
+        'role_symbol_scopes': {
+            role: list(symbols) for role in roles
+        },
+        'role_symbol_counts': {role: len(symbols) for role in roles},
+        'failed_symbols_by_role': {failed_role: ['005930']},
+        'role_progress': {
+            role: {
+                'role': role,
+                'status': (
+                    'completed_with_failures'
+                    if role == failed_role
+                    else 'completed'
+                ),
+                'boundary_status': (
+                    'completed_with_failures'
+                    if role == failed_role
+                    else 'completed'
+                ),
+                'total_symbols': len(symbols),
+                'processed_symbols': len(symbols),
+                'completed_symbols': (
+                    len(symbols) - 1
+                    if role == failed_role
+                    else len(symbols)
+                ),
+                'terminal_symbols': len(symbols),
+                'failed_items': 1 if role == failed_role else 0,
+                'in_progress_symbols': 0,
+                'pending_symbols': 0,
+                'retry_pending_symbols': 1 if role == failed_role else 0,
+            }
+            for role in roles
+        },
     }
 
 
@@ -1604,6 +1658,356 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 'admitted_symbols': ['000660', '005930'],
             },
         )
+
+    def test_exact_partial_summary_cutoff_uses_terminal_success_intersection(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-partial-summary'
+        admitted_symbols = [f'{index:06d}' for index in range(1, 121)]
+        failed_symbols = admitted_symbols[-3:]
+        technical_role = 'technical-summarizer'
+        role_scopes = {
+            role: list(admitted_symbols)
+            for role in SUMMARIZER_AGENT_NAMES
+        }
+        request_payload = {
+            'mode': DAILY_RETRY_CYCLE_MODE,
+            'roles': list(SUMMARIZER_AGENT_NAMES),
+            'requested_symbols': list(admitted_symbols),
+            'symbols': list(admitted_symbols),
+            'role_symbol_scopes': role_scopes,
+            'role_symbol_counts': {
+                role: len(symbols)
+                for role, symbols in role_scopes.items()
+            },
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'request_run_id': source_run_id,
+            'child_run_lineage': {
+                'schema_version': 'agent_feedback_child_run_lineage_v1',
+                'parent_run_id': source_run_id,
+                'child_link_field': 'parent_run_id',
+            },
+            'admission_knowledge_cutoff_at': cutoff.isoformat(),
+        }
+        role_progress = {
+            role: {
+                'role': role,
+                'status': (
+                    'completed_with_failures'
+                    if role == technical_role
+                    else 'completed'
+                ),
+                'boundary_status': (
+                    'completed_with_failures'
+                    if role == technical_role
+                    else 'completed'
+                ),
+                'total_symbols': 120,
+                'processed_symbols': 120,
+                'completed_symbols': (
+                    117 if role == technical_role else 120
+                ),
+                'terminal_symbols': 120,
+                'failed_items': 3 if role == technical_role else 0,
+                'in_progress_symbols': 0,
+                'pending_symbols': 0,
+                'retry_pending_symbols': (
+                    3 if role == technical_role else 0
+                ),
+            }
+            for role in SUMMARIZER_AGENT_NAMES
+        }
+        progress_summary = {
+            'run_id': source_run_id,
+            'run_status': 'partial',
+            'run_table_status': 'partial',
+            'is_live': False,
+            'run_completed_at': (
+                cutoff + timedelta(minutes=1)
+            ).isoformat(),
+            'expected_feedback_count': 360,
+            'completed_feedback_count': 357,
+            'failed_items': 3,
+            'role_symbol_scopes': role_scopes,
+            'role_symbol_counts': {
+                role: 120 for role in SUMMARIZER_AGENT_NAMES
+            },
+            'failed_symbols_by_role': {
+                technical_role: list(failed_symbols),
+            },
+            'role_progress': role_progress,
+        }
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'partial',
+            'symbols_total': 360,
+            'completed_count': 357,
+            'failed_count': 3,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': request_payload,
+            'summary_payload': {
+                'lifecycle_stage': 'finished',
+                'request': dict(request_payload),
+                'progress_summary': progress_summary,
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                source_run_id=source_run_id,
+                requested_symbols=admitted_symbols,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        completed_symbols = admitted_symbols[:-3]
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['knowledge_cutoff_at'], cutoff)
+        self.assertEqual(result['source_run_id'], source_run_id)
+        self.assertEqual(result['requested_symbols'], completed_symbols)
+        self.assertEqual(
+            result['completed_scope_proof'],
+            {
+                'schema_version': 'completed_summarizer_intersection_v1',
+                'completed_symbols': completed_symbols,
+                'admitted_symbols': admitted_symbols,
+            },
+        )
+
+    def test_exact_partial_summary_cutoff_rejects_inconsistent_failure_partition(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-invalid-partial'
+        roles = list(SUMMARIZER_AGENT_NAMES)
+        request_payload = {
+            'mode': DAILY_RETRY_CYCLE_MODE,
+            'roles': roles,
+            'requested_symbols': ['000660', '005930'],
+            'symbols': ['000660', '005930'],
+            'role_symbol_scopes': {
+                role: ['000660', '005930'] for role in roles
+            },
+            'role_symbol_counts': {role: 2 for role in roles},
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'request_run_id': source_run_id,
+            'admission_knowledge_cutoff_at': cutoff.isoformat(),
+        }
+        technical_role = 'technical-summarizer'
+        progress_summary = {
+            'run_id': source_run_id,
+            'run_status': 'partial',
+            'run_table_status': 'partial',
+            'is_live': False,
+            'run_completed_at': cutoff.isoformat(),
+            'expected_feedback_count': 6,
+            'completed_feedback_count': 5,
+            'failed_items': 1,
+            'role_symbol_scopes': request_payload['role_symbol_scopes'],
+            'role_symbol_counts': request_payload['role_symbol_counts'],
+            # The role count claims one failure, but the exact failed-symbol
+            # partition is absent. Counts alone must never authorize scope.
+            'failed_symbols_by_role': {},
+            'role_progress': {
+                role: {
+                    'role': role,
+                    'status': (
+                        'completed_with_failures'
+                        if role == technical_role
+                        else 'completed'
+                    ),
+                    'boundary_status': (
+                        'completed_with_failures'
+                        if role == technical_role
+                        else 'completed'
+                    ),
+                    'total_symbols': 2,
+                    'processed_symbols': 2,
+                    'completed_symbols': (
+                        1 if role == technical_role else 2
+                    ),
+                    'terminal_symbols': 2,
+                    'failed_items': 1 if role == technical_role else 0,
+                    'in_progress_symbols': 0,
+                    'pending_symbols': 0,
+                    'retry_pending_symbols': (
+                        1 if role == technical_role else 0
+                    ),
+                }
+                for role in roles
+            },
+        }
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'partial',
+            'symbols_total': 6,
+            'completed_count': 5,
+            'failed_count': 1,
+            'completed_at': cutoff,
+            'request_payload': request_payload,
+            'summary_payload': {
+                'lifecycle_stage': 'finished',
+                'request': dict(request_payload),
+                'progress_summary': progress_summary,
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                source_run_id=source_run_id,
+                requested_symbols=['000660', '005930'],
+                now=cutoff + timedelta(minutes=1),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['reason'], 'summary_run_incomplete')
+
+    def test_exact_partial_summary_cutoff_rejects_same_size_progress_scope_swap(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-2026-04-16-scope-swap'
+        roles = list(SUMMARIZER_AGENT_NAMES)
+        admitted_symbols = ['000660', '005930']
+        request_role_scopes = {
+            role: list(admitted_symbols) for role in roles
+        }
+        request_payload = {
+            'mode': DAILY_RETRY_CYCLE_MODE,
+            'roles': roles,
+            'requested_symbols': list(admitted_symbols),
+            'symbols': list(admitted_symbols),
+            'role_symbol_scopes': request_role_scopes,
+            'role_symbol_counts': {role: 2 for role in roles},
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'request_run_id': source_run_id,
+            'admission_knowledge_cutoff_at': cutoff.isoformat(),
+        }
+        progress_summary = _terminal_partial_progress_summary(
+            roles=roles,
+            run_id=source_run_id,
+            completed_at=cutoff.isoformat(),
+        )
+        swapped_role = roles[-1]
+        progress_summary['role_symbol_scopes'][swapped_role] = [
+            '000660',
+            '035420',
+        ]
+        progress_summary['failed_symbols_by_role'][swapped_role] = [
+            '035420'
+        ]
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'partial',
+            'symbols_total': 6,
+            'completed_count': 5,
+            'failed_count': 1,
+            'completed_at': cutoff,
+            'request_payload': request_payload,
+            'summary_payload': {
+                'lifecycle_stage': 'finished',
+                'request': dict(request_payload),
+                'progress_summary': progress_summary,
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                source_run_id=source_run_id,
+                requested_symbols=admitted_symbols,
+                now=cutoff + timedelta(minutes=1),
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['reason'], 'summary_run_incomplete')
+
+    def test_terminal_success_intersection_rejects_completed_run_with_failures(
+        self,
+    ):
+        roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        progress_summary = _terminal_partial_progress_summary(
+            roles=roles,
+            run_id='signal-decider-status-conflict',
+            completed_at='2026-04-16T06:45:00+00:00',
+        )
+        progress_summary['run_status'] = 'completed'
+        progress_summary['run_table_status'] = 'completed'
+
+        result = resolve_terminal_role_success_intersection(
+            progress_summary=progress_summary,
+            roles=roles,
+            expected_role_symbol_scopes={
+                role: ['000660', '005930'] for role in roles
+            },
+        )
+
+        self.assertFalse(result['ready'])
+
+    def test_terminal_success_intersection_rejects_role_status_count_conflict(
+        self,
+    ):
+        roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        progress_summary = _terminal_partial_progress_summary(
+            roles=roles,
+            run_id='signal-decider-role-status-conflict',
+            completed_at='2026-04-16T06:45:00+00:00',
+        )
+        failed_role = roles[-1]
+        progress_summary['role_progress'][failed_role]['status'] = 'completed'
+        progress_summary['role_progress'][failed_role][
+            'boundary_status'
+        ] = 'completed'
+
+        result = resolve_terminal_role_success_intersection(
+            progress_summary=progress_summary,
+            roles=roles,
+            expected_role_symbol_scopes={
+                role: ['000660', '005930'] for role in roles
+            },
+        )
+
+        self.assertFalse(result['ready'])
+
+    def test_terminal_success_intersection_rejects_naive_completed_at(
+        self,
+    ):
+        roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        progress_summary = _terminal_partial_progress_summary(
+            roles=roles,
+            run_id='signal-decider-naive-completed-at',
+            completed_at='2026-04-16T06:45:00',
+        )
+
+        result = resolve_terminal_role_success_intersection(
+            progress_summary=progress_summary,
+            roles=roles,
+            expected_role_symbol_scopes={
+                role: ['000660', '005930'] for role in roles
+            },
+        )
+
+        self.assertFalse(result['ready'])
 
     def test_exact_summary_cutoff_rejects_completed_scope_outside_admitted_parent(
         self,

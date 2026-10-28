@@ -22,6 +22,9 @@ from app.agent_context.prerequisite_service import (
 from app.agent_context.run_state_service import (
     agent_context_feedback_run_state_service,
 )
+from app.agent_context.retry_service import (
+    resolve_latest_completed_summary_knowledge_cutoff,
+)
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
@@ -59,6 +62,7 @@ from app.eod.run_stage_support import (
     is_recoverable_same_day_intraday_watch_expiration,
     outcome_contains_reason,
     pending_same_day_intraday_watch_rearm_marker,
+    validated_nonblocking_partial_progression_marker,
 )
 from app.eod.summary_cutoff_contract import (
     completed_summary_scope_matches_parent,
@@ -303,12 +307,22 @@ def _select_summary_cutoff_proof(
     pipeline_stages: Mapping[str, Any],
     run_metadata: Mapping[str, Any] | None = None,
     eod_stage_progress: Mapping[str, Any],
+    market_date: str | date | None = None,
+    fs_div: str | None = None,
+    parent_symbols: Sequence[object] | None = None,
 ) -> dict[str, Any] | None:
     """Prefer the newest summary and never mask its invalid lineage."""
 
     if 'agent_feedback_summaries' in pipeline_stages:
-        return _summary_cutoff_proof_from_stage(
-            pipeline_stages.get('agent_feedback_summaries')
+        summary_stage = pipeline_stages.get('agent_feedback_summaries')
+        completed_proof = _summary_cutoff_proof_from_stage(summary_stage)
+        if completed_proof is not None:
+            return completed_proof
+        return _partial_summary_cutoff_proof_from_stage(
+            summary_stage,
+            market_date=market_date,
+            fs_div=fs_div,
+            parent_symbols=parent_symbols,
         )
     if (
         isinstance(run_metadata, Mapping)
@@ -340,6 +354,108 @@ def _select_summary_cutoff_proof(
     return _summary_cutoff_proof_from_stage(
         eod_stage_progress.get('agent_feedback_summaries')
     )
+
+
+def _partial_summary_cutoff_proof_from_stage(
+    stage: object,
+    *,
+    market_date: str | date | None,
+    fs_div: str | None,
+    parent_symbols: Sequence[object] | None,
+) -> dict[str, Any] | None:
+    """Resolve one terminal partial summary to its exact success cohort."""
+
+    if not isinstance(stage, Mapping) or market_date is None:
+        return None
+    result_summary = _stage_result_summary(stage)
+    if not (
+        str(stage.get('status') or '').strip().lower() == 'partial'
+        and str(result_summary.get('status') or '').strip().lower()
+        == 'partial'
+    ):
+        return None
+    source_run_ids = (
+        stage.get('source_run_ids')
+        if isinstance(stage.get('source_run_ids'), Mapping)
+        else {}
+    )
+    source_ids = {
+        str(value or '').strip()
+        for value in (
+            source_run_ids.get('agent_feedback_run_id'),
+            source_run_ids.get('run_id'),
+            result_summary.get('run_id'),
+        )
+        if str(value or '').strip()
+    }
+    normalized_fs_div = str(fs_div or '').strip().upper()
+    feedback_scope_mode = str(
+        result_summary.get('feedback_scope_mode') or ''
+    ).strip()
+    if not (
+        len(source_ids) == 1
+        and normalized_fs_div in {'CFS', 'OFS'}
+        and feedback_scope_mode
+        in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and isinstance(parent_symbols, (list, tuple))
+    ):
+        return None
+    normalized_parent_symbols = _dedupe_symbol_codes(parent_symbols)
+    if not (
+        normalized_parent_symbols
+        and normalized_parent_symbols == list(parent_symbols)
+    ):
+        return None
+
+    resolution = resolve_latest_completed_summary_knowledge_cutoff(
+        market_date=market_date,
+        feedback_scope_mode=feedback_scope_mode,
+        fs_div=normalized_fs_div,
+        source_run_id=next(iter(source_ids)),
+        # The exact source run owns its admitted scope. FAST mode may
+        # legitimately be a subset of the pipeline parent; validate that
+        # relationship from the returned versioned proof below.
+        requested_symbols=None,
+    )
+    completed_symbols = resolution.get('requested_symbols')
+    completed_scope_proof = resolution.get('completed_scope_proof')
+    terminal_role_scope_proof = resolution.get(
+        'terminal_role_scope_proof'
+    )
+    knowledge_cutoff_at = resolution.get('knowledge_cutoff_at')
+    if not (
+        resolution.get('ready') is True
+        and isinstance(completed_symbols, list)
+        and completed_symbols
+        and isinstance(terminal_role_scope_proof, Mapping)
+        and completed_summary_scope_matches_parent(
+            feedback_scope_mode=feedback_scope_mode,
+            completed_symbols=completed_symbols,
+            completed_scope_proof=completed_scope_proof,
+            parent_symbols=normalized_parent_symbols,
+        )
+        and isinstance(knowledge_cutoff_at, datetime)
+        and knowledge_cutoff_at.tzinfo is not None
+        and knowledge_cutoff_at.utcoffset() is not None
+    ):
+        return None
+    return {
+        'source_run_id': next(iter(source_ids)),
+        'feedback_scope_mode': feedback_scope_mode,
+        # Re-resolve the exact source in the stage service. The expected
+        # completed cohort prevents any later widening or narrowing.
+        'requested_symbols': None,
+        'expected_completed_symbols': list(completed_symbols),
+        'knowledge_cutoff_at': knowledge_cutoff_at.astimezone(
+            timezone.utc
+        ).isoformat(),
+        'fs_div': normalized_fs_div,
+        'completed_scope_proof': dict(completed_scope_proof),
+        'terminal_role_scope_proof': dict(terminal_role_scope_proof),
+    }
 
 
 def _summary_cutoff_proof_from_run_metadata(
@@ -3970,10 +4086,22 @@ class PykrxBackfillService:
             )
             else {}
         )
+        summary_parent_symbols = (
+            run_metadata.get('symbols')
+            if isinstance(run_metadata.get('symbols'), list)
+            else latest_eod_metadata.get('requested_symbols')
+        )
+        summary_fs_div = (
+            run_metadata.get('fs_div')
+            or latest_eod_metadata.get('fs_div')
+        )
         summary_cutoff_proof = _select_summary_cutoff_proof(
             pipeline_stages=stage_rows,
             run_metadata=run_metadata,
             eod_stage_progress=latest_eod_stage_progress,
+            market_date=market_date,
+            fs_div=summary_fs_div,
+            parent_symbols=summary_parent_symbols,
         )
         if (
             'agent_feedback_summaries' in stage_rows
@@ -4052,10 +4180,61 @@ class PykrxBackfillService:
         if not recovery_scope:
             return None
 
+        pipeline_status = str(
+            pipeline_run.get('status') or ''
+        ).strip().lower()
+        resolved_stage_list = list(
+            run_metadata.get('resolved_stages') or []
+        )
+        persisted_recovery_result: dict[str, Any] = {
+            'status': pipeline_status,
+            'pipeline_run_id': pipeline_run.get('id'),
+            'pipeline_run': dict(pipeline_run),
+            'market_date': pipeline_run.get('market_date'),
+            'resolved_stages': resolved_stage_list,
+            'stages': stage_rows,
+        }
+        persisted_nonblocking_marker = (
+            validated_nonblocking_partial_progression_marker(
+                persisted_recovery_result,
+                expected_eod_collection_run_id=int(
+                    latest_eod_run['id']
+                ),
+            )
+            if pipeline_run.get('trigger')
+            == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            and type(latest_eod_run.get('id')) is int
+            else None
+        )
         outcome_is_satisfied = (
             daily_pipeline_prefix_outcome_is_satisfied
             if terminal_continuation_marker_is_valid(run_metadata)
             else daily_pipeline_outcome_is_satisfied
+        )
+        partial_summary_prefix_proven = bool(
+            isinstance(
+                stage_rows.get('agent_feedback_summaries'), Mapping
+            )
+            and str(
+                stage_rows['agent_feedback_summaries'].get('status') or ''
+            ).strip().lower()
+            == 'partial'
+            and isinstance(summary_cutoff_proof, Mapping)
+            and isinstance(
+                summary_cutoff_proof.get('completed_scope_proof'),
+                Mapping,
+            )
+            and isinstance(
+                summary_cutoff_proof.get('terminal_role_scope_proof'),
+                Mapping,
+            )
+            and isinstance(
+                summary_cutoff_proof.get('expected_completed_symbols'),
+                list,
+            )
+            and bool(
+                summary_cutoff_proof.get('expected_completed_symbols')
+            )
         )
         incomplete_stages = []
         for stage_id in recovery_scope:
@@ -4065,6 +4244,11 @@ class PykrxBackfillService:
                 if isinstance(stage, Mapping)
                 else {}
             )
+            if (
+                stage_id == 'agent_feedback_summaries'
+                and partial_summary_prefix_proven
+            ):
+                continue
             if (
                 recoverable_same_day_expiration
                 or not outcome_is_satisfied(stage_outcome)
@@ -4102,7 +4286,6 @@ class PykrxBackfillService:
             )
         ):
             incomplete_stages.insert(0, ordering_repair_stage)
-        pipeline_status = str(pipeline_run.get('status') or '').strip().lower()
         downstream_resume_from_stage = str(
             latest_eod_metadata.get('downstream_retry_resume_from_stage') or ''
         ).strip()
@@ -4129,24 +4312,41 @@ class PykrxBackfillService:
             )
         ):
             incomplete_stages.insert(0, downstream_resume_from_stage)
+        if persisted_nonblocking_marker is not None:
+            # A crash can occur after the suffix run is finalized but before
+            # its proof is copied to the EOD ancestor. Reconcile that exact
+            # durable proof instead of rerunning a partial decider.
+            incomplete_stages.clear()
         if not incomplete_stages:
             is_followup_recovery_parent = bool(
                 pipeline_run.get('trigger')
                 == AUTO_FOLLOWUP_RECOVERY_TRIGGER
             )
-            convergence_kwargs: dict[str, Any] = {
-                'pipeline_run_id': int(pipeline_run['id']),
-            }
-            if is_followup_recovery_parent:
-                convergence_kwargs['allow_satisfied_terminal'] = True
-            pipeline_convergence = (
-                daily_pipeline_run_state_service
-                .converge_terminal_stages_run(**convergence_kwargs)
-            )
+            if persisted_nonblocking_marker is not None:
+                pipeline_convergence = {
+                    'updated': False,
+                    'pipeline_run_id': pipeline_run.get('id'),
+                    'status': 'partial',
+                    'reason': (
+                        'validated_nonblocking_partial_progression'
+                    ),
+                }
+            else:
+                convergence_kwargs: dict[str, Any] = {
+                    'pipeline_run_id': int(pipeline_run['id']),
+                }
+                if is_followup_recovery_parent:
+                    convergence_kwargs['allow_satisfied_terminal'] = True
+                pipeline_convergence = (
+                    daily_pipeline_run_state_service
+                    .converge_terminal_stages_run(**convergence_kwargs)
+                )
             pipeline_parent_finalized = bool(
                 pipeline_convergence.get('updated')
                 or pipeline_convergence.get('reason')
                 == 'already_non_resumable'
+                or pipeline_convergence.get('reason')
+                == 'validated_nonblocking_partial_progression'
             )
             if not pipeline_parent_finalized:
                 return None
@@ -4156,14 +4356,19 @@ class PykrxBackfillService:
                 converged_status = str(
                     pipeline_convergence.get('status') or pipeline_status
                 ).strip().lower()
-                convergence_result: dict[str, Any] = {
-                    # Persisted terminal stage rows remain sufficient for the
-                    # legacy non-rearm convergence path.  A pending rearm
-                    # marker alone requires the full exact PITR proof below.
-                    'status': 'completed',
-                    'pipeline_run_id': pipeline_run.get('id'),
-                    'pipeline_status': pipeline_status,
-                }
+                convergence_result: dict[str, Any] = (
+                    persisted_recovery_result
+                    if persisted_nonblocking_marker is not None
+                    else {
+                        # Persisted terminal stage rows remain sufficient for
+                        # the legacy non-rearm convergence path. A pending
+                        # rearm marker alone requires the full exact PITR
+                        # proof below.
+                        'status': 'completed',
+                        'pipeline_run_id': pipeline_run.get('id'),
+                        'pipeline_status': pipeline_status,
+                    }
+                )
                 if pending_same_day_rearm is not None:
                     convergence_result.update(
                         {
@@ -5125,6 +5330,16 @@ class PykrxBackfillService:
                 )
             )
         pipeline_run_id = recovery_result.get('pipeline_run_id')
+        nonblocking_partial_marker = (
+            validated_nonblocking_partial_progression_marker(
+                recovery_result,
+                expected_eod_collection_run_id=int(
+                    latest_eod_run['id']
+                ),
+            )
+            if type(latest_eod_run.get('id')) is int
+            else None
+        )
         if (
             terminal_rearm_expiry_block is not None
         ):
@@ -5133,6 +5348,17 @@ class PykrxBackfillService:
                 'pipeline_run_id': pipeline_run_id,
                 'status': recovery_result.get('status'),
                 'reason': 'same_day_intraday_watch_rearm_terminal_expiry',
+            }
+        elif nonblocking_partial_marker is not None:
+            # The shared validator proves that every failed role/symbol pair
+            # was excluded before plan and evaluation. The run remains
+            # truthfully partial, so the generic completed-only convergence
+            # helper must not be used here.
+            pipeline_convergence = {
+                'updated': False,
+                'pipeline_run_id': pipeline_run_id,
+                'status': 'partial',
+                'reason': 'validated_nonblocking_partial_progression',
             }
         elif (
             pipeline_run_id is not None
@@ -5156,6 +5382,8 @@ class PykrxBackfillService:
             pipeline_convergence.get('updated')
             or pipeline_convergence.get('reason')
             == 'already_non_resumable'
+            or pipeline_convergence.get('reason')
+            == 'validated_nonblocking_partial_progression'
         )
         if terminal_rearm_expiry_block is not None:
             convergence = {
@@ -5470,7 +5698,20 @@ class PykrxBackfillService:
                 'updated': False,
                 'reason': 'same_day_intraday_watch_rearm_not_completed',
             }
-        if not daily_pipeline_outcome_is_satisfied(recovery_result):
+        nonblocking_partial_marker = (
+            validated_nonblocking_partial_progression_marker(
+                recovery_result,
+                expected_eod_collection_run_id=int(
+                    latest_eod_run['id']
+                ),
+            )
+            if type(latest_eod_run.get('id')) is int
+            else None
+        )
+        if not (
+            daily_pipeline_outcome_is_satisfied(recovery_result)
+            or nonblocking_partial_marker is not None
+        ):
             return {'updated': False, 'reason': 'recovery_not_completed'}
 
         downstream_retry_symbols = _dedupe_symbol_codes(
@@ -5516,6 +5757,17 @@ class PykrxBackfillService:
                 'followup_recovery_required': False,
             }
         )
+        if nonblocking_partial_marker is not None:
+            metadata.update(
+                {
+                    'nonblocking_partial_progression': deepcopy(
+                        nonblocking_partial_marker
+                    ),
+                    'nonblocking_feedback_retry_debt': deepcopy(
+                        nonblocking_partial_marker['retry_debt']
+                    ),
+                }
+            )
         run_id = int(latest_eod_run['id'])
         symbols_total = max(int(latest_eod_run.get('symbols_total') or 0), 0)
         symbols_succeeded = max(

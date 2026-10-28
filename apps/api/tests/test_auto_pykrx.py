@@ -20,7 +20,7 @@ from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import (
     OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION,
 )
-from app.core.settings import Settings
+from app.core.settings import Settings, settings
 from app.eod.auto_pykrx import (
     AutoPykrxEODScheduler,
     RecoveryOnlyScheduleDisposition,
@@ -1135,6 +1135,105 @@ class PykrxBackfillServiceTests(TestCase):
                 eod_stage_progress={
                     'agent_feedback_summaries': eod_summary,
                 },
+            )
+        )
+
+    def test_partial_summary_proof_resolves_only_exact_success_intersection(
+        self,
+    ) -> None:
+        cutoff_at = datetime(
+            2026,
+            4,
+            3,
+            8,
+            0,
+            tzinfo=timezone.utc,
+        )
+        parent_symbols = ['000660', '005930', '035420']
+        completed_scope_proof = {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': ['000660'],
+            'admitted_symbols': ['000660', '005930'],
+        }
+        terminal_scope_proof = {
+            'schema_version': 'terminal_role_success_intersection_v1',
+            'failed_symbols_by_role': {
+                'eod-summarizer': [],
+                'technical-summarizer': ['005930'],
+                'fundamental-summarizer': [],
+            },
+            'total_items': 6,
+            'completed_items': 5,
+            'failed_items': 1,
+        }
+        stage = {
+            'status': 'partial',
+            'source_run_ids': {'run_id': 'summary-partial'},
+            'result_summary': {
+                'status': 'partial',
+                'run_id': 'summary-partial',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+            },
+        }
+        resolution = {
+            'ready': True,
+            'source_run_id': 'summary-partial',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'knowledge_cutoff_at': cutoff_at,
+            'requested_symbols': ['000660'],
+            'completed_scope_proof': completed_scope_proof,
+            'terminal_role_scope_proof': terminal_scope_proof,
+        }
+
+        with patch(
+            'app.eod.pykrx_backfill.'
+            'resolve_latest_completed_summary_knowledge_cutoff',
+            return_value=resolution,
+        ) as resolve_cutoff:
+            proof = _select_summary_cutoff_proof(
+                pipeline_stages={
+                    'agent_feedback_summaries': stage,
+                },
+                eod_stage_progress={},
+                market_date='2026-04-03',
+                fs_div='CFS',
+                parent_symbols=parent_symbols,
+            )
+
+        self.assertEqual(
+            proof,
+            {
+                'source_run_id': 'summary-partial',
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'requested_symbols': None,
+                'expected_completed_symbols': ['000660'],
+                'knowledge_cutoff_at': cutoff_at.isoformat(),
+                'fs_div': 'CFS',
+                'completed_scope_proof': completed_scope_proof,
+                'terminal_role_scope_proof': terminal_scope_proof,
+            },
+        )
+        resolve_cutoff.assert_called_once_with(
+            market_date='2026-04-03',
+            feedback_scope_mode='decider_scope_fast_path',
+            fs_div='CFS',
+            source_run_id='summary-partial',
+            requested_symbols=None,
+        )
+
+        conflicting = deepcopy(stage)
+        conflicting['source_run_ids']['agent_feedback_run_id'] = (
+            'different-summary'
+        )
+        self.assertIsNone(
+            _select_summary_cutoff_proof(
+                pipeline_stages={
+                    'agent_feedback_summaries': conflicting,
+                },
+                eod_stage_progress={},
+                market_date='2026-04-03',
+                fs_div='CFS',
+                parent_symbols=parent_symbols,
             )
         )
 
@@ -3567,6 +3666,114 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             resume_stages.call_args.kwargs['symbols'],
             ['005930', '000660'],
+        )
+
+    def test_finalized_nonblocking_partial_suffix_reconciles_without_replay(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        marker = {
+            'schema_version': 'nonblocking_partial_progression_v1',
+            'proof_digest': 'validated-by-shared-contract',
+            'retry_debt': {
+                'schema_version': 'nonblocking_feedback_retry_debt_v1',
+                'items': [
+                    {
+                        'stage': 'agent_feedback_summaries',
+                        'role': 'technical-summarizer',
+                        'symbol': '028050',
+                    }
+                ],
+            },
+        }
+        resolved_stages = [
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        stage_rows = {
+            'signal_decider': {'status': 'partial'},
+            'next_open_execution_plan': {'status': 'completed'},
+            'signal_decider_evaluations': {'status': 'completed'},
+        }
+        pipeline_run = {
+            'id': 596,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'partial',
+            'market_date': '2026-10-28',
+            'current_stage': 'signal_decider_evaluations',
+            'completed_at': '2026-10-28T23:15:00+00:00',
+            'run_metadata': {
+                'resolved_stages': resolved_stages,
+                'reused_eod_collection_run_id': 582,
+                'resumable': False,
+                'nonblocking_partial_progression': marker,
+            },
+            'stages': stage_rows,
+        }
+        latest_eod_run = {
+            'id': 582,
+            'trade_date': '2026-10-28',
+            'status': 'completed_with_errors',
+            'symbols_total': 1,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'followup_recovery_required': True,
+                'downstream_retry_symbols': ['005930'],
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'validated_nonblocking_partial_progression_marker',
+                return_value=marker,
+            ) as validate_marker,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run'
+            ) as converge_pipeline,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as replay_stages,
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+                return_value={'updated': True, 'status': 'partial'},
+            ) as persist_recovery,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-10-28',
+                latest_available_trade_date='2026-10-28',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI', 'KOSDAQ'),
+            )
+
+        self.assertEqual(result['reason'], 'followup_recovery_state_converged')
+        validate_marker.assert_called_once_with(
+            {
+                'status': 'partial',
+                'pipeline_run_id': 596,
+                'pipeline_run': pipeline_run,
+                'market_date': '2026-10-28',
+                'resolved_stages': resolved_stages,
+                'stages': stage_rows,
+            },
+            expected_eod_collection_run_id=582,
+        )
+        converge_pipeline.assert_not_called()
+        replay_stages.assert_not_called()
+        persist_recovery.assert_called_once()
+        self.assertEqual(
+            persist_recovery.call_args.kwargs['recovery_result']['stages'],
+            stage_rows,
         )
 
     def test_point_in_time_followup_recovers_membership_from_retry_lineage(
@@ -6244,6 +6451,79 @@ class PykrxBackfillServiceTests(TestCase):
         )
         complete_eod_run.assert_not_called()
         update_eod_run.assert_not_called()
+
+    def test_validated_nonblocking_partial_recovery_preserves_retry_debt(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        marker = {
+            'schema_version': 'nonblocking_partial_progression_v1',
+            'proof_digest': 'validated-by-shared-contract',
+            'retry_debt': {
+                'schema_version': 'nonblocking_feedback_retry_debt_v1',
+                'items': [
+                    {
+                        'stage': 'agent_feedback_summaries',
+                        'role': 'technical-summarizer',
+                        'symbol': '028050',
+                    }
+                ],
+            },
+        }
+        latest_eod_run = {
+            'id': 582,
+            'trade_date': '2026-10-28',
+            'status': 'completed_with_errors',
+            'symbols_total': 1,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'requested_symbols': ['005930'],
+                'failed_symbols': [],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': ['005930'],
+                'downstream_retry_symbols_count': 1,
+                'followup_recovery_required': True,
+            },
+        }
+        recovery_result = {'status': 'partial', 'pipeline_run_id': 596}
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.'
+                'validated_nonblocking_partial_progression_marker',
+                return_value=marker,
+            ) as validate_marker,
+            patch(
+                'app.eod.pykrx_backfill.count_eod_run_persisted_symbols',
+                return_value=1,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=['005930'],
+            ),
+            patch(
+                'app.eod.pykrx_backfill.complete_eod_collection_run'
+            ) as complete_eod_run,
+        ):
+            result = service._persist_successful_followup_recovery(
+                latest_eod_run=latest_eod_run,
+                recovery_result=recovery_result,
+            )
+
+        validate_marker.assert_called_once_with(
+            recovery_result,
+            expected_eod_collection_run_id=582,
+        )
+        self.assertEqual(result['status'], 'completed')
+        metadata = complete_eod_run.call_args.kwargs['run_metadata']
+        self.assertEqual(metadata['nonblocking_partial_progression'], marker)
+        self.assertEqual(
+            metadata['nonblocking_feedback_retry_debt'],
+            marker['retry_debt'],
+        )
+        self.assertFalse(metadata['followup_recovery_required'])
+        self.assertEqual(metadata['downstream_retry_symbols'], [])
 
     def test_successful_followup_recovery_clears_downstream_resume_provenance(
         self,
@@ -17563,7 +17843,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             RecoveryOnlyScheduleDisposition.DUE_BLOCKED,
         )
 
-    async def test_preopen_recovery_inspection_never_starts_pipeline(
+    async def test_preopen_recovery_starts_exact_previous_session_pipeline(
         self,
     ) -> None:
         scheduler = AutoPykrxEODScheduler()
@@ -17596,6 +17876,85 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
                 'run_daily_pipeline_if_due',
                 return_value={'status': 'completed'},
             ) as run_daily,
+            patch(
+                'app.eod.auto_pykrx.async_previous_krx_trading_date',
+                new=AsyncMock(
+                    side_effect=[
+                        date(2026, 9, 11),
+                        date(2026, 9, 10),
+                        date(2026, 9, 9),
+                        date(2026, 9, 8),
+                        date(2026, 9, 11),
+                    ]
+                ),
+            ),
+        ):
+            disposition = await scheduler.schedule_recovery_if_due(
+                expected_market_state='PREOPEN'
+            )
+            self.assertIsNotNone(scheduler._task)
+            await scheduler._task
+
+        self.assertEqual(
+            disposition,
+            RecoveryOnlyScheduleDisposition.DUE_STARTED,
+        )
+        self.assertFalse(scheduler.state.active_task)
+        self.assertEqual(scheduler.snapshot()['last_status'], 'completed')
+        run_daily.assert_called_once_with(
+            market_date='2026-09-11',
+            markets=('KOSPI', 'KOSDAQ'),
+            trigger='auto_close_scheduler',
+            refresh_universe=settings.eod_auto_pykrx_refresh_universe,
+            point_in_time_recovery=True,
+            recovery_eod_run_id=73,
+        )
+
+    async def test_preopen_recovery_keeps_older_than_previous_session_blocked(
+        self,
+    ) -> None:
+        scheduler = AutoPykrxEODScheduler()
+        market = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-09-14T08:00:00+09:00',
+            session_open_at='2026-09-14T09:00:00+09:00',
+            session_close_at='2026-09-14T15:30:00+09:00',
+            latest_valid_trading_date='2026-09-11',
+        )
+
+        with (
+            patch(
+                'app.eod.auto_pykrx.async_get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.eod.auto_pykrx.'
+                'load_oldest_outstanding_auto_eod_recovery_target',
+                return_value=AutoEODRecoveryTarget(
+                    trade_date='2026-09-10',
+                    eod_run_id=72,
+                ),
+            ),
+            patch(
+                'app.eod.auto_pykrx.async_previous_krx_trading_date',
+                new=AsyncMock(
+                    side_effect=[
+                        date(2026, 9, 11),
+                        date(2026, 9, 10),
+                        date(2026, 9, 9),
+                        date(2026, 9, 8),
+                        date(2026, 9, 11),
+                    ]
+                ),
+            ),
+            patch.object(
+                scheduler,
+                '_run_scheduled_daily_pipeline',
+                new=AsyncMock(return_value=None),
+            ) as run_pipeline,
         ):
             disposition = await scheduler.schedule_recovery_if_due(
                 expected_market_state='PREOPEN'
@@ -17606,13 +17965,11 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             RecoveryOnlyScheduleDisposition.DUE_BLOCKED,
         )
         self.assertIsNone(scheduler._task)
-        self.assertFalse(scheduler.state.active_task)
-        self.assertEqual(scheduler.snapshot()['last_status'], 'blocked')
+        run_pipeline.assert_not_awaited()
         self.assertEqual(
             scheduler.snapshot()['last_reason'],
             'older_recovery_debt_pending',
         )
-        run_daily.assert_not_called()
 
     async def test_daily_scheduler_never_starts_recovery_during_preopen(self) -> None:
         scheduler = AutoPykrxEODScheduler()

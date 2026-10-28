@@ -11,6 +11,7 @@ from app.agent_context.retry_service import (
     FeedbackRetryCycleConfig,
     agent_feedback_retry_service,
     resolve_latest_completed_summary_knowledge_cutoff,
+    resolve_terminal_role_success_intersection,
 )
 from app.agent_context.prerequisite_service import (
     FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
@@ -63,11 +64,16 @@ from app.eod.pykrx_pipeline_runner import (
 )
 from app.eod.run_stage_support import (
     EXPIRED_DECISION_REPLAY_STAGE_IDS,
+    build_nonblocking_downstream_scope_proof,
+    NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION,
+    NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
+    admits_previous_session_preopen_auto_recovery,
     admits_same_day_intraday_watch_continuation,
     build_expired_decision_replay_result,
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
     is_exact_auto_pitr_intraday_watch_recovery_request,
+    nonblocking_partial_progression_digest,
 )
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.eod.technical_snapshots import daily_technical_snapshot_service
@@ -793,6 +799,53 @@ class DailyPipelineStageService:
                 allow_existing_recovery_resume=(
                     intraday_watch_rearm_resume_candidate
                 ),
+            )
+        )
+        previous_session_preopen_candidate = bool(
+            trigger == 'auto_eod_followup_resume'
+            and point_in_time_recovery is True
+            and force is False
+            and reuse_existing_feedback is True
+            and provider_admission_fence_owned is True
+            and existing_pipeline_run_id is None
+            and tuple(resolved_stages)
+            in {
+                (
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ),
+                (
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ),
+            }
+        )
+        previous_session_preopen_market = (
+            get_market_state()
+            if previous_session_preopen_candidate
+            else None
+        )
+        allow_previous_session_preopen_recovery = bool(
+            previous_session_preopen_candidate
+            and admits_previous_session_preopen_auto_recovery(
+                market_date=resolved_market_date,
+                market=previous_session_preopen_market,
+                trigger=trigger,
+                point_in_time_recovery=point_in_time_recovery,
+                reused_eod_collection_run_id=(
+                    reused_eod_collection_run_id
+                ),
+                force=force,
+                reuse_existing_feedback=reuse_existing_feedback,
+                resume_from_stage=resume_from_stage,
+                resolved_stages=resolved_stages,
+                provider_admission_fence_owned=(
+                    provider_admission_fence_owned
+                ),
+                existing_pipeline_run_id=existing_pipeline_run_id,
             )
         )
         if (
@@ -1597,6 +1650,9 @@ class DailyPipelineStageService:
                     'same_day_intraday_watch_continuation_admitted': (
                         allow_same_day_intraday_watch_continuation
                     ),
+                    'previous_session_preopen_recovery_admitted': (
+                        allow_previous_session_preopen_recovery
+                    ),
                     **(
                         {
                             'summary_cutoff_contract_repair_version': (
@@ -1672,6 +1728,34 @@ class DailyPipelineStageService:
             if stage_id in handled:
                 continue
             stage_symbols = resolved_symbols
+            terminal_decider_symbols = (
+                self._terminal_decider_completed_symbols(
+                    stage_outcomes.get('signal_decider'),
+                    expected_decider_symbols=(
+                        feedback_cutoff_resolution.get(
+                            'requested_symbols'
+                        )
+                        if isinstance(
+                            feedback_cutoff_resolution,
+                            dict,
+                        )
+                        else None
+                    ),
+                    feedback_cutoff_resolution=(
+                        feedback_cutoff_resolution
+                    ),
+                )
+                if stage_id in {
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                }
+                else None
+            )
+            if (
+                stage_id == 'signal_decider_evaluations'
+                and terminal_decider_symbols
+            ):
+                stage_symbols = list(terminal_decider_symbols)
             if (
                 stage_id == 'signal_decider'
                 and isinstance(feedback_cutoff_resolution, dict)
@@ -1736,7 +1820,7 @@ class DailyPipelineStageService:
                     pipeline_run_id=pipeline_run_id,
                     stage_id=stage_id,
                     market_date=resolved_market_date,
-                    symbols=resolved_symbols,
+                    symbols=stage_symbols,
                 )
             except Exception as exc:
                 self._finish_run_after_stage_start_failure(
@@ -1752,6 +1836,26 @@ class DailyPipelineStageService:
                     stage_outcomes.get(dependency)
                 )
             ]
+            if (
+                stage_id == 'signal_decider'
+                and 'agent_feedback_summaries' in incomplete_dependencies
+                and self._partial_summary_dependency_is_proven(
+                    outcome=stage_outcomes.get(
+                        'agent_feedback_summaries'
+                    ),
+                    cutoff_resolution=feedback_cutoff_resolution,
+                    parent_symbols=resolved_symbols,
+                )
+            ):
+                incomplete_dependencies.remove(
+                    'agent_feedback_summaries'
+                )
+            if (
+                stage_id == 'signal_decider_evaluations'
+                and 'signal_decider' in incomplete_dependencies
+                and terminal_decider_symbols
+            ):
+                incomplete_dependencies.remove('signal_decider')
             if incomplete_dependencies and stage_id != 'next_open_execution_plan':
                 stage_result = {
                     'triggered': False,
@@ -1774,7 +1878,7 @@ class DailyPipelineStageService:
                 decider_status = str((decider_outcome or {}).get('status') or '').strip().lower()
                 if decider_outcome is not None and not self._dependency_outcome_is_satisfied(
                     decider_outcome
-                ):
+                ) and not terminal_decider_symbols:
                     stage_result = {
                         'triggered': False,
                         'status': 'blocked',
@@ -2198,6 +2302,9 @@ class DailyPipelineStageService:
                             allow_same_day_intraday_watch_continuation=(
                                 allow_same_day_intraday_watch_continuation
                             ),
+                            allow_previous_session_preopen_recovery=(
+                                allow_previous_session_preopen_recovery
+                            ),
                             provider_admission_fence_owned=(
                                 provider_admission_fence_owned
                             ),
@@ -2284,9 +2391,9 @@ class DailyPipelineStageService:
                 if (
                     stage_id == 'agent_feedback_summaries'
                     and 'signal_decider' in resolved_stages
-                    and self._dependency_outcome_is_satisfied(
-                        stage_outcomes[stage_id]
-                    )
+                    and str(
+                        stage_outcomes[stage_id].get('status') or ''
+                    ).strip().lower() in {'completed', 'partial'}
                 ):
                     summary_source_run_id = str(
                         stage_result.get('run_id') or ''
@@ -2446,6 +2553,28 @@ class DailyPipelineStageService:
                 feedback_cutoff_resolution,
             ),
         }
+        nonblocking_partial_progression = (
+            self._build_nonblocking_partial_progression_marker(
+                market_date=resolved_market_date,
+                pipeline_run_id=pipeline_run_id,
+                reused_eod_collection_run_id=(
+                    reused_eod_collection_run_id
+                ),
+                trigger=trigger,
+                stage_outcomes=stage_outcomes,
+                feedback_cutoff_resolution=feedback_cutoff_resolution,
+            )
+        )
+        if nonblocking_partial_progression is not None:
+            overall_status = 'partial'
+            run_metadata.update(
+                {
+                    'nonblocking_partial_progression': (
+                        nonblocking_partial_progression
+                    ),
+                    'resumable': False,
+                }
+            )
         if overall_status == 'partial' and all(
             daily_pipeline_outcome_is_satisfied(outcome)
             for outcome in stage_outcomes.values()
@@ -2466,6 +2595,238 @@ class DailyPipelineStageService:
             'status': overall_status,
             'stages': stage_outcomes,
         }
+
+    @staticmethod
+    def _build_nonblocking_partial_progression_marker(
+        *,
+        market_date: str,
+        pipeline_run_id: int,
+        reused_eod_collection_run_id: int | None,
+        trigger: str,
+        stage_outcomes: Mapping[str, dict[str, Any]],
+        feedback_cutoff_resolution: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Build proof that isolated feedback failures were excluded."""
+
+        if not (
+            trigger == 'auto_eod_followup_resume'
+            and type(pipeline_run_id) is int
+            and pipeline_run_id > 0
+            and type(reused_eod_collection_run_id) is int
+            and reused_eod_collection_run_id > 0
+            and isinstance(feedback_cutoff_resolution, Mapping)
+            and feedback_cutoff_resolution.get('ready') is True
+        ):
+            return None
+
+        completed_scope_proof = feedback_cutoff_resolution.get(
+            'completed_scope_proof'
+        )
+        completed_summary_symbols = feedback_cutoff_resolution.get(
+            'requested_symbols'
+        )
+        if not (
+            isinstance(completed_summary_symbols, list)
+            and completed_summary_symbols
+            and completed_summary_scope_matches_parent(
+                feedback_scope_mode=feedback_cutoff_resolution.get(
+                    'feedback_scope_mode'
+                ),
+                completed_symbols=completed_summary_symbols,
+                completed_scope_proof=completed_scope_proof,
+                parent_symbols=None,
+            )
+        ):
+            return None
+        summary_admitted_symbols = list(
+            completed_scope_proof['admitted_symbols']
+        )
+        summary_terminal_proof = feedback_cutoff_resolution.get(
+            'terminal_role_scope_proof'
+        )
+        summary_failed_symbols_by_role = {
+            role: [] for role in SUMMARIZER_AGENT_NAMES
+        }
+        if isinstance(summary_terminal_proof, Mapping):
+            raw_summary_failures = summary_terminal_proof.get(
+                'failed_symbols_by_role'
+            )
+            if not (
+                summary_terminal_proof.get('schema_version')
+                == 'terminal_role_success_intersection_v1'
+                and isinstance(raw_summary_failures, Mapping)
+                and set(raw_summary_failures)
+                == set(SUMMARIZER_AGENT_NAMES)
+            ):
+                return None
+            summary_failed_symbols_by_role = {
+                role: list(raw_summary_failures[role])
+                for role in SUMMARIZER_AGENT_NAMES
+            }
+        summary_failed_symbols = set().union(
+            *(
+                set(symbols)
+                for symbols in summary_failed_symbols_by_role.values()
+            )
+        )
+        if set(completed_summary_symbols) != (
+            set(summary_admitted_symbols) - summary_failed_symbols
+        ):
+            return None
+
+        decider_proof = (
+            DailyPipelineStageService._terminal_decider_progression_proof(
+                stage_outcomes.get('signal_decider'),
+                expected_decider_symbols=completed_summary_symbols,
+                feedback_cutoff_resolution=feedback_cutoff_resolution,
+            )
+        )
+        if not isinstance(decider_proof, Mapping):
+            return None
+        decider_failed_symbols_by_role = decider_proof.get(
+            'failed_symbols_by_role'
+        )
+        if not (
+            isinstance(decider_failed_symbols_by_role, Mapping)
+            and set(decider_failed_symbols_by_role)
+            == set(DECISION_SUPPORT_AGENT_NAMES)
+        ):
+            return None
+        decider_failed_symbols_by_role = {
+            role: list(decider_failed_symbols_by_role[role])
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        actionable_symbols = list(decider_proof['completed_symbols'])
+        plan_outcome = stage_outcomes.get('next_open_execution_plan')
+        evaluation_outcome = stage_outcomes.get(
+            'signal_decider_evaluations'
+        )
+        plan_scope_proof = build_nonblocking_downstream_scope_proof(
+            'next_open_execution_plan',
+            (plan_outcome or {}).get('result'),
+        )
+        evaluation_scope_proof = (
+            build_nonblocking_downstream_scope_proof(
+                'signal_decider_evaluations',
+                (evaluation_outcome or {}).get('result'),
+            )
+        )
+        if not (
+            str((plan_outcome or {}).get('status') or '').strip().lower()
+            == 'completed'
+            and str(
+                (evaluation_outcome or {}).get('status') or ''
+            ).strip().lower()
+            == 'completed'
+            and actionable_symbols
+            and isinstance(plan_scope_proof, Mapping)
+            and isinstance(evaluation_scope_proof, Mapping)
+            and evaluation_scope_proof.get('requested_symbols')
+            == actionable_symbols
+            and set(plan_scope_proof.get('active_symbols') or [])
+            <= set(actionable_symbols)
+            and (
+                summary_failed_symbols
+                or any(decider_failed_symbols_by_role.values())
+            )
+        ):
+            return None
+
+        cutoff_at = feedback_cutoff_resolution.get(
+            'knowledge_cutoff_at'
+        )
+        if not isinstance(cutoff_at, datetime):
+            try:
+                cutoff_at = datetime.fromisoformat(str(cutoff_at or ''))
+            except ValueError:
+                return None
+        if cutoff_at.tzinfo is None or cutoff_at.utcoffset() is None:
+            return None
+        cutoff_at = cutoff_at.astimezone(timezone.utc)
+
+        marker: dict[str, Any] = {
+            'schema_version': (
+                NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION
+            ),
+            'blocking_status': 'non_blocking',
+            'market_date': market_date,
+            'pipeline_run_id': pipeline_run_id,
+            'reused_eod_collection_run_id': (
+                reused_eod_collection_run_id
+            ),
+            'summary': {
+                'source_run_id': str(
+                    feedback_cutoff_resolution.get('source_run_id') or ''
+                ).strip(),
+                'knowledge_cutoff_at': cutoff_at.isoformat(),
+                'feedback_scope_mode': str(
+                    feedback_cutoff_resolution.get(
+                        'feedback_scope_mode'
+                    )
+                    or ''
+                ).strip(),
+                'admitted_symbols': summary_admitted_symbols,
+                'completed_symbols': list(completed_summary_symbols),
+                'failed_symbols_by_role': (
+                    summary_failed_symbols_by_role
+                ),
+                'total_items': summary_terminal_proof.get(
+                    'total_items'
+                ) if isinstance(summary_terminal_proof, Mapping) else (
+                    len(summary_admitted_symbols)
+                    * len(SUMMARIZER_AGENT_NAMES)
+                ),
+                'completed_items': summary_terminal_proof.get(
+                    'completed_items'
+                ) if isinstance(summary_terminal_proof, Mapping) else (
+                    len(summary_admitted_symbols)
+                    * len(SUMMARIZER_AGENT_NAMES)
+                ),
+                'failed_items': summary_terminal_proof.get(
+                    'failed_items'
+                ) if isinstance(summary_terminal_proof, Mapping) else 0,
+            },
+            'decider': {
+                'source_run_id': decider_proof['source_run_id'],
+                'source_summary_run_id': decider_proof[
+                    'source_summary_run_id'
+                ],
+                'admitted_symbols': list(
+                    decider_proof['admitted_symbols']
+                ),
+                'completed_symbols': actionable_symbols,
+                'failed_symbols_by_role': (
+                    decider_failed_symbols_by_role
+                ),
+                'total_items': decider_proof['total_items'],
+                'completed_items': decider_proof['completed_items'],
+                'failed_items': decider_proof['failed_items'],
+            },
+            'downstream': {
+                'plan_status': 'completed',
+                'evaluation_status': 'completed',
+                'actionable_symbols': actionable_symbols,
+                'plan_scope_proof': plan_scope_proof,
+                'evaluation_scope_proof': evaluation_scope_proof,
+            },
+            'retry_debt': {
+                'schema_version': (
+                    NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION
+                ),
+                'summary_failed_symbols_by_role': (
+                    summary_failed_symbols_by_role
+                ),
+                'decider_failed_symbols_by_role': (
+                    decider_failed_symbols_by_role
+                ),
+            },
+        }
+        if not marker['summary']['source_run_id']:
+            return None
+        marker['proof_digest'] = nonblocking_partial_progression_digest(
+            marker
+        )
+        return marker
 
     @staticmethod
     def _feedback_cutoff_run_metadata(
@@ -2507,6 +2868,24 @@ class DailyPipelineStageService:
                     and isinstance(
                         resolution.get('requested_symbols'),
                         (list, tuple),
+                    )
+                    else None
+                ),
+                'completed_scope_proof': (
+                    dict(resolution['completed_scope_proof'])
+                    if isinstance(resolution, dict)
+                    and isinstance(
+                        resolution.get('completed_scope_proof'),
+                        Mapping,
+                    )
+                    else None
+                ),
+                'terminal_role_scope_proof': (
+                    dict(resolution['terminal_role_scope_proof'])
+                    if isinstance(resolution, dict)
+                    and isinstance(
+                        resolution.get('terminal_role_scope_proof'),
+                        Mapping,
                     )
                     else None
                 ),
@@ -3333,6 +3712,11 @@ class DailyPipelineStageService:
         }
         if result_summary_omissions:
             details['result_summary_omissions'] = result_summary_omissions
+        nonblocking_scope_proof = (
+            build_nonblocking_downstream_scope_proof(stage_id, result)
+        )
+        if nonblocking_scope_proof is not None:
+            details['nonblocking_scope_proof'] = nonblocking_scope_proof
         count_semantics = DailyPipelineStageService._extract_stage_count_semantics(
             stage_id=stage_id,
             result=result,
@@ -3364,6 +3748,7 @@ class DailyPipelineStageService:
         feedback_cutoff_resolution: dict[str, Any] | None = None,
         point_in_time_recovery: bool = False,
         allow_same_day_intraday_watch_continuation: bool = False,
+        allow_previous_session_preopen_recovery: bool = False,
         provider_admission_fence_owned: bool = False,
         run_id: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
@@ -3397,6 +3782,9 @@ class DailyPipelineStageService:
                 market=get_market_state(),
                 allow_same_day_intraday_watch_continuation=bool(
                     allow_same_day_intraday_watch_continuation
+                ),
+                allow_previous_session_preopen_recovery=bool(
+                    allow_previous_session_preopen_recovery
                 ),
             )
             if expired_decision_result is not None:
@@ -3801,6 +4189,9 @@ class DailyPipelineStageService:
                     allow_same_day_intraday_watch_continuation=(
                         allow_same_day_intraday_watch_continuation
                     ),
+                    allow_previous_session_preopen_recovery=(
+                        allow_previous_session_preopen_recovery
+                    ),
                 )
             )
             if expired_after_completion is not None:
@@ -3817,6 +4208,9 @@ class DailyPipelineStageService:
                 market=get_market_state(),
                 allow_same_day_intraday_watch_continuation=(
                     allow_same_day_intraday_watch_continuation
+                ),
+                allow_previous_session_preopen_recovery=(
+                    allow_previous_session_preopen_recovery
                 ),
             )
             if expired_result is not None:
@@ -3853,6 +4247,9 @@ class DailyPipelineStageService:
                     market=get_market_state(),
                     allow_same_day_intraday_watch_continuation=(
                         allow_same_day_intraday_watch_continuation
+                    ),
+                    allow_previous_session_preopen_recovery=(
+                        allow_previous_session_preopen_recovery
                     ),
                 )
             )
@@ -3981,6 +4378,231 @@ class DailyPipelineStageService:
     @staticmethod
     def _dependency_outcome_is_satisfied(outcome: dict[str, Any] | None) -> bool:
         return daily_pipeline_outcome_is_satisfied(outcome)
+
+    @staticmethod
+    def _partial_summary_dependency_is_proven(
+        *,
+        outcome: dict[str, Any] | None,
+        cutoff_resolution: dict[str, Any] | None,
+        parent_symbols: Sequence[str] | None,
+    ) -> bool:
+        """Accept only an exact finalized success intersection as input."""
+
+        if not (
+            isinstance(outcome, dict)
+            and str(outcome.get('status') or '').strip().lower()
+            == 'partial'
+            and isinstance(cutoff_resolution, dict)
+            and cutoff_resolution.get('ready') is True
+            and cutoff_resolution.get('knowledge_cutoff_at') is not None
+        ):
+            return False
+        result = outcome.get('result')
+        if not isinstance(result, dict):
+            return False
+        source_run_id = str(
+            cutoff_resolution.get('source_run_id') or ''
+        ).strip()
+        completed_symbols = cutoff_resolution.get('requested_symbols')
+        return bool(
+            source_run_id
+            and source_run_id == str(result.get('run_id') or '').strip()
+            and isinstance(completed_symbols, list)
+            and completed_symbols
+            and completed_summary_scope_matches_parent(
+                feedback_scope_mode=cutoff_resolution.get(
+                    'feedback_scope_mode'
+                ),
+                completed_symbols=completed_symbols,
+                completed_scope_proof=cutoff_resolution.get(
+                    'completed_scope_proof'
+                ),
+                parent_symbols=parent_symbols,
+            )
+        )
+
+    @staticmethod
+    def _terminal_decider_progression_proof(
+        outcome: dict[str, Any] | None,
+        *,
+        expected_decider_symbols: Sequence[str] | None,
+        feedback_cutoff_resolution: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return terminal decider evidence bound to one summary lineage."""
+
+        if not (
+            isinstance(outcome, dict)
+            and str(outcome.get('status') or '').strip().lower()
+            in {'completed', 'partial'}
+        ):
+            return None
+        result = outcome.get('result')
+        progress = (
+            result.get('progress')
+            if isinstance(result, dict)
+            and isinstance(result.get('progress'), dict)
+            else {}
+        )
+        progress_summary = (
+            progress.get('summary')
+            if isinstance(progress.get('summary'), dict)
+            else {}
+        )
+        roles = result.get('roles') if isinstance(result, dict) else None
+        normalized_expected_symbols = (
+            normalize_symbol_codes(expected_decider_symbols)
+            if isinstance(expected_decider_symbols, (list, tuple))
+            else []
+        )
+        cutoff_requested_symbols = (
+            feedback_cutoff_resolution.get('requested_symbols')
+            if isinstance(feedback_cutoff_resolution, Mapping)
+            else None
+        )
+        normalized_cutoff_symbols = (
+            normalize_symbol_codes(cutoff_requested_symbols)
+            if isinstance(cutoff_requested_symbols, list)
+            else []
+        )
+        result_requested_symbols = (
+            result.get('requested_symbols')
+            if isinstance(result, dict)
+            else None
+        )
+        scope_authority = (
+            result.get('scope_authority')
+            if isinstance(result, dict)
+            and isinstance(result.get('scope_authority'), Mapping)
+            else {}
+        )
+        cutoff_source_run_id = str(
+            (
+                feedback_cutoff_resolution.get('source_run_id')
+                if isinstance(feedback_cutoff_resolution, Mapping)
+                else None
+            )
+            or ''
+        ).strip()
+        cutoff_scope_mode = str(
+            (
+                feedback_cutoff_resolution.get('feedback_scope_mode')
+                if isinstance(feedback_cutoff_resolution, Mapping)
+                else None
+            )
+            or ''
+        ).strip()
+        cutoff_at = (
+            feedback_cutoff_resolution.get('knowledge_cutoff_at')
+            if isinstance(feedback_cutoff_resolution, Mapping)
+            else None
+        )
+        try:
+            normalized_cutoff_at = (
+                cutoff_at
+                if isinstance(cutoff_at, datetime)
+                else datetime.fromisoformat(str(cutoff_at or ''))
+            )
+        except (TypeError, ValueError):
+            normalized_cutoff_at = None
+        if (
+            normalized_cutoff_at is not None
+            and normalized_cutoff_at.tzinfo is not None
+            and normalized_cutoff_at.utcoffset() is not None
+        ):
+            normalized_cutoff_at = normalized_cutoff_at.astimezone(
+                timezone.utc
+            )
+        else:
+            normalized_cutoff_at = None
+        if not (
+            isinstance(roles, list)
+            and set(roles) == set(DECISION_SUPPORT_AGENT_NAMES)
+            and len(roles) == len(DECISION_SUPPORT_AGENT_NAMES)
+            and str(result.get('run_id') or '').strip()
+            == str(progress_summary.get('run_id') or '').strip()
+            and normalized_expected_symbols
+            and normalized_expected_symbols
+            == list(expected_decider_symbols or ())
+            and normalized_cutoff_symbols == normalized_expected_symbols
+            and result_requested_symbols == normalized_expected_symbols
+            and result.get('feedback_scope_mode')
+            == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            and isinstance(feedback_cutoff_resolution, Mapping)
+            and feedback_cutoff_resolution.get('ready') is True
+            and cutoff_source_run_id
+            and normalized_cutoff_at is not None
+            and scope_authority.get('schema_version')
+            == FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+            and scope_authority.get('kind')
+            == FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+            and scope_authority.get('source_summary_run_id')
+            == cutoff_source_run_id
+            and scope_authority.get('source_feedback_scope_mode')
+            == cutoff_scope_mode
+            and scope_authority.get('decision_feedback_scope_mode')
+            == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            and scope_authority.get('knowledge_cutoff_at')
+            == normalized_cutoff_at.isoformat()
+            and scope_authority.get('completed_scope_proof')
+            == feedback_cutoff_resolution.get('completed_scope_proof')
+        ):
+            return None
+        resolution = resolve_terminal_role_success_intersection(
+            progress_summary=progress_summary,
+            roles=DECISION_SUPPORT_AGENT_NAMES,
+            expected_role_symbol_scopes={
+                role: normalized_expected_symbols
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+        )
+        completed_symbols = resolution.get('completed_symbols')
+        if not (
+            resolution.get('ready') is True
+            and isinstance(completed_symbols, list)
+            and completed_symbols
+        ):
+            return None
+        return {
+            **resolution,
+            'source_run_id': str(result.get('run_id') or '').strip(),
+            'source_summary_run_id': cutoff_source_run_id,
+            'admitted_symbols': list(normalized_expected_symbols),
+            'completed_symbols': list(completed_symbols),
+        }
+
+    @staticmethod
+    def _terminal_decider_completed_symbols(
+        outcome: dict[str, Any] | None,
+        *,
+        expected_decider_symbols: Sequence[str] | None,
+        feedback_cutoff_resolution: Mapping[str, Any] | None,
+    ) -> list[str] | None:
+        """Return the exact terminal two-decider success intersection."""
+
+        if not (
+            isinstance(outcome, dict)
+            and str(outcome.get('status') or '').strip().lower()
+            in {'completed', 'partial'}
+        ):
+            return None
+        proof = (
+            DailyPipelineStageService._terminal_decider_progression_proof(
+                outcome,
+                expected_decider_symbols=expected_decider_symbols,
+                feedback_cutoff_resolution=feedback_cutoff_resolution,
+            )
+        )
+        completed_symbols = (
+            proof.get('completed_symbols')
+            if isinstance(proof, Mapping)
+            else None
+        )
+        return (
+            list(completed_symbols)
+            if isinstance(completed_symbols, list)
+            and completed_symbols
+            else None
+        )
 
     def _resolve_stage_ids(
         self,

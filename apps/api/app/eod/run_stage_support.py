@@ -2,14 +2,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import hashlib
+import json
 from typing import Any, Mapping, Sequence
 
-from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
+from app.agent_context.roles import (
+    DECISION_SUPPORT_AGENT_NAMES,
+    SUMMARIZER_AGENT_NAMES,
+)
 from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
     FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
 from app.eod.summary_cutoff_contract import (
+    COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION,
     normalize_symbol_codes,
     stage_result_summary,
 )
@@ -43,6 +51,7 @@ def build_next_open_window_expired_result(
     market_date: str,
     market: object,
     allow_same_day_intraday_watch_continuation: bool = False,
+    allow_previous_session_preopen_recovery: bool = False,
 ) -> dict[str, Any] | None:
     """Return an auditable no-op when a recovered plan's window has passed."""
 
@@ -66,7 +75,10 @@ def build_next_open_window_expired_result(
     target_is_still_actionable = bool(
         (
             market_state == 'PREOPEN'
-            and allow_same_day_intraday_watch_continuation
+            and (
+                allow_same_day_intraday_watch_continuation
+                or allow_previous_session_preopen_recovery
+            )
             and target_trade_date >= current_market_date
         )
         or target_trade_date > current_market_date
@@ -102,11 +114,784 @@ AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER: tuple[str, ...] = (
     'next_open_execution_plan',
     'signal_decider_evaluations',
 )
+AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS: tuple[tuple[str, ...], ...] = (
+    (
+        'agent_feedback_summaries',
+        *AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    ),
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+)
+NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION = (
+    'nonblocking_partial_progression_v1'
+)
+NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION = (
+    'nonblocking_feedback_retry_debt_v1'
+)
+NONBLOCKING_DOWNSTREAM_SCOPE_PROOF_SCHEMA_VERSION = (
+    'nonblocking_downstream_scope_v1'
+)
 SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY = (
     'same_day_intraday_watch_rearm'
 )
 SAME_DAY_INTRADAY_WATCH_REARM_VERSION = 1
 SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT = 8
+
+
+def nonblocking_partial_progression_digest(
+    marker: Mapping[str, Any],
+) -> str:
+    payload = {
+        str(key): value
+        for key, value in marker.items()
+        if str(key) != 'proof_digest'
+    }
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(',', ':'),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+
+def validated_nonblocking_downstream_scope_proof(
+    stage_id: str,
+    proof: object,
+) -> dict[str, Any] | None:
+    """Return a canonical downstream scope proof or fail closed.
+
+    These small proofs are persisted outside the compact result summary so a
+    large plan/evaluation result cannot lose the exact symbol boundary needed
+    to validate non-blocking partial progression after a restart.
+    """
+
+    if not isinstance(proof, Mapping):
+        return None
+    proof = dict(proof)
+    if proof.get('schema_version') != (
+        NONBLOCKING_DOWNSTREAM_SCOPE_PROOF_SCHEMA_VERSION
+    ):
+        return None
+
+    if stage_id == 'next_open_execution_plan':
+        if set(proof) != {
+            'schema_version',
+            'kind',
+            'active_symbols',
+            'active_scope',
+            'item_count',
+            'active_item_count',
+            'blocked_item_count',
+        } or proof.get('kind') != 'next_open_plan_active_scope':
+            return None
+        active_symbols = proof.get('active_symbols')
+        active_scope = proof.get('active_scope')
+        item_count = proof.get('item_count')
+        active_item_count = proof.get('active_item_count')
+        blocked_item_count = proof.get('blocked_item_count')
+        if not (
+            isinstance(active_symbols, list)
+            and normalize_symbol_codes(active_symbols) == active_symbols
+            and isinstance(active_scope, list)
+            and all(
+                type(value) is int and value >= 0
+                for value in (
+                    item_count,
+                    active_item_count,
+                    blocked_item_count,
+                )
+            )
+            and active_item_count + blocked_item_count == item_count
+            and len(active_symbols) <= active_item_count
+            and bool(active_symbols) == bool(active_item_count)
+        ):
+            return None
+        canonical_active_scope: list[dict[str, str]] = []
+        for raw_scope in active_scope:
+            if not (
+                isinstance(raw_scope, Mapping)
+                and set(raw_scope)
+                == {'symbol', 'decision_agent_name', 'decision_run_id'}
+            ):
+                return None
+            normalized_symbol = normalize_symbol_codes(
+                [raw_scope.get('symbol')]
+            )
+            decision_agent_name = str(
+                raw_scope.get('decision_agent_name') or ''
+            ).strip()
+            decision_run_id = str(
+                raw_scope.get('decision_run_id') or ''
+            ).strip()
+            if not (
+                len(normalized_symbol) == 1
+                and decision_agent_name in DECISION_SUPPORT_AGENT_NAMES
+                and decision_run_id
+            ):
+                return None
+            canonical_active_scope.append(
+                {
+                    'symbol': normalized_symbol[0],
+                    'decision_agent_name': decision_agent_name,
+                    'decision_run_id': decision_run_id,
+                }
+            )
+        canonical_scope_tuples = sorted(
+            {
+                (
+                    scope['symbol'],
+                    scope['decision_agent_name'],
+                    scope['decision_run_id'],
+                )
+                for scope in canonical_active_scope
+            }
+        )
+        normalized_scope_payload = [
+            {
+                'symbol': symbol,
+                'decision_agent_name': decision_agent_name,
+                'decision_run_id': decision_run_id,
+            }
+            for symbol, decision_agent_name, decision_run_id
+            in canonical_scope_tuples
+        ]
+        if not (
+            active_scope == normalized_scope_payload
+            and normalize_symbol_codes(
+                [scope['symbol'] for scope in normalized_scope_payload]
+            )
+            == active_symbols
+            and len(active_scope) <= active_item_count
+        ):
+            return None
+        return proof
+
+    if stage_id == 'signal_decider_evaluations':
+        if set(proof) != {
+            'schema_version',
+            'kind',
+            'requested_symbols',
+            'requested_symbol_count',
+        } or proof.get('kind') != 'signal_decider_evaluation_scope':
+            return None
+        requested_symbols = proof.get('requested_symbols')
+        requested_symbol_count = proof.get('requested_symbol_count')
+        if not (
+            isinstance(requested_symbols, list)
+            and requested_symbols
+            and normalize_symbol_codes(requested_symbols)
+            == requested_symbols
+            and type(requested_symbol_count) is int
+            and requested_symbol_count == len(requested_symbols)
+        ):
+            return None
+        return proof
+
+    return None
+
+
+def build_nonblocking_downstream_scope_proof(
+    stage_id: str,
+    result: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Derive the exact plan/evaluation symbol scope from a full result."""
+
+    if not isinstance(result, Mapping):
+        return None
+
+    if stage_id == 'next_open_execution_plan':
+        items = result.get('items')
+        if not isinstance(items, list):
+            return None
+        active_scope: list[dict[str, str]] = []
+        active_item_count = 0
+        blocked_item_count = 0
+        for item in items:
+            if not isinstance(item, Mapping):
+                return None
+            normalized_symbol = normalize_symbol_codes(
+                [item.get('symbol')]
+            )
+            if len(normalized_symbol) != 1:
+                return None
+            eligibility_status = str(
+                item.get('eligibility_status') or ''
+            ).strip().lower()
+            handoff_active = item.get('handoff_active')
+            exec_monitoring_active = item.get('exec_monitoring_active')
+            if not (
+                type(handoff_active) is bool
+                and type(exec_monitoring_active) is bool
+            ):
+                return None
+            active = bool(
+                eligibility_status in {'eligible', 'monitor_candidate'}
+                or handoff_active
+                or exec_monitoring_active
+            )
+            if active:
+                decision_agent_name = str(
+                    item.get('decision_agent_name')
+                    or item.get('agent_name')
+                    or ''
+                ).strip()
+                decision_run_id = str(
+                    item.get('decision_run_id') or ''
+                ).strip()
+                if not (
+                    decision_agent_name in DECISION_SUPPORT_AGENT_NAMES
+                    and decision_run_id
+                ):
+                    return None
+                active_item_count += 1
+                active_scope.append(
+                    {
+                        'symbol': normalized_symbol[0],
+                        'decision_agent_name': decision_agent_name,
+                        'decision_run_id': decision_run_id,
+                    }
+                )
+                continue
+            if not (
+                eligibility_status == 'blocked'
+                and not handoff_active
+                and not exec_monitoring_active
+            ):
+                return None
+            blocked_item_count += 1
+        active_scope_tuples = sorted(
+            {
+                (
+                    scope['symbol'],
+                    scope['decision_agent_name'],
+                    scope['decision_run_id'],
+                )
+                for scope in active_scope
+            }
+        )
+        active_scope_payload = [
+            {
+                'symbol': symbol,
+                'decision_agent_name': decision_agent_name,
+                'decision_run_id': decision_run_id,
+            }
+            for symbol, decision_agent_name, decision_run_id
+            in active_scope_tuples
+        ]
+        proof = {
+            'schema_version': (
+                NONBLOCKING_DOWNSTREAM_SCOPE_PROOF_SCHEMA_VERSION
+            ),
+            'kind': 'next_open_plan_active_scope',
+            'active_symbols': normalize_symbol_codes(
+                [scope['symbol'] for scope in active_scope_payload]
+            ),
+            'active_scope': active_scope_payload,
+            'item_count': len(items),
+            'active_item_count': active_item_count,
+            'blocked_item_count': blocked_item_count,
+        }
+        return validated_nonblocking_downstream_scope_proof(
+            stage_id,
+            proof,
+        )
+
+    if stage_id == 'signal_decider_evaluations':
+        request = result.get('request')
+        raw_symbols = (
+            request.get('symbols')
+            if isinstance(request, Mapping)
+            else None
+        )
+        if not isinstance(raw_symbols, list):
+            return None
+        requested_symbols = normalize_symbol_codes(raw_symbols)
+        if not requested_symbols or requested_symbols != raw_symbols:
+            return None
+        proof = {
+            'schema_version': (
+                NONBLOCKING_DOWNSTREAM_SCOPE_PROOF_SCHEMA_VERSION
+            ),
+            'kind': 'signal_decider_evaluation_scope',
+            'requested_symbols': requested_symbols,
+            'requested_symbol_count': len(requested_symbols),
+        }
+        return validated_nonblocking_downstream_scope_proof(
+            stage_id,
+            proof,
+        )
+
+    return None
+
+
+def validated_nonblocking_partial_progression_marker(
+    recovery_result: Mapping[str, Any] | None,
+    *,
+    expected_eod_collection_run_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Validate the exact proof that isolated feedback failures are safe.
+
+    The pipeline remains truthfully ``partial``.  This marker only proves that
+    every failed role/symbol pair was removed from the cohort that reached the
+    plan and evaluation stages, so the remaining retry debt need not freeze
+    unrelated symbols.
+    """
+
+    if not isinstance(recovery_result, Mapping):
+        return None
+    pipeline_run = recovery_result.get('pipeline_run')
+    stages = recovery_result.get('stages')
+    if not isinstance(pipeline_run, Mapping) or not isinstance(stages, Mapping):
+        return None
+    metadata = pipeline_run.get('run_metadata')
+    if not isinstance(metadata, Mapping):
+        return None
+    marker = metadata.get('nonblocking_partial_progression')
+    if not isinstance(marker, Mapping):
+        return None
+    marker = dict(marker)
+
+    pipeline_run_id = pipeline_run.get('id')
+    result_pipeline_run_id = recovery_result.get('pipeline_run_id')
+    eod_run_id = metadata.get('reused_eod_collection_run_id')
+    resolved_stages = metadata.get('resolved_stages')
+    if not (
+        marker.get('schema_version')
+        == NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION
+        and marker.get('blocking_status') == 'non_blocking'
+        and str(marker.get('proof_digest') or '')
+        == nonblocking_partial_progression_digest(marker)
+        and type(pipeline_run_id) is int
+        and pipeline_run_id > 0
+        and result_pipeline_run_id == pipeline_run_id
+        and marker.get('pipeline_run_id') == pipeline_run_id
+        and type(eod_run_id) is int
+        and eod_run_id > 0
+        and marker.get('reused_eod_collection_run_id') == eod_run_id
+        and (
+            expected_eod_collection_run_id is None
+            or eod_run_id == expected_eod_collection_run_id
+        )
+        and str(recovery_result.get('market_date') or '')
+        == str(marker.get('market_date') or '')
+        == str(pipeline_run.get('market_date') or '')
+        and str(recovery_result.get('status') or '').strip().lower()
+        == 'partial'
+        and str(pipeline_run.get('status') or '').strip().lower()
+        == 'partial'
+        and pipeline_run.get('trigger') == 'auto_eod_followup_resume'
+        and metadata.get('resumable') is False
+        and str(pipeline_run.get('completed_at') or '').strip()
+        and not str(pipeline_run.get('error_message') or '').strip()
+        and isinstance(resolved_stages, list)
+        and tuple(resolved_stages)
+        in AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS
+        and pipeline_run.get('current_stage') == resolved_stages[-1]
+        and set(stages) == set(resolved_stages)
+    ):
+        return None
+
+    def canonical_symbols(value: object) -> list[str] | None:
+        if not isinstance(value, list):
+            return None
+        normalized = normalize_symbol_codes(value)
+        if not normalized or normalized != value:
+            return None
+        return normalized
+
+    def failed_scope(
+        payload: Mapping[str, Any],
+        *,
+        roles: Sequence[str],
+    ) -> tuple[dict[str, list[str]], set[str]] | None:
+        raw = payload.get('failed_symbols_by_role')
+        if not isinstance(raw, Mapping) or set(raw) != set(roles):
+            return None
+        normalized: dict[str, list[str]] = {}
+        failed: set[str] = set()
+        for role in roles:
+            symbols = raw.get(role)
+            if not isinstance(symbols, list):
+                return None
+            normalized_symbols = normalize_symbol_codes(symbols)
+            if normalized_symbols != symbols:
+                return None
+            normalized[role] = normalized_symbols
+            failed.update(normalized_symbols)
+        return normalized, failed
+
+    summary = marker.get('summary')
+    decider = marker.get('decider')
+    downstream = marker.get('downstream')
+    retry_debt = marker.get('retry_debt')
+    if not all(
+        isinstance(payload, Mapping)
+        for payload in (summary, decider, downstream, retry_debt)
+    ):
+        return None
+    summary_admitted = canonical_symbols(summary.get('admitted_symbols'))
+    summary_completed = canonical_symbols(summary.get('completed_symbols'))
+    decider_admitted = canonical_symbols(decider.get('admitted_symbols'))
+    decider_completed = canonical_symbols(decider.get('completed_symbols'))
+    actionable = canonical_symbols(downstream.get('actionable_symbols'))
+    plan_scope_proof = validated_nonblocking_downstream_scope_proof(
+        'next_open_execution_plan',
+        downstream.get('plan_scope_proof'),
+    )
+    evaluation_scope_proof = validated_nonblocking_downstream_scope_proof(
+        'signal_decider_evaluations',
+        downstream.get('evaluation_scope_proof'),
+    )
+    summary_failed_scope = failed_scope(
+        summary,
+        roles=SUMMARIZER_AGENT_NAMES,
+    )
+    decider_failed_scope = failed_scope(
+        decider,
+        roles=DECISION_SUPPORT_AGENT_NAMES,
+    )
+    if not all(
+        value is not None
+        for value in (
+            summary_admitted,
+            summary_completed,
+            decider_admitted,
+            decider_completed,
+            actionable,
+            plan_scope_proof,
+            evaluation_scope_proof,
+            summary_failed_scope,
+            decider_failed_scope,
+        )
+    ):
+        return None
+    summary_failed = summary_failed_scope[1]
+    decider_failed = decider_failed_scope[1]
+
+    def terminal_counts_are_exact(
+        payload: Mapping[str, Any],
+        *,
+        roles: Sequence[str],
+        admitted_symbols: Sequence[str],
+        failures_by_role: Mapping[str, Sequence[str]],
+    ) -> bool:
+        total_items = payload.get('total_items')
+        completed_items = payload.get('completed_items')
+        failed_items = payload.get('failed_items')
+        expected_total = len(admitted_symbols) * len(roles)
+        expected_failed = sum(
+            len(failures_by_role[role]) for role in roles
+        )
+        return bool(
+            type(total_items) is int
+            and type(completed_items) is int
+            and type(failed_items) is int
+            and total_items == expected_total
+            and failed_items == expected_failed
+            and completed_items == expected_total - expected_failed
+        )
+
+    if not (
+        str(summary.get('source_run_id') or '').strip()
+        and summary.get('feedback_scope_mode')
+        in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and str(decider.get('source_run_id') or '').strip()
+        and set(summary_completed)
+        == set(summary_admitted) - summary_failed
+        and set(decider_admitted) == set(summary_completed)
+        and set(decider_completed)
+        == set(decider_admitted) - decider_failed
+        and actionable == decider_completed
+        and (summary_failed or decider_failed)
+        and downstream.get('plan_status') == 'completed'
+        and downstream.get('evaluation_status') == 'completed'
+        and evaluation_scope_proof['requested_symbols'] == actionable
+        and set(plan_scope_proof['active_symbols']) <= set(actionable)
+        and retry_debt.get('schema_version')
+        == NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION
+        and retry_debt.get('summary_failed_symbols_by_role')
+        == summary_failed_scope[0]
+        and retry_debt.get('decider_failed_symbols_by_role')
+        == decider_failed_scope[0]
+        and terminal_counts_are_exact(
+            summary,
+            roles=SUMMARIZER_AGENT_NAMES,
+            admitted_symbols=summary_admitted,
+            failures_by_role=summary_failed_scope[0],
+        )
+        and terminal_counts_are_exact(
+            decider,
+            roles=DECISION_SUPPORT_AGENT_NAMES,
+            admitted_symbols=decider_admitted,
+            failures_by_role=decider_failed_scope[0],
+        )
+    ):
+        return None
+
+    raw_cutoff_at = summary.get('knowledge_cutoff_at')
+    try:
+        cutoff_at = datetime.fromisoformat(str(raw_cutoff_at or ''))
+    except ValueError:
+        return None
+    if cutoff_at.tzinfo is None or cutoff_at.utcoffset() is None:
+        return None
+    persisted_cutoff = metadata.get('feedback_knowledge_cutoff')
+    expected_completed_scope_proof = {
+        'schema_version': (
+            COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+        ),
+        'completed_symbols': summary_completed,
+        'admitted_symbols': summary_admitted,
+    }
+    expected_terminal_scope_proof = (
+        {
+            'schema_version': 'terminal_role_success_intersection_v1',
+            'failed_symbols_by_role': summary_failed_scope[0],
+            'total_items': summary['total_items'],
+            'completed_items': summary['completed_items'],
+            'failed_items': summary['failed_items'],
+        }
+        if summary_failed
+        else None
+    )
+    if not (
+        isinstance(persisted_cutoff, Mapping)
+        and persisted_cutoff.get('ready') is True
+        and persisted_cutoff.get('source_run_id')
+        == summary.get('source_run_id')
+        and persisted_cutoff.get('feedback_scope_mode')
+        == summary.get('feedback_scope_mode')
+        and persisted_cutoff.get('knowledge_cutoff_at')
+        == summary.get('knowledge_cutoff_at')
+        and persisted_cutoff.get('requested_symbols')
+        == summary_completed
+        and persisted_cutoff.get('completed_scope_proof')
+        == expected_completed_scope_proof
+        and persisted_cutoff.get('terminal_role_scope_proof')
+        == expected_terminal_scope_proof
+        and decider.get('source_summary_run_id')
+        == summary.get('source_run_id')
+    ):
+        return None
+
+    def exact_stage_source(stage: Mapping[str, Any], source: str) -> bool:
+        source_run_ids = (
+            stage.get('source_run_ids')
+            if isinstance(stage.get('source_run_ids'), Mapping)
+            else {}
+        )
+        result = (
+            stage.get('result')
+            if isinstance(stage.get('result'), Mapping)
+            else stage_result_summary(stage)
+        )
+        observed = {
+            str(value or '').strip()
+            for value in (
+                source_run_ids.get('agent_feedback_run_id'),
+                source_run_ids.get('run_id'),
+                result.get('run_id'),
+            )
+            if str(value or '').strip()
+        }
+        return observed == {source}
+
+    def terminal_stage_matches_marker(
+        stage: Mapping[str, Any],
+        *,
+        roles: Sequence[str],
+        admitted_symbols: list[str],
+        completed_symbols: list[str],
+        failures_by_role: Mapping[str, list[str]],
+        source_run_id: str,
+        marker_payload: Mapping[str, Any],
+        require_scope_authority: bool,
+    ) -> bool:
+        if not exact_stage_source(stage, source_run_id):
+            return False
+        has_uncompacted_result = isinstance(stage.get('result'), Mapping)
+        result = (
+            stage.get('result')
+            if has_uncompacted_result
+            else stage_result_summary(stage)
+        )
+        raw_roles = result.get('roles')
+        if not (
+            isinstance(raw_roles, list)
+            and len(raw_roles) == len(roles)
+            and set(raw_roles) == set(roles)
+        ):
+            return False
+        requested_symbols = result.get('requested_symbols')
+        if (
+            requested_symbols is not None
+            and requested_symbols != admitted_symbols
+        ):
+            return False
+        if require_scope_authority:
+            scope_authority = result.get('scope_authority')
+            if not (
+                isinstance(scope_authority, Mapping)
+                and scope_authority.get('schema_version')
+                == FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+                and scope_authority.get('kind')
+                == (
+                    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+                )
+                and scope_authority.get('source_summary_run_id')
+                == summary.get('source_run_id')
+                and scope_authority.get('source_feedback_scope_mode')
+                == summary.get('feedback_scope_mode')
+                and scope_authority.get('decision_feedback_scope_mode')
+                == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                and scope_authority.get('knowledge_cutoff_at')
+                == summary.get('knowledge_cutoff_at')
+                and (
+                    not has_uncompacted_result
+                    or scope_authority.get('completed_scope_proof')
+                    == expected_completed_scope_proof
+                )
+            ):
+                return False
+
+        progress = result.get('progress')
+        progress_summary = (
+            progress.get('summary')
+            if isinstance(progress, Mapping)
+            and isinstance(progress.get('summary'), Mapping)
+            else None
+        )
+        if progress_summary is not None:
+            # Lazy import avoids the repository -> run-stage-support ->
+            # retry-service -> market-data-store repository cycle.
+            from app.agent_context.retry_service import (
+                resolve_terminal_role_success_intersection,
+            )
+
+            exact_resolution = resolve_terminal_role_success_intersection(
+                progress_summary=progress_summary,
+                roles=roles,
+                expected_role_symbol_scopes={
+                    role: admitted_symbols for role in roles
+                },
+            )
+            if exact_resolution.get('ready') is True:
+                return bool(
+                    exact_resolution.get('completed_symbols')
+                    == completed_symbols
+                    and exact_resolution.get('failed_symbols_by_role')
+                    == failures_by_role
+                    and exact_resolution.get('total_items')
+                    == marker_payload.get('total_items')
+                    and exact_resolution.get('completed_items')
+                    == marker_payload.get('completed_items')
+                    and exact_resolution.get('failed_items')
+                    == marker_payload.get('failed_items')
+                )
+
+        stage_counts = tuple(
+            stage.get(field)
+            for field in ('processed', 'total', 'succeeded', 'failed')
+        )
+        if not all(type(value) is int for value in stage_counts):
+            return False
+        processed, total, succeeded, failed = stage_counts
+        return bool(
+            total == marker_payload.get('total_items')
+            and succeeded == marker_payload.get('completed_items')
+            and failed == marker_payload.get('failed_items')
+            and processed == succeeded + failed
+        )
+
+    def stage_status(stage_id: str) -> str:
+        stage = stages.get(stage_id)
+        return (
+            str(stage.get('status') or '').strip().lower()
+            if isinstance(stage, Mapping)
+            else ''
+        )
+
+    if not (
+        stage_status('signal_decider') in {'completed', 'partial'}
+        and stage_status('next_open_execution_plan') == 'completed'
+        and stage_status('signal_decider_evaluations') == 'completed'
+        and (
+            'agent_feedback_summaries' not in resolved_stages
+            or stage_status('agent_feedback_summaries')
+            in {'completed', 'partial'}
+        )
+    ):
+        return None
+    summary_stage = stages.get('agent_feedback_summaries')
+    if (
+        summary_stage is not None
+        and not (
+            isinstance(summary_stage, Mapping)
+            and terminal_stage_matches_marker(
+                summary_stage,
+                roles=SUMMARIZER_AGENT_NAMES,
+                admitted_symbols=summary_admitted,
+                completed_symbols=summary_completed,
+                failures_by_role=summary_failed_scope[0],
+                source_run_id=str(summary['source_run_id']),
+                marker_payload=summary,
+                require_scope_authority=False,
+            )
+        )
+    ):
+        return None
+    signal_stage = stages.get('signal_decider')
+    if not (
+        isinstance(signal_stage, Mapping)
+        and terminal_stage_matches_marker(
+            signal_stage,
+            roles=DECISION_SUPPORT_AGENT_NAMES,
+            admitted_symbols=decider_admitted,
+            completed_symbols=decider_completed,
+            failures_by_role=decider_failed_scope[0],
+            source_run_id=str(decider['source_run_id']),
+            marker_payload=decider,
+            require_scope_authority=True,
+        )
+    ):
+        return None
+
+    def stage_downstream_scope_proof(
+        stage_id: str,
+    ) -> dict[str, Any] | None:
+        stage = stages.get(stage_id)
+        if not isinstance(stage, Mapping):
+            return None
+        result = stage.get('result')
+        if isinstance(result, Mapping):
+            return build_nonblocking_downstream_scope_proof(
+                stage_id,
+                result,
+            )
+        details = stage.get('details')
+        persisted_proof = (
+            details.get('nonblocking_scope_proof')
+            if isinstance(details, Mapping)
+            else None
+        )
+        return validated_nonblocking_downstream_scope_proof(
+            stage_id,
+            persisted_proof,
+        )
+
+    if not (
+        stage_downstream_scope_proof('next_open_execution_plan')
+        == plan_scope_proof
+        and stage_downstream_scope_proof(
+            'signal_decider_evaluations'
+        )
+        == evaluation_scope_proof
+    ):
+        return None
+    return marker
 
 
 def pending_same_day_intraday_watch_rearm_marker(
@@ -285,6 +1070,67 @@ def is_exact_auto_pitr_intraday_watch_recovery_request(
         == AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[0]
         and exact_stages
     )
+
+
+def admits_previous_session_preopen_auto_recovery(
+    *,
+    market_date: str,
+    market: object,
+    trigger: str,
+    point_in_time_recovery: bool,
+    reused_eod_collection_run_id: object,
+    force: bool,
+    reuse_existing_feedback: bool,
+    resume_from_stage: str | None,
+    resolved_stages: Sequence[str],
+    provider_admission_fence_owned: bool,
+    existing_pipeline_run_id: int | None,
+) -> bool:
+    """Admit only an exact automatic prior-session suffix before the open.
+
+    This admission is intentionally separate from the same-day intraday-watch
+    contract: it lets the scheduler finish yesterday's decision suffix during
+    today's PREOPEN, but it expires immediately when the market becomes OPEN.
+    """
+
+    market_state = str(getattr(market, 'state', '') or '').strip().upper()
+    if not (
+        market_state == 'PREOPEN'
+        and trigger == 'auto_eod_followup_resume'
+        and point_in_time_recovery is True
+        and isinstance(reused_eod_collection_run_id, int)
+        and not isinstance(reused_eod_collection_run_id, bool)
+        and reused_eod_collection_run_id > 0
+        and force is False
+        and reuse_existing_feedback is True
+        and provider_admission_fence_owned is True
+        and existing_pipeline_run_id is None
+        and isinstance(resolved_stages, (list, tuple))
+    ):
+        return False
+    normalized_stages = tuple(resolved_stages)
+    if not (
+        normalized_stages in AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS
+        and resume_from_stage == normalized_stages[0]
+    ):
+        return False
+
+    server_time = str(getattr(market, 'server_time', '') or '')
+    try:
+        current_market_date = date.fromisoformat(server_time[:10])
+        source_market_date = date.fromisoformat(market_date)
+    except ValueError:
+        return False
+
+    from app.orders.next_open_execution import normalize_next_open_target_trade_date
+
+    candidate = source_market_date + timedelta(days=1)
+    target_trade_date = normalize_next_open_target_trade_date(
+        candidate,
+        default=candidate,
+        allow_fallback=True,
+    )
+    return target_trade_date == current_market_date
 
 
 def is_canonical_same_day_signal_rearm_proof(
@@ -626,6 +1472,7 @@ def build_expired_decision_replay_result(
     market_date: str,
     market: object,
     allow_same_day_intraday_watch_continuation: bool = False,
+    allow_previous_session_preopen_recovery: bool = False,
 ) -> dict[str, Any] | None:
     """Fence decision replay once its next-open action window has passed."""
 
@@ -636,6 +1483,9 @@ def build_expired_decision_replay_result(
         market=market,
         allow_same_day_intraday_watch_continuation=(
             allow_same_day_intraday_watch_continuation
+        ),
+        allow_previous_session_preopen_recovery=(
+            allow_previous_session_preopen_recovery
         ),
     )
     if expired_result is None:

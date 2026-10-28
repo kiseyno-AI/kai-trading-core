@@ -41,6 +41,7 @@ from app.eod.run_stage_support import (
     is_exact_auto_pitr_intraday_watch_recovery_request,
     is_recoverable_same_day_intraday_watch_expiration,
     pending_same_day_intraday_watch_rearm_marker,
+    validated_nonblocking_partial_progression_marker,
 )
 from app.eod.summary_cutoff_contract import (
     is_resumable_summary_cutoff_contract_repair,
@@ -693,6 +694,12 @@ def _load_eod_recovery_metadata(
             metadata['same_day_intraday_watch_rearm'].label(
                 'same_day_intraday_watch_rearm'
             ),
+            metadata['nonblocking_partial_progression'].label(
+                'nonblocking_partial_progression'
+            ),
+            metadata['nonblocking_feedback_retry_debt'].label(
+                'nonblocking_feedback_retry_debt'
+            ),
         ).where(EODCollectionRun.id.in_(tuple(candidate_by_id)))
     )
     for row in rows:
@@ -715,6 +722,12 @@ def _load_eod_recovery_metadata(
                 'feedback_summary_stage': row.feedback_summary_stage,
                 'same_day_intraday_watch_rearm': (
                     row.same_day_intraday_watch_rearm
+                ),
+                'nonblocking_partial_progression': (
+                    row.nonblocking_partial_progression
+                ),
+                'nonblocking_feedback_retry_debt': (
+                    row.nonblocking_feedback_retry_debt
                 ),
             }
         )
@@ -884,6 +897,9 @@ def _load_pipeline_recovery_candidates(
             ),
             metadata['summary_cutoff_contract_repair_resume_count']
             .label('summary_cutoff_contract_repair_resume_count'),
+            metadata['nonblocking_partial_progression'].label(
+                'nonblocking_partial_progression'
+            ),
         )
         .where(DailyPipelineRun.market_date.in_(tuple(market_dates)))
         .order_by(
@@ -970,6 +986,9 @@ def _load_pipeline_recovery_candidates(
                 ),
                 'summary_cutoff_contract_repair_resume_count': (
                     row.summary_cutoff_contract_repair_resume_count
+                ),
+                'nonblocking_partial_progression': (
+                    row.nonblocking_partial_progression
                 ),
             },
         )
@@ -1062,6 +1081,93 @@ def _pipeline_stage_outcome(stage_row: DailyPipelineStageRun) -> dict[str, Any]:
             stage_row.details if isinstance(stage_row.details, dict) else {}
         ),
     }
+
+
+def _validated_nonblocking_partial_recovery(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    eod_run: _EODRecoveryCandidate,
+    require_eod_reconciled: bool,
+) -> dict[str, Any] | None:
+    """Rebuild and validate a partial-success recovery from durable rows."""
+
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, dict)
+        else {}
+    )
+    raw_resolved_stages = metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return None
+    resolved_stages = [
+        str(stage_id or '').strip() for stage_id in raw_resolved_stages
+    ]
+    if not (
+        resolved_stages
+        and all(resolved_stages)
+        and len(resolved_stages) == len(set(resolved_stages))
+    ):
+        return None
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(resolved_stages),
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+    }
+    if set(stages) != set(resolved_stages):
+        return None
+    recovery_result = {
+        'status': pipeline_run.status,
+        'pipeline_run_id': int(pipeline_run.id),
+        'pipeline_run': {
+            'id': int(pipeline_run.id),
+            'market_date': pipeline_run.market_date.isoformat(),
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'completed_at': pipeline_run.completed_at,
+            'error_message': pipeline_run.error_message,
+            'run_metadata': metadata,
+        },
+        'market_date': pipeline_run.market_date.isoformat(),
+        'resolved_stages': resolved_stages,
+        'stages': stages,
+    }
+    marker = validated_nonblocking_partial_progression_marker(
+        recovery_result,
+        expected_eod_collection_run_id=int(eod_run.id),
+    )
+    if marker is None:
+        return None
+    if not require_eod_reconciled:
+        return marker
+
+    eod_metadata = (
+        eod_run.run_metadata
+        if isinstance(eod_run.run_metadata, dict)
+        else {}
+    )
+    if not (
+        eod_metadata.get('nonblocking_partial_progression') == marker
+        and eod_metadata.get('nonblocking_feedback_retry_debt')
+        == marker.get('retry_debt')
+        and not _eod_has_followup_recovery_scope(eod_run)
+        and not _eod_has_price_recovery_scope(eod_run)
+    ):
+        return None
+    return marker
 
 
 def _followup_recovery_is_recoverable_same_day_expiration(
@@ -2427,6 +2533,24 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                     eod_run_id=eod_row.id,
                 )
             if _eod_has_followup_recovery_scope(eod_row):
+                if (
+                    latest_recovery is not None
+                    and _validated_nonblocking_partial_recovery(
+                        session,
+                        pipeline_run=latest_recovery,
+                        eod_run=eod_row,
+                        require_eod_reconciled=False,
+                    )
+                    is not None
+                ):
+                    # The suffix finished, but Core may have restarted before
+                    # copying the proof to its EOD ancestor. Surface exactly
+                    # one lineage for idempotent reconciliation regardless of
+                    # the ordinary retry-attempt cap.
+                    return AutoEODRecoveryTarget(
+                        trade_date=eod_row.trade_date.isoformat(),
+                        eod_run_id=eod_row.id,
+                    )
                 if followup_attempts < _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD:
                     return AutoEODRecoveryTarget(
                         trade_date=eod_row.trade_date.isoformat(),
@@ -2527,13 +2651,45 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                 ),
                 None,
             )
+            pipeline_status = (
+                str(linked_pipeline.status or '').strip().lower()
+                if linked_pipeline is not None
+                else ''
+            )
+            partial_pipeline_reconciled = bool(
+                linked_pipeline is not None
+                and pipeline_status == 'partial'
+                and isinstance(linked_pipeline.run_metadata, dict)
+                and linked_pipeline.run_metadata.get('resumable') is False
+                and _validated_nonblocking_partial_recovery(
+                    session,
+                    pipeline_run=linked_pipeline,
+                    eod_run=eod_row,
+                    require_eod_reconciled=True,
+                )
+                is not None
+            )
             pipeline_is_incomplete = bool(
                 linked_pipeline is not None
-                and str(linked_pipeline.status or '').strip().lower()
-                in _RECOVERABLE_DAILY_PIPELINE_STATUSES
+                and pipeline_status in _RECOVERABLE_DAILY_PIPELINE_STATUSES
                 and (
-                    not isinstance(linked_pipeline.run_metadata, dict)
-                    or linked_pipeline.run_metadata.get('resumable') is not False
+                    (
+                        pipeline_status == 'partial'
+                        and not partial_pipeline_reconciled
+                    )
+                    or (
+                        pipeline_status != 'partial'
+                        and (
+                            not isinstance(
+                                linked_pipeline.run_metadata,
+                                dict,
+                            )
+                            or linked_pipeline.run_metadata.get(
+                                'resumable'
+                            )
+                            is not False
+                        )
+                    )
                 )
             )
             if pipeline_is_incomplete and eod_has_price_recovery_scope:

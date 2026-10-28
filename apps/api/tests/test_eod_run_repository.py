@@ -1,5 +1,6 @@
 import hashlib
 import unittest
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from app.eod.run_stage_support import (
     SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
     SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
     SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+    nonblocking_partial_progression_digest,
 )
 from app.repositories.eod_run_repository import (
     _load_pipeline_recovery_candidates,
@@ -377,6 +379,266 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
     def _session_scope(self):
         with self.session_factory.begin() as session:
             yield session
+
+    def _persist_nonblocking_partial_recovery_lineage(
+        self,
+        *,
+        market_date: date,
+        include_pipeline_marker: bool,
+        reconcile_eod: bool,
+        followup_attempts: int = 1,
+    ) -> dict[str, int]:
+        from tests.test_eod_run_stage_support import EODRunStageSupportTests
+
+        recovery = deepcopy(
+            EODRunStageSupportTests._nonblocking_partial_recovery_result()
+        )
+        completed_at = datetime.fromisoformat(
+            recovery['pipeline_run']['completed_at']
+        )
+
+        with self.session_factory.begin() as session:
+            eod_run = EODCollectionRun(
+                market='KRX',
+                trade_date=market_date,
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=2,
+                symbols_succeeded=2,
+                symbols_failed=0,
+                started_at=completed_at - timedelta(minutes=10),
+                completed_at=completed_at - timedelta(minutes=8),
+                run_metadata={'mode': 'daily_auto'},
+            )
+            session.add(eod_run)
+            session.flush()
+
+            session.add_all(
+                [
+                    DailyPipelineRun(
+                        market_date=market_date,
+                        trigger='auto_eod_followup_resume',
+                        status='failed',
+                        current_stage='signal_decider',
+                        started_at=completed_at
+                        - timedelta(minutes=10 - attempt),
+                        completed_at=completed_at
+                        - timedelta(minutes=9 - attempt),
+                        run_metadata={
+                            'reused_eod_collection_run_id': eod_run.id,
+                        },
+                    )
+                    for attempt in range(followup_attempts - 1)
+                ]
+            )
+
+            pipeline_metadata = deepcopy(
+                recovery['pipeline_run']['run_metadata']
+            )
+            pipeline_run = DailyPipelineRun(
+                market_date=market_date,
+                trigger='auto_eod_followup_resume',
+                status='partial',
+                current_stage=recovery['pipeline_run']['current_stage'],
+                started_at=completed_at - timedelta(minutes=4),
+                completed_at=completed_at,
+                run_metadata={},
+            )
+            session.add(pipeline_run)
+            session.flush()
+
+            marker = pipeline_metadata['nonblocking_partial_progression']
+            pipeline_metadata['reused_eod_collection_run_id'] = int(
+                eod_run.id
+            )
+            marker['market_date'] = market_date.isoformat()
+            marker['pipeline_run_id'] = int(pipeline_run.id)
+            marker['reused_eod_collection_run_id'] = int(eod_run.id)
+            marker['proof_digest'] = (
+                nonblocking_partial_progression_digest(marker)
+            )
+            if not include_pipeline_marker:
+                pipeline_metadata.pop(
+                    'nonblocking_partial_progression',
+                    None,
+                )
+            pipeline_run.run_metadata = pipeline_metadata
+            if reconcile_eod:
+                eod_run.run_metadata = {
+                    **eod_run.run_metadata,
+                    'nonblocking_partial_progression': deepcopy(marker),
+                    'nonblocking_feedback_retry_debt': deepcopy(
+                        marker['retry_debt']
+                    ),
+                }
+
+            for stage_id, stage in recovery['stages'].items():
+                is_signal_stage = stage_id == 'signal_decider'
+                counts = marker['decider'] if is_signal_stage else None
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=pipeline_run.id,
+                        market_date=market_date,
+                        stage_id=stage_id,
+                        status=stage['status'],
+                        processed=(counts or {}).get('total_items', 1),
+                        total=(counts or {}).get('total_items', 1),
+                        succeeded=(counts or {}).get('completed_items', 1),
+                        failed=(counts or {}).get('failed_items', 0),
+                        remaining=0,
+                        started_at=completed_at - timedelta(minutes=1),
+                        completed_at=completed_at,
+                        source_run_ids=(
+                            {'agent_feedback_run_id': 'decider-run'}
+                            if is_signal_stage
+                            else {}
+                        ),
+                        details=(
+                            {'result_summary': deepcopy(stage['result'])}
+                            if is_signal_stage
+                            else {
+                                'nonblocking_scope_proof': deepcopy(
+                                    marker['downstream'][
+                                        'plan_scope_proof'
+                                        if stage_id
+                                        == 'next_open_execution_plan'
+                                        else 'evaluation_scope_proof'
+                                    ]
+                                )
+                            }
+                            if stage_id in {
+                                'next_open_execution_plan',
+                                'signal_decider_evaluations',
+                            }
+                            else {}
+                        ),
+                    )
+                )
+
+            return {
+                'eod_run_id': int(eod_run.id),
+                'pipeline_run_id': int(pipeline_run.id),
+            }
+
+    def _load_recovery_target_for_date(
+        self,
+        market_date: date,
+    ) -> AutoEODRecoveryTarget | None:
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            return load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=market_date,
+                on_or_before=market_date,
+            )
+
+    def test_bare_nonblocking_partial_remains_recovery_eligible(self) -> None:
+        market_date = date(2026, 10, 19)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=False,
+            reconcile_eod=False,
+        )
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_reconciled_nonblocking_partial_is_not_recovery_eligible(
+        self,
+    ) -> None:
+        market_date = date(2026, 10, 20)
+        self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=True,
+        )
+
+        self.assertIsNone(self._load_recovery_target_for_date(market_date))
+
+    def test_valid_nonblocking_partial_without_eod_copy_surfaces_past_cap(
+        self,
+    ) -> None:
+        market_date = date(2026, 4, 14)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=False,
+            followup_attempts=5,
+        )
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, lineage['eod_run_id'])
+            eod_run.run_metadata = {
+                **eod_run.run_metadata,
+                'followup_recovery_required': True,
+            }
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_tampered_nonblocking_partial_marker_remains_recovery_eligible(
+        self,
+    ) -> None:
+        market_date = date(2026, 10, 21)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=True,
+        )
+        with self.session_factory.begin() as session:
+            pipeline_run = session.get(
+                DailyPipelineRun,
+                lineage['pipeline_run_id'],
+            )
+            metadata = deepcopy(pipeline_run.run_metadata)
+            metadata['nonblocking_partial_progression']['summary'][
+                'completed_symbols'
+            ] = ['005930']
+            pipeline_run.run_metadata = metadata
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_tampered_eod_nonblocking_copy_remains_recovery_eligible(
+        self,
+    ) -> None:
+        market_date = date(2026, 10, 22)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=True,
+        )
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, lineage['eod_run_id'])
+            metadata = deepcopy(eod_run.run_metadata)
+            metadata['nonblocking_feedback_retry_debt'][
+                'summary_failed_symbols_by_role'
+            ]['technical-summarizer'] = []
+            eod_run.run_metadata = metadata
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
 
     def test_repair_marker_projection_preserves_raw_json_types(self) -> None:
         session = MagicMock()

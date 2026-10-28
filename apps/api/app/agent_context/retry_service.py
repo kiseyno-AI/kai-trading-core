@@ -127,9 +127,255 @@ def _ordered_symbol_union(symbol_scopes: Sequence[Sequence[str]]) -> list[str]:
     return ordered
 
 
+def resolve_terminal_role_success_intersection(
+    *,
+    progress_summary: Mapping[str, Any],
+    roles: Sequence[str],
+    expected_role_symbol_scopes: Mapping[
+        str,
+        Sequence[str],
+    ] | None = None,
+) -> dict[str, Any]:
+    """Prove the exact symbols completed by every required role.
+
+    A terminal partial run may contain useful results, but aggregate coverage
+    is not enough to authorize downstream work.  This validator reconciles
+    each role's admitted scope, exact failed-symbol partition, and terminal
+    counts.  Any missing or contradictory evidence fails closed.
+    """
+
+    normalized_roles = tuple(
+        str(role or '').strip().lower() for role in roles
+    )
+    base_result: dict[str, Any] = {
+        'ready': False,
+        'reason': 'terminal_role_scope_unproven',
+        'completed_symbols': [],
+        'admitted_symbols': [],
+    }
+    if (
+        not normalized_roles
+        or len(set(normalized_roles)) != len(normalized_roles)
+        or not isinstance(progress_summary, Mapping)
+    ):
+        return base_result
+
+    run_status = str(
+        progress_summary.get('run_status') or ''
+    ).strip().lower()
+    run_table_status = str(
+        progress_summary.get('run_table_status') or ''
+    ).strip().lower()
+    try:
+        run_completed_at = _normalize_admission_knowledge_cutoff(
+            progress_summary.get('run_completed_at')
+        )
+    except (TypeError, ValueError):
+        run_completed_at = None
+    if (
+        run_status not in {'completed', 'partial'}
+        or run_table_status != run_status
+        or progress_summary.get('is_live') is not False
+        or run_completed_at is None
+    ):
+        return {**base_result, 'reason': 'terminal_role_scope_not_finalized'}
+
+    role_scopes = progress_summary.get('role_symbol_scopes')
+    role_counts = progress_summary.get('role_symbol_counts')
+    role_progress = progress_summary.get('role_progress')
+    failed_by_role = progress_summary.get('failed_symbols_by_role')
+    if not (
+        isinstance(role_scopes, Mapping)
+        and set(role_scopes) == set(normalized_roles)
+        and isinstance(role_counts, Mapping)
+        and set(role_counts) == set(normalized_roles)
+        and isinstance(role_progress, Mapping)
+        and set(role_progress) == set(normalized_roles)
+        and isinstance(failed_by_role, Mapping)
+        and set(failed_by_role).issubset(normalized_roles)
+    ):
+        return base_result
+
+    def strict_nonnegative_int(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    normalized_expected_role_scopes: dict[str, list[str]] | None = None
+    if expected_role_symbol_scopes is not None:
+        if not (
+            isinstance(expected_role_symbol_scopes, Mapping)
+            and set(expected_role_symbol_scopes) == set(normalized_roles)
+        ):
+            return base_result
+        normalized_expected_role_scopes = {}
+        for role in normalized_roles:
+            raw_expected_scope = expected_role_symbol_scopes.get(role)
+            if isinstance(raw_expected_scope, (str, bytes)) or not isinstance(
+                raw_expected_scope,
+                Sequence,
+            ):
+                return base_result
+            expected_scope = _normalize_optional_symbol_scope(
+                raw_expected_scope
+            )
+            if (
+                not expected_scope
+                or len(expected_scope) != len(raw_expected_scope)
+            ):
+                return base_result
+            normalized_expected_role_scopes[role] = expected_scope
+
+    completed_scopes: list[set[str]] = []
+    admitted_scopes: list[list[str]] = []
+    total_items = 0
+    completed_items = 0
+    failed_items = 0
+    normalized_failed_by_role: dict[str, list[str]] = {}
+
+    for role in normalized_roles:
+        raw_scope = role_scopes.get(role)
+        raw_failed = failed_by_role.get(role, [])
+        role_state = role_progress.get(role)
+        if not (
+            isinstance(raw_scope, list)
+            and isinstance(raw_failed, list)
+            and isinstance(role_state, Mapping)
+        ):
+            return base_result
+        scope = _normalize_optional_symbol_scope(raw_scope)
+        failed_symbols = _normalize_optional_symbol_scope(raw_failed)
+        if (
+            raw_scope != scope
+            or raw_failed != failed_symbols
+            or not scope
+            or not set(failed_symbols).issubset(scope)
+            or (
+                normalized_expected_role_scopes is not None
+                and set(scope)
+                != set(normalized_expected_role_scopes[role])
+            )
+        ):
+            return base_result
+
+        total = strict_nonnegative_int(role_state.get('total_symbols'))
+        processed = strict_nonnegative_int(
+            role_state.get('processed_symbols')
+        )
+        completed = strict_nonnegative_int(
+            role_state.get('completed_symbols')
+        )
+        terminal = strict_nonnegative_int(
+            role_state.get('terminal_symbols')
+        )
+        failed = strict_nonnegative_int(role_state.get('failed_items'))
+        in_progress = strict_nonnegative_int(
+            role_state.get('in_progress_symbols')
+        )
+        pending = strict_nonnegative_int(
+            role_state.get('pending_symbols')
+        )
+        retry_pending = strict_nonnegative_int(
+            role_state.get('retry_pending_symbols')
+        )
+        persisted_role_count = strict_nonnegative_int(
+            role_counts.get(role)
+        )
+        if any(
+            value is None
+            for value in (
+                total,
+                processed,
+                completed,
+                terminal,
+                failed,
+                in_progress,
+                pending,
+                retry_pending,
+                persisted_role_count,
+            )
+        ):
+            return base_result
+        expected_role_status = (
+            'completed'
+            if failed == 0
+            else 'completed_with_failures'
+            if completed > 0
+            else 'failed'
+        )
+        if not (
+            str(role_state.get('role') or '').strip().lower() == role
+            and str(role_state.get('status') or '').strip().lower()
+            == expected_role_status
+            and str(
+                role_state.get('boundary_status') or ''
+            ).strip().lower()
+            == expected_role_status
+            and total == len(scope)
+            and persisted_role_count == total
+            and processed == total
+            and terminal == total
+            and completed + failed == total
+            and failed == len(failed_symbols)
+            and in_progress == 0
+            and pending == 0
+            and retry_pending <= failed
+        ):
+            return base_result
+
+        admitted_scopes.append(scope)
+        completed_scopes.append(set(scope) - set(failed_symbols))
+        normalized_failed_by_role[role] = failed_symbols
+        total_items += total
+        completed_items += completed
+        failed_items += failed
+
+    expected_total = strict_nonnegative_int(
+        progress_summary.get('expected_feedback_count')
+    )
+    reported_completed = strict_nonnegative_int(
+        progress_summary.get('completed_feedback_count')
+    )
+    reported_failed = strict_nonnegative_int(
+        progress_summary.get('failed_items')
+    )
+    if not (
+        expected_total == total_items
+        and reported_completed == completed_items
+        and reported_failed == failed_items
+        and completed_items + failed_items == total_items
+    ):
+        return base_result
+
+    expected_run_status = (
+        'completed'
+        if failed_items == 0
+        else 'partial'
+        if completed_items > 0
+        else 'failed'
+    )
+    if run_status != expected_run_status:
+        return base_result
+
+    completed_intersection = sorted(set.intersection(*completed_scopes))
+    admitted_symbols = sorted(set().union(*map(set, admitted_scopes)))
+    if not completed_intersection:
+        return {**base_result, 'reason': 'terminal_role_scope_zero_work'}
+    return {
+        'ready': True,
+        'reason': 'terminal_role_success_intersection',
+        'completed_symbols': completed_intersection,
+        'admitted_symbols': admitted_symbols,
+        'failed_symbols_by_role': normalized_failed_by_role,
+        'total_items': total_items,
+        'completed_items': completed_items,
+        'failed_items': failed_items,
+    }
+
+
 def _exact_completed_summary_scope(
     payload: Mapping[str, Any],
-) -> tuple[list[str], int] | None:
+) -> tuple[list[str], int, dict[str, list[str]]] | None:
     """Return symbols completed by every summarizer plus role-item total."""
 
     raw_symbols = payload.get('symbols')
@@ -148,17 +394,20 @@ def _exact_completed_summary_scope(
         return None
 
     role_scopes: list[set[str]] = []
+    canonical_role_scopes: dict[str, list[str]] = {}
     role_item_total = 0
     for role in SUMMARIZER_AGENT_NAMES:
         role_symbols = normalized_role_scopes.get(role)
         if not isinstance(role_symbols, list):
             return None
-        normalized_symbols = set(
+        normalized_symbol_list = sorted(
             _normalize_optional_symbol_scope(role_symbols)
         )
-        if len(normalized_symbols) != len(role_symbols):
+        if len(normalized_symbol_list) != len(role_symbols):
             return None
+        normalized_symbols = set(normalized_symbol_list)
         role_scopes.append(normalized_symbols)
+        canonical_role_scopes[role] = normalized_symbol_list
         role_item_total += len(normalized_symbols)
 
     dispatched_symbols = set(
@@ -187,7 +436,7 @@ def _exact_completed_summary_scope(
                 return None
 
     completed_scope = set.intersection(*role_scopes)
-    return sorted(completed_scope), role_item_total
+    return sorted(completed_scope), role_item_total, canonical_role_scopes
 
 
 def _feedback_retry_admission_lock_key(
@@ -1143,6 +1392,7 @@ def resolve_latest_completed_summary_knowledge_cutoff(
                 }
 
     exact_summary_item_total: int | None = None
+    completed_role_scopes: list[dict[str, list[str]]] = []
     if normalized_source_run_id is not None:
         completed_scope_evidence = [
             _exact_completed_summary_scope(payload)
@@ -1165,12 +1415,20 @@ def resolve_latest_completed_summary_knowledge_cutoff(
             for evidence in completed_scope_evidence
             if evidence is not None
         ]
+        completed_role_scopes = [
+            evidence[2]
+            for evidence in completed_scope_evidence
+            if evidence is not None
+        ]
         if any(
             scope != completed_scopes[0]
             for scope in completed_scopes[1:]
         ) or any(
             item_total != completed_item_totals[0]
             for item_total in completed_item_totals[1:]
+        ) or any(
+            role_scopes != completed_role_scopes[0]
+            for role_scopes in completed_role_scopes[1:]
         ):
             return {
                 **base_result,
@@ -1203,7 +1461,13 @@ def resolve_latest_completed_summary_knowledge_cutoff(
 
     status = str(latest_run.get('status') or '').strip().lower()
     completed_at = latest_run.get('completed_at')
-    if completed_at is None:
+    try:
+        normalized_completed_at = _normalize_admission_knowledge_cutoff(
+            completed_at
+        )
+    except (TypeError, ValueError):
+        normalized_completed_at = None
+    if normalized_completed_at is None:
         return {**base_result, 'reason': 'summary_run_not_finalized'}
     raw_counts = (
         latest_run.get('symbols_total'),
@@ -1213,18 +1477,73 @@ def resolve_latest_completed_summary_knowledge_cutoff(
     if any(type(value) is not int or value < 0 for value in raw_counts):
         return {**base_result, 'reason': 'summary_run_counts_invalid'}
     symbols_total, completed_count, failed_count = raw_counts
-    if (
-        status != 'completed'
-        or failed_count != 0
-        or completed_count != symbols_total
-    ):
-        return {**base_result, 'reason': 'summary_run_incomplete'}
     if normalized_source_run_id is not None and (
         symbols_total <= 0
         or exact_summary_item_total is None
         or symbols_total != exact_summary_item_total
     ):
         return {**base_result, 'reason': 'summary_run_counts_invalid'}
+    if status == 'completed':
+        if failed_count != 0 or completed_count != symbols_total:
+            return {**base_result, 'reason': 'summary_run_incomplete'}
+    elif status == 'partial' and normalized_source_run_id is not None:
+        progress_summary = summary_payload.get('progress_summary')
+        terminal_scope = resolve_terminal_role_success_intersection(
+            progress_summary=(
+                progress_summary
+                if isinstance(progress_summary, Mapping)
+                else {}
+            ),
+            roles=SUMMARIZER_AGENT_NAMES,
+            expected_role_symbol_scopes=completed_role_scopes[0],
+        )
+        if not (
+            terminal_scope.get('ready') is True
+            and terminal_scope.get('total_items') == symbols_total
+            and terminal_scope.get('completed_items') == completed_count
+            and terminal_scope.get('failed_items') == failed_count
+            and completed_count > 0
+            and failed_count > 0
+            and completed_count + failed_count == symbols_total
+        ):
+            return {**base_result, 'reason': 'summary_run_incomplete'}
+        completed_scope = terminal_scope['completed_symbols']
+        admitted_scope = (
+            represented_symbol_scopes[0]
+            if represented_symbol_scopes
+            else None
+        )
+        if not (
+            isinstance(admitted_scope, list)
+            and admitted_scope
+            and set(completed_scope).issubset(admitted_scope)
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_mismatch',
+            }
+        base_result['requested_symbols'] = list(completed_scope)
+        base_result['completed_scope_proof'] = {
+            'schema_version': (
+                COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+            ),
+            'completed_symbols': list(completed_scope),
+            'admitted_symbols': list(admitted_scope),
+        }
+        base_result['terminal_role_scope_proof'] = {
+            'schema_version': 'terminal_role_success_intersection_v1',
+            'failed_symbols_by_role': {
+                role: list(symbols)
+                for role, symbols in terminal_scope[
+                    'failed_symbols_by_role'
+                ].items()
+            },
+            'total_items': terminal_scope['total_items'],
+            'completed_items': terminal_scope['completed_items'],
+            'failed_items': terminal_scope['failed_items'],
+        }
+    else:
+        return {**base_result, 'reason': 'summary_run_incomplete'}
 
     try:
         represented_cutoffs: list[str] = []

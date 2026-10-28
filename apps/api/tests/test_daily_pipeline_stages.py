@@ -1,10 +1,13 @@
 import threading
 import unittest
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
 from app.core.settings import settings
@@ -1160,6 +1163,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
         parent_symbols = ['000660', '005930', '035420']
         completed_intersection = ['000660', '005930']
+        decider_roles = list(DECISION_SUPPORT_AGENT_NAMES)
         service = DailyPipelineStageService(
             feedback_retry_service=feedback_retry_service,
         )
@@ -1176,13 +1180,83 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'feedback_scope_mode': 'broad_feedback_universe',
                     'run_id': 'feedback-cycle-summary-same-run',
                 }
+            role_progress = {
+                role: {
+                    'role': role,
+                    'status': 'completed',
+                    'boundary_status': 'completed',
+                    'total_symbols': len(completed_intersection),
+                    'processed_symbols': len(completed_intersection),
+                    'completed_symbols': len(completed_intersection),
+                    'terminal_symbols': len(completed_intersection),
+                    'failed_items': 0,
+                    'in_progress_symbols': 0,
+                    'pending_symbols': 0,
+                    'retry_pending_symbols': 0,
+                }
+                for role in decider_roles
+            }
             return {
                 'completed': True,
                 'status': 'completed',
                 'final_pending': 0,
                 'roles': list(config.roles),
                 'requested_symbols': list(config.symbols or ()),
+                'feedback_scope_mode': config.feedback_scope_mode,
+                'scope_authority': config.scope_authority,
+                'run_id': 'signal-decider-completed',
+                'progress': {
+                    'summary': {
+                        'run_id': 'signal-decider-completed',
+                        'run_status': 'completed',
+                        'run_table_status': 'completed',
+                        'run_completed_at': cutoff.isoformat(),
+                        'is_live': False,
+                        'expected_feedback_count': (
+                            len(completed_intersection)
+                            * len(decider_roles)
+                        ),
+                        'completed_feedback_count': (
+                            len(completed_intersection)
+                            * len(decider_roles)
+                        ),
+                        'failed_items': 0,
+                        'role_symbol_scopes': {
+                            role: list(completed_intersection)
+                            for role in decider_roles
+                        },
+                        'role_symbol_counts': {
+                            role: len(completed_intersection)
+                            for role in decider_roles
+                        },
+                        'failed_symbols_by_role': {
+                            role: [] for role in decider_roles
+                        },
+                        'role_progress': role_progress,
+                    }
+                },
             }
+
+        original_execute_stage = service._execute_stage
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cutoff if tz is not None else cutoff.replace(tzinfo=None)
+
+        def execute_stage(stage_id, **kwargs):
+            if stage_id == 'next_open_execution_plan':
+                return {'status': 'completed', 'items': []}
+            if stage_id == 'signal_decider_evaluations':
+                return {
+                    'status': 'completed',
+                    'request': {'symbols': kwargs['symbols']},
+                    'summary': {
+                        'outcomes_upserted': len(kwargs['symbols']),
+                        'evaluations_upserted': len(kwargs['symbols']),
+                    },
+                }
+            return original_execute_stage(stage_id, **kwargs)
 
         with (
             patch.object(
@@ -1195,9 +1269,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 '_normalize_market_date',
                 return_value='2026-04-14',
             ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute_stage,
+            ) as execute_stage_mock,
             patch(
-                'app.eod.daily_pipeline_stages.datetime'
-            ) as clock,
+                'app.eod.daily_pipeline_stages.datetime',
+                new=FixedDatetime,
+            ),
             patch(
                 'app.eod.daily_pipeline_stages.'
                 'agent_feedback_prerequisite_service.'
@@ -1229,10 +1309,14 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return_value=None,
             ),
         ):
-            clock.now.return_value = cutoff
             result = service.run(
                 market_date='2026-04-14',
-                stages=['agent_feedback_summaries', 'signal_decider'],
+                stages=[
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
                 symbols=parent_symbols,
                 fs_div='CFS',
             )
@@ -1261,6 +1345,328 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             fs_div='CFS',
             source_run_id='feedback-cycle-summary-same-run',
             requested_symbols=parent_symbols,
+        )
+        completed_evaluation_call = next(
+            call
+            for call in execute_stage_mock.call_args_list
+            if call.args[0] == 'signal_decider_evaluations'
+        )
+        self.assertEqual(
+            completed_evaluation_call.kwargs['symbols'],
+            completed_intersection,
+        )
+
+    def test_same_run_partial_summary_advances_only_terminal_success_intersection(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+        parent_symbols = ['000660', '005930', '035420']
+        completed_intersection = ['000660', '005930']
+        decider_roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+        )
+
+        def feedback_result(*, config, **_kwargs):
+            feedback_retry_service.calls.append({'config': config})
+            if config.roles == SUMMARIZER_AGENT_NAMES:
+                return {
+                    'completed': False,
+                    'status': 'partial',
+                    'final_pending': 0,
+                    'roles': list(config.roles),
+                    'requested_symbols': parent_symbols,
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                    'run_id': 'feedback-cycle-summary-partial',
+                }
+            role_progress = {
+                role: {
+                    'role': role,
+                    'status': 'completed',
+                    'boundary_status': 'completed',
+                    'total_symbols': len(completed_intersection),
+                    'processed_symbols': len(completed_intersection),
+                    'completed_symbols': len(completed_intersection),
+                    'terminal_symbols': len(completed_intersection),
+                    'failed_items': 0,
+                    'in_progress_symbols': 0,
+                    'pending_symbols': 0,
+                    'retry_pending_symbols': 0,
+                }
+                for role in decider_roles
+            }
+            return {
+                'completed': True,
+                'status': 'completed',
+                'final_pending': 0,
+                'roles': list(config.roles),
+                'requested_symbols': list(config.symbols or ()),
+                'feedback_scope_mode': config.feedback_scope_mode,
+                'scope_authority': config.scope_authority,
+                'run_id': 'signal-decider-completed-after-partial-summary',
+                'progress': {
+                    'summary': {
+                        'run_id': (
+                            'signal-decider-completed-after-partial-summary'
+                        ),
+                        'run_status': 'completed',
+                        'run_table_status': 'completed',
+                        'run_completed_at': cutoff.isoformat(),
+                        'is_live': False,
+                        'expected_feedback_count': (
+                            len(completed_intersection)
+                            * len(decider_roles)
+                        ),
+                        'completed_feedback_count': (
+                            len(completed_intersection)
+                            * len(decider_roles)
+                        ),
+                        'failed_items': 0,
+                        'role_symbol_scopes': {
+                            role: list(completed_intersection)
+                            for role in decider_roles
+                        },
+                        'role_symbol_counts': {
+                            role: len(completed_intersection)
+                            for role in decider_roles
+                        },
+                        'failed_symbols_by_role': {
+                            role: [] for role in decider_roles
+                        },
+                        'role_progress': role_progress,
+                    }
+                },
+            }
+
+        original_execute_stage = service._execute_stage
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cutoff if tz is not None else cutoff.replace(tzinfo=None)
+
+        def execute_stage(stage_id, **kwargs):
+            if stage_id == 'next_open_execution_plan':
+                return {'status': 'completed', 'items': []}
+            if stage_id == 'signal_decider_evaluations':
+                return {
+                    'status': 'completed',
+                    'request': {'symbols': kwargs['symbols']},
+                    'summary': {
+                        'outcomes_upserted': len(kwargs['symbols']),
+                        'evaluations_upserted': len(kwargs['symbols']),
+                    },
+                }
+            return original_execute_stage(stage_id, **kwargs)
+
+        with (
+            patch.object(
+                feedback_retry_service,
+                'run_retry_cycles',
+                side_effect=feedback_result,
+            ),
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute_stage,
+            ) as execute_stage_mock,
+            patch(
+                'app.eod.daily_pipeline_stages.datetime',
+                new=FixedDatetime,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': True,
+                    'reason': 'terminal_role_success_intersection',
+                    'knowledge_cutoff_at': cutoff,
+                    'source_run_id': 'feedback-cycle-summary-partial',
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                    'requested_symbols': completed_intersection,
+                    'completed_scope_proof': {
+                        'schema_version': (
+                            'completed_summarizer_intersection_v1'
+                        ),
+                        'completed_symbols': completed_intersection,
+                        'admitted_symbols': parent_symbols,
+                    },
+                },
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'build_expired_decision_replay_result',
+                return_value=None,
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                symbols=parent_symbols,
+                fs_div='CFS',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['stages']['agent_feedback_summaries']['status'],
+            'partial',
+        )
+        self.assertEqual(
+            result['stages']['signal_decider']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['next_open_execution_plan']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['signal_decider_evaluations']['status'],
+            'completed',
+        )
+        self.assertEqual(len(feedback_retry_service.calls), 2)
+        self.assertEqual(
+            feedback_retry_service.calls[1]['config'].symbols,
+            tuple(completed_intersection),
+        )
+        self.assertEqual(
+            feedback_retry_service.calls[1]['config'].scope_authority[
+                'source_summary_run_id'
+            ],
+            'feedback-cycle-summary-partial',
+        )
+        evaluation_call = next(
+            call
+            for call in execute_stage_mock.call_args_list
+            if call.args[0] == 'signal_decider_evaluations'
+        )
+        self.assertEqual(
+            evaluation_call.kwargs['symbols'],
+            completed_intersection,
+        )
+
+    def test_exact_previous_session_recovery_runs_only_during_preopen(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        symbols = ['000660', '005930']
+        cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+        market = type(
+            'Market',
+            (),
+            {
+                'state': 'PREOPEN',
+                'server_time': '2026-04-15T08:00:00+09:00',
+            },
+        )()
+
+        def execute(stage_id, **_kwargs):
+            if stage_id == 'agent_feedback_summaries':
+                return {
+                    'status': 'completed',
+                    'run_id': 'summary-run',
+                    'roles': list(SUMMARIZER_AGENT_NAMES),
+                    'requested_symbols': symbols,
+                }
+            if stage_id == 'signal_decider':
+                return {'status': 'completed'}
+            if stage_id == 'next_open_execution_plan':
+                return {'status': 'completed', 'items': []}
+            if stage_id == 'signal_decider_evaluations':
+                return {'status': 'completed'}
+            raise AssertionError(stage_id)
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 4, 15),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': True,
+                    'knowledge_cutoff_at': cutoff,
+                    'source_run_id': 'summary-run',
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                    'requested_symbols': symbols,
+                    'completed_scope_proof': {
+                        'schema_version': (
+                            'completed_summarizer_intersection_v1'
+                        ),
+                        'completed_symbols': symbols,
+                        'admitted_symbols': symbols,
+                    },
+                },
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                symbols=symbols,
+                resume_from_stage='agent_feedback_summaries',
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=73,
+                point_in_time_recovery=True,
+                reuse_existing_feedback=True,
+                provider_admission_fence_owned=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(
+            self.run_state_service.runs[-1]['run_metadata'][
+                'previous_session_preopen_recovery_admitted'
+            ]
+        )
+        self.assertTrue(execute_stage.call_args_list)
+        self.assertTrue(
+            all(
+                call.kwargs['allow_previous_session_preopen_recovery']
+                is True
+                for call in execute_stage.call_args_list
+            )
         )
 
     def test_decider_only_recovery_inherits_completed_summary_cutoff(self) -> None:
@@ -5779,6 +6185,344 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'signal_decider_stage_incomplete',
         )
         self.assertEqual([call.args[0] for call in execute_stage.call_args_list], ['signal_decider'])
+
+    def test_run_advances_plan_and_evaluation_for_terminal_partial_decider_intersection(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        symbols = ['000660', '005930']
+        roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        failed_role = 'short-term-decider'
+        cutoff_at = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+        completed_scope_proof = {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': symbols,
+            'admitted_symbols': symbols,
+        }
+        cutoff_resolution = {
+            'ready': True,
+            'reason': 'latest_completed_summary_cutoff',
+            'knowledge_cutoff_at': cutoff_at,
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'requested_symbols': symbols,
+            'completed_scope_proof': completed_scope_proof,
+        }
+
+        role_progress = {
+            role: {
+                'role': role,
+                'status': (
+                    'completed_with_failures'
+                    if role == failed_role
+                    else 'completed'
+                ),
+                'boundary_status': (
+                    'completed_with_failures'
+                    if role == failed_role
+                    else 'completed'
+                ),
+                'total_symbols': 2,
+                'processed_symbols': 2,
+                'completed_symbols': 1 if role == failed_role else 2,
+                'terminal_symbols': 2,
+                'failed_items': 1 if role == failed_role else 0,
+                'in_progress_symbols': 0,
+                'pending_symbols': 0,
+                'retry_pending_symbols': 1 if role == failed_role else 0,
+            }
+            for role in roles
+        }
+        progress_summary = {
+            'run_id': 'signal-decider-partial',
+            'run_status': 'partial',
+            'run_table_status': 'partial',
+            'run_completed_at': cutoff_at.isoformat(),
+            'is_live': False,
+            'expected_feedback_count': 4,
+            'completed_feedback_count': 3,
+            'failed_items': 1,
+            'role_symbol_scopes': {
+                role: list(symbols) for role in roles
+            },
+            'role_symbol_counts': {role: 2 for role in roles},
+            'failed_symbols_by_role': {
+                failed_role: ['005930'],
+            },
+            'role_progress': role_progress,
+        }
+
+        def execute(stage_id, **kwargs):
+            if stage_id == 'signal_decider':
+                return {
+                    'status': 'partial',
+                    'run_id': 'signal-decider-partial',
+                    'roles': roles,
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': symbols,
+                    'scope_authority': {
+                        'schema_version': (
+                            FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+                        ),
+                        'kind': (
+                            FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+                        ),
+                        'source_summary_run_id': (
+                            'feedback-cycle-summary'
+                        ),
+                        'source_feedback_scope_mode': (
+                            'broad_feedback_universe'
+                        ),
+                        'decision_feedback_scope_mode': (
+                            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                        ),
+                        'knowledge_cutoff_at': cutoff_at.isoformat(),
+                        'completed_scope_proof': completed_scope_proof,
+                    },
+                    'progress': {'summary': progress_summary},
+                }
+            if stage_id == 'next_open_execution_plan':
+                return {'status': 'completed', 'items': []}
+            if stage_id == 'signal_decider_evaluations':
+                return {
+                    'status': 'completed',
+                    'request': {'symbols': kwargs['symbols']},
+                    'summary': {
+                        'outcomes_upserted': 1,
+                        'evaluations_upserted': 1,
+                    },
+                }
+            raise AssertionError(f'unexpected stage: {stage_id}')
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value=cutoff_resolution,
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                symbols=symbols,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['stages']['signal_decider']['status'], 'partial')
+        self.assertEqual(
+            result['stages']['next_open_execution_plan']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['signal_decider_evaluations']['status'],
+            'completed',
+        )
+        evaluation_call = next(
+            call
+            for call in execute_stage.call_args_list
+            if call.args[0] == 'signal_decider_evaluations'
+        )
+        self.assertEqual(evaluation_call.kwargs['symbols'], ['000660'])
+        marker = service._build_nonblocking_partial_progression_marker(
+            market_date='2026-04-14',
+            pipeline_run_id=96,
+            reused_eod_collection_run_id=7,
+            trigger='auto_eod_followup_resume',
+            stage_outcomes=result['stages'],
+            feedback_cutoff_resolution=cutoff_resolution,
+        )
+        self.assertIsNotNone(marker)
+        self.assertEqual(
+            marker['decider']['completed_symbols'],
+            ['000660'],
+        )
+        self.assertEqual(
+            marker['retry_debt']['decider_failed_symbols_by_role'][
+                'short-term-decider'
+            ],
+            ['005930'],
+        )
+        blocked_stages = deepcopy(result['stages'])
+        blocked_stages['next_open_execution_plan']['status'] = 'blocked'
+        self.assertIsNone(
+            service._build_nonblocking_partial_progression_marker(
+                market_date='2026-04-14',
+                pipeline_run_id=96,
+                reused_eod_collection_run_id=7,
+                trigger='auto_eod_followup_resume',
+                stage_outcomes=blocked_stages,
+                feedback_cutoff_resolution=cutoff_resolution,
+            )
+        )
+
+    def test_partial_decider_intersection_rejects_tampered_scope_and_lineage(
+        self,
+    ) -> None:
+        roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        symbols = ['000660', '005930']
+        cutoff_at = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+        scope_proof = {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': symbols,
+            'admitted_symbols': symbols,
+        }
+        cutoff_resolution = {
+            'ready': True,
+            'knowledge_cutoff_at': cutoff_at,
+            'source_run_id': 'summary-run',
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'requested_symbols': symbols,
+            'completed_scope_proof': scope_proof,
+        }
+        progress_summary = {
+            'run_id': 'decider-run',
+            'run_status': 'partial',
+            'run_table_status': 'partial',
+            'run_completed_at': cutoff_at.isoformat(),
+            'is_live': False,
+            'expected_feedback_count': 4,
+            'completed_feedback_count': 3,
+            'failed_items': 1,
+            'role_symbol_scopes': {
+                role: list(symbols) for role in roles
+            },
+            'role_symbol_counts': {role: 2 for role in roles},
+            'failed_symbols_by_role': {
+                'short-term-decider': ['005930'],
+            },
+            'role_progress': {
+                role: {
+                    'role': role,
+                    'status': (
+                        'completed_with_failures'
+                        if role == 'short-term-decider'
+                        else 'completed'
+                    ),
+                    'boundary_status': (
+                        'completed_with_failures'
+                        if role == 'short-term-decider'
+                        else 'completed'
+                    ),
+                    'total_symbols': 2,
+                    'processed_symbols': 2,
+                    'completed_symbols': (
+                        1 if role == 'short-term-decider' else 2
+                    ),
+                    'terminal_symbols': 2,
+                    'failed_items': (
+                        1 if role == 'short-term-decider' else 0
+                    ),
+                    'in_progress_symbols': 0,
+                    'pending_symbols': 0,
+                    'retry_pending_symbols': (
+                        1 if role == 'short-term-decider' else 0
+                    ),
+                }
+                for role in roles
+            },
+        }
+        outcome = {
+            'status': 'partial',
+            'result': {
+                'status': 'partial',
+                'run_id': 'decider-run',
+                'roles': roles,
+                'feedback_scope_mode': (
+                    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                ),
+                'requested_symbols': symbols,
+                'scope_authority': {
+                    'schema_version': (
+                        FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION
+                    ),
+                    'kind': (
+                        FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION
+                    ),
+                    'source_summary_run_id': 'summary-run',
+                    'source_feedback_scope_mode': (
+                        'broad_feedback_universe'
+                    ),
+                    'decision_feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'knowledge_cutoff_at': cutoff_at.isoformat(),
+                    'completed_scope_proof': scope_proof,
+                },
+                'progress': {'summary': progress_summary},
+            },
+        }
+
+        resolver = (
+            DailyPipelineStageService
+            ._terminal_decider_completed_symbols
+        )
+        self.assertEqual(
+            resolver(
+                outcome,
+                expected_decider_symbols=symbols,
+                feedback_cutoff_resolution=cutoff_resolution,
+            ),
+            ['000660'],
+        )
+
+        tampered_cases = []
+        wrong_lineage = deepcopy(outcome)
+        wrong_lineage['result']['scope_authority'][
+            'source_summary_run_id'
+        ] = 'other-summary-run'
+        tampered_cases.append(('summary_lineage', wrong_lineage))
+        wrong_requested_scope = deepcopy(outcome)
+        wrong_requested_scope['result']['requested_symbols'] = [
+            '000660',
+            '035420',
+        ]
+        tampered_cases.append(('requested_scope', wrong_requested_scope))
+        wrong_progress_scope = deepcopy(outcome)
+        wrong_progress_scope['result']['progress']['summary'][
+            'role_symbol_scopes'
+        ]['signal-decider'] = ['000660', '035420']
+        tampered_cases.append(('progress_scope', wrong_progress_scope))
+        contradictory_status = deepcopy(outcome)
+        contradictory_status['result']['progress']['summary'][
+            'run_status'
+        ] = 'completed'
+        contradictory_status['result']['progress']['summary'][
+            'run_table_status'
+        ] = 'completed'
+        tampered_cases.append(('status_counts', contradictory_status))
+
+        for case_name, tampered_outcome in tampered_cases:
+            with self.subTest(case=case_name):
+                self.assertIsNone(
+                    resolver(
+                        tampered_outcome,
+                        expected_decider_symbols=symbols,
+                        feedback_cutoff_resolution=cutoff_resolution,
+                    )
+                )
 
 
 if __name__ == '__main__':

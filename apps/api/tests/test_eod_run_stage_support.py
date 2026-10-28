@@ -4,20 +4,376 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.agent_context.roles import (
+    DECISION_SUPPORT_AGENT_NAMES,
+    SUMMARIZER_AGENT_NAMES,
+)
+from app.agent_context.run_modes import (
+    FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+    FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
 from app.eod.run_stage_support import (
+    NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION,
+    NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
+    admits_previous_session_preopen_auto_recovery,
     admits_same_day_intraday_watch_continuation,
     build_next_open_window_expired_result,
+    build_nonblocking_downstream_scope_proof,
     build_stage_counts,
     extract_fundamentals_refresh_metrics,
     is_exact_auto_pitr_intraday_watch_recovery_request,
     is_recoverable_same_day_intraday_watch_expiration,
     normalize_run_status,
+    nonblocking_partial_progression_digest,
     resolve_run_updated_at,
     select_preferred_eod_run,
+    validated_nonblocking_partial_progression_marker,
 )
 
 
 class EODRunStageSupportTests(unittest.TestCase):
+    @staticmethod
+    def _nonblocking_partial_recovery_result():
+        summary_admitted = ['000660', '005930']
+        summary_completed = ['000660']
+        summary_failures = {
+            role: ['005930'] if role == 'technical-summarizer' else []
+            for role in SUMMARIZER_AGENT_NAMES
+        }
+        decider_failures = {
+            role: [] for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        scope_proof = {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': summary_completed,
+            'admitted_symbols': summary_admitted,
+        }
+        summary_terminal_proof = {
+            'schema_version': 'terminal_role_success_intersection_v1',
+            'failed_symbols_by_role': summary_failures,
+            'total_items': 6,
+            'completed_items': 5,
+            'failed_items': 1,
+        }
+        cutoff_at = '2026-04-14T08:30:00+00:00'
+        plan_result = {
+            'items': [
+                {
+                    'symbol': summary_completed[0],
+                    'eligibility_status': 'eligible',
+                    'handoff_active': True,
+                    'exec_monitoring_active': True,
+                    'decision_agent_name': 'signal-decider',
+                    'decision_run_id': 'decider-run',
+                }
+            ]
+        }
+        evaluation_result = {
+            'request': {'symbols': summary_completed},
+        }
+        plan_scope_proof = build_nonblocking_downstream_scope_proof(
+            'next_open_execution_plan',
+            plan_result,
+        )
+        evaluation_scope_proof = (
+            build_nonblocking_downstream_scope_proof(
+                'signal_decider_evaluations',
+                evaluation_result,
+            )
+        )
+        marker = {
+            'schema_version': NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
+            'blocking_status': 'non_blocking',
+            'market_date': '2026-04-14',
+            'pipeline_run_id': 96,
+            'reused_eod_collection_run_id': 7,
+            'summary': {
+                'source_run_id': 'summary-run',
+                'knowledge_cutoff_at': cutoff_at,
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'admitted_symbols': summary_admitted,
+                'completed_symbols': summary_completed,
+                'failed_symbols_by_role': summary_failures,
+                'total_items': 6,
+                'completed_items': 5,
+                'failed_items': 1,
+            },
+            'decider': {
+                'source_run_id': 'decider-run',
+                'source_summary_run_id': 'summary-run',
+                'admitted_symbols': summary_completed,
+                'completed_symbols': summary_completed,
+                'failed_symbols_by_role': decider_failures,
+                'total_items': 2,
+                'completed_items': 2,
+                'failed_items': 0,
+            },
+            'downstream': {
+                'plan_status': 'completed',
+                'evaluation_status': 'completed',
+                'actionable_symbols': summary_completed,
+                'plan_scope_proof': plan_scope_proof,
+                'evaluation_scope_proof': evaluation_scope_proof,
+            },
+            'retry_debt': {
+                'schema_version': NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION,
+                'summary_failed_symbols_by_role': summary_failures,
+                'decider_failed_symbols_by_role': decider_failures,
+            },
+        }
+        marker['proof_digest'] = nonblocking_partial_progression_digest(
+            marker
+        )
+        decider_progress = {
+            'run_id': 'decider-run',
+            'run_status': 'completed',
+            'run_table_status': 'completed',
+            'run_completed_at': cutoff_at,
+            'is_live': False,
+            'expected_feedback_count': 2,
+            'completed_feedback_count': 2,
+            'failed_items': 0,
+            'role_symbol_scopes': {
+                role: summary_completed
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+            'role_symbol_counts': {
+                role: 1 for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+            'failed_symbols_by_role': {},
+            'role_progress': {
+                role: {
+                    'role': role,
+                    'status': 'completed',
+                    'boundary_status': 'completed',
+                    'total_symbols': 1,
+                    'processed_symbols': 1,
+                    'completed_symbols': 1,
+                    'terminal_symbols': 1,
+                    'failed_items': 0,
+                    'in_progress_symbols': 0,
+                    'pending_symbols': 0,
+                    'retry_pending_symbols': 0,
+                }
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+        }
+        signal_result = {
+            'status': 'completed',
+            'run_id': 'decider-run',
+            'roles': list(DECISION_SUPPORT_AGENT_NAMES),
+            'feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            'requested_symbols': summary_completed,
+            'scope_authority': {
+                'schema_version': FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+                'kind': FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+                'source_summary_run_id': 'summary-run',
+                'source_feedback_scope_mode': 'broad_feedback_universe',
+                'decision_feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                'knowledge_cutoff_at': cutoff_at,
+                'completed_scope_proof': scope_proof,
+            },
+            'progress': {'summary': decider_progress},
+        }
+        metadata = {
+            'reused_eod_collection_run_id': 7,
+            'resolved_stages': [
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            ],
+            'resumable': False,
+            'feedback_knowledge_cutoff': {
+                'ready': True,
+                'source_run_id': 'summary-run',
+                'feedback_scope_mode': 'broad_feedback_universe',
+                'knowledge_cutoff_at': cutoff_at,
+                'requested_symbols': summary_completed,
+                'completed_scope_proof': scope_proof,
+                'terminal_role_scope_proof': summary_terminal_proof,
+            },
+            'nonblocking_partial_progression': marker,
+        }
+        return {
+            'status': 'partial',
+            'pipeline_run_id': 96,
+            'market_date': '2026-04-14',
+            'resolved_stages': metadata['resolved_stages'],
+            'pipeline_run': {
+                'id': 96,
+                'market_date': '2026-04-14',
+                'trigger': 'auto_eod_followup_resume',
+                'status': 'partial',
+                'current_stage': 'signal_decider_evaluations',
+                'completed_at': cutoff_at,
+                'error_message': None,
+                'run_metadata': metadata,
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'completed',
+                    'result': signal_result,
+                },
+                'next_open_execution_plan': {
+                    'status': 'completed',
+                    'result': plan_result,
+                },
+                'signal_decider_evaluations': {
+                    'status': 'completed',
+                    'result': evaluation_result,
+                },
+            },
+        }
+
+    def test_nonblocking_partial_marker_is_exactly_bound_to_durable_evidence(
+        self,
+    ):
+        recovery_result = self._nonblocking_partial_recovery_result()
+
+        marker = validated_nonblocking_partial_progression_marker(
+            recovery_result,
+            expected_eod_collection_run_id=7,
+        )
+
+        self.assertIsNotNone(marker)
+        tampered_digest = deepcopy(recovery_result)
+        tampered_digest['pipeline_run']['run_metadata'][
+            'nonblocking_partial_progression'
+        ]['summary']['completed_symbols'] = ['005930']
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                tampered_digest,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        tampered_stage = deepcopy(recovery_result)
+        tampered_stage['stages']['signal_decider']['result']['run_id'] = (
+            'different-decider-run'
+        )
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                tampered_stage,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        tampered_evaluation_scope = deepcopy(recovery_result)
+        tampered_evaluation_scope['stages'][
+            'signal_decider_evaluations'
+        ]['result']['request']['symbols'] = ['000660', '005930']
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                tampered_evaluation_scope,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        tampered_plan_scope = deepcopy(recovery_result)
+        tampered_plan_scope['stages']['next_open_execution_plan'][
+            'result'
+        ]['items'] = [
+            {
+                'symbol': '005930',
+                'eligibility_status': 'eligible',
+                'handoff_active': True,
+                'exec_monitoring_active': True,
+                'decision_agent_name': 'signal-decider',
+                'decision_run_id': 'decider-run',
+            }
+        ]
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                tampered_plan_scope,
+                expected_eod_collection_run_id=7,
+            )
+        )
+
+    def test_previous_session_preopen_recovery_requires_exact_automatic_suffix(
+        self,
+    ):
+        market = SimpleNamespace(
+            state='PREOPEN',
+            server_time='2026-09-14T08:00:00+09:00',
+        )
+        request = {
+            'market_date': '2026-09-11',
+            'market': market,
+            'trigger': 'auto_eod_followup_resume',
+            'point_in_time_recovery': True,
+            'reused_eod_collection_run_id': 581,
+            'force': False,
+            'reuse_existing_feedback': True,
+            'resume_from_stage': 'agent_feedback_summaries',
+            'resolved_stages': [
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            ],
+            'provider_admission_fence_owned': True,
+            'existing_pipeline_run_id': None,
+        }
+
+        with patch(
+            'app.orders.next_open_execution.'
+            'normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            self.assertTrue(
+                admits_previous_session_preopen_auto_recovery(**request)
+            )
+            invalid_values = {
+                'trigger': 'stage_orchestrator',
+                'point_in_time_recovery': False,
+                'reused_eod_collection_run_id': 0,
+                'force': True,
+                'reuse_existing_feedback': False,
+                'resume_from_stage': 'signal_decider',
+                'provider_admission_fence_owned': False,
+                'existing_pipeline_run_id': 99,
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'next_open_execution_plan',
+                ],
+            }
+            for field, invalid_value in invalid_values.items():
+                with self.subTest(field=field):
+                    self.assertFalse(
+                        admits_previous_session_preopen_auto_recovery(
+                            **{**request, field: invalid_value}
+                        )
+                    )
+
+    def test_previous_session_preopen_recovery_expires_at_open(self):
+        preopen = SimpleNamespace(
+            state='PREOPEN',
+            server_time='2026-09-14T08:59:00+09:00',
+        )
+        opened = SimpleNamespace(
+            state='OPEN',
+            server_time='2026-09-14T09:00:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.'
+            'normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            self.assertIsNone(
+                build_next_open_window_expired_result(
+                    market_date='2026-09-11',
+                    market=preopen,
+                    allow_previous_session_preopen_recovery=True,
+                )
+            )
+            opened_result = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=opened,
+                allow_previous_session_preopen_recovery=True,
+            )
+
+        self.assertEqual(opened_result['reason'], 'next_open_window_expired')
+        self.assertEqual(opened_result['market_state'], 'OPEN')
+
     def test_exact_auto_pitr_intraday_watch_recovery_request_is_narrow(self):
         request = {
             'trigger': 'auto_eod_followup_resume',

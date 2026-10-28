@@ -8933,6 +8933,129 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(x_item['execution_status'], EXECUTION_STATUS_REVOCATION_PENDING)
         self.assertEqual(x_item['submission']['revocation']['reason_code'], 'candidate_removed')
 
+    def test_partial_decider_cohort_tombstones_failed_symbol_without_older_fallback(
+        self,
+    ) -> None:
+        old_run = f'cohort-old-{uuid4().hex[:10]}'
+        partial_run = f'cohort-partial-{uuid4().hex[:10]}'
+        symbol_seed = 100_000 + int(uuid4().hex[:6], 16) % 800_000
+        succeeded_symbol = f'{symbol_seed:06d}'
+        failed_symbol = f'{symbol_seed + 1:06d}'
+        symbols = [succeeded_symbol, failed_symbol]
+        self._seed_feedback_run(
+            run_id=old_run,
+            symbols=symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 22, 0, tzinfo=timezone.utc),
+        )
+        self._seed_snapshot(
+            symbol=succeeded_symbol,
+            decision_run_id=old_run,
+            feedback_received_at=datetime(
+                2026, 4, 29, 22, 1, tzinfo=timezone.utc
+            ),
+        )
+        older_failed_snapshot_id = self._seed_snapshot(
+            symbol=failed_symbol,
+            decision_run_id=old_run,
+            feedback_received_at=datetime(
+                2026, 4, 29, 22, 1, tzinfo=timezone.utc
+            ),
+        )
+        self._seed_feedback_run(
+            run_id=partial_run,
+            symbols=symbols,
+            roles=['signal-decider'],
+            started_at=datetime(2026, 4, 29, 23, 0, tzinfo=timezone.utc),
+            status='partial',
+            completed_count=1,
+            failed_count=1,
+            progress_summary={
+                'failed_symbols_by_role': {
+                    'signal-decider': [failed_symbol],
+                },
+            },
+        )
+        succeeded_snapshot_id = self._seed_snapshot(
+            symbol=succeeded_symbol,
+            decision_run_id=partial_run,
+            feedback_received_at=datetime(
+                2026, 4, 29, 23, 1, tzinfo=timezone.utc
+            ),
+        )
+        self.feedback_failure_symbols.append(failed_symbol)
+        with session_scope() as session:
+            session.add(
+                AgentContextFeedbackFailure(
+                    market_date=self.market_date,
+                    symbol=failed_symbol,
+                    agent_name='signal-decider',
+                    run_id=partial_run,
+                    failure_kind='response_contract_invalid',
+                    retryable=True,
+                    summary_payload={},
+                    context_payload={},
+                    received_at=datetime(
+                        2026, 4, 29, 23, 2, tzinfo=timezone.utc
+                    ),
+                )
+            )
+
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        scope_state = service._load_latest_decider_scope_state(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+        )
+
+        self.assertEqual(
+            scope_state['selected_by_key'][
+                (succeeded_symbol, 'signal-decider')
+            ].id,
+            succeeded_snapshot_id,
+        )
+        failed_key = (failed_symbol, 'signal-decider')
+        self.assertIsNone(scope_state['selected_by_key'][failed_key])
+        self.assertEqual(
+            scope_state['authoritative_run_id_by_key'][failed_key],
+            partial_run,
+        )
+        self.assertEqual(
+            scope_state['failures_by_key'][failed_key]['run_id'],
+            partial_run,
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='partial_cohort',
+            )
+
+        plan_items = {
+            item['symbol']: item
+            for item in refreshed['items']
+            if item['symbol'] in symbols
+        }
+        self.assertEqual(set(plan_items), {succeeded_symbol})
+        self.assertEqual(
+            plan_items[succeeded_symbol]['decision_snapshot_id'],
+            succeeded_snapshot_id,
+        )
+        self.assertNotIn(
+            older_failed_snapshot_id,
+            {
+                item['decision_snapshot_id']
+                for item in refreshed['items']
+            },
+        )
+
     def test_latest_run_cohort_narrower_scope_does_not_remove_unrequested_symbol(self) -> None:
         run_a = f'cohort-full-{uuid4().hex[:10]}'
         run_b = f'cohort-narrow-{uuid4().hex[:10]}'

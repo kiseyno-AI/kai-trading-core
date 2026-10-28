@@ -259,17 +259,33 @@ class AutoPykrxEODScheduler:
             recovery_market_date is not None
             and recovery_market_date < current_market_date
         )
+        previous_session_preopen_recovery_due = False
         if recovery_only:
             if not older_recovery_due:
                 self._clear_preflight_backoff()
                 self._state.last_status = 'idle'
                 self._state.last_reason = 'no_older_recovery_debt'
                 return RecoveryOnlyScheduleDisposition.NO_DEBT
-            self._state.last_market_date = recovery_market_date
-            self._state.last_status = 'blocked'
-            self._state.last_reason = 'older_recovery_debt_pending'
-            return RecoveryOnlyScheduleDisposition.DUE_BLOCKED
-        if market.state in {'PREOPEN', 'OPEN'}:
+            if market.state == 'PREOPEN':
+                previous_session_date = (
+                    await async_previous_krx_trading_date(
+                        date.fromisoformat(current_market_date),
+                        allow_fallback=True,
+                    )
+                )
+                previous_session_preopen_recovery_due = bool(
+                    previous_session_date is not None
+                    and recovery_market_date
+                    == previous_session_date.isoformat()
+                )
+            if not previous_session_preopen_recovery_due:
+                self._state.last_market_date = recovery_market_date
+                self._state.last_status = 'blocked'
+                self._state.last_reason = 'older_recovery_debt_pending'
+                return RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+        if market.state in {'PREOPEN', 'OPEN'} and not (
+            recovery_only and previous_session_preopen_recovery_due
+        ):
             self._state.last_status = 'idle'
             self._state.last_reason = f'market_not_closed:{market.state}'
             return None
