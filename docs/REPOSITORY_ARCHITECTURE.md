@@ -146,7 +146,7 @@ Supporting scheduler modules:
 
 - `app/eod/auto_pykrx.py`
   - decides whether the daily pykrx collection is due
-  - waits until 20:10 KST by default for same-day data finality (15:30 KRX close + 280 minutes), while older incomplete-date recovery remains eligible earlier
+  - waits until 20:10 KST by default for same-day data finality (15:30 KRX close + 280 minutes), including older incomplete-date recovery on trading days; `PREOPEN` and `OPEN` only inspect debt
   - records scheduler status for `/eod/status`
   - runs the daily pykrx collection in a background task
 - `app/eod/state.py`

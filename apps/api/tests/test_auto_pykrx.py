@@ -953,7 +953,7 @@ class NextOpenExecutionPlanFollowupTests(TestCase):
 
         self.assertEqual(result['status'], 'skipped')
         self.assertEqual(result['reason'], 'next_open_window_expired')
-        run_retry_cycles.assert_called_once()
+        run_retry_cycles.assert_not_called()
 
 
 def _completed_factor_followup_result(*, market_date: str = '2026-04-03') -> dict:
@@ -17404,7 +17404,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             'recovery_state_unavailable',
         )
 
-    async def test_open_recovery_only_reports_due_blocked_during_preflight_backoff(
+    async def test_open_recovery_only_reports_due_blocked_for_pending_debt(
         self,
     ) -> None:
         scheduler = AutoPykrxEODScheduler()
@@ -17449,7 +17449,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
         self.assertIsNone(scheduler._task)
         self.assertEqual(
             scheduler.snapshot()['last_reason'],
-            'incomplete_universe_preflight_backoff',
+            'older_recovery_debt_pending',
         )
 
     async def test_open_recovery_only_reports_active_task_as_due_blocked(
@@ -17487,7 +17487,9 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             RecoveryOnlyScheduleDisposition.DUE_BLOCKED,
         )
 
-    async def test_monday_open_dispatches_outstanding_friday_recovery(self) -> None:
+    async def test_monday_open_blocks_on_outstanding_friday_recovery_without_starting_pipeline(
+        self,
+    ) -> None:
         scheduler = AutoPykrxEODScheduler()
         market = MarketState(
             market='KRX',
@@ -17535,8 +17537,6 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             disposition = await scheduler.schedule_recovery_if_due(
                 expected_market_state='OPEN'
             )
-            self.assertIsNotNone(scheduler._task)
-            await scheduler._task
 
         load_recovery_target.assert_called_once_with(
             on_or_after='2026-09-08',
@@ -17551,28 +17551,28 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
                 call(date(2026, 9, 9), allow_fallback=True),
             ],
         )
-        run_pipeline.assert_awaited_once_with(
-            '2026-09-11',
-            markets=('KOSPI', 'KOSDAQ'),
-            point_in_time_recovery=True,
-            recovery_eod_run_id=73,
-        )
+        self.assertIsNone(scheduler._task)
+        run_pipeline.assert_not_awaited()
         self.assertEqual(scheduler.snapshot()['last_market_date'], '2026-09-11')
         self.assertEqual(
+            scheduler.snapshot()['last_reason'],
+            'older_recovery_debt_pending',
+        )
+        self.assertEqual(
             disposition,
-            RecoveryOnlyScheduleDisposition.DUE_STARTED,
+            RecoveryOnlyScheduleDisposition.DUE_BLOCKED,
         )
 
-    async def test_open_recovery_disposition_survives_fast_task_completion(
+    async def test_preopen_recovery_inspection_never_starts_pipeline(
         self,
     ) -> None:
         scheduler = AutoPykrxEODScheduler()
         market = MarketState(
             market='KRX',
-            state='OPEN',
+            state='PREOPEN',
             is_trading_day=True,
-            is_open=True,
-            server_time='2026-09-14T10:00:00+09:00',
+            is_open=False,
+            server_time='2026-09-14T08:00:00+09:00',
             session_open_at='2026-09-14T09:00:00+09:00',
             session_close_at='2026-09-14T15:30:00+09:00',
             latest_valid_trading_date='2026-09-11',
@@ -17595,22 +17595,26 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
                 'app.eod.auto_pykrx.PYKRX_BACKFILL_SERVICE.'
                 'run_daily_pipeline_if_due',
                 return_value={'status': 'completed'},
-            ),
+            ) as run_daily,
         ):
             disposition = await scheduler.schedule_recovery_if_due(
-                expected_market_state='OPEN'
+                expected_market_state='PREOPEN'
             )
-            self.assertIsNotNone(scheduler._task)
-            await scheduler._task
 
         self.assertEqual(
             disposition,
-            RecoveryOnlyScheduleDisposition.DUE_STARTED,
+            RecoveryOnlyScheduleDisposition.DUE_BLOCKED,
         )
+        self.assertIsNone(scheduler._task)
         self.assertFalse(scheduler.state.active_task)
-        self.assertEqual(scheduler.snapshot()['last_status'], 'completed')
+        self.assertEqual(scheduler.snapshot()['last_status'], 'blocked')
+        self.assertEqual(
+            scheduler.snapshot()['last_reason'],
+            'older_recovery_debt_pending',
+        )
+        run_daily.assert_not_called()
 
-    async def test_preopen_recovery_does_not_start_after_market_opens(self) -> None:
+    async def test_daily_scheduler_never_starts_recovery_during_preopen(self) -> None:
         scheduler = AutoPykrxEODScheduler()
         preopen = MarketState(
             market='KRX',
@@ -17622,21 +17626,10 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             session_close_at='2026-09-14T15:30:00+09:00',
             latest_valid_trading_date='2026-09-11',
         )
-        opened = MarketState(
-            market='KRX',
-            state='OPEN',
-            is_trading_day=True,
-            is_open=True,
-            server_time='2026-09-14T09:00:01+09:00',
-            session_open_at='2026-09-14T09:00:00+09:00',
-            session_close_at='2026-09-14T15:30:00+09:00',
-            latest_valid_trading_date='2026-09-14',
-        )
-
         with (
             patch(
                 'app.eod.auto_pykrx.async_get_market_state',
-                side_effect=[preopen, opened],
+                return_value=preopen,
             ),
             patch(
                 'app.eod.auto_pykrx.'
@@ -17658,13 +17651,13 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
 
         self.assertIsNone(scheduler._task)
         run_pipeline.assert_not_awaited()
-        self.assertEqual(scheduler.snapshot()['last_market_state'], 'OPEN')
+        self.assertEqual(scheduler.snapshot()['last_market_state'], 'PREOPEN')
         self.assertEqual(
             scheduler.snapshot()['last_reason'],
-            'market_state_changed:PREOPEN->OPEN',
+            'market_not_closed:PREOPEN',
         )
 
-    async def test_closed_session_drains_older_recovery_before_same_day_finality_window(
+    async def test_closed_session_defers_older_recovery_until_same_day_finality_window(
         self,
     ) -> None:
         scheduler = AutoPykrxEODScheduler()
@@ -17690,13 +17683,10 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             patch(
                 'app.eod.auto_pykrx.'
                 'load_oldest_outstanding_auto_eod_recovery_target',
-                side_effect=[
-                    AutoEODRecoveryTarget(
-                        trade_date='2026-09-11',
-                        eod_run_id=81,
-                    ),
-                    None,
-                ],
+                return_value=AutoEODRecoveryTarget(
+                    trade_date='2026-09-11',
+                    eod_run_id=81,
+                ),
                 create=True,
             ) as load_recovery_target,
             patch.object(
@@ -17706,28 +17696,141 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             ) as run_pipeline,
         ):
             await scheduler.schedule_daily_pipeline_if_due()
-            self.assertIsNotNone(scheduler._task)
-            await scheduler._task
-
-            await scheduler.schedule_daily_pipeline_if_due()
             self.assertIsNone(scheduler._task)
 
-        self.assertEqual(load_recovery_target.call_count, 2)
-        self.assertEqual(
-            run_pipeline.await_args_list,
-            [
-                call(
-                    '2026-09-11',
-                    markets=('KOSPI', 'KOSDAQ'),
-                    point_in_time_recovery=True,
-                    recovery_eod_run_id=81,
-                ),
-            ],
-        )
+        load_recovery_target.assert_called_once()
+        run_pipeline.assert_not_awaited()
         self.assertEqual(scheduler.snapshot()['last_status'], 'idle')
         self.assertEqual(
             scheduler.snapshot()['last_reason'],
             f'waiting_until:{(close_at + timedelta(minutes=280)).isoformat()}',
+        )
+
+    async def test_closed_session_starts_older_recovery_after_same_day_finality_window(
+        self,
+    ) -> None:
+        scheduler = AutoPykrxEODScheduler()
+        now = datetime.now(KST)
+        close_at = (now - timedelta(minutes=281)).replace(
+            second=0,
+            microsecond=0,
+        )
+        current_market_date = now.date().isoformat()
+        market = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time=now.isoformat(),
+            session_open_at=(
+                close_at - timedelta(hours=6, minutes=30)
+            ).isoformat(),
+            session_close_at=close_at.isoformat(),
+            latest_valid_trading_date=current_market_date,
+        )
+
+        with (
+            patch(
+                'app.eod.auto_pykrx.async_get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.eod.auto_pykrx.'
+                'load_oldest_outstanding_auto_eod_recovery_target',
+                return_value=AutoEODRecoveryTarget(
+                    trade_date='2026-09-11',
+                    eod_run_id=81,
+                ),
+            ),
+            patch.object(
+                scheduler,
+                '_run_scheduled_daily_pipeline',
+                new=AsyncMock(return_value=None),
+            ) as run_pipeline,
+        ):
+            await scheduler.schedule_daily_pipeline_if_due(
+                expected_market_state='CLOSED'
+            )
+            self.assertIsNotNone(scheduler._task)
+            await scheduler._task
+
+        run_pipeline.assert_awaited_once_with(
+            '2026-09-11',
+            markets=('KOSPI', 'KOSDAQ'),
+            point_in_time_recovery=True,
+            recovery_eod_run_id=81,
+        )
+
+    async def test_closed_scheduler_rechecks_session_before_starting_recovery(
+        self,
+    ) -> None:
+        scheduler = AutoPykrxEODScheduler()
+        now = datetime.now(KST)
+        close_at = (now - timedelta(minutes=281)).replace(
+            second=0,
+            microsecond=0,
+        )
+        current_market_date = now.date().isoformat()
+        closed = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time=now.isoformat(),
+            session_open_at=(
+                close_at - timedelta(hours=6, minutes=30)
+            ).isoformat(),
+            session_close_at=close_at.isoformat(),
+            latest_valid_trading_date=current_market_date,
+        )
+        preopen = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time=(now + timedelta(days=1)).replace(
+                hour=8,
+                minute=0,
+            ).isoformat(),
+            session_open_at=(now + timedelta(days=1)).replace(
+                hour=9,
+                minute=0,
+            ).isoformat(),
+            session_close_at=(now + timedelta(days=1)).replace(
+                hour=15,
+                minute=30,
+            ).isoformat(),
+            latest_valid_trading_date=current_market_date,
+        )
+
+        with (
+            patch(
+                'app.eod.auto_pykrx.async_get_market_state',
+                side_effect=[closed, preopen],
+            ),
+            patch(
+                'app.eod.auto_pykrx.'
+                'load_oldest_outstanding_auto_eod_recovery_target',
+                return_value=AutoEODRecoveryTarget(
+                    trade_date='2026-09-11',
+                    eod_run_id=81,
+                ),
+            ),
+            patch.object(
+                scheduler,
+                '_run_scheduled_daily_pipeline',
+                new=AsyncMock(return_value=None),
+            ) as run_pipeline,
+        ):
+            await scheduler.schedule_daily_pipeline_if_due(
+                expected_market_state='CLOSED'
+            )
+
+        self.assertIsNone(scheduler._task)
+        run_pipeline.assert_not_awaited()
+        self.assertEqual(
+            scheduler.snapshot()['last_reason'],
+            'market_state_changed:CLOSED->PREOPEN',
         )
 
     async def test_same_day_recovery_does_not_bypass_finality_window(self) -> None:

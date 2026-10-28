@@ -66,6 +66,7 @@ def build_next_open_window_expired_result(
     target_is_still_actionable = bool(
         (
             market_state == 'PREOPEN'
+            and allow_same_day_intraday_watch_continuation
             and target_trade_date >= current_market_date
         )
         or target_trade_date > current_market_date
@@ -649,14 +650,15 @@ def admits_same_day_intraday_watch_continuation(
     *,
     market_date: str,
     market: object,
-    allow_open_recovery_start: bool = False,
+    allow_existing_recovery_resume: bool = False,
 ) -> bool:
-    """Admit same-day PREOPEN, plus an explicitly verified OPEN recovery."""
+    """Admit only a proven existing recovery during its live target session."""
 
     market_state = str(getattr(market, 'state', '') or '').strip().upper()
-    if market_state != 'PREOPEN' and not (
-        allow_open_recovery_start and market_state == 'OPEN'
-    ):
+    if not allow_existing_recovery_resume or market_state not in {
+        'PREOPEN',
+        'OPEN',
+    }:
         return False
     server_time = str(getattr(market, 'server_time', '') or '')
     try:

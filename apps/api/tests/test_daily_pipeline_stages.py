@@ -4817,7 +4817,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(len(feedback_retry_service.calls), 1)
         self.assertEqual(len(evaluation_service.calls), 1)
 
-    def test_execute_decider_crossing_market_open_finishes_as_expired(
+    def test_execute_decider_does_not_start_during_preopen(
         self,
     ) -> None:
         feedback_retry_service = _FakeFeedbackRetryService()
@@ -4865,7 +4865,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         self.assertEqual(result['status'], 'skipped')
         self.assertEqual(result['reason'], 'next_open_window_expired')
-        self.assertEqual(len(feedback_retry_service.calls), 1)
+        self.assertEqual(feedback_retry_service.calls, [])
 
     def test_execute_decider_keeps_preopen_admission_after_market_open(
         self,
@@ -4961,7 +4961,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ]
         )
 
-    def test_exact_auto_pitr_recovery_started_during_open_persists_admission(
+    def test_exact_auto_pitr_recovery_cannot_start_during_open(
         self,
     ) -> None:
         feedback_retry_service = _FakeFeedbackRetryService()
@@ -5040,27 +5040,116 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(result['status'], 'completed')
-        self.assertEqual(len(feedback_retry_service.calls), 1)
-        refresh_plan.assert_called_once_with(
-            target_trade_date='2026-10-27',
-            trigger='daily_pipeline_post_decider',
-            force=False,
-        )
-        self.assertEqual(len(evaluation_service.calls), 1)
-        evaluation_outcome = result['stages'][
-            'signal_decider_evaluations'
-        ]
-        self.assertEqual(evaluation_outcome['status'], 'completed')
-        self.assertEqual(
-            evaluation_outcome['result']['summary'][
-                'evaluations_upserted'
-            ],
-            4,
-        )
-        self.assertNotIn('reason', evaluation_outcome['result'])
-        self.assertNotIn('skipped', evaluation_outcome['result'])
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(feedback_retry_service.calls, [])
+        refresh_plan.assert_not_called()
+        self.assertEqual(evaluation_service.calls, [])
         self.assertTrue(
+            all(
+                outcome['status'] == 'skipped'
+                and outcome['result']['reason']
+                == 'next_open_window_expired'
+                for outcome in result['stages'].values()
+            )
+        )
+        self.assertFalse(
+            self.run_state_service.runs[-1]['run_metadata'][
+                'same_day_intraday_watch_continuation_admitted'
+            ]
+        )
+
+    def test_exact_auto_pitr_recovery_cannot_start_during_preopen(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        evaluation_service = _FakeSignalDeciderEvaluationService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+            decision_loop_service=evaluation_service,
+        )
+        cutoff = datetime(2026, 10, 27, 0, 5, tzinfo=timezone.utc)
+        preopen_market = MagicMock(
+            state='PREOPEN',
+            server_time='2026-10-27T08:01:00+09:00',
+        )
+        stages = [
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=preopen_market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 10, 27),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'knowledge_cutoff_at': cutoff,
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': ['005930'],
+                    'completed_scope_proof': {
+                        'schema_version': (
+                            'completed_summarizer_intersection_v1'
+                        ),
+                        'completed_symbols': ['005930'],
+                        'admitted_symbols': ['005930'],
+                    },
+                },
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'signal_decider_next_open_execution_service.'
+                'refresh_plan_items',
+                return_value={'status': 'completed'},
+            ) as refresh_plan,
+        ):
+            result = service.run(
+                market_date='2026-10-26',
+                stages=stages,
+                resume_from_stage='signal_decider',
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=581,
+                point_in_time_recovery=True,
+                force=False,
+                reuse_existing_feedback=True,
+                summary_cutoff_proof={
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': None,
+                    'expected_completed_symbols': ['005930'],
+                    'knowledge_cutoff_at': cutoff.isoformat(),
+                    'fs_div': 'CFS',
+                },
+            )
+
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(feedback_retry_service.calls, [])
+        refresh_plan.assert_not_called()
+        self.assertEqual(evaluation_service.calls, [])
+        self.assertTrue(
+            all(
+                outcome['status'] == 'skipped'
+                and outcome['result']['reason']
+                == 'next_open_window_expired'
+                for outcome in result['stages'].values()
+            )
+        )
+        self.assertFalse(
             self.run_state_service.runs[-1]['run_metadata'][
                 'same_day_intraday_watch_continuation_admitted'
             ]

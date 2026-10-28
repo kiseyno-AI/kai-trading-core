@@ -216,7 +216,7 @@ class EODRunStageSupportTests(unittest.TestCase):
             },
         )
 
-    def test_preopen_admission_keeps_only_same_day_open_window_alive(self):
+    def test_existing_recovery_preopen_admission_keeps_only_same_day_open_window_alive(self):
         preopen = SimpleNamespace(
             state='PREOPEN',
             server_time='2026-09-14T08:59:00+09:00',
@@ -234,6 +234,7 @@ class EODRunStageSupportTests(unittest.TestCase):
             admitted = admits_same_day_intraday_watch_continuation(
                 market_date='2026-09-11',
                 market=preopen,
+                allow_existing_recovery_resume=True,
             )
             without_admission = build_next_open_window_expired_result(
                 market_date='2026-09-11',
@@ -251,6 +252,28 @@ class EODRunStageSupportTests(unittest.TestCase):
             'next_open_window_expired',
         )
         self.assertIsNone(with_admission)
+
+    def test_new_recovery_is_not_admitted_during_live_session(self):
+        for state, server_time in (
+            ('PREOPEN', '2026-09-14T08:59:00+09:00'),
+            ('OPEN', '2026-09-14T09:01:00+09:00'),
+        ):
+            with self.subTest(state=state):
+                market = SimpleNamespace(
+                    state=state,
+                    server_time=server_time,
+                )
+                with patch(
+                    'app.orders.next_open_execution.'
+                    'normalize_next_open_target_trade_date',
+                    return_value=date(2026, 9, 14),
+                ):
+                    admitted = admits_same_day_intraday_watch_continuation(
+                        market_date='2026-09-11',
+                        market=market,
+                    )
+
+                self.assertFalse(admitted)
 
     def test_same_day_admission_never_extends_past_market_close(self):
         closed = SimpleNamespace(
@@ -289,7 +312,7 @@ class EODRunStageSupportTests(unittest.TestCase):
         self.assertEqual(result['status'], 'skipped')
         self.assertEqual(result['reason'], 'next_open_window_expired')
 
-    def test_preopen_current_target_next_open_window_remains_eligible(self):
+    def test_existing_recovery_preopen_current_target_remains_eligible(self):
         market = SimpleNamespace(
             state='PREOPEN',
             server_time='2026-09-14T08:00:00+09:00',
@@ -302,6 +325,7 @@ class EODRunStageSupportTests(unittest.TestCase):
             result = build_next_open_window_expired_result(
                 market_date='2026-09-11',
                 market=market,
+                allow_same_day_intraday_watch_continuation=True,
             )
 
         self.assertIsNone(result)

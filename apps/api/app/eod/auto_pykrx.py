@@ -163,7 +163,7 @@ class AutoPykrxEODScheduler:
         *,
         expected_market_state: str,
     ) -> RecoveryOnlyScheduleDisposition:
-        """Inspect and optionally start older debt; never start a fresh daily run."""
+        """Inspect older debt without starting pipeline work during live sessions."""
 
         disposition = await self._schedule_pipeline_if_due(
             expected_market_state=expected_market_state,
@@ -259,15 +259,20 @@ class AutoPykrxEODScheduler:
             recovery_market_date is not None
             and recovery_market_date < current_market_date
         )
-        if recovery_only and not older_recovery_due:
-            self._clear_preflight_backoff()
-            self._state.last_status = 'idle'
-            self._state.last_reason = 'no_older_recovery_debt'
-            return RecoveryOnlyScheduleDisposition.NO_DEBT
-        if recovery_only and not settings.eod_auto_pykrx_enabled:
+        if recovery_only:
+            if not older_recovery_due:
+                self._clear_preflight_backoff()
+                self._state.last_status = 'idle'
+                self._state.last_reason = 'no_older_recovery_debt'
+                return RecoveryOnlyScheduleDisposition.NO_DEBT
+            self._state.last_market_date = recovery_market_date
             self._state.last_status = 'blocked'
-            self._state.last_reason = 'recovery_disabled_by_config'
+            self._state.last_reason = 'older_recovery_debt_pending'
             return RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+        if market.state in {'PREOPEN', 'OPEN'}:
+            self._state.last_status = 'idle'
+            self._state.last_reason = f'market_not_closed:{market.state}'
+            return None
         if recovery_market_date is not None:
             target_market_date = recovery_market_date
         elif market.state == 'CLOSED':
@@ -308,12 +313,12 @@ class AutoPykrxEODScheduler:
             self._state.last_reason = 'missing_latest_valid_trading_date'
             return None
 
-        if not older_recovery_due and market.state == 'CLOSED' and not market.session_close_at:
+        if market.state == 'CLOSED' and not market.session_close_at:
             self._state.last_status = 'idle'
             self._state.last_reason = 'missing_session_close'
             return None
 
-        if not older_recovery_due and market.state == 'CLOSED':
+        if market.state == 'CLOSED':
             close_at = datetime.fromisoformat(market.session_close_at)
             eligible_at = close_at + timedelta(
                 minutes=settings.eod_auto_pykrx_after_close_minutes

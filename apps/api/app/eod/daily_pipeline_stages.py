@@ -790,7 +790,9 @@ class DailyPipelineStageService:
             and admits_same_day_intraday_watch_continuation(
                 market_date=resolved_market_date,
                 market=intraday_watch_market,
-                allow_open_recovery_start=True,
+                allow_existing_recovery_resume=(
+                    intraday_watch_rearm_resume_candidate
+                ),
             )
         )
         if (
