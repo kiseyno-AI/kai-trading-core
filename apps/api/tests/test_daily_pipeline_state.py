@@ -360,6 +360,394 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         session.feedback_child_rows = feedback_child_rows
         return session
 
+    @staticmethod
+    def _same_day_rearm_claim_fixture(
+        *,
+        lineage_count: int = 6,
+        conflicting_cutoff: bool = False,
+        current_checkpoint: str = 'after_signal',
+    ) -> tuple[SimpleNamespace, list[SimpleNamespace], SimpleNamespace, MagicMock, dict]:
+        source_date = date(2026, 10, 27)
+        cutoff = datetime(2026, 10, 27, 7, 55, tzinfo=timezone.utc)
+        source_completed_at = datetime(
+            2026, 10, 28, 0, 35, tzinfo=timezone.utc
+        )
+        marker_started_at = source_completed_at + timedelta(seconds=1)
+        current_started_at = source_completed_at + timedelta(minutes=2)
+        interrupted_at = current_started_at + timedelta(minutes=2)
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+            'expected_completed_symbols': ['005930'],
+            'knowledge_cutoff_at': cutoff.isoformat(),
+            'fs_div': 'CFS',
+        }
+
+        def run_metadata(*, cutoff_source: str = 'feedback-cycle-summary') -> dict:
+            return {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resolved_stages': [
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'resume_from_stage': 'signal_decider',
+                'reused_eod_collection_run_id': 581,
+                'symbols': None,
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'fs_div': 'CFS',
+                'point_in_time_recovery': True,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': True,
+                'feedback_knowledge_cutoff': {
+                    'ready': True,
+                    'knowledge_cutoff_at': cutoff.isoformat(),
+                    'source_run_id': cutoff_source,
+                    'feedback_scope_mode': 'decider_scope_fast_path',
+                    'requested_symbols': ['005930'],
+                },
+            }
+
+        interruption_reason = 'Core restarted after signal completion.'
+        current = SimpleNamespace(
+            id=593,
+            market_date=source_date,
+            trigger='auto_eod_followup_resume',
+            status='interrupted',
+            current_stage='signal_decider',
+            started_at=current_started_at,
+            updated_at=interrupted_at,
+            completed_at=interrupted_at,
+            error_message=interruption_reason,
+            run_metadata={
+                **run_metadata(),
+                'resumable': True,
+                'interrupted_at': interrupted_at.isoformat(),
+                'interrupted_reason': interruption_reason,
+            },
+        )
+        signal = SimpleNamespace(
+            id=1,
+            pipeline_run_id=593,
+            market_date=source_date,
+            stage_id='signal_decider',
+            status='completed',
+            processed=160,
+            total=160,
+            succeeded=160,
+            failed=0,
+            remaining=0,
+            current_step='signal_decider_completed',
+            current_activity='Signal decider completed',
+            current_symbol=None,
+            current_period=None,
+            started_at=current_started_at,
+            updated_at=current_started_at + timedelta(minutes=1),
+            completed_at=current_started_at + timedelta(minutes=1),
+            error_message=None,
+            source_run_ids={
+                'agent_feedback_run_id': 'decider-cycle-completed'
+            },
+            details={'result_summary': {'status': 'completed'}},
+        )
+        current_stage_rows = [signal]
+        if current_checkpoint in {'during_plan', 'during_evaluation'}:
+            plan_completed = current_checkpoint == 'during_evaluation'
+            current_stage_rows.append(
+                SimpleNamespace(
+                    id=2,
+                    pipeline_run_id=593,
+                    market_date=source_date,
+                    stage_id='next_open_execution_plan',
+                    status=(
+                        'completed' if plan_completed else 'interrupted'
+                    ),
+                    processed=1 if plan_completed else 0,
+                    total=1 if plan_completed else 0,
+                    succeeded=1 if plan_completed else 0,
+                    failed=0,
+                    remaining=0,
+                    current_step=(
+                        'next_open_execution_plan_completed'
+                        if plan_completed
+                        else 'core_restart_interrupted'
+                    ),
+                    current_activity='Plan stage',
+                    current_symbol=None,
+                    current_period=None,
+                    started_at=current_started_at + timedelta(minutes=1),
+                    updated_at=interrupted_at,
+                    completed_at=interrupted_at,
+                    error_message=(
+                        None if plan_completed else interruption_reason
+                    ),
+                    source_run_ids=(
+                        {'plan_id': 77} if plan_completed else {}
+                    ),
+                    details=(
+                        {'result_summary': {'status': 'completed'}}
+                        if plan_completed
+                        else {
+                            'resumable': True,
+                            'interrupted_reason': interruption_reason,
+                        }
+                    ),
+                )
+            )
+        if current_checkpoint == 'during_evaluation':
+            current_stage_rows.append(
+                SimpleNamespace(
+                    id=3,
+                    pipeline_run_id=593,
+                    market_date=source_date,
+                    stage_id='signal_decider_evaluations',
+                    status='interrupted',
+                    processed=0,
+                    total=0,
+                    succeeded=0,
+                    failed=0,
+                    remaining=0,
+                    current_step='core_restart_interrupted',
+                    current_activity='Evaluation stage',
+                    current_symbol=None,
+                    current_period=None,
+                    started_at=current_started_at + timedelta(minutes=2),
+                    updated_at=interrupted_at,
+                    completed_at=interrupted_at,
+                    error_message=interruption_reason,
+                    source_run_ids={},
+                    details={
+                        'resumable': True,
+                        'interrupted_reason': interruption_reason,
+                    },
+                )
+            )
+        if current_checkpoint == 'during_plan':
+            current.current_stage = 'next_open_execution_plan'
+        elif current_checkpoint == 'during_evaluation':
+            current.current_stage = 'signal_decider_evaluations'
+        elif current_checkpoint != 'after_signal':
+            raise AssertionError(
+                f'unknown current checkpoint: {current_checkpoint}'
+            )
+        proof_run = SimpleNamespace(
+            id=590,
+            market_date=source_date,
+            trigger='auto_eod_followup_resume',
+            status='blocked',
+            current_stage='signal_decider_evaluations',
+            started_at=source_completed_at - timedelta(minutes=10),
+            completed_at=source_completed_at - timedelta(minutes=5),
+            error_message=None,
+            run_metadata=run_metadata(
+                cutoff_source=(
+                    'conflicting-feedback-cycle'
+                    if conflicting_cutoff
+                    else 'feedback-cycle-summary'
+                )
+            ),
+        )
+        source_run = SimpleNamespace(
+            id=592,
+            market_date=source_date,
+            trigger='auto_eod_followup_resume',
+            status='skipped',
+            current_stage='signal_decider_evaluations',
+            started_at=source_completed_at - timedelta(minutes=1),
+            completed_at=source_completed_at,
+            error_message=None,
+            run_metadata={
+                **run_metadata(),
+                'same_day_intraday_watch_continuation_admitted': False,
+            },
+        )
+        filler_count = max(0, lineage_count - 3)
+        filler_ids = list(range(560, 560 + filler_count))
+        lineage = [
+            *[
+                SimpleNamespace(
+                    id=run_id,
+                    started_at=source_completed_at
+                    - timedelta(minutes=30 - index),
+                    run_metadata=run_metadata(),
+                )
+                for index, run_id in enumerate(filler_ids)
+            ],
+            proof_run,
+            source_run,
+            current,
+        ]
+        eod_run = SimpleNamespace(
+            id=581,
+            market='KRX',
+            source='pykrx',
+            trade_date=source_date,
+            run_metadata={
+                'same_day_intraday_watch_rearm': {
+                    'version': 1,
+                    'status': 'pending',
+                    'source_false_skip_run_id': 592,
+                    'proof_pipeline_run_id': 590,
+                    'target_trade_date': '2026-10-28',
+                    'attempt_limit': 8,
+                    'started_at': marker_started_at.isoformat(),
+                }
+            },
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = current
+        lineage_result = MagicMock()
+        lineage_result.scalars.return_value = lineage
+        active_result = MagicMock()
+        active_result.scalars.return_value = []
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = current_stage_rows
+        marker_evidence_rows: list[SimpleNamespace] = []
+        for stage_id in (
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ):
+            marker_evidence_rows.append(
+                SimpleNamespace(
+                    id=100 + len(marker_evidence_rows),
+                    pipeline_run_id=592,
+                    market_date=source_date,
+                    stage_id=stage_id,
+                    status='skipped',
+                    processed=0,
+                    total=0,
+                    succeeded=0,
+                    failed=0,
+                    remaining=0,
+                    completed_at=source_completed_at,
+                    error_message=None,
+                    source_run_ids={},
+                    details={
+                        'result_summary': {
+                            'triggered': False,
+                            'status': 'skipped',
+                            'reason': 'next_open_window_expired',
+                            'market_date': '2026-10-27',
+                            'target_trade_date': '2026-10-28',
+                            'current_market_date': '2026-10-28',
+                            'market_state': 'OPEN',
+                            'stage': stage_id,
+                        }
+                    },
+                )
+            )
+        marker_evidence_rows.extend(
+            [
+                SimpleNamespace(
+                    id=200,
+                    pipeline_run_id=590,
+                    market_date=source_date,
+                    stage_id='signal_decider',
+                    status='partial',
+                    processed=160,
+                    total=160,
+                    succeeded=147,
+                    failed=13,
+                    remaining=0,
+                    completed_at=source_completed_at - timedelta(minutes=5),
+                    error_message=None,
+                    source_run_ids={
+                        'agent_feedback_run_id': 'decider-cycle-prior'
+                    },
+                    details={
+                        'result_summary': {
+                            'run_id': 'decider-cycle-prior',
+                            'prerequisites': {'ready': True},
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 13,
+                                    'failure_groups': {
+                                        'openclaw_transport_error': {
+                                            'count': 13,
+                                            'retryable_count': 13,
+                                        }
+                                    },
+                                    'role_progress': {
+                                        'short-term-decider': {
+                                            'retry_pending_symbols': 13,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        },
+                                        'signal-decider': {
+                                            'retry_pending_symbols': 0,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        },
+                                    },
+                                }
+                            },
+                        }
+                    },
+                ),
+                SimpleNamespace(
+                    id=201,
+                    pipeline_run_id=590,
+                    market_date=source_date,
+                    stage_id='next_open_execution_plan',
+                    status='blocked',
+                    processed=0,
+                    total=0,
+                    succeeded=0,
+                    failed=0,
+                    remaining=0,
+                    completed_at=source_completed_at - timedelta(minutes=5),
+                    error_message=None,
+                    source_run_ids={},
+                    details={
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete'
+                        }
+                    },
+                ),
+                SimpleNamespace(
+                    id=202,
+                    pipeline_run_id=590,
+                    market_date=source_date,
+                    stage_id='signal_decider_evaluations',
+                    status='blocked',
+                    processed=0,
+                    total=0,
+                    succeeded=0,
+                    failed=0,
+                    remaining=0,
+                    completed_at=source_completed_at - timedelta(minutes=5),
+                    error_message=None,
+                    source_run_ids={},
+                    details={
+                        'result_summary': {
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                ),
+            ]
+        )
+        marker_evidence_result = MagicMock()
+        marker_evidence_result.scalars.return_value = marker_evidence_rows
+        session = MagicMock()
+        session.execute.side_effect = [
+            MagicMock(),
+            run_result,
+            lineage_result,
+            marker_evidence_result,
+            active_result,
+            stages_result,
+        ]
+        session.lineage_rows = lineage
+        session.marker_evidence_rows = marker_evidence_rows
+        session.get.return_value = eod_run
+        return current, current_stage_rows, eod_run, session, proof
+
     def test_startup_stage_adapter_preserves_safe_partial_evidence(self) -> None:
         stage = SimpleNamespace(
             stage_id='momentum_factors',
@@ -378,6 +766,213 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(outcome['succeeded'], 99)
         self.assertEqual(outcome['total'], 100)
         self.assertTrue(daily_pipeline_outcome_is_satisfied(outcome))
+
+    def test_same_day_rearm_claim_preserves_completed_signal_lazy_tail(
+        self,
+    ) -> None:
+        current, signal_rows, _, session, proof = (
+            self._same_day_rearm_claim_fixture()
+        )
+        context = MagicMock()
+        context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=context,
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .claim_same_day_intraday_watch_rearm_resume(
+                    pipeline_run_id=593,
+                    market_date='2026-10-27',
+                    reused_eod_collection_run_id=581,
+                    target_trade_date='2026-10-28',
+                    expected_summary_cutoff_proof=proof,
+                )
+            )
+
+        self.assertTrue(result['claimed'], result)
+        self.assertEqual(result['resume_from_stage'], 'next_open_execution_plan')
+        self.assertEqual(
+            list(result['persisted_stage_outcomes']), ['signal_decider']
+        )
+        self.assertEqual(signal_rows[0].status, 'completed')
+        self.assertEqual(current.status, 'running')
+        self.assertEqual(current.current_stage, 'next_open_execution_plan')
+        self.assertEqual(
+            current.run_metadata['stage_statuses'],
+            {
+                'signal_decider': 'completed',
+                'next_open_execution_plan': 'pending',
+                'signal_decider_evaluations': 'pending',
+            },
+        )
+        session.flush.assert_called_once()
+
+    def test_same_day_rearm_claim_accepts_lazy_plan_and_evaluation_shapes(
+        self,
+    ) -> None:
+        for checkpoint, expected_resume, expected_persisted in (
+            (
+                'during_plan',
+                'next_open_execution_plan',
+                ['signal_decider'],
+            ),
+            (
+                'during_evaluation',
+                'signal_decider_evaluations',
+                ['signal_decider', 'next_open_execution_plan'],
+            ),
+        ):
+            with self.subTest(checkpoint=checkpoint):
+                current, stage_rows, _, session, proof = (
+                    self._same_day_rearm_claim_fixture(
+                        current_checkpoint=checkpoint
+                    )
+                )
+                context = MagicMock()
+                context.__enter__.return_value = session
+                with patch(
+                    'app.eod.daily_pipeline_state.session_scope',
+                    return_value=context,
+                ):
+                    result = (
+                        DailyPipelineRunStateService()
+                        .claim_same_day_intraday_watch_rearm_resume(
+                            pipeline_run_id=593,
+                            market_date='2026-10-27',
+                            reused_eod_collection_run_id=581,
+                            target_trade_date='2026-10-28',
+                            expected_summary_cutoff_proof=proof,
+                        )
+                    )
+                self.assertTrue(result['claimed'], result)
+                self.assertEqual(result['resume_from_stage'], expected_resume)
+                self.assertEqual(
+                    list(result['persisted_stage_outcomes']),
+                    expected_persisted,
+                )
+                self.assertEqual(current.current_stage, expected_resume)
+                self.assertEqual(
+                    {
+                        row.stage_id: row.status
+                        for row in stage_rows
+                    },
+                    {
+                        stage_id: (
+                            'completed'
+                            if stage_id in expected_persisted
+                            else 'pending'
+                        )
+                        for stage_id in {
+                            row.stage_id for row in stage_rows
+                        }
+                    },
+                )
+                session.flush.assert_called_once()
+
+    def test_same_day_rearm_claim_rejects_attempt_nine_and_cutoff_mismatch(
+        self,
+    ) -> None:
+        for lineage_count, conflicting_cutoff, expected_reason in (
+            (9, False, 'same_day_rearm_lineage_mismatch'),
+            (8, True, 'proof_pipeline_cutoff_mismatch'),
+        ):
+            with self.subTest(
+                lineage_count=lineage_count,
+                conflicting_cutoff=conflicting_cutoff,
+            ):
+                _, _, _, session, proof = (
+                    self._same_day_rearm_claim_fixture(
+                        lineage_count=lineage_count,
+                        conflicting_cutoff=conflicting_cutoff,
+                    )
+                )
+                context = MagicMock()
+                context.__enter__.return_value = session
+                with patch(
+                    'app.eod.daily_pipeline_state.session_scope',
+                    return_value=context,
+                ):
+                    result = (
+                        DailyPipelineRunStateService()
+                        .claim_same_day_intraday_watch_rearm_resume(
+                            pipeline_run_id=593,
+                            market_date='2026-10-27',
+                            reused_eod_collection_run_id=581,
+                            target_trade_date='2026-10-28',
+                            expected_summary_cutoff_proof=proof,
+                        )
+                    )
+                self.assertFalse(result['claimed'], result)
+                self.assertEqual(result['reason'], expected_reason)
+                session.flush.assert_not_called()
+
+    def test_same_day_rearm_claim_revalidates_marker_source_and_proof(
+        self,
+    ) -> None:
+        for mutation, expected_reason in (
+            ('proof_source_id', 'proof_pipeline_evidence_invalid'),
+            ('source_false_skip', 'source_false_skip_evidence_invalid'),
+            (
+                'proof_chronology',
+                'same_day_rearm_proof_chronology_mismatch',
+            ),
+        ):
+            with self.subTest(mutation=mutation):
+                _, _, _, session, proof = (
+                    self._same_day_rearm_claim_fixture()
+                )
+                marker_rows = session.marker_evidence_rows
+                if mutation == 'proof_chronology':
+                    proof_run = next(
+                        row for row in session.lineage_rows if row.id == 590
+                    )
+                    source_run = next(
+                        row for row in session.lineage_rows if row.id == 592
+                    )
+                    proof_run.started_at = source_run.started_at + timedelta(
+                        seconds=1
+                    )
+                elif mutation == 'proof_source_id':
+                    proof_signal = next(
+                        row
+                        for row in marker_rows
+                        if row.pipeline_run_id == 590
+                        and row.stage_id == 'signal_decider'
+                    )
+                    proof_signal.source_run_ids = {
+                        'agent_feedback_run_id': 'mutated-cycle'
+                    }
+                else:
+                    source_signal = next(
+                        row
+                        for row in marker_rows
+                        if row.pipeline_run_id == 592
+                        and row.stage_id == 'signal_decider'
+                    )
+                    source_signal.details['result_summary'][
+                        'target_trade_date'
+                    ] = '2026-10-29'
+                context = MagicMock()
+                context.__enter__.return_value = session
+                with patch(
+                    'app.eod.daily_pipeline_state.session_scope',
+                    return_value=context,
+                ):
+                    result = (
+                        DailyPipelineRunStateService()
+                        .claim_same_day_intraday_watch_rearm_resume(
+                            pipeline_run_id=593,
+                            market_date='2026-10-27',
+                            reused_eod_collection_run_id=581,
+                            target_trade_date='2026-10-28',
+                            expected_summary_cutoff_proof=proof,
+                        )
+                    )
+                self.assertFalse(result['claimed'], result)
+                self.assertEqual(result['reason'], expected_reason)
+                session.flush.assert_not_called()
 
     def test_authoritative_decider_completed_evidence_allows_capped_role_subsets(
         self,

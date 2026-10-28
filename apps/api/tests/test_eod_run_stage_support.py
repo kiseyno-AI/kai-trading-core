@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +9,8 @@ from app.eod.run_stage_support import (
     build_next_open_window_expired_result,
     build_stage_counts,
     extract_fundamentals_refresh_metrics,
+    is_exact_auto_pitr_intraday_watch_recovery_request,
+    is_recoverable_same_day_intraday_watch_expiration,
     normalize_run_status,
     resolve_run_updated_at,
     select_preferred_eod_run,
@@ -15,6 +18,176 @@ from app.eod.run_stage_support import (
 
 
 class EODRunStageSupportTests(unittest.TestCase):
+    def test_exact_auto_pitr_intraday_watch_recovery_request_is_narrow(self):
+        request = {
+            'trigger': 'auto_eod_followup_resume',
+            'point_in_time_recovery': True,
+            'reused_eod_collection_run_id': 581,
+            'force': False,
+            'reuse_existing_feedback': True,
+            'resume_from_stage': 'signal_decider',
+            'resolved_stages': [
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            ],
+        }
+
+        self.assertTrue(
+            is_exact_auto_pitr_intraday_watch_recovery_request(**request)
+        )
+
+        invalid_values = {
+            'trigger': 'stage_orchestrator',
+            'point_in_time_recovery': False,
+            'reused_eod_collection_run_id': 0,
+            'force': True,
+            'reuse_existing_feedback': False,
+            'resume_from_stage': 'next_open_execution_plan',
+            'resolved_stages': [
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            ],
+        }
+        for field, invalid_value in invalid_values.items():
+            with self.subTest(field=field):
+                self.assertFalse(
+                    is_exact_auto_pitr_intraday_watch_recovery_request(
+                        **{**request, field: invalid_value}
+                    )
+                )
+
+    def test_same_day_open_expiration_is_recoverable_only_with_exact_evidence(
+        self,
+    ):
+        stage_ids = (
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        )
+
+        def expired_stage(stage_id: str) -> dict:
+            return {
+                'status': 'skipped',
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
+                'failed': 0,
+                'remaining': 0,
+                'source_run_ids': {},
+                'details': {
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'skipped',
+                        'reason': 'next_open_window_expired',
+                        'market_date': '2026-10-26',
+                        'target_trade_date': '2026-10-27',
+                        'current_market_date': '2026-10-27',
+                        'market_state': 'OPEN',
+                        'stage': stage_id,
+                    }
+                },
+            }
+
+        pipeline_run = {
+            'market_date': '2026-10-26',
+            'trigger': 'auto_eod_followup_resume',
+            'status': 'skipped',
+            'current_stage': 'signal_decider_evaluations',
+            'completed_at': '2026-10-27T01:02:03+00:00',
+            'error_message': None,
+            'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'point_in_time_recovery': True,
+                'reused_eod_collection_run_id': 581,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': False,
+                'resume_from_stage': 'signal_decider',
+                'resolved_stages': list(stage_ids),
+            },
+            'stages': {
+                stage_id: expired_stage(stage_id) for stage_id in stage_ids
+            },
+        }
+
+        self.assertTrue(
+            is_recoverable_same_day_intraday_watch_expiration(
+                pipeline_run,
+                current_market_date=date(2026, 10, 27),
+            )
+        )
+
+        invalid_runs = []
+        wrong_status = deepcopy(pipeline_run)
+        wrong_status['status'] = 'completed'
+        invalid_runs.append(('status', wrong_status))
+        wrong_current_stage = deepcopy(pipeline_run)
+        wrong_current_stage['current_stage'] = 'next_open_execution_plan'
+        invalid_runs.append(('current_stage', wrong_current_stage))
+        unfinished = deepcopy(pipeline_run)
+        unfinished['completed_at'] = None
+        invalid_runs.append(('completed_at', unfinished))
+        errored = deepcopy(pipeline_run)
+        errored['error_message'] = 'unexpected failure'
+        invalid_runs.append(('error_message', errored))
+        wrong_trigger = deepcopy(pipeline_run)
+        wrong_trigger['trigger'] = 'stage_orchestrator'
+        invalid_runs.append(('trigger', wrong_trigger))
+        wrong_entrypoint = deepcopy(pipeline_run)
+        wrong_entrypoint['run_metadata']['entrypoint'] = 'forged.entrypoint'
+        invalid_runs.append(('entrypoint', wrong_entrypoint))
+        missing_lineage = deepcopy(pipeline_run)
+        missing_lineage['run_metadata']['reused_eod_collection_run_id'] = 0
+        invalid_runs.append(('reused_eod_collection_run_id', missing_lineage))
+        forced = deepcopy(pipeline_run)
+        forced['run_metadata']['force'] = True
+        invalid_runs.append(('force', forced))
+        analysis_replay = deepcopy(pipeline_run)
+        analysis_replay['run_metadata']['allow_expired_analysis_replay'] = True
+        invalid_runs.append(('allow_expired_analysis_replay', analysis_replay))
+        already_admitted = deepcopy(pipeline_run)
+        already_admitted['run_metadata'][
+            'same_day_intraday_watch_continuation_admitted'
+        ] = True
+        invalid_runs.append(
+            ('same_day_intraday_watch_continuation_admitted', already_admitted)
+        )
+        wrong_suffix = deepcopy(pipeline_run)
+        wrong_suffix['run_metadata']['resolved_stages'] = [
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        invalid_runs.append(('resolved_stages', wrong_suffix))
+        nonzero_work = deepcopy(pipeline_run)
+        nonzero_work['stages']['signal_decider']['processed'] = 1
+        invalid_runs.append(('processed', nonzero_work))
+        sourced_work = deepcopy(pipeline_run)
+        sourced_work['stages']['signal_decider']['source_run_ids'] = {
+            'agent_feedback_run_id': 'feedback-run'
+        }
+        invalid_runs.append(('source_run_ids', sourced_work))
+        closed = deepcopy(pipeline_run)
+        closed['stages']['signal_decider']['details']['result_summary'][
+            'market_state'
+        ] = 'CLOSED'
+        invalid_runs.append(('market_state', closed))
+        future_target = deepcopy(pipeline_run)
+        future_target['stages']['signal_decider']['details'][
+            'result_summary'
+        ]['target_trade_date'] = '2026-10-28'
+        invalid_runs.append(('target_trade_date', future_target))
+
+        for field, invalid_run in invalid_runs:
+            with self.subTest(field=field):
+                self.assertFalse(
+                    is_recoverable_same_day_intraday_watch_expiration(
+                        invalid_run,
+                        current_market_date='2026-10-27',
+                    )
+                )
+
     def test_open_prior_date_next_open_window_is_skipped(self):
         market = SimpleNamespace(
             state='OPEN',

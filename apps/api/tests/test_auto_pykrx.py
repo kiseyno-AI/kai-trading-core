@@ -37,6 +37,8 @@ from app.eod.pykrx_backfill import (
     _feedback_suffix_has_stale_prerequisite_ordering,
     _is_dart_provider_outage_rearm_candidate,
     _is_retired_decider_cutoff_zero_work_run,
+    _is_resumable_same_day_intraday_watch_post_signal_restart,
+    _is_transparent_core_restart_signal_suffix_run,
     _is_retryable_feedback_rearm_candidate,
     _retryable_feedback_rearm_config,
     _retryable_feedback_rearm_knowledge_cutoff,
@@ -56,6 +58,13 @@ from app.eod.market_membership import (
     validate_market_membership_snapshot,
 )
 from app.eod.pykrx_pipeline_support import build_daily_retry_context
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+    pending_same_day_intraday_watch_rearm_marker,
+)
 from app.eod.summary_cutoff_contract import (
     is_resumable_summary_cutoff_contract_repair,
     summary_cutoff_proof_from_stage,
@@ -8180,6 +8189,22 @@ class PykrxBackfillServiceTests(TestCase):
                 recovery_kwargs,
             )
 
+        latest_eod_run['run_metadata'].update(
+            {
+                'followup_recovery_required': True,
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: {
+                    'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+                    'status': 'pending',
+                    'source_false_skip_run_id': 580,
+                    'proof_pipeline_run_id': 577,
+                    'target_trade_date': '2026-10-20',
+                    'attempt_limit': (
+                        SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                    ),
+                    'started_at': completed_at.isoformat(),
+                },
+            }
+        )
         with (
             patch(
                 'app.eod.pykrx_backfill.'
@@ -8201,6 +8226,10 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.daily_pipeline_stages.'
                 'daily_pipeline_stage_service.run'
             ) as capped_resume_followups,
+            patch(
+                'app.eod.pykrx_backfill.'
+                'update_eod_collection_run_progress'
+            ) as persist_terminal_block,
         ):
             capped = service._resume_auto_daily_followups_if_due(
                 market_date='2026-10-20',
@@ -8213,6 +8242,21 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(capped['reason'], 'followup_recovery_limit_reached')
         self.assertEqual(capped['followup_recovery']['attempts'], 8)
         self.assertEqual(capped['followup_recovery']['max_attempts'], 8)
+        self.assertTrue(
+            capped['followup_recovery'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ]['updated']
+        )
+        blocked_metadata = persist_terminal_block.call_args.kwargs[
+            'run_metadata'
+        ]
+        self.assertEqual(
+            blocked_metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY][
+                'status'
+            ],
+            'blocked',
+        )
+        self.assertFalse(blocked_metadata['followup_recovery_required'])
         capped_resume_followups.assert_not_called()
 
     def test_retired_zero_work_chain_rearms_from_contiguous_prior_signal_evidence(
@@ -8267,6 +8311,9 @@ class PykrxBackfillServiceTests(TestCase):
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
             'status': 'blocked',
             'current_stage': 'signal_decider_evaluations',
+            'started_at': (
+                completed_at - timedelta(minutes=1)
+            ).isoformat(),
             'updated_at': completed_at.isoformat(),
             'completed_at': completed_at.isoformat(),
             'run_metadata': {
@@ -8303,11 +8350,11 @@ class PykrxBackfillServiceTests(TestCase):
         }
         prior_run['stages']['signal_decider'] = {
             'status': 'partial',
-            'processed': 20,
+            'processed': 160,
             'total': 160,
-            'succeeded': 7,
+            'succeeded': 147,
             'failed': 13,
-            'remaining': 140,
+            'remaining': 0,
             'source_run_ids': {
                 'agent_feedback_run_id': 'decider-cycle-prior',
             },
@@ -8315,22 +8362,18 @@ class PykrxBackfillServiceTests(TestCase):
                 'result_summary': {
                     'run_id': 'decider-cycle-prior',
                     'prerequisites': {'ready': True},
-                    'openclaw_dispatch_circuit_breaker': {
-                        'schema_version': (
-                            OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
-                        ),
-                        'failure_kind': 'openclaw_transport_error',
-                        'failure_status': 'transport/error',
-                        'role': 'short-term-decider',
-                        'retryable': True,
-                        'source': 'child_dispatch_circuit_breaker',
-                    },
                     'progress': {
                         'summary': {
                             'run_status': 'partial',
                             'failed_items': 13,
                             'completed_cycles': 0,
                             'cycle_number': 1,
+                            'failure_groups': {
+                                'openclaw_transport_error': {
+                                    'count': 13,
+                                    'retryable_count': 13,
+                                }
+                            },
                             'role_progress': {
                                 'short-term-decider': {
                                     'retry_pending_symbols': 13,
@@ -8385,6 +8428,236 @@ class PykrxBackfillServiceTests(TestCase):
             'fs_div': 'CFS',
         }
         self.assertEqual(selected[1], expected_proof)
+
+        expired_current = deepcopy(current_run)
+        expired_current.update(
+            {
+                'status': 'skipped',
+                'current_stage': 'signal_decider_evaluations',
+                'completed_at': completed_at.isoformat(),
+                'error_message': None,
+            }
+        )
+        expired_current['run_metadata'].update(
+            {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'point_in_time_recovery': True,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': False,
+                'feedback_knowledge_cutoff': {
+                    'ready': False,
+                    'reason': 'summary_cutoff_proof_unavailable',
+                    'knowledge_cutoff_at': None,
+                    'source_run_id': None,
+                    'feedback_scope_mode': None,
+                    'requested_symbols': None,
+                },
+            }
+        )
+
+        def expired_stage(stage_id: str) -> dict:
+            return {
+                'status': 'skipped',
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
+                'failed': 0,
+                'remaining': 0,
+                'source_run_ids': {},
+                'details': {
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'skipped',
+                        'reason': 'next_open_window_expired',
+                        'market_date': '2026-10-23',
+                        'target_trade_date': '2026-10-24',
+                        'current_market_date': '2026-10-24',
+                        'market_state': 'OPEN',
+                        'stage': stage_id,
+                    }
+                },
+            }
+
+        expired_current['stages'] = {
+            stage_id: expired_stage(stage_id)
+            for stage_id in (
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            )
+        }
+        interrupted_prior = {
+            'id': 579,
+            'market_date': '2026-10-23',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'interrupted',
+            'current_stage': 'signal_decider',
+            'completed_at': completed_at.isoformat(),
+            'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resolved_stages': [
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'resume_from_stage': 'signal_decider',
+                'reused_eod_collection_run_id': 579,
+                'fs_div': 'CFS',
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'point_in_time_recovery': True,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': True,
+                'resumable': True,
+                'interrupted_at': completed_at.isoformat(),
+                'interrupted_reason': 'Core restarted during recovery.',
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'interrupted',
+                    'current_step': 'core_restart_interrupted',
+                    'completed_at': completed_at.isoformat(),
+                    'error_message': 'Core restarted during recovery.',
+                    'source_run_ids': {
+                        'agent_feedback_run_id': 'interrupted-cycle'
+                    },
+                    'details': {
+                        'resumable': True,
+                        'interrupted_reason': (
+                            'Core restarted during recovery.'
+                        ),
+                    },
+                }
+            },
+        }
+        proof_prior = deepcopy(prior_run)
+        proof_prior['run_metadata'].update(
+            {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'point_in_time_recovery': True,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': True,
+            }
+        )
+
+        self.assertTrue(
+            _is_transparent_core_restart_signal_suffix_run(
+                interrupted_prior
+            )
+        )
+        interrupted_with_own_proof = deepcopy(interrupted_prior)
+        interrupted_with_own_proof['run_metadata'][
+            'feedback_knowledge_cutoff'
+        ] = deepcopy(
+            prior_run['run_metadata']['feedback_knowledge_cutoff']
+        )
+        self.assertFalse(
+            _is_transparent_core_restart_signal_suffix_run(
+                interrupted_with_own_proof
+            )
+        )
+        recovered_proof = _select_prior_signal_rearm_evidence(
+            current_pipeline_run=expired_current,
+            prior_pipeline_runs=[interrupted_prior, proof_prior],
+            current_market_date='2026-10-24',
+        )
+        self.assertIsNotNone(recovered_proof)
+        self.assertEqual(recovered_proof[0]['id'], 577)
+        self.assertEqual(recovered_proof[1], expected_proof)
+
+        false_skip_eod_run = {
+            'id': 579,
+            'status': 'completed',
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'followup_recovery_required': False,
+            },
+        }
+        service = PykrxBackfillService()
+
+        def resume_after_marker(**_kwargs: object) -> dict:
+            marker = false_skip_eod_run['run_metadata'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ]
+            self.assertEqual(marker['status'], 'pending')
+            self.assertEqual(marker['source_false_skip_run_id'], 580)
+            self.assertEqual(marker['proof_pipeline_run_id'], 577)
+            self.assertTrue(
+                false_skip_eod_run['run_metadata'][
+                    'followup_recovery_required'
+                ]
+            )
+            return {'status': 'partial', 'pipeline_run_id': 581}
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 10, 24),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=expired_current,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=5,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'list_prior_followup_runs_for_lineage',
+                return_value=[interrupted_prior, proof_prior],
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'update_eod_collection_run_progress'
+            ) as persist_rearm,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                side_effect=resume_after_marker,
+            ) as resume_false_skip,
+        ):
+            false_skip_rearm = service._resume_auto_daily_followups_if_due(
+                market_date='2026-10-23',
+                latest_available_trade_date='2026-10-23',
+                latest_eod_run=false_skip_eod_run,
+                markets=('KOSPI', 'KOSDAQ', 'KONEX'),
+            )
+
+        self.assertTrue(false_skip_rearm['triggered'], false_skip_rearm)
+        persist_rearm.assert_called_once()
+        resume_false_skip.assert_called_once()
+        persisted_metadata = persist_rearm.call_args.kwargs['run_metadata']
+        self.assertTrue(persisted_metadata['followup_recovery_required'])
+        self.assertEqual(
+            persisted_metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY][
+                'attempt_limit'
+            ],
+            8,
+        )
 
         for field, value in (
             ('knowledge_cutoff_at', '2026-10-23T12:16:52+00:00'),
@@ -8587,6 +8860,1314 @@ class PykrxBackfillServiceTests(TestCase):
                     bounded['reason'],
                     'followup_recovery_limit_reached',
                 )
+
+    def _assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+        self,
+        *,
+        restart_checkpoint: str,
+        attempt_count: int = 6,
+        shared_circuit_proof: bool = False,
+        noncanonical_proof: str | None = None,
+        proof_started_after_source: bool = False,
+        expiry_stage_id: str | None = None,
+        closed_before_call: bool = False,
+    ) -> None:
+        completed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        stage_ids = AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+        expected_proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+            'expected_completed_symbols': ['005930'],
+            'knowledge_cutoff_at': '2026-10-27T07:55:00+00:00',
+            'fs_div': 'CFS',
+        }
+
+        def expired_stage(stage_id: str) -> dict:
+            return {
+                'status': 'skipped',
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
+                'failed': 0,
+                'remaining': 0,
+                'source_run_ids': {},
+                'details': {
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'skipped',
+                        'reason': 'next_open_window_expired',
+                        'market_date': '2026-10-27',
+                        'target_trade_date': '2026-10-28',
+                        'current_market_date': '2026-10-28',
+                        'market_state': 'OPEN',
+                        'stage': stage_id,
+                    }
+                },
+            }
+
+        false_skip = {
+            'id': 592,
+            'market_date': '2026-10-27',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'skipped',
+            'current_stage': stage_ids[-1],
+            'started_at': (
+                completed_at - timedelta(minutes=1)
+            ).isoformat(),
+            'completed_at': completed_at.isoformat(),
+            'error_message': None,
+            'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resolved_stages': list(stage_ids),
+                'resume_from_stage': stage_ids[0],
+                'reused_eod_collection_run_id': 581,
+                'fs_div': 'CFS',
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'point_in_time_recovery': True,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': False,
+            },
+            'stages': {
+                stage_id: expired_stage(stage_id) for stage_id in stage_ids
+            },
+        }
+        proof_run = {
+            'id': 590,
+            'market_date': '2026-10-27',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'current_stage': stage_ids[-1],
+            'started_at': (
+                completed_at - timedelta(minutes=6)
+            ).isoformat(),
+            'completed_at': (
+                completed_at - timedelta(minutes=5)
+            ).isoformat(),
+            'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resolved_stages': list(stage_ids),
+                'resume_from_stage': stage_ids[0],
+                'reused_eod_collection_run_id': 581,
+                'fs_div': 'CFS',
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'point_in_time_recovery': True,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': True,
+                'feedback_knowledge_cutoff': {
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'knowledge_cutoff_at': (
+                        expected_proof['knowledge_cutoff_at']
+                    ),
+                    'source_run_id': expected_proof['source_run_id'],
+                    'feedback_scope_mode': (
+                        expected_proof['feedback_scope_mode']
+                    ),
+                    'requested_symbols': ['005930'],
+                },
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'partial',
+                    'processed': 160,
+                    'total': 160,
+                    'succeeded': 147,
+                    'failed': 13,
+                    'remaining': 0,
+                    'source_run_ids': {
+                        'agent_feedback_run_id': 'decider-cycle-prior'
+                    },
+                    'details': {
+                        'result_summary': {
+                            'run_id': 'decider-cycle-prior',
+                            'prerequisites': {'ready': True},
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 13,
+                                    'completed_cycles': 0,
+                                    'cycle_number': 1,
+                                    'failure_groups': {
+                                        'openclaw_transport_error': {
+                                            'count': 13,
+                                            'retryable_count': 13,
+                                        }
+                                    },
+                                    'role_progress': {
+                                        'short-term-decider': {
+                                            'retry_pending_symbols': 13,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        },
+                                        'signal-decider': {
+                                            'retry_pending_symbols': 0,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        },
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {},
+                    'details': {
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete'
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {},
+                    'details': {
+                        'result_summary': {
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            },
+        }
+        restart_reason = 'Core restarted during recovery.'
+        current_restart = {
+            'id': 593,
+            'market_date': '2026-10-27',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'interrupted',
+            'current_stage': 'signal_decider',
+            'started_at': (
+                completed_at + timedelta(minutes=1)
+            ).isoformat(),
+            'completed_at': (
+                completed_at + timedelta(minutes=2)
+            ).isoformat(),
+            'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resolved_stages': list(stage_ids),
+                'resume_from_stage': stage_ids[0],
+                'reused_eod_collection_run_id': 581,
+                'fs_div': 'CFS',
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'point_in_time_recovery': True,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': True,
+                'resumable': True,
+                'interrupted_at': (
+                    completed_at + timedelta(minutes=2)
+                ).isoformat(),
+                'interrupted_reason': restart_reason,
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'interrupted',
+                    'current_step': 'core_restart_interrupted',
+                    'completed_at': (
+                        completed_at + timedelta(minutes=2)
+                    ).isoformat(),
+                    'error_message': restart_reason,
+                    'source_run_ids': {
+                        'agent_feedback_run_id': 'interrupted-cycle'
+                    },
+                    'details': {
+                        'resumable': True,
+                        'interrupted_reason': restart_reason,
+                    },
+                }
+            },
+        }
+        if shared_circuit_proof:
+            proof_run['stages']['signal_decider']['details'][
+                'result_summary'
+            ]['openclaw_dispatch_circuit_breaker'] = {
+                'schema_version': (
+                    OPENCLAW_SHARED_DISPATCH_CIRCUIT_BREAKER_SCHEMA_VERSION
+                ),
+                'failure_kind': 'openclaw_transport_error',
+                'failure_status': 'transport/error',
+                'role': 'short-term-decider',
+                'retryable': True,
+                'source': 'child_dispatch_circuit_breaker',
+            }
+        if noncanonical_proof == 'empty_failure_groups':
+            proof_run['stages']['signal_decider']['details'][
+                'result_summary'
+            ]['progress']['summary']['failure_groups'] = {}
+        elif noncanonical_proof == 'source_run_id_mismatch':
+            proof_run['stages']['signal_decider']['source_run_ids'] = {
+                'agent_feedback_run_id': 'different-decider-cycle'
+            }
+        elif noncanonical_proof is not None:
+            self.fail(f'unknown noncanonical proof: {noncanonical_proof}')
+        if proof_started_after_source:
+            proof_run['started_at'] = (
+                completed_at + timedelta(minutes=1)
+            ).isoformat()
+        if restart_checkpoint == 'immediately_after_start_run':
+            current_restart['current_stage'] = None
+            current_restart['stages'] = {}
+        elif restart_checkpoint == 'after_cutoff_persisted':
+            current_restart['run_metadata']['feedback_knowledge_cutoff'] = {
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': expected_proof[
+                    'knowledge_cutoff_at'
+                ],
+                'source_run_id': expected_proof['source_run_id'],
+                'feedback_scope_mode': expected_proof[
+                    'feedback_scope_mode'
+                ],
+                'requested_symbols': ['005930'],
+            }
+        elif restart_checkpoint in {
+            'after_signal_completed_before_plan',
+            'during_plan',
+            'during_evaluation',
+        }:
+            current_restart['run_metadata']['feedback_knowledge_cutoff'] = {
+                'ready': True,
+                'reason': 'latest_completed_summary_cutoff',
+                'knowledge_cutoff_at': expected_proof[
+                    'knowledge_cutoff_at'
+                ],
+                'source_run_id': expected_proof['source_run_id'],
+                'feedback_scope_mode': expected_proof[
+                    'feedback_scope_mode'
+                ],
+                'requested_symbols': ['005930'],
+            }
+            current_restart['current_stage'] = 'signal_decider'
+            current_restart['stages'] = {
+                'signal_decider': {
+                    'status': 'completed',
+                    'processed': 160,
+                    'total': 160,
+                    'succeeded': 160,
+                    'failed': 0,
+                    'remaining': 0,
+                    'current_step': 'signal_decider_completed',
+                    'completed_at': (
+                        completed_at + timedelta(minutes=1)
+                    ).isoformat(),
+                    'error_message': None,
+                    'source_run_ids': {
+                        'agent_feedback_run_id': 'decider-cycle-completed'
+                    },
+                    'details': {
+                        'result_summary': {'status': 'completed'}
+                    },
+                }
+            }
+            if restart_checkpoint in {'during_plan', 'during_evaluation'}:
+                current_restart['current_stage'] = (
+                    'next_open_execution_plan'
+                    if restart_checkpoint == 'during_plan'
+                    else 'signal_decider_evaluations'
+                )
+                current_restart['stages']['next_open_execution_plan'] = {
+                    'status': (
+                        'interrupted'
+                        if restart_checkpoint == 'during_plan'
+                        else 'completed'
+                    ),
+                    'processed': 1 if restart_checkpoint == 'during_evaluation' else 0,
+                    'total': 1 if restart_checkpoint == 'during_evaluation' else 0,
+                    'succeeded': 1 if restart_checkpoint == 'during_evaluation' else 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'current_step': (
+                        'core_restart_interrupted'
+                        if restart_checkpoint == 'during_plan'
+                        else 'next_open_execution_plan_completed'
+                    ),
+                    'completed_at': (
+                        completed_at + timedelta(minutes=2)
+                    ).isoformat(),
+                    'error_message': (
+                        restart_reason
+                        if restart_checkpoint == 'during_plan'
+                        else None
+                    ),
+                    'source_run_ids': (
+                        {}
+                        if restart_checkpoint == 'during_plan'
+                        else {'plan_id': 77}
+                    ),
+                    'details': (
+                        {
+                            'resumable': True,
+                            'interrupted_reason': restart_reason,
+                        }
+                        if restart_checkpoint == 'during_plan'
+                        else {'result_summary': {'status': 'completed'}}
+                    ),
+                }
+            if restart_checkpoint == 'during_evaluation':
+                current_restart['stages'][
+                    'signal_decider_evaluations'
+                ] = {
+                    'status': 'interrupted',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 0,
+                    'current_step': 'core_restart_interrupted',
+                    'completed_at': (
+                        completed_at + timedelta(minutes=2)
+                    ).isoformat(),
+                    'error_message': restart_reason,
+                    'source_run_ids': {},
+                    'details': {
+                        'resumable': True,
+                        'interrupted_reason': restart_reason,
+                    },
+                }
+        elif restart_checkpoint != 'after_signal_stage_started':
+            self.fail(f'unknown restart checkpoint: {restart_checkpoint}')
+
+        post_signal_restart = restart_checkpoint in {
+            'after_signal_completed_before_plan',
+            'during_plan',
+            'during_evaluation',
+        }
+        self.assertEqual(
+            _is_resumable_same_day_intraday_watch_post_signal_restart(
+                current_restart
+            ),
+            post_signal_restart,
+        )
+        self.assertEqual(
+            _is_transparent_core_restart_signal_suffix_run(
+                current_restart,
+                allow_pending_marker_restart=True,
+            ),
+            not post_signal_restart,
+        )
+        if (
+            restart_checkpoint != 'after_signal_stage_started'
+            and not post_signal_restart
+        ):
+            self.assertFalse(
+                _is_transparent_core_restart_signal_suffix_run(
+                    current_restart
+                )
+            )
+        latest_eod_run = {
+            'id': 581,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'followup_recovery_required': True,
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: {
+                    'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+                    'status': 'pending',
+                    'source_false_skip_run_id': 592,
+                    'proof_pipeline_run_id': 590,
+                    'target_trade_date': '2026-10-28',
+                    'attempt_limit': (
+                        SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                    ),
+                    'started_at': (
+                        completed_at + timedelta(seconds=1)
+                    ).isoformat(),
+                },
+            },
+        }
+        service = PykrxBackfillService()
+        recovery_response = {
+            'status': 'partial',
+            'pipeline_run_id': 594,
+        }
+        if expiry_stage_id is not None:
+            recovery_response = {
+                'status': 'skipped',
+                'pipeline_run_id': 594,
+                'stages': {
+                    expiry_stage_id: {
+                        'status': 'skipped',
+                        'details': {
+                            'result_summary': {
+                                'reason': 'next_open_window_expired',
+                                'stage': expiry_stage_id,
+                            }
+                        },
+                    }
+                },
+            }
+        recovery_side_effect = (
+            ValueError(
+                'same-day intraday-watch rearm resume is outside its '
+                'target PREOPEN/OPEN session'
+            )
+            if closed_before_call
+            else None
+        )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 10, 28),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=current_restart,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=attempt_count,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'list_prior_followup_runs_for_lineage',
+                return_value=[false_skip, proof_run],
+            ) as list_prior,
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_resolve_point_in_time_followup_membership',
+                return_value=(
+                    ['005930'],
+                    ('KOSPI', 'KOSDAQ', 'KONEX'),
+                ),
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'verified': True,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ) as preflight_price_scope,
+            patch(
+                'app.eod.pykrx_backfill.'
+                'update_eod_collection_run_progress'
+            ) as persist_terminal_block,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value=recovery_response,
+                side_effect=recovery_side_effect,
+            ) as resume_suffix,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-10-27',
+                latest_available_trade_date='2026-10-27',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI', 'KOSDAQ', 'KONEX'),
+            )
+
+        if attempt_count > SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT:
+            self.assertFalse(result['triggered'])
+            list_prior.assert_not_called()
+            preflight_price_scope.assert_not_called()
+            resume_suffix.assert_not_called()
+            self.assertEqual(result['reason'], 'followup_recovery_limit_reached')
+            return
+        list_prior.assert_called_once()
+        if proof_started_after_source:
+            self.assertFalse(result['triggered'])
+            self.assertEqual(
+                result['reason'], 'followup_recovery_limit_reached'
+            )
+            preflight_price_scope.assert_not_called()
+            resume_suffix.assert_not_called()
+            return
+        if shared_circuit_proof or noncanonical_proof is not None:
+            self.assertFalse(result['triggered'])
+            self.assertEqual(
+                result['reason'], 'followup_rearm_proof_not_canonical'
+            )
+            preflight_price_scope.assert_not_called()
+            resume_suffix.assert_not_called()
+            return
+        if closed_before_call:
+            self.assertFalse(result['triggered'])
+        else:
+            self.assertTrue(result['triggered'])
+        if post_signal_restart:
+            preflight_price_scope.assert_not_called()
+        else:
+            preflight_price_scope.assert_called_once()
+        resume_suffix.assert_called_once()
+        recovery_kwargs = resume_suffix.call_args.kwargs
+        self.assertEqual(recovery_kwargs['stages'], list(stage_ids))
+        self.assertEqual(recovery_kwargs['resume_from_stage'], stage_ids[0])
+        self.assertEqual(
+            recovery_kwargs['trigger'], AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        )
+        self.assertEqual(recovery_kwargs['reused_eod_collection_run_id'], 581)
+        self.assertTrue(recovery_kwargs['point_in_time_recovery'])
+        self.assertFalse(recovery_kwargs['force'])
+        self.assertTrue(recovery_kwargs['reuse_existing_feedback'])
+        self.assertEqual(
+            recovery_kwargs['summary_cutoff_proof'], expected_proof
+        )
+        if expiry_stage_id is not None or closed_before_call:
+            persist_terminal_block.assert_called_once()
+            marker = latest_eod_run['run_metadata'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ]
+            self.assertEqual(marker['status'], 'blocked')
+            self.assertEqual(
+                marker['blocked_reason'], 'next_open_window_expired'
+            )
+            self.assertFalse(
+                latest_eod_run['run_metadata'][
+                    'followup_recovery_required'
+                ]
+            )
+            self.assertTrue(
+                result['followup_recovery'][
+                    'same_day_intraday_watch_rearm_terminal_expiry'
+                ]
+            )
+            self.assertIsNone(
+                pending_same_day_intraday_watch_rearm_marker(
+                    marker,
+                    target_trade_date=date(2026, 10, 29),
+                )
+            )
+            return
+        persist_terminal_block.assert_not_called()
+        self.assertNotIn('agent_feedback_summaries', recovery_kwargs['stages'])
+        self.assertNotIn('symbols', recovery_kwargs)
+        if post_signal_restart:
+            self.assertEqual(recovery_kwargs['existing_pipeline_run_id'], 593)
+            self.assertTrue(
+                recovery_kwargs['same_day_intraday_watch_rearm_resume']
+            )
+            self.assertEqual(
+                result['followup_recovery']['attempt'], attempt_count
+            )
+            self.assertEqual(
+                result['followup_recovery']['max_attempts'],
+                SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+            )
+        else:
+            self.assertNotIn('existing_pipeline_run_id', recovery_kwargs)
+
+    def test_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_signal_stage_started',
+        )
+
+    def test_pending_rearm_retries_after_restart_immediately_after_start_run(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='immediately_after_start_run',
+        )
+
+    def test_pending_rearm_retries_after_cutoff_persisted_signal_restart(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_cutoff_persisted',
+        )
+
+    def test_pending_rearm_resumes_after_signal_before_plan_without_replay(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_signal_completed_before_plan',
+        )
+
+    def test_pending_rearm_resumes_interrupted_plan_without_signal_replay(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='during_plan',
+        )
+
+    def test_pending_rearm_resumes_interrupted_evaluation_without_replay(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='during_evaluation',
+        )
+
+    def test_pending_rearm_post_signal_allows_attempt_eight_not_nine(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_signal_completed_before_plan',
+            attempt_count=8,
+        )
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_signal_completed_before_plan',
+            attempt_count=9,
+        )
+
+    def test_same_day_marker_rejects_shared_dispatch_circuit_proof(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_signal_stage_started',
+            shared_circuit_proof=True,
+        )
+
+    def test_same_day_marker_writer_rejects_noncanonical_signal_proof(
+        self,
+    ) -> None:
+        for noncanonical_proof in (
+            'empty_failure_groups',
+            'source_run_id_mismatch',
+        ):
+            with self.subTest(noncanonical_proof=noncanonical_proof):
+                self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+                    restart_checkpoint='after_signal_stage_started',
+                    noncanonical_proof=noncanonical_proof,
+                )
+
+    def test_same_day_marker_writer_rejects_late_started_proof(self) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_signal_stage_started',
+            proof_started_after_source=True,
+        )
+
+    def test_pending_rearm_terminal_blocks_expiry_at_each_suffix_stage(
+        self,
+    ) -> None:
+        for restart_checkpoint, expiry_stage_id in (
+            ('after_signal_stage_started', 'signal_decider'),
+            (
+                'after_signal_completed_before_plan',
+                'next_open_execution_plan',
+            ),
+            ('during_evaluation', 'signal_decider_evaluations'),
+        ):
+            with self.subTest(expiry_stage_id=expiry_stage_id):
+                self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+                    restart_checkpoint=restart_checkpoint,
+                    expiry_stage_id=expiry_stage_id,
+                )
+
+    def test_pending_rearm_terminal_blocks_closed_before_in_place_resume(
+        self,
+    ) -> None:
+        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
+            restart_checkpoint='after_signal_completed_before_plan',
+            closed_before_call=True,
+        )
+
+    def test_pending_rearm_rejects_conflicting_intermediate_restart_cutoff(
+        self,
+    ) -> None:
+        completed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        stage_ids = AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+        exact_metadata = {
+            'entrypoint': 'daily_pipeline_stage_service.run',
+            'resolved_stages': list(stage_ids),
+            'resume_from_stage': stage_ids[0],
+            'reused_eod_collection_run_id': 581,
+            'fs_div': 'CFS',
+            'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+            'point_in_time_recovery': True,
+            'force': False,
+            'reuse_existing_feedback': True,
+            'allow_expired_analysis_replay': False,
+            'same_day_intraday_watch_continuation_admitted': True,
+        }
+        proof_cutoff = {
+            'ready': True,
+            'reason': 'latest_completed_summary_cutoff',
+            'knowledge_cutoff_at': '2026-10-27T07:55:00+00:00',
+            'source_run_id': 'feedback-cycle-proof',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': ['005930'],
+        }
+        conflicting_cutoff = {
+            'ready': True,
+            'reason': 'latest_completed_summary_cutoff',
+            'knowledge_cutoff_at': '2026-10-27T07:56:00+00:00',
+            'source_run_id': 'feedback-cycle-conflict',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': ['000660'],
+        }
+
+        proof_run = {
+            'id': 590,
+            'market_date': '2026-10-27',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'current_stage': stage_ids[-1],
+            'completed_at': (
+                completed_at - timedelta(minutes=5)
+            ).isoformat(),
+            'run_metadata': {
+                **exact_metadata,
+                'feedback_knowledge_cutoff': proof_cutoff,
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'partial',
+                    'processed': 1,
+                    'total': 1,
+                    'succeeded': 0,
+                    'failed': 1,
+                    'remaining': 0,
+                    'source_run_ids': {
+                        'agent_feedback_run_id': 'feedback-cycle-proof'
+                    },
+                    'details': {
+                        'result_summary': {
+                            'run_id': 'feedback-cycle-proof',
+                            'prerequisites': {'ready': True},
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 1,
+                                    'failure_groups': {
+                                        'openclaw_transport_error': {
+                                            'count': 1,
+                                            'retryable_count': 1,
+                                        }
+                                    },
+                                    'role_progress': {
+                                        'signal-decider': {
+                                            'retry_pending_symbols': 1,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete'
+                        }
+                    },
+                },
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'declared_dependencies_incomplete',
+                            'incomplete_dependencies': ['signal_decider'],
+                        }
+                    },
+                },
+            },
+        }
+
+        def expired_stage(stage_id: str) -> dict:
+            return {
+                'status': 'skipped',
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
+                'failed': 0,
+                'remaining': 0,
+                'source_run_ids': {},
+                'details': {
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'skipped',
+                        'reason': 'next_open_window_expired',
+                        'market_date': '2026-10-27',
+                        'target_trade_date': '2026-10-28',
+                        'current_market_date': '2026-10-28',
+                        'market_state': 'OPEN',
+                        'stage': stage_id,
+                    }
+                },
+            }
+
+        false_skip = {
+            'id': 592,
+            'market_date': '2026-10-27',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'skipped',
+            'current_stage': stage_ids[-1],
+            'completed_at': completed_at.isoformat(),
+            'error_message': None,
+            'run_metadata': {
+                **exact_metadata,
+                'same_day_intraday_watch_continuation_admitted': False,
+            },
+            'stages': {
+                stage_id: expired_stage(stage_id) for stage_id in stage_ids
+            },
+        }
+        restart_reason = 'Core restarted during recovery.'
+        intermediate_restart = {
+            'id': 593,
+            'market_date': '2026-10-27',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'interrupted',
+            'current_stage': 'signal_decider',
+            'completed_at': (
+                completed_at + timedelta(minutes=1)
+            ).isoformat(),
+            'run_metadata': {
+                **exact_metadata,
+                'feedback_knowledge_cutoff': conflicting_cutoff,
+                'resumable': True,
+                'interrupted_at': (
+                    completed_at + timedelta(minutes=1)
+                ).isoformat(),
+                'interrupted_reason': restart_reason,
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'interrupted',
+                    'processed': 0,
+                    'total': 1,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'remaining': 1,
+                    'current_step': 'core_restart_interrupted',
+                    'completed_at': (
+                        completed_at + timedelta(minutes=1)
+                    ).isoformat(),
+                    'error_message': restart_reason,
+                    'source_run_ids': {},
+                    'details': {
+                        'resumable': True,
+                        'interrupted_reason': restart_reason,
+                    },
+                }
+            },
+        }
+        current_restart = {
+            'id': 594,
+            'market_date': '2026-10-27',
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'interrupted',
+            'current_stage': None,
+            'completed_at': (
+                completed_at + timedelta(minutes=2)
+            ).isoformat(),
+            'run_metadata': {
+                **exact_metadata,
+                'resumable': True,
+                'interrupted_at': (
+                    completed_at + timedelta(minutes=2)
+                ).isoformat(),
+                'interrupted_reason': restart_reason,
+            },
+            'stages': {},
+        }
+        prior_runs = [intermediate_restart, false_skip, proof_run]
+        latest_eod_run = {
+            'id': 581,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                'followup_recovery_required': True,
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: {
+                    'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+                    'status': 'pending',
+                    'source_false_skip_run_id': 592,
+                    'proof_pipeline_run_id': 590,
+                    'target_trade_date': '2026-10-28',
+                    'attempt_limit': (
+                        SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                    ),
+                    'started_at': (
+                        completed_at + timedelta(seconds=1)
+                    ).isoformat(),
+                },
+            },
+        }
+
+        selected = _select_prior_signal_rearm_evidence(
+            current_pipeline_run=current_restart,
+            prior_pipeline_runs=prior_runs,
+            current_market_date=date(2026, 10, 28),
+            allow_transparent_current=True,
+        )
+        service = PykrxBackfillService()
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 10, 28),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=current_restart,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=7,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'list_prior_followup_runs_for_lineage',
+                return_value=prior_runs,
+            ) as list_prior,
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'verified': True,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'update_eod_collection_run_progress'
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 595,
+                },
+            ) as resume_suffix,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-10-27',
+                latest_available_trade_date='2026-10-27',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI', 'KOSDAQ', 'KONEX'),
+            )
+
+        list_prior.assert_called_once()
+        self.assertEqual(
+            {
+                'prior_proof_rejected': selected is None,
+                'recovery_triggered': result['triggered'],
+                'recovery_call_count': resume_suffix.call_count,
+            },
+            {
+                'prior_proof_rejected': True,
+                'recovery_triggered': False,
+                'recovery_call_count': 0,
+            },
+        )
+
+    def test_pending_same_day_rearm_is_not_completed_by_zero_work_expiration(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        marker = {
+            'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+            'status': 'pending',
+            'source_false_skip_run_id': 592,
+            'proof_pipeline_run_id': 590,
+            'target_trade_date': '2026-10-28',
+            'attempt_limit': SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+            'started_at': '2026-10-28T01:45:00+00:00',
+        }
+        eod_run = {
+            'id': 581,
+            'status': 'completed',
+            'symbols_total': 0,
+            'symbols_succeeded': 0,
+            'symbols_failed': 0,
+            'trade_date': '2026-10-27',
+            'run_metadata': {
+                'followup_recovery_required': True,
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: marker,
+            },
+        }
+
+        def expired_stage(stage_id: str) -> dict:
+            return {
+                'status': 'skipped',
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
+                'failed': 0,
+                'remaining': 0,
+                'source_run_ids': {},
+                'details': {
+                    'result_summary': {
+                        'triggered': False,
+                        'status': 'skipped',
+                        'reason': 'next_open_window_expired',
+                        'market_date': '2026-10-27',
+                        'target_trade_date': '2026-10-28',
+                        'current_market_date': '2026-10-28',
+                        'market_state': 'OPEN',
+                        'stage': stage_id,
+                    }
+                },
+            }
+
+        recovery_result = {
+            'status': 'skipped',
+            'reason': 'next_open_window_expired',
+            'pipeline_run_id': 593,
+            'stages': {
+                stage_id: expired_stage(stage_id)
+                for stage_id in AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+            },
+        }
+
+        with patch(
+            'app.eod.pykrx_backfill.update_eod_collection_run_progress'
+        ) as persist_progress:
+            result = service._persist_successful_followup_recovery(
+                latest_eod_run=eod_run,
+                recovery_result=recovery_result,
+            )
+
+        self.assertFalse(result['updated'])
+        self.assertEqual(
+            eod_run['run_metadata'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ]['status'],
+            'pending',
+        )
+        self.assertTrue(
+            eod_run['run_metadata']['followup_recovery_required']
+        )
+        persist_progress.assert_not_called()
+
+    def test_stale_pending_rearm_is_blocked_without_replaying_decisions(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        eod_run = {
+            'id': 581,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'trade_date': '2026-10-27',
+            'run_metadata': {
+                'markets': ['KOSPI', 'KOSDAQ'],
+                'followup_recovery_required': True,
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: {
+                    'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+                    'status': 'pending',
+                    'source_false_skip_run_id': 592,
+                    'proof_pipeline_run_id': 590,
+                    'target_trade_date': '2026-10-28',
+                    'attempt_limit': (
+                        SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                    ),
+                    'started_at': '2026-10-28T01:45:00+00:00',
+                },
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 10, 29),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context'
+            ) as load_pipeline_run,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as run_stages,
+            patch(
+                'app.eod.pykrx_backfill.'
+                'update_eod_collection_run_progress'
+            ) as persist_terminal_block,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-10-27',
+                latest_available_trade_date='2026-10-27',
+                latest_eod_run=eod_run,
+                markets=('KOSPI', 'KOSDAQ'),
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(result['reason'], 'next_open_window_expired')
+        self.assertEqual(
+            result['followup_recovery']['blocker'],
+            'same_day_intraday_watch_rearm_terminal_expiry',
+        )
+        marker = eod_run['run_metadata'][
+            SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+        ]
+        self.assertEqual(marker['status'], 'blocked')
+        self.assertEqual(marker['blocked_reason'], 'next_open_window_expired')
+        self.assertFalse(
+            eod_run['run_metadata']['followup_recovery_required']
+        )
+        persist_terminal_block.assert_called_once()
+        load_pipeline_run.assert_not_called()
+        run_stages.assert_not_called()
+
+    def test_same_day_intraday_watch_rearm_marker_lifecycle_is_durable(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        eod_run = {
+            'id': 581,
+            'status': 'completed',
+            'symbols_total': 0,
+            'symbols_succeeded': 0,
+            'symbols_failed': 0,
+            'trade_date': '2026-10-27',
+            'run_metadata': {},
+        }
+
+        with patch(
+            'app.eod.pykrx_backfill.update_eod_collection_run_progress'
+        ) as persist_progress:
+            first = service._persist_same_day_intraday_watch_rearm_pending(
+                latest_eod_run=eod_run,
+                source_false_skip_run_id=592,
+                proof_pipeline_run_id=590,
+                target_trade_date=date(2026, 10, 28),
+            )
+            started_at = eod_run['run_metadata'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ]['started_at']
+            second = service._persist_same_day_intraday_watch_rearm_pending(
+                latest_eod_run=eod_run,
+                source_false_skip_run_id=592,
+                proof_pipeline_run_id=590,
+                target_trade_date=date(2026, 10, 28),
+            )
+
+        self.assertTrue(first['updated'])
+        self.assertFalse(second['updated'])
+        self.assertEqual(second['reason'], 'rearm_marker_already_pending')
+        self.assertEqual(
+            eod_run['run_metadata'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ][
+                'started_at'
+            ],
+            started_at,
+        )
+        self.assertTrue(eod_run['run_metadata']['followup_recovery_required'])
+        self.assertEqual(persist_progress.call_count, 2)
+
+        with patch(
+            'app.eod.pykrx_backfill.update_eod_collection_run_progress'
+        ) as persist_block:
+            blocked = service._block_same_day_intraday_watch_rearm(
+                latest_eod_run=eod_run,
+                reason='followup_recovery_limit_reached',
+            )
+
+        self.assertTrue(blocked['updated'])
+        self.assertEqual(
+            eod_run['run_metadata'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ][
+                'status'
+            ],
+            'blocked',
+        )
+        self.assertFalse(eod_run['run_metadata']['followup_recovery_required'])
+        persist_block.assert_called_once()
+
+        completion_run = deepcopy(eod_run)
+        completion_run['run_metadata'][
+            SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+        ] = {
+            **completion_run['run_metadata'][
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+            ],
+            'status': 'pending',
+        }
+        completion_run['run_metadata']['followup_recovery_required'] = True
+        completion_result = {
+            'status': 'completed',
+            'pipeline_run_id': 593,
+            'resolved_stages': list(
+                AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+            ),
+            'pipeline_run': {
+                'id': 593,
+                'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+                'status': 'completed',
+                'current_stage': (
+                    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[-1]
+                ),
+                'run_metadata': {
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'resolved_stages': list(
+                        AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+                    ),
+                    'resume_from_stage': (
+                        AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[0]
+                    ),
+                    'reused_eod_collection_run_id': 581,
+                    'point_in_time_recovery': True,
+                    'force': False,
+                    'reuse_existing_feedback': True,
+                    'allow_expired_analysis_replay': False,
+                    'same_day_intraday_watch_continuation_admitted': True,
+                },
+            },
+            'stages': {
+                stage_id: {'status': 'completed'}
+                for stage_id in (
+                    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+                )
+            },
+        }
+        with patch(
+            'app.eod.pykrx_backfill.update_eod_collection_run_progress'
+        ) as persist_completion:
+            completed = service._persist_successful_followup_recovery(
+                latest_eod_run=completion_run,
+                recovery_result=completion_result,
+            )
+
+        self.assertTrue(completed['updated'])
+        completed_metadata = persist_completion.call_args.kwargs[
+            'run_metadata'
+        ]
+        completed_marker = completed_metadata[
+            SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+        ]
+        self.assertEqual(completed_marker['status'], 'completed')
+        self.assertEqual(completed_marker['completion_pipeline_run_id'], 593)
+        self.assertFalse(completed_metadata['followup_recovery_required'])
+        persist_completion.assert_called_once()
 
     def test_feedback_provider_rate_limit_waits_until_retry_deadline(
         self,

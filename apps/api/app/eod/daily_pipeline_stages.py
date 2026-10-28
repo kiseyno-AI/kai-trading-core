@@ -67,6 +67,7 @@ from app.eod.run_stage_support import (
     build_expired_decision_replay_result,
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
+    is_exact_auto_pitr_intraday_watch_recovery_request,
 )
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.eod.technical_snapshots import daily_technical_snapshot_service
@@ -627,6 +628,7 @@ class DailyPipelineStageService:
         provider_admission_fence_owned: bool = False,
         summary_cutoff_proof: Mapping[str, Any] | None = None,
         summary_cutoff_contract_repair: bool = False,
+        same_day_intraday_watch_rearm_resume: bool = False,
     ) -> dict[str, Any]:
         validated_request = self.validate_run_request(
             market_date=market_date,
@@ -648,19 +650,6 @@ class DailyPipelineStageService:
                 and trigger in POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS
                 else None
             ),
-        )
-        allow_same_day_intraday_watch_continuation = bool(
-            point_in_time_recovery
-            and trigger == 'auto_eod_followup_resume'
-            and {
-                'agent_feedback_summaries',
-                'signal_decider',
-                'next_open_execution_plan',
-            }.intersection(resolved_stages)
-            and admits_same_day_intraday_watch_continuation(
-                market_date=resolved_market_date,
-                market=get_market_state(),
-            )
         )
         resolved_symbols = self._normalize_symbols(symbols)
         resolved_markets = self._normalize_markets(markets)
@@ -737,6 +726,81 @@ class DailyPipelineStageService:
             isinstance(normalized_summary_cutoff_proof, dict)
             and 'fs_div' in normalized_summary_cutoff_proof
         )
+        canonical_intraday_summary_cutoff_proof = bool(
+            isinstance(normalized_summary_cutoff_proof, dict)
+            and str(
+                normalized_summary_cutoff_proof.get('source_run_id') or ''
+            ).strip()
+            and summary_cutoff_expected_at_provided
+            and expected_summary_cutoff_at is not None
+            and expected_completed_symbols_provided
+            and expected_completed_symbols is not None
+            and proof_fs_div_provided
+            and proof_fs_div == resolved_fs_div
+        )
+        intraday_watch_candidate = bool(
+            allow_expired_analysis_replay is False
+            and existing_pipeline_run_id is None
+            and summary_cutoff_contract_repair is False
+            and canonical_intraday_summary_cutoff_proof
+            and is_exact_auto_pitr_intraday_watch_recovery_request(
+                trigger=trigger,
+                point_in_time_recovery=point_in_time_recovery,
+                reused_eod_collection_run_id=reused_eod_collection_run_id,
+                force=force,
+                reuse_existing_feedback=reuse_existing_feedback,
+                resume_from_stage=resume_from_stage,
+                resolved_stages=resolved_stages,
+            )
+        )
+        intraday_watch_rearm_resume_candidate = bool(
+            same_day_intraday_watch_rearm_resume is True
+            and allow_expired_analysis_replay is False
+            and existing_pipeline_run_id is not None
+            and summary_cutoff_contract_repair is False
+            and canonical_intraday_summary_cutoff_proof
+            and is_exact_auto_pitr_intraday_watch_recovery_request(
+                trigger=trigger,
+                point_in_time_recovery=point_in_time_recovery,
+                reused_eod_collection_run_id=reused_eod_collection_run_id,
+                force=force,
+                reuse_existing_feedback=reuse_existing_feedback,
+                resume_from_stage=resume_from_stage,
+                resolved_stages=resolved_stages,
+            )
+        )
+        if same_day_intraday_watch_rearm_resume and not (
+            intraday_watch_rearm_resume_candidate
+        ):
+            raise ValueError(
+                'same-day intraday-watch rearm resume requires the exact '
+                'admitted PITR suffix and existing pipeline run'
+            )
+        intraday_watch_market = (
+            get_market_state()
+            if intraday_watch_candidate
+            or intraday_watch_rearm_resume_candidate
+            else None
+        )
+        allow_same_day_intraday_watch_continuation = bool(
+            (
+                intraday_watch_candidate
+                or intraday_watch_rearm_resume_candidate
+            )
+            and admits_same_day_intraday_watch_continuation(
+                market_date=resolved_market_date,
+                market=intraday_watch_market,
+                allow_open_recovery_start=True,
+            )
+        )
+        if (
+            intraday_watch_rearm_resume_candidate
+            and not allow_same_day_intraday_watch_continuation
+        ):
+            raise ValueError(
+                'same-day intraday-watch rearm resume is outside its '
+                'target PREOPEN/OPEN session'
+            )
         if summary_cutoff_contract_repair and not (
             trigger == 'auto_eod_followup_resume'
             and tuple(resolved_stages) == LEGACY_CUTOFF_REPAIR_STAGE_IDS
@@ -952,6 +1016,128 @@ class DailyPipelineStageService:
         stage_outcomes: dict[str, dict[str, Any]] = {}
         handled: set[str] = set()
         if (
+            existing_pipeline_run_id is not None
+            and same_day_intraday_watch_rearm_resume
+        ):
+            target_trade_date = str(
+                getattr(intraday_watch_market, 'server_time', '') or ''
+            )[:10]
+            rearm_claim = (
+                self.run_state_service
+                .claim_same_day_intraday_watch_rearm_resume(
+                    pipeline_run_id=int(existing_pipeline_run_id),
+                    market_date=resolved_market_date,
+                    reused_eod_collection_run_id=int(
+                        reused_eod_collection_run_id
+                    ),
+                    target_trade_date=target_trade_date,
+                    expected_summary_cutoff_proof=(
+                        normalized_summary_cutoff_proof
+                    ),
+                )
+            )
+            if not rearm_claim.get('claimed'):
+                return {
+                    'triggered': False,
+                    'reason': (
+                        rearm_claim.get('reason')
+                        or 'same_day_intraday_watch_rearm_not_claimed'
+                    ),
+                    'pipeline_run_id': int(existing_pipeline_run_id),
+                    'pipeline_run': rearm_claim.get('pipeline_run'),
+                    'market_date': resolved_market_date,
+                    'requested_stages': requested_stages,
+                    'resolved_stages': resolved_stages,
+                    'status': 'blocked',
+                    'stages': {},
+                }
+            pipeline_run = rearm_claim.get('pipeline_run')
+            if not isinstance(pipeline_run, dict):
+                raise RuntimeError(
+                    'same-day intraday-watch rearm claim did not return '
+                    'pipeline state'
+                )
+            persisted_metadata = pipeline_run.get('run_metadata')
+            if not isinstance(persisted_metadata, dict):
+                raise RuntimeError(
+                    'same-day intraday-watch rearm claim returned invalid '
+                    'pipeline metadata'
+                )
+            resolved_symbols = self._normalize_symbols(
+                persisted_metadata.get('symbols')
+            )
+            persisted_markets = persisted_metadata.get('markets')
+            if not isinstance(persisted_markets, list) or not (
+                persisted_markets
+            ):
+                raise RuntimeError(
+                    'same-day intraday-watch rearm markets are unavailable'
+                )
+            resolved_markets = [
+                str(market).strip().upper()
+                for market in persisted_markets
+            ]
+            resolved_fs_div = str(
+                persisted_metadata.get('fs_div') or ''
+            ).strip().upper()
+            force = False
+            reuse_existing_feedback = True
+            point_in_time_recovery = True
+            allow_same_day_intraday_watch_continuation = True
+            normalized_summary_cutoff_proof = dict(
+                rearm_claim['summary_cutoff_proof']
+            )
+            raw_persisted_stage_outcomes = rearm_claim.get(
+                'persisted_stage_outcomes',
+                {},
+            )
+            if not isinstance(raw_persisted_stage_outcomes, dict):
+                raise RuntimeError(
+                    'same-day intraday-watch rearm claim returned invalid '
+                    'persisted stage outcomes'
+                )
+            persisted_stage_ids = list(raw_persisted_stage_outcomes)
+            if persisted_stage_ids != resolved_stages[
+                : len(persisted_stage_ids)
+            ]:
+                raise RuntimeError(
+                    'same-day intraday-watch rearm claim returned a '
+                    'noncontiguous persisted stage prefix'
+                )
+            for stage_id in persisted_stage_ids:
+                persisted_outcome = raw_persisted_stage_outcomes[stage_id]
+                if not (
+                    isinstance(persisted_outcome, dict)
+                    and daily_pipeline_outcome_is_satisfied(
+                        persisted_outcome
+                    )
+                ):
+                    raise RuntimeError(
+                        'same-day intraday-watch rearm claim returned an '
+                        'unsatisfied persisted stage outcome'
+                    )
+                persisted_details = persisted_outcome.get('details')
+                persisted_result = (
+                    persisted_details.get('result_summary')
+                    if isinstance(persisted_details, dict)
+                    and isinstance(
+                        persisted_details.get('result_summary'),
+                        dict,
+                    )
+                    else {}
+                )
+                restored_outcome = self._build_stage_outcome(
+                    stage_id,
+                    {
+                        **persisted_result,
+                        'status': persisted_outcome['status'],
+                        'resumed_from_persisted_stage': True,
+                    },
+                )
+                restored_outcome['status'] = persisted_outcome['status']
+                stage_outcomes[stage_id] = restored_outcome
+                handled.add(stage_id)
+        elif (
             existing_pipeline_run_id is not None
             and summary_cutoff_contract_repair
         ):
@@ -3209,8 +3395,6 @@ class DailyPipelineStageService:
                 market=get_market_state(),
                 allow_same_day_intraday_watch_continuation=bool(
                     allow_same_day_intraday_watch_continuation
-                    and stage_id
-                    in {'agent_feedback_summaries', 'signal_decider'}
                 ),
             )
             if expired_decision_result is not None:
@@ -3665,6 +3849,9 @@ class DailyPipelineStageService:
                     stage_id=stage_id,
                     market_date=market_date,
                     market=get_market_state(),
+                    allow_same_day_intraday_watch_continuation=(
+                        allow_same_day_intraday_watch_continuation
+                    ),
                 )
             )
             if expired_after_completion is not None:

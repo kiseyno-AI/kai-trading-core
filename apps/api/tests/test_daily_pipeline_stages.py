@@ -302,6 +302,67 @@ class _FakeTerminalContinuationRunStateService(_FakePipelineRunStateService):
         }
 
 
+class _FakeSameDayRearmRunStateService(_FakePipelineRunStateService):
+    def __init__(self, *, proof: dict) -> None:
+        super().__init__()
+        self.proof = dict(proof)
+        self.claim_calls: list[dict] = []
+        self.start_run_calls: list[dict] = []
+        self.finish_calls: list[dict] = []
+
+    def start_run(self, **kwargs):
+        self.start_run_calls.append(kwargs)
+        raise AssertionError('same-day rearm must resume the existing run')
+
+    def claim_same_day_intraday_watch_rearm_resume(self, **kwargs):
+        self.claim_calls.append(kwargs)
+        return {
+            'claimed': True,
+            'reason': 'same_day_intraday_watch_rearm_resumed',
+            'pipeline_run_id': kwargs['pipeline_run_id'],
+            'summary_cutoff_proof': self.proof,
+            'persisted_stage_outcomes': {
+                'signal_decider': {
+                    'stage': 'signal_decider',
+                    'status': 'completed',
+                    'processed': 160,
+                    'total': 160,
+                    'succeeded': 160,
+                    'failed': 0,
+                    'remaining': 0,
+                    'source_run_ids': {
+                        'agent_feedback_run_id': 'decider-completed'
+                    },
+                    'details': {
+                        'result_summary': {'status': 'completed'}
+                    },
+                }
+            },
+            'pipeline_run': {
+                'id': kwargs['pipeline_run_id'],
+                'status': 'running',
+                'stages': {},
+                'run_metadata': {
+                    'symbols': None,
+                    'markets': ['KOSPI', 'KOSDAQ', 'KONEX'],
+                    'force': False,
+                    'fs_div': 'CFS',
+                    'reuse_existing_feedback': True,
+                    'point_in_time_recovery': True,
+                    'same_day_intraday_watch_continuation_admitted': True,
+                },
+            },
+        }
+
+    def finish_run(self, **kwargs):
+        self.finish_calls.append(kwargs)
+        return {
+            'id': kwargs['pipeline_run_id'],
+            'status': kwargs['status'],
+            'run_metadata': kwargs.get('run_metadata') or {},
+        }
+
+
 class _FakeCutoffContractRepairRunStateService(
     _FakePipelineRunStateService
 ):
@@ -4856,7 +4917,9 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertTrue(result['completed'])
         self.assertEqual(len(feedback_retry_service.calls), 1)
 
-    def test_exact_auto_recovery_persists_preopen_plan_admission(self) -> None:
+    def test_auto_pitr_preopen_plan_only_does_not_persist_admission(
+        self,
+    ) -> None:
         service = DailyPipelineStageService()
         preopen = MagicMock(
             state='PREOPEN',
@@ -4887,12 +4950,312 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 point_in_time_recovery=True,
             )
 
-        self.assertTrue(
+        self.assertFalse(
             execute_stage.call_args.kwargs[
                 'allow_same_day_intraday_watch_continuation'
             ]
         )
+        self.assertFalse(
+            self.run_state_service.runs[-1]['run_metadata'][
+                'same_day_intraday_watch_continuation_admitted'
+            ]
+        )
+
+    def test_exact_auto_pitr_recovery_started_during_open_persists_admission(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        evaluation_service = _FakeSignalDeciderEvaluationService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+            decision_loop_service=evaluation_service,
+        )
+        cutoff = datetime(2026, 10, 27, 0, 5, tzinfo=timezone.utc)
+        open_market = MagicMock(
+            state='OPEN',
+            server_time='2026-10-27T10:01:00+09:00',
+        )
+        stages = [
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=open_market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 10, 27),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': True,
+                    'reason': 'latest_completed_summary_cutoff',
+                    'knowledge_cutoff_at': cutoff,
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': ['005930'],
+                    'completed_scope_proof': {
+                        'schema_version': (
+                            'completed_summarizer_intersection_v1'
+                        ),
+                        'completed_symbols': ['005930'],
+                        'admitted_symbols': ['005930'],
+                    },
+                },
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'signal_decider_next_open_execution_service.'
+                'refresh_plan_items',
+                return_value={'status': 'completed'},
+            ) as refresh_plan,
+        ):
+            result = service.run(
+                market_date='2026-10-26',
+                stages=stages,
+                resume_from_stage='signal_decider',
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=581,
+                point_in_time_recovery=True,
+                force=False,
+                reuse_existing_feedback=True,
+                summary_cutoff_proof={
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': None,
+                    'expected_completed_symbols': ['005930'],
+                    'knowledge_cutoff_at': cutoff.isoformat(),
+                    'fs_div': 'CFS',
+                },
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(feedback_retry_service.calls), 1)
+        refresh_plan.assert_called_once_with(
+            target_trade_date='2026-10-27',
+            trigger='daily_pipeline_post_decider',
+            force=False,
+        )
+        self.assertEqual(len(evaluation_service.calls), 1)
+        evaluation_outcome = result['stages'][
+            'signal_decider_evaluations'
+        ]
+        self.assertEqual(evaluation_outcome['status'], 'completed')
+        self.assertEqual(
+            evaluation_outcome['result']['summary'][
+                'evaluations_upserted'
+            ],
+            4,
+        )
+        self.assertNotIn('reason', evaluation_outcome['result'])
+        self.assertNotIn('skipped', evaluation_outcome['result'])
         self.assertTrue(
+            self.run_state_service.runs[-1]['run_metadata'][
+                'same_day_intraday_watch_continuation_admitted'
+            ]
+        )
+
+    def test_same_day_rearm_resumes_plan_and_evaluation_without_signal_replay(
+        self,
+    ) -> None:
+        cutoff = datetime(2026, 10, 27, 0, 5, tzinfo=timezone.utc)
+        proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': (
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            ),
+            'requested_symbols': None,
+            'expected_completed_symbols': ['005930'],
+            'knowledge_cutoff_at': cutoff.isoformat(),
+            'fs_div': 'CFS',
+        }
+        run_state_service = _FakeSameDayRearmRunStateService(proof=proof)
+        feedback_retry_service = _FakeFeedbackRetryService()
+        evaluation_service = _FakeSignalDeciderEvaluationService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+            decision_loop_service=evaluation_service,
+            run_state_service=run_state_service,
+        )
+        open_market = MagicMock(
+            state='OPEN',
+            server_time='2026-10-28T10:01:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=open_market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 10, 28),
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'signal_decider_next_open_execution_service.'
+                'refresh_plan_items',
+                return_value={'status': 'completed'},
+            ) as refresh_plan,
+        ):
+            result = service.run(
+                market_date='2026-10-27',
+                stages=[
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                resume_from_stage='signal_decider',
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=581,
+                point_in_time_recovery=True,
+                force=False,
+                reuse_existing_feedback=True,
+                fs_div='CFS',
+                summary_cutoff_proof=proof,
+                existing_pipeline_run_id=593,
+                same_day_intraday_watch_rearm_resume=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(feedback_retry_service.calls), 0)
+        refresh_plan.assert_called_once_with(
+            target_trade_date='2026-10-28',
+            trigger='daily_pipeline_post_decider',
+            force=False,
+        )
+        self.assertEqual(len(evaluation_service.calls), 1)
+        self.assertEqual(
+            [event['stage_id'] for event in run_state_service.stage_events
+             if event['event'] == 'start_stage'],
+            ['next_open_execution_plan', 'signal_decider_evaluations'],
+        )
+        self.assertEqual(len(run_state_service.claim_calls), 1)
+        self.assertEqual(
+            run_state_service.claim_calls[0]['target_trade_date'],
+            '2026-10-28',
+        )
+        self.assertEqual(
+            run_state_service.claim_calls[0][
+                'expected_summary_cutoff_proof'
+            ],
+            proof,
+        )
+        self.assertEqual(run_state_service.start_run_calls, [])
+
+    def test_open_auto_pitr_exact_suffix_without_full_proof_is_not_admitted(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        open_market = MagicMock(
+            state='OPEN',
+            server_time='2026-10-27T10:01:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=open_market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 10, 27),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': False,
+                    'reason': 'summary_cutoff_proof_unavailable',
+                    'knowledge_cutoff_at': None,
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                },
+            ),
+        ):
+            result = service.run(
+                market_date='2026-10-26',
+                stages=[
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                resume_from_stage='signal_decider',
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=581,
+                point_in_time_recovery=True,
+                force=False,
+                reuse_existing_feedback=True,
+                summary_cutoff_proof={
+                    'source_run_id': 'feedback-cycle-summary',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': None,
+                },
+            )
+
+        self.assertEqual(result['status'], 'skipped')
+        self.assertFalse(
+            self.run_state_service.runs[-1]['run_metadata'][
+                'same_day_intraday_watch_continuation_admitted'
+            ]
+        )
+
+    def test_open_auto_pitr_plan_only_does_not_persist_admission(self) -> None:
+        service = DailyPipelineStageService()
+        open_market = MagicMock(
+            state='OPEN',
+            server_time='2026-10-27T10:01:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=open_market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 10, 27),
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                return_value={'status': 'completed'},
+            ) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-10-26',
+                stages=['next_open_execution_plan'],
+                resume_from_stage='next_open_execution_plan',
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=581,
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertFalse(
+            execute_stage.call_args.kwargs[
+                'allow_same_day_intraday_watch_continuation'
+            ]
+        )
+        self.assertFalse(
             self.run_state_service.runs[-1]['run_metadata'][
                 'same_day_intraday_watch_continuation_admitted'
             ]

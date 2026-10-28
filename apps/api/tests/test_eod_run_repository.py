@@ -18,6 +18,12 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+)
 from app.repositories.eod_run_repository import (
     _load_pipeline_recovery_candidates,
     AutoEODRecoveryTarget,
@@ -2760,6 +2766,588 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 )
             )
         self.assertIsNone(missing_child_target)
+
+    def _persist_same_day_open_false_skip_lineage(
+        self,
+        *,
+        source_date: date,
+        target_date: date,
+        followup_attempts: int,
+        latest_status: str = 'partial',
+        include_marker: bool = False,
+        canonical_proof: bool = True,
+        marker_delay_seconds_after_false_skip: int = 1,
+        marker_overrides: dict | None = None,
+    ) -> dict[str, int]:
+        started_at = datetime.combine(
+            target_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ) + timedelta(hours=1)
+        stage_ids = AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+        with self.session_factory.begin() as session:
+            eod_run = EODCollectionRun(
+                market='KRX',
+                trade_date=source_date,
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=2,
+                symbols_succeeded=2,
+                symbols_failed=0,
+                started_at=started_at,
+                run_metadata={
+                    'mode': 'daily_auto',
+                    'markets': ['KOSPI', 'KOSDAQ'],
+                    'downstream_retry_symbols': [],
+                },
+            )
+            session.add(eod_run)
+            session.flush()
+            eod_run_id = int(eod_run.id)
+            prior_runs = [
+                DailyPipelineRun(
+                    market_date=source_date,
+                    trigger='auto_eod_followup_resume',
+                    status='failed',
+                    current_stage='signal_decider',
+                    started_at=started_at + timedelta(minutes=index),
+                    completed_at=started_at + timedelta(minutes=index),
+                    run_metadata={
+                        'reused_eod_collection_run_id': eod_run.id,
+                    },
+                )
+                for index in range(4)
+            ]
+            session.add_all(prior_runs)
+            session.flush()
+            proof_pipeline_run = prior_runs[-1]
+            proof_pipeline_run_id = int(proof_pipeline_run.id)
+            if canonical_proof:
+                proof_pipeline_run.status = 'blocked'
+                proof_pipeline_run.current_stage = stage_ids[-1]
+                proof_pipeline_run.completed_at = started_at + timedelta(
+                    minutes=4
+                )
+                proof_pipeline_run.run_metadata = {
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'reused_eod_collection_run_id': eod_run.id,
+                    'resolved_stages': list(stage_ids),
+                    'resume_from_stage': stage_ids[0],
+                    'point_in_time_recovery': True,
+                    'force': False,
+                    'reuse_existing_feedback': True,
+                    'allow_expired_analysis_replay': False,
+                    'same_day_intraday_watch_continuation_admitted': True,
+                    'fs_div': 'CFS',
+                    'feedback_knowledge_cutoff': {
+                        'ready': True,
+                        'reason': 'latest_completed_summary_cutoff',
+                        'knowledge_cutoff_at': (
+                            started_at + timedelta(minutes=3)
+                        ).isoformat(),
+                        'source_run_id': 'feedback-cycle-summary',
+                        'feedback_scope_mode': 'decider_scope_fast_path',
+                        'requested_symbols': ['005930'],
+                    },
+                }
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=proof_pipeline_run.id,
+                        market_date=source_date,
+                        stage_id='signal_decider',
+                        status='partial',
+                        processed=160,
+                        total=160,
+                        succeeded=147,
+                        failed=13,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=3),
+                        completed_at=started_at + timedelta(minutes=4),
+                        source_run_ids={
+                            'agent_feedback_run_id': 'decider-cycle-prior'
+                        },
+                        details={
+                            'result_summary': {
+                                'run_id': 'decider-cycle-prior',
+                                'prerequisites': {'ready': True},
+                                'progress': {
+                                    'summary': {
+                                        'run_status': 'partial',
+                                        'failed_items': 13,
+                                        'completed_cycles': 0,
+                                        'cycle_number': 1,
+                                        'failure_groups': {
+                                            'openclaw_transport_error': {
+                                                'count': 13,
+                                                'retryable_count': 13,
+                                            }
+                                        },
+                                        'role_progress': {
+                                            'short-term-decider': {
+                                                'retry_pending_symbols': 13,
+                                                'in_progress_symbols': 0,
+                                                'pending_symbols': 0,
+                                            },
+                                            'signal-decider': {
+                                                'retry_pending_symbols': 0,
+                                                'in_progress_symbols': 0,
+                                                'pending_symbols': 0,
+                                            },
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                    )
+                )
+                session.add_all(
+                    [
+                        DailyPipelineStageRun(
+                            pipeline_run_id=proof_pipeline_run.id,
+                            market_date=source_date,
+                            stage_id='next_open_execution_plan',
+                            status='blocked',
+                            processed=0,
+                            total=0,
+                            succeeded=0,
+                            failed=0,
+                            remaining=0,
+                            started_at=started_at + timedelta(minutes=4),
+                            completed_at=started_at + timedelta(minutes=4),
+                            source_run_ids={},
+                            details={
+                                'result_summary': {
+                                    'reason': (
+                                        'signal_decider_stage_incomplete'
+                                    )
+                                }
+                            },
+                        ),
+                        DailyPipelineStageRun(
+                            pipeline_run_id=proof_pipeline_run.id,
+                            market_date=source_date,
+                            stage_id='signal_decider_evaluations',
+                            status='blocked',
+                            processed=0,
+                            total=0,
+                            succeeded=0,
+                            failed=0,
+                            remaining=0,
+                            started_at=started_at + timedelta(minutes=4),
+                            completed_at=started_at + timedelta(minutes=4),
+                            source_run_ids={},
+                            details={
+                                'result_summary': {
+                                    'reason': (
+                                        'declared_dependencies_incomplete'
+                                    ),
+                                    'incomplete_dependencies': [
+                                        'signal_decider'
+                                    ],
+                                }
+                            },
+                        ),
+                    ]
+                )
+            false_skip = DailyPipelineRun(
+                market_date=source_date,
+                trigger='auto_eod_followup_resume',
+                status='skipped',
+                current_stage='signal_decider_evaluations',
+                started_at=started_at + timedelta(minutes=5),
+                completed_at=started_at + timedelta(minutes=6),
+                run_metadata={
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'reused_eod_collection_run_id': eod_run.id,
+                    'resolved_stages': list(stage_ids),
+                    'resume_from_stage': 'signal_decider',
+                    'point_in_time_recovery': True,
+                    'force': False,
+                    'reuse_existing_feedback': True,
+                    'allow_expired_analysis_replay': False,
+                    'same_day_intraday_watch_continuation_admitted': False,
+                },
+            )
+            session.add(false_skip)
+            session.flush()
+            for stage_id in stage_ids:
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=false_skip.id,
+                        market_date=source_date,
+                        stage_id=stage_id,
+                        status='skipped',
+                        processed=0,
+                        total=0,
+                        succeeded=0,
+                        failed=0,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=5),
+                        completed_at=started_at + timedelta(minutes=6),
+                        source_run_ids={},
+                        details={
+                            'result_summary': {
+                                'triggered': False,
+                                'status': 'skipped',
+                                'reason': 'next_open_window_expired',
+                                'market_date': source_date.isoformat(),
+                                'target_trade_date': target_date.isoformat(),
+                                'current_market_date': target_date.isoformat(),
+                                'market_state': 'OPEN',
+                                'stage': stage_id,
+                            }
+                        },
+                    )
+                )
+
+            latest_recovery = false_skip
+            for attempt_index in range(5, followup_attempts):
+                is_latest = attempt_index == followup_attempts - 1
+                latest_recovery = DailyPipelineRun(
+                    market_date=source_date,
+                    trigger='auto_eod_followup_resume',
+                    status=latest_status if is_latest else 'failed',
+                    current_stage='signal_decider',
+                    started_at=started_at
+                    + timedelta(minutes=attempt_index + 2),
+                    completed_at=started_at
+                    + timedelta(minutes=attempt_index + 3),
+                    run_metadata={
+                        'entrypoint': 'daily_pipeline_stage_service.run',
+                        'resolved_stages': list(stage_ids),
+                        'resume_from_stage': stage_ids[0],
+                        'reused_eod_collection_run_id': eod_run.id,
+                        'point_in_time_recovery': True,
+                        'force': False,
+                        'reuse_existing_feedback': True,
+                        'allow_expired_analysis_replay': False,
+                    },
+                )
+                session.add(latest_recovery)
+            session.flush()
+
+            if include_marker:
+                marker = {
+                    'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+                    'status': 'pending',
+                    'source_false_skip_run_id': int(false_skip.id),
+                    'proof_pipeline_run_id': proof_pipeline_run_id,
+                    'target_trade_date': target_date.isoformat(),
+                    'attempt_limit': (
+                        SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                    ),
+                    'started_at': (
+                        started_at
+                        + timedelta(
+                            minutes=6,
+                            seconds=marker_delay_seconds_after_false_skip,
+                        )
+                    ).isoformat(),
+                }
+                marker.update(marker_overrides or {})
+                eod_run.run_metadata = {
+                    **eod_run.run_metadata,
+                    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: marker,
+                }
+
+            return {
+                'eod_run_id': eod_run_id,
+                'false_skip_run_id': int(false_skip.id),
+                'proof_pipeline_run_id': proof_pipeline_run_id,
+                'latest_recovery_run_id': int(latest_recovery.id),
+            }
+
+    def test_same_day_open_false_skip_rearms_cleared_exact_pitr_debt(
+        self,
+    ) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=5,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_markerless_post_cap_partial_does_not_extend_recovery(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_valid_rearm_marker_surfaces_post_cap_partial_or_interrupted(
+        self,
+    ) -> None:
+        for day_offset, latest_status in enumerate(
+            ('partial', 'interrupted'),
+            start=20,
+        ):
+            with self.subTest(latest_status=latest_status):
+                source_date = date(2026, 10, day_offset)
+                target_date = source_date + timedelta(days=1)
+                lineage = self._persist_same_day_open_false_skip_lineage(
+                    source_date=source_date,
+                    target_date=target_date,
+                    followup_attempts=6,
+                    latest_status=latest_status,
+                    include_marker=True,
+                )
+
+                with patch(
+                    'app.repositories.eod_run_repository.session_scope',
+                    self._session_scope,
+                ):
+                    target = load_oldest_outstanding_auto_eod_recovery_target(
+                        on_or_after=source_date,
+                        on_or_before=target_date,
+                    )
+
+                self.assertEqual(
+                    target,
+                    AutoEODRecoveryTarget(
+                        trade_date=source_date.isoformat(),
+                        eod_run_id=lineage['eod_run_id'],
+                    ),
+                )
+
+    def test_valid_rearm_marker_surfaces_eighth_attempt_once_more(self) -> None:
+        source_date = date(2026, 10, 24)
+        target_date = date(2026, 10, 25)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=8,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_terminally_expired_rearm_does_not_resurface_next_day(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, lineage['eod_run_id'])
+            metadata = dict(eod_run.run_metadata)
+            metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY] = {
+                **metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY],
+                'status': 'blocked',
+                'blocked_reason': 'next_open_window_expired',
+                'blocked_at': '2026-10-28T06:30:00+00:00',
+            }
+            metadata['followup_recovery_required'] = False
+            eod_run.run_metadata = metadata
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date + timedelta(days=1),
+            )
+
+        self.assertIsNone(target)
+
+    def test_stale_pending_rearm_surfaces_once_for_terminal_block(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date + timedelta(days=1),
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_stale_pending_rearm_surfaces_after_pre_run_crash(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=5,
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date + timedelta(days=1),
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_invalid_rearm_marker_does_not_extend_recovery(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+            include_marker=True,
+            marker_overrides={'attempt_limit': 9},
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_rearm_marker_rejects_generic_failed_proof_run(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+            include_marker=True,
+            canonical_proof=False,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_rearm_marker_must_precede_first_post_skip_attempt(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+            include_marker=True,
+            marker_delay_seconds_after_false_skip=61,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_rearm_marker_cannot_extend_past_eighth_attempt(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=9,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
 
     def test_exhausted_terminal_satisfied_followup_remains_eligible_for_convergence(
         self,

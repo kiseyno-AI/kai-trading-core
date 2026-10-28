@@ -39,6 +39,14 @@ from app.eod.summary_cutoff_contract import (
     normalize_symbol_codes,
     summary_cutoff_proof_from_stage,
 )
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    is_canonical_same_day_signal_rearm_proof,
+    is_recoverable_same_day_intraday_watch_expiration,
+    pending_same_day_intraday_watch_rearm_marker,
+)
 from app.repositories.eod_run_repository import (
     daily_price_bar_has_current_eod_run_provenance,
     eod_collection_advisory_lock_keys,
@@ -133,6 +141,48 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value if value is not None else default)
     except (TypeError, ValueError):
         return default
+
+
+def _intraday_summary_cutoff_proof(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Normalize the immutable cutoff carried by an admitted PITR suffix."""
+
+    raw_cutoff = metadata.get('feedback_knowledge_cutoff')
+    if not isinstance(raw_cutoff, Mapping):
+        return None
+    cutoff_at = _parse_utc_datetime(raw_cutoff.get('knowledge_cutoff_at'))
+    source_run_id = str(raw_cutoff.get('source_run_id') or '').strip()
+    scope_mode = str(raw_cutoff.get('feedback_scope_mode') or '').strip()
+    fs_div = str(metadata.get('fs_div') or '').strip().upper()
+    raw_symbols = raw_cutoff.get('requested_symbols')
+    symbols = (
+        normalize_symbol_codes(raw_symbols)
+        if isinstance(raw_symbols, list)
+        else []
+    )
+    if not (
+        raw_cutoff.get('ready') is True
+        and cutoff_at is not None
+        and source_run_id
+        and scope_mode
+        in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and fs_div in {'CFS', 'OFS'}
+        and symbols
+        and symbols == raw_symbols
+    ):
+        return None
+    return {
+        'source_run_id': source_run_id,
+        'feedback_scope_mode': scope_mode,
+        'requested_symbols': None,
+        'expected_completed_symbols': symbols,
+        'knowledge_cutoff_at': cutoff_at.isoformat(),
+        'fs_div': fs_div,
+    }
 
 
 def _terminal_continuation_execution_context_error(
@@ -1453,6 +1503,495 @@ class DailyPipelineRunStateService:
                     stage_rows,
                 ),
                 'knowledge_cutoff_resolution': compact_cutoff_resolution,
+            }
+
+    def claim_same_day_intraday_watch_rearm_resume(
+        self,
+        *,
+        pipeline_run_id: int,
+        market_date: str | date,
+        reused_eod_collection_run_id: int,
+        target_trade_date: str | date,
+        expected_summary_cutoff_proof: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Reclaim only the unfinished tail after a durable signal decision.
+
+        The EOD marker authorizes no new decision pass.  This claim therefore
+        preserves the completed signal row and resets only the first unfinished
+        plan/evaluation stage plus its untouched tail in the same pipeline run.
+        """
+
+        normalized_pipeline_run_id = int(pipeline_run_id)
+        normalized_eod_run_id = int(reused_eod_collection_run_id)
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_target_trade_date = _normalize_market_date(
+            target_trade_date
+        )
+
+        def reject(rejection_reason: str, **extra: Any) -> dict[str, Any]:
+            return {
+                'claimed': False,
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'reason': rejection_reason,
+                **extra,
+            }
+
+        if min(normalized_pipeline_run_id, normalized_eod_run_id) <= 0:
+            return reject('invalid_rearm_resume_identity')
+        if not isinstance(expected_summary_cutoff_proof, Mapping):
+            return reject('summary_cutoff_proof_unavailable')
+        expected_proof = dict(expected_summary_cutoff_proof)
+        now = _utcnow()
+
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
+        ) as session:
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                {
+                    'source_key': 20_001,
+                    'trade_key': int(
+                        normalized_market_date.strftime('%Y%m%d')
+                    ),
+                },
+            )
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == normalized_pipeline_run_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if run_row is None:
+                return reject('pipeline_run_not_found')
+
+            metadata = (
+                dict(run_row.run_metadata)
+                if isinstance(run_row.run_metadata, Mapping)
+                else {}
+            )
+            interruption_reason = str(
+                metadata.get('interrupted_reason') or ''
+            ).strip()
+            if not (
+                run_row.market_date == normalized_market_date
+                and str(run_row.trigger or '').strip()
+                == 'auto_eod_followup_resume'
+                and str(run_row.status or '').strip().lower()
+                == 'interrupted'
+                and tuple(metadata.get('resolved_stages') or ())
+                == AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+                and str(metadata.get('resume_from_stage') or '').strip()
+                == AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[0]
+                and str(metadata.get('entrypoint') or '').strip()
+                == 'daily_pipeline_stage_service.run'
+                and _as_int(metadata.get('reused_eod_collection_run_id'))
+                == normalized_eod_run_id
+                and metadata.get('point_in_time_recovery') is True
+                and metadata.get('force') is False
+                and metadata.get('reuse_existing_feedback') is True
+                and metadata.get('allow_expired_analysis_replay') is False
+                and metadata.get(
+                    'same_day_intraday_watch_continuation_admitted'
+                ) is True
+                and metadata.get('resumable') is True
+                and isinstance(metadata.get('markets'), list)
+                and bool(metadata.get('markets'))
+                and all(
+                    isinstance(market, str) and market.strip()
+                    for market in metadata['markets']
+                )
+                and str(metadata.get('fs_div') or '').strip().upper()
+                in {'CFS', 'OFS'}
+                and interruption_reason
+                and _parse_utc_datetime(metadata.get('interrupted_at'))
+                is not None
+                and str(run_row.error_message or '').strip()
+                == interruption_reason
+            ):
+                return reject('rearm_resume_parent_contract_mismatch')
+
+            current_proof = _intraday_summary_cutoff_proof(metadata)
+            if current_proof is None or current_proof != expected_proof:
+                return reject('summary_cutoff_proof_mismatch')
+
+            eod_run = session.get(EODCollectionRun, normalized_eod_run_id)
+            if eod_run is not None:
+                session.refresh(eod_run, with_for_update=True)
+            if not (
+                eod_run is not None
+                and str(eod_run.market or '').strip().upper() == 'KRX'
+                and str(eod_run.source or '').strip().lower() == 'pykrx'
+                and eod_run.trade_date == normalized_market_date
+            ):
+                return reject('eod_lineage_context_mismatch')
+            eod_metadata = (
+                eod_run.run_metadata
+                if isinstance(eod_run.run_metadata, Mapping)
+                else {}
+            )
+            marker = pending_same_day_intraday_watch_rearm_marker(
+                eod_metadata.get(SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY),
+                target_trade_date=normalized_target_trade_date,
+            )
+            if marker is None:
+                return reject('same_day_rearm_marker_invalid')
+
+            lineage_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.trigger
+                        == 'auto_eod_followup_resume',
+                        DailyPipelineRun.run_metadata[
+                            'reused_eod_collection_run_id'
+                        ].as_integer()
+                        == normalized_eod_run_id,
+                    )
+                    .order_by(
+                        DailyPipelineRun.started_at.asc(),
+                        DailyPipelineRun.id.asc(),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            lineage_by_id = {int(row.id): row for row in lineage_rows}
+            source_run = lineage_by_id.get(
+                int(marker['source_false_skip_run_id'])
+            )
+            proof_run = lineage_by_id.get(int(marker['proof_pipeline_run_id']))
+            ordered_ids = [int(row.id) for row in lineage_rows]
+            if not (
+                source_run is not None
+                and proof_run is not None
+                and ordered_ids
+                and ordered_ids[-1] == normalized_pipeline_run_id
+                and len(ordered_ids)
+                <= SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                and int(proof_run.id) < int(source_run.id)
+                < normalized_pipeline_run_id
+            ):
+                return reject(
+                    'same_day_rearm_lineage_mismatch',
+                    observed_pipeline_run_ids=ordered_ids,
+                )
+            marker_started_at = _parse_utc_datetime(marker.get('started_at'))
+            source_completed_at = _as_utc_datetime(source_run.completed_at)
+            current_started_at = _as_utc_datetime(run_row.started_at)
+            proof_started_at = getattr(proof_run, 'started_at', None)
+            source_started_at = getattr(source_run, 'started_at', None)
+            if not (
+                isinstance(proof_started_at, datetime)
+                and proof_started_at.tzinfo is not None
+                and proof_started_at.utcoffset() is not None
+                and isinstance(source_started_at, datetime)
+                and source_started_at.tzinfo is not None
+                and source_started_at.utcoffset() is not None
+                and proof_started_at.astimezone(timezone.utc)
+                <= source_started_at.astimezone(timezone.utc)
+            ):
+                return reject('same_day_rearm_proof_chronology_mismatch')
+            if not (
+                marker_started_at is not None
+                and source_completed_at is not None
+                and current_started_at is not None
+                and source_completed_at <= marker_started_at
+                <= current_started_at
+            ):
+                return reject('same_day_rearm_marker_timeline_mismatch')
+            proof_metadata = (
+                proof_run.run_metadata
+                if isinstance(proof_run.run_metadata, Mapping)
+                else {}
+            )
+            if _intraday_summary_cutoff_proof(proof_metadata) != expected_proof:
+                return reject('proof_pipeline_cutoff_mismatch')
+
+            marker_evidence_stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id.in_(
+                            [int(source_run.id), int(proof_run.id)]
+                        ),
+                        DailyPipelineStageRun.market_date
+                        == normalized_market_date,
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            marker_stages_by_run: dict[int, dict[str, dict[str, Any]]] = {}
+            for stage_row in marker_evidence_stage_rows:
+                stage_outcome = _stage_row_outcome(stage_row)
+                stage_outcome['source_run_ids'] = (
+                    dict(stage_row.source_run_ids)
+                    if isinstance(stage_row.source_run_ids, Mapping)
+                    else {}
+                )
+                marker_stages_by_run.setdefault(
+                    int(stage_row.pipeline_run_id),
+                    {},
+                )[str(stage_row.stage_id or '').strip()] = stage_outcome
+
+            def marker_pipeline_evidence(
+                row: DailyPipelineRun,
+            ) -> dict[str, Any]:
+                return {
+                    'id': int(row.id),
+                    'market_date': row.market_date,
+                    'trigger': row.trigger,
+                    'status': row.status,
+                    'current_stage': row.current_stage,
+                    'completed_at': row.completed_at,
+                    'error_message': row.error_message,
+                    'run_metadata': row.run_metadata,
+                    'stages': marker_stages_by_run.get(int(row.id), {}),
+                }
+
+            if not is_recoverable_same_day_intraday_watch_expiration(
+                marker_pipeline_evidence(source_run),
+                current_market_date=normalized_target_trade_date,
+            ):
+                return reject('source_false_skip_evidence_invalid')
+            if not is_canonical_same_day_signal_rearm_proof(
+                marker_pipeline_evidence(proof_run),
+                expected_eod_collection_run_id=normalized_eod_run_id,
+            ):
+                return reject('proof_pipeline_evidence_invalid')
+
+            active_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.status.in_(
+                            ACTIVE_DAILY_PIPELINE_STATUSES
+                        ),
+                        DailyPipelineRun.id != normalized_pipeline_run_id,
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            if active_rows:
+                return reject(
+                    'overlapping_run_already_active',
+                    active_pipeline_run_ids=[
+                        int(active_row.id) for active_row in active_rows
+                    ],
+                )
+
+            stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == normalized_pipeline_run_id
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            stage_rows_by_id = {
+                str(stage_row.stage_id or '').strip(): stage_row
+                for stage_row in stage_rows
+            }
+            if not (
+                stage_rows_by_id
+                and set(stage_rows_by_id).issubset(
+                    set(AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER)
+                )
+                and len(stage_rows_by_id) == len(stage_rows)
+                and 'signal_decider' in stage_rows_by_id
+            ):
+                return reject('resolved_stage_rows_mismatch')
+
+            def satisfied(stage_row: DailyPipelineStageRun) -> bool:
+                return bool(
+                    daily_pipeline_outcome_is_satisfied(
+                        _stage_row_outcome(stage_row)
+                    )
+                    and stage_row.completed_at is not None
+                    and not str(stage_row.error_message or '').strip()
+                )
+
+            signal_row = stage_rows_by_id['signal_decider']
+            signal_sources = (
+                signal_row.source_run_ids
+                if isinstance(signal_row.source_run_ids, Mapping)
+                else {}
+            )
+            if not (
+                satisfied(signal_row)
+                and str(
+                    signal_sources.get('agent_feedback_run_id')
+                    or signal_sources.get('run_id')
+                    or ''
+                ).strip()
+            ):
+                return reject('completed_signal_evidence_invalid')
+
+            satisfied_prefix: list[str] = []
+            for stage_id in AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER:
+                stage_row = stage_rows_by_id.get(stage_id)
+                if stage_row is None or not satisfied(stage_row):
+                    break
+                satisfied_prefix.append(stage_id)
+            if len(satisfied_prefix) == len(
+                AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+            ):
+                return reject('same_day_rearm_suffix_already_satisfied')
+            first_unfinished_index = len(satisfied_prefix)
+            if first_unfinished_index == 0:
+                return reject('completed_signal_evidence_invalid')
+            first_unfinished_stage = (
+                AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[
+                    first_unfinished_index
+                ]
+            )
+
+            def untouched_pending(stage_row: DailyPipelineStageRun) -> bool:
+                return bool(
+                    str(stage_row.status or '').strip().lower() == 'pending'
+                    and all(
+                        _as_int(getattr(stage_row, field, 0)) == 0
+                        for field in (
+                            'processed',
+                            'total',
+                            'succeeded',
+                            'failed',
+                            'remaining',
+                        )
+                    )
+                    and stage_row.completed_at is None
+                    and not str(stage_row.error_message or '').strip()
+                    and isinstance(stage_row.source_run_ids, Mapping)
+                    and not stage_row.source_run_ids
+                )
+
+            first_row = stage_rows_by_id.get(first_unfinished_stage)
+            first_status = (
+                str(first_row.status or '').strip().lower()
+                if first_row is not None
+                else 'absent'
+            )
+            current_stage = str(run_row.current_stage or '').strip()
+            if first_status == 'absent':
+                first_is_valid = current_stage in {
+                    first_unfinished_stage,
+                    satisfied_prefix[-1],
+                }
+            elif first_status == 'pending':
+                first_is_valid = bool(
+                    untouched_pending(first_row)
+                    and current_stage
+                    in {first_unfinished_stage, satisfied_prefix[-1]}
+                )
+            elif first_status == 'interrupted':
+                details = (
+                    first_row.details
+                    if isinstance(first_row.details, Mapping)
+                    else {}
+                )
+                first_is_valid = bool(
+                    current_stage == first_unfinished_stage
+                    and str(first_row.current_step or '').strip()
+                    == 'core_restart_interrupted'
+                    and first_row.completed_at is not None
+                    and str(first_row.error_message or '').strip()
+                    == interruption_reason
+                    and details.get('resumable') is True
+                    and str(details.get('interrupted_reason') or '').strip()
+                    == interruption_reason
+                )
+            else:
+                first_is_valid = False
+            untouched_tail = all(
+                stage_id not in stage_rows_by_id
+                or untouched_pending(stage_rows_by_id[stage_id])
+                for stage_id in AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[
+                    first_unfinished_index + 1 :
+                ]
+            )
+            if not first_is_valid or not untouched_tail:
+                return reject(
+                    'same_day_rearm_stage_progress_invalid',
+                    first_unfinished_stage=first_unfinished_stage,
+                    first_unfinished_status=first_status,
+                )
+
+            persisted_stage_outcomes = {
+                stage_id: self._serialize_stage(stage_rows_by_id[stage_id])
+                for stage_id in satisfied_prefix
+            }
+            stage_statuses = {
+                stage_id: str(stage_rows_by_id[stage_id].status or '')
+                .strip()
+                .lower()
+                for stage_id in satisfied_prefix
+            }
+            for stage_id in AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[
+                first_unfinished_index:
+            ]:
+                stage_row = stage_rows_by_id.get(stage_id)
+                stage_statuses[stage_id] = 'pending'
+                if stage_row is None:
+                    continue
+                stage_row.status = 'pending'
+                stage_row.processed = 0
+                stage_row.total = 0
+                stage_row.succeeded = 0
+                stage_row.failed = 0
+                stage_row.remaining = 0
+                stage_row.current_step = (
+                    'same_day_intraday_watch_rearm_pending'
+                )
+                stage_row.current_activity = (
+                    f'Pending same-day recovery from {first_unfinished_stage}'
+                )
+                stage_row.current_symbol = None
+                stage_row.current_period = None
+                stage_row.started_at = now
+                stage_row.updated_at = now
+                stage_row.completed_at = None
+                stage_row.error_message = None
+                stage_row.source_run_ids = {}
+                stage_row.details = {}
+
+            metadata.update(
+                {
+                    'same_day_intraday_watch_rearm_resume_count': (
+                        _as_int(
+                            metadata.get(
+                                'same_day_intraday_watch_rearm_resume_count'
+                            )
+                        )
+                        + 1
+                    ),
+                    'same_day_intraday_watch_rearm_resumed_at': now.isoformat(),
+                    'same_day_intraday_watch_rearm_resume_from_stage': (
+                        first_unfinished_stage
+                    ),
+                    'stage_statuses': stage_statuses,
+                    'resumable': True,
+                }
+            )
+            run_row.status = 'running'
+            run_row.current_stage = first_unfinished_stage
+            run_row.completed_at = None
+            run_row.error_message = None
+            run_row.updated_at = now
+            run_row.run_metadata = metadata
+            session.flush()
+            return {
+                'claimed': True,
+                'reason': 'same_day_intraday_watch_rearm_resumed',
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'resume_from_stage': first_unfinished_stage,
+                'pipeline_run': self._serialize_run(run_row, stage_rows),
+                'persisted_stage_outcomes': persisted_stage_outcomes,
+                'summary_cutoff_proof': current_proof,
             }
 
     def claim_terminal_continuation(

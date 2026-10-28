@@ -33,6 +33,15 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_marker_is_valid,
     terminal_continuation_resume_is_unconsumed,
 )
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    is_canonical_same_day_signal_rearm_proof,
+    is_exact_auto_pitr_intraday_watch_recovery_request,
+    is_recoverable_same_day_intraday_watch_expiration,
+    pending_same_day_intraday_watch_rearm_marker,
+)
 from app.eod.summary_cutoff_contract import (
     is_resumable_summary_cutoff_contract_repair,
     is_summary_cutoff_contract_repair_candidate,
@@ -681,6 +690,9 @@ def _load_eod_recovery_metadata(
             metadata['stage_progress']['agent_feedback_summaries'].label(
                 'feedback_summary_stage'
             ),
+            metadata['same_day_intraday_watch_rearm'].label(
+                'same_day_intraday_watch_rearm'
+            ),
         ).where(EODCollectionRun.id.in_(tuple(candidate_by_id)))
     )
     for row in rows:
@@ -701,6 +713,9 @@ def _load_eod_recovery_metadata(
                 'markets': row.markets,
                 'requested_symbols': row.requested_symbols,
                 'feedback_summary_stage': row.feedback_summary_stage,
+                'same_day_intraday_watch_rearm': (
+                    row.same_day_intraday_watch_rearm
+                ),
             }
         )
 
@@ -841,6 +856,15 @@ def _load_pipeline_recovery_candidates(
             .as_boolean()
             .label('reuse_existing_feedback'),
             metadata['force'].as_boolean().label('force'),
+            metadata['point_in_time_recovery']
+            .as_boolean()
+            .label('point_in_time_recovery'),
+            metadata['allow_expired_analysis_replay']
+            .as_boolean()
+            .label('allow_expired_analysis_replay'),
+            metadata['same_day_intraday_watch_continuation_admitted']
+            .as_boolean()
+            .label('same_day_intraday_watch_continuation_admitted'),
             metadata['terminal_continuation_feedback_lease_loss_run_id']
             .as_string()
             .label('terminal_continuation_feedback_lease_loss_run_id'),
@@ -921,6 +945,13 @@ def _load_pipeline_recovery_candidates(
                 'fs_div': row.fs_div,
                 'reuse_existing_feedback': row.reuse_existing_feedback,
                 'force': row.force,
+                'point_in_time_recovery': row.point_in_time_recovery,
+                'allow_expired_analysis_replay': (
+                    row.allow_expired_analysis_replay
+                ),
+                'same_day_intraday_watch_continuation_admitted': (
+                    row.same_day_intraday_watch_continuation_admitted
+                ),
                 'terminal_continuation_feedback_lease_loss_run_id': (
                     row.terminal_continuation_feedback_lease_loss_run_id
                 ),
@@ -1031,6 +1062,287 @@ def _pipeline_stage_outcome(stage_row: DailyPipelineStageRun) -> dict[str, Any]:
             stage_row.details if isinstance(stage_row.details, dict) else {}
         ),
     }
+
+
+def _followup_recovery_is_recoverable_same_day_expiration(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    current_market_date: date,
+) -> bool:
+    """Keep one exact OPEN PITR false-skip from consuming recovery debt."""
+
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, dict)
+        else {}
+    )
+    raw_resolved_stages = metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return False
+    resolved_stages = tuple(
+        str(stage_id or '').strip()
+        for stage_id in raw_resolved_stages
+        if str(stage_id or '').strip()
+    )
+    if len(resolved_stages) != len(raw_resolved_stages):
+        return False
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(resolved_stages),
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+    }
+    if set(stages) != set(resolved_stages):
+        return False
+    return is_recoverable_same_day_intraday_watch_expiration(
+        {
+            'id': pipeline_run.id,
+            'market_date': pipeline_run.market_date,
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'started_at': pipeline_run.started_at,
+            'updated_at': pipeline_run.activity_at,
+            'completed_at': pipeline_run.completed_at,
+            'error_message': pipeline_run.error_message,
+            'run_metadata': metadata,
+            'stages': stages,
+        },
+        current_market_date=current_market_date,
+    )
+
+
+def _followup_candidate_is_exact_intraday_watch_recovery(
+    pipeline_run: _PipelineRecoveryCandidate,
+    *,
+    eod_run_id: int,
+) -> bool:
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, Mapping)
+        else {}
+    )
+    resolved_stages = metadata.get('resolved_stages')
+    return bool(
+        metadata.get('entrypoint') == 'daily_pipeline_stage_service.run'
+        and metadata.get('allow_expired_analysis_replay') is False
+        and isinstance(resolved_stages, (list, tuple))
+        and is_exact_auto_pitr_intraday_watch_recovery_request(
+            trigger=pipeline_run.trigger,
+            point_in_time_recovery=metadata.get('point_in_time_recovery'),
+            reused_eod_collection_run_id=metadata.get(
+                'reused_eod_collection_run_id'
+            ),
+            force=metadata.get('force'),
+            reuse_existing_feedback=metadata.get('reuse_existing_feedback'),
+            resume_from_stage=metadata.get('resume_from_stage'),
+            resolved_stages=resolved_stages,
+        )
+        and metadata.get('reused_eod_collection_run_id') == eod_run_id
+    )
+
+
+def _followup_recovery_is_canonical_signal_rearm_proof(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    eod_run_id: int,
+) -> bool:
+    """Verify the immutable signal retry evidence named by a rearm marker."""
+
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(
+                    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+                ),
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+    }
+    return is_canonical_same_day_signal_rearm_proof(
+        {
+            'id': int(pipeline_run.id),
+            'market_date': pipeline_run.market_date,
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'run_metadata': pipeline_run.run_metadata,
+            'stages': stages,
+        },
+        expected_eod_collection_run_id=eod_run_id,
+    )
+
+
+def _followup_recovery_has_valid_same_day_rearm_marker(
+    session: Any,
+    *,
+    eod_run: _EODRecoveryCandidate,
+    pipeline_candidates: Sequence[_PipelineRecoveryCandidate],
+    latest_recovery: _PipelineRecoveryCandidate | None,
+    current_market_date: date,
+    followup_attempts: int,
+    allow_stale_target_for_terminal_block: bool = False,
+) -> bool:
+    """Validate the narrow marker that extends one false-skip lineage.
+
+    This is deliberately separate from the generic follow-up retry budget. The
+    marker can surface only the exact same-day OPEN false-skip it names, and it
+    cannot authorize work after its bounded eighth recovery observation.
+    """
+
+    within_rearm_attempt_budget = bool(
+        _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD < followup_attempts
+        <= SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+    )
+    stale_pre_run_crash = bool(
+        allow_stale_target_for_terminal_block
+        and followup_attempts == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+    )
+    if not (
+        (within_rearm_attempt_budget or stale_pre_run_crash)
+        and latest_recovery is not None
+        and str(latest_recovery.status or '').strip().lower()
+        in (
+            _RECOVERABLE_DAILY_PIPELINE_STATUSES
+            | _CONVERGENCE_ELIGIBLE_RECOVERY_STATUSES
+        )
+        and _followup_candidate_is_exact_intraday_watch_recovery(
+            latest_recovery,
+            eod_run_id=eod_run.id,
+        )
+    ):
+        return False
+
+    marker = pending_same_day_intraday_watch_rearm_marker(
+        eod_run.run_metadata.get(
+            SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+        ),
+        target_trade_date=(
+            None
+            if allow_stale_target_for_terminal_block
+            else current_market_date
+        ),
+    )
+    if marker is None:
+        return False
+    marker_target_trade_date = date.fromisoformat(
+        str(marker['target_trade_date'])
+    )
+    if allow_stale_target_for_terminal_block and not (
+        marker_target_trade_date < current_market_date
+    ):
+        return False
+    marker_started_at = _normalized_datetime(marker.get('started_at'))
+    if marker_started_at is None:
+        return False
+    source_false_skip_run_id = marker.get('source_false_skip_run_id')
+    proof_pipeline_run_id = marker.get('proof_pipeline_run_id')
+
+    candidates_by_id = {
+        candidate.id: candidate for candidate in pipeline_candidates
+    }
+    source_false_skip = candidates_by_id.get(source_false_skip_run_id)
+    proof_pipeline_run = candidates_by_id.get(proof_pipeline_run_id)
+    if source_false_skip is None or proof_pipeline_run is None:
+        return False
+
+    def _reuses_exact_eod(candidate: _PipelineRecoveryCandidate) -> bool:
+        metadata = (
+            candidate.run_metadata
+            if isinstance(candidate.run_metadata, Mapping)
+            else {}
+        )
+        try:
+            return int(metadata.get('reused_eod_collection_run_id')) == int(
+                eod_run.id
+            )
+        except (TypeError, ValueError):
+            return False
+
+    if not (
+        source_false_skip.market_date == eod_run.trade_date
+        and proof_pipeline_run.market_date == eod_run.trade_date
+        and source_false_skip.trigger == _AUTO_DAILY_RECOVERY_TRIGGER
+        and proof_pipeline_run.trigger == _AUTO_DAILY_RECOVERY_TRIGGER
+        and _reuses_exact_eod(source_false_skip)
+        and _reuses_exact_eod(proof_pipeline_run)
+        and proof_pipeline_run.started_at <= source_false_skip.started_at
+        and (
+            latest_recovery.id > source_false_skip.id
+            or (
+                stale_pre_run_crash
+                and latest_recovery.id == source_false_skip.id
+            )
+        )
+        and _reuses_exact_eod(latest_recovery)
+    ):
+        return False
+
+    source_completed_at = _normalized_datetime(source_false_skip.completed_at)
+    if source_completed_at is None or marker_started_at < source_completed_at:
+        return False
+    post_source_attempts = sorted(
+        (
+            candidate
+            for candidate in pipeline_candidates
+            if candidate.id > source_false_skip.id
+            and candidate.market_date == eod_run.trade_date
+            and candidate.trigger == _AUTO_DAILY_RECOVERY_TRIGGER
+            and _reuses_exact_eod(candidate)
+        ),
+        key=lambda candidate: (
+            _normalized_datetime(candidate.started_at)
+            or datetime.min.replace(tzinfo=timezone.utc),
+            candidate.id,
+        ),
+    )
+    earliest_attempt_at = (
+        _normalized_datetime(post_source_attempts[0].started_at)
+        if post_source_attempts
+        else None
+    )
+    marker_precedes_recovery_attempt = bool(
+        (
+            earliest_attempt_at is not None
+            and marker_started_at <= earliest_attempt_at
+        )
+        or (stale_pre_run_crash and not post_source_attempts)
+    )
+    return bool(
+        marker_precedes_recovery_attempt
+        and _followup_recovery_is_recoverable_same_day_expiration(
+            session,
+            pipeline_run=source_false_skip,
+            current_market_date=marker_target_trade_date,
+        )
+        and _followup_recovery_is_canonical_signal_rearm_proof(
+            session,
+            pipeline_run=proof_pipeline_run,
+            eod_run_id=eod_run.id,
+        )
+    )
 
 
 def _terminal_continuation_lease_loss_child_is_valid(
@@ -2063,24 +2375,63 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                     trade_date=eod_row.trade_date.isoformat(),
                     eod_run_id=eod_row.id,
                 )
-            if _eod_has_followup_recovery_scope(eod_row):
-                followup_attempts = _count_auto_followup_recovery_attempts(
+            pipeline_candidates = _load_pipeline_recovery_candidates(
+                session,
+                market_dates=[eod_row.trade_date],
+            )
+            latest_recovery = _latest_exact_followup_recovery(
+                candidates=pipeline_candidates,
+                eod_run=eod_row,
+            )
+            followup_attempts = _count_auto_followup_recovery_attempts(
+                session,
+                eod_run=eod_row,
+            )
+            if (
+                latest_recovery is not None
+                and followup_attempts
+                <= _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+                and _followup_recovery_is_recoverable_same_day_expiration(
                     session,
-                    eod_run=eod_row,
+                    pipeline_run=latest_recovery,
+                    current_market_date=cutoff,
                 )
+            ):
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
+            if _followup_recovery_has_valid_same_day_rearm_marker(
+                session,
+                eod_run=eod_row,
+                pipeline_candidates=pipeline_candidates,
+                latest_recovery=latest_recovery,
+                current_market_date=cutoff,
+                followup_attempts=followup_attempts,
+            ):
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
+            if _followup_recovery_has_valid_same_day_rearm_marker(
+                session,
+                eod_run=eod_row,
+                pipeline_candidates=pipeline_candidates,
+                latest_recovery=latest_recovery,
+                current_market_date=cutoff,
+                followup_attempts=followup_attempts,
+                allow_stale_target_for_terminal_block=True,
+            ):
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
+            if _eod_has_followup_recovery_scope(eod_row):
                 if followup_attempts < _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD:
                     return AutoEODRecoveryTarget(
                         trade_date=eod_row.trade_date.isoformat(),
                         eod_run_id=eod_row.id,
                     )
-                pipeline_candidates = _load_pipeline_recovery_candidates(
-                    session,
-                    market_dates=[eod_row.trade_date],
-                )
-                latest_recovery = _latest_exact_followup_recovery(
-                    candidates=pipeline_candidates,
-                    eod_run=eod_row,
-                )
                 if (
                     latest_recovery is not None
                     and _followup_recovery_is_satisfied_for_convergence(

@@ -48,6 +48,18 @@ from app.eod.pykrx_pipeline_support import (
     build_daily_retry_context,
     build_daily_skip_result,
 )
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+    is_completed_auto_pitr_intraday_watch_recovery,
+    is_canonical_same_day_signal_rearm_proof,
+    is_exact_auto_pitr_intraday_watch_recovery_request,
+    is_recoverable_same_day_intraday_watch_expiration,
+    outcome_contains_reason,
+    pending_same_day_intraday_watch_rearm_marker,
+)
 from app.eod.summary_cutoff_contract import (
     completed_summary_scope_matches_parent,
     is_resumable_summary_cutoff_contract_repair,
@@ -500,20 +512,334 @@ def _is_retired_decider_cutoff_zero_work_run(
     )
 
 
+def _is_transparent_core_restart_signal_suffix_run(
+    pipeline_run: object,
+    *,
+    allow_pending_marker_restart: bool = False,
+) -> bool:
+    """Recognize an exact interrupted signal suffix that adds no new summary.
+
+    A process restart can interrupt a retry after some decider rows were
+    durably reused or written but before the pipeline copied its immutable
+    summary cutoff into run metadata.  Such an interruption is transparent
+    while walking backwards for the canonical summary proof; it is not proof
+    that the interrupted decision work itself completed.
+    """
+
+    if not isinstance(pipeline_run, Mapping):
+        return False
+    metadata = pipeline_run.get('run_metadata')
+    stages = pipeline_run.get('stages')
+    if not isinstance(metadata, Mapping) or not isinstance(stages, Mapping):
+        return False
+    expected_stage_ids = (
+        'signal_decider',
+        'next_open_execution_plan',
+        'signal_decider_evaluations',
+    )
+    interruption_reason = str(
+        metadata.get('interrupted_reason') or ''
+    ).strip()
+    if not (
+        str(pipeline_run.get('trigger') or '').strip()
+        == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        and str(pipeline_run.get('status') or '').strip().lower()
+        == 'interrupted'
+        and tuple(metadata.get('resolved_stages') or ())
+        == expected_stage_ids
+        and str(metadata.get('resume_from_stage') or '').strip()
+        == 'signal_decider'
+        and type(metadata.get('reused_eod_collection_run_id')) is int
+        and int(metadata['reused_eod_collection_run_id']) > 0
+        and str(metadata.get('entrypoint') or '').strip()
+        == 'daily_pipeline_stage_service.run'
+        and metadata.get('point_in_time_recovery') is True
+        and metadata.get('force') is False
+        and metadata.get('reuse_existing_feedback') is True
+        and metadata.get('allow_expired_analysis_replay') is False
+        and metadata.get(
+            'same_day_intraday_watch_continuation_admitted'
+        ) is True
+        and (
+            _summary_cutoff_proof_from_run_metadata(metadata) is None
+            or allow_pending_marker_restart
+        )
+        and not (
+            'feedback_knowledge_cutoff' in metadata
+            and _summary_cutoff_proof_from_run_metadata(metadata) is None
+        )
+        and metadata.get('resumable') is True
+        and interruption_reason
+        and _parse_activity_datetime(metadata.get('interrupted_at'))
+        is not None
+    ):
+        return False
+    current_stage = str(pipeline_run.get('current_stage') or '').strip()
+    if not stages:
+        return bool(
+            allow_pending_marker_restart
+            and current_stage in {'', 'signal_decider'}
+        )
+    signal_stage = stages.get('signal_decider')
+    if not (
+        current_stage == 'signal_decider'
+        and set(stages) == {'signal_decider'}
+        and isinstance(signal_stage, Mapping)
+        and str(signal_stage.get('status') or '').strip().lower()
+        == 'interrupted'
+        and str(signal_stage.get('current_step') or '').strip()
+        == 'core_restart_interrupted'
+        and _parse_activity_datetime(signal_stage.get('completed_at'))
+        is not None
+        and str(signal_stage.get('error_message') or '').strip()
+        == interruption_reason
+        and isinstance(signal_stage.get('source_run_ids'), Mapping)
+    ):
+        return False
+    details = signal_stage.get('details')
+    interruption_is_consistent = bool(
+        isinstance(details, Mapping)
+        and details.get('resumable') is True
+        and str(details.get('interrupted_reason') or '').strip()
+        == interruption_reason
+    )
+    if not interruption_is_consistent:
+        return False
+    source_run_ids = signal_stage.get('source_run_ids')
+    if str(source_run_ids.get('agent_feedback_run_id') or '').strip():
+        return True
+    return bool(
+        allow_pending_marker_restart
+        and not any(
+            int(signal_stage.get(field) or 0)
+            for field in ('processed', 'succeeded', 'failed')
+        )
+        and not any(
+            str(value or '').strip() for value in source_run_ids.values()
+        )
+    )
+
+
+def _is_resumable_same_day_intraday_watch_post_signal_restart(
+    pipeline_run: object,
+) -> bool:
+    """Recognize one admitted PITR run whose signal result is already durable.
+
+    This shape must be resumed in place.  Starting another signal suffix would
+    replay a completed decision, while starting only the remaining stages would
+    lose the exact three-stage recovery contract used to clear the durable EOD
+    marker.
+    """
+
+    if not isinstance(pipeline_run, Mapping):
+        return False
+    metadata = pipeline_run.get('run_metadata')
+    stages = pipeline_run.get('stages')
+    expected_stage_ids = AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+    interruption_reason = str(
+        (metadata or {}).get('interrupted_reason') or ''
+    ).strip()
+    if not (
+        isinstance(metadata, Mapping)
+        and isinstance(stages, Mapping)
+        and bool(stages)
+        and set(stages).issubset(set(expected_stage_ids))
+        and str(pipeline_run.get('trigger') or '').strip()
+        == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        and str(pipeline_run.get('status') or '').strip().lower()
+        == 'interrupted'
+        and tuple(metadata.get('resolved_stages') or ())
+        == expected_stage_ids
+        and str(metadata.get('resume_from_stage') or '').strip()
+        == expected_stage_ids[0]
+        and type(metadata.get('reused_eod_collection_run_id')) is int
+        and int(metadata['reused_eod_collection_run_id']) > 0
+        and str(metadata.get('entrypoint') or '').strip()
+        == 'daily_pipeline_stage_service.run'
+        and metadata.get('point_in_time_recovery') is True
+        and metadata.get('force') is False
+        and metadata.get('reuse_existing_feedback') is True
+        and metadata.get('allow_expired_analysis_replay') is False
+        and metadata.get(
+            'same_day_intraday_watch_continuation_admitted'
+        ) is True
+        and _summary_cutoff_proof_from_run_metadata(metadata) is not None
+        and metadata.get('resumable') is True
+        and interruption_reason
+        and _parse_activity_datetime(metadata.get('interrupted_at'))
+        is not None
+    ):
+        return False
+
+    def satisfied(stage: object) -> bool:
+        return bool(
+            isinstance(stage, Mapping)
+            and daily_pipeline_outcome_is_satisfied(stage)
+            and _parse_activity_datetime(stage.get('completed_at'))
+            is not None
+            and not str(stage.get('error_message') or '').strip()
+        )
+
+    signal_stage = stages.get(expected_stage_ids[0])
+    signal_sources = (
+        signal_stage.get('source_run_ids')
+        if isinstance(signal_stage, Mapping)
+        else None
+    )
+    if not (
+        satisfied(signal_stage)
+        and isinstance(signal_sources, Mapping)
+        and str(
+            signal_sources.get('agent_feedback_run_id')
+            or signal_sources.get('run_id')
+            or ''
+        ).strip()
+    ):
+        return False
+
+    satisfied_prefix: list[str] = []
+    for stage_id in expected_stage_ids:
+        if not satisfied(stages.get(stage_id)):
+            break
+        satisfied_prefix.append(stage_id)
+    if not satisfied_prefix or len(satisfied_prefix) == len(
+        expected_stage_ids
+    ):
+        return False
+    first_unfinished_index = len(satisfied_prefix)
+    first_unfinished_stage_id = expected_stage_ids[first_unfinished_index]
+    first_unfinished_stage = stages.get(first_unfinished_stage_id)
+
+    def untouched_pending(stage: object) -> bool:
+        return bool(
+            isinstance(stage, Mapping)
+            and str(stage.get('status') or '').strip().lower() == 'pending'
+            and not any(
+                int(stage.get(field) or 0)
+                for field in (
+                    'processed',
+                    'total',
+                    'succeeded',
+                    'failed',
+                    'remaining',
+                )
+            )
+            and stage.get('completed_at') is None
+            and not str(stage.get('error_message') or '').strip()
+            and isinstance(stage.get('source_run_ids'), Mapping)
+            and not stage.get('source_run_ids')
+        )
+
+    first_status = (
+        str(first_unfinished_stage.get('status') or '').strip().lower()
+        if isinstance(first_unfinished_stage, Mapping)
+        else 'absent'
+    )
+    current_stage = str(pipeline_run.get('current_stage') or '').strip()
+    if first_status == 'absent':
+        if current_stage not in {
+            first_unfinished_stage_id,
+            satisfied_prefix[-1],
+        }:
+            return False
+    elif first_status == 'pending':
+        if not (
+            untouched_pending(first_unfinished_stage)
+            and current_stage
+            in {first_unfinished_stage_id, satisfied_prefix[-1]}
+        ):
+            return False
+    elif first_status == 'interrupted':
+        details = first_unfinished_stage.get('details')
+        if not (
+            current_stage == first_unfinished_stage_id
+            and str(
+                first_unfinished_stage.get('current_step') or ''
+            ).strip()
+            == 'core_restart_interrupted'
+            and _parse_activity_datetime(
+                first_unfinished_stage.get('completed_at')
+            )
+            is not None
+            and str(
+                first_unfinished_stage.get('error_message') or ''
+            ).strip()
+            == interruption_reason
+            and isinstance(details, Mapping)
+            and details.get('resumable') is True
+            and str(details.get('interrupted_reason') or '').strip()
+            == interruption_reason
+        ):
+            return False
+    else:
+        return False
+
+    return all(
+        stage_id not in stages or untouched_pending(stages.get(stage_id))
+        for stage_id in expected_stage_ids[first_unfinished_index + 1 :]
+    )
+
+
 def _select_prior_signal_rearm_evidence(
     *,
     current_pipeline_run: Mapping[str, Any],
     prior_pipeline_runs: Sequence[Mapping[str, Any]],
+    current_market_date: date | str | None = None,
+    allow_transparent_current: bool = False,
 ) -> tuple[Mapping[str, Any], dict[str, Any]] | None:
     """Select one coherent prior signal circuit row from the same lineage."""
 
-    if not _is_retired_decider_cutoff_zero_work_run(current_pipeline_run):
+    recoverable_same_day_expiration = bool(
+        current_market_date is not None
+        and is_recoverable_same_day_intraday_watch_expiration(
+            current_pipeline_run,
+            current_market_date=current_market_date,
+        )
+    )
+    if not (
+        _is_retired_decider_cutoff_zero_work_run(current_pipeline_run)
+        or recoverable_same_day_expiration
+        or (
+            allow_transparent_current
+            and (
+                _is_transparent_core_restart_signal_suffix_run(
+                    current_pipeline_run,
+                    allow_pending_marker_restart=True,
+                )
+                or _is_resumable_same_day_intraday_watch_post_signal_restart(
+                    current_pipeline_run
+                )
+            )
+        )
+    ):
         return None
     current_metadata = current_pipeline_run['run_metadata']
+    current_cutoff_proof = _summary_cutoff_proof_from_run_metadata(
+        current_metadata
+    )
+    transparent_cutoff_proofs = (
+        [current_cutoff_proof]
+        if current_cutoff_proof is not None
+        else []
+    )
+    same_day_chronology_required = bool(
+        recoverable_same_day_expiration or allow_transparent_current
+    )
+    source_false_skip_started_at = (
+        _parse_aware_activity_datetime(
+            current_pipeline_run.get('started_at')
+        )
+        if recoverable_same_day_expiration
+        else None
+    )
+    if recoverable_same_day_expiration and (
+        source_false_skip_started_at is None
+    ):
+        return None
     current_eod_run_id = int(
         current_metadata['reused_eod_collection_run_id']
     )
-    current_market_date = _to_iso_date(
+    lineage_market_date = _to_iso_date(
         current_pipeline_run.get('market_date')
     )
     current_run_id = int(current_pipeline_run.get('id') or 0)
@@ -533,7 +859,7 @@ def _select_prior_signal_rearm_evidence(
             isinstance(prior_metadata, Mapping)
             and 0 < int(prior_run.get('id') or 0) < previous_run_id
             and _to_iso_date(prior_run.get('market_date'))
-            == current_market_date
+            == lineage_market_date
             and prior_metadata.get('reused_eod_collection_run_id')
             == current_eod_run_id
             and str(prior_metadata.get('fs_div') or '')
@@ -547,17 +873,66 @@ def _select_prior_signal_rearm_evidence(
         ):
             return None
         previous_run_id = int(prior_run['id'])
+        transparent_restart = bool(
+            _is_transparent_core_restart_signal_suffix_run(
+                prior_run,
+                allow_pending_marker_restart=allow_transparent_current,
+            )
+            or (
+                allow_transparent_current
+                and _is_resumable_same_day_intraday_watch_post_signal_restart(
+                    prior_run
+                )
+            )
+        )
+        if transparent_restart:
+            transparent_proof = _summary_cutoff_proof_from_run_metadata(
+                prior_metadata
+            )
+            if transparent_proof is not None:
+                transparent_cutoff_proofs.append(transparent_proof)
+            continue
+        prior_is_same_day_expiration = bool(
+            current_market_date is not None
+            and is_recoverable_same_day_intraday_watch_expiration(
+                prior_run,
+                current_market_date=current_market_date,
+            )
+        )
+        if prior_is_same_day_expiration:
+            if source_false_skip_started_at is not None:
+                return None
+            source_false_skip_started_at = (
+                _parse_aware_activity_datetime(
+                    prior_run.get('started_at')
+                )
+            )
+            if source_false_skip_started_at is None:
+                return None
+            continue
         if _is_retired_decider_cutoff_zero_work_run(prior_run):
             continue
         if not _is_retryable_feedback_rearm_candidate(prior_run):
             return None
-        _, circuit_stage_id, _ = _feedback_dispatch_circuit_evidence(
-            prior_run
-        )
+        retry_stage_id = _feedback_retry_stage_id(prior_run)
         proof = _summary_cutoff_proof_from_run_metadata(
             prior_metadata
         )
-        if circuit_stage_id == 'signal_decider' and proof is not None:
+        if retry_stage_id == 'signal_decider' and proof is not None:
+            proof_started_at = _parse_aware_activity_datetime(
+                prior_run.get('started_at')
+            )
+            if same_day_chronology_required and not (
+                proof_started_at is not None
+                and source_false_skip_started_at is not None
+                and proof_started_at <= source_false_skip_started_at
+            ):
+                return None
+            if any(
+                transparent_proof != proof
+                for transparent_proof in transparent_cutoff_proofs
+            ):
+                return None
             return prior_run, proof
         return None
     return None
@@ -1298,6 +1673,21 @@ def _parse_activity_datetime(value: object) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_aware_activity_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -3470,6 +3860,34 @@ class PykrxBackfillService:
             if isinstance(latest_eod_run.get('run_metadata'), dict)
             else {}
         )
+        current_krx_calendar_date = _current_krx_calendar_date()
+        stale_pending_rearm = (
+            pending_same_day_intraday_watch_rearm_marker(
+                latest_eod_metadata.get(
+                    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+                )
+            )
+        )
+        if stale_pending_rearm is not None and (
+            date.fromisoformat(stale_pending_rearm['target_trade_date'])
+            < current_krx_calendar_date
+        ):
+            rearm_block = self._block_same_day_intraday_watch_rearm(
+                latest_eod_run=latest_eod_run,
+                reason='next_open_window_expired',
+            )
+            result = build_daily_skip_result(
+                reason='next_open_window_expired',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'retry_scheduled': False,
+                'blocker': 'same_day_intraday_watch_rearm_terminal_expiry',
+                'same_day_intraday_watch_rearm': rearm_block,
+            }
+            return result
         lineage_markets = _point_in_time_source_markets(
             latest_eod_metadata,
             fallback=markets,
@@ -3573,9 +3991,45 @@ class PykrxBackfillService:
         prior_signal_rearm_evidence: (
             tuple[Mapping[str, Any], dict[str, Any]] | None
         ) = None
+        pending_same_day_rearm = (
+            pending_same_day_intraday_watch_rearm_marker(
+                latest_eod_metadata.get(
+                    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+                ),
+                target_trade_date=current_krx_calendar_date,
+            )
+        )
+        transparent_rearm_restart = bool(
+            pending_same_day_rearm is not None
+            and _is_transparent_core_restart_signal_suffix_run(
+                pipeline_run,
+                allow_pending_marker_restart=True,
+            )
+        )
+        post_signal_rearm_restart = bool(
+            pending_same_day_rearm is not None
+            and _is_resumable_same_day_intraday_watch_post_signal_restart(
+                pipeline_run
+            )
+        )
+        recoverable_same_day_expiration = (
+            is_recoverable_same_day_intraday_watch_expiration(
+                pipeline_run,
+                current_market_date=current_krx_calendar_date,
+            )
+        )
         needs_prior_signal_rearm_evidence = bool(
-            summary_cutoff_proof is None
-            and _is_retired_decider_cutoff_zero_work_run(pipeline_run)
+            (
+                summary_cutoff_proof is None
+                or transparent_rearm_restart
+                or post_signal_rearm_restart
+            )
+            and (
+                _is_retired_decider_cutoff_zero_work_run(pipeline_run)
+                or recoverable_same_day_expiration
+                or transparent_rearm_restart
+                or post_signal_rearm_restart
+            )
         )
         resolved_stage_ids = {
             str(stage_id).strip()
@@ -3611,7 +4065,10 @@ class PykrxBackfillService:
                 if isinstance(stage, Mapping)
                 else {}
             )
-            if not outcome_is_satisfied(stage_outcome):
+            if (
+                recoverable_same_day_expiration
+                or not outcome_is_satisfied(stage_outcome)
+            ):
                 incomplete_stages.append(stage_id)
         stale_feedback_ordering = (
             _feedback_suffix_has_stale_prerequisite_ordering(
@@ -3696,17 +4153,38 @@ class PykrxBackfillService:
 
             eod_convergence: dict[str, Any] | None = None
             if is_followup_recovery_parent:
+                converged_status = str(
+                    pipeline_convergence.get('status') or pipeline_status
+                ).strip().lower()
+                convergence_result: dict[str, Any] = {
+                    # Persisted terminal stage rows remain sufficient for the
+                    # legacy non-rearm convergence path.  A pending rearm
+                    # marker alone requires the full exact PITR proof below.
+                    'status': 'completed',
+                    'pipeline_run_id': pipeline_run.get('id'),
+                    'pipeline_status': pipeline_status,
+                }
+                if pending_same_day_rearm is not None:
+                    convergence_result.update(
+                        {
+                            'status': converged_status,
+                            'pipeline_run': {
+                                **dict(pipeline_run),
+                                'status': converged_status,
+                                'current_stage': list(
+                                    run_metadata.get('resolved_stages') or []
+                                )[-1],
+                            },
+                            'market_date': pipeline_run.get('market_date'),
+                            'resolved_stages': list(
+                                run_metadata.get('resolved_stages') or []
+                            ),
+                            'stages': stage_rows,
+                        }
+                    )
                 eod_convergence = self._persist_successful_followup_recovery(
                     latest_eod_run=latest_eod_run,
-                    recovery_result={
-                        # Every resolved recovery stage is terminally
-                        # completed/skipped. That persisted stage evidence is
-                        # stronger than a parent left interrupted between its
-                        # last finish_stage and finish_run commits.
-                        'status': 'completed',
-                        'pipeline_run_id': pipeline_run.get('id'),
-                        'pipeline_status': pipeline_status,
-                    },
+                    recovery_result=convergence_result,
                 )
             elif downstream_retry_symbols:
                 # A primary parent is not terminal proof while an implicit
@@ -3832,8 +4310,16 @@ class PykrxBackfillService:
 
         if (
             needs_prior_signal_rearm_evidence
-            and recovery_attempts
-            == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+            and (
+                recovery_attempts
+                == MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                or (
+                    pending_same_day_rearm is not None
+                    and MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                    < recovery_attempts
+                    <= SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                )
+            )
         ):
             try:
                 prior_pipeline_runs = (
@@ -3870,6 +4356,10 @@ class PykrxBackfillService:
                 _select_prior_signal_rearm_evidence(
                     current_pipeline_run=pipeline_run,
                     prior_pipeline_runs=prior_pipeline_runs,
+                    current_market_date=current_krx_calendar_date,
+                    allow_transparent_current=(
+                        pending_same_day_rearm is not None
+                    ),
                 )
             )
             if prior_signal_rearm_evidence is not None:
@@ -3877,6 +4367,16 @@ class PykrxBackfillService:
                     prior_signal_rearm_evidence
                 )
                 prior_signal_rearm_evidence_used = True
+
+        same_day_post_signal_continuation_in_place = bool(
+            post_signal_rearm_restart
+            and prior_signal_rearm_evidence_used
+            and pending_same_day_rearm is not None
+            and int(feedback_rearm_evidence_run.get('id') or 0)
+            == int(pending_same_day_rearm['proof_pipeline_run_id'])
+            and recovery_attempts
+            <= SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+        )
 
         cutoff_contract_repair_eligible = (
             not prior_signal_rearm_evidence_used
@@ -3931,6 +4431,34 @@ class PykrxBackfillService:
         ) = _feedback_dispatch_circuit_evidence(
             feedback_rearm_evidence_run
         )
+        if (
+            prior_signal_rearm_evidence_used
+            and (
+                recoverable_same_day_expiration
+                or pending_same_day_rearm is not None
+            )
+            and not is_canonical_same_day_signal_rearm_proof(
+                feedback_rearm_evidence_run
+            )
+        ):
+            rearm_block = self._block_same_day_intraday_watch_rearm(
+                latest_eod_run=latest_eod_run,
+                reason='signal_rearm_proof_not_canonical',
+            )
+            result = build_daily_skip_result(
+                reason='followup_rearm_proof_not_canonical',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'attempts': recovery_attempts,
+                'retry_scheduled': False,
+                'blocker': 'signal_rearm_proof_not_canonical',
+                'resume_from_stage': incomplete_stages[0],
+                'same_day_intraday_watch_rearm': rearm_block,
+            }
+            return result
         feedback_retry_stage_id = _feedback_retry_stage_id(
             feedback_rearm_evidence_run
         )
@@ -3941,6 +4469,10 @@ class PykrxBackfillService:
             marker_retryable = bool(
                 isinstance(feedback_circuit_marker, Mapping)
                 and feedback_circuit_marker.get('retryable') is True
+            )
+            rearm_block = self._block_same_day_intraday_watch_rearm(
+                latest_eod_run=latest_eod_run,
+                reason='invalid_or_non_retryable_dispatch_circuit',
             )
             result = build_daily_skip_result(
                 reason='followup_feedback_dispatch_circuit_blocked',
@@ -3958,6 +4490,7 @@ class PykrxBackfillService:
                     else 'non_retryable_dispatch_circuit_breaker'
                 ),
                 'resume_from_stage': incomplete_stages[0],
+                'same_day_intraday_watch_rearm': rearm_block,
             }
             return result
         feedback_provider_backoff = _feedback_dispatch_rate_limit_backoff(
@@ -4057,6 +4590,10 @@ class PykrxBackfillService:
             )
             and not retryable_feedback_rearm_candidate
         ):
+            rearm_block = self._block_same_day_intraday_watch_rearm(
+                latest_eod_run=latest_eod_run,
+                reason='exact_parent_feedback_contract_unavailable',
+            )
             result = build_daily_skip_result(
                 reason='followup_feedback_rearm_contract_unavailable',
                 market_date=market_date,
@@ -4069,6 +4606,7 @@ class PykrxBackfillService:
                 'retry_scheduled': False,
                 'blocker': 'exact_parent_feedback_contract_unavailable',
                 'resume_from_stage': incomplete_stages[0],
+                'same_day_intraday_watch_rearm': rearm_block,
             }
             return result
         provider_outage_retry_after_seconds: int | None = None
@@ -4105,7 +4643,16 @@ class PykrxBackfillService:
             and not cutoff_contract_repair_resume
             and not provider_outage_rearm_due
             and not retryable_feedback_rearm_candidate
+            and not same_day_post_signal_continuation_in_place
         ):
+            rearm_block = (
+                {'updated': False, 'reason': 'provider_backoff_pending'}
+                if provider_outage_rearm_candidate
+                else self._block_same_day_intraday_watch_rearm(
+                    latest_eod_run=latest_eod_run,
+                    reason='followup_recovery_limit_reached',
+                )
+            )
             result = build_daily_skip_result(
                 reason=(
                     'followup_recovery_provider_backoff'
@@ -4127,6 +4674,7 @@ class PykrxBackfillService:
                     )
                 ),
                 'resume_from_stage': incomplete_stages[0],
+                'same_day_intraday_watch_rearm': rearm_block,
             }
             if provider_outage_rearm_candidate:
                 result['followup_recovery'].update(
@@ -4188,6 +4736,7 @@ class PykrxBackfillService:
             not terminal_continuation_in_place
             and not cutoff_contract_repair
             and not cutoff_contract_repair_resume
+            and not same_day_post_signal_continuation_in_place
             and not point_in_time_recovery
             and not price_retry_symbols
             and (
@@ -4243,6 +4792,7 @@ class PykrxBackfillService:
             not terminal_continuation_in_place
             and not cutoff_contract_repair
             and not cutoff_contract_repair_resume
+            and not same_day_post_signal_continuation_in_place
             and point_in_time_recovery
             and not point_in_time_membership_symbols
         ):
@@ -4288,6 +4838,19 @@ class PykrxBackfillService:
         if terminal_continuation_in_place:
             resume_from_stage = TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
             recovery_stages = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+            persisted_markets = run_metadata.get('markets')
+            recovery_markets = tuple(
+                str(market or '').strip().upper()
+                for market in persisted_markets
+                if str(market or '').strip()
+            )
+        elif same_day_post_signal_continuation_in_place:
+            resume_from_stage = (
+                AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[0]
+            )
+            recovery_stages = list(
+                AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+            )
             persisted_markets = run_metadata.get('markets')
             recovery_markets = tuple(
                 str(market or '').strip().upper()
@@ -4373,12 +4936,24 @@ class PykrxBackfillService:
             recovery_kwargs['existing_pipeline_run_id'] = int(
                 pipeline_run['id']
             )
+        if same_day_post_signal_continuation_in_place:
+            recovery_kwargs.update(
+                {
+                    'existing_pipeline_run_id': int(pipeline_run['id']),
+                    'same_day_intraday_watch_rearm_resume': True,
+                    'fs_div': str(summary_cutoff_proof['fs_div']),
+                }
+            )
         persisted_point_in_time_recovery = bool(
             run_metadata.get('point_in_time_recovery')
         )
         if point_in_time_recovery or (
-            terminal_continuation_in_place
-            and persisted_point_in_time_recovery
+            persisted_point_in_time_recovery
+            and (
+                terminal_continuation_in_place
+                or recoverable_same_day_expiration
+                or pending_same_day_rearm is not None
+            )
         ):
             recovery_kwargs['point_in_time_recovery'] = True
         # A later follow-up can fail independently of the immediate PyKRX
@@ -4393,6 +4968,8 @@ class PykrxBackfillService:
             recovery_symbols = _dedupe_symbol_codes(
                 run_metadata.get('symbols') or []
             )
+        elif same_day_post_signal_continuation_in_place:
+            recovery_symbols = []
         elif retryable_feedback_rearm_candidate:
             recovery_symbols = (
                 []
@@ -4436,9 +5013,128 @@ class PykrxBackfillService:
             recovery_symbols = downstream_retry_symbols
         if recovery_symbols:
             recovery_kwargs['symbols'] = recovery_symbols
-        recovery_result = dict(daily_pipeline_stage_service.run(**recovery_kwargs))
+        if (
+            recoverable_same_day_expiration
+            and prior_signal_rearm_evidence_used
+            and retryable_feedback_rearm_candidate
+        ):
+            try:
+                rearm_marker_result = (
+                    self._persist_same_day_intraday_watch_rearm_pending(
+                        latest_eod_run=latest_eod_run,
+                        source_false_skip_run_id=int(pipeline_run['id']),
+                        proof_pipeline_run_id=int(
+                            feedback_rearm_evidence_run['id']
+                        ),
+                        target_trade_date=current_krx_calendar_date,
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.exception(
+                    'Unable to persist same-day intraday-watch rearm for %s',
+                    market_date,
+                )
+                rearm_marker_result = {
+                    'updated': False,
+                    'reason': type(exc).__name__,
+                }
+            if rearm_marker_result.get('reason') not in {
+                'rearm_marker_persisted',
+                'rearm_marker_already_pending',
+            }:
+                result = build_daily_skip_result(
+                    reason='followup_rearm_marker_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'state_unavailable',
+                    'marker_reason': rearm_marker_result.get('reason'),
+                    'resume_from_stage': incomplete_stages[0],
+                }
+                return result
+        terminal_rearm_expiry_block: dict[str, Any] | None = None
+        try:
+            recovery_result = dict(
+                daily_pipeline_stage_service.run(**recovery_kwargs)
+            )
+        except ValueError as exc:
+            pending_rearm_before_call = (
+                pending_same_day_intraday_watch_rearm_marker(
+                    (
+                        latest_eod_run.get('run_metadata') or {}
+                    ).get(SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY),
+                    target_trade_date=current_krx_calendar_date,
+                )
+                if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+                else None
+            )
+            if not (
+                same_day_post_signal_continuation_in_place
+                and pending_rearm_before_call is not None
+                and str(exc)
+                == (
+                    'same-day intraday-watch rearm resume is outside its '
+                    'target PREOPEN/OPEN session'
+                )
+            ):
+                raise
+            terminal_rearm_expiry_block = (
+                self._block_same_day_intraday_watch_rearm(
+                    latest_eod_run=latest_eod_run,
+                    reason='next_open_window_expired',
+                )
+            )
+            recovery_result = build_daily_skip_result(
+                reason='next_open_window_expired',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            recovery_result.update(
+                {
+                    'status': 'skipped',
+                    'pipeline_run_id': pipeline_run.get('id'),
+                }
+            )
+        pending_rearm_after_recovery = (
+            pending_same_day_intraday_watch_rearm_marker(
+                (
+                    latest_eod_run.get('run_metadata') or {}
+                ).get(SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY),
+                target_trade_date=current_krx_calendar_date,
+            )
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else None
+        )
+        if (
+            terminal_rearm_expiry_block is None
+            and pending_rearm_after_recovery is not None
+            and outcome_contains_reason(
+                recovery_result,
+                reason='next_open_window_expired',
+            )
+        ):
+            terminal_rearm_expiry_block = (
+                self._block_same_day_intraday_watch_rearm(
+                    latest_eod_run=latest_eod_run,
+                    reason='next_open_window_expired',
+                )
+            )
         pipeline_run_id = recovery_result.get('pipeline_run_id')
         if (
+            terminal_rearm_expiry_block is not None
+        ):
+            pipeline_convergence = {
+                'updated': False,
+                'pipeline_run_id': pipeline_run_id,
+                'status': recovery_result.get('status'),
+                'reason': 'same_day_intraday_watch_rearm_terminal_expiry',
+            }
+        elif (
             pipeline_run_id is not None
             and daily_pipeline_outcome_is_satisfied(recovery_result)
         ):
@@ -4461,7 +5157,17 @@ class PykrxBackfillService:
             or pipeline_convergence.get('reason')
             == 'already_non_resumable'
         )
-        if pipeline_parent_finalized:
+        if terminal_rearm_expiry_block is not None:
+            convergence = {
+                'updated': bool(
+                    terminal_rearm_expiry_block.get('updated')
+                ),
+                'reason': 'same_day_intraday_watch_rearm_terminal_expiry',
+                'same_day_intraday_watch_rearm': (
+                    terminal_rearm_expiry_block
+                ),
+            }
+        elif pipeline_parent_finalized:
             convergence = self._persist_successful_followup_recovery(
                 latest_eod_run=latest_eod_run,
                 recovery_result=recovery_result,
@@ -4489,6 +5195,7 @@ class PykrxBackfillService:
                 recovery_attempts
                 if terminal_continuation_in_place
                 or cutoff_contract_repair_resume
+                or same_day_post_signal_continuation_in_place
                 else recovery_attempts + 1
             ),
             'max_attempts': (
@@ -4498,23 +5205,27 @@ class PykrxBackfillService:
                     + (1 if repair_checkpoint is not None else 0),
                 )
                 if terminal_continuation_in_place
-                else max(
-                    MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
-                    + (
-                        MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
-                        if retryable_feedback_rearm_candidate
-                        else (
-                            1
-                            if repair_checkpoint is not None
-                            or cutoff_contract_repair
-                            or cutoff_contract_repair_resume
-                            else 0
-                        )
-                    ),
-                    recovery_attempts + 1
-                    if provider_outage_rearm_due
-                    or retryable_feedback_rearm_candidate
-                    else 0,
+                else (
+                    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                    if same_day_post_signal_continuation_in_place
+                    else max(
+                        MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
+                        + (
+                            MAX_AUTO_FEEDBACK_REARM_RUNS_PER_TRADE_DATE
+                            if retryable_feedback_rearm_candidate
+                            else (
+                                1
+                                if repair_checkpoint is not None
+                                or cutoff_contract_repair
+                                or cutoff_contract_repair_resume
+                                else 0
+                            )
+                        ),
+                        recovery_attempts + 1
+                        if provider_outage_rearm_due
+                        or retryable_feedback_rearm_candidate
+                        else 0,
+                    )
                 )
             ),
             'resumed_from_pipeline_run_id': pipeline_run.get('id'),
@@ -4555,6 +5266,17 @@ class PykrxBackfillService:
             recovery_result['followup_recovery'][
                 'terminal_continuation_in_place'
             ] = True
+        if same_day_post_signal_continuation_in_place:
+            recovery_result['followup_recovery'][
+                'same_day_intraday_watch_rearm_resumed_in_place'
+            ] = True
+        if terminal_rearm_expiry_block is not None:
+            recovery_result['followup_recovery'][
+                'same_day_intraday_watch_rearm'
+            ] = terminal_rearm_expiry_block
+            recovery_result['followup_recovery'][
+                'same_day_intraday_watch_rearm_terminal_expiry'
+            ] = True
         if cutoff_contract_repair:
             recovery_result['followup_recovery'][
                 'cutoff_contract_repair'
@@ -4569,20 +5291,188 @@ class PykrxBackfillService:
             ] = repair_checkpoint.get('pipeline_run_id')
         return recovery_result
 
+    @staticmethod
+    def _persist_same_day_intraday_watch_rearm_pending(
+        *,
+        latest_eod_run: dict[str, Any],
+        source_false_skip_run_id: int,
+        proof_pipeline_run_id: int,
+        target_trade_date: date,
+    ) -> dict[str, Any]:
+        """Durably preserve the bounded retry authority rescued from a false skip."""
+
+        run_id = int(latest_eod_run['id'])
+        source_run_id = int(source_false_skip_run_id)
+        proof_run_id = int(proof_pipeline_run_id)
+        if min(run_id, source_run_id, proof_run_id) <= 0:
+            return {'updated': False, 'reason': 'invalid_rearm_lineage'}
+
+        metadata = (
+            dict(latest_eod_run.get('run_metadata') or {})
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        expected_identity = {
+            'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+            'source_false_skip_run_id': source_run_id,
+            'proof_pipeline_run_id': proof_run_id,
+            'target_trade_date': target_trade_date.isoformat(),
+            'attempt_limit': SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+        }
+        existing_marker = metadata.get(
+            SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+        )
+        if existing_marker is not None:
+            if not (
+                isinstance(existing_marker, Mapping)
+                and str(existing_marker.get('status') or '').strip()
+                == 'pending'
+                and all(
+                    existing_marker.get(key) == value
+                    for key, value in expected_identity.items()
+                )
+                and _parse_activity_datetime(existing_marker.get('started_at'))
+                is not None
+            ):
+                return {'updated': False, 'reason': 'rearm_marker_conflict'}
+            marker = dict(existing_marker)
+        else:
+            marker = {
+                **expected_identity,
+                'status': 'pending',
+                'started_at': _utcnow_iso(),
+            }
+
+        metadata.update(
+            {
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: marker,
+                'followup_recovery_required': True,
+            }
+        )
+        update_eod_collection_run_progress(
+            run_id,
+            symbols_succeeded=max(
+                int(latest_eod_run.get('symbols_succeeded') or 0),
+                0,
+            ),
+            symbols_failed=max(
+                int(latest_eod_run.get('symbols_failed') or 0),
+                0,
+            ),
+            run_metadata=metadata,
+        )
+        latest_eod_run['run_metadata'] = metadata
+        return {
+            'updated': existing_marker is None,
+            'reason': (
+                'rearm_marker_persisted'
+                if existing_marker is None
+                else 'rearm_marker_already_pending'
+            ),
+            'marker': marker,
+        }
+
+    @staticmethod
+    def _block_same_day_intraday_watch_rearm(
+        *,
+        latest_eod_run: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Close only the incident-specific rearm lane after a terminal block."""
+
+        metadata = (
+            dict(latest_eod_run.get('run_metadata') or {})
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        marker = metadata.get(SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY)
+        if not (
+            isinstance(marker, Mapping)
+            and marker.get('version')
+            == SAME_DAY_INTRADAY_WATCH_REARM_VERSION
+            and str(marker.get('status') or '').strip() == 'pending'
+        ):
+            return {'updated': False, 'reason': 'rearm_marker_not_pending'}
+
+        blocked_marker = {
+            **dict(marker),
+            'status': 'blocked',
+            'blocked_reason': str(reason or '').strip() or 'unknown',
+            'blocked_at': _utcnow_iso(),
+        }
+        metadata.update(
+            {
+                SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: blocked_marker,
+                'followup_recovery_required': False,
+            }
+        )
+        try:
+            update_eod_collection_run_progress(
+                int(latest_eod_run['id']),
+                symbols_succeeded=max(
+                    int(latest_eod_run.get('symbols_succeeded') or 0),
+                    0,
+                ),
+                symbols_failed=max(
+                    int(latest_eod_run.get('symbols_failed') or 0),
+                    0,
+                ),
+                run_metadata=metadata,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception(
+                'Unable to persist terminal same-day rearm block for EOD %s',
+                latest_eod_run.get('id'),
+            )
+            return {
+                'updated': False,
+                'reason': 'rearm_marker_persist_failed',
+                'error_type': type(exc).__name__,
+            }
+        latest_eod_run['run_metadata'] = metadata
+        return {
+            'updated': True,
+            'reason': 'rearm_marker_blocked',
+            'marker': blocked_marker,
+        }
+
     def _persist_successful_followup_recovery(
         self,
         *,
         latest_eod_run: Mapping[str, Any],
         recovery_result: Mapping[str, Any],
     ) -> dict[str, Any]:
-        if not daily_pipeline_outcome_is_satisfied(recovery_result):
-            return {'updated': False, 'reason': 'recovery_not_completed'}
-
         metadata = (
             dict(latest_eod_run.get('run_metadata') or {})
             if isinstance(latest_eod_run.get('run_metadata'), dict)
             else {}
         )
+        raw_rearm_marker = metadata.get(
+            SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+        )
+        marker_claims_pending = bool(
+            isinstance(raw_rearm_marker, Mapping)
+            and str(raw_rearm_marker.get('status') or '').strip() == 'pending'
+        )
+        rearm_marker = pending_same_day_intraday_watch_rearm_marker(
+            raw_rearm_marker
+        )
+        if marker_claims_pending and rearm_marker is None:
+            return {'updated': False, 'reason': 'rearm_marker_invalid'}
+        if rearm_marker is not None and not (
+            type(latest_eod_run.get('id')) is int
+            and is_completed_auto_pitr_intraday_watch_recovery(
+                recovery_result,
+                expected_eod_collection_run_id=int(latest_eod_run['id']),
+            )
+        ):
+            return {
+                'updated': False,
+                'reason': 'same_day_intraday_watch_rearm_not_completed',
+            }
+        if not daily_pipeline_outcome_is_satisfied(recovery_result):
+            return {'updated': False, 'reason': 'recovery_not_completed'}
+
         downstream_retry_symbols = _dedupe_symbol_codes(
             metadata.get('downstream_retry_symbols') or []
         )
@@ -4601,6 +5491,15 @@ class PykrxBackfillService:
             'inherited_downstream_retry_resume_from_stage',
             None,
         )
+        if rearm_marker is not None:
+            metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY] = {
+                **rearm_marker,
+                'status': 'completed',
+                'completed_at': completed_at,
+                'completion_pipeline_run_id': recovery_result.get(
+                    'pipeline_run_id'
+                ),
+            }
         metadata.update(
             {
                 'downstream_retry_symbols': [],
