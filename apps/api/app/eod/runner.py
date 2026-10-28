@@ -14,7 +14,10 @@ from app.agent_context.wait_recheck_service import (
     signal_decider_wait_recheck_service,
 )
 from app.core.settings import settings
-from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
+from app.eod.auto_pykrx import (
+    RecoveryOnlyScheduleDisposition,
+    auto_pykrx_eod_scheduler,
+)
 from app.eod.master import refresh_master_if_due
 from app.market.clock import async_get_market_state
 from app.market.snapshot import market_snapshot_service
@@ -472,7 +475,8 @@ class EODBackgroundRunner:
         awaitable,
         *,
         fail_closed: bool = False,
-    ) -> bool:
+        return_task_result: bool = False,
+    ) -> object:
         running_task = self._async_step_tasks.get(name)
         if running_task is not None and not running_task.done():
             with suppress(Exception):
@@ -515,7 +519,7 @@ class EODBackgroundRunner:
             if fail_closed:
                 raise RuntimeError(f'async step timed out: {name}')
             return False
-        return True
+        return task.result() if return_task_result else True
 
     def _finalize_async_step(self, name: str, task: asyncio.Task) -> None:
         if self._async_step_tasks.get(name) is task:
@@ -634,8 +638,17 @@ class EODBackgroundRunner:
                     continue
                 runtime_background_enabled = settings.background_runner_enabled
                 market_snapshot_refreshed = False
-                if market.state in {'PREOPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}:
-                    if runtime_background_enabled:
+                if market.state in {
+                    'PREOPEN',
+                    'OPEN',
+                    'CLOSED',
+                    'WEEKEND',
+                    'HOLIDAY',
+                }:
+                    if (
+                        runtime_background_enabled
+                        and market.state != 'OPEN'
+                    ):
                         await self._run_async_step(
                             'market_snapshot_refresh_if_due',
                             market_snapshot_service.refresh_market_snapshot_if_due(
@@ -648,22 +661,47 @@ class EODBackgroundRunner:
                             fail_closed=True,
                         )
                         market_snapshot_refreshed = True
-                    await self._run_async_step(
-                        'auto_pykrx_schedule_daily_pipeline_if_due',
-                        auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(
+                    scheduler_awaitable = (
+                        auto_pykrx_eod_scheduler.schedule_recovery_if_due(
+                            expected_market_state='OPEN'
+                        )
+                        if market.state == 'OPEN'
+                        else auto_pykrx_eod_scheduler.schedule_daily_pipeline_if_due(
                             **(
                                 {'expected_market_state': 'PREOPEN'}
                                 if market.state == 'PREOPEN'
                                 else {}
                             )
-                        ),
-                        fail_closed=True,
+                        )
                     )
+                    scheduler_disposition = await self._run_async_step(
+                        'auto_pykrx_schedule_daily_pipeline_if_due',
+                        scheduler_awaitable,
+                        fail_closed=True,
+                        return_task_result=market.state == 'OPEN',
+                    )
+                    if (
+                        market.state == 'OPEN'
+                        and scheduler_disposition
+                        != RecoveryOnlyScheduleDisposition.NO_DEBT
+                    ):
+                        await self._wait_for_wake_or_timeout(
+                            self.interval_seconds
+                        )
+                        continue
                     if auto_pykrx_eod_scheduler.state.active_task:
                         await self._wait_for_wake_or_timeout(
                             self.interval_seconds
                         )
                         continue
+                    if market.state == 'OPEN':
+                        refreshed_market = await async_get_market_state()
+                        if refreshed_market.state != 'OPEN':
+                            await self._wait_for_wake_or_timeout(
+                                self.interval_seconds
+                            )
+                            continue
+                        market = refreshed_market
                 if runtime_background_enabled and market.state == 'OPEN':
                     await self._run_buy_authority_critical_step(
                         name='refresh_master_if_due',
