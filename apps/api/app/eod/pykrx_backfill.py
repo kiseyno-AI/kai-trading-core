@@ -4431,6 +4431,12 @@ class PykrxBackfillService:
         resume_from_stage = incomplete_stages[0]
         resume_index = recovery_scope.index(resume_from_stage)
         recovery_stages = recovery_scope[resume_index:]
+        proven_partial_summary_downstream_continuation = bool(
+            partial_summary_prefix_proven
+            and resume_from_stage == 'signal_decider'
+            and 'agent_feedback_summaries' not in recovery_stages
+            and isinstance(summary_cutoff_proof, Mapping)
+        )
         recovery_reaches_followup_stage = any(
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in recovery_stages
@@ -5093,7 +5099,10 @@ class PykrxBackfillService:
                 provider_admission_fence_owned
             ),
         }
-        if retryable_feedback_rearm_candidate:
+        if (
+            retryable_feedback_rearm_candidate
+            and not proven_partial_summary_downstream_continuation
+        ):
             recovery_kwargs['feedback_max_cycles'] = (
                 retryable_feedback_max_cycles
             )
@@ -5174,6 +5183,14 @@ class PykrxBackfillService:
                 run_metadata.get('symbols') or []
             )
         elif same_day_post_signal_continuation_in_place:
+            recovery_symbols = []
+        elif proven_partial_summary_downstream_continuation:
+            # The durable summary proof already pins the exact all-role
+            # success intersection.  Keep failed summarizer symbols as retry
+            # debt, but let the successful cohort enter the decider suffix.
+            # Passing the failed-symbol retry config or symbol list here
+            # would either violate the suffix contract or replace the proven
+            # success scope with the failed scope.
             recovery_symbols = []
         elif retryable_feedback_rearm_candidate:
             recovery_symbols = (

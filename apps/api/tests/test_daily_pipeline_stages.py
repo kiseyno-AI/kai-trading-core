@@ -4076,6 +4076,43 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         )
 
+    def test_decider_only_suffix_rejects_summary_retry_config(self) -> None:
+        service = DailyPipelineStageService()
+        cutoff = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'inherited feedback retry config requires the exact automatic '
+            'feedback suffix',
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                resume_from_stage='signal_decider',
+                trigger='auto_eod_followup_resume',
+                point_in_time_recovery=True,
+                reuse_existing_feedback=True,
+                reused_eod_collection_run_id=7,
+                inherited_feedback_retry_config={
+                    'source_run_id': 'feedback-cycle-parent',
+                    'knowledge_cutoff_at': cutoff,
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                },
+            )
+
     def test_signal_decider_does_not_reuse_summary_parent_lineage(
         self,
     ) -> None:

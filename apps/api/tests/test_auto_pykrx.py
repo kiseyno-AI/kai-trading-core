@@ -1237,6 +1237,184 @@ class PykrxBackfillServiceTests(TestCase):
             )
         )
 
+    def test_partial_summary_success_scope_continues_without_failed_retry_scope(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        completed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        completed_scope_proof = {
+            'schema_version': 'completed_summarizer_intersection_v1',
+            'completed_symbols': ['000660'],
+            'admitted_symbols': ['000660', '005930'],
+        }
+        terminal_scope_proof = {
+            'schema_version': 'terminal_role_success_intersection_v1',
+            'failed_symbols_by_role': {
+                'eod-summarizer': [],
+                'technical-summarizer': ['005930'],
+                'fundamental-summarizer': [],
+            },
+            'total_items': 6,
+            'completed_items': 5,
+            'failed_items': 1,
+        }
+        summary_proof = {
+            'source_run_id': 'feedback-cycle-summary',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': None,
+            'expected_completed_symbols': ['000660'],
+            'knowledge_cutoff_at': '2026-04-03T08:00:00+00:00',
+            'fs_div': 'CFS',
+            'completed_scope_proof': completed_scope_proof,
+            'terminal_role_scope_proof': terminal_scope_proof,
+        }
+        pipeline_run = {
+            'id': 595,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': completed_at.isoformat(),
+            'completed_at': completed_at.isoformat(),
+            'run_metadata': {
+                'resolved_stages': [
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'resume_from_stage': 'agent_feedback_summaries',
+                'reused_eod_collection_run_id': 582,
+                'fs_div': 'CFS',
+                'markets': ['KOSPI', 'KOSDAQ'],
+            },
+            'stages': {
+                'agent_feedback_summaries': {
+                    'status': 'partial',
+                    'source_run_ids': {
+                        'agent_feedback_run_id': (
+                            'feedback-cycle-summary'
+                        ),
+                    },
+                },
+                'signal_decider': {'status': 'blocked'},
+                'next_open_execution_plan': {'status': 'blocked'},
+                'signal_decider_evaluations': {'status': 'blocked'},
+            },
+        }
+        retry_config = {
+            'source_run_id': 'feedback-cycle-summary',
+            'knowledge_cutoff_at': '2026-04-03T08:00:00+00:00',
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': ['005930'],
+            'outer_batch_size': 20,
+            'fs_div': 'CFS',
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=6,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._select_summary_cutoff_proof',
+                return_value=summary_proof,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_is_retryable_feedback_rearm_candidate',
+                return_value=True,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._feedback_retry_stage_id',
+                return_value='agent_feedback_summaries',
+            ),
+            patch(
+                'app.eod.pykrx_backfill._retryable_feedback_rearm_config',
+                return_value=retry_config,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_retryable_feedback_rearm_max_cycles',
+                return_value=3,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch.object(
+                service,
+                '_resolve_point_in_time_followup_membership',
+                return_value=(
+                    {'000660', '005930'},
+                    ('KOSPI', 'KOSDAQ'),
+                ),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'blocked',
+                    'pipeline_run_id': 596,
+                },
+            ) as resume_followups,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 582,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                    'run_metadata': {},
+                },
+                markets=('KOSPI', 'KOSDAQ'),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        recovery_kwargs = resume_followups.call_args.kwargs
+        self.assertEqual(
+            recovery_kwargs['stages'],
+            [
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            ],
+        )
+        self.assertEqual(
+            recovery_kwargs['resume_from_stage'],
+            'signal_decider',
+        )
+        self.assertEqual(
+            recovery_kwargs['summary_cutoff_proof'],
+            summary_proof,
+        )
+        self.assertIs(recovery_kwargs['point_in_time_recovery'], True)
+        self.assertNotIn('symbols', recovery_kwargs)
+        self.assertNotIn(
+            'inherited_feedback_retry_config',
+            recovery_kwargs,
+        )
+        self.assertNotIn(
+            'inherited_feedback_source_run_id',
+            recovery_kwargs,
+        )
+        self.assertNotIn(
+            'inherit_feedback_prerequisite_admission',
+            recovery_kwargs,
+        )
+        self.assertNotIn('feedback_max_cycles', recovery_kwargs)
+
     def test_market_turnover_enrichment_rejects_invalid_turnover_but_preserves_zero_volume_bar(self) -> None:
         frames = {
             '20260402': pd.DataFrame({'거래대금': [0]}, index=['005930']),
