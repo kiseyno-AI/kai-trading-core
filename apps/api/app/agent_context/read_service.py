@@ -1740,7 +1740,7 @@ def _resolve_valuation_trading_value_candidate(
     if raw_trading_value_krw < 0:
         return {
             'trade_date': provenance.get('as_of_market_date') or provenance.get('latest_available_market_date'),
-            'source': 'pykrx',
+            'source': provenance.get('source_provider') or 'pykrx',
             'captured_at': provenance.get('latest_available_timestamp'),
             'close_price': _to_int(payload.get('close_price')),
             'volume': _to_int(payload.get('volume')),
@@ -1761,7 +1761,7 @@ def _resolve_valuation_trading_value_candidate(
         }
     return {
         'trade_date': provenance.get('as_of_market_date') or provenance.get('latest_available_market_date'),
-        'source': 'pykrx',
+        'source': provenance.get('source_provider') or 'pykrx',
         'captured_at': provenance.get('latest_available_timestamp'),
         'close_price': _to_int(payload.get('close_price')),
         'volume': _to_int(payload.get('volume')),
@@ -1800,11 +1800,65 @@ def _build_turnover_context(
             'provenance': _compact_provenance_summary(freshness_provenance),
         }
 
+    price_candidate = _resolve_turnover_candidate(price_context)
     valuation_candidate = _resolve_valuation_trading_value_candidate(
         valuation_context,
         valuation_context_freshness_provenance,
     )
-    current_candidate = valuation_candidate or _resolve_turnover_candidate(price_context)
+    price_candidate_is_current = bool(
+        price_candidate
+        and _trade_date_relation_to_request(
+            as_of_market_date=price_candidate.get('trade_date'),
+            requested_market_date=requested_market_date,
+        )
+        == 'same_market_date'
+        and freshness_provenance.get('freshness_status') == FRESHNESS_STATUS_FRESH
+    )
+    price_candidate_is_authoritative_raw = bool(
+        price_candidate_is_current
+        and price_candidate.get('status') == LIQUIDITY_TURNOVER_STATUS_AVAILABLE
+        and price_candidate.get('trading_value_source') == TRADING_VALUE_SOURCE_RAW
+    )
+    valuation_candidate_is_current_raw = bool(
+        valuation_candidate
+        and valuation_candidate.get('status') == LIQUIDITY_TURNOVER_STATUS_AVAILABLE
+        and valuation_candidate.get('trading_value_source') == TRADING_VALUE_SOURCE_RAW
+        and _maybe_dict(valuation_candidate.get('provenance')).get('freshness_status')
+        == FRESHNESS_STATUS_FRESH
+        and _trade_date_relation_to_request(
+            as_of_market_date=valuation_candidate.get('trade_date'),
+            requested_market_date=requested_market_date,
+        )
+        == 'same_market_date'
+    )
+    current_candidate = price_candidate if price_candidate_is_current else None
+    if (
+        price_candidate_is_current
+        and not price_candidate_is_authoritative_raw
+        and price_candidate
+        and price_candidate.get('status') == LIQUIDITY_TURNOVER_STATUS_DERIVED
+        and valuation_candidate_is_current_raw
+        and valuation_candidate
+    ):
+        raw_trading_value_krw = valuation_candidate['raw_trading_value_krw']
+        current_candidate = {
+            **price_candidate,
+            'turnover': raw_trading_value_krw,
+            'turnover_krw': raw_trading_value_krw,
+            'trading_value_krw': raw_trading_value_krw,
+            'provider_turnover_krw': raw_trading_value_krw,
+            'raw_trading_value_krw': raw_trading_value_krw,
+            'turnover_source': 'provider',
+            'trading_value_source': TRADING_VALUE_SOURCE_RAW,
+            'trading_value_source_detail': (
+                'pykrx_valuation_snapshot.trading_value'
+            ),
+            'trading_value_source_provider': valuation_candidate.get('source'),
+            'trading_value_captured_at': valuation_candidate.get('captured_at'),
+            'trading_value_provenance': valuation_candidate.get('provenance'),
+            'status': LIQUIDITY_TURNOVER_STATUS_AVAILABLE,
+            'reason': None,
+        }
     if current_candidate is not None:
         candidate_provenance = (
             current_candidate.get('provenance')
@@ -1830,27 +1884,53 @@ def _build_turnover_context(
             'turnover_source': current_candidate['turnover_source'],
             'trading_value_source': current_candidate['trading_value_source'],
             'trading_value_source_detail': current_candidate['trading_value_source_detail'],
+            'trading_value_source_provider': (
+                current_candidate.get('trading_value_source_provider')
+                or current_candidate['source']
+            ),
+            'trading_value_captured_at': (
+                current_candidate.get('trading_value_captured_at')
+                or current_candidate['captured_at']
+            ),
+            'trading_value_freshness_status': _maybe_dict(
+                current_candidate.get('trading_value_provenance')
+            ).get('freshness_status') or candidate_provenance.get('freshness_status'),
             'provider_turnover_krw': current_candidate['provider_turnover_krw'],
             'derived_turnover_krw': current_candidate['derived_turnover_krw'],
             'raw_trading_value_krw': current_candidate['raw_trading_value_krw'],
             'estimated_trading_value_krw': current_candidate['estimated_trading_value_krw'],
             'price_bar_issue_codes': current_candidate['price_bar_issue_codes'],
             'provenance': _compact_provenance_summary(candidate_provenance),
+            'trading_value_provenance': _compact_provenance_summary(
+                _maybe_dict(current_candidate.get('trading_value_provenance'))
+                or candidate_provenance
+            ),
         }
 
     latest_history_row = price_context_history[-1] if price_context_history else None
-    stale_candidate = _resolve_turnover_candidate(
-        latest_history_row.get('price_context') if isinstance(latest_history_row, dict) else None
+    stale_candidate = (
+        price_candidate
+        if price_candidate is not None and not price_candidate_is_current
+        else _resolve_turnover_candidate(
+            latest_history_row.get('price_context')
+            if isinstance(latest_history_row, dict)
+            else None
+        )
     )
     if stale_candidate is not None:
+        stale_relation = _trade_date_relation_to_request(
+            as_of_market_date=stale_candidate['trade_date'],
+            requested_market_date=requested_market_date,
+        )
         return {
             'status': LIQUIDITY_TURNOVER_STATUS_STALE,
-            'reason': 'latest_price_context_before_requested_market_date',
-            'trade_date': stale_candidate['trade_date'],
-            'trade_date_relation_to_request': _trade_date_relation_to_request(
-                as_of_market_date=stale_candidate['trade_date'],
-                requested_market_date=requested_market_date,
+            'reason': (
+                'price_context_not_fresh_for_requested_market_date'
+                if stale_relation == 'same_market_date'
+                else 'latest_price_context_before_requested_market_date'
             ),
+            'trade_date': stale_candidate['trade_date'],
+            'trade_date_relation_to_request': stale_relation,
             'freshness_status': FRESHNESS_STATUS_STALE,
             'source': stale_candidate['source'],
             'captured_at': stale_candidate['captured_at'],
@@ -1862,6 +1942,9 @@ def _build_turnover_context(
             'turnover_source': stale_candidate['turnover_source'],
             'trading_value_source': stale_candidate['trading_value_source'],
             'trading_value_source_detail': stale_candidate['trading_value_source_detail'],
+            'trading_value_source_provider': stale_candidate['source'],
+            'trading_value_captured_at': stale_candidate['captured_at'],
+            'trading_value_freshness_status': FRESHNESS_STATUS_STALE,
             'provider_turnover_krw': stale_candidate['provider_turnover_krw'],
             'derived_turnover_krw': stale_candidate['derived_turnover_krw'],
             'raw_trading_value_krw': stale_candidate['raw_trading_value_krw'],
@@ -1869,6 +1952,9 @@ def _build_turnover_context(
             'stale_from_status': stale_candidate['status'],
             'price_bar_issue_codes': stale_candidate['price_bar_issue_codes'],
             'provenance': _compact_provenance_summary(freshness_provenance),
+            'trading_value_provenance': _compact_provenance_summary(
+                freshness_provenance
+            ),
         }
 
     return {
@@ -2449,10 +2535,18 @@ def _build_pre_decider_enrichment_context(
             'reason': turnover.get('reason'),
             'trade_date': turnover.get('trade_date'),
             'trade_date_relation_to_request': turnover.get('trade_date_relation_to_request'),
-            'freshness_status': turnover.get('freshness_status'),
-            'source_provider': turnover.get('source'),
-            'captured_at': turnover.get('captured_at'),
-            'freshness': _compact_provenance_summary(_maybe_dict(turnover.get('provenance'))),
+            'freshness_status': turnover.get('trading_value_freshness_status')
+            or turnover.get('freshness_status'),
+            'source_provider': turnover.get('trading_value_source_provider')
+            or turnover.get('source'),
+            'captured_at': turnover.get('trading_value_captured_at')
+            or turnover.get('captured_at'),
+            'canonical_price_source_provider': turnover.get('source'),
+            'canonical_price_captured_at': turnover.get('captured_at'),
+            'freshness': _compact_provenance_summary(
+                _maybe_dict(turnover.get('trading_value_provenance'))
+                or _maybe_dict(turnover.get('provenance'))
+            ),
         },
         'flow_short_sector_context': {
             'status': flow_short_sector_status,
@@ -7293,6 +7387,13 @@ class AgentContextReadService:
                 provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
                 extra={'categories': ['valuation_snapshot', 'foreign_ownership']},
             )
+            valuation_snapshot_provenance = _build_pykrx_block_freshness_provenance(
+                requested_market_date=normalized_market_date,
+                rows=(symbol_enrichment_rows.get('valuation_snapshot'),),
+                source_provider='pykrx',
+                provenance_status=PROVENANCE_STATUS_PROVIDER_SOURCED,
+                extra={'category': 'valuation_snapshot'},
+            )
             quote_context = {
                 **quote_context,
                 'freshness_provenance': quote_context_provenance,
@@ -7392,7 +7493,7 @@ class AgentContextReadService:
                 intraday_execution_context=intraday_execution_context,
                 intraday_execution_freshness_provenance=intraday_execution_provenance,
                 valuation_context=valuation_context,
-                valuation_context_freshness_provenance=valuation_context_provenance,
+                valuation_context_freshness_provenance=valuation_snapshot_provenance,
             )
             pre_decider_enrichment_context = _build_pre_decider_enrichment_context(
                 requested_market_date=normalized_market_date,

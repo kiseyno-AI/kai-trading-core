@@ -1041,6 +1041,22 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('Core recomputes a conservative slippage-adjusted pre-screen return', suffix)
         self.assertIn('Exec applies its final full-cost check in dispatch mode', suffix)
         self.assertIn('independent swing, position, and long-horizon lane', suffix)
+        self.assertIn(
+            'symbol_day_context.price_context as the regular-session price and volume authority',
+            suffix,
+        )
+        self.assertIn(
+            'core_post_response_revalidation describes a Core-owned validation that runs after your response',
+            suffix,
+        )
+        self.assertIn(
+            'Use upstream_summaries, previous_decision_context, and signal_envelopes only for thesis continuity and decision delta',
+            suffix,
+        )
+        self.assertIn(
+            'decision_input_quality_context.final_judgment.hard_blocks independently confirm',
+            suffix,
+        )
         self.assertIn('trigger_price, chase_limit_price', suffix)
         self.assertIn('trigger_conditions', suffix)
         self.assertIn(
@@ -1106,6 +1122,22 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertIn('normally be 2-3 trading days', suffix)
         self.assertIn('not a minimum holding lock', suffix)
         self.assertIn('maximum remains 3 trading sessions', suffix)
+        self.assertIn(
+            'symbol_day_context.price_context as the regular-session price and volume authority',
+            suffix,
+        )
+        self.assertIn(
+            'core_post_response_revalidation describes a Core-owned validation that runs after your response',
+            suffix,
+        )
+        self.assertIn(
+            'Use upstream_summaries, previous_decision_context, and signal_envelopes only for thesis continuity and decision delta',
+            suffix,
+        )
+        self.assertIn(
+            'decision_input_quality_context.final_judgment.hard_blocks independently confirm',
+            suffix,
+        )
 
         output_text = json.dumps(
             _complete_short_term_decider_feedback(

@@ -1355,15 +1355,71 @@ def build_response_storage_payload(
     }
 
 
+def _compact_valuation_context_for_decider(context: dict[str, Any]) -> dict[str, Any]:
+    compacted = dict(context)
+    snapshot = context.get('valuation_snapshot')
+    if not isinstance(snapshot, dict):
+        return compacted
+
+    compacted_snapshot = dict(snapshot)
+    omitted_fields = [
+        field
+        for field in ('close_price', 'volume', 'trading_value')
+        if field in compacted_snapshot
+    ]
+    for field in omitted_fields:
+        compacted_snapshot.pop(field, None)
+    compacted['valuation_snapshot'] = compacted_snapshot
+    if omitted_fields:
+        compacted['market_activity_reference'] = {
+            'authority': 'symbol_day_context.price_context',
+            'omitted_auxiliary_fields': omitted_fields,
+            'reason': (
+                'The valuation endpoint is authoritative for valuation metrics. Its '
+                'repeated price and volume are not execution references, and any '
+                'eligible raw trading value is exposed only through '
+                'liquidity_context.turnover after Core source selection.'
+            ),
+        }
+    return compacted
+
+
+def _compact_sector_peer_context_for_decider(context: dict[str, Any]) -> dict[str, Any]:
+    compacted = dict(context)
+    omitted_fields = [
+        field for field in ('close_price', 'change_pct') if field in compacted
+    ]
+    for field in omitted_fields:
+        compacted.pop(field, None)
+    self_entry = context.get('self')
+    if isinstance(self_entry, dict):
+        compacted_self = dict(self_entry)
+        if 'change_pct' in compacted_self:
+            compacted_self.pop('change_pct', None)
+            omitted_fields.append('self.change_pct')
+        compacted['self'] = compacted_self
+    if omitted_fields:
+        compacted['market_activity_reference'] = {
+            'authority': 'symbol_day_context.price_context',
+            'omitted_auxiliary_fields': omitted_fields,
+            'reason': (
+                'The sector endpoint is authoritative for sector membership and peer '
+                'comparison only. Its self price/change fields are not independent '
+                'execution evidence.'
+            ),
+        }
+    return compacted
+
+
 def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str, Any]:
     """Keep decision-relevant symbol context without shipping bulky raw provenance."""
-    keep_keys = {
+    keep_keys = (
         'symbol',
         'market',
+        'market_date',
         'exchange',
         'currency',
         'calendar_timezone',
-        'market_date',
         'company',
         'market_session',
         'market_data_phase_contract',
@@ -1375,8 +1431,8 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
         'technical_snapshot',
         'action_summary',
         'intraday_execution_context',
-        'intraday_wait_recheck_context',
         'valuation_context',
+        'intraday_wait_recheck_context',
         'investor_flow_context',
         'short_selling_context',
         'sector_peer_context',
@@ -1390,8 +1446,18 @@ def _compact_symbol_day_context_for_decider(context: dict[str, Any]) -> dict[str
         'price_screen',
         'fundamental_screen',
         'screening_decision',
-    }
+    )
     compacted = {key: context.get(key) for key in keep_keys if key in context}
+    valuation_context = compacted.get('valuation_context')
+    if isinstance(valuation_context, dict):
+        compacted['valuation_context'] = _compact_valuation_context_for_decider(
+            valuation_context
+        )
+    sector_peer_context = compacted.get('sector_peer_context')
+    if isinstance(sector_peer_context, dict):
+        compacted['sector_peer_context'] = _compact_sector_peer_context_for_decider(
+            sector_peer_context
+        )
     completeness = context.get('context_completeness')
     if isinstance(completeness, dict):
         compacted['context_completeness'] = {
@@ -1530,12 +1596,536 @@ def _compact_market_regime_context(context: dict[str, Any]) -> dict[str, Any]:
     for key in ('market_breadth', 'sector_context', 'relative_strength_context', 'open_drive_context', 'fx_context', 'freshness'):
         value = context.get(key)
         if isinstance(value, dict):
-            compacted[key] = value
+            compacted_value = dict(value)
+            if key == 'sector_context' and 'self_change_pct' in compacted_value:
+                compacted_value.pop('self_change_pct', None)
+                compacted_value['market_activity_reference'] = {
+                    'authority': 'symbol_day_context.price_context',
+                    'omitted_auxiliary_fields': ['self_change_pct'],
+                    'reason': (
+                        'The market-regime sector context is comparative context. '
+                        'Its repeated self return is not an independent execution '
+                        'reference.'
+                    ),
+                }
+            compacted[key] = compacted_value
     return compacted
+
+
+_CANONICAL_MARKET_ACTIVITY_SOURCE_TOKENS = (
+    'price_context',
+    'technical_snapshot',
+    'price context',
+    'technical close',
+    '가격·기술',
+    '가격/기술',
+    '기술 종가',
+    '기준가격',
+    '가격 컨텍스트',
+    '가격 문맥',
+    '가격 데이터',
+    '가격 필드',
+    '가격봉·기술',
+    '가격봉/기술',
+    '기술·가격',
+    '기술/가격',
+    '일봉·기술',
+    '일봉/기술',
+    '기술 일봉',
+    '기술 스냅샷',
+    '가격 자료',
+    '일봉 종가',
+)
+_AUXILIARY_MARKET_ACTIVITY_SOURCE_TOKENS = (
+    'liquidity_context',
+    'valuation_context',
+    'valuation_snapshot',
+    'sector_peer_context',
+    'liquidity context',
+    'valuation endpoint',
+    'sector endpoint',
+    '유동성',
+    '유동성 컨텍스트',
+    '유동성 문맥',
+    '밸류에이션',
+    '가치평가',
+    '평가 자료',
+    '업종 종가',
+    '업종 문맥',
+    '업종 자료',
+    '섹터 종가',
+    '섹터 문맥',
+)
+_CROSS_SOURCE_CONFLICT_TOKENS = (
+    'mismatch',
+    'conflict',
+    'inconsisten',
+    'discrepan',
+    'diverg',
+    '불일치',
+    '충돌',
+    '상충',
+    '비정합',
+    '달라',
+    '다르',
+    '다릅',
+    'different',
+    'differ',
+    'does not match',
+    'do not match',
+    'not match',
+    '일치하지',
+)
+_CROSS_SOURCE_CONFLICT_PATTERNS = (
+    r'(?<![가-힣A-Za-z0-9_])상이(?:함|하|한|해|했|였|$|\s|[.,])',
+)
+_CORE_REVALIDATION_RUNTIME_PHRASES = (
+    'source revalidation',
+    'source_revalidation',
+    'source-revalidation',
+    'required revalidation',
+    'revalidation pass',
+    'revalidation result',
+    'generation fence',
+    'decision_input_generation_fence',
+    'source generation',
+    '원천 재검증',
+    '필수 재검증',
+    '필수 입력 재검증',
+    '필수 입력 세대 재검증',
+    '입력 생성 펜스의 재검증',
+    '입력 생성 펜스 재검증',
+    '요구된 재검증',
+    'core 재검증',
+    '재검증 완료',
+    '재검증 통과',
+    '재검증 결과',
+    '원천 검증 완료',
+    '동일한 원천 종가 정합성 검증',
+    '원천 데이터 재검증',
+)
+_PREVIOUS_CONTEXT_STALE_EXECUTION_PHRASES = (
+    '가격 자료 정합성',
+    '자료 원천별로 달라',
+    '원천별로 달라',
+    '원천 충돌이 지속되면',
+)
+_STALE_MARKET_ACTIVITY_TOKENS = (
+    '종가',
+    '가격',
+    'close_price',
+    'reference_close',
+    '거래대금',
+    'turnover',
+)
+_MARKET_ACTIVITY_MEASURE_TOKENS = (
+    '종가',
+    'close_price',
+    'reference_close',
+    '거래량',
+    'volume',
+    '거래대금',
+    'turnover',
+)
+_STALE_SOURCE_IDENTITY_TOKENS = (
+    '원천',
+    '자료원',
+    '자료 경로',
+    '데이터',
+    '필드',
+    '입력',
+    '컨텍스트',
+    '문맥',
+    '기준값',
+    '기준 가격',
+    '기준가격',
+    '가격 기준',
+    '종가 기준',
+    '동일 거래일',
+    '동일 시장일',
+    '단일 소스',
+    '단일 원천',
+    '산출 경로',
+    '산출 기준',
+    '단일 기준',
+    '정합성',
+    '병합',
+)
+_STALE_PRICE_CONFLICT_PATTERNS = (
+    r'종가(?:도|가|는|의)?\s*(?:값\s*)?(?:불일치|충돌|상충|비정합)',
+    r'종가\s*차이',
+    r'(?:개별\s*)?가격\s*(?:불일치|충돌|상충|비정합)',
+    (
+        r'종가.{0,100}\d[\d,]*(?:원)?\s*(?:과|와|/|·|,)\s*'
+        r'\d[\d,]*(?:원)?.{0,60}'
+        r'(?:불일치|충돌|상충|차이|달라|다릅|일치하지|differ|not match)'
+    ),
+    (
+        r'가격\s*정합성\s*'
+        r'(?:불일치|충돌|상충|문제|이슈|해소|미확보|부족|검증|입증|정합화)'
+    ),
+    (
+        r'거래대금(?:도)?.{0,100}\d[\d,]*(?:원)?\s*(?:과|와|/|·|,)\s*'
+        r'\d[\d,]*(?:원)?.{0,60}(?:불일치|충돌|상충|차이)'
+    ),
+    r'거래대금.{0,40}회전율.{0,40}(?:불일치|충돌|상충)',
+    r'(?:가격|종가).{0,30}거래대금.{0,30}기준.{0,30}(?:불일치|충돌|상충|차이)',
+    r'거래대금.{0,60}(?:저장|산출|자료)\s*경로별.{0,30}차이',
+    (
+        r'종가.{0,40}거래대금.{0,60}공매도.{0,60}'
+        r'(?:범위|집계).{0,40}차이.{0,80}'
+        r'(?:신뢰|판단).{0,40}(?:제한|부족)'
+    ),
+)
+_STALE_PRICE_NORMALIZATION_PATTERNS = (
+    r'일관된\s*단일\s*종가',
+    r'정합화된\s*가격',
+    (
+        r'종가.{0,80}(?:단일\s*(?:기준값|소스|원천)|산출\s*경로)'
+        r'.{0,60}(?:정규화|정합화|단일화)'
+    ),
+    (
+        r'(?:정합성|정합화|정규화|단일화).{0,100}'
+        r'(?:해소|해야|필요|확보|먼저|검증\s*추가|'
+        r'사용하도록|한\s*(?:뒤|후)|\s후|'
+        r'확인(?:이\s*필요|해야|되어야|$))'
+    ),
+)
+_INTERNAL_TECHNICAL_LEVEL_PATTERNS = (
+    r'(?:저항|지지)(?:값|선)?.{0,60}현재\s*종가',
+    r'현재\s*종가.{0,60}(?:저항|지지)(?:값|선)?',
+)
+_DECISIVE_SOURCE_IDENTITY_TOKENS = (
+    '필드',
+    '원천',
+    '자료원',
+    '자료 경로',
+    '데이터',
+    '기준가격',
+    '기준 가격',
+    '가격 기준',
+    '입력',
+    '산출 기준',
+)
+_STRUCTURED_BLOCKER_TOKENS = (
+    '대기',
+    'wait',
+    'block',
+    '제한',
+    '불가',
+    '부분',
+    '근거 부족',
+    '해소 전',
+    '정정',
+    '재검증',
+)
+_STRUCTURED_CROSS_LEAF_FIELDS = (
+    'finding',
+    'decision',
+    'reason',
+    'warning',
+    'blocker',
+)
+
+
+def _collect_string_leaves(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [
+            leaf
+            for nested_value in value.values()
+            for leaf in _collect_string_leaves(nested_value)
+        ]
+    if isinstance(value, list):
+        return [
+            leaf
+            for nested_value in value
+            for leaf in _collect_string_leaves(nested_value)
+        ]
+    return []
+
+
+def _has_cross_source_conflict(value: str) -> bool:
+    return any(token in value for token in _CROSS_SOURCE_CONFLICT_TOKENS) or any(
+        re.search(pattern, value) for pattern in _CROSS_SOURCE_CONFLICT_PATTERNS
+    )
+
+
+def _collect_immediate_structured_conflict_text(value: dict[str, Any]) -> str:
+    leaves: list[str] = []
+    for key, nested_value in value.items():
+        normalized_key = str(key).casefold()
+        if isinstance(nested_value, str):
+            leaves.append(nested_value)
+        elif (
+            'source' in normalized_key
+            or normalized_key in {'sources', 'primary', 'secondary'}
+        ):
+            leaves.extend(_collect_string_leaves(nested_value))
+    return ' '.join(leaves)
+
+
+def _noncanonical_execution_claim_reason_codes(
+    value: str,
+    *,
+    section_name: str | None = None,
+) -> list[str]:
+    normalized = value.casefold()
+    reason_codes: list[str] = []
+    if (
+        any(
+            token in normalized
+            for token in _CANONICAL_MARKET_ACTIVITY_SOURCE_TOKENS
+        )
+        and any(
+            token in normalized
+            for token in _AUXILIARY_MARKET_ACTIVITY_SOURCE_TOKENS
+        )
+        and _has_cross_source_conflict(normalized)
+    ):
+        reason_codes.append('noncanonical_market_activity_conflict')
+    if any(token in normalized for token in _CORE_REVALIDATION_RUNTIME_PHRASES):
+        reason_codes.append('core_post_response_revalidation_claim')
+    if section_name == 'previous_decision_context' and any(
+        phrase in normalized for phrase in _PREVIOUS_CONTEXT_STALE_EXECUTION_PHRASES
+    ):
+        reason_codes.append('previous_noncanonical_execution_claim')
+    has_market_activity = any(
+        token in normalized for token in _STALE_MARKET_ACTIVITY_TOKENS
+    )
+    has_market_activity_measure = any(
+        token in normalized for token in _MARKET_ACTIVITY_MEASURE_TOKENS
+    )
+    has_source_identity = any(
+        token in normalized for token in _STALE_SOURCE_IDENTITY_TOKENS
+    )
+    has_conflict = _has_cross_source_conflict(normalized)
+    has_cross_source_difference = bool(
+        has_market_activity_measure
+        and '차이' in normalized
+        and (
+            (
+                any(
+                    token in normalized
+                    for token in _AUXILIARY_MARKET_ACTIVITY_SOURCE_TOKENS
+                )
+                and (
+                    any(
+                        token in normalized
+                        for token in _CANONICAL_MARKET_ACTIVITY_SOURCE_TOKENS
+                    )
+                    or any(token in normalized for token in ('일봉', '기술', '당일'))
+                )
+            )
+            or bool(
+                re.search(
+                    r'(?:당일|동일\s*(?:거래일|시장일)).{0,100}원천.{0,60}차이',
+                    normalized,
+                )
+            )
+        )
+    )
+    has_named_source_difference = bool(
+        '차이' in normalized
+        and re.search(
+            (
+                r'(?:가격[\s·/]*기술|기술[\s·/]*가격)'
+                r'.{0,100}원천.{0,100}'
+                r'(?:유동성|평가|가치평가|업종|섹터)'
+                r'.{0,100}원천.{0,60}차이'
+            ),
+            normalized,
+        )
+    )
+    is_internal_technical_level_relation = (
+        any(
+            re.search(pattern, normalized)
+            for pattern in _INTERNAL_TECHNICAL_LEVEL_PATTERNS
+        )
+        and not any(
+            token in normalized for token in _DECISIVE_SOURCE_IDENTITY_TOKENS
+        )
+    )
+    if (
+        (
+            has_market_activity
+            and has_source_identity
+            and has_conflict
+            and not is_internal_technical_level_relation
+        )
+        or any(
+            re.search(pattern, normalized)
+            for pattern in _STALE_PRICE_CONFLICT_PATTERNS
+        )
+        or has_cross_source_difference
+        or has_named_source_difference
+        or (
+            has_market_activity
+            and any(
+                re.search(pattern, normalized)
+                for pattern in _STALE_PRICE_NORMALIZATION_PATTERNS
+            )
+        )
+    ):
+        reason_codes.append('stale_price_conflict_claim')
+    return reason_codes
+
+
+def _sanitize_noncanonical_execution_narratives(
+    value: Any,
+    *,
+    section_name: str | None = None,
+) -> tuple[Any, int]:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        count = 0
+        direct_blocker_items = {
+            str(key): nested_value
+            for key, nested_value in value.items()
+            if isinstance(nested_value, str)
+            and str(key).casefold() in _STRUCTURED_CROSS_LEAF_FIELDS
+        }
+        direct_text = _collect_immediate_structured_conflict_text(value)
+        structured_reason_codes = _noncanonical_execution_claim_reason_codes(
+            direct_text,
+            section_name=section_name,
+        )
+        structured_conflict = bool(
+            direct_blocker_items
+            and set(structured_reason_codes).intersection(
+                {
+                    'noncanonical_market_activity_conflict',
+                    'previous_noncanonical_execution_claim',
+                    'stale_price_conflict_claim',
+                }
+            )
+            and any(token in direct_text.casefold() for token in _STRUCTURED_BLOCKER_TOKENS)
+        )
+        for key, nested_value in value.items():
+            normalized_key = str(key).casefold()
+            normalized_nested_value = (
+                nested_value.casefold() if isinstance(nested_value, str) else ''
+            )
+            if (
+                structured_conflict
+                and isinstance(nested_value, str)
+                and normalized_key in _STRUCTURED_CROSS_LEAF_FIELDS
+                and not _noncanonical_execution_claim_reason_codes(
+                    nested_value,
+                    section_name=section_name,
+                )
+                and (
+                    normalized_key in {'finding', 'reason', 'warning', 'blocker'}
+                    or any(
+                        token in normalized_nested_value
+                        for token in _STRUCTURED_BLOCKER_TOKENS
+                    )
+                )
+            ):
+                sanitized[key] = (
+                    '[noncanonical_execution_claim_withheld:'
+                    'structured_noncanonical_market_activity_conflict; '
+                    'use current canonical contexts and quality hard blocks]'
+                )
+                count += 1
+                continue
+            sanitized_value, nested_count = _sanitize_noncanonical_execution_narratives(
+                nested_value,
+                section_name=section_name,
+            )
+            sanitized[key] = sanitized_value
+            count += nested_count
+        return sanitized, count
+    if isinstance(value, list):
+        sanitized_items: list[Any] = []
+        count = 0
+        for nested_value in value:
+            sanitized_value, nested_count = _sanitize_noncanonical_execution_narratives(
+                nested_value,
+                section_name=section_name,
+            )
+            sanitized_items.append(sanitized_value)
+            count += nested_count
+        return sanitized_items, count
+    if isinstance(value, str):
+        reason_codes = _noncanonical_execution_claim_reason_codes(
+            value,
+            section_name=section_name,
+        )
+        if reason_codes:
+            return (
+                '[noncanonical_execution_claim_withheld:'
+                + ','.join(reason_codes)
+                + '; use current canonical contexts and quality hard blocks]',
+                1,
+            )
+    return value, 0
 
 
 def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
+    source_revalidation_request = trimmed.pop('source_revalidation_request', None)
+    decision_input_generation_fence = trimmed.pop(
+        'decision_input_generation_fence',
+        None,
+    )
+    if isinstance(source_revalidation_request, dict) or isinstance(
+        decision_input_generation_fence,
+        dict,
+    ):
+        trimmed['core_post_response_revalidation'] = {
+            'status': 'enforced_by_core_after_model_response',
+            'decision_effect': 'not_a_pre_decision_evidence_gap',
+            'guidance': (
+                'Core revalidates the durable input generation after the model '
+                'responds. Do not wait or reject solely because this runtime control '
+                'exists; use the supplied decision-input quality hard blocks instead.'
+            ),
+        }
+    sanitized_claim_count = 0
+    sanitized_sections: list[str] = []
+    narrative_sections = (
+        'upstream_summaries',
+        'previous_decision_context',
+        'signal_envelopes',
+    )
+    for section_name in narrative_sections:
+        section = trimmed.get(section_name)
+        if not isinstance(section, (dict, list)):
+            continue
+        sanitized_section, section_claim_count = (
+            _sanitize_noncanonical_execution_narratives(
+                section,
+                section_name=section_name,
+            )
+        )
+        trimmed[section_name] = sanitized_section
+        if section_claim_count:
+            sanitized_claim_count += section_claim_count
+            sanitized_sections.append(section_name)
+    if any(
+        isinstance(trimmed.get(section_name), (dict, list))
+        for section_name in narrative_sections
+    ):
+        trimmed['narrative_execution_authority'] = {
+            'status': 'noncanonical_narratives_are_not_current_execution_evidence',
+            'current_authority_paths': [
+                'symbol_day_context.price_context',
+                'symbol_day_context.technical_snapshot',
+                'liquidity_context.turnover',
+                'decision_input_quality_context.execution_feasibility',
+                'decision_input_quality_context.final_judgment',
+                'decision_input_quality_context.final_judgment.hard_blocks',
+            ],
+            'sanitized_claim_count': sanitized_claim_count,
+            'sanitized_sections': sanitized_sections,
+            'guidance': (
+                'Use upstream summaries, previous decisions, and signal envelopes '
+                'for thesis continuity and delta only. Do not inherit their '
+                'price-conflict or Core-revalidation claims as current blockers.'
+            ),
+        }
     symbol_day_context = trimmed.get('symbol_day_context')
     if isinstance(symbol_day_context, dict):
         compact_symbol_context = _compact_symbol_day_context_for_decider(symbol_day_context)
@@ -1705,6 +2295,8 @@ _PROMPT_SLIM_PRIORITY_KEYS = (
     'market_regime_context',
     'decision_input_quality_context',
     'decider_data_quality_context',
+    'core_post_response_revalidation',
+    'narrative_execution_authority',
     'pre_decider_enrichment_context',
     'upstream_summaries',
     'upstream_traceability',

@@ -3157,6 +3157,636 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertTrue(context['screening_decision']['selected'])
         self.assertEqual(context['context_provenance']['screening_rank'], 1)
 
+    def test_trim_batch_item_for_prompt_resolves_auxiliary_market_activity_against_daily_price_context(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'symbol_day_context': {
+                    'symbol': '005930',
+                    'market': 'KOSPI',
+                    'market_date': '2026-04-14',
+                    'price_context': {
+                        'trade_date': '2026-04-14',
+                        'close_price': 71000,
+                        'volume': 120000,
+                        'turnover': 8520000000,
+                    },
+                    'technical_snapshot': {
+                        'market_date': '2026-04-14',
+                        'close': 71000,
+                        'rsi_14': 58.2,
+                    },
+                    'valuation_context': {
+                        'status': 'available',
+                        'valuation_snapshot': {
+                            'close_price': 70500,
+                            'volume': 140000,
+                            'trading_value': 9870000000,
+                            'market_cap': 420000000000000,
+                            'per': 12.5,
+                            'pbr': 1.2,
+                        },
+                    },
+                    'sector_peer_context': {
+                        'status': 'available',
+                        'sector_name': 'Semiconductors',
+                        'close_price': 70500,
+                        'change_pct': 9.5,
+                        'self': {
+                            'symbol': '005930',
+                            'market_cap': 420000000000000,
+                            'change_pct': 9.5,
+                        },
+                        'peers': [
+                            {
+                                'symbol': '000660',
+                                'market_cap': 300000000000000,
+                                'change_pct': 2.1,
+                            }
+                        ],
+                    },
+                },
+                'market_regime_context': {
+                    'schema_version': 'market_regime_context_v1',
+                    'status': 'available',
+                    'market_date': '2026-04-14',
+                    'sector_context': {
+                        'status': 'available',
+                        'sector_name': 'Semiconductors',
+                        'self_change_pct': 9.5,
+                        'peer_avg_change_pct': 2.1,
+                    },
+                },
+            }
+        )
+
+        context = trimmed['symbol_day_context']
+        self.assertEqual(
+            list(context)[:5],
+            ['symbol', 'market', 'market_date', 'price_context', 'technical_snapshot'],
+        )
+        valuation = context['valuation_context']
+        self.assertEqual(valuation['valuation_snapshot']['per'], 12.5)
+        self.assertEqual(valuation['valuation_snapshot']['market_cap'], 420000000000000)
+        self.assertNotIn('close_price', valuation['valuation_snapshot'])
+        self.assertNotIn('volume', valuation['valuation_snapshot'])
+        self.assertNotIn('trading_value', valuation['valuation_snapshot'])
+        self.assertEqual(
+            valuation['market_activity_reference']['authority'],
+            'symbol_day_context.price_context',
+        )
+        sector = context['sector_peer_context']
+        self.assertNotIn('close_price', sector)
+        self.assertNotIn('change_pct', sector)
+        self.assertNotIn('change_pct', sector['self'])
+        self.assertEqual(sector['peers'][0]['change_pct'], 2.1)
+        self.assertEqual(
+            sector['market_activity_reference']['authority'],
+            'symbol_day_context.price_context',
+        )
+        regime_sector = trimmed['market_regime_context']['sector_context']
+        self.assertNotIn('self_change_pct', regime_sector)
+        self.assertEqual(regime_sector['peer_avg_change_pct'], 2.1)
+        self.assertEqual(
+            regime_sector['market_activity_reference']['authority'],
+            'symbol_day_context.price_context',
+        )
+
+    def test_trim_batch_item_for_prompt_replaces_post_response_revalidation_controls_with_notice(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'source_revalidation_request': {
+                    'schema_version': 'decider_source_revalidation_request_v1',
+                    'source_context_scope_symbols': ['005930'],
+                },
+                'decision_input_generation_fence': {
+                    'schema_version': 'decision_input_generation_fence_v1',
+                    'enforcement': 'required',
+                    'durable_revalidation_required': True,
+                },
+            }
+        )
+
+        self.assertNotIn('source_revalidation_request', trimmed)
+        self.assertNotIn('decision_input_generation_fence', trimmed)
+        self.assertEqual(
+            trimmed['core_post_response_revalidation']['status'],
+            'enforced_by_core_after_model_response',
+        )
+        self.assertEqual(
+            trimmed['core_post_response_revalidation']['decision_effect'],
+            'not_a_pre_decision_evidence_gap',
+        )
+
+    def test_trim_batch_item_for_prompt_withholds_stale_narrative_execution_blockers(self):
+        source_item = {
+            'symbol': '005930',
+            'market_date': '2026-04-14',
+            'symbol_day_context': {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'price_context': {
+                    'close_price': 71000,
+                    'volume': 120000,
+                },
+                'technical_snapshot': {'close': 71000},
+            },
+            'liquidity_context': {
+                'turnover': {
+                    'close_price': 71000,
+                    'volume': 120000,
+                    'trading_value_krw': 8520000000,
+                }
+            },
+            'decision_input_quality_context': {
+                'final_judgment': {'hard_blocks': []},
+                'execution_feasibility': {'blocking_reasons': []},
+            },
+            'upstream_summaries': {
+                'technical-analyst': {
+                    'summary': (
+                        'price_context의 close_price 71,000과 liquidity_context의 '
+                        'close_price 70,500이 불일치합니다.'
+                    ),
+                    'thesis_summary': '추세는 유지되고 있습니다.',
+                    'technical_risk': '가격과 모멘텀 판정이 불일치합니다.',
+                    'close_trend_risk': '종가와 추세 신호가 불일치합니다.',
+                    'resistance_context': '저항값보다 현재 종가가 높습니다.',
+                    'resistance_mismatch_context': (
+                        '저항값이 현재 종가보다 낮아 가격 컨텍스트와 '
+                        '불일치 가능성이 있어 재검증이 필요합니다.'
+                    ),
+                    'candle_context': '고가-종가 거리 2.1%입니다.',
+                    'short_context': '공매도 총거래량 집계범위 차이입니다.',
+                    'benign_source_difference': (
+                        '가격 컨텍스트와 유동성 컨텍스트의 산출 기준 '
+                        '차이를 설명합니다.'
+                    ),
+                    'benign_calculation_difference': (
+                        '가격 데이터 필드 차이는 계산 목적에 따른 것입니다.'
+                    ),
+                    'volume_risk': (
+                        '시장 Regime과 개별 종목의 단기 가격·거래량 흐름 '
+                        '신호가 충돌합니다.'
+                    ),
+                    'supporting_evidence': [
+                        '기술적 지지선 재검증이 필요합니다.'
+                    ],
+                    'details': {
+                        'anomalies': [
+                            '가격 컨텍스트 종가와 유동성 컨텍스트 종가가 상충합니다.',
+                            (
+                                'price_context와 liquidity_context 종가를 '
+                                '단일 원천으로 정합화해야 합니다.'
+                            ),
+                            '종가 불일치로 원천 데이터 재검증이 필요합니다.',
+                            '종가 충돌 해소 전에는 부분 준비만 가능합니다.',
+                            '기준가격 충돌이 있어 대기 유지합니다.',
+                            '가격 원천 충돌로 실행 근거가 부족합니다.',
+                            '가격 정합성 문제 해소 전 대기합니다.',
+                            '가격 필드 불일치입니다.',
+                            (
+                                '종가 데이터가 일부 컨텍스트에서 71,000과 '
+                                '70,500으로 불일치합니다.'
+                            ),
+                            '종가·거래대금 기준값을 단일 원천으로 정합화해야 합니다.',
+                            '동일 거래일 종가 71,000/70,500의 원천 정합성이 필요합니다.',
+                            '종가가 자료원별로 달라 대기합니다.',
+                            '종가를 단일 기준값으로 정규화해야 합니다.',
+                            '가격 기준과 병합 반영 여부를 정합화해야 합니다.',
+                            '일관된 단일 종가가 필요합니다.',
+                            '종가 값 불일치가 있어 부분 준비만 가능합니다.',
+                            (
+                                '가격·유동성 입력 간 종가 차이로 정확한 '
+                                '실행 기준은 제한됩니다.'
+                            ),
+                            (
+                                '정상 시장 국면과 상승 추세는 유지되지만 개별 '
+                                '가격 충돌을 해소하지 못했습니다.'
+                            ),
+                            '종가 기준을 정합화하고 눌림 지지를 재검토해야 합니다.',
+                            '정합화된 가격에서 눌림 후 지지 회복을 확인해야 합니다.',
+                            (
+                                '일봉 거래대금 21,991,907,400원과 원시 유동성 '
+                                '거래대금 22,020,672,700원에 차이가 있습니다.'
+                            ),
+                        ]
+                    },
+                },
+            },
+            'signal_envelopes': [
+                {
+                    'schema_version': 'signal_envelope_v1',
+                    'symbol': '005930',
+                    'market_date': '2026-04-14',
+                    'horizon': 'swing',
+                    'source_name': 'technical-analyst',
+                    'source_type': 'agent_feedback',
+                    'thesis_summary': '수급과 추세는 양호합니다.',
+                    'summary': (
+                        '가격 컨텍스트 종가 71,000원과 유동성 컨텍스트 '
+                        '종가 70,500원이 서로 다릅니다.'
+                    ),
+                    'alternate_summary': (
+                        'price_context.close_price=71000과 '
+                        'liquidity_context.turnover.close_price=70500이 상이함'
+                    ),
+                    'normal_freshness_summary': (
+                        '가격·기술 데이터는 정상이고 '
+                        '유동성 컨텍스트도 신선합니다.'
+                    ),
+                    'closed_session_summary': (
+                        '시장 정상 국면이며 일봉 데이터와 거래대금은 '
+                        '당일 기준 신선합니다. 장 마감 상태라 실시간 '
+                        '호가·스프레드는 적용 대상이 아니며, 해당 가격은 '
+                        '최신 완료 일봉 기준입니다.'
+                    ),
+                    'confirmed_consistency_summary': (
+                        '가격 컨텍스트와 유동성 컨텍스트의 종가는 '
+                        '정합하며 실행 기준이 일치합니다.'
+                    ),
+                    'financial_consistency_summary': (
+                        '재무제표 계정 정합성 검증 추가가 필요하며 '
+                        '입력 피처 정규화가 필요합니다.'
+                    ),
+                    'risk_flags': [
+                        (
+                            'price_context close 71000 differs from '
+                            'liquidity_context close 70500.'
+                        ),
+                        (
+                            'price_context close 71000 does not match '
+                            'liquidity_context close 70500.'
+                        ),
+                        '가격 데이터의 종가 값이 서로 일치하지 않아 대기합니다.',
+                        '가격과 모멘텀 판정이 불일치합니다.',
+                        (
+                            '거래대금도 803,125,152원과 804,467,457원으로 '
+                            '불일치합니다.'
+                        ),
+                        '거래대금과 회전율 수치에 소폭 불일치가 있습니다.',
+                    ],
+                    'structured_conflict': {
+                        'source_a': 'price_context',
+                        'source_b': 'liquidity_context',
+                        'finding': '종가가 서로 다릅니다.',
+                        'decision': '해소 전 대기합니다.',
+                        'recommendation': 'wait',
+                        'recommendation_class': 'wait',
+                        'risk_reward_assessment': (
+                            '현재 종가에서 저항까지의 여력은 작고 '
+                            '지지선 이탈 위험은 큭니다.'
+                        ),
+                    },
+                    'sources_conflict': {
+                        'sources': ['price_context', 'liquidity_context'],
+                        'finding': '종가가 서로 다릅니다.',
+                        'decision': '해소 전 대기합니다.',
+                        'thesis_summary': '수급과 추세는 양호합니다.',
+                    },
+                    'nested_sources_conflict': {
+                        'source_comparison': {
+                            'primary': 'price_context',
+                            'secondary': 'liquidity_context',
+                        },
+                        'finding': '종가가 서로 다릅니다.',
+                        'decision': '해소 전 대기합니다.',
+                        'owner': 'risk-team',
+                    },
+                    'benign_sources': {
+                        'sources': ['price_context', 'liquidity_context'],
+                        'finding': '산출 목적이 달라 두 소스를 함께 사용합니다.',
+                        'decision': '두 소스를 함께 사용합니다.',
+                    },
+                    'nested_ancestor_conflict': {
+                        'reason': '시장 위험회피 국면으로 대기합니다.',
+                        'warning': '변동성이 큽니다.',
+                        'child': {
+                            'sources': ['price_context', 'liquidity_context'],
+                            'finding': '종가가 서로 다릅니다.',
+                            'decision': '해소 전 대기합니다.',
+                        },
+                    },
+                }
+            ],
+            'previous_decision_context': {
+                'available': True,
+                'market_date': '2026-04-13',
+                'wait_reason': (
+                    '필수 원천 재검증 완료 결과가 제공되지 않아 통과를 '
+                    '확인할 수 없습니다.'
+                ),
+                'thesis_summary': '전일 지지선은 유지됐습니다.',
+                'data_quality_warnings': [
+                    '요구된 재검증의 현재 통과 결과가 없습니다.',
+                    '시장·업종 상대강도와 가격 자료 정합성을 확인해야 합니다.',
+                    '거래대금도 저장 경로별 차이가 있어 단일 권위값 확인이 필요합니다.',
+                ],
+                'upgrade_trigger': {
+                    'summary': '가격·거래대금 기준 충돌 해소 후 재평가합니다.',
+                },
+                'summary': (
+                    '추세는 양호하지만 종가도 충돌하므로 '
+                    '신규 단기 매수 후보에서 제외합니다.'
+                ),
+                'decision_risks': [
+                    (
+                        '종가뿐 아니라 거래대금과 공매도 집계의 '
+                        '범위에도 차이가 있어 세부 가격 판단의 '
+                        '신뢰도가 제한됩니다.'
+                    ),
+                    '공매도 총거래량 집계범위 차이입니다.',
+                ],
+                'invalidation_conditions': [
+                    '원천 충돌이 지속되면 관찰 후보 또는 '
+                    '매수 후보로 상향하지 않습니다.'
+                ],
+                'trigger_conditions': [
+                    (
+                        '가격·기술 원천의 26,550원과 유동성·평가·업종 '
+                        '원천의 26,250원 차이를 해소해야 합니다.'
+                    ),
+                    (
+                        '당일 종가·거래량의 원천 차이를 설명하고 동일 기준의 '
+                        '확정 자료를 제공해야 합니다.'
+                    ),
+                    (
+                        '동일 거래일 기술·유동성·가치평가 자료의 종가와 '
+                        '거래대금 차이를 설명하고 일관된 기준을 확인해야 합니다.'
+                    ),
+                ],
+            },
+        }
+        source_before = json.dumps(source_item, ensure_ascii=False, sort_keys=True)
+
+        trimmed = trim_batch_item_for_prompt(source_item)
+
+        upstream = trimmed['upstream_summaries']['technical-analyst']
+        previous = trimmed['previous_decision_context']
+        self.assertIn(
+            'noncanonical_market_activity_conflict',
+            upstream['summary'],
+        )
+        self.assertEqual(upstream['thesis_summary'], '추세는 유지되고 있습니다.')
+        self.assertEqual(
+            upstream['technical_risk'],
+            '가격과 모멘텀 판정이 불일치합니다.',
+        )
+        self.assertEqual(
+            upstream['close_trend_risk'],
+            '종가와 추세 신호가 불일치합니다.',
+        )
+        self.assertEqual(
+            upstream['resistance_context'],
+            '저항값보다 현재 종가가 높습니다.',
+        )
+        self.assertIn(
+            '저항값이 현재 종가보다 낮아 가격 컨텍스트와 불일치',
+            upstream['resistance_mismatch_context'],
+        )
+        self.assertEqual(upstream['candle_context'], '고가-종가 거리 2.1%입니다.')
+        self.assertEqual(
+            upstream['short_context'],
+            '공매도 총거래량 집계범위 차이입니다.',
+        )
+        self.assertIn('산출 기준 차이', upstream['benign_source_difference'])
+        self.assertIn('계산 목적', upstream['benign_calculation_difference'])
+        self.assertIn('신호가 충돌', upstream['volume_risk'])
+        self.assertEqual(
+            upstream['supporting_evidence'],
+            ['기술적 지지선 재검증이 필요합니다.'],
+        )
+        self.assertIn(
+            'noncanonical_market_activity_conflict',
+            upstream['details']['anomalies'][0],
+        )
+        self.assertIn(
+            'stale_price_conflict_claim',
+            upstream['details']['anomalies'][1],
+        )
+        self.assertIn(
+            'core_post_response_revalidation_claim',
+            upstream['details']['anomalies'][2],
+        )
+        for stale_claim in upstream['details']['anomalies'][3:]:
+            self.assertIn('stale_price_conflict_claim', stale_claim)
+        self.assertIn(
+            'core_post_response_revalidation_claim',
+            previous['wait_reason'],
+        )
+        self.assertEqual(previous['market_date'], '2026-04-13')
+        self.assertEqual(previous['thesis_summary'], '전일 지지선은 유지됐습니다.')
+        self.assertIn(
+            'core_post_response_revalidation_claim',
+            previous['data_quality_warnings'][0],
+        )
+        self.assertIn(
+            'previous_noncanonical_execution_claim',
+            previous['data_quality_warnings'][1],
+        )
+        self.assertIn(
+            'stale_price_conflict_claim',
+            previous['data_quality_warnings'][2],
+        )
+        self.assertIn(
+            'stale_price_conflict_claim',
+            previous['upgrade_trigger']['summary'],
+        )
+        self.assertIn('stale_price_conflict_claim', previous['summary'])
+        self.assertIn(
+            'stale_price_conflict_claim',
+            previous['decision_risks'][0],
+        )
+        self.assertEqual(
+            previous['decision_risks'][1],
+            '공매도 총거래량 집계범위 차이입니다.',
+        )
+        self.assertIn(
+            'previous_noncanonical_execution_claim',
+            previous['invalidation_conditions'][0],
+        )
+        signal_envelope = trimmed['signal_envelopes'][0]
+        self.assertIn('noncanonical_market_activity_conflict', signal_envelope['summary'])
+        self.assertIn(
+            'noncanonical_market_activity_conflict',
+            signal_envelope['alternate_summary'],
+        )
+        self.assertEqual(
+            signal_envelope['normal_freshness_summary'],
+            '가격·기술 데이터는 정상이고 '
+            '유동성 컨텍스트도 신선합니다.',
+        )
+        self.assertIn(
+            '적용 대상이 아니며',
+            signal_envelope['closed_session_summary'],
+        )
+        self.assertIn(
+            '정합하며 실행 기준이 일치',
+            signal_envelope['confirmed_consistency_summary'],
+        )
+        self.assertIn(
+            '재무제표 계정 정합성',
+            signal_envelope['financial_consistency_summary'],
+        )
+        for risk_flag in signal_envelope['risk_flags'][:2]:
+            self.assertIn('noncanonical_market_activity_conflict', risk_flag)
+        self.assertIn(
+            'stale_price_conflict_claim',
+            signal_envelope['risk_flags'][2],
+        )
+        self.assertEqual(
+            signal_envelope['risk_flags'][3],
+            '가격과 모멘텀 판정이 불일치합니다.',
+        )
+        for risk_flag in signal_envelope['risk_flags'][4:]:
+            self.assertIn('stale_price_conflict_claim', risk_flag)
+        self.assertEqual(signal_envelope['schema_version'], 'signal_envelope_v1')
+        self.assertEqual(signal_envelope['symbol'], '005930')
+        self.assertEqual(signal_envelope['market_date'], '2026-04-14')
+        self.assertEqual(signal_envelope['horizon'], 'swing')
+        self.assertEqual(signal_envelope['source_name'], 'technical-analyst')
+        self.assertEqual(signal_envelope['source_type'], 'agent_feedback')
+        self.assertEqual(
+            signal_envelope['thesis_summary'],
+            '수급과 추세는 양호합니다.',
+        )
+        structured_conflict = signal_envelope['structured_conflict']
+        self.assertEqual(structured_conflict['source_a'], 'price_context')
+        self.assertEqual(structured_conflict['source_b'], 'liquidity_context')
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            structured_conflict['finding'],
+        )
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            structured_conflict['decision'],
+        )
+        self.assertEqual(structured_conflict['recommendation'], 'wait')
+        self.assertEqual(structured_conflict['recommendation_class'], 'wait')
+        self.assertIn(
+            '저항까지의 여력',
+            structured_conflict['risk_reward_assessment'],
+        )
+        for key in ('sources_conflict', 'nested_sources_conflict'):
+            structured_variant = signal_envelope[key]
+            self.assertIn(
+                'structured_noncanonical_market_activity_conflict',
+                structured_variant['finding'],
+            )
+            self.assertIn(
+                'structured_noncanonical_market_activity_conflict',
+                structured_variant['decision'],
+            )
+        self.assertEqual(
+            signal_envelope['sources_conflict']['thesis_summary'],
+            '수급과 추세는 양호합니다.',
+        )
+        self.assertEqual(
+            signal_envelope['nested_sources_conflict']['owner'],
+            'risk-team',
+        )
+        self.assertEqual(
+            signal_envelope['benign_sources']['finding'],
+            '산출 목적이 달라 두 소스를 함께 사용합니다.',
+        )
+        ancestor = signal_envelope['nested_ancestor_conflict']
+        self.assertEqual(
+            ancestor['reason'],
+            '시장 위험회피 국면으로 대기합니다.',
+        )
+        self.assertEqual(ancestor['warning'], '변동성이 큽니다.')
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            ancestor['child']['finding'],
+        )
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            ancestor['child']['decision'],
+        )
+        for trigger_condition in previous['trigger_conditions']:
+            self.assertIn('stale_price_conflict_claim', trigger_condition)
+        authority = trimmed['narrative_execution_authority']
+        self.assertEqual(authority['sanitized_claim_count'], 48)
+        self.assertEqual(
+            authority['sanitized_sections'],
+            [
+                'upstream_summaries',
+                'previous_decision_context',
+                'signal_envelopes',
+            ],
+        )
+        self.assertEqual(
+            authority['current_authority_paths'][0],
+            'symbol_day_context.price_context',
+        )
+        self.assertEqual(
+            trimmed['decision_input_quality_context']['final_judgment']['hard_blocks'],
+            [],
+        )
+        self.assertIn(
+            'decision_input_quality_context.final_judgment.hard_blocks',
+            authority['current_authority_paths'],
+        )
+        self.assertEqual(
+            json.dumps(source_item, ensure_ascii=False, sort_keys=True),
+            source_before,
+        )
+        compressed = compressed_batch_item_for_prompt(source_item)
+        compressed_text = json.dumps(compressed, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn('close_price 70,500이 불일치', compressed_text)
+        self.assertNotIn('재검증 완료 결과가 제공되지 않아', compressed_text)
+        self.assertEqual(
+            compressed['narrative_execution_authority']['status'],
+            'noncanonical_narratives_are_not_current_execution_evidence',
+        )
+
+    def test_compressed_batch_item_for_prompt_keeps_canonical_execution_fields(self):
+        compressed = compressed_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'symbol_day_context': {
+                    'symbol': '005930',
+                    'market': 'KOSPI',
+                    'market_date': '2026-04-14',
+                    'company': {'name': 'Samsung Electronics'},
+                    'market_session': {'current_market_state': 'closed'},
+                    'market_data_phase_contract': {'phase': 'post_close'},
+                    'decider_data_quality_context': {'status': 'available'},
+                    'decision_input_quality_context': {
+                        'final_judgment': {'hard_blocks': []},
+                    },
+                    'quote_context': {'status': 'not_applicable'},
+                    'price_context': {'close_price': 71000, 'volume': 120000},
+                    'liquidity_context': {'status': 'available'},
+                    'technical_snapshot': {'close': 71000, 'rsi_14': 58.2},
+                    'intraday_execution_context': {'status': 'not_applicable'},
+                    'intraday_wait_recheck_context': {'status': 'not_applicable'},
+                    'valuation_context': {
+                        'valuation_snapshot': {'per': 12.5, 'pbr': 1.2},
+                    },
+                    'action_summary': {'action': 'watch'},
+                    'investor_flow_context': {'status': 'available'},
+                    'short_selling_context': {'status': 'available'},
+                    'sector_peer_context': {'status': 'available'},
+                    'market_relative_context': {'status': 'available'},
+                    'market_breadth_context': {'status': 'available'},
+                    'macro_context': {'status': 'available'},
+                },
+            }
+        )
+
+        context = compressed['symbol_day_context']
+        self.assertIn('price_context', context)
+        self.assertIn('technical_snapshot', context)
+        self.assertIn('liquidity_context', context)
+        self.assertIn('intraday_execution_context', context)
+        self.assertIn('valuation_context', context)
+        self.assertIn('intraday_wait_recheck_context', context)
+
 
 class FakeFuture:
     def __init__(self, *, result, cancel_result):
