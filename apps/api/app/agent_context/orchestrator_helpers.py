@@ -1697,12 +1697,24 @@ _CORE_REVALIDATION_RUNTIME_PHRASES = (
     '입력 생성 펜스 재검증',
     '요구된 재검증',
     'core 재검증',
-    '재검증 완료',
-    '재검증 통과',
-    '재검증 결과',
     '원천 검증 완료',
     '동일한 원천 종가 정합성 검증',
     '원천 데이터 재검증',
+)
+_GENERIC_REVALIDATION_STATUS_PHRASES = (
+    '재검증 완료',
+    '재검증 통과',
+    '재검증 결과',
+)
+_CORE_REVALIDATION_CONTEXT_TOKENS = (
+    'core',
+    '코어',
+    'source',
+    '원천',
+    'fence',
+    '펜스',
+    'generation',
+    '입력 생성',
 )
 _PREVIOUS_CONTEXT_STALE_EXECUTION_PHRASES = (
     '가격 자료 정합성',
@@ -1866,6 +1878,14 @@ def _collect_immediate_structured_conflict_text(value: dict[str, Any]) -> str:
     return ' '.join(leaves)
 
 
+def _has_core_revalidation_runtime_claim(value: str) -> bool:
+    if any(phrase in value for phrase in _CORE_REVALIDATION_RUNTIME_PHRASES):
+        return True
+    return any(
+        phrase in value for phrase in _GENERIC_REVALIDATION_STATUS_PHRASES
+    ) and any(token in value for token in _CORE_REVALIDATION_CONTEXT_TOKENS)
+
+
 def _noncanonical_execution_claim_reason_codes(
     value: str,
     *,
@@ -1885,7 +1905,7 @@ def _noncanonical_execution_claim_reason_codes(
         and _has_cross_source_conflict(normalized)
     ):
         reason_codes.append('noncanonical_market_activity_conflict')
-    if any(token in normalized for token in _CORE_REVALIDATION_RUNTIME_PHRASES):
+    if _has_core_revalidation_runtime_claim(normalized):
         reason_codes.append('core_post_response_revalidation_claim')
     if section_name == 'previous_decision_context' and any(
         phrase in normalized for phrase in _PREVIOUS_CONTEXT_STALE_EXECUTION_PHRASES
@@ -2015,13 +2035,12 @@ def _sanitize_noncanonical_execution_narratives(
                     nested_value,
                     section_name=section_name,
                 )
-                and (
-                    normalized_key in {'finding', 'reason', 'warning', 'blocker'}
-                    or any(
-                        token in normalized_nested_value
-                        for token in _STRUCTURED_BLOCKER_TOKENS
-                    )
+                and normalized_key == 'finding'
+                and any(
+                    token in normalized_nested_value
+                    for token in _MARKET_ACTIVITY_MEASURE_TOKENS
                 )
+                and _has_cross_source_conflict(normalized_nested_value)
             ):
                 sanitized[key] = (
                     '[noncanonical_execution_claim_withheld:'
@@ -2292,9 +2311,16 @@ _PROMPT_SLIM_PRIORITY_KEYS = (
     'data_quality_warnings',
     'specialist_disagreement',
     'traceability',
+    'scores',
+    'factor_summary',
+    'symbol_day_context',
+    'liquidity_context',
+    'macro_context',
     'market_regime_context',
     'decision_input_quality_context',
     'decider_data_quality_context',
+    'signal_envelopes',
+    'market_context',
     'core_post_response_revalidation',
     'narrative_execution_authority',
     'pre_decider_enrichment_context',
@@ -2436,7 +2462,7 @@ def _compress_prompt_value(value: Any, *, depth: int = 0) -> Any:
             if key not in set(ordered_keys)
             and not str(key).startswith('_')
         )
-        limit = 18 if depth <= 1 else 10
+        limit = 20 if depth == 0 else 18 if depth == 1 else 10
         selected_keys = ordered_keys[:limit]
         compact = {
             str(key): (

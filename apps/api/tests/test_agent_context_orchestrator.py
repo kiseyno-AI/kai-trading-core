@@ -2797,6 +2797,109 @@ class RepairJsonTailTests(unittest.TestCase):
             'signal_envelope_v1',
         )
 
+    def test_compressed_actual_signal_decider_payload_keeps_signal_and_market_contexts(self):
+        market_context = {
+            'market': 'KOSPI',
+            'market_state': 'closed',
+            'breadth': {'advancers': 510, 'decliners': 380},
+        }
+        payload = build_signal_decider_payload(
+            item={
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'price_context': {'close_price': 71000, 'volume': 120000},
+                'scores': {
+                    'momentum': {
+                        'status': 'available',
+                        'score': 0.91,
+                    }
+                },
+                'factor_summary': {
+                    'requested_market_date': '2026-04-14',
+                    'factor_scores': {
+                        'momentum': {
+                            'status': 'available',
+                            'score': 0.91,
+                            'components_used': 3,
+                            'components_possible': 3,
+                        }
+                    },
+                },
+                'liquidity_context': {'turnover': {'trading_value_krw': 8520000000}},
+                'decider_data_quality_context': {'status': 'available'},
+                'decision_input_quality_context': {
+                    'final_judgment': {'hard_blocks': []},
+                },
+                'pre_decider_enrichment_context': {'status': 'available'},
+                'market_regime_context': {'posture': 'normal'},
+                'macro_context': {
+                    'status': 'available',
+                    'macro_regime_summary': {'growth_label': 'growth_stable'},
+                },
+                'signal_envelopes': [
+                    {
+                        'schema_version': 'signal_envelope_v1',
+                        'source_name': 'price:daily',
+                        'source_type': 'market_data',
+                        'symbol': '005930',
+                        'market_date': '2026-04-14',
+                        'summary': '정규장 종가와 거래량이 확정됐습니다.',
+                    }
+                ],
+            },
+            market_date=date(2026, 4, 14),
+            request_run_id='request-run-compression-regression',
+            market_context=market_context,
+            upstream_summaries={
+                'technical-summarizer': {
+                    'summary': '추세와 거래량이 양호합니다.',
+                }
+            },
+            upstream_traceability={
+                'technical-summarizer': {'run_id': 'technical-run-1'},
+            },
+            signal_decider_agent_name='signal-decider',
+            signal_decider_policy={},
+        )
+        payload['source_revalidation_request'] = {
+            'schema_version': 'decider_source_revalidation_request_v1',
+        }
+        payload['decision_input_generation_fence'] = {
+            'schema_version': 'decision_input_generation_fence_v1',
+            'enforcement': 'required',
+        }
+
+        compressed = compressed_batch_item_for_prompt(payload)
+
+        self.assertIsInstance(compressed['signal_envelopes'], list)
+        self.assertEqual(
+            compressed['signal_envelopes'][0]['source_name'],
+            'price:daily',
+        )
+        self.assertEqual(compressed['market_context'], market_context)
+        self.assertEqual(
+            compressed['symbol_day_context']['price_context']['close_price'],
+            71000,
+        )
+        self.assertEqual(
+            compressed['liquidity_context']['turnover']['trading_value_krw'],
+            8520000000,
+        )
+        self.assertEqual(compressed['macro_context']['status'], 'available')
+        self.assertEqual(compressed['scores']['momentum']['score'], 0.91)
+        self.assertEqual(
+            compressed['factor_summary']['factor_scores']['momentum']['score'],
+            0.91,
+        )
+        self.assertEqual(
+            compressed['core_post_response_revalidation']['status'],
+            'enforced_by_core_after_model_response',
+        )
+        self.assertEqual(
+            compressed['narrative_execution_authority']['status'],
+            'noncanonical_narratives_are_not_current_execution_evidence',
+        )
+
     def test_build_signal_decider_payload_preserves_degraded_macro_context_statuses(self):
         for status in ('partial', 'unavailable', 'stale'):
             with self.subTest(status=status):
@@ -3281,6 +3384,88 @@ class RepairJsonTailTests(unittest.TestCase):
             'not_a_pre_decision_evidence_gap',
         )
 
+    def test_trim_batch_item_for_prompt_preserves_unrelated_structured_risk_reason(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'signal_envelopes': [
+                    {
+                        'structured_conflict': {
+                            'source_a': 'price_context',
+                            'source_b': 'liquidity_context',
+                            'finding': '종가가 다릅니다',
+                            'decision': '가격 원천 충돌 해소 전 대기',
+                            'reason': '시장 위험회피 국면',
+                            'blocker': '거래대금 원천 불일치로 실행 근거 부족',
+                        }
+                    }
+                ],
+            }
+        )
+
+        conflict = trimmed['signal_envelopes'][0]['structured_conflict']
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            conflict['finding'],
+        )
+        self.assertIn('stale_price_conflict_claim', conflict['decision'])
+        self.assertIn('stale_price_conflict_claim', conflict['blocker'])
+        self.assertEqual(conflict['reason'], '시장 위험회피 국면')
+
+    def test_trim_batch_item_for_prompt_preserves_independent_structured_decision_and_blocker(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'signal_envelopes': [
+                    {
+                        'structured_conflict': {
+                            'source_a': 'price_context',
+                            'source_b': 'liquidity_context',
+                            'finding': '종가가 다릅니다',
+                            'decision': '거래정지로 매수 불가',
+                            'blocker': '시장 위험회피로 신규 매수 제한',
+                        }
+                    }
+                ],
+            }
+        )
+
+        conflict = trimmed['signal_envelopes'][0]['structured_conflict']
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            conflict['finding'],
+        )
+        self.assertEqual(conflict['decision'], '거래정지로 매수 불가')
+        self.assertEqual(conflict['blocker'], '시장 위험회피로 신규 매수 제한')
+
+    def test_trim_batch_item_for_prompt_qualifies_core_revalidation_controls(self):
+        technical_corpus = [
+            '기술적 지지선 재검증 완료 후 반등이 확인됐습니다.',
+            '저항 돌파 재검증 통과로 추세가 강화됐습니다.',
+            '기술적 지지 재검증 결과 상승 추세가 유지됩니다.',
+        ]
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'upstream_summaries': {
+                    'technical-summarizer': {
+                        'technical_corpus': technical_corpus,
+                        'core_control': 'Core 재검증 완료 결과가 없어 대기합니다.',
+                        'source_control': '원천 재검증 통과 결과가 제공되지 않았습니다.',
+                        'fence_control': '입력 생성 펜스 재검증 결과를 확인해야 합니다.',
+                    }
+                },
+            }
+        )
+
+        summary = trimmed['upstream_summaries']['technical-summarizer']
+        self.assertEqual(summary['technical_corpus'], technical_corpus)
+        for key in ('core_control', 'source_control', 'fence_control'):
+            self.assertIn('core_post_response_revalidation_claim', summary[key])
+
     def test_trim_batch_item_for_prompt_withholds_stale_narrative_execution_blockers(self):
         source_item = {
             'symbol': '005930',
@@ -3661,7 +3846,7 @@ class RepairJsonTailTests(unittest.TestCase):
             structured_conflict['finding'],
         )
         self.assertIn(
-            'structured_noncanonical_market_activity_conflict',
+            '해소 전 대기',
             structured_conflict['decision'],
         )
         self.assertEqual(structured_conflict['recommendation'], 'wait')
@@ -3676,10 +3861,7 @@ class RepairJsonTailTests(unittest.TestCase):
                 'structured_noncanonical_market_activity_conflict',
                 structured_variant['finding'],
             )
-            self.assertIn(
-                'structured_noncanonical_market_activity_conflict',
-                structured_variant['decision'],
-            )
+            self.assertEqual(structured_variant['decision'], '해소 전 대기합니다.')
         self.assertEqual(
             signal_envelope['sources_conflict']['thesis_summary'],
             '수급과 추세는 양호합니다.',
@@ -3703,13 +3885,13 @@ class RepairJsonTailTests(unittest.TestCase):
             ancestor['child']['finding'],
         )
         self.assertIn(
-            'structured_noncanonical_market_activity_conflict',
+            '해소 전 대기',
             ancestor['child']['decision'],
         )
         for trigger_condition in previous['trigger_conditions']:
             self.assertIn('stale_price_conflict_claim', trigger_condition)
         authority = trimmed['narrative_execution_authority']
-        self.assertEqual(authority['sanitized_claim_count'], 48)
+        self.assertEqual(authority['sanitized_claim_count'], 44)
         self.assertEqual(
             authority['sanitized_sections'],
             [
