@@ -174,7 +174,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - `signal_decider` can be inferred as `completed` from same-date `agent_context_feedback` rows for `agent_name=signal-decider` and/or same-date `signal_decider_decision_snapshots`.
 - These persisted-output inferences are storage availability signals. They do not silently relax prerequisite gates.
 - A late decision snapshot whose canonical observation time is at or after its target KRX open is not valid persisted authority. It is a tombstone for next-open, replay, evaluation, calibration, eligibility, and policy-candidate consumers; readers must not fall back to an older snapshot for the same source date.
-- Once the next-open action window has passed, recovered feedback, decider, plan, and evaluation stages use an auditable terminal `skipped` outcome with `reason=next_open_window_expired`. This prevents a historical replay from manufacturing stale BUY authority or post-open learning evidence.
+- Once the next-open action window has passed, recovered feedback, decider, evaluation, and next-open plan stages use an auditable terminal `skipped` outcome with `reason=next_open_window_expired` by default. `allow_expired_analysis_replay=true` is the narrow opt-in exception for historical analysis: it permits the feedback, decider, and evaluation stages to run and persist their historical outputs. When persisted structural prerequisites are missing, that exception also requires `bypass_prerequisite_gate=true`; neither flag alone bypasses the normal structural gate. These historical outputs grant no BUY or execution authority: `next_open_execution_plan` remains fenced, returns `next_open_window_expired`, and cannot create or refresh plan items.
 
 ### gate summary
 
