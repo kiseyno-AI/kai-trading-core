@@ -1130,8 +1130,25 @@ class KISRealtimePriceService:
                     self._wait_recheck_symbols.difference(next_wait_order)
                 )
             )
+            protected_base_order = [
+                symbol
+                for symbol in next_base_order
+                if symbol in self._protected_symbols
+            ]
+            passive_base_order = [
+                symbol
+                for symbol in next_base_order
+                if symbol not in self._protected_symbols
+                and symbol not in self._wait_recheck_symbols
+            ]
             self._desired_symbol_order = list(
-                dict.fromkeys([*next_base_order, *next_wait_order])
+                dict.fromkeys(
+                    [
+                        *protected_base_order,
+                        *next_wait_order,
+                        *passive_base_order,
+                    ]
+                )
             )
             self._desired_symbols = set(self._desired_symbol_order)
             subscription_changed = bool(

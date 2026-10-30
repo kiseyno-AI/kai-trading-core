@@ -1001,6 +1001,37 @@ def test_wait_membership_is_appended_below_holdings_and_exec_protection() -> Non
     assert merged.membership_complete is True
 
 
+def test_wait_membership_precedes_passive_observation_symbols_at_subscription_cap() -> None:
+    observed_at = datetime(2026, 10, 21, 0, 1, tzinfo=timezone.utc)
+    service = KISRealtimePriceService()
+    merged = merge_wait_recheck_monitored_source(
+        KISRealtimeMonitoredSymbolSource(
+            symbols=('000660', '005930', '035420'),
+            market_date=None,
+            source_version=observed_at,
+            membership_complete=True,
+            protected_symbols=('000660',),
+            critical_protected_symbols=('000660',),
+        ),
+        symbols=('035420',),
+        source_version=observed_at + timedelta(seconds=1),
+        membership_complete=True,
+    )
+
+    with patch.object(settings, 'kis_realtime_price_max_subscriptions', 2):
+        service._apply_runtime_monitored_source(
+            merged,
+            trigger='test:wait-priority',
+            expected_observation_revision=None,
+        )
+
+        snapshot = service.subscription_snapshot()
+
+    assert snapshot['allowed_symbols'] == ['000660', '035420']
+    assert snapshot['limited_symbols'] == ['005930']
+    assert snapshot['wait_recheck_symbols'] == ['035420']
+
+
 def test_wait_membership_partition_replaces_old_symbols_when_exec_is_partial() -> None:
     observed_at = datetime(2026, 10, 21, 0, 1, tzinfo=timezone.utc)
     service = KISRealtimePriceService()
