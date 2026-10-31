@@ -47,6 +47,7 @@ from app.dart.share_issuance_audit import (
     DART_SHARE_ISSUANCE_OUTCOME_MANIFEST_VERSION,
 )
 from app.dart.signals_service import (
+    MAX_AUDIT_BACKFILL_CONCURRENCY,
     SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION,
     SHARE_ISSUANCE_NEGATIVE_COVERAGE_DAYS,
     SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA,
@@ -109,6 +110,9 @@ from app.signals.unified_value_factor import (
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
 from app.scanner.state import scanner_state
 from app.signals.daily_signal_features import daily_signal_feature_service
+
+
+DART_AUDIT_BACKFILL_OPS_DEFAULT_CONCURRENCY = 4
 
 
 def bootstrap_runtime() -> None:
@@ -241,6 +245,7 @@ def inspect_pykrx_enrichment(
 def run_dart_fundamentals_daily_if_due(
     *,
     market_date: str | None = None,
+    symbols: str | None = None,
     symbol_limit: int | None = None,
     symbol_offset: int = 0,
     capture_limit: int = 500,
@@ -248,10 +253,29 @@ def run_dart_fundamentals_daily_if_due(
     force: bool = False,
     fs_div: str | None = None,
 ) -> dict[str, Any]:
+    parsed_symbols: list[str] | None = None
+    if symbols is not None:
+        if symbol_limit is not None or symbol_offset != 0:
+            raise ValueError(
+                '--symbols cannot be combined with a non-default '
+                '--symbol-limit or --symbol-offset'
+            )
+        parsed_symbols = []
+        for value in symbols.split(','):
+            stock_code = value.strip()
+            if not stock_code or not stock_code.isdigit() or len(stock_code) > 6:
+                raise ValueError(
+                    '--symbols must contain comma-separated stock codes of 1 to 6 digits'
+                )
+            normalized_stock_code = stock_code.zfill(6)
+            if normalized_stock_code not in parsed_symbols:
+                parsed_symbols.append(normalized_stock_code)
+
     bootstrap_runtime()
     return asyncio.run(
         dart_fundamentals_capture_service.run_daily_incremental_refresh(
             market_date=market_date,
+            symbols=parsed_symbols,
             symbol_limit=symbol_limit,
             symbol_offset=symbol_offset,
             capture_limit=capture_limit,
@@ -273,6 +297,7 @@ def backfill_dart_audit_signals(
     market_date: str,
     limit: int = 25,
     after_event_id: int = 0,
+    concurrency: int = DART_AUDIT_BACKFILL_OPS_DEFAULT_CONCURRENCY,
     dry_run: bool = True,
 ) -> dict[str, Any]:
     bootstrap_runtime()
@@ -281,6 +306,7 @@ def backfill_dart_audit_signals(
             market_date=date.fromisoformat(market_date),
             limit=limit,
             after_event_id=after_event_id,
+            concurrency=concurrency,
             dry_run=dry_run,
         )
     )
@@ -1950,6 +1976,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Run DART fundamentals daily incremental refresh directly',
     )
     dart_daily_parser.add_argument('--market-date')
+    dart_daily_parser.add_argument(
+        '--symbols',
+        help='Optional comma-separated exact stock-code scope',
+    )
     dart_daily_parser.add_argument('--symbol-limit', type=int)
     dart_daily_parser.add_argument('--symbol-offset', type=int, default=0)
     dart_daily_parser.add_argument('--capture-limit', type=int, default=500)
@@ -1970,6 +2000,13 @@ def _build_parser() -> argparse.ArgumentParser:
     dart_audit_backfill_parser.add_argument('--market-date', required=True)
     dart_audit_backfill_parser.add_argument('--limit', type=int, default=25)
     dart_audit_backfill_parser.add_argument('--after-event-id', type=int, default=0)
+    dart_audit_backfill_parser.add_argument(
+        '--concurrency',
+        type=int,
+        choices=range(1, MAX_AUDIT_BACKFILL_CONCURRENCY + 1),
+        default=DART_AUDIT_BACKFILL_OPS_DEFAULT_CONCURRENCY,
+        help='Maximum concurrent DART document captures per wave (default: 4).',
+    )
     dart_audit_backfill_mode = dart_audit_backfill_parser.add_mutually_exclusive_group()
     dart_audit_backfill_mode.add_argument(
         '--apply',
@@ -2510,6 +2547,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     elif args.command == 'dart-fundamentals-daily-run-if-due':
         payload = run_dart_fundamentals_daily_if_due(
             market_date=args.market_date,
+            symbols=args.symbols,
             symbol_limit=args.symbol_limit,
             symbol_offset=args.symbol_offset,
             capture_limit=args.capture_limit,
@@ -2524,6 +2562,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             market_date=args.market_date,
             limit=args.limit,
             after_event_id=args.after_event_id,
+            concurrency=args.concurrency,
             dry_run=args.dry_run,
         )
     elif args.command == 'dart-share-issuance-evidence-backfill':

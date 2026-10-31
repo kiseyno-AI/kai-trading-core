@@ -1,3 +1,4 @@
+import asyncio
 import io
 import unittest
 import zipfile
@@ -846,6 +847,150 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(service.capture_audit_signal_for_event.await_count, 3)
 
+    async def test_backfill_missing_audit_signals_runs_bounded_ordered_waves(self):
+        event_ids = list(range(51, 56))
+        repository = FakeSignalsRepository(
+            [
+                {
+                    'event_id': event_id,
+                    'rcept_no': f'202604220000{event_id}',
+                    'stock_code': f'{event_id:06d}',
+                    'receipt_date': '2026-04-22',
+                    'report_nm': '사업보고서',
+                }
+                for event_id in event_ids
+            ]
+        )
+        service = DartSignalsService(
+            client=FakeSignalsClient(members=[]),
+            repository=repository,
+        )
+        started: list[int] = []
+        release = {event_id: asyncio.Event() for event_id in event_ids}
+        started_counts = {count: asyncio.Event() for count in (2, 4, 5)}
+        active_count = 0
+        max_active_count = 0
+
+        async def capture(*, rcept_no):
+            nonlocal active_count, max_active_count
+            event_id = int(rcept_no[-2:])
+            started.append(event_id)
+            active_count += 1
+            max_active_count = max(max_active_count, active_count)
+            if len(started) in started_counts:
+                started_counts[len(started)].set()
+            await release[event_id].wait()
+            active_count -= 1
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': {'opinion_code': 'unqualified'},
+            }
+
+        service.capture_audit_signal_for_event = AsyncMock(side_effect=capture)
+        backfill_task = asyncio.create_task(
+            service.backfill_missing_annual_audit_signals(
+                market_date=date(2026, 4, 30),
+                limit=5,
+                after_event_id=50,
+                concurrency=2,
+                dry_run=False,
+            )
+        )
+
+        await asyncio.wait_for(started_counts[2].wait(), timeout=1)
+        self.assertEqual(started, [51, 52])
+        release[52].set()
+        await asyncio.sleep(0)
+        self.assertEqual(started, [51, 52])
+        release[51].set()
+
+        await asyncio.wait_for(started_counts[4].wait(), timeout=1)
+        self.assertEqual(started, [51, 52, 53, 54])
+        release[54].set()
+        await asyncio.sleep(0)
+        self.assertEqual(started, [51, 52, 53, 54])
+        release[53].set()
+
+        await asyncio.wait_for(started_counts[5].wait(), timeout=1)
+        self.assertEqual(started, event_ids)
+        release[55].set()
+        result = await asyncio.wait_for(backfill_task, timeout=1)
+
+        self.assertEqual(max_active_count, 2)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['concurrency'], 2)
+        self.assertEqual(result['candidates_attempted'], 5)
+        self.assertEqual(result['audit_signals_captured'], 5)
+        self.assertEqual(
+            [item['event_id'] for item in result['results']],
+            event_ids,
+        )
+        self.assertEqual(result['next_after_event_id'], 55)
+        self.assertEqual(result['next_forward_after_event_id'], 55)
+
+    async def test_backfill_circuit_breaker_finishes_started_wave_then_stops(self):
+        event_ids = list(range(61, 66))
+        repository = FakeSignalsRepository(
+            [
+                {
+                    'event_id': event_id,
+                    'rcept_no': f'202604220000{event_id}',
+                    'stock_code': f'{event_id:06d}',
+                    'receipt_date': '2026-04-22',
+                    'report_nm': '사업보고서',
+                }
+                for event_id in event_ids
+            ]
+        )
+        service = DartSignalsService(
+            client=FakeSignalsClient(members=[]),
+            repository=repository,
+        )
+
+        async def capture(*, rcept_no):
+            event_id = int(rcept_no[-2:])
+            if event_id in {61, 62, 63}:
+                raise TimeoutError(f'DART timed out for {event_id}')
+            if event_id == 64:
+                return {
+                    'rcept_no': rcept_no,
+                    'audit_signal': {'opinion_code': 'unqualified'},
+                }
+            raise AssertionError('the circuit breaker must stop the next wave')
+
+        service.capture_audit_signal_for_event = AsyncMock(side_effect=capture)
+
+        result = await service.backfill_missing_annual_audit_signals(
+            market_date=date(2026, 4, 30),
+            limit=5,
+            after_event_id=60,
+            concurrency=2,
+            dry_run=False,
+        )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['candidates_attempted'], 4)
+        self.assertEqual(result['events_failed'], 3)
+        self.assertEqual(result['audit_signals_captured'], 1)
+        self.assertEqual(result['retry_event_ids'], [61, 62, 63])
+        self.assertEqual(result['failed_event_ids'], [61, 62, 63])
+        self.assertEqual(result['unattempted_event_ids'], [65])
+        self.assertEqual(result['next_after_event_id'], 60)
+        self.assertEqual(result['next_forward_after_event_id'], 64)
+        self.assertEqual(
+            [item['status'] for item in result['results']],
+            ['failed', 'failed', 'failed', 'captured'],
+        )
+        self.assertEqual(
+            result['circuit_breaker'],
+            {
+                'tripped': True,
+                'threshold': 3,
+                'consecutive_systemic_failures': 3,
+            },
+        )
+        self.assertEqual(service.capture_audit_signal_for_event.await_count, 4)
+
     async def test_backfill_missing_audit_signals_rejects_unbounded_or_invalid_scope(self):
         service = DartSignalsService(
             client=FakeSignalsClient(members=[]),
@@ -862,6 +1007,16 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
                 market_date=date(2026, 4, 30),
                 after_event_id=-1,
             )
+        for concurrency in (0, 9):
+            with self.subTest(concurrency=concurrency):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    'concurrency must be between 1 and 8',
+                ):
+                    await service.backfill_missing_annual_audit_signals(
+                        market_date=date(2026, 4, 30),
+                        concurrency=concurrency,
+                    )
 
 
 class DartSignalsRepositoryPostgresTests(unittest.TestCase):
