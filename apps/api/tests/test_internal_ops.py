@@ -791,6 +791,62 @@ class InternalOpsTests(unittest.TestCase):
             'duplicate_corp_code_mapping_across_stock_codes',
         )
 
+    def test_backfill_dart_share_issuance_evidence_rejects_conflicting_corp_claim_across_pages(self) -> None:
+        mapping = self._authoritative_mapping(
+            resolved=[
+                {
+                    'stock_code': '000660',
+                    'corp_code': 'corp-x',
+                    'corp_name': '000660',
+                }
+            ],
+            conflicting_mappings=[
+                {
+                    'stock_code': '005930',
+                    'corp_codes': ['corp-x', 'corp-y'],
+                    'reason': 'ambiguous_stock_to_corp_mapping',
+                }
+            ],
+        )
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(return_value=mapping),
+            ) as lookup_corp_codes,
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(return_value={'status': 'completed'}),
+            ) as sync_disclosures,
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=1,
+                stock_codes='000660,005930',
+                dry_run=True,
+            )
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=1,
+                stock_codes='000660,005930',
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        lookup_corp_codes.assert_awaited_once_with(
+            stock_codes=['000660', '005930']
+        )
+        sync_disclosures.assert_not_awaited()
+        self.assertTrue(result['has_more'])
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(
+            result['lookup_errors'][0]['reason'],
+            'duplicate_corp_code_mapping_across_stock_codes',
+        )
+
     def test_backfill_dart_share_issuance_evidence_fails_closed_when_full_manifest_lookup_fails(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime'),

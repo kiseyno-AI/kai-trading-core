@@ -1067,6 +1067,14 @@ async def _backfill_dart_share_issuance_evidence_async(
                 stock_codes_by_corp.setdefault(corp_code, set()).add(
                     stock_code
                 )
+    for stock_code, conflict_items in conflicts_by_stock.items():
+        for conflict_item in conflict_items:
+            for value in conflict_item.get('corp_codes') or []:
+                corp_code = str(value or '').strip()
+                if corp_code:
+                    stock_codes_by_corp.setdefault(corp_code, set()).add(
+                        stock_code
+                    )
     duplicate_corp_codes = {
         corp_code
         for corp_code, stock_codes_for_corp in stock_codes_by_corp.items()
