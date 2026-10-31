@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import time
 from contextvars import ContextVar
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -42,6 +46,11 @@ _SENSITIVE_KEYS = {
 _SAFE_HEADERS = {'accept', 'content-length', 'content-type', 'host', 'user-agent', 'x-request-id'}
 _MAX_AUDIT_STRING_LENGTH = 300
 _MAX_AUDIT_COLLECTION_ITEMS = 25
+_IDEMPOTENT_READ_METHODS = frozenset({'GET', 'HEAD'})
+_TRANSIENT_READ_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_MAX_READ_ATTEMPTS = 3
+_READ_RETRY_BASE_DELAY_SECONDS = 0.25
+_READ_RETRY_MAX_DELAY_SECONDS = 2.0
 
 
 class JsonLineFormatter(logging.Formatter):
@@ -237,6 +246,11 @@ def log_fetch_event(
     log_upstream_event(payload)
 
 
+def exception_message(error: BaseException) -> str:
+    message = str(error).strip()
+    return message or type(error).__name__
+
+
 def build_api_request_event(
     *,
     request_id: str,
@@ -270,7 +284,7 @@ def build_api_request_event(
         'response_content_length': response_content_length,
         'response_content_type': (response_headers or {}).get('content-type') if response_headers else None,
         'error_type': type(error).__name__ if error else None,
-        'error_message': str(error) if error else None,
+        'error_message': exception_message(error) if error else None,
     }
 
 
@@ -328,9 +342,106 @@ async def request_with_audit(
             'response_content_length': response.headers.get('content-length') if response else None,
             'response_content_type': response.headers.get('content-type') if response else None,
             'error_type': type(error).__name__ if error else None,
-            'error_message': str(error) if error else None,
+            'error_message': exception_message(error) if error else None,
         }
         log_upstream_event(payload)
+
+
+def _retry_after_delay_seconds(value: str | None) -> float | None:
+    normalized = str(value or '').strip()
+    if not normalized:
+        return None
+    try:
+        delay = float(normalized)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(normalized)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+    if not math.isfinite(delay):
+        return None
+    return min(max(0.0, delay), _READ_RETRY_MAX_DELAY_SECONDS)
+
+
+async def request_read_with_retry_and_audit(
+    client: httpx.AsyncClient,
+    service: str,
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    params: Mapping[str, Any] | None = None,
+    json_body: Any = None,
+    secret_values: Iterable[str] | None = None,
+    max_attempts: int = _MAX_READ_ATTEMPTS,
+) -> httpx.Response:
+    normalized_method = str(method or '').strip().upper()
+    if normalized_method not in _IDEMPOTENT_READ_METHODS:
+        raise ValueError('Upstream read retries are limited to GET and HEAD requests')
+    if not 1 <= max_attempts <= _MAX_READ_ATTEMPTS:
+        raise ValueError(f'max_attempts must be between 1 and {_MAX_READ_ATTEMPTS}')
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await request_with_audit(
+                client,
+                service,
+                normalized_method,
+                url,
+                headers=headers,
+                params=params,
+                json_body=json_body,
+                secret_values=secret_values,
+            )
+        except httpx.TransportError as exc:
+            if attempt >= max_attempts:
+                raise
+            delay = min(
+                _READ_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                _READ_RETRY_MAX_DELAY_SECONDS,
+            )
+            log_fetch_event(
+                service=service,
+                operation='upstream_read_retry',
+                status='retrying',
+                method=normalized_method,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                retry_delay_seconds=delay,
+                error_type=type(exc).__name__,
+                error_message=exception_message(exc),
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if response.status_code not in _TRANSIENT_READ_STATUS_CODES or attempt >= max_attempts:
+            return response
+
+        retry_after_delay = _retry_after_delay_seconds(response.headers.get('Retry-After'))
+        delay = retry_after_delay
+        if delay is None:
+            delay = min(
+                _READ_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                _READ_RETRY_MAX_DELAY_SECONDS,
+            )
+        status_code = response.status_code
+        await response.aclose()
+        log_fetch_event(
+            service=service,
+            operation='upstream_read_retry',
+            status='retrying',
+            method=normalized_method,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            retry_delay_seconds=delay,
+            status_code=status_code,
+        )
+        await asyncio.sleep(delay)
+
+    raise AssertionError('unreachable upstream read retry state')
 
 
 def download_bytes_with_audit(*, service: str, url: str, timeout: float) -> bytes:
@@ -373,6 +484,6 @@ def download_bytes_with_audit(*, service: str, url: str, timeout: float) -> byte
                 'response_content_length': response_headers.get('content-length') if response_headers else len(payload) or None,
                 'response_content_type': response_headers.get('content-type') if response_headers else None,
                 'error_type': type(error).__name__ if error else None,
-                'error_message': str(error) if error else None,
+                'error_message': exception_message(error) if error else None,
             }
         )

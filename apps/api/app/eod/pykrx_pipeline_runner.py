@@ -8,9 +8,12 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable, Sequence
 
 from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_result_has_no_ready_content,
+    daily_pipeline_warning_metadata,
     daily_pipeline_zero_scope_gate_status,
+    normalize_daily_pipeline_stage_status,
 )
 from app.eod.pykrx_enrichment import DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
 from app.eod.pykrx_enrichment_gate import (
@@ -530,7 +533,11 @@ def _consume_retry_failed_symbols(result: dict[str, Any]) -> list[str]:
     )
 
 
-def _resolve_result_status(result: dict[str, Any]) -> str:
+def _resolve_result_status(
+    result: dict[str, Any],
+    *,
+    stage_id: str | None = None,
+) -> str:
     if result.get('safe_skip') is True:
         return 'completed'
     if result.get('triggered') is False:
@@ -542,6 +549,11 @@ def _resolve_result_status(result: dict[str, Any]) -> str:
     zero_scope_gate_status = daily_pipeline_zero_scope_gate_status(result)
     if zero_scope_gate_status:
         return zero_scope_gate_status
+    status = normalize_daily_pipeline_stage_status(
+        stage_id=stage_id,
+        status=status,
+        outcome=result,
+    )
     if status != 'completed':
         return status
     if daily_pipeline_result_has_no_ready_content(result):
@@ -583,7 +595,10 @@ def _is_satisfied_followup_result(
     stage_id: str | None = None,
 ) -> bool:
     outcome = dict(result)
-    outcome['status'] = _resolve_result_status(result)
+    outcome['status'] = _resolve_result_status(
+        result,
+        stage_id=stage_id,
+    )
     if stage_id:
         outcome['stage'] = stage_id
     return daily_pipeline_outcome_is_satisfied(outcome)
@@ -737,6 +752,7 @@ class _OfficialDailyPipelineTracker:
         self.market_date: str | None = None
         self.eod_run_id: int | None = None
         self.stage_statuses: dict[str, str] = {}
+        self.stage_outcomes: dict[str, dict[str, Any]] = {}
         self.stage_source_run_ids: dict[str, dict[str, Any]] = {}
         self.enabled = service is not None
 
@@ -830,8 +846,7 @@ class _OfficialDailyPipelineTracker:
     ) -> None:
         if not self.enabled or self.service is None or self.pipeline_run_id is None or self.market_date is None:
             return
-        normalized_status = _normalize_stage_status(status)
-        self.stage_statuses[stage] = normalized_status
+        raw_status = _normalize_stage_status(status)
         merged_source_run_ids = dict(
             self.stage_source_run_ids.get(stage, {})
         )
@@ -844,6 +859,38 @@ class _OfficialDailyPipelineTracker:
             'mode': 'auto_eod_pipeline_tracking',
             'progress_source': 'auto_eod_stage_progress',
             **dict(details or {}),
+        }
+        normalized_status = normalize_daily_pipeline_stage_status(
+            stage_id=stage,
+            status=raw_status,
+            outcome={
+                'stage': stage,
+                'status': raw_status,
+                'processed': processed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+                'details': merged_details,
+            },
+        )
+        if normalized_status != raw_status:
+            merged_details.setdefault(
+                'status_canonicalized_from',
+                raw_status,
+            )
+            merged_details.setdefault(
+                'status_canonicalization_reason',
+                'terminal_optional_context_unavailable',
+            )
+        self.stage_statuses[stage] = normalized_status
+        self.stage_outcomes[stage] = {
+            'stage': stage,
+            'status': normalized_status,
+            'processed': processed,
+            'total': total,
+            'succeeded': succeeded,
+            'failed': failed,
+            'details': merged_details,
         }
         try:
             self.service.update_stage(
@@ -933,6 +980,9 @@ class _OfficialDailyPipelineTracker:
         if not self.enabled or self.service is None or self.pipeline_run_id is None:
             return
         final_status = status or self.resolve_overall_status()
+        warning_metadata = daily_pipeline_warning_metadata(
+            self.stage_outcomes,
+        )
         last_error: Exception | None = None
         for attempt in range(1, DAILY_PIPELINE_TRACKER_FINISH_ATTEMPTS + 1):
             try:
@@ -943,6 +993,7 @@ class _OfficialDailyPipelineTracker:
                     run_metadata={
                         'stage_statuses': dict(self.stage_statuses),
                         'eod_collection_run_id': self.eod_run_id,
+                        **warning_metadata,
                     },
                 )
                 return
@@ -983,7 +1034,16 @@ class _OfficialDailyPipelineTracker:
             )
 
     def resolve_overall_status(self) -> str:
-        statuses = set(self.stage_statuses.values())
+        warning_stage_ids = set(
+            daily_pipeline_nonblocking_warning_stage_ids(
+                self.stage_outcomes,
+            )
+        )
+        statuses = {
+            status
+            for stage_id, status in self.stage_statuses.items()
+            if stage_id not in warning_stage_ids
+        }
         if not statuses:
             return 'completed'
         if 'failed' in statuses:
@@ -3440,7 +3500,10 @@ def run_market_data_pipeline(
         *,
         default_total: int = 0,
     ) -> None:
-        stage_status = _resolve_result_status(stage_result)
+        stage_status = _resolve_result_status(
+            stage_result,
+            stage_id=stage_id,
+        )
         counts = _extract_result_counts(stage_result, default_total=default_total)
         persist_stage_progress(
             stage=stage_id,

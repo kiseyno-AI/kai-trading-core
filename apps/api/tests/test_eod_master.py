@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import zipfile
 from contextlib import contextmanager
+from http.client import IncompleteRead
+from urllib.error import HTTPError
+
 import pytest
 
 from app.eod import master
@@ -28,6 +32,128 @@ def _master_line(
 @contextmanager
 def _available_master_lock(**_kwargs):
     yield True
+
+
+def test_download_zip_bytes_retries_transient_network_error(monkeypatch) -> None:
+    attempts: list[str] = []
+
+    def fake_download(*, service: str, url: str, timeout: float) -> bytes:
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise TimeoutError('timed out')
+        return b'zip-bytes'
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(master, 'download_bytes_with_audit', fake_download)
+    monkeypatch.setattr(master.time, 'sleep', sleeps.append)
+
+    assert master._download_zip_bytes('https://example.test/master.zip') == b'zip-bytes'
+    assert attempts == [
+        'https://example.test/master.zip',
+        'https://example.test/master.zip',
+    ]
+    assert sleeps == [master.MASTER_DOWNLOAD_RETRY_BASE_SECONDS]
+
+
+def test_download_zip_bytes_retries_incomplete_read_once_then_succeeds(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    def fake_download(*, service: str, url: str, timeout: float) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise IncompleteRead(b'partial archive', 128)
+        return b'complete-zip-bytes'
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(master, 'download_bytes_with_audit', fake_download)
+    monkeypatch.setattr(master.time, 'sleep', sleeps.append)
+
+    assert (
+        master._download_zip_bytes('https://example.test/master.zip')
+        == b'complete-zip-bytes'
+    )
+    assert attempts == 2
+    assert sleeps == [master.MASTER_DOWNLOAD_RETRY_BASE_SECONDS]
+
+
+def test_download_zip_bytes_retries_only_transient_http_statuses(monkeypatch) -> None:
+    attempts = 0
+
+    def fake_download(*, service: str, url: str, timeout: float) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HTTPError(url, 503, 'service unavailable', None, None)
+        return b'zip-bytes'
+
+    monkeypatch.setattr(master, 'download_bytes_with_audit', fake_download)
+    monkeypatch.setattr(master.time, 'sleep', lambda _seconds: None)
+
+    assert master._download_zip_bytes('https://example.test/master.zip') == b'zip-bytes'
+    assert attempts == 2
+
+
+def test_download_zip_bytes_stops_after_bounded_attempts(monkeypatch) -> None:
+    attempts = 0
+
+    def fake_download(*, service: str, url: str, timeout: float) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError('still timed out')
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(master, 'download_bytes_with_audit', fake_download)
+    monkeypatch.setattr(master.time, 'sleep', sleeps.append)
+
+    with pytest.raises(TimeoutError, match='still timed out'):
+        master._download_zip_bytes('https://example.test/master.zip')
+
+    assert attempts == master.MASTER_DOWNLOAD_MAX_ATTEMPTS
+    assert sleeps == [
+        master.MASTER_DOWNLOAD_RETRY_BASE_SECONDS,
+        master.MASTER_DOWNLOAD_RETRY_BASE_SECONDS * 2,
+    ]
+
+
+def test_download_zip_bytes_does_not_retry_nontransient_http_status(monkeypatch) -> None:
+    attempts = 0
+
+    def fake_download(*, service: str, url: str, timeout: float) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        raise HTTPError(url, 404, 'not found', None, None)
+
+    monkeypatch.setattr(master, 'download_bytes_with_audit', fake_download)
+    monkeypatch.setattr(
+        master.time,
+        'sleep',
+        lambda _seconds: pytest.fail('nontransient failures must not sleep'),
+    )
+
+    with pytest.raises(HTTPError) as exc_info:
+        master._download_zip_bytes('https://example.test/master.zip')
+
+    assert exc_info.value.code == 404
+    assert attempts == 1
+
+
+def test_load_master_does_not_retry_invalid_zip_payload(monkeypatch) -> None:
+    attempts = 0
+
+    def fake_download(*, service: str, url: str, timeout: float) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        return b'not-a-zip'
+
+    monkeypatch.setattr(master, 'download_bytes_with_audit', fake_download)
+
+    with pytest.raises(zipfile.BadZipFile):
+        master.load_kospi_master()
+
+    assert attempts == 1
 
 
 @pytest.mark.parametrize('security_group', ['ST', 'RT', 'IF', 'MF', 'DR', 'FS'])

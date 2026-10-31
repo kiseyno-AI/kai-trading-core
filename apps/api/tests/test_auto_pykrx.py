@@ -370,6 +370,25 @@ class PykrxPipelineResultStatusTests(TestCase):
 
         self.assertEqual(_resolve_result_status(result), 'partial')
 
+    def test_official_optional_unavailable_result_is_partial(self) -> None:
+        result = {
+            'triggered': True,
+            'status': 'unavailable',
+            'reason': 'external_news_storage_unavailable',
+        }
+
+        self.assertEqual(
+            _resolve_result_status(
+                result,
+                stage_id='external_news_enrich',
+            ),
+            'partial',
+        )
+        self.assertEqual(
+            _resolve_result_status(result, stage_id='price_collection'),
+            'unavailable',
+        )
+
     def test_factor_payload_without_ready_content_is_partial(self) -> None:
         result = {
             'status': 'completed',
@@ -1836,6 +1855,55 @@ class PykrxBackfillServiceTests(TestCase):
             fake_run_state_service.finish_runs[-1]['run_metadata']['stage_statuses'],
             {'signal_decider_evaluations': 'partial'},
         )
+
+    def test_auto_tracker_completes_with_optional_context_warning(self) -> None:
+        fake_run_state_service = _FakeDailyPipelineRunStateService()
+        tracker = _OfficialDailyPipelineTracker(
+            service=fake_run_state_service,
+            log_fetch=MagicMock(),
+        )
+        tracker.start(
+            market_date='2026-04-03',
+            trigger='auto_close_scheduler',
+            requested_stages=['macro_context_refresh'],
+            resolved_stages=['macro_context_refresh'],
+            eod_run_id=12,
+            run_metadata={'mode': 'daily_auto'},
+        )
+        tracker.update_stage(
+            stage='macro_context_refresh',
+            status='unavailable',
+            current_step='macro_context_refresh_unavailable',
+            current_activity='Macro context completed with stale cache',
+            processed=3,
+            total=3,
+            succeeded=2,
+            failed=1,
+            details={
+                'result_summary': {
+                    'triggered': True,
+                    'status': 'unavailable',
+                    'remaining_retryable_events': 0,
+                },
+            },
+        )
+        tracker.finish_run()
+
+        completion = fake_run_state_service.finish_runs[-1]
+        self.assertEqual(tracker.stage_statuses['macro_context_refresh'], 'partial')
+        self.assertEqual(
+            fake_run_state_service.stage_updates[-1]['details'][
+                'status_canonicalized_from'
+            ],
+            'unavailable',
+        )
+        self.assertEqual(completion['status'], 'completed')
+        self.assertEqual(completion['run_metadata']['quality_status'], 'degraded')
+        self.assertEqual(
+            completion['run_metadata']['warning_stage_ids'],
+            ['macro_context_refresh'],
+        )
+        self.assertEqual(completion['run_metadata']['warning_count'], 1)
 
     def test_auto_tracker_preserves_feedback_child_run_id_on_final_update(
         self,

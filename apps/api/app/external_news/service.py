@@ -7,6 +7,7 @@ from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
+from app.core.audit_logging import exception_message
 from app.core.settings import settings
 from app.external_news.provider import ExternalNewsProvider, NaverNewsSearchProvider
 from app.external_news.store import enrich_recent_external_news_classification, list_external_news_items, persist_external_news_items
@@ -15,6 +16,7 @@ from app.market_data_store import load_symbols
 
 logger = logging.getLogger(__name__)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
+EXTERNAL_NEWS_PROVIDER_CIRCUIT_FAILURE_THRESHOLD = 2
 
 
 def _utcnow() -> datetime:
@@ -81,6 +83,10 @@ class ExternalNewsService:
         summary = {
             'requested_symbol_count': len(requested_symbols),
             'matched_symbol_count': 0,
+            'collected_symbol_count': 0,
+            'failed_symbol_count': 0,
+            'skipped_symbol_count': 0,
+            'provider_circuit_open': False,
             'symbols_with_news': 0,
             'items_fetched': 0,
             'items_inserted': 0,
@@ -103,17 +109,98 @@ class ExternalNewsService:
         items_out: list[dict[str, Any]] = []
         per_symbol_limit = display or settings.external_news_default_display
         throttle_seconds = max(0.0, float(settings.external_news_collect_throttle_seconds or 0.0))
+        consecutive_provider_failures = 0
+        provider_circuit_open = False
         for index, symbol in enumerate(requested_symbols):
             row = symbol_map.get(symbol)
             if row is None:
                 summary['items_skipped'] += 1
+                summary['skipped_symbol_count'] += 1
                 items_out.append({'symbol': symbol, 'status': 'skipped', 'reason': 'symbol_not_found'})
+                continue
+            if provider_circuit_open:
+                summary['items_skipped'] += 1
+                summary['skipped_symbol_count'] += 1
+                items_out.append(
+                    {
+                        'symbol': symbol,
+                        'name_ko': row.get('name_ko'),
+                        'status': 'skipped',
+                        'reason': 'provider_circuit_open',
+                    }
+                )
                 continue
             if index > 0 and throttle_seconds > 0:
                 await asyncio.sleep(throttle_seconds)
             query = f"{row.get('name_ko') or symbol} {symbol}"
-            fetched = await self.provider.search_news(query=query, display=per_symbol_limit)
-            persist_result = persist_external_news_items(symbol=symbol, items=fetched, source=self.provider.provider_name)
+            try:
+                fetched = await self.provider.search_news(
+                    query=query,
+                    display=per_symbol_limit,
+                )
+            except Exception as exc:
+                consecutive_provider_failures += 1
+                summary['failed_symbol_count'] += 1
+                provider_circuit_open = (
+                    consecutive_provider_failures
+                    >= EXTERNAL_NEWS_PROVIDER_CIRCUIT_FAILURE_THRESHOLD
+                )
+                summary['provider_circuit_open'] = provider_circuit_open
+                logger.warning(
+                    'External news provider failed for one symbol.',
+                    extra={
+                        'provider': self.provider.provider_name,
+                        'symbol': symbol,
+                        'error_class': type(exc).__name__,
+                        'consecutive_provider_failures': consecutive_provider_failures,
+                        'provider_circuit_open': provider_circuit_open,
+                    },
+                )
+                items_out.append(
+                    {
+                        'symbol': symbol,
+                        'name_ko': row.get('name_ko'),
+                        'status': 'failed',
+                        'reason': 'provider_search_failed',
+                        'query': query,
+                        'error_type': type(exc).__name__,
+                        'error_message': exception_message(exc),
+                    }
+                )
+                continue
+
+            consecutive_provider_failures = 0
+            try:
+                persist_result = persist_external_news_items(
+                    symbol=symbol,
+                    items=fetched,
+                    source=self.provider.provider_name,
+                )
+            except Exception as exc:
+                summary['failed_symbol_count'] += 1
+                logger.warning(
+                    'External news persistence failed for one symbol.',
+                    extra={
+                        'provider': self.provider.provider_name,
+                        'symbol': symbol,
+                        'error_class': type(exc).__name__,
+                    },
+                )
+                items_out.append(
+                    {
+                        'symbol': symbol,
+                        'name_ko': row.get('name_ko'),
+                        'status': 'failed',
+                        'reason': 'persistence_failed',
+                        'query': query,
+                        'fetched_count': len(fetched),
+                        'error_type': type(exc).__name__,
+                        'error_message': exception_message(exc),
+                    }
+                )
+                continue
+
+            summary['collected_symbol_count'] += 1
             summary['items_fetched'] += len(fetched)
             summary['items_inserted'] += int(persist_result.get('inserted', 0))
             summary['items_updated'] += int(persist_result.get('updated', 0))
@@ -130,14 +217,22 @@ class ExternalNewsService:
                     'persisted': persist_result,
                 }
             )
-        return {
-            'status': 'ok',
+        status = (
+            'partial'
+            if summary['failed_symbol_count'] or summary['skipped_symbol_count']
+            else 'ok'
+        )
+        result = {
+            'status': status,
             'provider': provider_status.as_dict(),
             'collected_at': datetime.now(timezone.utc).isoformat(),
             'requested_symbols': requested_symbols,
             'summary': summary,
             'items': items_out,
         }
+        if status == 'partial':
+            result['reason'] = 'external_news_collection_partial'
+        return result
 
     async def collect_for_agent_feedback_candidates(
         self,
@@ -193,7 +288,15 @@ class ExternalNewsService:
             }
         )
         result.setdefault('summary', {})['eligible_symbol_count'] = len(eligible_symbols)
-        result['summary']['collected_symbol_count'] = len(eligible_symbols)
+        result['summary'].setdefault(
+            'collected_symbol_count',
+            max(
+                len(eligible_symbols)
+                - int(result['summary'].get('failed_symbol_count') or 0)
+                - int(result['summary'].get('skipped_symbol_count') or 0),
+                0,
+            ),
+        )
         return result
 
     def enrich_recent_classification(

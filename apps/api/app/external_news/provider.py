@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from app.core.audit_logging import log_fetch_event, request_with_audit
+from app.core.audit_logging import exception_message, log_fetch_event, request_read_with_retry_and_audit
 from app.core.settings import settings
 
 NAVER_NEWS_PROVIDER = 'naver_news_search'
@@ -114,7 +114,7 @@ class NaverNewsSearchProvider:
         }
         try:
             async with httpx.AsyncClient(timeout=settings.external_news_request_timeout_seconds, transport=self.transport) as client:
-                response = await request_with_audit(
+                response = await request_read_with_retry_and_audit(
                     client,
                     self.provider_name,
                     'GET',
@@ -122,6 +122,7 @@ class NaverNewsSearchProvider:
                     headers=headers,
                     params=params,
                     secret_values=(settings.naver_search_client_id, settings.naver_search_client_secret),
+                    max_attempts=2,
                 )
         except httpx.HTTPError as exc:
             log_fetch_event(
@@ -129,9 +130,9 @@ class NaverNewsSearchProvider:
                 operation='search_news',
                 status='failed',
                 query=query,
-                error_message=str(exc),
+                error_message=exception_message(exc),
             )
-            raise RuntimeError(f'Naver News Search transport error: {exc}') from exc
+            raise RuntimeError(f'Naver News Search transport error: {exception_message(exc)}') from exc
 
         if response.status_code >= 400:
             log_fetch_event(

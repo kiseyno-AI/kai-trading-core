@@ -510,6 +510,127 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_legacy_optional_unavailable_stage_is_rendered_partial(self) -> None:
+        normalized = EODPipelineStatusService._normalize_stage_contract(
+            {
+                'external_news_enrich': {
+                    'task': 'external_news_enrich',
+                    'status': 'unavailable',
+                    'details': {
+                        'result_summary': {
+                            'triggered': True,
+                            'status': 'unavailable',
+                            'reason': 'external_news_storage_unavailable',
+                        },
+                    },
+                },
+            }
+        )
+        stage = normalized['external_news_enrich']
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['source_status'], 'unavailable')
+        self.assertEqual(
+            stage['details']['status_canonicalized_from'],
+            'unavailable',
+        )
+        self.assertEqual(
+            EODPipelineStatusService._resolve_overall_status(
+                {'external_news_enrich': stage}
+            ),
+            'completed',
+        )
+
+    def test_read_reports_completed_with_optional_context_warning_metadata(
+        self,
+    ) -> None:
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 0,
+            fundamentals_refresh_loader=lambda **_: None,
+            price_bar_count_loader=lambda **_: 0,
+            pykrx_enrichment_loader=lambda **_: {},
+        )
+        normalized_stages = {
+            'technical_snapshots': {
+                'task': 'technical_snapshots',
+                'stage_id': 'technical_snapshots',
+                'label': 'Technical snapshots',
+                'status': 'completed',
+                'details': {},
+            },
+            'macro_context_refresh': {
+                'task': 'macro_context_refresh',
+                'stage_id': 'macro_context_refresh',
+                'label': 'Macro context refresh',
+                'status': 'partial',
+                'details': {
+                    'result_summary': {
+                        'status': 'partial',
+                        'remaining_retryable_events': 0,
+                    },
+                },
+            },
+        }
+
+        with patch.object(
+            service,
+            '_normalize_stage_contract',
+            return_value=normalized_stages,
+        ):
+            result = service.read(
+                market_date='2026-04-21',
+                include_feedback_context=False,
+                include_feedback_stage=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            result['stages']['macro_context_refresh']['status'],
+            'partial',
+        )
+        self.assertEqual(result['quality_status'], 'degraded')
+        self.assertEqual(
+            result['warning_stage_ids'],
+            ['macro_context_refresh'],
+        )
+        self.assertEqual(result['warning_count'], 1)
+
+    def test_required_partial_keeps_pipeline_status_partial(self) -> None:
+        stages = {
+            'technical_snapshots': {
+                'stage_id': 'technical_snapshots',
+                'status': 'partial',
+                'details': {'remaining_retryable_events': 0},
+            },
+            'macro_context_refresh': {
+                'stage_id': 'macro_context_refresh',
+                'status': 'partial',
+                'details': {'remaining_retryable_events': 0},
+            },
+        }
+
+        self.assertEqual(
+            EODPipelineStatusService._resolve_overall_status(stages),
+            'partial',
+        )
+
+    def test_optional_context_warning_only_resolves_completed(self) -> None:
+        stages = {
+            'macro_context_refresh': {
+                'stage_id': 'macro_context_refresh',
+                'status': 'partial',
+                'details': {'remaining_retryable_events': 0},
+            },
+        }
+
+        self.assertEqual(
+            EODPipelineStatusService._resolve_overall_status(stages),
+            'completed',
+        )
+
     def test_pykrx_stage_counts_not_applicable_categories_as_satisfied(self):
         coverage = _full_pykrx_enrichment_coverage(
             symbol_count=1,

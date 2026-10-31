@@ -2850,7 +2850,7 @@ class DartDisclosureEvent(Base, TimestampMixin):
             desc('receipt_date').nulls_last(),
             'id',
             postgresql_where=text("fundamentals_capture_status = 'captured'"),
-        ),
+        ).ddl_if(dialect='postgresql'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

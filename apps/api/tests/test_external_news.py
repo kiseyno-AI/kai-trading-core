@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from sqlalchemy.dialects import postgresql
@@ -468,6 +468,37 @@ class NaverNewsProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0].url, 'https://news.example/1')
         self.assertEqual(items[0].payload['access_status'], 'headline_only')
         self.assertEqual(items[0].published_at.isoformat(), '2026-05-08T00:00:00+00:00')
+
+    async def test_naver_provider_retries_transient_read_failure(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ReadTimeout('', request=request)
+            return httpx.Response(200, json={'items': []}, request=request)
+
+        provider = NaverNewsSearchProvider(transport=httpx.MockTransport(handler))
+        with patch('app.core.audit_logging.asyncio.sleep', new_callable=AsyncMock):
+            items = await provider.search_news(query='삼성전자 005930', display=1)
+
+        self.assertEqual(items, [])
+        self.assertEqual(attempts, 2)
+
+    async def test_naver_provider_does_not_retry_authentication_failure(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(401, request=request)
+
+        provider = NaverNewsSearchProvider(transport=httpx.MockTransport(handler))
+        with self.assertRaisesRegex(RuntimeError, r'failed \[401\]'):
+            await provider.search_news(query='삼성전자 005930', display=1)
+
+        self.assertEqual(attempts, 1)
 
 
 class ExternalNewsClassifierTests(unittest.TestCase):
