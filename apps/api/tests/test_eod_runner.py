@@ -292,6 +292,108 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                         return_exceptions=True,
                     )
 
+    async def test_wait_recheck_schedule_captures_epoch_before_thread_start(
+        self,
+    ) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+        runner._running = True
+        market = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-10-30T10:00:00+09:00',
+            session_open_at='2026-10-30T09:00:00+09:00',
+            session_close_at='2026-10-30T15:30:00+09:00',
+            calendar_source='kis_chk_holiday',
+            calendar_source_status='ok',
+        )
+        with (
+            patch(
+                'app.eod.runner.async_get_market_state',
+                new=AsyncMock(return_value=market),
+            ),
+            patch(
+                'app.eod.runner.signal_decider_wait_recheck_service.'
+                'candidate_cache_epoch',
+                return_value=7,
+            ),
+            patch.object(
+                runner,
+                '_schedule_blocking_step',
+                return_value=True,
+            ) as schedule_blocking_step,
+            patch(
+                'app.eod.runner.signal_decider_wait_recheck_service.'
+                'run_open_cycle'
+            ) as run_open_cycle,
+        ):
+            self.assertTrue(
+                await runner._schedule_wait_recheck_open_cycle()
+            )
+            scheduled_call = schedule_blocking_step.call_args
+            scheduled_call.args[1]()
+
+        self.assertEqual(
+            scheduled_call.args[0],
+            WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+        )
+        self.assertTrue(scheduled_call.kwargs['wake_on_follow_up'])
+        run_open_cycle.assert_called_once_with(
+            market=market,
+            expected_cache_epoch=7,
+        )
+
+    async def test_wait_recheck_schedule_rejects_revoked_or_unverified_market(
+        self,
+    ) -> None:
+        authoritative = MarketState(
+            market='KRX',
+            state='OPEN',
+            is_trading_day=True,
+            is_open=True,
+            server_time='2026-10-30T10:00:00+09:00',
+            session_open_at='2026-10-30T09:00:00+09:00',
+            session_close_at='2026-10-30T15:30:00+09:00',
+            calendar_source='kis_chk_holiday',
+            calendar_source_status='ok',
+        )
+        fallback = MarketState(
+            **{
+                **authoritative.__dict__,
+                'calendar_source': 'exchange_calendars',
+                'calendar_source_status': 'fallback',
+            }
+        )
+        cases = (
+            ('epoch_changed', authoritative, (7, 8), True),
+            ('fallback', fallback, (7, 7), True),
+            ('runner_stopped', authoritative, (7, 7), False),
+        )
+        for name, market, epochs, running in cases:
+            with self.subTest(name=name):
+                runner = EODBackgroundRunner(interval_seconds=60)
+                runner._running = running
+                with (
+                    patch(
+                        'app.eod.runner.async_get_market_state',
+                        new=AsyncMock(return_value=market),
+                    ),
+                    patch(
+                        'app.eod.runner.signal_decider_wait_recheck_service.'
+                        'candidate_cache_epoch',
+                        side_effect=epochs,
+                    ),
+                    patch.object(
+                        runner,
+                        '_schedule_blocking_step',
+                    ) as schedule_blocking_step,
+                ):
+                    self.assertFalse(
+                        await runner._schedule_wait_recheck_open_cycle()
+                    )
+                schedule_blocking_step.assert_not_called()
+
     async def test_wake_during_inflight_idle_cycle_is_preserved_until_completion(
         self,
     ) -> None:

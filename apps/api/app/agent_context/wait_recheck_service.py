@@ -24,7 +24,12 @@ from app.db_models import (
     SignalDeciderDecisionSnapshot,
     SignalDeciderWaitRecheckEvent,
 )
-from app.market.session import previous_krx_trading_date
+from app.market.session import (
+    CALENDAR_SOURCE_KIS_CHK_HOLIDAY,
+    CALENDAR_SOURCE_STATUS_OK,
+    is_krx_trading_day,
+    previous_krx_trading_date,
+)
 from app.quotes.kis_realtime_prices import (
     KISRealtimeMonitoredSymbolSource,
     KISRealtimePriceTick,
@@ -68,6 +73,23 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _target_regular_session_is_open_at(
+    target_trade_date: date,
+    value: datetime,
+) -> bool:
+    normalized = _aware_utc(value)
+    if normalized is None:
+        return False
+    seoul_value = normalized.astimezone(SEOUL_TZ)
+    local_time = seoul_value.time().replace(tzinfo=None)
+    return bool(
+        seoul_value.date() == target_trade_date
+        and KRX_REGULAR_SESSION_OPEN
+        <= local_time
+        <= KRX_REGULAR_SESSION_CLOSE
+    )
+
+
 def _daily_claim_lock_key(target_trade_date: date) -> int:
     digest = hashlib.sha256(
         f'wait-recheck-claim:{target_trade_date.isoformat()}'.encode('utf-8')
@@ -99,7 +121,14 @@ def _event_retry_not_before(
         )
     if event.status == 'expired':
         error_payload = _json_object(event.last_error_payload)
-        if error_payload.get('code') == 'wait_recheck_observation_stale':
+        if error_payload.get('code') in {
+            'wait_recheck_observation_stale',
+            'wait_recheck_market_session_revoked',
+        }:
+            # Both conditions discard the old observation.  Re-admission is
+            # immediate only at the subscription layer; _claim_observation
+            # still requires and durably binds a wholly fresh supported
+            # websocket evidence window before the row can be queued again.
             return anchor
     return None
 
@@ -1380,6 +1409,10 @@ def merge_wait_recheck_monitored_source(
 class SignalDeciderWaitRecheckService:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        # Linearizes session revocation with the actual orchestrator entry
+        # point.  The orchestrator releases this lock through its first-line
+        # callback, so close/shutdown never waits for the model call itself.
+        self._dispatch_entry_lock = threading.RLock()
         self._candidates_by_key: dict[
             tuple[str, str], WaitRecheckCandidate
         ] = {}
@@ -1401,6 +1434,7 @@ class SignalDeciderWaitRecheckService:
         self._last_source_refresh_at: datetime | None = None
         self._last_cycle_at: datetime | None = None
         self._last_cycle_result: dict[str, Any] | None = None
+        self._candidate_cache_epoch = 0
 
     def runtime_snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -1472,7 +1506,9 @@ class SignalDeciderWaitRecheckService:
     def replace_candidate_cache(
         self,
         candidates: Iterable[WaitRecheckCandidate],
-    ) -> None:
+        *,
+        expected_cache_epoch: int | None = None,
+    ) -> bool:
         normalized = {
             (candidate.symbol, candidate.agent_name): candidate
             for candidate in candidates
@@ -1490,6 +1526,11 @@ class SignalDeciderWaitRecheckService:
             candidate.symbol for candidate in normalized.values()
         }
         with self._lock:
+            if (
+                expected_cache_epoch is not None
+                and expected_cache_epoch != self._candidate_cache_epoch
+            ):
+                return False
             self._candidates_by_key = normalized
             self._pending_by_key = {
                 key: observation
@@ -1508,6 +1549,59 @@ class SignalDeciderWaitRecheckService:
                 if symbol in active_symbols
             }
             self._last_source_refresh_at = _utcnow()
+            return True
+
+    def candidate_cache_epoch(self) -> int:
+        with self._lock:
+            return self._candidate_cache_epoch
+
+    def clear_candidate_cache(self) -> bool:
+        with self._dispatch_entry_lock:
+            with self._lock:
+                self._candidate_cache_epoch += 1
+                had_cached_state = bool(
+                    self._candidates_by_key
+                    or self._pending_by_key
+                    or self._reserved_keys
+                    or self._tick_samples_by_symbol
+                    or self._latest_tick_gate_by_symbol
+                )
+                if not had_cached_state:
+                    return False
+                self._candidates_by_key = {}
+                self._pending_by_key = {}
+                self._reserved_keys.clear()
+                self._tick_samples_by_symbol = {}
+                self._latest_tick_gate_by_symbol = {}
+                self._last_source_refresh_at = _utcnow()
+                return True
+
+    def _refresh_candidate_cache_during_target_session(
+        self,
+        *,
+        target_trade_date: date,
+        expected_cache_epoch: int | None = None,
+    ) -> None:
+        refresh_cache_epoch = (
+            self.candidate_cache_epoch()
+            if expected_cache_epoch is None
+            else expected_cache_epoch
+        )
+        if not _target_regular_session_is_open_at(
+            target_trade_date,
+            _utcnow(),
+        ):
+            self.clear_candidate_cache()
+            return
+        self.load_subscription_source(
+            target_trade_date=target_trade_date,
+            expected_cache_epoch=refresh_cache_epoch,
+        )
+        if not _target_regular_session_is_open_at(
+            target_trade_date,
+            _utcnow(),
+        ):
+            self.clear_candidate_cache()
 
     def _record_tick_gate(
         self,
@@ -1830,11 +1924,46 @@ class SignalDeciderWaitRecheckService:
         self,
         *,
         target_trade_date: date,
+        expected_cache_epoch: int | None = None,
     ) -> WaitRecheckSubscriptionSource:
-        if not settings.signal_decider_wait_recheck_monitoring_enabled:
-            self.replace_candidate_cache(())
+        def empty_source(
+            *,
+            source_version: datetime | None,
+            membership_complete: bool,
+        ) -> WaitRecheckSubscriptionSource:
+            committed = self.replace_candidate_cache(
+                (),
+                expected_cache_epoch=expected_cache_epoch,
+            )
             return WaitRecheckSubscriptionSource(
                 symbols=(),
+                source_version=(source_version if committed else None),
+                membership_complete=(
+                    membership_complete if committed else False
+                ),
+            )
+
+        if not settings.signal_decider_wait_recheck_monitoring_enabled:
+            return empty_source(
+                source_version=_utcnow(),
+                membership_complete=True,
+            )
+        try:
+            target_is_trading_day = is_krx_trading_day(
+                target_trade_date,
+                allow_fallback=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'WAIT recheck target-date calendar lookup failed closed: %s',
+                type(exc).__name__,
+            )
+            return empty_source(
+                source_version=None,
+                membership_complete=False,
+            )
+        if not target_is_trading_day:
+            return empty_source(
                 source_version=_utcnow(),
                 membership_complete=True,
             )
@@ -1848,16 +1977,12 @@ class SignalDeciderWaitRecheckService:
                 'WAIT recheck trading-calendar lookup failed closed: %s',
                 type(exc).__name__,
             )
-            self.replace_candidate_cache(())
-            return WaitRecheckSubscriptionSource(
-                symbols=(),
+            return empty_source(
                 source_version=None,
                 membership_complete=False,
             )
         if source_market_date is None:
-            self.replace_candidate_cache(())
-            return WaitRecheckSubscriptionSource(
-                symbols=(),
+            return empty_source(
                 source_version=None,
                 membership_complete=False,
             )
@@ -2148,14 +2273,21 @@ class SignalDeciderWaitRecheckService:
                 'WAIT recheck candidate lookup failed closed: %s',
                 type(exc).__name__,
             )
-            self.replace_candidate_cache(())
+            return empty_source(
+                source_version=None,
+                membership_complete=False,
+            )
+
+        committed = self.replace_candidate_cache(
+            candidates,
+            expected_cache_epoch=expected_cache_epoch,
+        )
+        if not committed:
             return WaitRecheckSubscriptionSource(
                 symbols=(),
                 source_version=None,
                 membership_complete=False,
             )
-
-        self.replace_candidate_cache(candidates)
         return WaitRecheckSubscriptionSource(
             symbols=tuple(
                 dict.fromkeys(candidate.symbol for candidate in candidates)
@@ -2546,7 +2678,15 @@ class SignalDeciderWaitRecheckService:
         event_id: int,
         *,
         now: datetime,
+        expected_cache_epoch: int | None = None,
     ) -> dict[str, Any] | None:
+        attempt_cache_epoch = (
+            self.candidate_cache_epoch()
+            if expected_cache_epoch is None
+            else expected_cache_epoch
+        )
+        if self.candidate_cache_epoch() != attempt_cache_epoch:
+            return None
         attempt_payload: dict[str, Any] | None = None
         refresh_target_trade_date: date | None = None
         with session_scope() as session:
@@ -2665,8 +2805,9 @@ class SignalDeciderWaitRecheckService:
             # Refresh only after the expiry transaction commits. This restores
             # a fresh-evidence subscription immediately instead of waiting for
             # the independent membership poll.
-            self.load_subscription_source(
+            self._refresh_candidate_cache_during_target_session(
                 target_trade_date=refresh_target_trade_date,
+                expected_cache_epoch=attempt_cache_epoch,
             )
         return attempt_payload
 
@@ -2676,11 +2817,13 @@ class SignalDeciderWaitRecheckService:
         event_id: int,
         request_run_id: str,
         status: str,
+        expected_cache_epoch: int,
         result_snapshot_id: int | None = None,
         result_action: str | None = None,
         error_code: str | None = None,
     ) -> None:
         target_trade_date: date | None = None
+        finished_at: datetime | None = None
         with session_scope() as session:
             event = session.execute(
                 select(SignalDeciderWaitRecheckEvent)
@@ -2708,22 +2851,109 @@ class SignalDeciderWaitRecheckService:
                 # A slow dispatch must not consume its cooldown while it is
                 # still occupying provider capacity.
                 event.last_attempt_at = finished_at
+            elif (
+                status == 'expired'
+                and error_code == 'wait_recheck_market_session_revoked'
+            ):
+                # _begin_attempt reserves one provider attempt before the
+                # linearized admission boundary.  If close/shutdown wins that
+                # boundary the provider never started, so restore the budget;
+                # a later fresh-evidence rearm may reuse the durable row.
+                event.attempt_count = max(int(event.attempt_count) - 1, 0)
+                # The reserved run id was never presented to the provider.
+                # Clearing it keeps the later history archive from poisoning
+                # the same deterministic id when the restored attempt number
+                # is legitimately reused after fresh evidence arrives.
+                event.request_run_id = None
         if status in {'completed', 'failed'} and target_trade_date is not None:
             # The terminal result is now durable. Refreshing immediately keeps
             # completed-WAIT lineage and retryable provider failures available
             # through their bounded re-arm cooldowns without waiting for the
             # membership poll.
-            self.load_subscription_source(
+            self._refresh_candidate_cache_during_target_session(
                 target_trade_date=target_trade_date,
+                expected_cache_epoch=expected_cache_epoch,
             )
 
-    def _dispatch_event(self, event_id: int, *, now: datetime) -> dict[str, Any]:
-        attempt = self._begin_attempt(event_id, now=now)
+    @staticmethod
+    def _expire_queued_event_after_session_revocation(
+        event_id: int,
+        *,
+        now: datetime,
+    ) -> None:
+        with session_scope() as session:
+            event = session.execute(
+                select(SignalDeciderWaitRecheckEvent)
+                .where(
+                    SignalDeciderWaitRecheckEvent.id == event_id,
+                    SignalDeciderWaitRecheckEvent.status == 'queued',
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if event is None:
+                return
+            event.status = 'expired'
+            event.last_attempt_at = now
+            event.last_error_payload = {
+                'code': 'wait_recheck_market_session_revoked',
+            }
+
+    def _dispatch_event(
+        self,
+        event_id: int,
+        *,
+        now: datetime,
+        expected_cache_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        # A market-close or shutdown clear must revoke this dispatch's later
+        # terminal refresh, even if it happens after this open cycle starts but
+        # before the blocking provider is entered.
+        dispatch_cache_epoch = (
+            self.candidate_cache_epoch()
+            if expected_cache_epoch is None
+            else expected_cache_epoch
+        )
+        if self.candidate_cache_epoch() != dispatch_cache_epoch:
+            self._expire_queued_event_after_session_revocation(
+                event_id,
+                now=now,
+            )
+            return {'event_id': event_id, 'status': 'not_dispatched'}
+        attempt = self._begin_attempt(
+            event_id,
+            now=now,
+            expected_cache_epoch=dispatch_cache_epoch,
+        )
         if attempt is None:
             return {'event_id': event_id, 'status': 'not_dispatched'}
-        try:
-            from app.agent_context.orchestrator import agent_feedback_orchestrator
+        from app.agent_context.orchestrator import agent_feedback_orchestrator
 
+        provider_entry_lock_held = True
+        self._dispatch_entry_lock.acquire()
+
+        def release_dispatch_entry_lock() -> None:
+            nonlocal provider_entry_lock_held
+            if not provider_entry_lock_held:
+                return
+            provider_entry_lock_held = False
+            self._dispatch_entry_lock.release()
+
+        try:
+            if self.candidate_cache_epoch() != dispatch_cache_epoch:
+                # _begin_attempt durably owns the event before the provider
+                # call.  The shared admission lock makes this final epoch read
+                # and the orchestrator's actual entry one linearized step.
+                # Release it before the DB-backed durable expiry so a slow row
+                # lock cannot block the event-loop shutdown/inactive clear.
+                release_dispatch_entry_lock()
+                self._finish_event(
+                    event_id=event_id,
+                    request_run_id=attempt['request_run_id'],
+                    status='expired',
+                    error_code='wait_recheck_market_session_revoked',
+                    expected_cache_epoch=dispatch_cache_epoch,
+                )
+                return {'event_id': event_id, 'status': 'not_dispatched'}
             result = agent_feedback_orchestrator.dispatch_for_symbols(
                 market_date=attempt['source_market_date'],
                 symbols=[attempt['symbol']],
@@ -2741,6 +2971,7 @@ class SignalDeciderWaitRecheckService:
                 source_context_overlays={
                     attempt['symbol']: attempt['context']
                 },
+                _dispatch_entry_callback=release_dispatch_entry_lock,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2753,8 +2984,15 @@ class SignalDeciderWaitRecheckService:
                 request_run_id=attempt['request_run_id'],
                 status='failed',
                 error_code='decider_dispatch_exception',
+                expected_cache_epoch=dispatch_cache_epoch,
             )
             return {'event_id': event_id, 'status': 'failed'}
+        finally:
+            # Patched providers and pre-entry exceptions may not execute the
+            # callback.  Never strand close/shutdown behind the admission lock.
+            if provider_entry_lock_held:
+                provider_entry_lock_held = False
+                self._dispatch_entry_lock.release()
 
         if not wait_recheck_dispatch_completed(result):
             self._finish_event(
@@ -2762,6 +3000,7 @@ class SignalDeciderWaitRecheckService:
                 request_run_id=attempt['request_run_id'],
                 status='failed',
                 error_code='decider_dispatch_not_completed',
+                expected_cache_epoch=dispatch_cache_epoch,
             )
             return {'event_id': event_id, 'status': 'failed'}
 
@@ -2811,6 +3050,7 @@ class SignalDeciderWaitRecheckService:
                     (summary or {}).get('status')
                     or 'decider_result_snapshot_missing'
                 ),
+                expected_cache_epoch=dispatch_cache_epoch,
             )
             return {'event_id': event_id, 'status': 'failed'}
 
@@ -2820,6 +3060,7 @@ class SignalDeciderWaitRecheckService:
             status='completed',
             result_snapshot_id=result_snapshot_id,
             result_action=result_action,
+            expected_cache_epoch=dispatch_cache_epoch,
         )
         return {
             'event_id': event_id,
@@ -2829,7 +3070,22 @@ class SignalDeciderWaitRecheckService:
             'direct_order_authority': False,
         }
 
-    def run_open_cycle(self, *, market: Any) -> dict[str, Any]:
+    def run_open_cycle(
+        self,
+        *,
+        market: Any,
+        expected_cache_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        cycle_cache_epoch = (
+            self.candidate_cache_epoch()
+            if expected_cache_epoch is None
+            else expected_cache_epoch
+        )
+        if self.candidate_cache_epoch() != cycle_cache_epoch:
+            return {
+                'status': 'not_due',
+                'direct_order_authority': False,
+            }
         now = _utcnow()
         market_state = str(getattr(market, 'state', '') or '').strip().upper()
         market_name = str(getattr(market, 'market', '') or '').strip().upper()
@@ -2851,12 +3107,21 @@ class SignalDeciderWaitRecheckService:
             and market_name == 'KRX'
             and market_state == 'OPEN'
             and bool(getattr(market, 'is_trading_day', False))
+            and bool(getattr(market, 'is_open', False))
+            and getattr(market, 'calendar_source', None)
+            == CALENDAR_SOURCE_KIS_CHK_HOLIDAY
+            and getattr(market, 'calendar_source_status', None)
+            == CALENDAR_SOURCE_STATUS_OK
             and target_trade_date is not None
             and session_open_at is not None
             and session_close_at is not None
+            and session_open_at
+            <= market_snapshot_time
+            <= session_close_at
             and now.astimezone(SEOUL_TZ).date() == target_trade_date
             and session_open_at <= now <= session_close_at
         ):
+            self.clear_candidate_cache()
             return {
                 'status': 'not_due',
                 'direct_order_authority': False,
@@ -2926,10 +3191,22 @@ class SignalDeciderWaitRecheckService:
                 )
                 if event_id is None:
                     break
+            if self.candidate_cache_epoch() != cycle_cache_epoch:
+                self._expire_queued_event_after_session_revocation(
+                    event_id,
+                    now=dispatch_now,
+                )
+                if claimed_observation is not None:
+                    self._release_observation(claimed_observation)
+                break
             processed_event_ids.add(event_id)
             try:
                 results.append(
-                    self._dispatch_event(event_id, now=dispatch_now)
+                    self._dispatch_event(
+                        event_id,
+                        now=dispatch_now,
+                        expected_cache_epoch=cycle_cache_epoch,
+                    )
                 )
             finally:
                 if claimed_observation is not None:

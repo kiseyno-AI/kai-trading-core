@@ -6338,7 +6338,15 @@ class AgentFeedbackOrchestrator:
         persistence_guard: Callable[..., Any] | None = None,
         expected_weekly_policy_binding: Mapping[str, Any] | None = None,
         source_context_overlays: Mapping[str, Mapping[str, Any]] | None = None,
+        _dispatch_entry_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
+        # Internal admission hand-off used by WAIT rechecks.  The callback is
+        # deliberately the first operation in the provider entry point so a
+        # market-session revocation can be linearized against dispatch start
+        # without holding a shutdown lock for the duration of a slow model
+        # call.  Other callers leave it unset.
+        if _dispatch_entry_callback is not None:
+            _dispatch_entry_callback()
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         resolved_policy_context_as_of_date = (
             policy_context_as_of_date.date()
