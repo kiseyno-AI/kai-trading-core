@@ -402,6 +402,7 @@ class InternalOpsTests(unittest.TestCase):
                 market_date='2026-10-30',
                 limit=2,
                 after_stock_code='000660',
+                concurrency=1,
                 dry_run=True,
             )
 
@@ -421,6 +422,8 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(result['next_after_stock_code'], '035420')
         self.assertFalse(result['has_more'])
         self.assertEqual(result['manifest_hash'], reordered['manifest_hash'])
+        self.assertEqual(result['concurrency'], 4)
+        self.assertEqual(reordered['concurrency'], 1)
         self.assertEqual(
             result['manifest']['requested_stock_codes'],
             result['requested_stock_codes'],
@@ -432,6 +435,21 @@ class InternalOpsTests(unittest.TestCase):
         self.assertTrue(
             result['invariants']['manifest_stock_codes_sorted_unique']
         )
+
+    def test_backfill_dart_share_issuance_evidence_rejects_invalid_concurrency_before_bootstrap(self) -> None:
+        with patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime:
+            for concurrency in (0, 9):
+                with self.subTest(concurrency=concurrency):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        'concurrency must be between 1 and 8',
+                    ):
+                        ops.backfill_dart_share_issuance_evidence(
+                            market_date='2026-10-30',
+                            concurrency=concurrency,
+                        )
+
+        bootstrap_runtime.assert_not_called()
 
     def test_backfill_dart_share_issuance_evidence_applies_exact_market_date_window(self) -> None:
         with (
@@ -529,6 +547,8 @@ class InternalOpsTests(unittest.TestCase):
             sync_disclosures.await_args.kwargs['trigger'],
             ops.DART_SHARE_ISSUANCE_BACKFILL_TRIGGER,
         )
+        self.assertEqual(sync_disclosures.await_args.kwargs['concurrency'], 4)
+        self.assertEqual(result['concurrency'], 4)
         self.assertLessEqual(
             len(sync_disclosures.await_args.kwargs['trigger']),
             32,
@@ -654,6 +674,172 @@ class InternalOpsTests(unittest.TestCase):
             [item['stock_code'] for item in sync_disclosures.await_args.kwargs['corporations']],
             ['005930'],
         )
+
+    def test_backfill_dart_share_issuance_evidence_orders_unique_authoritative_mappings(self) -> None:
+        mapping_result = self._authoritative_mapping(
+            resolved=[
+                {
+                    'stock_code': '035420',
+                    'corp_code': 'corp-035420',
+                    'corp_name': '035420',
+                },
+                {
+                    'stock_code': '005930',
+                    'corp_code': 'corp-005930-a',
+                    'corp_name': '005930 A',
+                },
+                {
+                    'stock_code': '000660',
+                    'corp_code': 'corp-000660',
+                    'corp_name': '000660',
+                },
+                {
+                    'stock_code': '005930',
+                    'corp_code': 'corp-005930-b',
+                    'corp_name': '005930 B',
+                },
+            ]
+        )
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(return_value=mapping_result),
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(return_value={'status': 'completed'}),
+            ) as sync_disclosures,
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=3,
+                stock_codes='051910,035420,005930,000660',
+                dry_run=True,
+            )
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=3,
+                stock_codes='051910,035420,005930,000660',
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        corporations = sync_disclosures.await_args.kwargs['corporations']
+        self.assertEqual(
+            [item['stock_code'] for item in corporations],
+            ['000660', '035420'],
+        )
+        self.assertEqual(result['resolved_corporation_count'], 2)
+        self.assertEqual(result['retryable_unmapped_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['lookup_errors'][0]['reason'],
+            'duplicate_resolved_stock_mapping',
+        )
+
+    def test_backfill_dart_share_issuance_aggregate_audit_rejects_duplicate_mapping_claims(self) -> None:
+        page_mapping = self._authoritative_mapping(
+            resolved=[
+                {
+                    'stock_code': stock_code,
+                    'corp_code': 'corp-shared',
+                    'corp_name': stock_code,
+                }
+                for stock_code in ('000660', '005930')
+            ]
+        )
+        aggregate_mapping = self._authoritative_mapping(
+            resolved=[
+                {
+                    'stock_code': '000660',
+                    'corp_code': 'corp-shared',
+                    'corp_name': '000660 duplicate A',
+                },
+                {
+                    'stock_code': '000660',
+                    'corp_code': 'corp-shared',
+                    'corp_name': '000660 duplicate B',
+                },
+                {
+                    'stock_code': '005930',
+                    'corp_code': 'corp-shared',
+                    'corp_name': '005930',
+                },
+            ]
+        )
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(
+                    side_effect=[page_mapping, aggregate_mapping],
+                ),
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(),
+            ) as sync_disclosures,
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_current_share_issuance_coverage',
+                return_value=[],
+            ),
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_latest_share_issuance_positive_event_dates',
+                return_value={'corp-shared': date(2026, 10, 30)},
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+                return_value=907,
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+            ),
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                stock_codes='000660,005930',
+                dry_run=True,
+            )
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                stock_codes='000660,005930',
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        sync_disclosures.assert_not_awaited()
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660', '005930'])
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(result['full_manifest_audit'])
+        self.assertFalse(
+            result['aggregate_audit']['aggregate_evidence_complete']
+        )
+        self.assertEqual(
+            result['aggregate_audit']['classification_stock_codes'][
+                'retry_debt'
+            ],
+            ['000660', '005930'],
+        )
+        outcomes = result['aggregate_audit']['outcome_manifest']['outcomes']
+        self.assertIn(
+            'duplicate_resolved_stock_mapping',
+            outcomes[0]['reasons'],
+        )
+        for outcome in outcomes:
+            self.assertIn(
+                'duplicate_corp_code_mapping_across_stock_codes',
+                outcome['reasons'],
+            )
 
     def test_backfill_dart_share_issuance_evidence_treats_all_terminal_mappings_as_completed_audit(self) -> None:
         with (
@@ -1207,8 +1393,45 @@ class InternalOpsTests(unittest.TestCase):
             stock_codes='005930,000660',
             after_stock_code='000660',
             expected_manifest_hash=None,
+            concurrency=4,
             dry_run=True,
         )
+
+    def test_cli_dart_share_issuance_evidence_backfill_passes_concurrency(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.backfill_dart_share_issuance_evidence',
+                return_value={'status': 'dry_run'},
+            ) as backfill,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'dart-share-issuance-evidence-backfill',
+                    '--market-date',
+                    '2026-10-30',
+                    '--concurrency',
+                    '3',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(backfill.call_args.kwargs['concurrency'], 3)
+
+    def test_cli_dart_share_issuance_evidence_backfill_rejects_invalid_concurrency(self) -> None:
+        for concurrency in ('0', '9'):
+            with self.subTest(concurrency=concurrency):
+                with self.assertRaises(SystemExit):
+                    ops._build_parser().parse_args(
+                        [
+                            'dart-share-issuance-evidence-backfill',
+                            '--market-date',
+                            '2026-10-30',
+                            '--concurrency',
+                            concurrency,
+                        ]
+                    )
 
     def test_cli_dart_share_issuance_evidence_backfill_returns_nonzero_for_retry_debt(self) -> None:
         stdout = io.StringIO()

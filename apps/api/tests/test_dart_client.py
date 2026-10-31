@@ -213,6 +213,285 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cache_file.read_bytes(), self._CORP_CODE_XML)
             self.assertEqual(cache_file.stat().st_mode & 0o777, 0o600)
 
+    async def test_fresh_persisted_corp_codes_skip_upstream_and_are_authoritative(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            client = TestableDartClient(
+                {'status': '800', 'message': 'must not be called'},
+            )
+            response = FakeResponse(
+                {'status': '800'},
+                content=(
+                    b'<result><status>800</status>'
+                    b'<message>must not be called</message></result>'
+                ),
+                headers={'content-type': 'application/xml'},
+            )
+
+            with (
+                patch.object(
+                    settings,
+                    'dart_corp_code_cache_file',
+                    str(cache_file),
+                ),
+                patch.object(
+                    client,
+                    '_request',
+                    new=AsyncMock(return_value=response),
+                ) as request,
+            ):
+                corp = await client.lookup_corp_code(stock_code='005930')
+
+            self.assertEqual(corp['corp_code'], '00126380')
+            request.assert_not_awaited()
+            authority = client.corp_code_mapping_authority()
+            self.assertEqual(authority['source'], 'persistent_cache')
+            self.assertTrue(authority['authoritative'])
+            self.assertIsNotNone(authority['source_fetched_at'])
+            self.assertIsNotNone(authority['cache_age_seconds'])
+
+    async def test_fresh_persisted_corp_codes_expire_from_their_source_mtime(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            initial_now = datetime.now(timezone.utc)
+            source_fetched_at = initial_now - timedelta(seconds=59)
+            os.utime(
+                cache_file,
+                (source_fetched_at.timestamp(), source_fetched_at.timestamp()),
+            )
+            client = TestableDartClient({'status': '000'})
+            response = FakeResponse(
+                {'status': '000'},
+                content=self._CORP_CODE_XML,
+                headers={'content-type': 'application/xml'},
+            )
+
+            with (
+                patch.object(
+                    settings,
+                    'dart_corp_code_cache_file',
+                    str(cache_file),
+                ),
+                patch.object(settings, 'dart_corp_code_cache_ttl_seconds', 60),
+                patch(
+                    'app.integrations.dart.client.datetime',
+                    wraps=datetime,
+                ) as clock,
+                patch.object(
+                    client,
+                    '_request',
+                    new=AsyncMock(return_value=response),
+                ) as request,
+            ):
+                clock.now.return_value = initial_now
+                first = await client.lookup_corp_code(stock_code='005930')
+                request.assert_not_awaited()
+
+                clock.now.return_value = initial_now + timedelta(seconds=2)
+                second = await client.lookup_corp_code(stock_code='005930')
+
+            self.assertEqual(first['corp_code'], '00126380')
+            self.assertEqual(second['corp_code'], '00126380')
+            request.assert_awaited_once_with('/corpCode.xml', {})
+            authority = client.corp_code_mapping_authority()
+            self.assertEqual(authority['source'], 'upstream')
+            self.assertTrue(authority['authoritative'])
+
+    def test_authoritative_memory_cache_uses_source_ttl_boundary(self):
+        now = datetime.now(timezone.utc)
+        ttl = timedelta(seconds=60)
+        client = TestableDartClient({'status': '000'})
+        client._corp_codes = [{'corp_code': '00126380'}]
+        client._corp_codes_loaded_at = now
+        client._corp_codes_source_fetched_at = now - ttl
+        client._corp_codes_authoritative = True
+
+        self.assertTrue(
+            client._corp_code_memory_cache_is_fresh(now=now, ttl=ttl)
+        )
+        self.assertFalse(
+            client._corp_code_memory_cache_is_fresh(
+                now=now + timedelta(microseconds=1),
+                ttl=ttl,
+            )
+        )
+
+    def test_persisted_cache_snapshot_keeps_mtime_and_bytes_from_same_open_file(self):
+        replacement_xml = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<result><list><corp_code>00999999</corp_code>'
+            b'<corp_name>Replacement Corp</corp_name>'
+            b'<stock_code>000660</stock_code>'
+            b'<modify_date>20260408</modify_date></list></result>'
+        )
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            replacement_file = Path(directory) / 'replacement.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            replacement_file.write_bytes(replacement_xml)
+            now = datetime.now(timezone.utc)
+            original_mtime = now - timedelta(seconds=10)
+            replacement_mtime = now - timedelta(days=2)
+            os.utime(
+                cache_file,
+                (original_mtime.timestamp(), original_mtime.timestamp()),
+            )
+            os.utime(
+                replacement_file,
+                (replacement_mtime.timestamp(), replacement_mtime.timestamp()),
+            )
+            real_fstat = os.fstat
+
+            def replace_path_then_fstat(file_descriptor):
+                os.replace(replacement_file, cache_file)
+                return real_fstat(file_descriptor)
+
+            client = TestableDartClient({'status': '000'})
+            with (
+                patch.object(
+                    settings,
+                    'dart_corp_code_cache_file',
+                    str(cache_file),
+                ),
+                patch(
+                    'app.integrations.dart.client.os.fstat',
+                    side_effect=replace_path_then_fstat,
+                ),
+            ):
+                snapshot = client._load_persisted_corp_code_snapshot(
+                    fresh_as_of=now,
+                    ttl=timedelta(minutes=1),
+                )
+
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            corp_codes, source_fetched_at = snapshot
+            self.assertEqual(corp_codes[0]['stock_code'], '005930')
+            self.assertAlmostEqual(
+                source_fetched_at.timestamp(),
+                original_mtime.timestamp(),
+                places=5,
+            )
+            self.assertEqual(cache_file.read_bytes(), replacement_xml)
+
+    def test_persisted_cache_snapshot_opens_path_nonblocking(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            observed_flags = []
+            real_open = os.open
+
+            def record_open_flags(path, flags):
+                observed_flags.append(flags)
+                return real_open(path, flags)
+
+            client = TestableDartClient({'status': '000'})
+            with (
+                patch.object(
+                    settings,
+                    'dart_corp_code_cache_file',
+                    str(cache_file),
+                ),
+                patch(
+                    'app.integrations.dart.client.os.open',
+                    side_effect=record_open_flags,
+                ),
+            ):
+                snapshot = client._load_persisted_corp_code_snapshot()
+
+            self.assertIsNotNone(snapshot)
+            self.assertTrue(observed_flags[0] & os.O_NONBLOCK)
+
+    @unittest.skipUnless(
+        hasattr(os, 'mkfifo') and hasattr(os, 'O_NONBLOCK'),
+        'FIFO cache safety requires POSIX nonblocking file support',
+    )
+    def test_persisted_cache_snapshot_rejects_fifo_without_blocking(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            os.mkfifo(cache_file)
+            client = TestableDartClient({'status': '000'})
+
+            with patch.object(
+                settings,
+                'dart_corp_code_cache_file',
+                str(cache_file),
+            ):
+                snapshot = client._load_persisted_corp_code_snapshot()
+
+            self.assertIsNone(snapshot)
+
+    async def test_stale_persisted_corp_codes_refresh_from_upstream(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            stale_at = datetime.now(timezone.utc) - timedelta(
+                seconds=settings.dart_corp_code_cache_ttl_seconds + 60
+            )
+            os.utime(
+                cache_file,
+                (stale_at.timestamp(), stale_at.timestamp()),
+            )
+            client = TestableDartClient({'status': '000'})
+            response = FakeResponse(
+                {'status': '000'},
+                content=self._CORP_CODE_XML,
+                headers={'content-type': 'application/xml'},
+            )
+
+            with (
+                patch.object(
+                    settings,
+                    'dart_corp_code_cache_file',
+                    str(cache_file),
+                ),
+                patch.object(
+                    client,
+                    '_request',
+                    new=AsyncMock(return_value=response),
+                ) as request,
+            ):
+                corp = await client.lookup_corp_code(stock_code='005930')
+
+            self.assertEqual(corp['corp_code'], '00126380')
+            request.assert_awaited_once_with('/corpCode.xml', {})
+            authority = client.corp_code_mapping_authority()
+            self.assertEqual(authority['source'], 'upstream')
+            self.assertTrue(authority['authoritative'])
+
+    async def test_invalid_persisted_corp_codes_refresh_from_upstream(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(b'not-a-valid-corp-code-payload')
+            client = TestableDartClient({'status': '000'})
+            response = FakeResponse(
+                {'status': '000'},
+                content=self._CORP_CODE_XML,
+                headers={'content-type': 'application/xml'},
+            )
+
+            with (
+                patch.object(
+                    settings,
+                    'dart_corp_code_cache_file',
+                    str(cache_file),
+                ),
+                patch.object(
+                    client,
+                    '_request',
+                    new=AsyncMock(return_value=response),
+                ) as request,
+            ):
+                corp = await client.lookup_corp_code(stock_code='005930')
+
+            self.assertEqual(corp['corp_code'], '00126380')
+            request.assert_awaited_once_with('/corpCode.xml', {})
+            authority = client.corp_code_mapping_authority()
+            self.assertEqual(authority['source'], 'upstream')
+            self.assertTrue(authority['authoritative'])
+
     async def test_corp_code_fetch_uses_persisted_payload_when_upstream_is_unavailable(self):
         with TemporaryDirectory() as directory:
             cache_file = Path(directory) / 'corp-codes.xml'
@@ -259,7 +538,7 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result['mapping_authority']['authoritative'])
             self.assertEqual(
                 result['mapping_authority']['source'],
-                'persistent_fallback',
+                'persistent_cache',
             )
 
     async def test_stale_persisted_corp_list_keeps_all_mappings_retryable(self):

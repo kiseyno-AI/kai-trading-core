@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import hashlib
@@ -38,6 +39,8 @@ _FINANCIAL_REPORT_PREFIXES = (
 )
 
 _CONSECUTIVE_PROVIDER_FAILURE_LIMIT = 3
+DEFAULT_DART_DISCLOSURE_SYNC_CONCURRENCY = 1
+MAX_DART_DISCLOSURE_SYNC_CONCURRENCY = 8
 _SYSTEMIC_DART_STATUS_CODES = {
     '010',  # unregistered API key
     '011',  # disabled API key
@@ -192,6 +195,37 @@ class _DisclosurePaginationGuard:
                 f'expected={self.expected_total_count}, '
                 f'observed={len(self.receipt_numbers)}'
             )
+
+
+@dataclass
+class _CorporationDisclosureFetch:
+    corporation: dict[str, str]
+    pages: list[list[dict[str, Any]]] = field(default_factory=list)
+    pages_fetched: int = 0
+    events_seen: int = 0
+    pagination_completed: bool = False
+    error: Exception | None = None
+
+    @property
+    def raw_items(self) -> list[dict[str, Any]]:
+        return [raw_item for page in self.pages for raw_item in page]
+
+
+@dataclass
+class _CorporationDisclosurePersistence:
+    success: bool = False
+    events_inserted: int = 0
+    events_updated: int = 0
+    financial_report_events: int = 0
+    dilution_positive_events: int = 0
+    dilution_negative_coverage_rows: int = 0
+    dilution_negative_segment_rows: int = 0
+    dilution_incomplete_attempt_rows: int = 0
+    dilution_evidence_rows_upserted: int = 0
+    error: Exception | None = None
+    incomplete_marker_error: Exception | None = None
+    systemic_provider_failure: bool = False
+    systemic_persistence_failure: bool = False
 
 
 def _is_systemic_provider_failure(exc: Exception) -> bool:
@@ -1313,6 +1347,159 @@ class DartDisclosureSyncService:
             )
             raise
 
+    async def _fetch_corporation_disclosures(
+        self,
+        *,
+        corporation: dict[str, str],
+        start_date: date,
+        end_date: date,
+        page_size: int,
+    ) -> _CorporationDisclosureFetch:
+        fetched = _CorporationDisclosureFetch(corporation=corporation)
+        pagination_guard = _DisclosurePaginationGuard()
+        try:
+            page_no = 1
+            total_pages = 1
+            while page_no <= total_pages:
+                payload = await self.client.fetch_disclosure_list(
+                    corp_code=corporation['corp_code'],
+                    bgn_de=start_date.strftime('%Y%m%d'),
+                    end_de=end_date.strftime('%Y%m%d'),
+                    page_no=page_no,
+                    page_count=page_size,
+                    last_reprt_at='N',
+                )
+                fetched.pages_fetched += 1
+                raw_items, total_pages = pagination_guard.accept_page(
+                    payload,
+                    requested_page_no=page_no,
+                )
+                fetched.pages.append(raw_items)
+                fetched.events_seen += len(raw_items)
+                page_no += 1
+            pagination_guard.assert_complete()
+            fetched.pagination_completed = True
+        except Exception as exc:
+            fetched.error = exc
+        return fetched
+
+    def _persist_corporation_disclosures(
+        self,
+        *,
+        fetched: _CorporationDisclosureFetch,
+        start_date: date,
+        end_date: date,
+        run_id: int,
+        persist_negative_authority: bool,
+    ) -> _CorporationDisclosurePersistence:
+        outcome = _CorporationDisclosurePersistence()
+        corporation = fetched.corporation
+        try:
+            for raw_items in fetched.pages:
+                positive_evidence = self.dilution_positive_persister(
+                    corporation=corporation,
+                    raw_items=raw_items,
+                    window_start=start_date,
+                    window_end=end_date,
+                    sync_run_id=run_id,
+                )
+                outcome.dilution_positive_events += int(
+                    positive_evidence.get('positive_event_count') or 0
+                )
+                outcome.dilution_evidence_rows_upserted += int(
+                    positive_evidence.get('rows_upserted') or 0
+                )
+                page_items = []
+                for raw_item in raw_items:
+                    event_record = self._build_event_record(
+                        raw_item,
+                        run_id=run_id,
+                    )
+                    if event_record['is_financial_report']:
+                        page_items.append(event_record)
+                counts = self.repository.upsert_events(
+                    page_items,
+                    run_id=run_id,
+                )
+                outcome.events_inserted += counts['inserted']
+                outcome.events_updated += counts['updated']
+                outcome.financial_report_events += counts[
+                    'financial_report_events'
+                ]
+
+            if fetched.error is not None:
+                raise fetched.error
+            if not fetched.pagination_completed:
+                raise ValueError('DART pagination scan did not complete')
+
+            # First persist page-level positive evidence as incomplete, then
+            # promote the same evidence only after full pagination proof.
+            self.dilution_positive_persister(
+                corporation=corporation,
+                raw_items=fetched.raw_items,
+                window_start=start_date,
+                window_end=end_date,
+                sync_run_id=run_id,
+                pagination_completed=True,
+            )
+            if persist_negative_authority:
+                dilution_evidence = self.dilution_evidence_persister(
+                    corporation=corporation,
+                    raw_items=fetched.raw_items,
+                    window_start=start_date,
+                    window_end=end_date,
+                    pagination_completed=True,
+                    sync_run_id=run_id,
+                    positive_events_already_persisted=True,
+                )
+                outcome.dilution_negative_coverage_rows += int(
+                    dilution_evidence.get('negative_coverage_count') or 0
+                )
+                outcome.dilution_negative_segment_rows += int(
+                    dilution_evidence.get('negative_segment_count') or 0
+                )
+                outcome.dilution_evidence_rows_upserted += int(
+                    dilution_evidence.get('rows_upserted') or 0
+                )
+            outcome.success = True
+            return outcome
+        except Exception as exc:
+            outcome.error = exc
+            outcome.systemic_provider_failure = (
+                _is_systemic_provider_failure(exc)
+                or (
+                    fetched.error is not None
+                    and _is_systemic_provider_failure(fetched.error)
+                )
+            )
+            outcome.systemic_persistence_failure = (
+                _is_systemic_persistence_failure(exc)
+            )
+            if (
+                persist_negative_authority
+                and not outcome.systemic_persistence_failure
+            ):
+                try:
+                    incomplete_evidence = self.dilution_evidence_persister(
+                        corporation=corporation,
+                        raw_items=[],
+                        window_start=start_date,
+                        window_end=end_date,
+                        pagination_completed=False,
+                        sync_run_id=run_id,
+                        failure_reason=str(exc),
+                    )
+                    incomplete_rows = int(
+                        incomplete_evidence.get('rows_upserted') or 0
+                    )
+                    outcome.dilution_incomplete_attempt_rows += incomplete_rows
+                    outcome.dilution_evidence_rows_upserted += incomplete_rows
+                except Exception as marker_exc:
+                    outcome.incomplete_marker_error = marker_exc
+                    if _is_systemic_persistence_failure(marker_exc):
+                        outcome.systemic_persistence_failure = True
+            return outcome
+
     async def sync_disclosures_for_corporations(
         self,
         *,
@@ -1321,7 +1508,13 @@ class DartDisclosureSyncService:
         end_date: date,
         trigger: str = 'manual_active_universe_backfill',
         persist_negative_authority: bool = True,
+        concurrency: int = DEFAULT_DART_DISCLOSURE_SYNC_CONCURRENCY,
     ) -> dict[str, Any]:
+        if not 1 <= concurrency <= MAX_DART_DISCLOSURE_SYNC_CONCURRENCY:
+            raise ValueError(
+                'concurrency must be between 1 and '
+                f'{MAX_DART_DISCLOSURE_SYNC_CONCURRENCY}'
+            )
         requested_stock_codes = sorted(
             {
                 str(item.get('stock_code') or '').strip().zfill(6)
@@ -1336,6 +1529,7 @@ class DartDisclosureSyncService:
                 end_date=end_date,
                 trigger=trigger,
                 persist_negative_authority=False,
+                concurrency=concurrency,
             )
         with self.global_scan_lock_factory(
             market='KRX',
@@ -1359,6 +1553,7 @@ class DartDisclosureSyncService:
                     'unattempted_stock_codes': requested_stock_codes,
                     'incomplete_stock_codes': requested_stock_codes,
                     'persist_negative_authority': True,
+                    'concurrency': concurrency,
                 }
             return await self._sync_disclosures_for_corporations_unlocked(
                 corporations=corporations,
@@ -1366,6 +1561,7 @@ class DartDisclosureSyncService:
                 end_date=end_date,
                 trigger=trigger,
                 persist_negative_authority=True,
+                concurrency=concurrency,
             )
 
     async def _sync_disclosures_for_corporations_unlocked(
@@ -1376,6 +1572,7 @@ class DartDisclosureSyncService:
         end_date: date,
         trigger: str = 'manual_active_universe_backfill',
         persist_negative_authority: bool = True,
+        concurrency: int = DEFAULT_DART_DISCLOSURE_SYNC_CONCURRENCY,
     ) -> dict[str, Any]:
         validate_finalized_krx_write_date(
             end_date,
@@ -1409,6 +1606,7 @@ class DartDisclosureSyncService:
                 'manifest_hash': requested_manifest_hash,
                 'requested_manifest': requested_manifest,
                 'persist_negative_authority': persist_negative_authority,
+                'concurrency': concurrency,
             },
         )
 
@@ -1428,136 +1626,140 @@ class DartDisclosureSyncService:
         incomplete_marker_errors: list[dict[str, str]] = []
         consecutive_provider_failures = 0
         circuit_breaker_tripped = False
+        persistence_breaker_tripped = False
+        circuit_breaker_reason: str | None = None
+        circuit_breaker_manifest_index: int | None = None
+        circuit_breaker_stock_code: str | None = None
+        circuit_breaker_wave_start: int | None = None
+        circuit_breaker_wave_size: int | None = None
         unattempted_corporations: list[dict[str, str]] = []
 
         try:
-            for corporation_index, corporation in enumerate(corporations):
-                pagination_guard = _DisclosurePaginationGuard()
-                corporation_raw_items: list[dict[str, Any]] = []
-                try:
-                    page_no = 1
-                    total_pages = 1
-                    while page_no <= total_pages:
-                        payload = await self.client.fetch_disclosure_list(
-                            corp_code=corporation['corp_code'],
-                            bgn_de=start_date.strftime('%Y%m%d'),
-                            end_de=end_date.strftime('%Y%m%d'),
-                            page_no=page_no,
-                            page_count=page_size,
-                            last_reprt_at='N',
-                        )
-                        pages_fetched += 1
-                        raw_items, total_pages = pagination_guard.accept_page(
-                            payload,
-                            requested_page_no=page_no,
-                        )
-                        events_seen += len(raw_items)
-                        corporation_raw_items.extend(raw_items)
-                        positive_evidence = self.dilution_positive_persister(
+            for wave_start in range(0, len(corporations), concurrency):
+                wave = corporations[wave_start : wave_start + concurrency]
+                fetched_wave = await asyncio.gather(
+                    *(
+                        self._fetch_corporation_disclosures(
                             corporation=corporation,
-                            raw_items=raw_items,
-                            window_start=start_date,
-                            window_end=end_date,
-                            sync_run_id=run_id,
+                            start_date=start_date,
+                            end_date=end_date,
+                            page_size=page_size,
                         )
-                        dilution_positive_events += int(
-                            positive_evidence.get('positive_event_count') or 0
-                        )
-                        dilution_evidence_rows_upserted += int(
-                            positive_evidence.get('rows_upserted') or 0
-                        )
-                        page_items = []
-                        for raw_item in raw_items:
-                            event_record = self._build_event_record(raw_item, run_id=run_id)
-                            if event_record['is_financial_report']:
-                                page_items.append(event_record)
-
-                        counts = self.repository.upsert_events(page_items, run_id=run_id)
-                        events_inserted += counts['inserted']
-                        events_updated += counts['updated']
-                        financial_report_events += counts['financial_report_events']
-                        page_no += 1
-
-                    pagination_guard.assert_complete()
-                    self.dilution_positive_persister(
-                        corporation=corporation,
-                        raw_items=corporation_raw_items,
-                        window_start=start_date,
-                        window_end=end_date,
-                        sync_run_id=run_id,
-                        pagination_completed=True,
+                        for corporation in wave
                     )
-                    if persist_negative_authority:
-                        dilution_evidence = self.dilution_evidence_persister(
-                            corporation=corporation,
-                            raw_items=corporation_raw_items,
-                            window_start=start_date,
-                            window_end=end_date,
-                            pagination_completed=True,
-                            sync_run_id=run_id,
-                            positive_events_already_persisted=True,
+                )
+                for wave_offset, fetched in enumerate(fetched_wave):
+                    corporation_index = wave_start + wave_offset
+                    corporation = fetched.corporation
+                    pages_fetched += fetched.pages_fetched
+                    events_seen += fetched.events_seen
+
+                    if persistence_breaker_tripped:
+                        outcome = _CorporationDisclosurePersistence(
+                            error=RuntimeError(
+                                'skipped persistence after systemic '
+                                'persistence failure in current wave'
+                            )
                         )
-                        dilution_negative_coverage_rows += int(
-                            dilution_evidence.get('negative_coverage_count') or 0
+                    else:
+                        outcome = self._persist_corporation_disclosures(
+                            fetched=fetched,
+                            start_date=start_date,
+                            end_date=end_date,
+                            run_id=run_id,
+                            persist_negative_authority=(
+                                persist_negative_authority
+                            ),
                         )
-                        dilution_negative_segment_rows += int(
-                            dilution_evidence.get('negative_segment_count') or 0
-                        )
-                        dilution_evidence_rows_upserted += int(
-                            dilution_evidence.get('rows_upserted') or 0
-                        )
-                    corporations_processed += 1
-                    consecutive_provider_failures = 0
-                except Exception as exc:
-                    systemic_persistence_failure = (
-                        _is_systemic_persistence_failure(exc)
+
+                    events_inserted += outcome.events_inserted
+                    events_updated += outcome.events_updated
+                    financial_report_events += (
+                        outcome.financial_report_events
                     )
-                    if persist_negative_authority and not systemic_persistence_failure:
-                        try:
-                            incomplete_evidence = self.dilution_evidence_persister(
-                                corporation=corporation,
-                                raw_items=[],
-                                window_start=start_date,
-                                window_end=end_date,
-                                pagination_completed=False,
-                                sync_run_id=run_id,
-                                failure_reason=str(exc),
-                            )
-                            incomplete_rows = int(
-                                incomplete_evidence.get('rows_upserted') or 0
-                            )
-                            dilution_incomplete_attempt_rows += incomplete_rows
-                            dilution_evidence_rows_upserted += incomplete_rows
-                        except Exception as marker_exc:
-                            incomplete_marker_errors.append(
-                                {
-                                    'corp_code': corporation['corp_code'],
-                                    'stock_code': corporation.get('stock_code', ''),
-                                    'error': str(marker_exc),
-                                }
-                            )
+                    dilution_positive_events += (
+                        outcome.dilution_positive_events
+                    )
+                    dilution_negative_coverage_rows += (
+                        outcome.dilution_negative_coverage_rows
+                    )
+                    dilution_negative_segment_rows += (
+                        outcome.dilution_negative_segment_rows
+                    )
+                    dilution_incomplete_attempt_rows += (
+                        outcome.dilution_incomplete_attempt_rows
+                    )
+                    dilution_evidence_rows_upserted += (
+                        outcome.dilution_evidence_rows_upserted
+                    )
+
+                    if outcome.incomplete_marker_error is not None:
+                        incomplete_marker_errors.append(
+                            {
+                                'corp_code': corporation['corp_code'],
+                                'stock_code': corporation.get('stock_code', ''),
+                                'error': str(outcome.incomplete_marker_error),
+                            }
+                        )
+
+                    if outcome.success:
+                        corporations_processed += 1
+                        if not circuit_breaker_tripped:
+                            consecutive_provider_failures = 0
+                        continue
+
                     corporations_failed += 1
+                    error = outcome.error or RuntimeError(
+                        'corporation disclosure scan failed'
+                    )
                     corporation_errors.append(
                         {
                             'corp_code': corporation['corp_code'],
                             'stock_code': corporation.get('stock_code', ''),
-                            'error': str(exc),
+                            'error': str(error),
                         }
                     )
-                    if systemic_persistence_failure:
-                        circuit_breaker_tripped = True
-                        unattempted_corporations = corporations[
-                            corporation_index + 1 :
-                        ]
-                        break
-                    if _is_systemic_provider_failure(exc):
-                        consecutive_provider_failures += 1
-                    else:
-                        consecutive_provider_failures = 0
-                    if consecutive_provider_failures >= _CONSECUTIVE_PROVIDER_FAILURE_LIMIT:
-                        circuit_breaker_tripped = True
-                        unattempted_corporations = corporations[corporation_index + 1 :]
-                        break
+                    if outcome.systemic_persistence_failure:
+                        persistence_breaker_tripped = True
+                        if not circuit_breaker_tripped:
+                            circuit_breaker_tripped = True
+                            circuit_breaker_reason = (
+                                'systemic_persistence_failure'
+                            )
+                            circuit_breaker_manifest_index = corporation_index
+                            circuit_breaker_stock_code = corporation.get(
+                                'stock_code',
+                                '',
+                            )
+                            circuit_breaker_wave_start = wave_start
+                            circuit_breaker_wave_size = len(wave)
+                        continue
+
+                    if not circuit_breaker_tripped:
+                        if outcome.systemic_provider_failure:
+                            consecutive_provider_failures += 1
+                        else:
+                            consecutive_provider_failures = 0
+                        if (
+                            consecutive_provider_failures
+                            >= _CONSECUTIVE_PROVIDER_FAILURE_LIMIT
+                        ):
+                            circuit_breaker_tripped = True
+                            circuit_breaker_reason = (
+                                'consecutive_systemic_provider_failures'
+                            )
+                            circuit_breaker_manifest_index = corporation_index
+                            circuit_breaker_stock_code = corporation.get(
+                                'stock_code',
+                                '',
+                            )
+                            circuit_breaker_wave_start = wave_start
+                            circuit_breaker_wave_size = len(wave)
+                if circuit_breaker_tripped:
+                    unattempted_corporations = corporations[
+                        wave_start + len(wave) :
+                    ]
+                    break
 
             failed_stock_codes = [
                 item['stock_code']
@@ -1589,6 +1791,7 @@ class DartDisclosureSyncService:
                 'manifest_hash': requested_manifest_hash,
                 'requested_manifest': requested_manifest,
                 'persist_negative_authority': persist_negative_authority,
+                'concurrency': concurrency,
                 'corporations_attempted': corporations_attempted,
                 'corporations_processed': corporations_processed,
                 'corporations_failed': corporations_failed,
@@ -1614,8 +1817,15 @@ class DartDisclosureSyncService:
                 'incomplete_stock_codes': incomplete_stock_codes,
                 'circuit_breaker': {
                     'tripped': circuit_breaker_tripped,
+                    'reason': circuit_breaker_reason,
                     'threshold': _CONSECUTIVE_PROVIDER_FAILURE_LIMIT,
                     'consecutive_provider_failures': consecutive_provider_failures,
+                    'trigger_manifest_index': (
+                        circuit_breaker_manifest_index
+                    ),
+                    'trigger_stock_code': circuit_breaker_stock_code,
+                    'wave_start_index': circuit_breaker_wave_start,
+                    'wave_size': circuit_breaker_wave_size,
                 },
             }
             if corporations and corporations_processed == 0 and corporations_incomplete:
@@ -1630,6 +1840,7 @@ class DartDisclosureSyncService:
                 'window_start': start_date.isoformat(),
                 'window_end': end_date.isoformat(),
                 'page_size': page_size,
+                'concurrency': concurrency,
                 'pages_fetched': pages_fetched,
                 'events_seen': events_seen,
                 'events_inserted': events_inserted,
@@ -1685,6 +1896,11 @@ class DartDisclosureSyncService:
                 run_metadata={
                     'scope': 'current_active_universe',
                     'requested_corporations': len(corporations),
+                    'manifest_version': 'dart_per_corp_scan_manifest_v1',
+                    'manifest_hash': requested_manifest_hash,
+                    'requested_manifest': requested_manifest,
+                    'persist_negative_authority': persist_negative_authority,
+                    'concurrency': concurrency,
                     'corporations_processed': corporations_processed,
                     'corporations_failed': corporations_failed,
                     'corporation_errors': corporation_errors[:25],
