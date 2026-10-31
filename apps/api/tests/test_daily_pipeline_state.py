@@ -7679,6 +7679,561 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(completed_run.run_metadata, {'terminal': True})
         session.flush.assert_not_called()
 
+    def test_finish_run_interrupts_only_running_children_for_terminal_outcomes(self) -> None:
+        now = datetime(2026, 10, 31, 2, 30, tzinfo=timezone.utc)
+        started_at = now - timedelta(minutes=15)
+
+        for terminal_status in ('failed', 'blocked', 'interrupted'):
+            with self.subTest(terminal_status=terminal_status):
+                run = SimpleNamespace(
+                    id=447,
+                    market_date=date(2026, 9, 18),
+                    trigger='auto_close_scheduler',
+                    status='running',
+                    current_stage='signal_decider',
+                    started_at=started_at,
+                    updated_at=started_at,
+                    completed_at=None,
+                    error_message=None,
+                    run_metadata={'resolved_stages': ['signal_decider']},
+                )
+                running_stage = SimpleNamespace(
+                    id=2431,
+                    pipeline_run_id=447,
+                    market_date=date(2026, 9, 18),
+                    stage_id='signal_decider',
+                    status='running',
+                    processed=3,
+                    total=10,
+                    succeeded=2,
+                    failed=1,
+                    remaining=99,
+                    current_step='dispatching',
+                    current_activity='Dispatching signal decisions',
+                    current_symbol='005930',
+                    current_period=None,
+                    started_at=started_at,
+                    updated_at=started_at,
+                    completed_at=None,
+                    error_message=None,
+                    source_run_ids={'eod_run_id': 991},
+                    details={'durable_progress': True},
+                )
+                terminal_stage = SimpleNamespace(
+                    id=2430,
+                    pipeline_run_id=447,
+                    market_date=date(2026, 9, 18),
+                    stage_id='agent_feedback_summaries',
+                    status='completed',
+                    processed=357,
+                    total=360,
+                    succeeded=357,
+                    failed=3,
+                    remaining=3,
+                    current_step='completed',
+                    current_activity='Completed with retry debt',
+                    current_symbol=None,
+                    current_period=None,
+                    started_at=started_at,
+                    updated_at=started_at,
+                    completed_at=started_at,
+                    error_message=None,
+                    source_run_ids={'feedback_run_id': 88},
+                    details={'retry_debt_symbols': ['105740', '028050', '241690']},
+                )
+                terminal_stage_snapshot = deepcopy(vars(terminal_stage))
+                run_result = MagicMock()
+                run_result.scalar_one_or_none.return_value = run
+                stage_result = MagicMock()
+                stage_result.scalars.return_value = [terminal_stage, running_stage]
+                session = MagicMock()
+                session.execute.side_effect = [run_result, stage_result]
+                session_context = MagicMock()
+                session_context.__enter__.return_value = session
+
+                with (
+                    patch(
+                        'app.eod.daily_pipeline_state.session_scope',
+                        return_value=session_context,
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_state._utcnow',
+                        return_value=now,
+                    ),
+                ):
+                    result = DailyPipelineRunStateService().finish_run(
+                        pipeline_run_id=447,
+                        status=terminal_status,
+                        error_message='parent terminalized',
+                    )
+
+                self.assertEqual(result['status'], terminal_status)
+                self.assertEqual(running_stage.status, 'interrupted')
+                self.assertEqual(running_stage.remaining, 7)
+                self.assertEqual(running_stage.processed, 3)
+                self.assertEqual(running_stage.total, 10)
+                self.assertEqual(running_stage.succeeded, 2)
+                self.assertEqual(running_stage.failed, 1)
+                self.assertEqual(
+                    running_stage.source_run_ids,
+                    {'eod_run_id': 991},
+                )
+                self.assertEqual(running_stage.completed_at, now)
+                self.assertEqual(running_stage.updated_at, now)
+                self.assertEqual(
+                    running_stage.details['terminal_parent_reconciliation'][
+                        'parent_status'
+                    ],
+                    terminal_status,
+                )
+                self.assertEqual(
+                    running_stage.details['terminal_parent_reconciliation'][
+                        'previous_stage_status'
+                    ],
+                    'running',
+                )
+                self.assertEqual(vars(terminal_stage), terminal_stage_snapshot)
+                session.flush.assert_called_once_with()
+
+    def test_finish_run_same_terminal_replay_repairs_running_child_without_rewriting_parent(self) -> None:
+        completed_at = datetime(2026, 8, 29, 11, 0, tzinfo=timezone.utc)
+        replayed_at = completed_at + timedelta(days=60)
+        failed_run = SimpleNamespace(
+            id=217,
+            market_date=date(2026, 7, 30),
+            trigger='auto_close_scheduler',
+            status='failed',
+            current_stage='signal_decider',
+            started_at=completed_at - timedelta(hours=1),
+            updated_at=completed_at,
+            completed_at=completed_at,
+            error_message='original parent failure',
+            run_metadata={'terminal': True},
+        )
+        running_stage = SimpleNamespace(
+            id=1136,
+            pipeline_run_id=217,
+            market_date=date(2026, 7, 30),
+            stage_id='signal_decider',
+            status='running',
+            processed=100,
+            total=120,
+            succeeded=100,
+            failed=0,
+            remaining=20,
+            current_step='dispatching',
+            current_activity='Dispatching signal decisions',
+            current_symbol=None,
+            current_period=None,
+            started_at=completed_at - timedelta(minutes=10),
+            updated_at=completed_at - timedelta(minutes=1),
+            completed_at=None,
+            error_message=None,
+            source_run_ids={'feedback_run_id': 91},
+            details={},
+        )
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = failed_run
+        stage_result = MagicMock()
+        stage_result.scalars.return_value = [running_stage]
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stage_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=replayed_at,
+            ),
+        ):
+            result = DailyPipelineRunStateService().finish_run(
+                pipeline_run_id=217,
+                status='failed',
+                error_message='new failure must not replace history',
+                run_metadata={'new': True},
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(failed_run.completed_at, completed_at)
+        self.assertEqual(failed_run.updated_at, completed_at)
+        self.assertEqual(failed_run.error_message, 'original parent failure')
+        self.assertEqual(failed_run.run_metadata, {'terminal': True})
+        self.assertEqual(running_stage.status, 'interrupted')
+        self.assertEqual(running_stage.completed_at, completed_at)
+        self.assertEqual(
+            running_stage.updated_at,
+            completed_at - timedelta(minutes=1),
+        )
+        session.flush.assert_called_once_with()
+
+    def test_exact_terminal_child_repair_preserves_historical_updated_at(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        DailyPipelineRun.__table__.create(engine)
+        DailyPipelineStageRun.__table__.create(engine)
+        session_factory = sessionmaker(bind=engine, future=True)
+        historical_updated_at = datetime(
+            2026,
+            9,
+            18,
+            13,
+            45,
+            tzinfo=timezone.utc,
+        )
+        parent_completed_at = historical_updated_at + timedelta(minutes=1)
+        with session_factory.begin() as session:
+            session.add(
+                DailyPipelineRun(
+                    id=447,
+                    market_date=date(2026, 9, 18),
+                    trigger='auto_close_scheduler',
+                    status='blocked',
+                    current_stage='signal_decider',
+                    started_at=historical_updated_at - timedelta(hours=1),
+                    updated_at=parent_completed_at,
+                    completed_at=parent_completed_at,
+                    error_message='parent blocked',
+                    run_metadata={},
+                )
+            )
+            session.add_all(
+                [
+                    DailyPipelineStageRun(
+                        id=2431,
+                        pipeline_run_id=447,
+                        market_date=date(2026, 9, 18),
+                        stage_id='signal_decider',
+                        status='running',
+                        processed=3,
+                        total=10,
+                        succeeded=2,
+                        failed=1,
+                        remaining=99,
+                        current_step='dispatching',
+                        current_activity='Dispatching signal decisions',
+                        started_at=historical_updated_at - timedelta(minutes=5),
+                        updated_at=historical_updated_at,
+                        source_run_ids={'eod_run_id': 991},
+                        details={'durable_progress': True},
+                    ),
+                    DailyPipelineStageRun(
+                        id=2430,
+                        pipeline_run_id=447,
+                        market_date=date(2026, 9, 18),
+                        stage_id='agent_feedback_summaries',
+                        status='completed',
+                        processed=357,
+                        total=360,
+                        succeeded=357,
+                        failed=3,
+                        remaining=3,
+                        current_step='completed',
+                        current_activity='Completed with retry debt',
+                        started_at=historical_updated_at - timedelta(minutes=10),
+                        updated_at=historical_updated_at,
+                        completed_at=historical_updated_at,
+                        source_run_ids={'feedback_run_id': 88},
+                        details={'retry_debt_symbols': ['105740']},
+                    ),
+                ]
+            )
+
+        @contextmanager
+        def _session_scope(**_kwargs):
+            with session_factory.begin() as session:
+                yield session
+
+        try:
+            with (
+                patch(
+                    'app.eod.daily_pipeline_state.session_scope',
+                    _session_scope,
+                ),
+                patch(
+                    'app.eod.daily_pipeline_state._utcnow',
+                    return_value=datetime(
+                        2026,
+                        10,
+                        31,
+                        2,
+                        30,
+                        tzinfo=timezone.utc,
+                    ),
+                ),
+            ):
+                dry_run_result = (
+                    DailyPipelineRunStateService()
+                    .reconcile_terminal_parent_running_stages(
+                        expected_orphans={
+                            447: ('blocked', 'signal_decider'),
+                        },
+                        expected_orphan_count=1,
+                        apply=False,
+                        preserve_historical_updated_at=True,
+                    )
+                )
+                with session_factory() as session:
+                    dry_run_stage = session.get(DailyPipelineStageRun, 2431)
+                    assert dry_run_stage is not None
+                    self.assertEqual(dry_run_stage.status, 'running')
+                    self.assertEqual(
+                        dry_run_stage.updated_at.replace(
+                            tzinfo=timezone.utc
+                        ),
+                        historical_updated_at,
+                    )
+                result = (
+                    DailyPipelineRunStateService()
+                    .reconcile_terminal_parent_running_stages(
+                        expected_orphans={
+                            447: ('blocked', 'signal_decider'),
+                        },
+                        expected_orphan_count=1,
+                        apply=True,
+                        preserve_historical_updated_at=True,
+                    )
+                )
+                replay_result = (
+                    DailyPipelineRunStateService()
+                    .reconcile_terminal_parent_running_stages(
+                        expected_orphans={
+                            447: ('blocked', 'signal_decider'),
+                        },
+                        expected_orphan_count=1,
+                        apply=True,
+                        preserve_historical_updated_at=True,
+                    )
+                )
+
+            with session_factory() as session:
+                repaired = session.get(DailyPipelineStageRun, 2431)
+                terminal = session.get(DailyPipelineStageRun, 2430)
+                assert repaired is not None
+                assert terminal is not None
+                self.assertEqual(repaired.status, 'interrupted')
+                self.assertEqual(repaired.remaining, 7)
+                self.assertEqual(
+                    repaired.updated_at.replace(tzinfo=timezone.utc),
+                    historical_updated_at,
+                )
+                self.assertEqual(
+                    repaired.completed_at.replace(tzinfo=timezone.utc),
+                    parent_completed_at,
+                )
+                self.assertEqual(repaired.processed, 3)
+                self.assertEqual(repaired.total, 10)
+                self.assertEqual(repaired.succeeded, 2)
+                self.assertEqual(repaired.failed, 1)
+                self.assertEqual(repaired.source_run_ids, {'eod_run_id': 991})
+                self.assertTrue(repaired.details['durable_progress'])
+                self.assertEqual(
+                    repaired.details['terminal_parent_reconciliation'][
+                        'schema_version'
+                    ],
+                    'terminal_parent_running_stage_reconciliation_v1',
+                )
+                self.assertEqual(terminal.status, 'completed')
+                self.assertEqual(terminal.details, {'retry_debt_symbols': ['105740']})
+                self.assertEqual(
+                    terminal.updated_at.replace(tzinfo=timezone.utc),
+                    historical_updated_at,
+                )
+        finally:
+            engine.dispose()
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['repaired_stage_run_ids'], [2431])
+        self.assertEqual(dry_run_result['status'], 'ready')
+        self.assertEqual(replay_result['status'], 'already_applied')
+
+    def test_exact_terminal_child_repair_blocks_without_exact_scope_match(self) -> None:
+        run = SimpleNamespace(
+            id=447,
+            status='blocked',
+            completed_at=datetime(
+                2026,
+                9,
+                18,
+                13,
+                46,
+                tzinfo=timezone.utc,
+            ),
+        )
+        stage = SimpleNamespace(
+            id=2431,
+            pipeline_run_id=447,
+            stage_id='signal_decider',
+            status='running',
+            details={},
+        )
+        parent_result = MagicMock()
+        parent_result.scalars.return_value = [run]
+        orphan_result = MagicMock()
+        orphan_result.all.return_value = [(run, stage)]
+        stage_result = MagicMock()
+        stage_result.scalars.return_value = [stage]
+        session = MagicMock()
+        session.execute.side_effect = [parent_result, orphan_result, stage_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .reconcile_terminal_parent_running_stages(
+                    expected_orphans={
+                        447: ('blocked', 'signal_decider'),
+                        231: ('interrupted', 'signal_decider'),
+                    },
+                    expected_orphan_count=2,
+                    apply=True,
+                    preserve_historical_updated_at=True,
+                )
+            )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertFalse(result['invariants']['parent_ids_match'])
+        self.assertEqual(stage.status, 'running')
+        session.flush.assert_not_called()
+
+    def test_exact_terminal_child_repair_blocks_on_status_or_stage_drift(self) -> None:
+        completed_at = datetime(2026, 9, 18, 13, 46, tzinfo=timezone.utc)
+        for parent_status, stage_id in (
+            ('failed', 'agent_feedback_summaries'),
+            ('blocked', 'signal_decider'),
+        ):
+            with self.subTest(
+                parent_status=parent_status,
+                stage_id=stage_id,
+            ):
+                run = SimpleNamespace(
+                    id=447,
+                    status=parent_status,
+                    completed_at=completed_at,
+                )
+                stage = SimpleNamespace(
+                    id=2431,
+                    pipeline_run_id=447,
+                    stage_id=stage_id,
+                    status='running',
+                    details={},
+                )
+                parent_result = MagicMock()
+                parent_result.scalars.return_value = [run]
+                orphan_result = MagicMock()
+                orphan_result.all.return_value = [(run, stage)]
+                stage_result = MagicMock()
+                stage_result.scalars.return_value = [stage]
+                session = MagicMock()
+                session.execute.side_effect = [
+                    parent_result,
+                    orphan_result,
+                    stage_result,
+                ]
+                session_context = MagicMock()
+                session_context.__enter__.return_value = session
+
+                with patch(
+                    'app.eod.daily_pipeline_state.session_scope',
+                    return_value=session_context,
+                ):
+                    result = (
+                        DailyPipelineRunStateService()
+                        .reconcile_terminal_parent_running_stages(
+                            expected_orphans={
+                                447: (
+                                    'blocked',
+                                    'agent_feedback_summaries',
+                                ),
+                            },
+                            expected_orphan_count=1,
+                            apply=True,
+                        )
+                    )
+
+                self.assertEqual(result['status'], 'blocked')
+                self.assertFalse(
+                    result['invariants']['orphan_manifest_matches']
+                )
+                self.assertEqual(stage.status, 'running')
+                session.flush.assert_not_called()
+
+    def test_exact_terminal_child_repair_rolls_back_if_postcondition_fails(self) -> None:
+        now = datetime(2026, 9, 18, 13, 46, tzinfo=timezone.utc)
+        run = SimpleNamespace(
+            id=447,
+            status='blocked',
+            completed_at=now,
+            error_message='parent blocked',
+        )
+        stage = SimpleNamespace(
+            id=2431,
+            pipeline_run_id=447,
+            stage_id='agent_feedback_summaries',
+            status='running',
+            processed=3,
+            total=10,
+            succeeded=2,
+            failed=1,
+            remaining=99,
+            current_step='dispatching',
+            current_activity='Dispatching summaries',
+            current_symbol=None,
+            current_period=None,
+            updated_at=now - timedelta(minutes=1),
+            completed_at=None,
+            error_message=None,
+            source_run_ids={'feedback_run_id': 88},
+            details={},
+        )
+        parent_result = MagicMock()
+        parent_result.scalars.return_value = [run]
+        orphan_result = MagicMock()
+        orphan_result.all.return_value = [(run, stage)]
+        stage_result = MagicMock()
+        stage_result.scalars.return_value = [stage]
+        postcondition_result = MagicMock()
+        postcondition_result.all.return_value = [(run, stage)]
+        session = MagicMock()
+        session.execute.side_effect = [
+            parent_result,
+            orphan_result,
+            stage_result,
+            postcondition_result,
+        ]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .reconcile_terminal_parent_running_stages(
+                    expected_orphans={
+                        447: ('blocked', 'agent_feedback_summaries'),
+                    },
+                    expected_orphan_count=1,
+                    apply=True,
+                )
+            )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(
+            result['reason'],
+            'terminal_child_repair_postcondition_failed',
+        )
+        session.flush.assert_called_once_with()
+        session.rollback.assert_called_once_with()
+
     def test_finish_stage_recomputes_stale_remaining_from_terminal_counts(self) -> None:
         now = datetime(2026, 9, 12, 16, 5, tzinfo=timezone.utc)
         run = SimpleNamespace(

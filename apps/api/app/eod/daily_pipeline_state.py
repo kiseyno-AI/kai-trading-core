@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import or_, select, text
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.agent_context.lease_loss_evidence import (
     terminal_feedback_completed_run_evidence_error,
@@ -494,6 +495,56 @@ class DailyPipelineRunStateService:
             'source_run_ids': row.source_run_ids or {},
             'details': row.details or {},
         }
+
+    @staticmethod
+    def _interrupt_running_child_stages(
+        *,
+        parent_row: DailyPipelineRun,
+        stage_rows: Sequence[DailyPipelineStageRun],
+        now: datetime,
+        preserve_updated_at: bool,
+    ) -> int:
+        repaired_count = 0
+        parent_terminal_at = parent_row.completed_at or now
+        reason = (
+            parent_row.error_message
+            or 'Interrupted running stage because its parent pipeline run is terminal.'
+        )
+        for stage_row in stage_rows:
+            if stage_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                continue
+            historical_updated_at = stage_row.updated_at
+            details = dict(stage_row.details or {})
+            details['terminal_parent_reconciliation'] = {
+                'schema_version': 'terminal_parent_running_stage_reconciliation_v1',
+                'reason': 'parent_terminal_while_stage_running',
+                'parent_run_id': int(parent_row.id),
+                'parent_status': str(parent_row.status),
+                'previous_stage_status': str(stage_row.status),
+                'parent_terminal_at': _iso(parent_terminal_at),
+                'reconciled_at': now.isoformat(),
+                'historical_updated_at_preserved': bool(
+                    preserve_updated_at
+                ),
+            }
+            stage_row.status = 'interrupted'
+            stage_row.remaining = max(
+                _as_int(stage_row.total) - _as_int(stage_row.processed),
+                0,
+            )
+            stage_row.current_step = 'parent_terminal_reconciled'
+            stage_row.current_activity = reason
+            stage_row.error_message = reason
+            stage_row.completed_at = stage_row.completed_at or parent_terminal_at
+            stage_row.details = details
+            if preserve_updated_at:
+                stage_row.updated_at = historical_updated_at
+                if hasattr(stage_row, '_sa_instance_state'):
+                    flag_modified(stage_row, 'updated_at')
+            else:
+                stage_row.updated_at = now
+            repaired_count += 1
+        return repaired_count
 
     def start_run(
         self,
@@ -991,8 +1042,19 @@ class DailyPipelineRunStateService:
                                 == int(pipeline_run_id)
                             )
                             .order_by(DailyPipelineStageRun.id.asc())
+                            .with_for_update()
                         ).scalars()
                     )
+                    repaired_count = 0
+                    if requested_status in TERMINAL_DAILY_PIPELINE_STATUSES:
+                        repaired_count = self._interrupt_running_child_stages(
+                            parent_row=row,
+                            stage_rows=stage_rows,
+                            now=now,
+                            preserve_updated_at=True,
+                        )
+                    if repaired_count:
+                        session.flush()
                     return self._serialize_run(row, stage_rows)
                 raise ValueError(
                     f'daily pipeline run is not active: {pipeline_run_id} ({row.status})'
@@ -1010,10 +1072,259 @@ class DailyPipelineRunStateService:
                     select(DailyPipelineStageRun)
                     .where(DailyPipelineStageRun.pipeline_run_id == int(pipeline_run_id))
                     .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
                 ).scalars()
             )
+            if requested_status in TERMINAL_DAILY_PIPELINE_STATUSES:
+                self._interrupt_running_child_stages(
+                    parent_row=row,
+                    stage_rows=stage_rows,
+                    now=now,
+                    preserve_updated_at=False,
+                )
             session.flush()
             return self._serialize_run(row, stage_rows)
+
+    def reconcile_terminal_parent_running_stages(
+        self,
+        *,
+        expected_orphans: Mapping[int, tuple[str, str]],
+        expected_orphan_count: int,
+        apply: bool = False,
+        preserve_historical_updated_at: bool = True,
+    ) -> dict[str, Any]:
+        """Repair one reviewed terminal-parent/running-child incident set.
+
+        The global orphan set must match the supplied manifest exactly. This
+        keeps the internal operation fail-closed if production state changes
+        between review and execution.
+        """
+
+        normalized_expected = {
+            int(parent_id): (
+                str(parent_status).strip().lower(),
+                str(stage_id).strip(),
+            )
+            for parent_id, (parent_status, stage_id) in expected_orphans.items()
+        }
+        normalized_expected_count = int(expected_orphan_count)
+        if not normalized_expected:
+            raise ValueError('expected terminal-child repair manifest is empty')
+        if normalized_expected_count != len(normalized_expected):
+            raise ValueError(
+                'expected orphan count must equal the exact parent manifest size'
+            )
+        if any(
+            parent_status not in TERMINAL_DAILY_PIPELINE_STATUSES
+            or not stage_id
+            for parent_status, stage_id in normalized_expected.values()
+        ):
+            raise ValueError('expected terminal-child repair manifest is invalid')
+
+        now = _utcnow()
+        expected_parent_ids = tuple(sorted(normalized_expected))
+
+        def _orphan_statement():
+            return (
+                select(DailyPipelineRun, DailyPipelineStageRun)
+                .join(
+                    DailyPipelineStageRun,
+                    DailyPipelineStageRun.pipeline_run_id
+                    == DailyPipelineRun.id,
+                )
+                .where(
+                    DailyPipelineRun.status.in_(
+                        TERMINAL_DAILY_PIPELINE_STATUSES
+                    ),
+                    DailyPipelineStageRun.status.in_(
+                        ACTIVE_DAILY_PIPELINE_STATUSES
+                    ),
+                )
+                .order_by(
+                    DailyPipelineRun.id.asc(),
+                    DailyPipelineStageRun.id.asc(),
+                )
+                .with_for_update()
+            )
+
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS,
+            lock_timeout_ms=DAILY_PIPELINE_HEARTBEAT_LOCK_TIMEOUT_MS,
+            isolated_connection=True,
+        ) as session:
+            parent_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(DailyPipelineRun.id.in_(expected_parent_ids))
+                    .order_by(DailyPipelineRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            orphan_rows = list(session.execute(_orphan_statement()).all())
+            scoped_stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id.in_(
+                            expected_parent_ids
+                        )
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+
+            actual_parent_ids = sorted(int(row.id) for row in parent_rows)
+            actual_manifest = sorted(
+                (
+                    int(parent_row.id),
+                    str(parent_row.status),
+                    str(stage_row.stage_id),
+                )
+                for parent_row, stage_row in orphan_rows
+            )
+            expected_manifest = sorted(
+                (
+                    parent_id,
+                    parent_status,
+                    stage_id,
+                )
+                for parent_id, (parent_status, stage_id) in normalized_expected.items()
+            )
+            parent_statuses_match = all(
+                normalized_expected.get(int(row.id), ('', ''))[0]
+                == str(row.status)
+                for row in parent_rows
+            )
+            parent_completed_at_present = all(
+                row.completed_at is not None for row in parent_rows
+            )
+            invariants = {
+                'parent_ids_match': actual_parent_ids
+                == list(expected_parent_ids),
+                'parent_statuses_match': parent_statuses_match,
+                'parent_completed_at_present': parent_completed_at_present,
+                'orphan_count_matches': len(orphan_rows)
+                == normalized_expected_count,
+                'orphan_manifest_matches': actual_manifest
+                == expected_manifest,
+            }
+
+            audited_stage_rows: list[
+                tuple[DailyPipelineStageRun, Mapping[str, Any]]
+            ] = []
+            for stage_row in scoped_stage_rows:
+                audit = (
+                    (stage_row.details or {}).get(
+                        'terminal_parent_reconciliation'
+                    )
+                    or {}
+                )
+                if (
+                    stage_row.status == 'interrupted'
+                    and isinstance(audit, Mapping)
+                    and str(audit.get('schema_version') or '')
+                    == 'terminal_parent_running_stage_reconciliation_v1'
+                ):
+                    audited_stage_rows.append((stage_row, audit))
+            audited_manifest = sorted(
+                (
+                    int(stage_row.pipeline_run_id),
+                    str(audit.get('parent_status') or ''),
+                    str(stage_row.stage_id),
+                )
+                for stage_row, audit in audited_stage_rows
+            )
+            already_applied_invariants = {
+                'parent_ids_match': invariants['parent_ids_match'],
+                'parent_statuses_match': invariants[
+                    'parent_statuses_match'
+                ],
+                'parent_completed_at_present': invariants[
+                    'parent_completed_at_present'
+                ],
+                'no_pending_orphans': not orphan_rows,
+                'repair_marker_count_matches': len(audited_stage_rows)
+                == normalized_expected_count,
+                'repair_marker_manifest_matches': audited_manifest
+                == expected_manifest,
+            }
+            if all(already_applied_invariants.values()):
+                return {
+                    'status': 'already_applied',
+                    'dry_run': not apply,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': 0,
+                    'invariants': already_applied_invariants,
+                    'repaired_stage_run_ids': sorted(
+                        int(stage_row.id)
+                        for stage_row, _audit in audited_stage_rows
+                    ),
+                }
+
+            if not all(invariants.values()):
+                return {
+                    'status': 'blocked',
+                    'reason': 'terminal_child_repair_manifest_mismatch',
+                    'dry_run': not apply,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'actual_parent_ids': actual_parent_ids,
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': len(orphan_rows),
+                    'expected_manifest': expected_manifest,
+                    'actual_manifest': actual_manifest,
+                    'invariants': invariants,
+                    'repaired_stage_run_ids': [],
+                }
+
+            if not apply:
+                return {
+                    'status': 'ready',
+                    'dry_run': True,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': len(orphan_rows),
+                    'expected_manifest': expected_manifest,
+                    'actual_manifest': actual_manifest,
+                    'invariants': invariants,
+                    'repaired_stage_run_ids': [],
+                }
+
+            repaired_stage_run_ids: list[int] = []
+            for parent_row, stage_row in orphan_rows:
+                repaired_stage_run_ids.append(int(stage_row.id))
+                self._interrupt_running_child_stages(
+                    parent_row=parent_row,
+                    stage_rows=[stage_row],
+                    now=now,
+                    preserve_updated_at=preserve_historical_updated_at,
+                )
+            session.flush()
+            remaining_orphans = list(
+                session.execute(_orphan_statement()).all()
+            )
+            if remaining_orphans:
+                session.rollback()
+                return {
+                    'status': 'blocked',
+                    'reason': 'terminal_child_repair_postcondition_failed',
+                    'dry_run': False,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': len(remaining_orphans),
+                    'invariants': invariants,
+                    'repaired_stage_run_ids': [],
+                }
+            return {
+                'status': 'completed',
+                'dry_run': False,
+                'expected_parent_ids': list(expected_parent_ids),
+                'expected_orphan_count': normalized_expected_count,
+                'actual_orphan_count': 0,
+                'invariants': invariants,
+                'repaired_stage_run_ids': sorted(repaired_stage_run_ids),
+            }
 
     def get_latest_run(
         self,

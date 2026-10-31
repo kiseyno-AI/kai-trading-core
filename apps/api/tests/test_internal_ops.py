@@ -174,6 +174,78 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(json.loads(stdout.getvalue()), payload)
 
+    def test_terminal_child_repair_uses_frozen_exact_manifest_without_bootstrap(self) -> None:
+        payload = {'status': 'ready', 'dry_run': True}
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.daily_pipeline_run_state_service.'
+                'reconcile_terminal_parent_running_stages',
+                return_value=payload,
+            ) as reconcile,
+        ):
+            result = ops.repair_terminal_daily_pipeline_children(
+                dry_run=True
+            )
+
+        self.assertEqual(result, payload)
+        bootstrap_runtime.assert_not_called()
+        reconcile.assert_called_once_with(
+            expected_orphans={
+                151: ('failed', 'price_collection'),
+                217: ('failed', 'signal_decider'),
+                231: ('interrupted', 'signal_decider'),
+                447: ('blocked', 'agent_feedback_summaries'),
+            },
+            expected_orphan_count=4,
+            apply=False,
+            preserve_historical_updated_at=True,
+        )
+
+    def test_terminal_child_repair_cli_defaults_dry_run_and_requires_apply(self) -> None:
+        for argv, expected_dry_run in (
+            (['eod-pipeline-terminal-child-repair'], True),
+            (['eod-pipeline-terminal-child-repair', '--apply'], False),
+        ):
+            with self.subTest(argv=argv):
+                payload = {
+                    'status': 'ready' if expected_dry_run else 'completed',
+                    'dry_run': expected_dry_run,
+                }
+                stdout = io.StringIO()
+                with (
+                    patch(
+                        'app.internal.ops.repair_terminal_daily_pipeline_children',
+                        return_value=payload,
+                    ) as repair,
+                    redirect_stdout(stdout),
+                ):
+                    exit_code = ops.main(argv)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(json.loads(stdout.getvalue()), payload)
+                repair.assert_called_once_with(dry_run=expected_dry_run)
+
+    def test_terminal_child_repair_cli_returns_nonzero_when_scope_drift_blocks(self) -> None:
+        payload = {
+            'status': 'blocked',
+            'reason': 'terminal_child_repair_manifest_mismatch',
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.repair_terminal_daily_pipeline_children',
+                return_value=payload,
+            ),
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                ['eod-pipeline-terminal-child-repair', '--apply']
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+
     def test_run_pykrx_daily_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
