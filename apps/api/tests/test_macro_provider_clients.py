@@ -7,7 +7,7 @@ import httpx
 
 from app.core.settings import settings
 from app.integrations.fred.client import FREDClient
-from app.integrations.world_bank.client import WorldBankClient
+from app.integrations.world_bank.client import WorldBankAPIError, WorldBankClient
 
 
 class MacroProviderClientRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -41,6 +41,30 @@ class MacroProviderClientRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempts, 2)
         self.assertEqual(result['rows'], [{'date': '2025', 'value': 2.1}])
+
+    async def test_world_bank_empty_read_timeout_has_nonblank_transport_error(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ReadTimeout('', request=request)
+
+        client = WorldBankClient(transport=httpx.MockTransport(handler))
+        with (
+            patch('app.core.audit_logging.asyncio.sleep', new_callable=AsyncMock),
+            self.assertRaises(WorldBankAPIError) as raised,
+        ):
+            await client.fetch_indicator(
+                country='KR',
+                indicator='FP.CPI.TOTL.ZG',
+            )
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(
+            str(raised.exception),
+            'World Bank transport error: ReadTimeout',
+        )
 
     async def test_world_bank_does_not_retry_invalid_json(self) -> None:
         attempts = 0

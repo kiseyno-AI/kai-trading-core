@@ -47,6 +47,16 @@ class FailingFredClient:
         raise AssertionError('FRED should not be called when FRED_API_KEY is missing')
 
 
+class EmptyErrorWorldBankClient:
+    async def fetch_indicator(self, **kwargs):
+        raise RuntimeError()
+
+
+class EmptyErrorFredClient:
+    async def fetch_latest_observations(self, **kwargs):
+        raise RuntimeError()
+
+
 class MacroContextServiceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -154,6 +164,80 @@ class MacroContextServiceTests(unittest.TestCase):
                 'series_id': None,
                 'status': 'disabled_missing_api_key',
                 'reason': 'FRED_API_KEY is not configured',
+            },
+        )
+
+    def test_world_bank_failure_reports_retry_contract_with_nonblank_reason(self) -> None:
+        settings.macro_context_world_bank_series = 'NY.GDP.MKTP.KD.ZG'
+        settings.macro_context_fred_enabled = False
+        service = self._service(EmptyErrorWorldBankClient())
+        now = datetime(2026, 6, 20, 9, tzinfo=timezone.utc)
+        config = DEFAULT_WORLD_BANK_SERIES['NY.GDP.MKTP.KD.ZG']
+        service.store.upsert_observation(
+            source=WORLD_BANK_SOURCE,
+            series_id=config.series_id,
+            series_name=config.series_name,
+            country_code='KOR',
+            observation_period='2024',
+            observation_date=date(2024, 12, 31),
+            value=2.8,
+            unit=config.unit,
+            frequency=config.frequency,
+            fetched_at=now - timedelta(hours=1),
+            source_status='available',
+        )
+
+        with patch('app.macro_context.service._utcnow', return_value=now):
+            result = service.refresh_context(force=True, trigger='unit_test')
+
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['observations_failed'], 1)
+        self.assertEqual(
+            result['series_statuses'][0],
+            {
+                'source': WORLD_BANK_SOURCE,
+                'series_id': 'NY.GDP.MKTP.KD.ZG',
+                'status': 'failed',
+                'reason': 'RuntimeError',
+                'error_type': 'RuntimeError',
+                'retryable': True,
+                'action_required': 'automatic_retry_pending',
+            },
+        )
+        self.assertEqual(result['context']['status'], 'available')
+        self.assertEqual(result['context']['series'][0]['latest_value'], 2.8)
+        latest = service.store.load_latest_by_series(
+            series_keys=[(WORLD_BANK_SOURCE, config.series_id)],
+            as_of_date=now.date(),
+        )
+        self.assertEqual(
+            latest[(WORLD_BANK_SOURCE, config.series_id)].status_detail,
+            f'refresh_failed_at={now.isoformat()}; RuntimeError',
+        )
+
+    def test_fred_failure_reports_retry_contract_with_nonblank_reason(self) -> None:
+        settings.macro_context_world_bank_enabled = False
+        settings.fred_api_key = 'test-fred-key'
+        service = MacroContextService(
+            store=MacroContextObservationStore(),
+            world_bank_client=FakeWorldBankClient(),
+            fred_client=EmptyErrorFredClient(),
+        )
+
+        result = service.refresh_context(force=True, trigger='unit_test')
+
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['observations_failed'], 1)
+        self.assertEqual(
+            result['series_statuses'][0],
+            {
+                'source': FRED_SOURCE,
+                'series_id': 'DEXKOUS',
+                'status': 'failed',
+                'reason': 'RuntimeError',
+                'error_type': 'RuntimeError',
+                'retryable': True,
+                'action_required': 'automatic_retry_pending',
             },
         )
 

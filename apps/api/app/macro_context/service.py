@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.audit_logging import exception_message
 from app.core.settings import settings
 from app.integrations.fred.client import FREDAPIError, FREDClient, FREDConfigurationError
 from app.integrations.world_bank.client import WorldBankAPIError, WorldBankClient
@@ -638,12 +639,13 @@ class MacroContextService:
                 )
             except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
                 observations_failed += 1
+                reason = exception_message(exc)
                 try:
                     self.store.mark_refresh_failure(
                         source=WORLD_BANK_SOURCE,
                         series_id=config.series_id,
                         failed_at=now,
-                        reason=str(exc),
+                        reason=reason,
                     )
                 except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
                     pass
@@ -652,7 +654,10 @@ class MacroContextService:
                         'source': WORLD_BANK_SOURCE,
                         'series_id': config.series_id,
                         'status': 'failed',
-                        'reason': str(exc),
+                        'reason': reason,
+                        'error_type': type(exc).__name__,
+                        'retryable': True,
+                        'action_required': 'automatic_retry_pending',
                     }
                 )
 
@@ -729,15 +734,19 @@ class MacroContextService:
                     }
                 )
             except FREDConfigurationError as exc:
-                return self._fred_disabled_result(status='disabled_missing_api_key', reason=str(exc))
+                return self._fred_disabled_result(
+                    status='disabled_missing_api_key',
+                    reason=exception_message(exc),
+                )
             except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
                 observations_failed += 1
+                reason = exception_message(exc)
                 try:
                     self.store.mark_refresh_failure(
                         source=FRED_SOURCE,
                         series_id=config.series_id,
                         failed_at=now,
-                        reason=str(exc),
+                        reason=reason,
                     )
                 except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
                     pass
@@ -746,7 +755,10 @@ class MacroContextService:
                         'source': FRED_SOURCE,
                         'series_id': config.series_id,
                         'status': 'failed',
-                        'reason': str(exc),
+                        'reason': reason,
+                        'error_type': type(exc).__name__,
+                        'retryable': True,
+                        'action_required': 'automatic_retry_pending',
                     }
                 )
 
