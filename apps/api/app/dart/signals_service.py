@@ -32,6 +32,8 @@ from app.integrations.dart.client import DartClient, dart_client
 
 DEFAULT_AUDIT_BACKFILL_LIMIT = 25
 MAX_AUDIT_BACKFILL_LIMIT = 100
+DEFAULT_AUDIT_BACKFILL_CONCURRENCY = 1
+MAX_AUDIT_BACKFILL_CONCURRENCY = 8
 AUDIT_BACKFILL_SYSTEMIC_FAILURE_LIMIT = 3
 AUDIT_BACKFILL_SELECTION_POLICY = 'piotroski_latest_annual_audit_v1'
 MAX_AUDIT_ARCHIVE_COMPRESSED_BYTES = 50 * 1024 * 1024
@@ -378,6 +380,7 @@ class DartSignalsService:
         market_date: date,
         limit: int = DEFAULT_AUDIT_BACKFILL_LIMIT,
         after_event_id: int = 0,
+        concurrency: int = DEFAULT_AUDIT_BACKFILL_CONCURRENCY,
         dry_run: bool = True,
     ) -> dict[str, Any]:
         if not 1 <= limit <= MAX_AUDIT_BACKFILL_LIMIT:
@@ -386,6 +389,11 @@ class DartSignalsService:
             )
         if after_event_id < 0:
             raise ValueError('after_event_id must be greater than or equal to 0')
+        if not 1 <= concurrency <= MAX_AUDIT_BACKFILL_CONCURRENCY:
+            raise ValueError(
+                'concurrency must be between 1 and '
+                f'{MAX_AUDIT_BACKFILL_CONCURRENCY}'
+            )
         if self.event_timeout_seconds <= 0:
             raise ValueError('event_timeout_seconds must be greater than 0')
 
@@ -406,6 +414,7 @@ class DartSignalsService:
                 'market_date': market_date.isoformat(),
                 'selection_policy': AUDIT_BACKFILL_SELECTION_POLICY,
                 'limit': limit,
+                'concurrency': concurrency,
                 'after_event_id': after_event_id,
                 # Inspection must never hand callers a cursor that skips work.
                 'next_after_event_id': after_event_id,
@@ -446,9 +455,8 @@ class DartSignalsService:
         circuit_breaker_tripped = False
         last_attempted_event_id = after_event_id
         results: list[dict[str, Any]] = []
-        for candidate_index, candidate in enumerate(candidates):
-            event_id = int(candidate['event_id'])
-            last_attempted_event_id = event_id
+
+        async def attempt_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             result_item = dict(candidate)
             try:
                 capture_result = await asyncio.wait_for(
@@ -459,14 +467,6 @@ class DartSignalsService:
                 )
             except Exception as exc:
                 systemic_failure = _is_systemic_provider_failure(exc)
-                consecutive_systemic_failures = (
-                    consecutive_systemic_failures + 1
-                    if systemic_failure
-                    else 0
-                )
-                failed_count += 1
-                retry_event_ids.append(event_id)
-                failed_event_ids.append(event_id)
                 result_item.update(
                     {
                         'status': 'failed',
@@ -475,10 +475,8 @@ class DartSignalsService:
                     }
                 )
             else:
-                consecutive_systemic_failures = 0
                 audit_signal = capture_result.get('audit_signal')
                 if audit_signal:
-                    captured_count += 1
                     result_item.update(
                         {
                             'status': 'captured',
@@ -487,19 +485,49 @@ class DartSignalsService:
                         }
                     )
                 else:
-                    missing_count += 1
-                    retry_event_ids.append(event_id)
-                    missing_evidence_event_ids.append(event_id)
                     result_item['status'] = 'audit_evidence_missing'
-            results.append(result_item)
-            if (
-                consecutive_systemic_failures
-                >= AUDIT_BACKFILL_SYSTEMIC_FAILURE_LIMIT
-            ):
-                circuit_breaker_tripped = True
+            return result_item
+
+        for wave_start in range(0, len(candidates), concurrency):
+            wave = candidates[wave_start : wave_start + concurrency]
+            wave_results = await asyncio.gather(
+                *(attempt_candidate(candidate) for candidate in wave)
+            )
+            last_attempted_event_id = int(wave[-1]['event_id'])
+            for result_item in wave_results:
+                event_id = int(result_item['event_id'])
+                status = result_item['status']
+                if status == 'failed':
+                    failed_count += 1
+                    retry_event_ids.append(event_id)
+                    failed_event_ids.append(event_id)
+                    # A full wave is already in flight.  Latch the first
+                    # ordered threshold breach while still accounting for
+                    # every result from that wave exactly once.
+                    if not circuit_breaker_tripped:
+                        if result_item['systemic_provider_failure']:
+                            consecutive_systemic_failures += 1
+                        else:
+                            consecutive_systemic_failures = 0
+                        if (
+                            consecutive_systemic_failures
+                            >= AUDIT_BACKFILL_SYSTEMIC_FAILURE_LIMIT
+                        ):
+                            circuit_breaker_tripped = True
+                else:
+                    if not circuit_breaker_tripped:
+                        consecutive_systemic_failures = 0
+                    if status == 'captured':
+                        captured_count += 1
+                    else:
+                        missing_count += 1
+                        retry_event_ids.append(event_id)
+                        missing_evidence_event_ids.append(event_id)
+                results.append(result_item)
+            if circuit_breaker_tripped:
                 unattempted_event_ids = [
                     int(item['event_id'])
-                    for item in candidates[candidate_index + 1 :]
+                    for item in candidates[wave_start + len(wave) :]
                 ]
                 break
 
@@ -520,6 +548,7 @@ class DartSignalsService:
             'market_date': market_date.isoformat(),
             'selection_policy': AUDIT_BACKFILL_SELECTION_POLICY,
             'limit': limit,
+            'concurrency': concurrency,
             'after_event_id': after_event_id,
             # Successful rows disappear from the candidate query.  Holding the
             # input cursor on any gap makes the next invocation retry only the

@@ -206,10 +206,62 @@ class InternalOpsTests(unittest.TestCase):
         bootstrap_runtime.assert_called_once_with()
         self.assertEqual(result, {'triggered': True, 'run_id': 15})
         self.assertEqual(run_daily.call_args.kwargs['market_date'], '2026-04-14')
+        self.assertIsNone(run_daily.call_args.kwargs['symbols'])
         self.assertEqual(run_daily.call_args.kwargs['symbol_limit'], 5)
         self.assertEqual(run_daily.call_args.kwargs['capture_limit'], 20)
         self.assertEqual(run_daily.call_args.kwargs['trigger'], 'internal_ops_cli')
         self.assertEqual(run_daily.call_args.kwargs['force'], True)
+
+    def test_run_dart_fundamentals_daily_if_due_passes_exact_symbol_scope(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.dart_fundamentals_capture_service.run_daily_incremental_refresh',
+                new=AsyncMock(
+                    return_value={
+                        'status': 'partial',
+                        'selected_stock_codes': ['005930', '000660'],
+                        'successful_stock_codes': ['005930'],
+                        'retry_debt_stock_codes': ['000660'],
+                    }
+                ),
+            ) as run_daily,
+        ):
+            result = ops.run_dart_fundamentals_daily_if_due(
+                market_date='2026-10-30',
+                symbols='005930, 000660,005930',
+                capture_limit=20,
+            )
+
+        bootstrap_runtime.assert_called_once_with()
+        self.assertEqual(result['selected_stock_codes'], ['005930', '000660'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(
+            run_daily.call_args.kwargs['symbols'],
+            ['005930', '000660'],
+        )
+        self.assertIsNone(run_daily.call_args.kwargs['symbol_limit'])
+        self.assertEqual(run_daily.call_args.kwargs['symbol_offset'], 0)
+
+    def test_run_dart_fundamentals_daily_if_due_rejects_ambiguous_symbol_scope(self) -> None:
+        for pagination in (
+            {'symbol_limit': 1},
+            {'symbol_offset': 1},
+        ):
+            with self.subTest(pagination=pagination):
+                with (
+                    patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+                    self.assertRaisesRegex(
+                        ValueError,
+                        '--symbols cannot be combined',
+                    ),
+                ):
+                    ops.run_dart_fundamentals_daily_if_due(
+                        symbols='005930',
+                        **pagination,
+                    )
+
+                bootstrap_runtime.assert_not_called()
 
     def test_backfill_dart_audit_signals_uses_bounded_direct_service_call(self) -> None:
         with (
@@ -223,6 +275,7 @@ class InternalOpsTests(unittest.TestCase):
                 market_date='2026-04-30',
                 limit=2,
                 after_event_id=40,
+                concurrency=3,
                 dry_run=False,
             )
 
@@ -231,6 +284,7 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(backfill.call_args.kwargs['market_date'], date(2026, 4, 30))
         self.assertEqual(backfill.call_args.kwargs['limit'], 2)
         self.assertEqual(backfill.call_args.kwargs['after_event_id'], 40)
+        self.assertEqual(backfill.call_args.kwargs['concurrency'], 3)
         self.assertFalse(backfill.call_args.kwargs['dry_run'])
 
     def test_backfill_dart_share_issuance_evidence_dry_run_freezes_sorted_manifest_and_cursor(self) -> None:
@@ -957,6 +1011,8 @@ class InternalOpsTests(unittest.TestCase):
                     '2',
                     '--after-event-id',
                     '40',
+                    '--concurrency',
+                    '3',
                     '--dry-run',
                 ]
             )
@@ -967,6 +1023,7 @@ class InternalOpsTests(unittest.TestCase):
             market_date='2026-04-30',
             limit=2,
             after_event_id=40,
+            concurrency=3,
             dry_run=True,
         )
 
@@ -986,6 +1043,21 @@ class InternalOpsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(backfill.call_args.kwargs['dry_run'])
+        self.assertEqual(backfill.call_args.kwargs['concurrency'], 4)
+
+    def test_cli_dart_audit_signals_backfill_rejects_invalid_concurrency(self) -> None:
+        for concurrency in ('0', '9'):
+            with self.subTest(concurrency=concurrency):
+                with self.assertRaises(SystemExit):
+                    ops._build_parser().parse_args(
+                        [
+                            'dart-audit-signals-backfill',
+                            '--market-date',
+                            '2026-04-30',
+                            '--concurrency',
+                            concurrency,
+                        ]
+                    )
 
     def test_cli_dart_audit_signals_backfill_requires_apply_for_writes(self) -> None:
         payload = {'status': 'completed', 'audit_signals_captured': 1}
@@ -2039,6 +2111,39 @@ class InternalOpsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(stdout.getvalue()), {'state': 'CLOSED'})
+
+    def test_cli_dart_fundamentals_daily_run_passes_symbols(self) -> None:
+        payload = {
+            'status': 'partial',
+            'selected_stock_codes': ['005930', '000660'],
+            'successful_stock_codes': ['005930'],
+            'retry_debt_stock_codes': ['000660'],
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.run_dart_fundamentals_daily_if_due',
+                return_value=payload,
+            ) as run_daily,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'dart-fundamentals-daily-run-if-due',
+                    '--market-date',
+                    '2026-10-30',
+                    '--symbols',
+                    '005930,000660',
+                    '--capture-limit',
+                    '20',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        self.assertEqual(run_daily.call_args.kwargs['symbols'], '005930,000660')
+        self.assertIsNone(run_daily.call_args.kwargs['symbol_limit'])
+        self.assertEqual(run_daily.call_args.kwargs['symbol_offset'], 0)
 
     def test_cli_signal_decider_evaluations_outputs_json(self) -> None:
         stdout = io.StringIO()
